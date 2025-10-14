@@ -14,3 +14,5 @@ state/*
 
 # Bootstrap runtime cache (signed seedlist.txt stays tracked)
 bootstrap/seedlist.runtime
+target/
+*.bak

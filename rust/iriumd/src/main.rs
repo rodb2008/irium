@@ -14,7 +14,7 @@ fn load_seeds() -> Vec<String> {
         if let Ok(f) = File::open(p) {
             for line in BufReader::new(f).lines().flatten() {
                 let ln = line.trim().to_string();
-                if !ln.is_empty() && !ln.starts_with(#) {
+                if !ln.is_empty() && !ln.starts_with("#") {
                     out.push(ln);
                 }
             }
