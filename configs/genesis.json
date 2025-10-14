@@ -1,0 +1,38 @@
+{
+  "network": "mainnet",
+  "timestamp": 1735689600,
+  "bits": "1d00ffff",
+  "nonce": 2083236893,
+  "allocations": [
+    {
+      "label": "founder_vesting_year1",
+      "amount_sats": 100000000000000,
+      "script_pubkey": "0350cd00b17576a9144f3cf4b44d0132891613be16caf253162072281888ac"
+    },
+    {
+      "label": "founder_vesting_year2",
+      "amount_sats": 100000000000000,
+      "script_pubkey": "03a09a01b17576a9144f3cf4b44d0132891613be16caf253162072281888ac"
+    },
+    {
+      "label": "founder_vesting_year3",
+      "amount_sats": 150000000000000,
+      "script_pubkey": "03f06702b17576a9144f3cf4b44d0132891613be16caf253162072281888ac"
+    },
+    {
+      "label": "public_ecosystem",
+      "amount_sats": 3000000000000000,
+      "script_pubkey": "1976a9149db82a0bc4c45f7a4e378e9387cfa947c47e60cf88ac"
+    },
+    {
+      "label": "public_miners",
+      "amount_sats": 5000000000000000,
+      "script_pubkey": "1976a914bb86e9d5c379c7bdd2079273115749870d6a1d6e88ac"
+    },
+    {
+      "label": "public_airdrop",
+      "amount_sats": 1650000000000000,
+      "script_pubkey": "1976a914628032163a423ef11fc554d8d689448231bc70a588ac"
+    }
+  ]
+}
