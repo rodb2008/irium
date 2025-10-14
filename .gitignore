@@ -1,3 +1,16 @@
+# Python build artefacts
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Local virtualenv
+.venv/
+
+# Runtime state (keep placeholder if present)
+state/*
+!state/.gitkeep
+
+# Bootstrap runtime cache (signed seedlist.txt stays tracked)
+bootstrap/seedlist.runtime
