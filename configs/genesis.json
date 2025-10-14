@@ -1,0 +1,13 @@
+{
+  "network": "mainnet",
+  "timestamp": 1735689600,
+  "bits": "1d00ffff",
+  "nonce": 2083236893,
+  "allocations": [
+    {
+      "label": "founder_vesting_3y",
+      "amount_sats": 350000000000000,
+      "script_pubkey": "03f06702b17576a9144f3cf4b44d0132891613be16caf253162072281888ac"
+    }
+  ]
+}
