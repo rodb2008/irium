@@ -216,3 +216,34 @@ class DisconnectMessage:
         """Parse from generic Message."""
         reason = msg.payload.decode('utf-8')
         return cls(reason=reason)
+
+
+# Uptime proof messages
+@dataclass
+class UptimeChallenge:
+    """Challenge for uptime proof."""
+    challenge: bytes
+    
+    def to_message(self) -> Message:
+        """Convert to generic Message."""
+        return Message(MessageType.PING, self.challenge)  # Reuse PING
+    
+    @classmethod
+    def from_message(cls, msg: Message) -> UptimeChallenge:
+        """Parse from generic Message."""
+        return cls(challenge=msg.payload)
+
+
+@dataclass
+class UptimeResponse:
+    """Response to uptime challenge."""
+    response: bytes
+    
+    def to_message(self) -> Message:
+        """Convert to generic Message."""
+        return Message(MessageType.PONG, self.response)  # Reuse PONG
+    
+    @classmethod
+    def from_message(cls, msg: Message) -> UptimeResponse:
+        """Parse from generic Message."""
+        return cls(response=msg.payload)
