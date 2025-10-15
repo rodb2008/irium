@@ -54,3 +54,31 @@ class SpvVerifier:
             if int.from_bytes(hdr.hash()[::-1], "big") > Target(hdr.bits).to_target():
                 return False
         return True
+
+
+class NiPoPoW:
+    """Non-Interactive Proofs of Proof-of-Work for super-light clients."""
+    
+    @staticmethod
+    def is_superblock(header: BlockHeader, level: int) -> bool:
+        """Check if header is a superblock at given level."""
+        block_hash = header.hash()
+        hash_int = int.from_bytes(block_hash[::-1], 'big')
+        # Superblock has extra leading zeros
+        return hash_int < (2 ** (256 - level))
+    
+    @staticmethod
+    def filter_superblocks(headers: list[BlockHeader], level: int) -> list[BlockHeader]:
+        """Filter headers to only superblocks at given level."""
+        return [h for h in headers if NiPoPoW.is_superblock(h, level)]
+    
+    @staticmethod
+    def verify_nipopow(
+        superblocks: list[BlockHeader],
+        level: int,
+        claimed_work: int
+    ) -> bool:
+        """Verify a NiPoPoW proves sufficient work."""
+        # Calculate work in superblocks
+        work = len(superblocks) * (2 ** level)
+        return work >= claimed_work
