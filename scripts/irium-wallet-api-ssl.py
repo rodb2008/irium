@@ -13,18 +13,18 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
         self.wallet_file = "irium-wallet.json"
         self.load_wallet()
         super().__init__(*args, **kwargs)
-    
+
     def load_wallet(self):
         if os.path.exists(self.wallet_file):
             with open(self.wallet_file, 'r') as f:
                 data = json.load(f)
             for addr, wif in data.get('keys', {}).items():
                 self.wallet.import_wif(wif)
-    
+
     def do_GET(self):
         parsed_path = urlparse(self.path)
         path = parsed_path.path
-        
+
         if path == '/api/wallet/status':
             self.send_wallet_status()
         elif path == '/api/wallet/addresses':
@@ -33,20 +33,24 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
             self.send_balance()
         elif path == '/api/network/info':
             self.send_network_info()
+        elif path == '/api/wallet/complete-new-address':
+            self.send_complete_new_address()
+        elif path == '/api/wallet/qr-code':
+            self.send_qr_code()
         elif path == '/irium-logo-wallet.svg':
             self.send_logo()
         else:
             self.send_error(404, "Not Found")
-    
+
     def do_HEAD(self):
         parsed_path = urlparse(self.path)
         path = parsed_path.path
-        
+
         if path == '/irium-logo-wallet.svg':
             self.send_logo_headers()
         else:
             self.send_error(404, "Not Found")
-    
+
     def send_logo_headers(self):
         logo_path = os.path.join(os.path.dirname(__file__), '..', 'irium-logo-wallet.svg')
         if os.path.exists(logo_path):
@@ -57,7 +61,7 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
             self.end_headers()
         else:
             self.send_error(404, "Logo not found")
-    
+
     def send_logo(self):
         logo_path = os.path.join(os.path.dirname(__file__), '..', 'irium-logo-wallet.svg')
         if os.path.exists(logo_path):
@@ -70,7 +74,7 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
                 self.wfile.write(f.read().encode('utf-8'))
         else:
             self.send_error(404, "Logo not found")
-    
+
     def send_wallet_status(self):
         addresses = list(self.wallet.addresses())
         balance = self.wallet.balance()
@@ -84,17 +88,17 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
             }
         }
         self.send_json_response(status)
-    
+
     def send_addresses(self):
         addresses = list(self.wallet.addresses())
         response = {"status": "success", "data": {"addresses": addresses}}
         self.send_json_response(response)
-    
+
     def send_balance(self):
         balance = self.wallet.balance()
         response = {"status": "success", "data": {"balance": balance, "currency": "IRM"}}
         self.send_json_response(response)
-    
+
     def send_network_info(self):
         info = {
             "status": "success",
@@ -107,7 +111,95 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
             }
         }
         self.send_json_response(info)
-    
+
+    def send_complete_new_address(self):
+        try:
+            from irium.wallet import KeyPair, Wallet
+            
+            # Generate a new key pair
+            key = KeyPair.generate()
+            wif = key.to_wif()
+            address = key.address()
+            public_key = key.public_key().hex()
+            
+            # Add to wallet and get balance
+            wallet = Wallet()
+            wallet.import_wif(wif)
+            balance = wallet.balance()
+            
+            response = {
+                "status": "success", 
+                "data": {
+                    "address": address,
+                    "wif": wif,
+                    "public_key": public_key,
+                    "balance": balance,
+                    "all_addresses": list(wallet.addresses()),
+                    "message": "Complete address generated successfully"
+                }
+            }
+            self.send_json_response(response)
+        except Exception as e:
+            error_response = {
+                "status": "error",
+                "data": {
+                    "error": str(e),
+                    "message": "Failed to generate complete address"
+                }
+            }
+            self.send_json_response(error_response)
+
+    def send_qr_code(self):
+        try:
+            import qrcode
+            import io
+            import base64
+            from urllib.parse import parse_qs
+            
+            # Get address from query parameters
+            query = parse_qs(urlparse(self.path).query)
+            address = query.get('address', [None])[0]
+            amount = query.get('amount', [None])[0]
+            
+            if not address:
+                self.send_error(400, "Address parameter required")
+                return
+            
+            # Create payment URI if amount is provided
+            if amount:
+                data = f"irium:{address}?amount={amount}"
+            else:
+                data = address
+            
+            # Generate QR code
+            qr = qrcode.QRCode(version=1, box_size=10, border=4)
+            qr.add_data(data)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            
+            # Convert to base64
+            buffered = io.BytesIO()
+            img.save(buffered, format="PNG")
+            img_base64 = base64.b64encode(buffered.getvalue()).decode()
+            
+            response = {
+                "status": "success",
+                "data": {
+                    "address": address,
+                    "amount": amount,
+                    "qr_code_base64": img_base64,
+                    "uri": data
+                }
+            }
+            self.send_json_response(response)
+            
+        except Exception as e:
+            error_response = {
+                "status": "error",
+                "data": {"error": str(e)}
+            }
+            self.send_json_response(error_response)
+
     def send_json_response(self, data):
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
@@ -125,3 +217,54 @@ def run_server(port=8080):
 
 if __name__ == "__main__":
     run_server()
+
+    def send_qr_code(self):
+        try:
+            import qrcode
+            import io
+            import base64
+            from urllib.parse import parse_qs
+            
+            # Get address from query parameters
+            query = parse_qs(urlparse(self.path).query)
+            address = query.get('address', [None])[0]
+            amount = query.get('amount', [None])[0]
+            
+            if not address:
+                self.send_error(400, "Address parameter required")
+                return
+            
+            # Create payment URI if amount is provided
+            if amount:
+                data = f"irium:{address}?amount={amount}"
+            else:
+                data = address
+            
+            # Generate QR code
+            qr = qrcode.QRCode(version=1, box_size=10, border=4)
+            qr.add_data(data)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            
+            # Convert to base64
+            buffered = io.BytesIO()
+            img.save(buffered, format="PNG")
+            img_base64 = base64.b64encode(buffered.getvalue()).decode()
+            
+            response = {
+                "status": "success",
+                "data": {
+                    "address": address,
+                    "amount": amount,
+                    "qr_code_base64": img_base64,
+                    "uri": data
+                }
+            }
+            self.send_json_response(response)
+            
+        except Exception as e:
+            error_response = {
+                "status": "error",
+                "data": {"error": str(e)}
+            }
+            self.send_json_response(error_response)
