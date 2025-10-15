@@ -22,7 +22,7 @@ def load_wallet():
     return Wallet(), {'keys': {}, 'addresses': []}
 
 def save_wallet(wallet, data):
-    """Save wallet to file - FIXED VERSION."""
+    """Save wallet to file."""
     data['addresses'] = list(wallet.addresses())
     with open(WALLET_FILE, 'w') as f:
         json.dump(data, f, indent=2)
@@ -40,6 +40,7 @@ def main():
         print("  python3 irium-wallet-proper.py show-wallet")
         print("  python3 irium-wallet-proper.py show-keys")
         print("  python3 irium-wallet-proper.py send <address> <amount>")
+        print("  python3 irium-wallet-proper.py monitor")
         return
 
     command = sys.argv[1]
@@ -133,12 +134,11 @@ def main():
         
         to_address = sys.argv[2]
         amount_irm = float(sys.argv[3])
-        amount_sats = int(amount_irm * 100000000)  # Convert IRM to satoshis
+        amount_sats = int(amount_irm * 100000000)
         
         wallet, data = load_wallet()
         
         try:
-            # Check balance
             balance = wallet.balance()
             if balance < amount_sats:
                 print(f"Error: Insufficient balance")
@@ -146,7 +146,6 @@ def main():
                 print(f"  You need: {amount_irm} IRM")
                 return
             
-            # Create transaction
             payments = [(to_address, amount_sats)]
             fee = 10000  # 0.0001 IRM fee
             tx = wallet.create_transaction(payments, fee=fee)
@@ -157,13 +156,36 @@ def main():
             print(f"  Fee: {fee / 100000000} IRM ({fee} satoshis)")
             print(f"  Transaction ID: {tx.txid().hex()}")
             print()
-            print("⚠️ IMPORTANT:")
-            print("  Transaction created but NOT broadcast yet")
-            print("  Broadcasting functionality needs to be implemented")
-            print("  The transaction is ready to be sent to the network")
+            
+            tx_hex = tx.serialize().hex()
+            print(f"  Transaction hex: {tx_hex[:64]}...")
+            print()
+            
+            print("📝 Adding transaction to mempool...")
+            result = os.system(f"python3 scripts/blockchain-manager.py add-tx {tx_hex} > /dev/null 2>&1")
+            
+            if result == 0:
+                print("✅ Transaction added to mempool successfully!")
+                print()
+                print("📡 Transaction will be:")
+                print("  1. Picked up by miners")
+                print("  2. Included in next block")
+                print("  3. Broadcast to network")
+                print()
+                print("🔍 Check mempool: python3 scripts/blockchain-manager.py show-mempool")
+            else:
+                print("⚠️ Could not add to mempool")
+                print(f"  Manual broadcast: python3 scripts/broadcast-transaction.py {tx_hex}")
             
         except Exception as e:
             print(f"Error creating transaction: {e}")
+
+    elif command == "monitor":
+        print("Starting transaction monitor...")
+        print("This will check for incoming transactions")
+        print("Press Ctrl+C to stop")
+        print()
+        os.system("python3 scripts/monitor-transactions.py")
 
     else:
         print(f"Unknown command: {command}")
