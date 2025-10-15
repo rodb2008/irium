@@ -1,5 +1,6 @@
 """Sybil-resistant handshake for Irium P2P network."""
 
+from __future__ import annotations
 import hashlib
 import hmac
 import secrets
@@ -14,10 +15,10 @@ class SybilChallenge:
     
     nonce: bytes
     timestamp: int
-    difficulty: int  # Required leading zero bits
+    difficulty: int
     
     @classmethod
-    def create(cls, difficulty: int = 8) -> SybilChallenge:
+    def create(cls, difficulty: int = 8):
         """Create a new challenge."""
         return cls(
             nonce=secrets.token_bytes(32),
@@ -30,7 +31,7 @@ class SybilChallenge:
         return self.nonce + self.timestamp.to_bytes(8, 'big') + bytes([self.difficulty])
     
     @classmethod
-    def from_bytes(cls, data: bytes) -> SybilChallenge:
+    def from_bytes(cls, data: bytes):
         """Deserialize challenge."""
         nonce = data[:32]
         timestamp = int.from_bytes(data[32:40], 'big')
@@ -43,28 +44,23 @@ class SybilProof:
     """Proof-of-work for sybil resistance."""
     
     challenge: SybilChallenge
-    solution: int  # Nonce that satisfies difficulty
-    peer_pubkey: bytes  # Peer's public key
+    solution: int
+    peer_pubkey: bytes
     
     def verify(self) -> bool:
         """Verify the proof-of-work."""
-        # Compute hash
         data = (
             self.challenge.to_bytes() + 
             self.solution.to_bytes(8, 'big') +
             self.peer_pubkey
         )
         hash_result = hashlib.sha256(data).digest()
-        
-        # Check difficulty (leading zero bits)
         required_zeros = self.challenge.difficulty
         hash_int = int.from_bytes(hash_result, 'big')
-        
-        # Check if hash has required leading zeros
         return hash_int < (2 ** (256 - required_zeros))
     
     @classmethod
-    def solve(cls, challenge: SybilChallenge, peer_pubkey: bytes) -> SybilProof:
+    def solve(cls, challenge: SybilChallenge, peer_pubkey: bytes):
         """Solve the proof-of-work challenge."""
         solution = 0
         
@@ -80,10 +76,8 @@ class SybilProof:
             
             solution += 1
             
-            if solution % 10000 == 0:
-                # Timeout after too many attempts
-                if solution > 1000000:
-                    raise ValueError("Could not solve challenge")
+            if solution > 1000000:
+                raise ValueError("Could not solve challenge")
     
     def to_bytes(self) -> bytes:
         """Serialize proof."""
@@ -94,7 +88,7 @@ class SybilProof:
         )
     
     @classmethod
-    def from_bytes(cls, data: bytes) -> SybilProof:
+    def from_bytes(cls, data: bytes):
         """Deserialize proof."""
         challenge = SybilChallenge.from_bytes(data[:41])
         solution = int.from_bytes(data[41:49], 'big')
@@ -108,20 +102,34 @@ class SybilResistantHandshake:
     def __init__(self, difficulty: int = 8):
         self.difficulty = difficulty
     
-    def create_challenge(self) -> SybilChallenge:
+    def create_challenge(self):
         """Create handshake challenge."""
         return SybilChallenge.create(difficulty=self.difficulty)
     
     def verify_proof(self, proof: SybilProof) -> bool:
         """Verify handshake proof."""
-        # Check timestamp (not too old)
         age = time.time() - proof.challenge.timestamp
-        if age > 300:  # 5 minutes max
+        if age > 300:
             return False
-        
-        # Verify PoW
         return proof.verify()
     
-    def solve_challenge(self, challenge: SybilChallenge, peer_pubkey: bytes) -> SybilProof:
+    def solve_challenge(self, challenge: SybilChallenge, peer_pubkey: bytes):
         """Solve handshake challenge."""
         return SybilProof.solve(challenge, peer_pubkey)
+
+
+# Legacy compatibility
+def generate_uptime_token():
+    """Generate uptime token (legacy)."""
+    return secrets.token_bytes(32)
+
+
+def verify_uptime_token(token: bytes) -> bool:
+    """Verify uptime token (legacy)."""
+    return len(token) == 32
+
+
+class HandshakeToken:
+    """Legacy handshake token."""
+    def __init__(self):
+        self.token = generate_uptime_token()

@@ -1,29 +1,43 @@
-"""Irium mainnet primitives."""
+"""Irium blockchain library."""
 
+__version__ = "1.0.0"
+
+# Core blockchain
+from .block import Block, BlockHeader
 from .chain import ChainParams, ChainState
-from .miner import Miner, MiningStats, RelayCommitment, TxCandidate
+from .tx import Transaction, TxInput, TxOutput
+from .wallet import Wallet, KeyPair
+from .pow import Target
+
+# Network and P2P
 from .network import PeerDirectory, SeedlistManager
-from .wallet import KeyPair, Wallet
-from .spv import SpvVerifier, Anchor
-from .relay import parse_commitments, RelayCommitmentParsed
-from .sybil import HandshakeToken, generate_uptime_token, verify_uptime_token
+from .protocol import Message, MessageType
+from .p2p import P2PNode
+
+# Advanced features
+from .mempool import Mempool, MempoolTransaction
+from .relay import RelayCommitment, RelayRewardCalculator
+from .uptime import UptimeProof, PeerReputation
+from .sybil import SybilChallenge, SybilProof
+from .anchors import AnchorManager, EclipseProtection
+from .spv import SpvVerifier, NiPoPoW
 
 __all__ = [
-    "ChainParams",
-    "ChainState",
-    "PeerDirectory",
-    "SeedlistManager",
-    "KeyPair",
-    "Wallet",
-    "Miner",
-    "TxCandidate",
-    "RelayCommitment",
-    "MiningStats",
-    "SpvVerifier",
-    "Anchor",
-    "parse_commitments",
-    "RelayCommitmentParsed",
-    "HandshakeToken",
-    "generate_uptime_token",
-    "verify_uptime_token",
+    # Core
+    'Block', 'BlockHeader',
+    'ChainParams', 'ChainState',
+    'Transaction', 'TxInput', 'TxOutput',
+    'Wallet', 'KeyPair',
+    'Target',
+    # Network
+    'PeerDirectory', 'SeedlistManager',
+    'Message', 'MessageType',
+    'P2PNode',
+    # Advanced
+    'Mempool', 'MempoolTransaction',
+    'RelayCommitment', 'RelayRewardCalculator',
+    'UptimeProof', 'PeerReputation',
+    'SybilChallenge', 'SybilProof',
+    'AnchorManager', 'EclipseProtection',
+    'SpvVerifier', 'NiPoPoW',
 ]
