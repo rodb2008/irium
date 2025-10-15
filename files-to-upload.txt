@@ -1,0 +1,32 @@
+Files to manually upload to GitHub:
+
+CORE FILES:
+- irium-logo-official.svg (Official Irium logo)
+- irium-logo-wallet.svg (Wallet logo)
+- PROJECT_SUMMARY.md (Project documentation)
+- QUICK_REFERENCE.md (Quick reference)
+
+NODE & MINER:
+- scripts/irium-node.py (Blockchain node)
+- scripts/irium-miner.py (Mining script)
+
+WALLET SYSTEM:
+- scripts/irium-wallet-api-ssl.py (Wallet API server)
+- scripts/irium-wallet-full.py (Full wallet)
+- scripts/irium-wallet-integration.py (Integration)
+- scripts/irium-wallet-proper.py (Proper wallet)
+- scripts/irium-wallet-summary.py (Summary)
+- scripts/irium-wallet.py (Basic wallet)
+- scripts/irium-web3-provider.js (Web3 provider)
+- irium-wallet.json (Wallet config)
+
+INSTRUCTIONS:
+1. Download the archive: irium-wallet-integration-complete.tar.gz
+2. Extract files to your local machine
+3. Upload each file to the corresponding location in your GitHub repo
+4. Create a commit with message: "Add wallet integration and node/miner scripts"
+5. Push to main branch
+
+ALTERNATIVE:
+- Use the GitHub web interface to upload files directly
+- Or use GitHub Desktop application

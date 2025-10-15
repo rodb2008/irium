@@ -70,7 +70,7 @@ class ChainState:
     def _connect_genesis(self, block: Block) -> None:
         if self.chain:
             raise ValueError("Genesis block already connected")
-        self._validate_block_header(block, expected_height=0, previous=None)
+        self._validate_block_header(block, height=0, previous=None)
         fees, coinbase_total, subsidy_created = self._validate_and_apply_transactions(
             block,
             block_reward=0,

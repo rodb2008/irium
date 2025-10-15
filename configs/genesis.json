@@ -2,11 +2,21 @@
   "network": "mainnet",
   "timestamp": 1735689600,
   "bits": "1d00ffff",
-  "nonce": 2083236893,
+  "nonce": 0,
   "allocations": [
     {
+      "label": "founder_vesting_1y",
+      "amount_sats": 100000000000000,
+      "script_pubkey": "03f06702b17576a9144f3cf4b44d0132891613be16caf253162072281888ac"
+    },
+    {
+      "label": "founder_vesting_2y",
+      "amount_sats": 125000000000000,
+      "script_pubkey": "03f06702b17576a9144f3cf4b44d0132891613be16caf253162072281888ac"
+    },
+    {
       "label": "founder_vesting_3y",
-      "amount_sats": 350000000000000,
+      "amount_sats": 125000000000000,
       "script_pubkey": "03f06702b17576a9144f3cf4b44d0132891613be16caf253162072281888ac"
     }
   ]

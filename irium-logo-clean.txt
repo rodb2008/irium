@@ -1,0 +1,17 @@
+    ██╗██████╗ ██╗██╗   ██╗███╗   ███╗
+    ██║██╔══██╗██║██║   ██║████╗ ████║
+    ██║██████╔╝██║██║   ██║██╔████╔██║
+    ██║██╔══██╗██║██║   ██║██║╚██╔╝██║
+    ██║██║  ██║██║╚██████╔╝██║ ╚═╝ ██║
+    ╚═╝╚═╝  ╚═╝╚═╝ ╚═════╝ ╚═╝     ╚═╝
+    
+    🔗 BLOCKCHAIN NETWORK
+    ⚡ Consensus: Proof-of-Work (SHA-256d)
+    💰 Max Supply: 100,000,000 IRM
+    🔒 Genesis Vesting: 3,500,000 IRM (CLTV)
+    ⏱️  Block Time: 600 seconds
+    🎯 Difficulty Retarget: Every 2016 blocks
+    
+    🌐 Bootstrap Node: 207.244.247.86:19444
+    🔐 Wallet API: https://207.244.247.86/api
+    📱 Web3 Compatible: MetaMask, Trust Wallet
