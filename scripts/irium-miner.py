@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Working Irium miner with actual PoW mining."""
+"""Irium miner with P2P block broadcasting."""
 
 import sys
 import os
@@ -15,19 +15,23 @@ from irium.chain import ChainParams, ChainState
 from irium.block import Block, BlockHeader
 from irium.tx import Transaction, TxInput, TxOutput
 from irium.pow import Target
+from irium.p2p import P2PNode
 
 WALLET_FILE = os.path.expanduser("~/.irium/irium-wallet.json")
 MEMPOOL_FILE = os.path.expanduser("~/.irium/mempool/pending.json")
 BLOCKCHAIN_DIR = os.path.expanduser("~/.irium/blocks")
 
+
 class IriumMiner:
-    def __init__(self):
+    def __init__(self, p2p_port: int = 38292):
         self.wallet = self.load_wallet()
         self.mining_address = self.get_mining_address()
         self.chain_params = None
         self.chain_state = None
         self.running = True
         self.blocks_mined = 0
+        self.p2p_port = p2p_port
+        self.p2p = None
         
     def load_wallet(self):
         """Load wallet from file."""
@@ -44,7 +48,6 @@ class IriumMiner:
         addresses = list(self.wallet.addresses())
         if addresses:
             return addresses[0]
-        # Generate new address if none exists
         from irium.wallet import KeyPair
         key = KeyPair.generate()
         wif = key.to_wif()
@@ -66,15 +69,12 @@ class IriumMiner:
     
     def create_coinbase_transaction(self, height, reward):
         """Create coinbase transaction for mining reward."""
-        # Coinbase input
         coinbase_input = TxInput(
             prev_txid=bytes(32),
             prev_index=0xFFFFFFFF,
             script_sig=f"Block {height}".encode()
         )
         
-        # Coinbase output (mining reward)
-        # Simple P2PKH-like script (not fully validated, just for testing)
         script_pubkey = bytes.fromhex(f"76a914{self.mining_address[1:21].encode().hex()}88ac")
         
         coinbase_output = TxOutput(
@@ -94,7 +94,6 @@ class IriumMiner:
         print(f"  Transactions: {len(transactions)}")
         print(f"  Prev hash: {prev_hash.hex()[:16]}...")
         
-        # Create temporary block to calculate merkle root
         temp_block = Block(
             header=BlockHeader(
                 version=1,
@@ -109,7 +108,6 @@ class IriumMiner:
         
         merkle_root = temp_block.merkle_root()[::-1]
         
-        # Mine for valid nonce
         nonce = 0
         start_time = time.time()
         
@@ -147,16 +145,33 @@ class IriumMiner:
         
         return None
 
+    async def handle_peer_block(self, peer, block_data: bytes):
+        """Handle block received from peer."""
+        try:
+            print(f"\n📦 Received block from {peer.address}")
+            # TODO: Validate and add to chain
+            # For now, just log it
+        except Exception as e:
+            print(f"❌ Error handling peer block: {e}")
+
+    async def handle_peer_tx(self, peer, tx_data: bytes):
+        """Handle transaction from peer."""
+        try:
+            print(f"\n💸 Received transaction from {peer.address}")
+            # TODO: Add to mempool
+        except Exception as e:
+            print(f"❌ Error handling peer tx: {e}")
+
     async def start(self):
-        """Start mining."""
-        print("⛏️  Starting Irium Miner...")
+        """Start mining with P2P."""
+        print("⛏️  Starting Irium Miner with P2P...")
         print(f"💰 Mining address: {self.mining_address}")
+        print(f"🔗 P2P port: {self.p2p_port}")
         print()
         
         # Initialize blockchain
         print("📋 Initializing blockchain...")
         
-        # Load genesis
         genesis_file = os.path.join(os.path.dirname(__file__), '..', 'configs', 'genesis.json')
         with open(genesis_file, 'r') as f:
             genesis_data = json.load(f)
@@ -205,48 +220,56 @@ class IriumMiner:
         self.chain_state = ChainState(params=self.chain_params)
         
         print(f"✅ Blockchain initialized at height {self.chain_state.height}")
+        
+        # Start P2P
+        print(f"\n🌐 Starting P2P networking on port {self.p2p_port}...")
+        self.p2p = P2PNode(
+            port=self.p2p_port,
+            max_peers=8,
+            agent="irium-miner/1.0",
+            chain_height=self.chain_state.height
+        )
+        
+        self.p2p.on_block = self.handle_peer_block
+        self.p2p.on_tx = self.handle_peer_tx
+        
+        await self.p2p.start()
+        print(f"✅ P2P node started")
         print()
         
         # Mining loop
         while self.running:
             try:
-                # Get current height and tip
                 height = self.chain_state.height + 1
-                tip_block = self.chain_state.chain[-1]  # Last block in chain
+                tip_block = self.chain_state.chain[-1]
                 prev_hash = tip_block.header.hash()
                 
-                # Calculate reward (50 IRM initially, halving every 210000 blocks)
-                reward = 5000000000  # 50 IRM in satoshis
+                reward = 5000000000  # 50 IRM
                 halvings = (height - 1) // 210000
                 reward = reward >> halvings
                 
-                # Create coinbase transaction
                 coinbase_tx = self.create_coinbase_transaction(height, reward)
-                
-                # Get pending transactions from mempool
                 mempool_txs = self.load_mempool()
-                
-                # Build transaction list
                 transactions = [coinbase_tx]
-                # TODO: Validate and add mempool transactions
                 
-                # Get target
                 target = self.chain_params.pow_limit
                 
-                # Mine block
                 block = self.mine_block(height, prev_hash, transactions, target)
                 
                 if block:
                     self.blocks_mined += 1
                     print(f"💰 Reward: {reward / 100000000} IRM")
+                    
+                    # Broadcast block to P2P network
+                    print(f"📡 Broadcasting block to {self.p2p.get_peer_count()} peers...")
+                    block_data = block.header.serialize() + b''.join(tx.serialize() for tx in block.transactions)
+                    await self.p2p.broadcast_block(block_data)
+                    print(f"✅ Block broadcast complete")
                     print()
                     
-                    # Clear mempool
                     if mempool_txs:
                         self.clear_mempool()
-                        print(f"📝 Cleared {len(mempool_txs)} transactions from mempool")
                     
-                    # Save block
                     os.makedirs(BLOCKCHAIN_DIR, exist_ok=True)
                     block_file = os.path.join(BLOCKCHAIN_DIR, f"block_{height}.json")
                     with open(block_file, 'w') as f:
@@ -263,14 +286,13 @@ class IriumMiner:
                         }, f, indent=2)
                     
                     print(f"💾 Saved block to {block_file}")
-                    print()
                     
-                    # Add block to chain (simplified - just append)
                     self.chain_state.chain.append(block)
                     self.chain_state.height += 1
                     
                     print(f"📊 Chain height: {self.chain_state.height}")
                     print(f"📊 Total blocks mined: {self.blocks_mined}")
+                    print(f"👥 Connected peers: {self.p2p.get_peer_count()}")
                     print()
                 
                 await asyncio.sleep(1)
@@ -281,16 +303,31 @@ class IriumMiner:
                 traceback.print_exc()
                 await asyncio.sleep(5)
 
-    def stop(self):
+    async def stop(self):
         """Stop mining."""
         print("\n🛑 Stopping Irium Miner...")
         self.running = False
+        
+        if self.p2p:
+            await self.p2p.stop()
+        
+        print("✅ Miner stopped")
+
 
 async def main():
-    miner = IriumMiner()
+    # Parse port from command line
+    port = 38292  # Different from node (38291)
+    if len(sys.argv) > 1:
+        try:
+            port = int(sys.argv[1])
+        except ValueError:
+            print(f"Invalid port: {sys.argv[1]}")
+            sys.exit(1)
+    
+    miner = IriumMiner(p2p_port=port)
     
     def signal_handler(signum, frame):
-        miner.stop()
+        asyncio.create_task(miner.stop())
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -298,7 +335,8 @@ async def main():
     try:
         await miner.start()
     except KeyboardInterrupt:
-        miner.stop()
+        await miner.stop()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
