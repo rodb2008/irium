@@ -16,3 +16,12 @@ state/*
 bootstrap/seedlist.runtime
 target/
 *.bak
+
+irium-wallet.json
+*.wallet.json
+*.tar.gz
+*.bak
+*.backup
+*.backup[0-9]
+genesis-mainnet-mining.log
+genesis*.log
