@@ -1,41 +1,60 @@
-# Python build artefacts
-__pycache__/
-*.py[cod]
-*.egg-info/
-build/
-dist/
-
-# Local virtualenv
-.venv/
-
-# Runtime state (keep placeholder if present)
-state/*
-!state/.gitkeep
-
-# Bootstrap runtime cache (signed seedlist.txt stays tracked)
-bootstrap/seedlist.runtime
-target/
-*.bak
-
+# Wallet files (NEVER commit these!)
 irium-wallet.json
 *.wallet.json
-*.tar.gz
+wallet.json
+
+# Build artifacts
+*.pyc
+__pycache__/
+*.so
+*.egg-info/
+dist/
+build/
+target/
+
+# Logs
+*.log
+logs/
+
+# State and data
+state/
+data/
+*.db
+*.sqlite
+
+# Temporary files
+*.tmp
 *.bak
 *.backup
 *.backup[0-9]
-genesis-mainnet-mining.log
-genesis*.log
+temp_release/
+*.tar.gz
+*.zip
 
-# Temporary and test files
-*.log
+# QR codes
 qr_*.png
+
+# Test files
 test-*.py
 test-*.html
+*-test.html
 logo-test.html
+
+# Scripts not needed
 manual_commit.sh
 files-to-upload.txt
 update-github-release-wallet.sh
 *-logo-*.txt
-irium_logo.svg.local_backup
-irium_logo_official.svg
-temp_release/
+*.local_backup
+check-*.sh
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
