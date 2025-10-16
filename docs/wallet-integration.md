@@ -166,9 +166,3 @@ curl -k https://207.244.247.86/api/wallet/status
 3. Restrict CORS to your domain
 4. Set up proper firewall rules
 5. Monitor API usage and performance
-
-## Support
-
-For technical support or questions about wallet integration:
-- GitHub Issues: [iriumlabs/irium](https://github.com/iriumlabs/irium)
-- Email: info@iriumlabs.org
