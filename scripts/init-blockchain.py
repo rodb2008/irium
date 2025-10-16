@@ -29,7 +29,7 @@ def load_genesis_block():
     coinbase_input = TxInput(
         prev_txid=bytes(32),
         prev_index=0xFFFFFFFF,
-        script_sig=b"Irium Genesis Block"
+        script_sig=b"Irium Genesis Block - SHA256d PoW"
     )
     
     coinbase_tx = Transaction(
@@ -44,7 +44,7 @@ def load_genesis_block():
             version=1,
             prev_hash=bytes(32),
             merkle_root=bytes(32),
-            time=genesis_data['timestamp'],
+            time=genesis_data.get('time', genesis_data['timestamp']),
             bits=int(genesis_data['bits'], 16),
             nonce=genesis_data['nonce']
         ),
@@ -59,7 +59,7 @@ def load_genesis_block():
         version=1,
         prev_hash=bytes(32),
         merkle_root=correct_merkle_root,
-        time=genesis_data['timestamp'],
+        time=genesis_data.get('time', genesis_data['timestamp']),
         bits=int(genesis_data['bits'], 16),
         nonce=genesis_data['nonce']
     )

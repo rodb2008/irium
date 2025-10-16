@@ -186,7 +186,7 @@ class IriumMiner:
         
         coinbase_tx = Transaction(
             version=1,
-            inputs=[TxInput(prev_txid=bytes(32), prev_index=0xFFFFFFFF, script_sig=b"Genesis")],
+            inputs=[TxInput(prev_txid=bytes(32), prev_index=0xFFFFFFFF, script_sig=b"Irium Genesis Block - SHA256d PoW")],
             outputs=outputs
         )
         
@@ -195,7 +195,7 @@ class IriumMiner:
                 version=1,
                 prev_hash=bytes(32),
                 merkle_root=bytes(32),
-                time=genesis_data['timestamp'],
+                time=genesis_data.get('time', genesis_data['timestamp']),
                 bits=int(genesis_data['bits'], 16),
                 nonce=genesis_data.get('nonce', 0)
             ),
@@ -208,7 +208,7 @@ class IriumMiner:
             version=1,
             prev_hash=bytes(32),
             merkle_root=merkle_root,
-            time=genesis_data['timestamp'],
+            time=genesis_data.get('time', genesis_data['timestamp']),
             bits=int(genesis_data['bits'], 16),
             nonce=genesis_data.get('nonce', 0)
         )
