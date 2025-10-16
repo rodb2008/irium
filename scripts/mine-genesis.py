@@ -16,12 +16,10 @@ def mine_genesis():
     print("⛏️  Mining Irium Genesis Block...")
     print()
     
-    # Load genesis config
     genesis_file = os.path.join(os.path.dirname(__file__), '..', 'configs', 'genesis.json')
     with open(genesis_file, 'r') as f:
         genesis_data = json.load(f)
     
-    # Create coinbase transaction
     allocations = genesis_data.get('allocations', [])
     outputs = []
     total_vesting = 0
@@ -44,7 +42,6 @@ def mine_genesis():
         outputs=outputs
     )
     
-    # Calculate merkle root
     temp_block = Block(
         header=BlockHeader(
             version=1,
@@ -59,7 +56,6 @@ def mine_genesis():
     
     correct_merkle = temp_block.merkle_root()[::-1]
     
-    # Setup target
     target = Target(bits=int(genesis_data['bits'], 16))
     target_value = target.to_target()
     
@@ -71,9 +67,9 @@ def mine_genesis():
     print(f"  Total vesting: {total_vesting / 100000000} IRM")
     print()
     
-    # Mine for valid nonce
     print("⛏️  Mining for valid nonce...")
     nonce = 0
+    current_time = genesis_data['timestamp']
     start_time = time.time()
     hashes_done = 0
     
@@ -82,7 +78,7 @@ def mine_genesis():
             version=1,
             prev_hash=bytes(32),
             merkle_root=correct_merkle,
-            time=genesis_data['timestamp'],
+            time=current_time,
             bits=int(genesis_data['bits'], 16),
             nonce=nonce
         )
@@ -100,9 +96,9 @@ def mine_genesis():
             print()
             print(f"Genesis Block Details:")
             print(f"  Nonce: {nonce}")
+            print(f"  Time: {current_time}")
             print(f"  Hash: {header.hash().hex()}")
             print(f"  Merkle root: {correct_merkle.hex()}")
-            print(f"  Time: {genesis_data['timestamp']}")
             print(f"  Bits: {hex(int(genesis_data['bits'], 16))}")
             print()
             print(f"Mining Stats:")
@@ -111,24 +107,30 @@ def mine_genesis():
             print(f"  Hashrate: {hashrate:.2f} H/s")
             print()
             
-            # Update genesis.json with new nonce
             genesis_data['nonce'] = nonce
+            genesis_data['time'] = current_time
             genesis_data['hash'] = header.hash().hex()
             genesis_data['merkle_root'] = correct_merkle.hex()
             
             with open(genesis_file, 'w') as f:
                 json.dump(genesis_data, f, indent=2)
             
-            print(f"✅ Updated {genesis_file} with new nonce")
+            print(f"✅ Updated {genesis_file} with new genesis")
             
             return header, coinbase_tx
         
         nonce += 1
         
-        if nonce % 100000 == 0:
+        # When nonce reaches 2^32, increment timestamp and reset nonce
+        if nonce >= 4294967295:
+            current_time += 1
+            nonce = 0
+            print(f"  Timestamp incremented to {current_time}, resetting nonce")
+        
+        if hashes_done % 100000 == 0:
             elapsed = time.time() - start_time
             hashrate = hashes_done / elapsed if elapsed > 0 else 0
-            print(f"  Nonce: {nonce:,} | Hashrate: {hashrate:.2f} H/s")
+            print(f"  Nonce: {nonce:,} | Time: {current_time} | Hashrate: {hashrate:.2f} H/s")
 
 if __name__ == "__main__":
     mine_genesis()
