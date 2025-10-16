@@ -285,6 +285,12 @@ Use Irium for payments:
 
 ---
 
+## Community & Support
+
+- **Discussions**: https://github.com/iriumlabs/irium/discussions - Ask questions, share ideas, connect with the community
+- **Issues**: https://github.com/iriumlabs/irium/issues - Report bugs or request features
+- **Email**: info@iriumlabs.org - Direct contact for security issues or partnerships
+
 ## License
 
 MIT License - Free and open source
