@@ -77,9 +77,17 @@ Help improve documentation:
 
 ## 💬 Community
 
-- **Issues**: https://github.com/iriumlabs/irium/issues
-- **Discussions**: https://github.com/iriumlabs/irium/discussions
-- **Email**: info@iriumlabs.org
+Join the Irium community and connect with other contributors:
+
+- **GitHub Discussions**: https://github.com/iriumlabs/irium/discussions
+  - 📢 Announcements - Stay updated with latest news
+  - 🙋 Q&A - Get help and answer questions
+  - 💡 Ideas - Share and discuss new ideas
+  - ⛏️ Mining - Discuss mining setups and optimizations
+  - 🛠️ Development - Technical development discussions
+
+- **Issues**: https://github.com/iriumlabs/irium/issues - Bug reports and feature requests
+- **Email**: info@iriumlabs.org - Security issues and direct contact
 
 ## 📜 License
 
