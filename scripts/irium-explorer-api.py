@@ -23,7 +23,6 @@ class ExplorerAPI(BaseHTTPRequestHandler):
         query = parse_qs(parsed_path.query)
         
         # CORS headers
-        self.send_header('Access-Control-Allow-Origin', '*')
         
         if path == '/api/blocks':
             self.get_blocks(query)
