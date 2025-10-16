@@ -25,3 +25,17 @@ irium-wallet.json
 *.backup[0-9]
 genesis-mainnet-mining.log
 genesis*.log
+
+# Temporary and test files
+*.log
+qr_*.png
+test-*.py
+test-*.html
+logo-test.html
+manual_commit.sh
+files-to-upload.txt
+update-github-release-wallet.sh
+*-logo-*.txt
+irium_logo.svg.local_backup
+irium_logo_official.svg
+temp_release/
