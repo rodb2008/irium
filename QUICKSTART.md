@@ -16,17 +16,17 @@ pip3 install qrcode[pil]
 
 ## Create Wallet
 ```bash
-python3 scripts/irium-wallet-proper.py create
+scripts/irium-wallet-proper.py create
 ```
 
 ## Run Node
 ```bash
-python3 scripts/irium-node.py
+scripts/irium-node.py
 ```
 
 ## Start Mining
 ```bash
-python3 scripts/irium-miner.py
+scripts/irium-miner.py
 ```
 
 See full documentation in repo for details.
