@@ -299,3 +299,14 @@ MIT License - Free and open source
 
 **Built with dedication to true decentralization**  
 **Irium Labs © 2025**
+
+## ⚠️ Important: Install Dependencies
+
+After downloading, you MUST install dependencies:
+
+```bash
+pip3 install --user pycryptodome qrcode pillow
+```
+
+This is required for wallet creation and blockchain operations.
+
