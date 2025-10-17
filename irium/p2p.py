@@ -40,35 +40,31 @@ class Peer:
     async def recv_message(self) -> Optional[Message]:
         """Receive a message from this peer."""
         try:
-            # Read header (6 bytes)
+            # Read header (6 bytes: version, type, length)
             header = await self.reader.readexactly(6)
             if not header:
                 return None
-            
-            # Read payload
-            msg = Message.deserialize(header)
-            if msg.payload:
-                # Already read in deserialize
-                pass
-            
-            # Actually we need to read the payload separately
-            # Let's fix the deserialization
+
+            # Parse header to get payload length
             import struct
-            version, msg_type, length = struct.unpack('!BBI', header)
-            
+            version, msg_type, length = struct.unpack("!BBI", header)
+
+            # Read payload if any
             if length > 0:
                 payload = await self.reader.readexactly(length)
             else:
-                payload = b''
-            
-            return Message(msg_type=MessageType(msg_type), payload=payload)
-            
+                payload = b""
+
+            # Deserialize the COMPLETE message (header + payload)
+            full_message = header + payload
+            return Message.deserialize(full_message)
+
         except asyncio.IncompleteReadError:
             return None
         except Exception as e:
             print(f"Error receiving message from {self.address}: {e}")
             return None
-    
+
     def close(self) -> None:
         """Close connection."""
         try:
