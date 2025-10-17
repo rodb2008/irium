@@ -29,10 +29,18 @@ def _int_to_bytes(value: int, length: int) -> bytes:
 
 
 def _hash160(payload: bytes) -> bytes:
+    """RIPEMD160(SHA256(data)) - with fallback"""
     sha = hashlib.sha256(payload).digest()
-    ripemd = hashlib.new("ripemd160")
-    ripemd.update(sha)
-    return ripemd.digest()
+    try:
+        ripemd = hashlib.new("ripemd160")
+        ripemd.update(sha)
+        return ripemd.digest()
+    except ValueError:
+        from Crypto.Hash import RIPEMD160
+        h = RIPEMD160.new()
+        h.update(sha)
+        return h.digest()
+
 
 
 def _encode_base58(data: bytes) -> str:
