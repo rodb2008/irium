@@ -28,7 +28,6 @@ data/
 *.backup
 *.backup[0-9]
 temp_release/
-*.tar.gz
 *.zip
 
 # QR codes
@@ -58,3 +57,5 @@ check-*.sh
 # OS
 .DS_Store
 Thumbs.db
+
+# Allow release packages
