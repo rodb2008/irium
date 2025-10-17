@@ -36,7 +36,8 @@ class Peer:
             await self.writer.drain()
         except Exception as e:
             print(f"Error sending message to {self.address}: {e}")
-            raise
+            # Don't raise - let the cleanup task handle dead connections
+            pass
     
     async def recv_message(self) -> Optional[Message]:
         """Receive a message from this peer."""
@@ -431,11 +432,11 @@ class P2PNode:
                     ping = PingMessage(nonce=nonce)
                     await peer.send_message(ping.to_message())
                 
-                await asyncio.sleep(60)  # Ping every 60 seconds
+                await asyncio.sleep(120)  # Ping every 120 seconds
             
             except Exception as e:
                 print(f"❌ Error in ping task: {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(120)
     
     async def _cleanup_dead_peers(self) -> None:
         """Background task to remove dead peers."""
@@ -444,7 +445,7 @@ class P2PNode:
                 now = time.time()
                 for address, peer in list(self.peers.items()):
                     # Remove peer if no pong in 3 minutes
-                    if now - peer.last_ping > 180:
+                    if now - peer.last_ping > 300:
                         print(f"⚠️  Peer {address} timed out")
                         await self._disconnect_peer(peer, "Timeout")
                 
