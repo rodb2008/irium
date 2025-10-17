@@ -290,6 +290,7 @@ class P2PNode:
     async def _connect_to_peers(self) -> None:
         print("🔄 Peer connection task started")
         """Background task to connect to peers from seedlist."""
+        print("🔄 Peer connection task started")
         while self.running:
             try:
                 if len(self.peers) < self.max_peers:
