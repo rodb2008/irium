@@ -288,15 +288,19 @@ class P2PNode:
             await self.on_tx(peer, tx_msg.tx_data)
     
     async def _connect_to_peers(self) -> None:
+        print("🔄 Peer connection task started")
         """Background task to connect to peers from seedlist."""
         while self.running:
             try:
                 if len(self.peers) < self.max_peers:
+                    print(f"  Current peers: {len(self.peers)}/{self.max_peers}")
                     # Get seedlist
                     seedlist = list(self.seedlist_manager.merged_seedlist())
+                    print(f"  Seedlist has {len(seedlist)} entries: {seedlist}")
                     if seedlist:
                         # Try random peer
                         multiaddr = random.choice(seedlist)
+                    print(f"  Attempting to connect to: {multiaddr}")
                         await self._connect_to_peer(multiaddr)
                 
                 await asyncio.sleep(30)  # Try every 30 seconds
