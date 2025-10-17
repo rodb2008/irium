@@ -323,6 +323,12 @@ class P2PNode:
                 
                 if address in self.peers:
                     return  # Already connected
+
+                # Skip connecting to self
+                if host in ["127.0.0.1", "localhost"] or port == self.port:
+                    return
+
+                    return  # Already connected
                 
                 print(f"📤 Connecting to {address}...")
                 
