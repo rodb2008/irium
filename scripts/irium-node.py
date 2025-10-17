@@ -119,11 +119,34 @@ class IriumNode:
     async def handle_block(self, peer, block_data: bytes):
         """Handle received block from peer."""
         try:
-            print(f"📦 Received block from {peer.address}")
-            # TODO: Validate and add block to chain
-            # For now, just log it
+            # Parse block data
+            block_json = json.loads(block_data.decode('utf-8'))
+            height = block_json.get('height', 0)
+            block_hash = block_json.get('hash', 'unknown')
+            
+            print(f"📦 Received block {height} from {peer.address}")
+            print(f"   Hash: {block_hash[:16]}...")
+            
+            # Save block to disk
+            blocks_dir = os.path.expanduser("~/.irium/blocks")
+            os.makedirs(blocks_dir, exist_ok=True)
+            
+            block_file = os.path.join(blocks_dir, f"block_{height}.json")
+            with open(block_file, 'w') as f:
+                json.dump(block_json, f, indent=2)
+            
+            print(f"   💾 Saved block {height} to disk")
+            
+            # Update chain height if this block is ahead
+            if height > self.chain_state.height:
+                self.chain_state.height = height
+                self.p2p.chain_height = height
+                print(f"   ✅ Updated chain height to {height}")
+                
         except Exception as e:
             print(f"❌ Error handling block: {e}")
+            import traceback
+            traceback.print_exc()
     
     async def handle_tx(self, peer, tx_data: bytes):
         """Handle received transaction from peer."""
