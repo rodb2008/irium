@@ -218,6 +218,19 @@ class IriumMiner:
         pow_limit = Target(bits=int(genesis_data['bits'], 16))
         self.chain_params = ChainParams(genesis_block=genesis_block, pow_limit=pow_limit)
         self.chain_state = ChainState(params=self.chain_params)
+
+        # Scan for existing mined blocks
+        blocks_dir = os.path.expanduser("~/.irium/blocks")
+        if os.path.exists(blocks_dir):
+            block_files = os.listdir(blocks_dir)
+            for block_file in block_files:
+                if block_file.startswith("block_") and block_file.endswith(".json"):
+                    try:
+                        height = int(block_file.replace("block_", "").replace(".json", ""))
+                        if height > self.chain_state.height:
+                            self.chain_state.height = height
+                    except ValueError:
+                        pass
         
         print(f"✅ Blockchain initialized at height {self.chain_state.height}")
         
