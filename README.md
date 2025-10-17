@@ -310,3 +310,18 @@ pip3 install --user pycryptodome qrcode pillow
 
 This is required for wallet creation and blockchain operations.
 
+
+## 💡 Important Notes
+
+### Wallet and Mining
+
+- The miner loads your wallet **at startup**
+- If you create a new address, **restart the miner** to use it:
+  ```bash
+  sudo systemctl restart irium-miner.service
+  ```
+- Check your mining address:
+  ```bash
+  sudo journalctl -u irium-miner.service | grep "Mining address" | tail -1
+  ```
+
