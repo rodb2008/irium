@@ -311,6 +311,8 @@ class P2PNode:
     
     async def _connect_to_peer(self, multiaddr: str) -> None:
         """Connect to a peer."""
+        print(f"🔍 _connect_to_peer called with: {multiaddr}")
+        """Connect to a peer."""
         try:
             # Parse multiaddr (simplified)
             # Format: /ip4/1.2.3.4/tcp/38291
@@ -325,6 +327,7 @@ class P2PNode:
                     return  # Already connected
 
                 # Skip connecting to self
+                print(f"  Checking if {host}:{port} is self (my port: {self.port})")
                 if host in ["127.0.0.1", "localhost"] or port == self.port:
                     return
 
