@@ -161,6 +161,13 @@ class P2PNode:
                 self.peers[address] = peer
                 print(f"✅ Peer connected: {address} ({peer.agent}, height: {peer.height})")
                 
+
+                # Request blocks if peer is ahead
+                if peer.height > self.chain_height:
+                    print(f"  Peer is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
+                    # TODO: Send GET_BLOCKS message
+                    # For now, just log it
+
                 if self.on_peer_connected:
                     await self.on_peer_connected(peer)
                 
@@ -348,6 +355,13 @@ class P2PNode:
                     self.peers[address] = peer
                     print(f"✅ Connected to peer: {address} ({peer.agent})")
                     
+
+                # Request blocks if peer is ahead
+                if peer.height > self.chain_height:
+                    print(f"  Peer is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
+                    # TODO: Send GET_BLOCKS message
+                    # For now, just log it
+
                     if self.on_peer_connected:
                         await self.on_peer_connected(peer)
                     
