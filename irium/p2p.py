@@ -326,9 +326,9 @@ class P2PNode:
                 if address in self.peers:
                     return  # Already connected
 
-                # Skip connecting to self
-                print(f"  Checking if {host}:{port} is self (my port: {self.port})")
-                if host in ["127.0.0.1", "localhost"] or port == self.port:
+                # Skip connecting to self  
+                print(f"  Checking if {host} is self")
+                if host in ["127.0.0.1", "localhost", "207.244.247.86"]:
                     return
 
                     return  # Already connected
