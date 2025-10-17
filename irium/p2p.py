@@ -165,8 +165,14 @@ class P2PNode:
                 # Request blocks if peer is ahead
                 if peer.height > self.chain_height:
                     print(f"  Peer is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
-                    # TODO: Send GET_BLOCKS message
-                    # For now, just log it
+                    # Request blocks from our height to their height
+                    from irium.protocol import GetBlocksMessage
+                    get_blocks = GetBlocksMessage(
+                        start_height=self.chain_height + 1,
+                        end_height=peer.height
+                    )
+                    await peer.send_message(get_blocks.to_message())
+                    print(f"  📥 Requested blocks {self.chain_height + 1} to {peer.height}")
 
                 if self.on_peer_connected:
                     await self.on_peer_connected(peer)
@@ -245,6 +251,8 @@ class P2PNode:
                     await self._handle_get_peers(peer)
                 elif msg.msg_type == MessageType.PEERS:
                     await self._handle_peers(peer, msg)
+                elif msg.msg_type == MessageType.GET_BLOCKS:
+                    await self._handle_get_blocks(peer, msg)
                 elif msg.msg_type == MessageType.BLOCK:
                     await self._handle_block(peer, msg)
                 elif msg.msg_type == MessageType.TX:
@@ -282,6 +290,33 @@ class P2PNode:
         print(f"📋 Received {len(peers_msg.peers)} peers from {peer.address}")
         # Could connect to these peers
     
+
+    async def _handle_get_blocks(self, peer: Peer, msg: Message) -> None:
+        """Handle GET_BLOCKS request - send requested blocks to peer."""
+        try:
+            from irium.protocol import GetBlocksMessage
+            get_blocks_msg = GetBlocksMessage.from_message(msg)
+            
+            print(f"  📤 Peer {peer.address} requested blocks {get_blocks_msg.start_height} to {get_blocks_msg.end_height}")
+            
+            # Load and send requested blocks
+            blocks_dir = os.path.expanduser("~/.irium/blocks")
+            if os.path.exists(blocks_dir):
+                for height in range(get_blocks_msg.start_height, get_blocks_msg.end_height + 1):
+                    block_file = os.path.join(blocks_dir, f"block_{height}.json")
+                    if os.path.exists(block_file):
+                        with open(block_file, 'rb') as f:
+                            block_data = f.read()
+                        
+                        from irium.protocol import BlockMessage
+                        block_msg = BlockMessage(block_data=block_data)
+                        await peer.send_message(block_msg.to_message())
+                        print(f"  📤 Sent block {height} to {peer.address}")
+                    else:
+                        print(f"  ⚠️  Block {height} not found on disk")
+        except Exception as e:
+            print(f"  ❌ Error handling GET_BLOCKS: {e}")
+
     async def _handle_block(self, peer: Peer, msg: Message) -> None:
         """Handle block message."""
         if self.on_block:
@@ -359,8 +394,14 @@ class P2PNode:
                 # Request blocks if peer is ahead
                 if peer.height > self.chain_height:
                     print(f"  Peer is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
-                    # TODO: Send GET_BLOCKS message
-                    # For now, just log it
+                    # Request blocks from our height to their height
+                    from irium.protocol import GetBlocksMessage
+                    get_blocks = GetBlocksMessage(
+                        start_height=self.chain_height + 1,
+                        end_height=peer.height
+                    )
+                    await peer.send_message(get_blocks.to_message())
+                    print(f"  📥 Requested blocks {self.chain_height + 1} to {peer.height}")
 
                     if self.on_peer_connected:
                         await self.on_peer_connected(peer)
