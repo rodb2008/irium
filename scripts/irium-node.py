@@ -101,7 +101,7 @@ class IriumNode:
                     try:
                         with open(os.path.join(blocks_dir, block_file)) as bf:
                             block_data = json.load(bf)
-                            print(f"  Updated height to {block_data[\"height\"]}")
+                            print(f"  Updated height to {block_data['height']}")
                         if block_data["height"] > self.chain_state.height:
                             self.chain_state.height = block_data["height"]
                     except Exception as be:
