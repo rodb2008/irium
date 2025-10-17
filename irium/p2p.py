@@ -297,27 +297,30 @@ class P2PNode:
         try:
             from irium.protocol import GetBlocksMessage
             get_blocks_msg = GetBlocksMessage.from_message(msg)
-            
-            print(f"  📤 Peer {peer.address} requested blocks {get_blocks_msg.start_height} to {get_blocks_msg.end_height}")
-            
-            # Load and send requested blocks
+
+            print(f"  📤 Peer {peer.address} requested {get_blocks_msg.count} blocks starting from hash {get_blocks_msg.start_hash.hex()[:16]}...")
+
+            # For now, just send blocks 2 onwards (TODO: properly handle start_hash)
             blocks_dir = os.path.expanduser("~/.irium/blocks")
             if os.path.exists(blocks_dir):
-                for height in range(get_blocks_msg.start_height, get_blocks_msg.end_height + 1):
+                # Send the requested number of blocks starting from height 2
+                for height in range(2, 2 + get_blocks_msg.count):
                     block_file = os.path.join(blocks_dir, f"block_{height}.json")
                     if os.path.exists(block_file):
                         with open(block_file, 'rb') as f:
                             block_data = f.read()
-                        
+
                         from irium.protocol import BlockMessage
                         block_msg = BlockMessage(block_data=block_data)
                         await peer.send_message(block_msg.to_message())
                         print(f"  📤 Sent block {height} to {peer.address}")
                     else:
                         print(f"  ⚠️  Block {height} not found on disk")
+                        break
         except Exception as e:
             print(f"  ❌ Error handling GET_BLOCKS: {e}")
-
+            import traceback
+            traceback.print_exc()
     async def _handle_block(self, peer: Peer, msg: Message) -> None:
         """Handle block message."""
         if self.on_block:
