@@ -1,7 +1,7 @@
-import os
 """P2P networking for Irium blockchain."""
 
 from __future__ import annotations
+import os
 import asyncio
 import time
 import random
