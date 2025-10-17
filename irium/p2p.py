@@ -329,10 +329,12 @@ class P2PNode:
                 # Skip connecting to self  
                 print(f"  Checking if {host} is self")
                 if host in ["127.0.0.1", "localhost", "207.244.247.86"]:
-                    return
+                    print(f"  Skipping self: {host}")
+                    return  # Skip self
 
                     return  # Already connected
                 
+                print(f"  Passed self-check, will connect to {address}")
                 print(f"📤 Connecting to {address}...")
                 
                 reader, writer = await asyncio.wait_for(
