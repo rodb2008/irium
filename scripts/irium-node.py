@@ -90,6 +90,19 @@ class IriumNode:
             self.chain_params = ChainParams(genesis_block=genesis_block, pow_limit=pow_limit)
             self.chain_state = ChainState(params=self.chain_params)
             
+            # Load mined blocks from disk
+            blocks_dir = os.path.expanduser("~/.irium/blocks")
+            if os.path.exists(blocks_dir):
+                block_files = sorted([f for f in os.listdir(blocks_dir) if f.endswith(".json")])
+                for block_file in block_files:
+                    try:
+                        with open(os.path.join(blocks_dir, block_file)) as bf:
+                            block_data = json.load(bf)
+                        if block_data["height"] > self.chain_state.height:
+                            self.chain_state.height = block_data["height"]
+                    except Exception as be:
+                        pass
+
             print(f"✅ Blockchain loaded at height {self.chain_state.height}")
             return True
         
