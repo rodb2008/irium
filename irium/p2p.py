@@ -1,3 +1,4 @@
+import os
 """P2P networking for Irium blockchain."""
 
 from __future__ import annotations
