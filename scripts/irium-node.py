@@ -91,13 +91,17 @@ class IriumNode:
             self.chain_state = ChainState(params=self.chain_params)
             
             # Load mined blocks from disk
+            print("  Scanning for mined blocks...")
             blocks_dir = os.path.expanduser("~/.irium/blocks")
+            print(f"  Blocks directory: {blocks_dir}")
             if os.path.exists(blocks_dir):
+                print(f"  Found blocks directory with files: {os.listdir(blocks_dir)}")
                 block_files = sorted([f for f in os.listdir(blocks_dir) if f.endswith(".json")])
                 for block_file in block_files:
                     try:
                         with open(os.path.join(blocks_dir, block_file)) as bf:
                             block_data = json.load(bf)
+                            print(f"  Updated height to {block_data[\"height\"]}")
                         if block_data["height"] > self.chain_state.height:
                             self.chain_state.height = block_data["height"]
                     except Exception as be:
