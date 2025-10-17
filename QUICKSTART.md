@@ -1,32 +1,36 @@
-# Irium Blockchain - Quick Start Guide
-
-Get up and running with Irium in 5 minutes!
-
-## Prerequisites
-- Linux (Ubuntu 20.04+)
-- Python 3.10+
-- 2GB RAM, 10GB disk
+# Irium Quick Start Guide
 
 ## Installation
+
 ```bash
 git clone https://github.com/iriumlabs/irium.git
 cd irium
-pip3 install qrcode[pil]
+pip3 install --user pycryptodome qrcode pillow
 ```
 
-## Create Wallet
+## Commands
+
+**Create Wallet:**
 ```bash
-scripts/irium-wallet-proper.py create
+python3 scripts/irium-wallet-proper.py new-address
 ```
 
-## Run Node
+**Run Node:**
 ```bash
-scripts/irium-node.py
+python3 scripts/irium-node.py
 ```
 
-## Start Mining
+**Start Mining:**
 ```bash
-scripts/irium-miner.py
+python3 scripts/irium-miner.py
 ```
 
-See full documentation in repo for details.
+**Check Balance:**
+```bash
+python3 scripts/irium-wallet-proper.py balance
+```
+
+## Resources
+- Website: https://www.iriumlabs.org
+- Whitepaper: https://www.iriumlabs.org/whitepaper.html
+- Telegram: https://t.me/iriumlabs

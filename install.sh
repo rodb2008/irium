@@ -1,35 +1,17 @@
 #!/bin/bash
 echo "🚀 Installing Irium Blockchain..."
 echo ""
-
-# Check Python
 if ! command -v python3 &> /dev/null; then
-    echo "❌ Python 3 is required. Please install Python 3.8 or higher."
+    echo "❌ Python 3 required"
     exit 1
 fi
-
 echo "✅ Python 3 found"
-
-# Install dependencies
-echo ""
 echo "📦 Installing dependencies..."
-pip3 install qrcode[pil] 2>/dev/null || pip3 install qrcode pillow
-
-echo ""
+pip3 install --user pycryptodome qrcode pillow 2>/dev/null || \
+sudo apt install -y python3-pycryptodome python3-qrcode python3-pil 2>/dev/null
 echo "✅ Installation complete!"
 echo ""
-echo "📋 Available commands:"
-echo ""
-echo "  Create Wallet:"
-echo "    python3 scripts/irium-wallet-proper.py new-address"
-echo ""
-echo "  Run Node:"
-echo "    python3 scripts/irium-node.py"
-echo ""
-echo "  Start Mining:"
-echo "    python3 scripts/irium-miner.py"
-echo ""
-echo "  Check Balance:"
-echo "    python3 scripts/irium-wallet-proper.py balance"
-echo ""
-echo "🎉 Ready to use Irium!"
+echo "Commands:"
+echo "  python3 scripts/irium-wallet-proper.py new-address"
+echo "  python3 scripts/irium-node.py"
+echo "  python3 scripts/irium-miner.py"
