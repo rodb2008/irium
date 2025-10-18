@@ -11,3 +11,7 @@ Miner used genesis hash instead of tip block. Now reads from disk correctly.
 **Block 4 was invalidated. All miners must update immediately.**
 
 ## Upgrade: git pull origin main && sudo systemctl restart irium-miner.service
+
+## Documentation Updates
+✅ Added blockchain sync explanation to prevent confusion
+✅ Clarified that same height = already in sync
