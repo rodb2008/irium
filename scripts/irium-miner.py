@@ -254,8 +254,18 @@ class IriumMiner:
         while self.running:
             try:
                 height = self.chain_state.height + 1
-                tip_block = self.chain_state.chain[-1]
-                prev_hash = tip_block.header.hash()
+                
+                # Get prev_hash from the actual tip block file
+                if height == 1:
+                    # Genesis
+                    tip_block = self.chain_state.chain[-1]
+                    prev_hash = tip_block.header.hash()
+                else:
+                    # Load from disk
+                    prev_block_file = os.path.expanduser(f"~/.irium/blocks/block_{height-1}.json")
+                    with open(prev_block_file, 'r') as f:
+                        prev_block = json.load(f)
+                    prev_hash = bytes.fromhex(prev_block['hash'])
                 
                 reward = 5000000000  # 50 IRM
                 halvings = (height - 1) // 210000
