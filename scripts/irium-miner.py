@@ -48,10 +48,24 @@ class IriumMiner:
         addresses = list(self.wallet.addresses())
         if addresses:
             return addresses[0]
+        
+        # No addresses - create new one and SAVE it
         from irium.wallet import KeyPair
         key = KeyPair.generate()
         wif = key.to_wif()
         self.wallet.import_wif(wif)
+        
+        # Save wallet with new address
+        wallet_data = {
+            'keys': {addr: self.wallet.get_wif(addr) for addr in self.wallet.addresses()},
+            'addresses': list(self.wallet.addresses())
+        }
+        os.makedirs(os.path.dirname(WALLET_FILE), exist_ok=True)
+        with open(WALLET_FILE, 'w') as f:
+            import json
+            json.dump(wallet_data, f, indent=2)
+        
+        print(f"💾 New wallet saved to {WALLET_FILE}")
         return key.address()
     
     def load_mempool(self):
