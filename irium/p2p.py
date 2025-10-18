@@ -33,13 +33,14 @@ class Peer:
         try:
             data = msg.serialize()
             self.writer.write(data)
-            await asyncio.wait_for(self.writer.drain(), timeout=30.0)
-        except asyncio.TimeoutError:
-            print(f"⚠️  Send timeout to {self.address}")
-            raise  # Let caller handle timeout
+            await self.writer.drain()
+        except ConnectionError as e:
+            print(f"⚠️  Connection error sending to {self.address}: {e}")
+            raise  # Connection is dead, let it clean up
         except Exception as e:
-            print(f"Error sending message to {self.address}: {e}")
-            raise  # Propagate errors so connection gets cleaned up
+            print(f"⚠️  Error sending to {self.address}: {e}")
+            # Don't raise for other errors - log and continue
+            pass
     
     async def recv_message(self) -> Optional[Message]:
         """Receive a message from this peer."""
@@ -248,6 +249,7 @@ class P2PNode:
                     break
                 
                 # Handle different message types
+                print(f"  📨 Received message type: {msg.msg_type} from {peer.address}")
                 if msg.msg_type == MessageType.PING:
                     await self._handle_ping(peer, msg)
                 elif msg.msg_type == MessageType.PONG:
@@ -267,7 +269,11 @@ class P2PNode:
             
             except Exception as e:
                 print(f"❌ Error handling message from {peer.address}: {e}")
-                break
+                # Don't break - just log and continue
+                # Breaking kills the connection for one bad message
+                import traceback
+                traceback.print_exc()
+                continue  # Keep connection alive
         
         # Clean up
         await self._disconnect_peer(peer, "Connection closed")
