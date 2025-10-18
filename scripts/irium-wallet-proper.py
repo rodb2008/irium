@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from irium.wallet import Wallet, KeyPair
 
-WALLET_FILE = "irium-wallet.json"
+WALLET_FILE = os.path.expanduser("~/.irium/irium-wallet.json")
 
 def load_wallet():
     """Load wallet from file or create new one."""
