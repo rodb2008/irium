@@ -408,9 +408,20 @@ class P2PNode:
 
                 # Skip connecting to self (only localhost/same IP)
                 print(f"  Checking if {host} is self")
-                if host in ["127.0.0.1", "localhost", "207.244.247.86"]:
+                # Only skip localhost/loopback - let nodes connect to seed
+                if host in ["127.0.0.1", "localhost"]:
                     print(f"  Skipping self: {host}")
                     return  # Skip self
+                
+                # Also skip if this is our own public IP (for seed node only)
+                try:
+                    import socket
+                    my_ip = socket.gethostbyname(socket.gethostname())
+                    if host == my_ip or host == self.host:
+                        print(f"  Skipping self: {host}")
+                        return
+                except:
+                    pass
 
                     return  # Already connected
                 
