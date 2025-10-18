@@ -201,6 +201,35 @@ class IriumNode:
         
         # Start P2P networking
         await self.p2p.start()
+
+        # Periodic block rescan (every 30 seconds)
+        async def rescan_blocks():
+            """Periodically rescan blocks directory for new blocks."""
+            while True:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+                blocks_dir = os.path.expanduser("~/.irium/blocks")
+                if os.path.exists(blocks_dir):
+                    block_files = sorted([f for f in os.listdir(blocks_dir) if f.endswith(".json")])
+                    if block_files:
+                        max_height = 0
+                        for block_file in block_files:
+                            try:
+                                with open(os.path.join(blocks_dir, block_file)) as bf:
+                                    block_data = json.load(bf)
+                                    if block_data["height"] > max_height:
+                                        max_height = block_data["height"]
+                            except:
+                                pass
+                        
+                        if max_height > self.chain_state.height:
+                            old_height = self.chain_state.height
+                            self.chain_state.height = max_height
+                            self.p2p.chain_height = max_height
+                            print(f"📊 Detected new blocks! Updated height: {old_height} -> {max_height}")
+        
+        # Start rescan task
+        asyncio.create_task(rescan_blocks())
         
         print()
         print("✅ Irium Node started successfully!")
