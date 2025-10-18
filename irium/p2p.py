@@ -38,7 +38,8 @@ class Peer:
             print(f"⚠️  Connection error sending to {self.address}: {e}")
             raise  # Connection is dead, let it clean up
         except Exception as e:
-            print(f"⚠️  Error sending to {self.address}: {e}")
+            print(f"⚠️  SEND FAILED to {self.address}: {e}")
+            print(f"     Message type: {msg.msg_type if hasattr(msg, 'msg_type') else 'unknown'}")
             # Don't raise for other errors - log and continue
             pass
     
