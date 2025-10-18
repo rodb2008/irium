@@ -369,3 +369,50 @@ If everyone shows the same height, it means:
 ✅ Waiting for next block to be mined
 
 **This is how blockchains work!** 🎯
+
+## ⛏️ Mining Setup
+
+### Start Mining with Your Address
+
+**Important:** Create your wallet address BEFORE starting the miner!
+
+```bash
+# 1. Create wallet address
+python3 scripts/irium-wallet-proper.py new-address
+
+# Save this address - your mining rewards go here!
+
+# 2. Start mining
+python3 scripts/irium-miner.py
+
+# OR if using systemd:
+sudo systemctl start irium-miner.service
+
+# 3. Verify mining address
+journalctl -u irium-miner.service | grep "Mining address"
+```
+
+### Changing Mining Address
+
+If the miner is already running:
+
+```bash
+# Stop miner
+sudo systemctl stop irium-miner.service
+
+# Create new address
+python3 scripts/irium-wallet-proper.py new-address
+
+# Restart miner (loads new wallet)
+sudo systemctl start irium-miner.service
+```
+
+### ⚠️ BACKUP YOUR WALLET!
+
+```bash
+cp ~/.irium/irium-wallet.json ~/irium-wallet-backup.json
+```
+
+**Without your wallet, you lose access to mining rewards!**
+
+For complete mining guide, see: [MINING_SETUP.md](MINING_SETUP.md)
