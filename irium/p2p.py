@@ -409,7 +409,7 @@ class P2PNode:
 
                 # Skip connecting to self (only localhost/same IP)
                 print(f"  Checking if {host} is self")
-                if host in ["127.0.0.1", "localhost"]:
+                if host in ["127.0.0.1", "localhost", "207.244.247.86"]:
                     print(f"  Skipping self: {host}")
                     return  # Skip self
 
