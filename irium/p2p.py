@@ -33,11 +33,13 @@ class Peer:
         try:
             data = msg.serialize()
             self.writer.write(data)
-            await self.writer.drain()
+            await asyncio.wait_for(self.writer.drain(), timeout=30.0)
+        except asyncio.TimeoutError:
+            print(f"⚠️  Send timeout to {self.address}")
+            raise  # Let caller handle timeout
         except Exception as e:
             print(f"Error sending message to {self.address}: {e}")
-            # Don't raise - let the cleanup task handle dead connections
-            pass
+            raise  # Propagate errors so connection gets cleaned up
     
     async def recv_message(self) -> Optional[Message]:
         """Receive a message from this peer."""
@@ -206,7 +208,7 @@ class P2PNode:
                 await peer.send_message(handshake.to_message())
             
             # Receive their handshake
-            msg = await asyncio.wait_for(peer.recv_message(), timeout=10.0)
+            msg = await asyncio.wait_for(peer.recv_message(), timeout=60.0)
             if not msg or msg.msg_type != MessageType.HANDSHAKE:
                 return False
             
@@ -322,12 +324,17 @@ class P2PNode:
                 for height in blocks_to_send:
                     block_file = os.path.join(blocks_dir, f"block_{height}.json")
                     if os.path.exists(block_file):
-                        with open(block_file, 'rb') as f:
-                            block_data = f.read()
+                        with open(block_file, 'r') as f:
+                            block_json = f.read()
 
-                        from irium.protocol import BlockMessage
-                        block_msg = BlockMessage(block_data=block_data)
-                        await peer.send_message(block_msg.to_message())
+                        # Send JSON as block data (simple approach)
+                        from irium.protocol import Message, MessageType
+                        block_msg = Message(
+                            version=1,
+                            msg_type=MessageType.BLOCK,
+                            payload=block_json.encode()
+                        )
+                        await peer.send_message(block_msg)
                         print(f"  📤 Sent block {height} to {peer.address}")
                     else:
                         print(f"  ⚠️  Block {height} not found on disk")
@@ -413,7 +420,7 @@ class P2PNode:
                 
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port),
-                    timeout=10.0
+                    timeout=60.0
                 )
                 
                 peer = Peer(reader=reader, writer=writer, address=address)
