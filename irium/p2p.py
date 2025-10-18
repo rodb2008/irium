@@ -347,20 +347,9 @@ class P2PNode:
                 block_data = json.loads(block_msg.block_data.decode('utf-8'))
                 block_height = block_data.get('height', 0)
                 
-                # Update peer height if this block is higher
-                if block_height > peer.height:
-                    peer.height = block_height
-                    print(f"  📊 Updated {peer.address} height to {block_height}")
-                
-                # If peer is now ahead, request more blocks
-                if peer.height > self.chain_height:
-                    print(f"  🔄 Peer {peer.address} is ahead ({peer.height} vs {self.chain_height}), requesting more blocks...")
-                    from irium.protocol import GetBlocksMessage
-                    genesis_hash = bytes.fromhex('cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000')
-                    count = min(500, peer.height - self.chain_height)
-                    get_blocks = GetBlocksMessage(start_hash=genesis_hash, count=count)
-                    await peer.send_message(get_blocks.to_message())
-                    print(f"  📥 Requested blocks {self.chain_height + 1} to {peer.height}")
+                # Only update peer height if we successfully save the block
+                # Don't auto-request more blocks here - causes infinite loop if block is invalid
+                # Peer height will be updated by the callback if block is valid
             except:
                 pass
             
