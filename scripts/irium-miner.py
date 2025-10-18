@@ -319,7 +319,8 @@ class IriumMiner:
                             'bits': hex(block.header.bits),
                             'nonce': block.header.nonce,
                             'transactions': len(transactions),
-                            'reward': reward
+                            'reward': reward,
+                            'miner_address': self.mining_address
                         }, f, indent=2)
                     
                     print(f"💾 Saved block to {block_file}")
