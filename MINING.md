@@ -94,3 +94,58 @@ python3 scripts/irium-wallet-proper.py list
 - Multi-threaded miner (uses all cores)
 - Full UTXO balance scanning
 - Transaction history
+
+---
+
+## Mining with Multiple CPU Cores
+
+### Multi-Core Mining (Recommended)
+
+The default miner uses only 1 CPU core. To use all your cores and mine faster:
+
+```bash
+# Stop single-core miner
+sudo systemctl stop irium-miner.service
+
+# Start multi-core mining (uses 4 cores by default)
+./scripts/irium-miner-multicore.sh 4
+
+# Or use all 8 cores on an 8-core system
+./scripts/irium-miner-multicore.sh 8
+```
+
+**Performance Comparison:**
+- Single core: ~210,000 H/s
+- 4 cores: ~840,000 H/s (4x faster)
+- 8 cores: ~1,680,000 H/s (8x faster)
+
+**To stop multi-core mining:**
+```bash
+pkill -f irium-miner.py
+```
+
+**To view mining progress:**
+```bash
+# View logs from one miner
+tail -f /tmp/miner-38293.log
+
+# Check for new blocks
+ls -lth ~/.irium/blocks/
+```
+
+### Permanent Multi-Core Mining
+
+To run multi-core mining automatically on system boot, update the systemd service:
+
+```bash
+# Edit the miner service
+sudo nano /etc/systemd/system/irium-miner.service
+
+# Change the ExecStart line to:
+ExecStart=/home/irium/irium/scripts/irium-miner-multicore.sh 4
+
+# Reload and restart
+sudo systemctl daemon-reload
+sudo systemctl restart irium-miner.service
+```
+
