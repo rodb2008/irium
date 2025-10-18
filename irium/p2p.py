@@ -302,18 +302,24 @@ class P2PNode:
 
             print(f"  📤 Peer {peer.address} requested {get_blocks_msg.count} blocks starting from hash {get_blocks_msg.start_hash.hex()[:16]}...")
 
-            # Send blocks the peer needs (after their current height)
+            # Send blocks the peer needs
             blocks_dir = os.path.expanduser("~/.irium/blocks")
             if os.path.exists(blocks_dir):
-                # Determine start height from peer's current height
-                # Peer sends genesis hash if they're at genesis/height 1
-                # We send all blocks we have
+                # Find all blocks we have
+                available_blocks = []
+                for f in os.listdir(blocks_dir):
+                    if f.startswith("block_") and f.endswith(".json"):
+                        h = int(f.replace("block_", "").replace(".json", ""))
+                        available_blocks.append(h)
+                available_blocks.sort()
+                
+                # Send blocks higher than peer's current height
                 start_height = peer.height + 1
-                end_height = start_height + get_blocks_msg.count
+                blocks_to_send = [h for h in available_blocks if h >= start_height][:get_blocks_msg.count]
                 
-                print(f"  📤 Sending blocks {start_height} to {end_height-1} (peer is at {peer.height})")
+                print(f"  📤 Sending {len(blocks_to_send)} blocks to {peer.address} (peer at {peer.height}, we have {available_blocks})")
                 
-                for height in range(start_height, end_height):
+                for height in blocks_to_send:
                     block_file = os.path.join(blocks_dir, f"block_{height}.json")
                     if os.path.exists(block_file):
                         with open(block_file, 'rb') as f:
