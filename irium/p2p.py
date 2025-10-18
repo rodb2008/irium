@@ -302,11 +302,18 @@ class P2PNode:
 
             print(f"  📤 Peer {peer.address} requested {get_blocks_msg.count} blocks starting from hash {get_blocks_msg.start_hash.hex()[:16]}...")
 
-            # For now, just send blocks 2 onwards (TODO: properly handle start_hash)
+            # Send blocks the peer needs (after their current height)
             blocks_dir = os.path.expanduser("~/.irium/blocks")
             if os.path.exists(blocks_dir):
-                # Send the requested number of blocks starting from height 2
-                for height in range(2, 2 + get_blocks_msg.count):
+                # Determine start height from peer's current height
+                # Peer sends genesis hash if they're at genesis/height 1
+                # We send all blocks we have
+                start_height = peer.height + 1
+                end_height = start_height + get_blocks_msg.count
+                
+                print(f"  📤 Sending blocks {start_height} to {end_height-1} (peer is at {peer.height})")
+                
+                for height in range(start_height, end_height):
                     block_file = os.path.join(blocks_dir, f"block_{height}.json")
                     if os.path.exists(block_file):
                         with open(block_file, 'rb') as f:
