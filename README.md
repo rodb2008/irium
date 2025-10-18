@@ -325,3 +325,47 @@ This is required for wallet creation and blockchain operations.
   sudo journalctl -u irium-miner.service | grep "Mining address" | tail -1
   ```
 
+
+## 🔄 Blockchain Sync
+
+### How Sync Works
+
+When you start a node, it will:
+1. Load existing blocks from `~/.irium/blocks/`
+2. Connect to seed peers
+3. Compare heights with connected peers
+4. Request missing blocks if peers are ahead
+
+### "Not Syncing" - Common Confusion
+
+**If you see "height 3" and it's not changing:**
+
+This is **normal** if:
+- All peers are also at height 3
+- No new blocks have been mined yet
+- Everyone is waiting for block 4
+
+**Sync only happens when:**
+- A peer has a higher block than you
+- Then your node automatically requests the missing blocks
+
+### How to Verify Sync is Working
+
+```bash
+# Check your node's height
+ls ~/.irium/blocks/
+
+# Check peer heights in logs
+journalctl -u irium-node.service -n 50 | grep "Status.*height"
+
+# If your height < peer height, sync happens automatically!
+```
+
+### Network is at Same Height = Working Correctly!
+
+If everyone shows the same height, it means:
+✅ Network is in sync
+✅ All nodes have the same blockchain
+✅ Waiting for next block to be mined
+
+**This is how blockchains work!** 🎯

@@ -63,3 +63,24 @@ sudo systemctl restart irium-miner.service
 sudo journalctl -u irium-miner.service -n 20 | grep "Mining address"
 ```
 
+
+## Understanding Blockchain Sync
+
+**"My node is stuck at height 3!"**
+
+Check the network:
+```bash
+# See what height peers are at
+journalctl -u irium-node.service -n 20 | grep "Status.*peers.*height"
+```
+
+If peers show "height 3", then **you're in sync!** ✅
+
+Everyone is waiting for the next block to be mined (~6 hours average).
+
+**Sync happens automatically when:**
+- A peer mines a new block
+- Your node detects they're ahead
+- Your node requests and downloads the block
+
+No manual intervention needed! 🚀
