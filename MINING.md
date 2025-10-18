@@ -87,3 +87,10 @@ python3 scripts/irium-wallet-proper.py list
 ```
 
 **Remember:** Mining rewards go to the address that was loaded when the miner started, not addresses created afterwards!
+
+## Mining Faster
+
+### Coming in v1.1.0
+- Multi-threaded miner (uses all cores)
+- Full UTXO balance scanning
+- Transaction history
