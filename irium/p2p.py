@@ -327,10 +327,9 @@ class P2PNode:
                         with open(block_file, 'r') as f:
                             block_json = f.read()
 
-                        # Send JSON as block data (simple approach)
+                        # Send JSON as block data
                         from irium.protocol import Message, MessageType
                         block_msg = Message(
-                            version=1,
                             msg_type=MessageType.BLOCK,
                             payload=block_json.encode()
                         )
