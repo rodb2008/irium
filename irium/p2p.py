@@ -34,13 +34,9 @@ class Peer:
             data = msg.serialize()
             self.writer.write(data)
             await self.writer.drain()
-        except ConnectionError as e:
-            print(f"⚠️  Connection error sending to {self.address}: {e}")
-            raise  # Connection is dead, let it clean up
         except Exception as e:
-            print(f"⚠️  SEND FAILED to {self.address}: {e}")
-            print(f"     Message type: {msg.msg_type if hasattr(msg, 'msg_type') else 'unknown'}")
-            # Don't raise for other errors - log and continue
+            print(f"Error sending message to {self.address}: {e}")
+            # Don't raise - let the cleanup task handle dead connections
             pass
     
     async def recv_message(self) -> Optional[Message]:
@@ -210,7 +206,7 @@ class P2PNode:
                 await peer.send_message(handshake.to_message())
             
             # Receive their handshake
-            msg = await asyncio.wait_for(peer.recv_message(), timeout=60.0)
+            msg = await asyncio.wait_for(peer.recv_message(), timeout=10.0)
             if not msg or msg.msg_type != MessageType.HANDSHAKE:
                 return False
             
@@ -250,7 +246,6 @@ class P2PNode:
                     break
                 
                 # Handle different message types
-                print(f"  📨 Received message type: {msg.msg_type} from {peer.address}")
                 if msg.msg_type == MessageType.PING:
                     await self._handle_ping(peer, msg)
                 elif msg.msg_type == MessageType.PONG:
@@ -270,11 +265,7 @@ class P2PNode:
             
             except Exception as e:
                 print(f"❌ Error handling message from {peer.address}: {e}")
-                # Don't break - just log and continue
-                # Breaking kills the connection for one bad message
-                import traceback
-                traceback.print_exc()
-                continue  # Keep connection alive
+                break
         
         # Clean up
         await self._disconnect_peer(peer, "Connection closed")
@@ -331,16 +322,12 @@ class P2PNode:
                 for height in blocks_to_send:
                     block_file = os.path.join(blocks_dir, f"block_{height}.json")
                     if os.path.exists(block_file):
-                        with open(block_file, 'r') as f:
-                            block_json = f.read()
+                        with open(block_file, 'rb') as f:
+                            block_data = f.read()
 
-                        # Send JSON as block data
-                        from irium.protocol import Message, MessageType
-                        block_msg = Message(
-                            msg_type=MessageType.BLOCK,
-                            payload=block_json.encode()
-                        )
-                        await peer.send_message(block_msg)
+                        from irium.protocol import BlockMessage
+                        block_msg = BlockMessage(block_data=block_data)
+                        await peer.send_message(block_msg.to_message())
                         print(f"  📤 Sent block {height} to {peer.address}")
                     else:
                         print(f"  ⚠️  Block {height} not found on disk")
@@ -415,20 +402,9 @@ class P2PNode:
 
                 # Skip connecting to self (only localhost/same IP)
                 print(f"  Checking if {host} is self")
-                # Only skip localhost/loopback - let nodes connect to seed
                 if host in ["127.0.0.1", "localhost"]:
                     print(f"  Skipping self: {host}")
                     return  # Skip self
-                
-                # Also skip if this is our own public IP (for seed node only)
-                try:
-                    import socket
-                    my_ip = socket.gethostbyname(socket.gethostname())
-                    if host == my_ip or host == self.host:
-                        print(f"  Skipping self: {host}")
-                        return
-                except:
-                    pass
 
                     return  # Already connected
                 
@@ -437,7 +413,7 @@ class P2PNode:
                 
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port),
-                    timeout=60.0
+                    timeout=10.0
                 )
                 
                 peer = Peer(reader=reader, writer=writer, address=address)
