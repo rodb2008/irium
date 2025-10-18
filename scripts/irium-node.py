@@ -123,6 +123,17 @@ class IriumNode:
             block_json = json.loads(block_data.decode('utf-8'))
             height = block_json.get('height', 0)
             block_hash = block_json.get('hash', 'unknown')
+
+            # Validate block hash
+            if "test" in block_hash.lower() or len(block_hash) != 64:
+                print(f"   ❌ Invalid/test block, rejecting")
+                return
+            
+            try:
+                bytes.fromhex(block_hash)
+            except ValueError:
+                print(f"   ❌ Invalid block hash (not hex), rejecting")
+                return
             
             print(f"📦 Received block {height} from {peer.address}")
             print(f"   Hash: {block_hash[:16]}...")
