@@ -50,3 +50,10 @@ python3 scripts/check-balance-v2.py
 
 Download: https://github.com/iriumlabs/irium/releases/tag/v1.1.0
 Website: https://iriumlabs.org
+
+## P2P Stability Improvements
+
+✅ Increased message timeouts (10s → 60s)
+✅ Better error handling in block transfers
+✅ Fixed JSON block sending/receiving
+✅ More reliable peer connections
