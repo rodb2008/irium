@@ -1,3 +1,7 @@
+# Irium Blockchain
+
+> **🎉 NEW: v1.1.3 Released!** - Critical P2P sync fix. [Download now →](https://github.com/iriumlabs/irium/releases/tag/v1.1.3)
+
 # Irium Blockchain (IRM)
 
 **A next-generation proof-of-work blockchain designed for true decentralization**
