@@ -117,48 +117,48 @@ class IriumNode:
             return False
     
     async def handle_block(self, peer, block_data: bytes):
-        """Handle received block from peer."""
+        """Handle received block from peer with fork prevention."""
         try:
-            # Parse block data
-            block_json = json.loads(block_data.decode('utf-8'))
-            height = block_json.get('height', 0)
-            block_hash = block_json.get('hash', 'unknown')
-
-            # Validate block hash
-            if "test" in block_hash.lower() or len(block_hash) != 64:
-                print(f"   ❌ Invalid/test block, rejecting")
-                return
+            block_json = json.loads(block_data.decode("utf-8"))
+            height = block_json.get("height", 0)
+            block_hash = block_json.get("hash", "unknown")
+            prev_hash = block_json.get("prev_hash", "")
             
+            # Validate hash format
+            if "test" in block_hash.lower() or len(block_hash) != 64:
+                return
             try:
                 bytes.fromhex(block_hash)
             except ValueError:
-                print(f"   ❌ Invalid block hash (not hex), rejecting")
                 return
             
-            print(f"📦 Received block {height} from {peer.address}")
-            print(f"   Hash: {block_hash[:16]}...")
+            # FORK PREVENTION: Only accept next block in sequence
+            if height != self.chain_state.height + 1:
+                return  # Ignore old or future blocks
             
-            # Save block to disk
+            # Validate it extends our current chain
             blocks_dir = os.path.expanduser("~/.irium/blocks")
+            if self.chain_state.height > 0:
+                tip_file = os.path.join(blocks_dir, f"block_{self.chain_state.height}.json")
+                if os.path.exists(tip_file):
+                    with open(tip_file) as f:
+                        tip = json.load(f)
+                    if prev_hash != tip["hash"]:
+                        print(f"   ❌ FORK REJECTED: Block {height}")
+                        return
+            
+            print(f"📦 Received block {height} from {peer.address}")
             os.makedirs(blocks_dir, exist_ok=True)
-            
             block_file = os.path.join(blocks_dir, f"block_{height}.json")
-            with open(block_file, 'w') as f:
+            with open(block_file, "w") as f:
                 json.dump(block_json, f, indent=2)
-            
-            print(f"   💾 Saved block {height} to disk")
-            
-            # Update chain height if this block is ahead
-            if height > self.chain_state.height:
-                self.chain_state.height = height
-                self.p2p.chain_height = height
-                print(f"   ✅ Updated chain height to {height}")
-                
+            print(f"   💾 Saved block {height}")
+            self.chain_state.height = height
+            self.p2p.chain_height = height
+            print(f"   ✅ Height now {height}")
         except Exception as e:
-            print(f"❌ Error handling block: {e}")
-            import traceback
-            traceback.print_exc()
-    
+            print(f"Error: {e}")
+
     async def handle_tx(self, peer, tx_data: bytes):
         """Handle received transaction from peer."""
         try:

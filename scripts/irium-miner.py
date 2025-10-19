@@ -160,34 +160,40 @@ class IriumMiner:
         return None
 
     async def handle_peer_block(self, peer, block_data: bytes):
-        """Handle block received from peer."""
+        """Handle block with fork prevention."""
         try:
             import json
             block_json = json.loads(block_data.decode('utf-8'))
             height = block_json.get('height', 0)
             block_hash = block_json.get('hash', 'unknown')
+            prev_hash = block_json.get('prev_hash', '')
             
-            print(f"\n📦 Received block {height} from {peer.address}")
-            print(f"  Hash: {block_hash[:16]}...")
-            
+            # Validate format
             if "test" in block_hash.lower() or len(block_hash) != 64:
-                print(f"  ❌ Invalid/test block, rejecting")
                 return
-            
             try:
                 bytes.fromhex(block_hash)
             except ValueError:
-                print(f"  ❌ Invalid block hash format, rejecting")
                 return
             
-            if height <= self.chain_state.height:
+            # FORK PREVENTION: Only accept next block
+            if height != self.chain_state.height + 1:
                 return
             
+            # Validate it extends our chain
+            if self.chain_state.height > 0:
+                tip_file = os.path.join(BLOCKCHAIN_DIR, f"block_{self.chain_state.height}.json")
+                if os.path.exists(tip_file):
+                    with open(tip_file) as f:
+                        tip = json.load(f)
+                    if prev_hash != tip['hash']:
+                        print(f"\n  ❌ FORK REJECTED: Block {height}")
+                        return
+            
+            print(f"\n📦 Received block {height}")
             os.makedirs(BLOCKCHAIN_DIR, exist_ok=True)
-            block_file = os.path.join(BLOCKCHAIN_DIR, f"block_{height}.json")
-            with open(block_file, 'w') as f:
+            with open(os.path.join(BLOCKCHAIN_DIR, f"block_{height}.json"), 'w') as f:
                 json.dump(block_json, f, indent=2)
-            print(f"  💾 Saved block {height}")
             self.chain_state.height = height
             self.p2p.chain_height = height
             print(f"  ✅ Updated to height {height}")
