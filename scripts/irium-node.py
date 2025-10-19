@@ -227,6 +227,19 @@ class IriumNode:
                             self.chain_state.height = max_height
                             self.p2p.chain_height = max_height
                             print(f"📊 Detected new blocks! Updated height: {old_height} -> {max_height}")
+                            
+                            # Broadcast newly detected blocks to peers
+                            for h in range(old_height + 1, max_height + 1):
+                                block_file = os.path.join(blocks_dir, f"block_{h}.json")
+                                if os.path.exists(block_file):
+                                    try:
+                                        with open(block_file, 'rb') as bf:
+                                            block_data = bf.read()
+                                        peer_count = len(self.p2p.peers)
+                                        print(f"  📡 Broadcasting block {h} to {peer_count} peers...")
+                                        await self.p2p.broadcast_block(block_data)
+                                    except Exception as e:
+                                        print(f"  ⚠️  Broadcast error for block {h}: {e}")
         
         # Start rescan task
         asyncio.create_task(rescan_blocks())
