@@ -205,7 +205,7 @@ class P2PNode:
                     await self.on_peer_connected(peer)
                 
                 # Handle messages from this peer
-                await self._handle_peer_messages(peer)
+                asyncio.create_task(self._handle_peer_messages(peer))
             else:
                 print(f"❌ Handshake failed with {address}")
                 peer.close()
