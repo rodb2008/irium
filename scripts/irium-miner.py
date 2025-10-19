@@ -102,7 +102,7 @@ class IriumMiner:
             outputs=[coinbase_output]
         )
     
-    async def mine_block(self, height, prev_hash, transactions, target):
+    def mine_block(self, height, prev_hash, transactions, target):
         """Mine a new block."""
         print(f"⛏️  Mining block {height}...")
         print(f"  Transactions: {len(transactions)}")
@@ -156,18 +156,45 @@ class IriumMiner:
                 elapsed = time.time() - start_time
                 hashrate = nonce / elapsed if elapsed > 0 else 0
                 print(f"  Nonce: {nonce:,} | Hashrate: {hashrate:.2f} H/s", end='\r')
-                await asyncio.sleep(0)  # Yield to other tasks
         
         return None
 
     async def handle_peer_block(self, peer, block_data: bytes):
         """Handle block received from peer."""
         try:
-            print(f"\n📦 Received block from {peer.address}")
-            # TODO: Validate and add to chain
-            # For now, just log it
+            import json
+            block_json = json.loads(block_data.decode('utf-8'))
+            height = block_json.get('height', 0)
+            block_hash = block_json.get('hash', 'unknown')
+            
+            print(f"\n📦 Received block {height} from {peer.address}")
+            print(f"  Hash: {block_hash[:16]}...")
+            
+            if "test" in block_hash.lower() or len(block_hash) != 64:
+                print(f"  ❌ Invalid/test block, rejecting")
+                return
+            
+            try:
+                bytes.fromhex(block_hash)
+            except ValueError:
+                print(f"  ❌ Invalid block hash format, rejecting")
+                return
+            
+            if height <= self.chain_state.height:
+                return
+            
+            os.makedirs(BLOCKCHAIN_DIR, exist_ok=True)
+            block_file = os.path.join(BLOCKCHAIN_DIR, f"block_{height}.json")
+            with open(block_file, 'w') as f:
+                json.dump(block_json, f, indent=2)
+            print(f"  💾 Saved block {height}")
+            self.chain_state.height = height
+            self.p2p.chain_height = height
+            print(f"  ✅ Updated to height {height}")
         except Exception as e:
-            print(f"❌ Error handling peer block: {e}")
+            print(f"  ❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def handle_peer_tx(self, peer, tx_data: bytes):
         """Handle transaction from peer."""
@@ -292,7 +319,7 @@ class IriumMiner:
                 
                 target = self.chain_params.pow_limit
                 
-                block = await self.mine_block(height, prev_hash, transactions, target)
+                block = self.mine_block(height, prev_hash, transactions, target)
                 
                 if block:
                     self.blocks_mined += 1
