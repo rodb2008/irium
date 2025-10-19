@@ -102,7 +102,7 @@ class IriumMiner:
             outputs=[coinbase_output]
         )
     
-    def mine_block(self, height, prev_hash, transactions, target):
+    async def mine_block(self, height, prev_hash, transactions, target):
         """Mine a new block."""
         print(f"⛏️  Mining block {height}...")
         print(f"  Transactions: {len(transactions)}")
@@ -156,6 +156,7 @@ class IriumMiner:
                 elapsed = time.time() - start_time
                 hashrate = nonce / elapsed if elapsed > 0 else 0
                 print(f"  Nonce: {nonce:,} | Hashrate: {hashrate:.2f} H/s", end='\r')
+                await asyncio.sleep(0)  # Yield to other tasks
         
         return None
 
@@ -291,7 +292,7 @@ class IriumMiner:
                 
                 target = self.chain_params.pow_limit
                 
-                block = self.mine_block(height, prev_hash, transactions, target)
+                block = await self.mine_block(height, prev_hash, transactions, target)
                 
                 if block:
                     self.blocks_mined += 1
