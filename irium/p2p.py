@@ -33,7 +33,12 @@ class Peer:
         try:
             data = msg.serialize()
             self.writer.write(data)
-            await self.writer.drain()
+            # Add timeout to drain to prevent hanging
+            await asyncio.wait_for(self.writer.drain(), timeout=30.0)
+        except asyncio.TimeoutError:
+            print(f"⚠️  Send timeout to {self.address} (data size: {len(data)} bytes)")
+            # Don't raise - connection might still be usable
+            pass
         except Exception as e:
             print(f"Error sending message to {self.address}: {e}")
             # Don't raise - let the cleanup task handle dead connections
@@ -121,7 +126,26 @@ class P2PNode:
         asyncio.create_task(self._connect_to_peers())
         asyncio.create_task(self._ping_peers())
         asyncio.create_task(self._cleanup_dead_peers())
+        asyncio.create_task(self._periodic_sync_check())
     
+    async def _periodic_sync_check(self) -> None:
+        """Periodically check if connected peers are ahead and request blocks."""
+        while self.running:
+            await asyncio.sleep(60)  # Check every 60 seconds
+            
+            for peer in list(self.peers.values()):
+                if peer.height > self.chain_height:
+                    print(f"🔄 Periodic check: Peer {peer.address} is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
+                    try:
+                        from irium.protocol import GetBlocksMessage
+                        genesis_hash = bytes.fromhex('cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000')
+                        count = min(500, peer.height - self.chain_height)
+                        get_blocks = GetBlocksMessage(start_hash=genesis_hash, count=count)
+                        await peer.send_message(get_blocks.to_message())
+                        print(f"  📥 Requested {count} blocks from {peer.address}")
+                    except Exception as e:
+                        print(f"  ⚠️  Error requesting blocks: {e}")
+
     async def stop(self) -> None:
         """Stop the P2P node."""
         print("🛑 Stopping P2P Node...")
@@ -265,7 +289,7 @@ class P2PNode:
             
             except Exception as e:
                 print(f"❌ Error handling message from {peer.address}: {e}")
-                break
+                continue
         
         # Clean up
         await self._disconnect_peer(peer, "Connection closed")
