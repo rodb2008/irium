@@ -482,11 +482,11 @@ class P2PNode:
                     ping = PingMessage(nonce=nonce)
                     await peer.send_message(ping.to_message())
                 
-                await asyncio.sleep(120)  # Ping every 120 seconds
+                await asyncio.sleep(30)  # Ping every 30 seconds
             
             except Exception as e:
                 print(f"❌ Error in ping task: {e}")
-                await asyncio.sleep(120)
+                await asyncio.sleep(30)
     
     async def _cleanup_dead_peers(self) -> None:
         """Background task to remove dead peers."""
