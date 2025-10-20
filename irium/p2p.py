@@ -202,7 +202,6 @@ class P2PNode:
 
                 if self.on_peer_connected:
                     await self.on_peer_connected(peer)
-                self.message_tasks[address] = task
             else:
                 print(f"  Debug: handshake returned False")
                 peer.close()
