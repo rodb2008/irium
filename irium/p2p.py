@@ -191,13 +191,6 @@ class P2PNode:
                 task = asyncio.create_task(self._handle_peer_messages(peer))
                 self.message_tasks[address] = task
                 
-                # Send immediate ping
-                await asyncio.sleep(0.1)
-                import random
-                from irium.protocol import PingMessage
-                nonce = random.randint(0, 2**64 - 1)
-                ping = PingMessage(nonce=nonce)
-                await peer.send_message(ping.to_message())
                 print(f"✅ Peer connected: {address} ({peer.agent}, height: {peer.height})")
                 
 
