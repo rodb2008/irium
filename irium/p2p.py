@@ -398,10 +398,10 @@ class P2PNode:
         while self.running:
             try:
                 if len(self.peers) < self.max_peers:
-                    # 👥 Peers: {len(self.peers)}/{self.max_peers}
+                    print(f"  👥 Peers: {len(self.peers)}/{self.max_peers}")
                     # Get seedlist
                     seedlist = list(self.seedlist_manager.merged_seedlist())
-                    # 📋 Seedlist: {len(seedlist)} entries
+                    print(f"  📋 Seedlist: {len(seedlist)} nodes")
                     if seedlist:
                         # Try random peer
                         multiaddr = random.choice(seedlist)
@@ -428,7 +428,7 @@ class P2PNode:
                 address = f"{host}:{port}"
                 
                 if address in self.peers:
-                    print(f"  ↩️  Already connected: {address}")
+                    print(f"  ✓ Already connected: {address}")
                     return
 
                 # Skip connecting to self
@@ -439,12 +439,12 @@ class P2PNode:
                 
                 # Skip VPS IP on same port
                 if host == "207.244.247.86" and port == self.port:
-                    print(f"  Skipping self: {host}:{port} (VPS on my port)")
+                    print(f"  ⏭️  Skipping self: {host}:{port}")
                     return
                 
                 # Skip simple miner (no P2P server)
                 if host == "207.244.247.86" and port == 38292:
-                    print(f"  Skipping simple-miner: {host}:{port} (no P2P)")
+                    print(f"  ⏭️  Skipping simple-miner: {host}:{port}")
                     return
                 
                 # Skip if same IP and same port
