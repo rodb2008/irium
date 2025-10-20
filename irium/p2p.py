@@ -268,7 +268,10 @@ class P2PNode:
                 address = corrected_address
             
             multiaddr = f"/ip4/{peer_ip}/tcp/{peer_port}"
-            self.peer_directory.register_connection(multiaddr, peer.agent)
+            try:
+                self.peer_directory.register_connection(multiaddr, peer.agent)
+            except (OSError, PermissionError):
+                pass  # Bootstrap node: runtime seedlist disabled
             
             return True
         
