@@ -235,7 +235,8 @@ class P2PNode:
                     version=1,
                     agent=self.agent,
                     height=self.chain_height,
-                    timestamp=int(time.time())
+                    timestamp=int(time.time()),
+                    port=self.port
                 )
                 await peer.send_message(handshake.to_message())
             
@@ -254,12 +255,15 @@ class P2PNode:
                     version=1,
                     agent=self.agent,
                     height=self.chain_height,
-                    timestamp=int(time.time())
+                    timestamp=int(time.time()),
+                    port=self.port
                 )
                 await peer.send_message(handshake.to_message())
             
-            # Register peer
-            multiaddr = f"/ip4/{peer.address.split(':')[0]}/tcp/{self.port}"
+            # Register peer with their announced listening port
+            peer_ip = peer.address.split(':')[0]
+            peer_port = their_handshake.port if their_handshake.port > 0 else self.port
+            multiaddr = f"/ip4/{peer_ip}/tcp/{peer_port}"
             self.peer_directory.register_connection(multiaddr, peer.agent)
             
             return True
@@ -273,7 +277,9 @@ class P2PNode:
     
     async def _handle_peer_messages(self, peer: Peer) -> None:
         """Handle messages from a connected peer."""
+        print(f"🔧 DEBUG: Starting message handler for {peer.address}")
         while self.running and peer.address in self.peers:
+            print(f"🔧 DEBUG: Waiting for message from {peer.address}...")
             try:
                 msg = await peer.recv_message()
                 if not msg:
