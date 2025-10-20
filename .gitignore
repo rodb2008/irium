@@ -34,3 +34,6 @@ __pycache__/
 
 # Runtime data
 *.runtime
+
+# State/runtime data
+state/
