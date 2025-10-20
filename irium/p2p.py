@@ -261,11 +261,7 @@ class P2PNode:
                 # Update peer object and re-add with correct address
                 peer.address = corrected_address
                 self.peers[corrected_address] = peer
-                # Update message task key
-                old_address = address
-                if old_address in self.message_tasks:
-                    self.message_tasks[corrected_address] = self.message_tasks.pop(old_address)
-                address = corrected_address
+                # Note: Message task key will be updated by caller if needed
             
             multiaddr = f"/ip4/{peer_ip}/tcp/{peer_port}"
             self.peer_directory.register_connection(multiaddr, peer.agent)
