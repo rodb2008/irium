@@ -189,7 +189,7 @@ class IriumNode:
         # Create P2P node
         self.p2p = P2PNode(
             port=self.port,
-            max_peers=8,
+            max_peers=8000,
             agent="irium-node/1.0",
             chain_height=self.chain_state.height
         )
