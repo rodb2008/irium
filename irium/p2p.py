@@ -133,6 +133,7 @@ class P2PNode:
         """Periodically check if connected peers are ahead and request blocks."""
         while self.running:
             await asyncio.sleep(60)  # Check every 60 seconds
+            
             for peer in list(self.peers.values()):
                 if peer.height > self.chain_height:
                     print(f"🔄 Periodic check: Peer {peer.address} is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
@@ -152,8 +153,6 @@ class P2PNode:
         self.running = False
         
         # Close all peer connections
-                peers = list(self.peers.values())
-                print(f"🔧 DEBUG: Ping cycle - {len(peers)} peers to ping")
         for peer in list(self.peers.values()):
             await self._disconnect_peer(peer, "Node shutting down")
         
@@ -186,7 +185,7 @@ class P2PNode:
         try:
             # Perform handshake
             if await self._perform_handshake(peer, is_initiator=False):
-                self.peers[peer.address] = peer
+                self.peers[address] = peer
                 
                 # Start message handler FIRST before sending any messages
                 task = asyncio.create_task(self._handle_peer_messages(peer))
@@ -262,7 +261,11 @@ class P2PNode:
                 # Update peer object and re-add with correct address
                 peer.address = corrected_address
                 self.peers[corrected_address] = peer
-                # Note: Message task key will be updated by caller if needed
+                # Update message task key
+                old_address = address
+                if old_address in self.message_tasks:
+                    self.message_tasks[corrected_address] = self.message_tasks.pop(old_address)
+                address = corrected_address
             
             multiaddr = f"/ip4/{peer_ip}/tcp/{peer_port}"
             self.peer_directory.register_connection(multiaddr, peer.agent)
@@ -510,12 +513,9 @@ class P2PNode:
             print(f"❌ Failed to connect to {multiaddr}: {e}")
     
     async def _ping_peers(self) -> None:
-        print("🔧 DEBUG: Ping task started")
         """Background task to ping peers."""
         while self.running:
             try:
-                peers = list(self.peers.values())
-                print(f"🔧 DEBUG: Ping cycle - {len(peers)} peers to ping")
                 for peer in list(self.peers.values()):
                     nonce = random.randint(0, 2**64 - 1)
                     ping = PingMessage(nonce=nonce)
@@ -565,8 +565,6 @@ class P2PNode:
         block_msg = BlockMessage(block_data=block_data)
         msg = block_msg.to_message()
         
-                peers = list(self.peers.values())
-                print(f"🔧 DEBUG: Ping cycle - {len(peers)} peers to ping")
         for peer in list(self.peers.values()):
             try:
                 await peer.send_message(msg)
@@ -578,8 +576,6 @@ class P2PNode:
         tx_msg = TxMessage(tx_data=tx_data)
         msg = tx_msg.to_message()
         
-                peers = list(self.peers.values())
-                print(f"🔧 DEBUG: Ping cycle - {len(peers)} peers to ping")
         for peer in list(self.peers.values()):
             try:
                 await peer.send_message(msg)
