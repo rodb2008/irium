@@ -253,6 +253,7 @@ class P2PNode:
             
             # Update peer.address to use announced port instead of ephemeral port
             corrected_address = f"{peer_ip}:{peer_port}"
+            original_address = peer.address
             if corrected_address != peer.address:
                 print(f"🔧 DEBUG: Updating peer address from {peer.address} to {corrected_address}")
                 # Remove old address from peers dict
@@ -262,8 +263,8 @@ class P2PNode:
                 peer.address = corrected_address
                 self.peers[corrected_address] = peer
                 # Update message task key
-                if address in self.message_tasks:
-                    self.message_tasks[corrected_address] = self.message_tasks.pop(address)
+                if original_address in self.message_tasks:
+                    self.message_tasks[corrected_address] = self.message_tasks.pop(original_address)
                 address = corrected_address
             
             multiaddr = f"/ip4/{peer_ip}/tcp/{peer_port}"
@@ -459,15 +460,15 @@ class P2PNode:
                     print(f"  ⏭️  Skipping simple-miner: {host}:{port}")
                     return
                 
-                # Skip if same IP and same port (DISABLED for testing)
-                # import socket
-                # try:
-                #     my_ip = socket.gethostbyname(socket.gethostname())
-                #     if host == my_ip and port == self.port:
-                #         print(f"  Skipping self: {host}:{port}")
-                #         return
-                # except:
-                #     pass
+                # Skip OUTGOING connections to self
+                import socket
+                try:
+                    my_ip = socket.gethostbyname(socket.gethostname())
+                    if host == my_ip and port == self.port:
+                        print(f"  ⏭️  Skipping outgoing self-connection: {host}:{port}")
+                        return
+                except:
+                    pass
                 
                 print(f"  Passed self-check, will connect to {address}")
                 print(f"📤 Connecting to {address}...")
