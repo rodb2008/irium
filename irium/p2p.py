@@ -185,7 +185,7 @@ class P2PNode:
         try:
             # Perform handshake
             if await self._perform_handshake(peer, is_initiator=False):
-                self.peers[address] = peer
+                self.peers[peer.address] = peer
                 
                 # Start message handler FIRST before sending any messages
                 task = asyncio.create_task(self._handle_peer_messages(peer))
