@@ -248,8 +248,24 @@ class P2PNode:
             
             # Register peer with their announced listening port
             peer_ip = peer.address.split(':')[0]
-            print(f"🔧 DEBUG: Peer announced port: {their_handshake.port}, using: {their_handshake.port if their_handshake.port > 0 else self.port}")
             peer_port = their_handshake.port if their_handshake.port > 0 else self.port
+            print(f"🔧 DEBUG: Peer announced port: {their_handshake.port}, using: {peer_port}")
+            
+            # Update peer.address to use announced port instead of ephemeral port
+            corrected_address = f"{peer_ip}:{peer_port}"
+            if corrected_address != peer.address:
+                print(f"🔧 DEBUG: Updating peer address from {peer.address} to {corrected_address}")
+                # Remove old address from peers dict
+                if peer.address in self.peers:
+                    del self.peers[peer.address]
+                # Update peer object and re-add with correct address
+                peer.address = corrected_address
+                self.peers[corrected_address] = peer
+                # Update message task key
+                if address in self.message_tasks:
+                    self.message_tasks[corrected_address] = self.message_tasks.pop(address)
+                address = corrected_address
+            
             multiaddr = f"/ip4/{peer_ip}/tcp/{peer_port}"
             self.peer_directory.register_connection(multiaddr, peer.agent)
             
