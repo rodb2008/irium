@@ -96,6 +96,7 @@ class P2PNode:
         self.chain_height = chain_height
         
         self.peers: Dict[str, Peer] = {}
+        self.message_tasks: Dict[str, asyncio.Task] = {}
         self.server: Optional[asyncio.Server] = None
         self.running = False
         
@@ -184,7 +185,7 @@ class P2PNode:
         try:
             # Perform handshake
             if await self._perform_handshake(peer, is_initiator=False):
-                self.peers[address] = peer
+                self.peers[peer.address] = peer
                 # Send immediate ping
                 await asyncio.sleep(0.1)
                 import random
@@ -212,7 +213,8 @@ class P2PNode:
                     await self.on_peer_connected(peer)
                 
                 # Handle messages from this peer
-                asyncio.create_task(self._handle_peer_messages(peer))
+                task = asyncio.create_task(self._handle_peer_messages(peer))
+                self.message_tasks[peer.address] = task
             else:
                 print(f"❌ Handshake failed with {address}")
                 peer.close()
@@ -232,7 +234,8 @@ class P2PNode:
                     version=1,
                     agent=self.agent,
                     height=self.chain_height,
-                    timestamp=int(time.time())
+                    timestamp=int(time.time()),
+                    port=self.port
                 )
                 await peer.send_message(handshake.to_message())
             
@@ -251,11 +254,22 @@ class P2PNode:
                     version=1,
                     agent=self.agent,
                     height=self.chain_height,
-                    timestamp=int(time.time())
+                    timestamp=int(time.time()),
+                    port=self.port
                 )
                 await peer.send_message(handshake.to_message())
             
             # Register peer
+            # Update peer.address to use announced listening port
+            peer_ip = peer.address.split(':')[0]
+            peer_port = their_handshake.port if their_handshake.port > 0 else self.port
+            corrected_address = f"{peer_ip}:{peer_port}"
+            if corrected_address != peer.address:
+                if peer.address in self.peers:
+                    del self.peers[peer.address]
+                peer.address = corrected_address
+                self.peers[corrected_address] = peer
+            
             multiaddr = f"/ip4/{peer.address.split(':')[0]}/tcp/{self.port}"
             self.peer_directory.register_connection(multiaddr, peer.agent)
             
