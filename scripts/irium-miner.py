@@ -156,6 +156,7 @@ class IriumMiner:
                 elapsed = time.time() - start_time
                 hashrate = nonce / elapsed if elapsed > 0 else 0
                 print(f"  Nonce: {nonce:,} | Hashrate: {hashrate:.2f} H/s", end='\r')
+                await asyncio.sleep(0)  # Yield to other tasks
         
         return None
 

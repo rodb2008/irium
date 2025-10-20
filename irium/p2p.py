@@ -281,8 +281,10 @@ class P2PNode:
         while self.running and peer.address in self.peers:
             print(f"🔧 DEBUG: Waiting for message from {peer.address}...")
             try:
-                msg = await peer.recv_message()
+                msg = await asyncio.wait_for(peer.recv_message(), timeout=120.0)
+                print(f"🔧 DEBUG: Received message type {msg.msg_type if msg else 'None'} from {peer.address}")
                 if not msg:
+                    print(f"🔧 DEBUG: No message received from {peer.address}, closing connection")
                     break
                 
                 # Handle different message types
