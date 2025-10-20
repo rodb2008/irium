@@ -235,6 +235,12 @@ class P2PNode:
             peer.agent = their_handshake.agent
             peer.height = their_handshake.height
             
+            # Version check
+            peer_version = their_handshake.node_version if hasattr(their_handshake, 'node_version') else "unknown"
+            if peer_version != "unknown" and peer_version < "1.1.8":
+                print(f"⚠️  WARNING: Peer {peer.address} is running outdated version {peer_version}")
+                print(f"   They should update to v1.1.8 to prevent forks!")
+            
             if not is_initiator:
                 # Send our handshake in response
                 handshake = HandshakeMessage(
