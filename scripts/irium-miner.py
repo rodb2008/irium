@@ -152,7 +152,7 @@ class IriumMiner:
             
             nonce += 1
             
-            if nonce % 10000 == 0:
+            if nonce % 1000 == 0:
                 elapsed = time.time() - start_time
                 hashrate = nonce / elapsed if elapsed > 0 else 0
                 print(f"  Nonce: {nonce:,} | Hashrate: {hashrate:.2f} H/s", end='\r')
