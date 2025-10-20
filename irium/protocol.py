@@ -64,6 +64,7 @@ class HandshakeMessage:
     agent: str
     height: int
     timestamp: int
+    port: int = 0  # Peer's listening port
     
     def to_message(self) -> Message:
         """Convert to generic Message."""
@@ -72,6 +73,7 @@ class HandshakeMessage:
             'agent': self.agent,
             'height': self.height,
             'timestamp': self.timestamp
+            'port': self.port,
         }).encode('utf-8')
         return Message(MessageType.HANDSHAKE, payload)
     
