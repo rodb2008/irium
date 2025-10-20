@@ -1,4 +1,1 @@
-# Irium Bootstrap Seed Nodes
-# Primary seed node (VPS) - Node only, NO miner P2P
-/ip4/207.244.247.86/tcp/38291
-# External nodes will be added here
+

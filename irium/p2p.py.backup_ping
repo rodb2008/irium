@@ -48,8 +48,9 @@ class Peer:
         """Receive a message from this peer."""
         try:
             # Read header (6 bytes: version, type, length)
+            # readexactly() will block until data arrives or connection closes
             header = await self.reader.readexactly(6)
-            if not header:
+            if not header or len(header) < 6:
                 return None
 
             # Parse header to get payload length
@@ -67,9 +68,14 @@ class Peer:
             return Message.deserialize(full_message)
 
         except asyncio.IncompleteReadError:
+            # Connection closed while reading
+            return None
+        except ConnectionResetError:
+            # Connection reset by peer
             return None
         except Exception as e:
-            print(f"Error receiving message from {self.address}: {e}")
+            # Log other errors but don't crash
+            # print(f"Error receiving message from {self.address}: {e}")
             return None
 
     def close(self) -> None:
@@ -96,7 +102,6 @@ class P2PNode:
         self.chain_height = chain_height
         
         self.peers: Dict[str, Peer] = {}
-        self.message_tasks: Dict[str, asyncio.Task] = {}
         self.server: Optional[asyncio.Server] = None
         self.running = False
         
@@ -186,13 +191,6 @@ class P2PNode:
             # Perform handshake
             if await self._perform_handshake(peer, is_initiator=False):
                 self.peers[address] = peer
-                # Send immediate ping
-                await asyncio.sleep(0.1)
-                import random
-                from irium.protocol import PingMessage
-                nonce = random.randint(0, 2**64 - 1)
-                ping = PingMessage(nonce=nonce)
-                await peer.send_message(ping.to_message())
                 print(f"✅ Peer connected: {address} ({peer.agent}, height: {peer.height})")
                 
 
@@ -213,11 +211,9 @@ class P2PNode:
                     await self.on_peer_connected(peer)
                 
                 # Handle messages from this peer
-                task = asyncio.create_task(self._handle_peer_messages(peer))
-                self.message_tasks[address] = task
+                asyncio.create_task(self._handle_peer_messages(peer))
             else:
                 print(f"❌ Handshake failed with {address}")
-                print(f"  Debug: handshake returned False")
                 peer.close()
         
         except Exception as e:
@@ -277,6 +273,7 @@ class P2PNode:
             try:
                 msg = await peer.recv_message()
                 if not msg:
+                    # Connection closed (recv_message checks EOF)
                     break
                 
                 # Handle different message types
@@ -396,15 +393,16 @@ class P2PNode:
             await self.on_tx(peer, tx_msg.tx_data)
     
     async def _connect_to_peers(self) -> None:
+        print("🔄 Peer connection task started")
         """Background task to connect to peers from seedlist."""
         print("🔄 Peer connection task started")
         while self.running:
             try:
                 if len(self.peers) < self.max_peers:
-                    print(f"  👥 Peers: {len(self.peers)}/{self.max_peers}")
+                    print(f"  Current peers: {len(self.peers)}/{self.max_peers}")
                     # Get seedlist
                     seedlist = list(self.seedlist_manager.merged_seedlist())
-                    print(f"  📋 Seedlist: {len(seedlist)} nodes")
+                    print(f"  Seedlist has {len(seedlist)} entries: {seedlist}")
                     if seedlist:
                         # Try random peer
                         multiaddr = random.choice(seedlist)
@@ -418,7 +416,7 @@ class P2PNode:
     
     async def _connect_to_peer(self, multiaddr: str) -> None:
         """Connect to a peer."""
-        # 🔌 Trying: {multiaddr}
+        print(f"🔍 _connect_to_peer called with: {multiaddr}")
         """Connect to a peer."""
         try:
             # Parse multiaddr (simplified)
@@ -431,32 +429,15 @@ class P2PNode:
                 address = f"{host}:{port}"
                 
                 if address in self.peers:
-                    print(f"  ✓ Already connected: {address}")
-                    return
+                    return  # Already connected
 
-                # Skip connecting to self
-                # 🔍 Self-check: {host}:{port}
+                # Skip connecting to self (only localhost/same IP)
+                print(f"  Checking if {host} is self")
                 if host in ["127.0.0.1", "localhost"]:
                     print(f"  Skipping self: {host}")
-                    return
-                
-                # Skip outgoing connections to same IP:port as this node (dynamic check only)
-                # No hardcoded IPs - let each node determine its own identity
-                
-                # Skip simple miner (no P2P server)
-                if host == "207.244.247.86" and port == 38292:
-                    print(f"  ⏭️  Skipping simple-miner: {host}:{port}")
-                    return
-                
-                # Skip if same IP and same port (DISABLED for testing)
-                # import socket
-                # try:
-                #     my_ip = socket.gethostbyname(socket.gethostname())
-                #     if host == my_ip and port == self.port:
-                #         print(f"  Skipping self: {host}:{port}")
-                #         return
-                # except:
-                #     pass
+                    return  # Skip self
+
+                    return  # Already connected
                 
                 print(f"  Passed self-check, will connect to {address}")
                 print(f"📤 Connecting to {address}...")
@@ -490,8 +471,7 @@ class P2PNode:
                         await self.on_peer_connected(peer)
                     
                     # Handle messages from this peer
-                    task = asyncio.create_task(self._handle_peer_messages(peer))
-                    self.message_tasks[address] = task
+                    asyncio.create_task(self._handle_peer_messages(peer))
                 else:
                     peer.close()
         
@@ -509,11 +489,11 @@ class P2PNode:
                     ping = PingMessage(nonce=nonce)
                     await peer.send_message(ping.to_message())
                 
-                await asyncio.sleep(120)  # Ping every 120 seconds
+                await asyncio.sleep(30)  # Ping every 30 seconds
             
             except Exception as e:
                 print(f"❌ Error in ping task: {e}")
-                await asyncio.sleep(120)
+                await asyncio.sleep(30)
     
     async def _cleanup_dead_peers(self) -> None:
         """Background task to remove dead peers."""

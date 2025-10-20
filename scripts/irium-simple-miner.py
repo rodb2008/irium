@@ -16,10 +16,10 @@ mining_address = "Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa"
 
 while True:
     # Get current height
-    blocks = [int(f.replace('block_', '').replace('.json', '')) 
+    blocks = [int(f.replace('block_', '').replace('.json', ''))
               for f in os.listdir(BLOCKCHAIN_DIR) if f.startswith('block_') and f.endswith('.json')]
     height = max(blocks) + 1 if blocks else 1
-    
+
     # Load prev block
     if height > 1:
         with open(f"{BLOCKCHAIN_DIR}/block_{height-1}.json") as f:
@@ -27,31 +27,53 @@ while True:
         prev_hash = bytes.fromhex(prev_block['hash'])
     else:
         prev_hash = bytes.fromhex('cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000')
-    
+
     print(f"⛏️  Mining block {height}...")
     print(f"  Prev: {prev_hash.hex()[:16]}...")
+
+    # Calculate reward
+    reward = 5000000000  # 50 IRM
+    halvings = (height - 1) // 210000
+    reward = reward >> halvings
+
+    # Create coinbase transaction and calculate merkle root
+    coinbase_tx = Transaction(
+        version=1,
+        inputs=[TxInput(prev_txid=bytes(32), prev_index=0xFFFFFFFF, script_sig=f"Block {height}".encode())],
+        outputs=[TxOutput(value=reward, script_pubkey=bytes(32))]  # Simplified
+    )
     
+    temp_block = Block(
+        header=BlockHeader(version=1, prev_hash=prev_hash, merkle_root=bytes(32), time=int(time.time()), bits=0x1d00ffff, nonce=0),
+        transactions=[coinbase_tx]
+    )
+    merkle_root = temp_block.merkle_root()[::-1]
+
     # Mine
     target_bits = 0x1d00ffff
     target_value = (target_bits & 0xFFFFFF) * 2**(8 * ((target_bits >> 24) - 3))
-    
+
     nonce = 0
     start = time.time()
     while True:
-        header_data = (1).to_bytes(4, 'little') + prev_hash + bytes(32) + int(time.time()).to_bytes(4, 'little') + target_bits.to_bytes(4, 'little') + nonce.to_bytes(4, 'little')
+        header_data = (1).to_bytes(4, 'little') + prev_hash + merkle_root + int(time.time()).to_bytes(4, 'little') + target_bits.to_bytes(4, 'little') + nonce.to_bytes(4, 'little')
         import hashlib
         h = hashlib.sha256(hashlib.sha256(header_data).digest()).digest()
         if int.from_bytes(h[::-1], 'big') < target_value:
             print(f"✅ Found block {height}! Hash: {h[::-1].hex()}")
-            reward = 5000000000  # 50 IRM
-            halvings = (height - 1) // 210000
-            reward = reward >> halvings
             
+            # Check if another miner already saved this block
+            block_file = f"{BLOCKCHAIN_DIR}/block_{height}.json"
+            if os.path.exists(block_file):
+                print(f"⚠️  Block {height} already exists (another miner was faster)")
+                print(f"   Moving to next block...")
+                break
+
             block_data = {
                 'height': height,
                 'hash': h[::-1].hex(),
                 'prev_hash': prev_hash.hex(),
-                'merkle_root': '0000000000000000000000000000000000000000000000000000000000000000',
+                'merkle_root': merkle_root.hex(),
                 'time': int(time.time()),
                 'bits': hex(target_bits),
                 'nonce': nonce,
@@ -59,12 +81,12 @@ while True:
                 'reward': reward,
                 'miner_address': mining_address
             }
-            with open(f"{BLOCKCHAIN_DIR}/block_{height}.json", 'w') as f:
+            with open(block_file, 'w') as f:
                 json.dump(block_data, f, indent=2)
             print(f"💾 Saved to disk")
             break
         nonce += 1
         if nonce % 100000 == 0:
             print(f"  Nonce: {nonce:,}", end='\r')
-    
+
     time.sleep(1)
