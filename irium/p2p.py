@@ -133,7 +133,6 @@ class P2PNode:
         """Periodically check if connected peers are ahead and request blocks."""
         while self.running:
             await asyncio.sleep(60)  # Check every 60 seconds
-                print(f"🔧 DEBUG: Ping cycle - {len(peers)} peers to ping")
             for peer in list(self.peers.values()):
                 if peer.height > self.chain_height:
                     print(f"🔄 Periodic check: Peer {peer.address} is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
