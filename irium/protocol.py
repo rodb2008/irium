@@ -85,7 +85,8 @@ class HandshakeMessage:
             version=data['version'],
             agent=data['agent'],
             height=data['height'],
-            timestamp=data['timestamp']
+            timestamp=data['timestamp'],
+            port=data.get('port', 0)
         )
 
 
