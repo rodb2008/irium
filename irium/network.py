@@ -69,6 +69,15 @@ class SeedlistManager:
         self.runtime.write_text(header + body)
 
     def merged_seedlist(self) -> Iterable[str]:
+        # Bootstrap node check: skip runtime seedlist to prevent outgoing connections
+        import os
+        env_file = os.path.expanduser("/home/irium/irium/.env")
+        if os.path.exists(env_file):
+            with open(env_file, "r") as f:
+                if "BOOTSTRAP_NODE=true" in f.read():
+                    # Return empty list for bootstrap nodes
+                    return []
+        
         baseline_entries = []
         if self.baseline.exists():
             for line in self.baseline.read_text().splitlines():
