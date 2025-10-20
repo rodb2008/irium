@@ -248,6 +248,7 @@ class P2PNode:
             
             # Register peer with their announced listening port
             peer_ip = peer.address.split(':')[0]
+            print(f"🔧 DEBUG: Peer announced port: {their_handshake.port}, using: {their_handshake.port if their_handshake.port > 0 else self.port}")
             peer_port = their_handshake.port if their_handshake.port > 0 else self.port
             multiaddr = f"/ip4/{peer_ip}/tcp/{peer_port}"
             self.peer_directory.register_connection(multiaddr, peer.agent)
