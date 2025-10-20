@@ -196,13 +196,6 @@ class P2PNode:
 
                 # Request blocks if peer is ahead
                 if peer.height > self.chain_height:
-                    print(f"  Peer is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
-                    # Request blocks from our height to their height
-                    from irium.protocol import GetBlocksMessage
-                    # Request blocks we're missing
-                    # For now, use genesis hash as start (TODO: use actual last block hash)
-                    genesis_hash = bytes.fromhex('cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000')
-                    count = min(500, peer.height - self.chain_height)  # Request up to 500 blocks
                     get_blocks = GetBlocksMessage(start_hash=genesis_hash, count=count)
                     await peer.send_message(get_blocks.to_message())
                     print(f"  📥 Requested blocks {self.chain_height + 1} to {peer.height}")
