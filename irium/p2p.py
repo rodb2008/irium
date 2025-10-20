@@ -398,10 +398,10 @@ class P2PNode:
         while self.running:
             try:
                 if len(self.peers) < self.max_peers:
-                    print(f"  Current peers: {len(self.peers)}/{self.max_peers}")
+                    # 👥 Peers: {len(self.peers)}/{self.max_peers}
                     # Get seedlist
                     seedlist = list(self.seedlist_manager.merged_seedlist())
-                    print(f"  Seedlist has {len(seedlist)} entries: {seedlist}")
+                    # 📋 Seedlist: {len(seedlist)} entries
                     if seedlist:
                         # Try random peer
                         multiaddr = random.choice(seedlist)
@@ -415,7 +415,7 @@ class P2PNode:
     
     async def _connect_to_peer(self, multiaddr: str) -> None:
         """Connect to a peer."""
-        print(f"🔍 _connect_to_peer called with: {multiaddr}")
+        # 🔌 Trying: {multiaddr}
         """Connect to a peer."""
         try:
             # Parse multiaddr (simplified)
@@ -428,11 +428,11 @@ class P2PNode:
                 address = f"{host}:{port}"
                 
                 if address in self.peers:
-                    print(f"  Already connected to {address}")
+                    print(f"  ↩️  Already connected: {address}")
                     return
 
                 # Skip connecting to self
-                print(f"  Checking if {host}:{port} is self")
+                # 🔍 Self-check: {host}:{port}
                 if host in ["127.0.0.1", "localhost"]:
                     print(f"  Skipping self: {host}")
                     return
@@ -440,6 +440,11 @@ class P2PNode:
                 # Skip VPS IP on same port
                 if host == "207.244.247.86" and port == self.port:
                     print(f"  Skipping self: {host}:{port} (VPS on my port)")
+                    return
+                
+                # Skip simple miner (no P2P server)
+                if host == "207.244.247.86" and port == 38292:
+                    print(f"  Skipping simple-miner: {host}:{port} (no P2P)")
                     return
                 
                 # Skip if same IP and same port

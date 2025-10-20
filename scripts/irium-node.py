@@ -268,13 +268,12 @@ class IriumNode:
     
     async def stop(self):
         """Stop the node."""
-        import traceback
+        import traceback, inspect
         print()
         print("🛑 Stopping Irium Node...")
-        with open('/tmp/irium_stop_trace.txt', 'a') as f:
-            f.write(f"\n{'='*60}\n")
-            f.write(f"Stop called at {__import__('time').time()}\n")
-            traceback.print_stack(file=f)
+        print("🔍 CALLER STACK:")
+        for frame in inspect.stack()[1:5]:
+            print(f"  {frame.filename}:{frame.lineno} in {frame.function}")
         self.running = False
         
         if self.p2p:
@@ -300,12 +299,21 @@ async def main():
     def signal_handler(signum, frame):
         asyncio.create_task(node.stop())
     
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    # signal.signal(signal.SIGINT, signal_handler)  # TEMP DISABLED
+    # signal.signal(signal.SIGTERM, signal_handler)  # TEMP DISABLED
     
     try:
+        print("🔵 Calling node.start()...")
         await node.start()
+        print("🔴 WARNING: node.start() RETURNED! (should run forever)")
+        print("🔴 This means the while self.running loop exited")
+        await node.stop()
     except KeyboardInterrupt:
+        await node.stop()
+    except Exception as e:
+        print(f"🔴 EXCEPTION in main: {e}")
+        import traceback
+        traceback.print_exc()
         await node.stop()
 
 
