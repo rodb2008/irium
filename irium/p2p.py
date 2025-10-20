@@ -459,15 +459,15 @@ class P2PNode:
                     print(f"  ⏭️  Skipping simple-miner: {host}:{port}")
                     return
                 
-                # Skip if same IP and same port (DISABLED for testing)
-                # import socket
-                # try:
-                #     my_ip = socket.gethostbyname(socket.gethostname())
-                #     if host == my_ip and port == self.port:
-                #         print(f"  Skipping self: {host}:{port}")
-                #         return
-                # except:
-                #     pass
+                # Skip OUTGOING connections to self (same IP and same port)
+                import socket
+                try:
+                    my_ip = socket.gethostbyname(socket.gethostname())
+                    if host == my_ip and port == self.port:
+                        print(f"  ⏭️  Skipping outgoing self-connection: {host}:{port}")
+                        return
+                except:
+                    pass
                 
                 print(f"  Passed self-check, will connect to {address}")
                 print(f"📤 Connecting to {address}...")
