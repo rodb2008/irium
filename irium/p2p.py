@@ -186,6 +186,11 @@ class P2PNode:
             # Perform handshake
             if await self._perform_handshake(peer, is_initiator=False):
                 self.peers[address] = peer
+                
+                # Start message handler FIRST before sending any messages
+                task = asyncio.create_task(self._handle_peer_messages(peer))
+                self.message_tasks[address] = task
+                
                 # Send immediate ping
                 await asyncio.sleep(0.1)
                 import random
