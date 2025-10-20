@@ -12,7 +12,7 @@ from .protocol import (
     Message, MessageType,
     HandshakeMessage, PingMessage, PongMessage,
     GetPeersMessage, PeersMessage,
-    BlockMessage, TxMessage, DisconnectMessage
+    BlockMessage, TxMessage, DisconnectMessage, GetBlocksMessage
 )
 from .network import PeerDirectory, SeedlistManager
 
