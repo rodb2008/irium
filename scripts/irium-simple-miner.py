@@ -43,8 +43,22 @@ while True:
         h = hashlib.sha256(hashlib.sha256(header_data).digest()).digest()
         if int.from_bytes(h[::-1], 'big') < target_value:
             print(f"✅ Found block {height}! Hash: {h[::-1].hex()}")
-            block_data = {'height': height, 'hash': h[::-1].hex(), 'prev_hash': prev_hash.hex(), 
-                         'time': int(time.time()), 'nonce': nonce, 'miner_address': mining_address}
+            reward = 5000000000  # 50 IRM
+            halvings = (height - 1) // 210000
+            reward = reward >> halvings
+            
+            block_data = {
+                'height': height,
+                'hash': h[::-1].hex(),
+                'prev_hash': prev_hash.hex(),
+                'merkle_root': '0000000000000000000000000000000000000000000000000000000000000000',
+                'time': int(time.time()),
+                'bits': hex(target_bits),
+                'nonce': nonce,
+                'transactions': 1,
+                'reward': reward,
+                'miner_address': mining_address
+            }
             with open(f"{BLOCKCHAIN_DIR}/block_{height}.json", 'w') as f:
                 json.dump(block_data, f, indent=2)
             print(f"💾 Saved to disk")
