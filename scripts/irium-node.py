@@ -252,7 +252,9 @@ class IriumNode:
         print()
         
         # Status loop
+        print("🔄 Entering main status loop...")
         while self.running:
+            print("💓 Heartbeat - node is running")
             await asyncio.sleep(30)
             
             # Print status
@@ -266,8 +268,13 @@ class IriumNode:
     
     async def stop(self):
         """Stop the node."""
+        import traceback
         print()
         print("🛑 Stopping Irium Node...")
+        with open('/tmp/irium_stop_trace.txt', 'a') as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"Stop called at {__import__('time').time()}\n")
+            traceback.print_stack(file=f)
         self.running = False
         
         if self.p2p:
