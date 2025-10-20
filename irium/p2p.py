@@ -185,38 +185,25 @@ class P2PNode:
         try:
             # Perform handshake
             if await self._perform_handshake(peer, is_initiator=False):
-                self.peers[peer.address] = peer
-                # Send immediate ping
-                await asyncio.sleep(0.1)
-                import random
-                from irium.protocol import PingMessage
-                nonce = random.randint(0, 2**64 - 1)
-                ping = PingMessage(nonce=nonce)
-                await peer.send_message(ping.to_message())
+                self.peers[address] = peer
+                
+                # Start message handler FIRST before sending any messages
+                task = asyncio.create_task(self._handle_peer_messages(peer))
+                self.message_tasks[address] = task
+                
                 print(f"✅ Peer connected: {address} ({peer.agent}, height: {peer.height})")
                 
 
                 # Request blocks if peer is ahead
                 if peer.height > self.chain_height:
-                    print(f"  Peer is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
-                    # Request blocks from our height to their height
-                    from irium.protocol import GetBlocksMessage
-                    # Request blocks we're missing
-                    # For now, use genesis hash as start (TODO: use actual last block hash)
-                    genesis_hash = bytes.fromhex('cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000')
-                    count = min(500, peer.height - self.chain_height)  # Request up to 500 blocks
                     get_blocks = GetBlocksMessage(start_hash=genesis_hash, count=count)
                     await peer.send_message(get_blocks.to_message())
                     print(f"  📥 Requested blocks {self.chain_height + 1} to {peer.height}")
 
                 if self.on_peer_connected:
                     await self.on_peer_connected(peer)
-                
-                # Handle messages from this peer
-                task = asyncio.create_task(self._handle_peer_messages(peer))
-                self.message_tasks[peer.address] = task
             else:
-                print(f"❌ Handshake failed with {address}")
+                print(f"  Debug: handshake returned False")
                 peer.close()
         
         except Exception as e:
@@ -259,18 +246,27 @@ class P2PNode:
                 )
                 await peer.send_message(handshake.to_message())
             
-            # Register peer
-            # Update peer.address to use announced listening port
+            # Register peer with their announced listening port
             peer_ip = peer.address.split(':')[0]
             peer_port = their_handshake.port if their_handshake.port > 0 else self.port
+            print(f"🔧 DEBUG: Peer announced port: {their_handshake.port}, using: {peer_port}")
+            
+            # Update peer.address to use announced port instead of ephemeral port
             corrected_address = f"{peer_ip}:{peer_port}"
             if corrected_address != peer.address:
+                print(f"🔧 DEBUG: Updating peer address from {peer.address} to {corrected_address}")
+                # Remove old address from peers dict
                 if peer.address in self.peers:
                     del self.peers[peer.address]
+                # Update peer object and re-add with correct address
                 peer.address = corrected_address
                 self.peers[corrected_address] = peer
+                # Update message task key
+                if address in self.message_tasks:
+                    self.message_tasks[corrected_address] = self.message_tasks.pop(address)
+                address = corrected_address
             
-            multiaddr = f"/ip4/{peer.address.split(':')[0]}/tcp/{self.port}"
+            multiaddr = f"/ip4/{peer_ip}/tcp/{peer_port}"
             self.peer_directory.register_connection(multiaddr, peer.agent)
             
             return True
@@ -284,10 +280,14 @@ class P2PNode:
     
     async def _handle_peer_messages(self, peer: Peer) -> None:
         """Handle messages from a connected peer."""
+        print(f"🔧 DEBUG: Starting message handler for {peer.address}")
         while self.running and peer.address in self.peers:
+            print(f"🔧 DEBUG: Waiting for message from {peer.address}...")
             try:
-                msg = await peer.recv_message()
+                msg = await asyncio.wait_for(peer.recv_message(), timeout=120.0)
+                print(f"🔧 DEBUG: Received message type {msg.msg_type if msg else 'None'} from {peer.address}")
                 if not msg:
+                    print(f"🔧 DEBUG: No message received from {peer.address}, closing connection")
                     break
                 
                 # Handle different message types
@@ -451,25 +451,23 @@ class P2PNode:
                     print(f"  Skipping self: {host}")
                     return
                 
-                # Skip VPS IP on same port
-                if host == "207.244.247.86" and port == self.port:
-                    print(f"  ⏭️  Skipping self: {host}:{port}")
-                    return
+                # Skip outgoing connections to same IP:port as this node (dynamic check only)
+                # No hardcoded IPs - let each node determine its own identity
                 
                 # Skip simple miner (no P2P server)
                 if host == "207.244.247.86" and port == 38292:
                     print(f"  ⏭️  Skipping simple-miner: {host}:{port}")
                     return
                 
-                # Skip if same IP and same port
-                import socket
-                try:
-                    my_ip = socket.gethostbyname(socket.gethostname())
-                    if host == my_ip and port == self.port:
-                        print(f"  Skipping self: {host}:{port}")
-                        return
-                except:
-                    pass
+                # Skip if same IP and same port (DISABLED for testing)
+                # import socket
+                # try:
+                #     my_ip = socket.gethostbyname(socket.gethostname())
+                #     if host == my_ip and port == self.port:
+                #         print(f"  Skipping self: {host}:{port}")
+                #         return
+                # except:
+                #     pass
                 
                 print(f"  Passed self-check, will connect to {address}")
                 print(f"📤 Connecting to {address}...")
