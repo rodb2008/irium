@@ -196,13 +196,29 @@ class P2PNode:
 
                 # Request blocks if peer is ahead
                 if peer.height > self.chain_height:
+                    print(f"  Peer is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
+                    # Request blocks from our height to their height
+                    from irium.protocol import GetBlocksMessage
+                    # Request blocks we're missing
+                    # For now, use genesis hash as start (TODO: use actual last block hash)
+                    genesis_hash = bytes.fromhex('cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000')
+                    count = min(500, peer.height - self.chain_height)  # Request up to 500 blocks
                     get_blocks = GetBlocksMessage(start_hash=genesis_hash, count=count)
                     await peer.send_message(get_blocks.to_message())
                     print(f"  📥 Requested blocks {self.chain_height + 1} to {peer.height}")
 
+                # Handle messages from this peer
+                task = asyncio.create_task(self._handle_peer_messages(peer))
+                self.message_tasks[address] = task
+
                 if self.on_peer_connected:
                     await self.on_peer_connected(peer)
+                
+                # Handle messages from this peer
+                task = asyncio.create_task(self._handle_peer_messages(peer))
+                self.message_tasks[address] = task
             else:
+                print(f"❌ Handshake failed with {address}")
                 print(f"  Debug: handshake returned False")
                 peer.close()
         
@@ -249,23 +265,14 @@ class P2PNode:
             # Register peer with their announced listening port
             peer_ip = peer.address.split(':')[0]
             peer_port = their_handshake.port if their_handshake.port > 0 else self.port
-            print(f"🔧 DEBUG: Peer announced port: {their_handshake.port}, using: {peer_port}")
             
             # Update peer.address to use announced port instead of ephemeral port
             corrected_address = f"{peer_ip}:{peer_port}"
             if corrected_address != peer.address:
-                print(f"🔧 DEBUG: Updating peer address from {peer.address} to {corrected_address}")
-                # Remove old address from peers dict
                 if peer.address in self.peers:
                     del self.peers[peer.address]
-                # Update peer object and re-add with correct address
                 peer.address = corrected_address
                 self.peers[corrected_address] = peer
-                # Update message task key
-                old_address = address
-                if old_address in self.message_tasks:
-                    self.message_tasks[corrected_address] = self.message_tasks.pop(old_address)
-                address = corrected_address
             
             multiaddr = f"/ip4/{peer_ip}/tcp/{peer_port}"
             self.peer_directory.register_connection(multiaddr, peer.agent)
@@ -497,6 +504,10 @@ class P2PNode:
                     get_blocks = GetBlocksMessage(start_hash=genesis_hash, count=count)
                     await peer.send_message(get_blocks.to_message())
                     print(f"  📥 Requested blocks {self.chain_height + 1} to {peer.height}")
+
+                # Handle messages from this peer
+                task = asyncio.create_task(self._handle_peer_messages(peer))
+                self.message_tasks[address] = task
 
                     if self.on_peer_connected:
                         await self.on_peer_connected(peer)
