@@ -63,7 +63,7 @@ def mine_single_block():
     print()
     
     # Create mining address
-    mining_address = "Q5uT1k6DR7WpxqYuiy7sQQXp8pYDx6U4eS"
+    # mining_address = "CHANGE_TO_YOUR_ADDRESS"  # TODO: Load from wallet
     print(f"💰 Mining to: {mining_address}")
     print(f"🎁 Block reward: 50 IRM")
     print()
