@@ -12,7 +12,7 @@ from irium.wallet import Wallet, KeyPair
 class IriumWalletAPI(BaseHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         self.wallet = Wallet()
-        self.wallet_file = "irium-wallet.json"
+        self.wallet_file = os.path.expanduser("~/.irium/irium-wallet.json")
         self.load_wallet()
         super().__init__(*args, **kwargs)
 
