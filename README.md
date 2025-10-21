@@ -1,6 +1,6 @@
 # Irium Blockchain
 
-> **🎉 NEW: v1.1.3 Released!** - Critical P2P sync fix. [Download now →](https://github.com/iriumlabs/irium/releases/tag/v1.1.3)
+> **🎉 NEW: v1.1.8 Released!** - Critical P2P sync fix. [Download now →](https://github.com/iriumlabs/irium/releases/tag/v1.1.8)
 
 # Irium Blockchain (IRM)
 
@@ -79,74 +79,75 @@ The coinbase transaction can include hash pointers to off-chain data, enabling t
 
 ---
 
-## Getting Started
+## 🚀 Quick Start (v1.1.8)
 
-### 1. Run a Full Node
+### 1. Download & Install
 
 ```bash
-# Clone repository
-git clone https://github.com/iriumlabs/irium.git
-cd irium
+# Download latest release
+wget https://iriumlabs.org/releases/v1.1.8/irium-bootstrap-v1.1.8.tar.gz
 
-# Install Python dependencies
-pip3 install qrcode[pil]
+# Extract
+tar -xzf irium-bootstrap-v1.1.8.tar.gz
+cd irium-bootstrap-v1.1.8
 
-# Start node (syncs with network)
-python3 scripts/irium-node.py
+# Install
+chmod +x install.sh
+./install.sh
 ```
 
-Your node will:
-- Connect to seed nodes
-- Download the blockchain
-- Validate all blocks
-- Participate in P2P network
-
-### 2. Create a Wallet
+### 2. Start Node
 
 ```bash
-# Create new wallet
+# Start as service (recommended)
+sudo systemctl start irium-node
+sudo systemctl enable irium-node
+
+# Check status
+sudo journalctl -u irium-node -f
+```
+
+### 3. Create Wallet
+
+```bash
 python3 scripts/irium-wallet-proper.py create
+# Save your address - mining rewards go here!
 ```
 
-This generates:
-- New IRM address (starts with Q or P)
-- Private key (WIF format)
-- Saved to `~/.irium/irium-wallet.json`
-
-**Important:** Back up your wallet file! If you lose it, you lose your coins.
-
-### 3. Start Mining
+### 4. Start Mining
 
 ```bash
-# Start mining to your wallet
-python3 scripts/irium-miner.py
+# Single-core
+sudo systemctl start irium-miner
+sudo systemctl enable irium-miner
+
+# Multi-core (4 cores)
+bash scripts/irium-miner-multicore.sh 4
 ```
 
-Your miner will:
-- Create block templates
-- Solve SHA-256d proof-of-work
-- Earn 50 IRM per block (current reward)
-- Broadcast blocks to network
-
-**Hardware Requirements:**
-- Any CPU can mine
-- GPU mining: Use existing Bitcoin SHA-256d miners
-- ASIC mining: Compatible with Bitcoin ASICs
-
-### 4. Send & Receive IRM
+### 5. Check Status
 
 ```bash
-# Check balance
-python3 scripts/irium-wallet-proper.py balance
+# Node status
+sudo journalctl -u irium-node -n 20
 
-# Send IRM
-python3 scripts/irium-wallet-proper.py send <address> <amount>
+# Mining progress
+sudo journalctl -u irium-miner -n 20
 
-# Generate QR code
-python3 scripts/irium-qrcode.py address <your_address>
+# Blockchain height
+ls ~/.irium/blocks/ | wc -l
 ```
 
----
+## ⚡ Update Existing Installation
+
+```bash
+cd ~/irium
+git pull origin main
+sudo systemctl restart irium-node
+sudo systemctl restart irium-miner
+```
+
+
 
 ## Network Information
 
