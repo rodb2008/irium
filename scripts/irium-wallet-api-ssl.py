@@ -109,7 +109,7 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
         self.wfile.write(html.encode())
 
     def send_wallet_status(self):
-        addresses = list(self.wallet.keys.keys())
+        addresses = list(self.wallet._keys.keys())
         response = {
             "status": "success",
             "data": {
@@ -122,7 +122,7 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
         self.send_json_response(response)
 
     def send_addresses(self):
-        addresses = list(self.wallet.keys.keys())
+        addresses = list(self.wallet._keys.keys())
         response = {
             "status": "success",
             "data": {
