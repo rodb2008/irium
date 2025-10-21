@@ -12,7 +12,24 @@ from irium.pow import Target
 BLOCKCHAIN_DIR = os.path.expanduser("~/.irium/blocks")
 WALLET_FILE = os.path.expanduser("~/.irium/irium-wallet.json")
 
-mining_address = "Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa"
+# Load mining address from wallet
+from irium.wallet import Wallet
+wallet = Wallet()
+if os.path.exists(WALLET_FILE):
+    wallet.load_from_file(WALLET_FILE)
+    addresses = wallet.get_addresses()
+    if addresses:
+        mining_address = addresses[0]
+    else:
+        print("❌ No addresses in wallet! Create one first:")
+        print("   python3 scripts/irium-wallet-proper.py create")
+        exit(1)
+else:
+    print("❌ Wallet not found! Create one first:")
+    print("   python3 scripts/irium-wallet-proper.py create")
+    exit(1)
+
+print(f"💰 Mining to: {mining_address}")
 
 while True:
     # Get current height
