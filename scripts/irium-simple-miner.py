@@ -12,11 +12,26 @@ from irium.pow import Target
 BLOCKCHAIN_DIR = os.path.expanduser("~/.irium/blocks")
 WALLET_FILE = os.path.expanduser("~/.irium/irium-wallet.json")
 
-# TODO: Load from wallet - for now using default address
-# Users should change this to their own address!
-mining_address = "Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa"
-print(f"⚠️  WARNING: Using default mining address: {mining_address}")
-print(f"   Change this in scripts/irium-simple-miner.py to YOUR address!")
+# Load mining address from wallet
+from irium.wallet import Wallet
+import json
+
+if not os.path.exists(WALLET_FILE):
+    print("❌ Wallet not found! Create one first:")
+    print("   python3 scripts/irium-wallet-proper.py create")
+    exit(1)
+
+# Load wallet from JSON
+with open(WALLET_FILE, 'r') as f:
+    wallet_data = json.load(f)
+    
+if not wallet_data.get('addresses'):
+    print("❌ No addresses in wallet! Create one:")
+    print("   python3 scripts/irium-wallet-proper.py create")
+    exit(1)
+
+mining_address = wallet_data['addresses'][0]
+print(f"💰 Mining to: {mining_address}")
 
 while True:
     # Get current height
