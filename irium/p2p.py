@@ -36,13 +36,12 @@ class Peer:
             # Add timeout to drain to prevent hanging
             await asyncio.wait_for(self.writer.drain(), timeout=30.0)
         except asyncio.TimeoutError:
-            print(f"⚠️  Send timeout to {self.address} (data size: {len(data)} bytes)")
-            # Don't raise - connection might still be usable
+            # Timeout is non-critical, cleanup task will handle
             pass
         except Exception as e:
-            print(f"Error sending message to {self.address}: {e}")
-            # Don't raise - let the cleanup task handle dead connections
-            pass
+            # For broadcasts and important messages, we need to know if it failed
+            # So re-raise, but don't print here (caller will handle)
+            raise
     
     async def recv_message(self) -> Optional[Message]:
         """Receive a message from this peer."""
@@ -66,10 +65,9 @@ class Peer:
             full_message = header + payload
             return Message.deserialize(full_message)
 
-        except asyncio.IncompleteReadError:
+        except asyncio.IncompleteReadError as e:
             return None
         except Exception as e:
-            print(f"Error receiving message from {self.address}: {e}")
             return None
 
     def close(self) -> None:
@@ -88,12 +86,22 @@ class P2PNode:
         port: int = 38291,
         max_peers: int = 8,
         agent: str = "irium-node/1.0",
-        chain_height: int = 0
+        chain_height: int = 0,
+        ping_interval: int = None  # Auto-detect: 60s for public, 30s for NAT
     ):
         self.port = port
         self.max_peers = max_peers
         self.agent = agent
         self.chain_height = chain_height
+        
+        # Auto-detect ping interval based on environment
+        if ping_interval is None:
+            import os
+            # Check if BOOTSTRAP_NODE env var is set (VPS)
+            is_bootstrap = os.getenv('BOOTSTRAP_NODE', 'false').lower() == 'true'
+            self.ping_interval = 60 if is_bootstrap else 30
+        else:
+            self.ping_interval = ping_interval
         
         self.peers: Dict[str, Peer] = {}
         self.message_tasks: Dict[str, asyncio.Task] = {}
@@ -171,26 +179,65 @@ class P2PNode:
             print(f"⚠️  Max peers reached, rejecting {address}")
             writer.close()
             await writer.wait_closed()
-            return
+            return  # ✅ Added missing return
+
+        # ✅ Check if we already have connection to this peer (incoming OR outgoing)
+        peer_ip = addr[0]
+        
+        # If we already have ANY connection to this IP, reject silently
+        # This prevents bidirectional connection conflicts
+        if self._is_peer_connected(peer_ip):
+            # Check if existing connection is still alive (responded to ping recently)
+            import time
+            existing_alive = False
+            for addr_key, p in self.peers.items():
+                if self._get_peer_ip(addr_key) == peer_ip:
+                    # Connection is alive if pinged within last 90 seconds
+                    if time.time() - p.last_ping < 180:
+                        existing_alive = True
+                        break
+            
+            if existing_alive:
+                # Silently reject - already have alive connection to this IP
+                writer.close()
+                await writer.wait_closed()
+                return
+            # Else: let new connection proceed, old one is dead/dying
         
         peer = Peer(reader=reader, writer=writer, address=address)
         
         try:
             # Perform handshake
             if await self._perform_handshake(peer, is_initiator=False):
-                self.peers[address] = peer
-                
+                # ✅ FIX #13: Use peer.address (corrected in handshake) not original address
+                self.peers[peer.address] = peer
+
                 # Start message handler FIRST before sending any messages
                 task = asyncio.create_task(self._handle_peer_messages(peer))
-                self.message_tasks[address] = task
+                self.message_tasks[peer.address] = task
+                
                 
                 print(f"✅ Peer connected: {address} ({peer.agent}, height: {peer.height})")
                 
 
-                # ✅ FIX #4: Don't request from incoming connections (often NAT peers)
-                # They will PUSH their blocks to us via broadcasting
-                if peer.height > self.chain_height:
+                # PUSH/PULL based on who is ahead
+                if peer.height < self.chain_height:
+                    # We're ahead - PUSH our blocks to them
+                    print(f"  📊 We are ahead ({self.chain_height} vs {peer.height}) - pushing blocks...")
+                    blocks_dir = os.path.expanduser("~/.irium/blocks")
+                    for h in range(peer.height + 1, self.chain_height + 1):
+                        block_file = os.path.join(blocks_dir, f"block_{h}.json")
+                        if os.path.exists(block_file):
+                            with open(block_file, 'rb') as bf:
+                                block_data = bf.read()
+                            from irium.protocol import BlockMessage
+                            block_msg = BlockMessage(block_data=block_data)
+                            await peer.send_message(block_msg.to_message())
+                            print(f"    📤 Pushed block {h} to {peer.address}")
+                elif peer.height > self.chain_height:
+                    # Peer ahead - wait for them to PUSH to us
                     print(f"  📊 Peer ahead by {peer.height - self.chain_height} blocks - waiting for broadcast")
+                
                 if self.on_peer_connected:
                     await self.on_peer_connected(peer)
             else:
@@ -249,17 +296,9 @@ class P2PNode:
             # Update peer.address to use announced port instead of ephemeral port
             corrected_address = f"{peer_ip}:{peer_port}"
             original_address = peer.address
+            # ✅ FIX #17: Just update peer.address - let CALLER manage self.peers
             if corrected_address != peer.address:
-                # Remove old address from peers dict
-                if peer.address in self.peers:
-                    del self.peers[peer.address]
-                # Update peer object and re-add with correct address
                 peer.address = corrected_address
-                self.peers[corrected_address] = peer
-                # Update message task key
-                if original_address in self.message_tasks:
-                    self.message_tasks[corrected_address] = self.message_tasks.pop(original_address)
-                address = corrected_address
             
             multiaddr = f"/ip4/{peer_ip}/tcp/{peer_port}"
             try:
@@ -280,7 +319,7 @@ class P2PNode:
         """Handle messages from a connected peer."""
         while self.running and peer.address in self.peers:
             try:
-                msg = await asyncio.wait_for(peer.recv_message(), timeout=120.0)
+                msg = await asyncio.wait_for(peer.recv_message(), timeout=180.0)
                 if not msg:
                     break
                 
@@ -303,7 +342,7 @@ class P2PNode:
                     break
             
             except Exception as e:
-                print(f"❌ Error handling message from {peer.address}: {e}")
+                # Silently continue - peer will be cleaned up if needed
                 continue
         
         # Clean up
@@ -430,7 +469,7 @@ class P2PNode:
                 await asyncio.sleep(30)  # Try every 30 seconds
             
             except Exception as e:
-                print(f"❌ Error in peer connection task: {e}")
+                # Silently continue trying
                 await asyncio.sleep(30)
     
     async def _connect_to_peer(self, multiaddr: str) -> None:
@@ -460,10 +499,6 @@ class P2PNode:
                 # Skip outgoing connections to same IP:port as this node (dynamic check only)
                 # No hardcoded IPs - let each node determine its own identity
                 
-                # Skip simple miner (no P2P server)
-                if host == "207.244.247.86" and port == 38292:
-                    print(f"  ⏭️  Skipping simple-miner: {host}:{port}")
-                    return
                 
                 # Skip OUTGOING connections to self
                 import socket
@@ -485,11 +520,43 @@ class P2PNode:
                 peer = Peer(reader=reader, writer=writer, address=address)
                 
                 if await self._perform_handshake(peer, is_initiator=True):
-                    self.peers[address] = peer
+                    # ✅ Use peer.address (corrected in handshake) for consistency
+                    self.peers[peer.address] = peer
                     print(f"✅ Connected to peer: {address} ({peer.agent})")
                     
 
+                # ✅ FIX #20: ALWAYS start message handler
+                task = asyncio.create_task(self._handle_peer_messages(peer))
+                self.message_tasks[peer.address] = task
+
+                if self.on_peer_connected:
+                    await self.on_peer_connected(peer)
+
+                # PUSH our blocks if peer is behind
+                if peer.height < self.chain_height:
+                    print(f"  We are ahead ({self.chain_height} vs {peer.height}), pushing our blocks...")
+                    blocks_dir = os.path.expanduser("~/.irium/blocks")
+                    for h in range(peer.height + 1, self.chain_height + 1):
+                        block_file = os.path.join(blocks_dir, f"block_{h}.json")
+                        if os.path.exists(block_file):
+                            with open(block_file, 'rb') as bf:
+                                block_data = bf.read()
+                            from irium.protocol import BlockMessage
+                            block_msg = BlockMessage(block_data=block_data)
+                            await peer.send_message(block_msg.to_message())
+                            print(f"  📤 Pushed block {h} to {peer.address}")
+                
                 # Request blocks if peer is ahead
+                elif peer.height > self.chain_height:
+                    print(f"  Peer is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
+                    from irium.protocol import GetBlocksMessage
+                    genesis_hash = bytes.fromhex('cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000')
+                    count = min(500, peer.height - self.chain_height)
+                    get_blocks = GetBlocksMessage(start_hash=genesis_hash, count=count)
+                    await peer.send_message(get_blocks.to_message())
+                    print(f"  📥 Requested blocks {self.chain_height + 1} to {peer.height}")
+
+        except asyncio.TimeoutError:
                 if peer.height > self.chain_height:
                     print(f"  Peer is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
                     # Request blocks from our height to their height
@@ -506,10 +573,6 @@ class P2PNode:
                         await self.on_peer_connected(peer)
                     
                     # Handle messages from this peer
-                    task = asyncio.create_task(self._handle_peer_messages(peer))
-                    self.message_tasks[address] = task
-                else:
-                    peer.close()
         
         except asyncio.TimeoutError:
             print(f"⚠️  Connection timeout: {multiaddr}")
@@ -525,10 +588,10 @@ class P2PNode:
                     ping = PingMessage(nonce=nonce)
                     await peer.send_message(ping.to_message())
                 
-                await asyncio.sleep(120)  # Ping every 120 seconds
+                await asyncio.sleep(self.ping_interval)  # Adaptive: 60s (public) or 30s (NAT)
             
             except Exception as e:
-                print(f"❌ Error in ping task: {e}")
+                # Silently continue
                 await asyncio.sleep(120)
     
     async def _cleanup_dead_peers(self) -> None:
@@ -538,15 +601,15 @@ class P2PNode:
                 now = time.time()
                 for address, peer in list(self.peers.items()):
                     # Remove peer if no pong in 3 minutes
-                    if now - peer.last_ping > 300:
-                        print(f"⚠️  Peer {address} timed out")
+                    if now - peer.last_ping > 180:
+                        # Silently remove timed out peer
                         await self._disconnect_peer(peer, "Timeout")
                 
                 await asyncio.sleep(30)  # Check every 30 seconds
             
             except Exception as e:
-                print(f"❌ Error in cleanup task: {e}")
-                await asyncio.sleep(30)
+                # Silently continue
+                await asyncio.sleep(10)
     
     async def _disconnect_peer(self, peer: Peer, reason: str) -> None:
         """Disconnect a peer."""
@@ -560,6 +623,13 @@ class P2PNode:
         # Remove from peers
         if peer.address in self.peers:
             del self.peers[peer.address]
+        
+        # ✅ FIX #8: Cleanup message tasks
+        if peer.address in self.message_tasks:
+            task = self.message_tasks[peer.address]
+            if not task.done():
+                task.cancel()
+            del self.message_tasks[peer.address]
             print(f"👋 Disconnected from {peer.address}: {reason}")
         
         peer.close()

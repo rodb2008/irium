@@ -287,7 +287,7 @@ class IriumMiner:
         print(f"\n🌐 Starting P2P networking on port {self.p2p_port}...")
         self.p2p = P2PNode(
             port=self.p2p_port,
-            max_peers=8,
+            max_peers=8000,
             agent="irium-miner/1.0",
             chain_height=self.chain_state.height
         )

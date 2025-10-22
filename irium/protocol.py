@@ -204,6 +204,62 @@ class TxMessage:
         return cls(tx_data=msg.payload)
 
 
+
+
+@dataclass
+class GetHeadersMessage:
+    """Request block headers (for SPV clients)."""
+    start_hash: bytes
+    count: int
+
+    def to_message(self) -> Message:
+        """Convert to generic Message."""
+        payload = struct.pack('!I', self.count) + self.start_hash
+        return Message(MessageType.GET_HEADERS, payload)
+
+    @classmethod
+    def from_message(cls, msg: Message) -> GetHeadersMessage:
+        """Parse from generic Message."""
+        count, = struct.unpack('!I', msg.payload[:4])
+        start_hash = msg.payload[4:]
+        return cls(start_hash=start_hash, count=count)
+
+
+@dataclass
+class HeadersMessage:
+    """Response with block headers."""
+    headers: bytes  # Serialized block headers
+
+    def to_message(self) -> Message:
+        """Convert to generic Message."""
+        return Message(MessageType.HEADERS, self.headers)
+
+    @classmethod
+    def from_message(cls, msg: Message) -> HeadersMessage:
+        """Parse from generic Message."""
+        return cls(headers=msg.payload)
+
+
+@dataclass
+class MempoolMessage:
+    """Mempool transaction list."""
+    tx_hashes: List[bytes]  # List of transaction hashes in mempool
+
+    def to_message(self) -> Message:
+        """Convert to generic Message."""
+        payload = json.dumps({
+            'tx_hashes': [h.hex() for h in self.tx_hashes]
+        }).encode('utf-8')
+        return Message(MessageType.MEMPOOL, payload)
+
+    @classmethod
+    def from_message(cls, msg: Message) -> MempoolMessage:
+        """Parse from generic Message."""
+        data = json.loads(msg.payload.decode('utf-8'))
+        tx_hashes = [bytes.fromhex(h) for h in data['tx_hashes']]
+        return cls(tx_hashes=tx_hashes)
+
+
 @dataclass
 class DisconnectMessage:
     """Disconnect notification."""

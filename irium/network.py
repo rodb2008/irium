@@ -71,7 +71,9 @@ class SeedlistManager:
     def merged_seedlist(self) -> Iterable[str]:
         # Bootstrap node check: skip runtime seedlist to prevent outgoing connections
         import os
-        env_file = os.path.expanduser("/home/irium/irium/.env")
+        # Find .env relative to this file's location
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        env_file = os.path.join(script_dir, '..', '.env')
         if os.path.exists(env_file):
             with open(env_file, "r") as f:
                 if "BOOTSTRAP_NODE=true" in f.read():

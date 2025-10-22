@@ -408,9 +408,16 @@ Transactions are organized in a merkle tree:
 
 **Configuration:**
 - Default port: 38291
-- Max peers: 8 per node
-- Ping interval: 60 seconds
-- Timeout: 180 seconds
+- Max peers: 8000 per node (production-optimized for network scale)
+- Ping interval: 60 seconds (public nodes), 30 seconds (NAT nodes for keepalive)
+- Peer timeout: 180 seconds
+- Message timeout: 180 seconds
+- Cleanup check: 30 seconds
+
+**NAT Traversal:**
+- Nodes behind NAT use 30-second ping interval to maintain session keepalive
+- Public nodes use 60-second interval for efficiency
+- Both configurations fully compatible and interoperable
 
 **Security:**
 - Sybil-resistant handshake
