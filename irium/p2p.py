@@ -108,6 +108,18 @@ class P2PNode:
         # Peer management
         self.peer_directory = PeerDirectory()
         self.seedlist_manager = SeedlistManager()
+
+    def _get_peer_ip(self, address: str) -> str:
+        """Extract IP from address string (IP:PORT)."""
+        return address.split(':')[0]
+
+    def _is_peer_connected(self, ip: str) -> bool:
+        """Check if we're already connected to this IP (any port)."""
+        for peer_addr in self.peers.keys():
+            if self._get_peer_ip(peer_addr) == ip:
+                return True
+        return False
+
     
     async def start(self) -> None:
         """Start the P2P node."""
@@ -127,26 +139,7 @@ class P2PNode:
         asyncio.create_task(self._connect_to_peers())
         asyncio.create_task(self._ping_peers())
         asyncio.create_task(self._cleanup_dead_peers())
-        asyncio.create_task(self._periodic_sync_check())
     
-    async def _periodic_sync_check(self) -> None:
-        """Periodically check if connected peers are ahead and request blocks."""
-        while self.running:
-            await asyncio.sleep(60)  # Check every 60 seconds
-            
-            for peer in list(self.peers.values()):
-                if peer.height > self.chain_height:
-                    print(f"🔄 Periodic check: Peer {peer.address} is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
-                    try:
-                        from irium.protocol import GetBlocksMessage
-                        genesis_hash = bytes.fromhex('cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000')
-                        count = min(500, peer.height - self.chain_height)
-                        get_blocks = GetBlocksMessage(start_hash=genesis_hash, count=count)
-                        await peer.send_message(get_blocks.to_message())
-                        print(f"  📥 Requested {count} blocks from {peer.address}")
-                    except Exception as e:
-                        print(f"  ⚠️  Error requesting blocks: {e}")
-
     async def stop(self) -> None:
         """Stop the P2P node."""
         print("🛑 Stopping P2P Node...")
@@ -194,18 +187,13 @@ class P2PNode:
                 print(f"✅ Peer connected: {address} ({peer.agent}, height: {peer.height})")
                 
 
-                # Request blocks if peer is ahead
+                # ✅ FIX #4: Don't request from incoming connections (often NAT peers)
+                # They will PUSH their blocks to us via broadcasting
                 if peer.height > self.chain_height:
-                    genesis_hash = bytes.fromhex('cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000')
-                    count = min(500, peer.height - self.chain_height)
-                    get_blocks = GetBlocksMessage(start_hash=genesis_hash, count=count)
-                    await peer.send_message(get_blocks.to_message())
-                    print(f"  📥 Requested blocks {self.chain_height + 1} to {peer.height}")
-
+                    print(f"  📊 Peer ahead by {peer.height - self.chain_height} blocks - waiting for broadcast")
                 if self.on_peer_connected:
                     await self.on_peer_connected(peer)
             else:
-                print(f"  Debug: handshake returned False")
                 peer.close()
         
         except Exception as e:
@@ -257,13 +245,11 @@ class P2PNode:
             # Register peer with their announced listening port
             peer_ip = peer.address.split(':')[0]
             peer_port = their_handshake.port if their_handshake.port > 0 else self.port
-            print(f"🔧 DEBUG: Peer announced port: {their_handshake.port}, using: {peer_port}")
             
             # Update peer.address to use announced port instead of ephemeral port
             corrected_address = f"{peer_ip}:{peer_port}"
             original_address = peer.address
             if corrected_address != peer.address:
-                print(f"🔧 DEBUG: Updating peer address from {peer.address} to {corrected_address}")
                 # Remove old address from peers dict
                 if peer.address in self.peers:
                     del self.peers[peer.address]
@@ -292,14 +278,10 @@ class P2PNode:
     
     async def _handle_peer_messages(self, peer: Peer) -> None:
         """Handle messages from a connected peer."""
-        print(f"🔧 DEBUG: Starting message handler for {peer.address}")
         while self.running and peer.address in self.peers:
-            print(f"🔧 DEBUG: Waiting for message from {peer.address}...")
             try:
                 msg = await asyncio.wait_for(peer.recv_message(), timeout=120.0)
-                print(f"🔧 DEBUG: Received message type {msg.msg_type if msg else 'None'} from {peer.address}")
                 if not msg:
-                    print(f"🔧 DEBUG: No message received from {peer.address}, closing connection")
                     break
                 
                 # Handle different message types
@@ -397,21 +379,33 @@ class P2PNode:
         """Handle block message."""
         if self.on_block:
             block_msg = BlockMessage.from_message(msg)
-            
+
             # Try to extract block height to update peer height
             try:
                 import json
                 block_data = json.loads(block_msg.block_data.decode('utf-8'))
                 block_height = block_data.get('height', 0)
+
+                # Save block via callback
+                await self.on_block(peer, block_msg.block_data)
                 
-                # Only update peer height if we successfully save the block
-                # Don't auto-request more blocks here - causes infinite loop if block is invalid
-                # Peer height will be updated by the callback if block is valid
-            except:
-                pass
-            
-            await self.on_block(peer, block_msg.block_data)
-    
+                # ✅ FIX #1: Re-broadcast block to all other peers (PUSH model)
+                broadcast_count = 0
+                for other_peer in list(self.peers.values()):
+                    if other_peer.address == peer.address:
+                        continue  # Don't send back to sender
+                    try:
+                        await other_peer.send_message(msg)
+                        broadcast_count += 1
+                    except Exception as e:
+                        print(f"  ⚠️  Failed to relay block to {other_peer.address}: {e}")
+                
+                if broadcast_count > 0:
+                    print(f"  📡 Block {block_height} relayed to {broadcast_count} peers")
+                
+            except Exception as e:
+                print(f"  ⚠️  Error processing block: {e}")
+
     async def _handle_tx(self, peer: Peer, msg: Message) -> None:
         """Handle transaction message."""
         if self.on_tx:
@@ -481,7 +475,6 @@ class P2PNode:
                 except:
                     pass
                 
-                print(f"  Passed self-check, will connect to {address}")
                 print(f"📤 Connecting to {address}...")
                 
                 reader, writer = await asyncio.wait_for(
