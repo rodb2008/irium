@@ -79,17 +79,17 @@ The coinbase transaction can include hash pointers to off-chain data, enabling t
 
 ---
 
-## 🚀 Quick Start (v1.1.9)
+## 🚀 Quick Start (v1.2.0)
 
 ### 1. Download & Install
 
 ```bash
 # Download latest release
-wget https://iriumlabs.org/releases/v1.1.9/irium-bootstrap-v1.1.9.tar.gz
+wget https://iriumlabs.org/releases/v1.2.0/irium-bootstrap-v1.2.0.tar.gz
 
 # Extract
-tar -xzf irium-bootstrap-v1.1.9.tar.gz
-cd irium-bootstrap-v1.1.9
+tar -xzf irium-bootstrap-v1.2.0.tar.gz
+cd irium-bootstrap-v1.2.0
 
 # Install
 chmod +x install.sh
