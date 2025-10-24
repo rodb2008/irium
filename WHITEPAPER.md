@@ -553,8 +553,8 @@ Nodes maintain a dynamic peer list (`bootstrap/seedlist.runtime`):
 - Ready for miners and users
 
 **Public Services:**
-- Explorer: https://api.iriumlabs.org/api
-- Wallet API: https://api.iriumlabs.org/wallet
+- [Explorer API](https://api.iriumlabs.org/api) - Blockchain statistics and block data
+- [Wallet API](https://api.iriumlabs.org/wallet) - Wallet management and documentation
 - P2P Network: 207.244.247.86:38291
 
 ---

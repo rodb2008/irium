@@ -374,7 +374,7 @@ Use Irium for payments:
 ## Community & Support
 
 - **GitHub:** https://github.com/iriumlabs/irium
-- **Explorer:** https://api.iriumlabs.org/api
+- **Explorer API:** [https://api.iriumlabs.org/api](https://api.iriumlabs.org/api)
 - **Email:** info@iriumlabs.org
 
 ---
