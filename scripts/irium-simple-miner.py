@@ -57,7 +57,7 @@ while True:
     coinbase = Transaction(
         version=1,
         inputs=[TxInput(prev_txid=bytes(32), prev_index=0xFFFFFFFF, script_sig=f"Block {height}".encode())],
-        outputs=[TxOutput(amount=reward, script_pubkey=mining_address.encode())],
+        outputs=[TxOutput(value=reward, script_pubkey=mining_address.encode())],
         locktime=0
     )
 
@@ -65,8 +65,8 @@ while True:
     header = BlockHeader(
         version=1,
         prev_hash=prev_hash,
-        merkle_root=coinbase.hash(),
-        timestamp=int(time.time()),
+        merkle_root=coinbase.txid(),
+        time=int(time.time()),
         bits=0x1d00ffff,
         nonce=0
     )
@@ -77,7 +77,7 @@ while True:
     
     while True:
         h = header.hash()
-        if int.from_bytes(h, 'big') < Target(header.bits).value:
+        if int.from_bytes(h, 'big') < Target(header.bits).to_target():
             print(f"✅ Found block {height}! Hash: {h[::-1].hex()}")
             
             block_file = f"{BLOCKCHAIN_DIR}/block_{height}.json"
@@ -92,10 +92,10 @@ while True:
                     'hash': h[::-1].hex(),
                     'prev_hash': prev_hash[::-1].hex(),
                     'merkle_root': header.merkle_root[::-1].hex(),
-                    'timestamp': header.timestamp,
+                    'timestamp': header.time,
                     'bits': header.bits,
                     'nonce': header.nonce,
-                    'transactions': [coinbase.to_dict()],
+                    'transactions': [{'txid': coinbase.txid().hex(), 'data': coinbase.serialize().hex()}],
                     'miner_address': mining_address
                 }, f, indent=2)
             print(f"💾 Saved to {block_file}")

@@ -12,7 +12,7 @@ pkill -f irium-simple-miner.py
 
 # Start simple miners (no P2P)
 for i in $(seq 1 $CORES); do
-    nohup python3 scripts/irium-simple-miner.py > /tmp/miner-$i.log 2>&1 &
+    nohup python3 -u scripts/irium-simple-miner.py > /tmp/miner-$i.log 2>&1 &
     echo "  ✅ Miner $i started (PID: $!, log: /tmp/miner-$i.log)"
     sleep 0.5
 done
