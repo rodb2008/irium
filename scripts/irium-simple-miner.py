@@ -53,7 +53,7 @@ while True:
     # Create coinbase
     halvings = (height - 1) // 210000
     reward = 5000000000 >> halvings
-    
+
     coinbase = Transaction(
         version=1,
         inputs=[TxInput(prev_txid=bytes(32), prev_index=0xFFFFFFFF, script_sig=f"Block {height}".encode())],
@@ -71,20 +71,20 @@ while True:
         nonce=0
     )
 
-    # Mine with periodic height checks
-    nonce_counter = 0
-    check_interval = 10000  # Check for new blocks every 10k nonces
-    
+    # Mine with TIME-BASED height checks (every 1 second)
+    last_check_time = time.time()
+    check_interval = 1.0  # Check every 1 second
+
     while True:
         h = header.hash()
         if int.from_bytes(h, 'big') < Target(header.bits).to_target():
             print(f"✅ Found block {height}! Hash: {h[::-1].hex()}")
-            
+
             block_file = f"{BLOCKCHAIN_DIR}/block_{height}.json"
             if os.path.exists(block_file):
                 print(f"⚠️  Block {height} already exists (another miner was faster)")
                 break
-            
+
             # Save block
             with open(block_file, 'w') as f:
                 json.dump({
@@ -100,12 +100,13 @@ while True:
                 }, f, indent=2)
             print(f"💾 Saved to {block_file}")
             break
-        
+
         header.nonce += 1
-        nonce_counter += 1
-        
-        # Check if another miner found this block (every 10k nonces)
-        if nonce_counter % check_interval == 0:
+
+        # TIME-BASED check (every 1 second)
+        current_time = time.time()
+        if current_time - last_check_time >= check_interval:
+            last_check_time = current_time
             current_height = get_current_height()
             if current_height > height:
                 print(f"⚠️  Block {height} found by another miner! Moving to {current_height}")
