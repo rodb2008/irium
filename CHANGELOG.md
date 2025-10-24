@@ -45,3 +45,12 @@ See individual RELEASE_NOTES_*.md files for detailed information.
   - Miners now stop immediately when another core finds the block
   - Dramatically improved multicore mining efficiency
 
+
+### Fixed (Time-Based Coordination)
+- **CRITICAL: Changed multicore coordination from nonce-based to time-based**
+  - Previous: Checked every 10k nonces (ineffective, miners worked on stale blocks)
+  - New: Check every 1 second (guaranteed coordination)
+  - Result: Miners detect new blocks within 1 second, stop immediately
+  - Maximum coordination delay: 1s miner check + 5s node rescan = 6 seconds
+  - Eliminates "block already exists" messages completely
+
