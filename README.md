@@ -1,6 +1,6 @@
 # Irium Blockchain
 
-> **🎉 NEW: v1.1.9 Released!** - Critical P2P sync fix. [Download now →](https://github.com/iriumlabs/irium/releases/tag/v1.1.9)
+> **🎉 NEW: v1.2.0 Released!** - P2P Network Resilience & NAT Stability. [Download now →](https://github.com/iriumlabs/irium/releases/tag/v1.2.0)
 
 # Irium Blockchain (IRM)
 

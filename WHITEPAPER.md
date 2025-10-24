@@ -495,6 +495,36 @@ Transactions are organized in a merkle tree:
 - ✅ Binary message protocol
 - ✅ Peer discovery and management
 - ✅ Block propagation
+
+**P2P Network Architecture:**
+- ✅ Binary message protocol (13 message types)
+- ✅ Peer discovery and management (runtime seedlist)
+- ✅ Block propagation (PUSH-based broadcasting)
+- ✅ Transaction broadcasting
+- ✅ Handshake and adaptive keepalive (60s public, 30s NAT)
+- ✅ NAT traversal support (outbound connections)
+- ✅ IP:PORT deduplication (multi-service support)
+- ✅ Self-connection detection (public IP aware)
+
+**NAT Support:**
+
+Irium fully supports nodes behind NAT/firewalls (same as Bitcoin):
+
+- **NAT Nodes:** Can mine, sync, and broadcast via outbound connections
+- **Public Nodes:** Accept inbound connections, help bootstrap network
+- **Network Topology:** Mesh network through public nodes
+- **Limitation:** NAT-to-NAT direct connections not possible (network limitation)
+
+The network requires at least one public bootstrap node. Current bootstrap:
+- VPS: 207.244.247.86:38291 (mainnet seed node)
+
+**Runtime Seedlist:**
+
+Nodes maintain a dynamic peer list (`bootstrap/seedlist.runtime`):
+- Automatically saves discovered peers (incoming + outgoing)
+- Persists between restarts for network resilience
+- Enables decentralized peer discovery
+- Reduces dependency on hardcoded bootstrap nodes
 - ✅ Transaction broadcasting
 - ✅ Handshake and keepalive
 

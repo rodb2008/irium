@@ -117,3 +117,36 @@ curl -X POST https://api.iriumlabs.org/wallet/new-address
 ```
 https://api.iriumlabs.org/
 ```
+
+## NAT & Firewall Support
+
+**Irium works behind NAT/firewalls!** (Same as Bitcoin)
+
+### NAT Nodes (No Port Forwarding Required)
+- ✅ Can sync blockchain
+- ✅ Can mine blocks
+- ✅ Can broadcast transactions
+- ✅ Connect outbound to public nodes
+- ⚠️ Cannot accept incoming connections
+
+### Public Nodes (Port Forwarding Enabled)
+- ✅ All NAT node features PLUS
+- ✅ Accept incoming connections
+- ✅ Help bootstrap the network
+- ✅ Improve network resilience
+
+### Network Requirements
+- **Minimum:** 1 public bootstrap node (VPS: 207.244.247.86)
+- **Recommended:** Multiple public nodes for redundancy
+- **NAT nodes:** Unlimited (connect via public nodes)
+
+### Testing Your Node
+```bash
+# Check peer connections
+journalctl -u irium-node -n 20 | grep "peers connected"
+
+# If you see 1+ peers, you're connected! ✅
+# NAT nodes typically connect to 2-3 public peers
+```
+
+**Note:** NAT-to-NAT direct connections are not possible (same limitation as Bitcoin).
