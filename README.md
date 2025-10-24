@@ -198,13 +198,13 @@ Interactive wallet management and documentation:
 
 ```bash
 # Access wallet API documentation
-curl https://api.iriumlabs.org/wallet/
+curl https://207.244.247.86:8080/
 
 # Get wallet balance
-curl https://api.iriumlabs.org/wallet/balance
+curl https://207.244.247.86:8080/api/wallet/balance
 
 # Create new address
-curl -X POST https://api.iriumlabs.org/wallet/new-address
+curl -X POST https://207.244.247.86:8080/new-address
 ```
 
 **Available Endpoints:**
@@ -250,13 +250,13 @@ Interactive wallet management and documentation:
 
 ```bash
 # Access wallet API documentation
-curl https://api.iriumlabs.org/wallet/
+curl https://207.244.247.86:8080/
 
 # Get wallet balance
-curl https://api.iriumlabs.org/wallet/balance
+curl https://207.244.247.86:8080/api/wallet/balance
 
 # Create new address
-curl -X POST https://api.iriumlabs.org/wallet/new-address
+curl -X POST https://207.244.247.86:8080/new-address
 ```
 
 **Available Endpoints:**
