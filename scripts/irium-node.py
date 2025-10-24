@@ -202,11 +202,11 @@ class IriumNode:
         # Start P2P networking
         await self.p2p.start()
 
-        # Periodic block rescan (every 30 seconds)
+        # Periodic block rescan (every 5 seconds)
         async def rescan_blocks():
             """Periodically rescan blocks directory for new blocks."""
             while True:
-                await asyncio.sleep(30)  # Check every 30 seconds
+                await asyncio.sleep(5)  # Check every 5 seconds
                 
                 blocks_dir = os.path.expanduser("~/.irium/blocks")
                 if os.path.exists(blocks_dir):
@@ -255,7 +255,7 @@ class IriumNode:
         print("🔄 Entering main status loop...")
         while self.running:
             print("💓 Heartbeat - node is running")
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
             
             # Print status
             peer_count = self.p2p.get_peer_count()

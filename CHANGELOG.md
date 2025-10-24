@@ -2,6 +2,31 @@
 
 All notable changes to the Irium blockchain will be documented in this file.
 
+## [v1.2.0] - 2025-10-24
+
+### Added
+- Runtime seedlist registration (incoming + outgoing peers)
+- Block relay spam prevention (tracking system)
+- Self-connection detection (public IP support)
+- Nginx API configuration for Explorer and Wallet APIs
+- NAT environment full support verification
+
+### Fixed
+- IP:PORT deduplication (was IP-only, now IP:PORT)
+- Peer height tracking after block reception
+- Block relay spam loop
+- Self-connection detection for NAT nodes
+
+### Changed
+- API Infrastructure: All endpoints documented and verified
+- Documentation: Updated README, QUICKSTART, WHITEPAPER with NAT details
+- Repository: Cleaned up website assets (moved to gh-pages)
+
+### Verified
+- NAT miners fully functional (same as Bitcoin behavior)
+- 4+ stable peer connections in production
+- Block propagation across mixed public/NAT topology
+
 ## [v1.1.9] - 2025-10-22
 
 ### Added
@@ -34,4 +59,4 @@ All notable changes to the Irium blockchain will be documented in this file.
 
 ---
 
-See individual RELEASE_NOTES_*.md files for detailed information.
+See individual RELEASE_NOTES_*.md and CHANGELOG_v*.txt files for detailed information.
