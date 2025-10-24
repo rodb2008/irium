@@ -38,3 +38,11 @@ __pycache__/
 # State/runtime data
 state/
 .env
+
+# Website assets (served from gh-pages branch)
+whitepaper.html
+script.js
+*-og-image.png
+
+# Runtime state files
+state/peers.json
