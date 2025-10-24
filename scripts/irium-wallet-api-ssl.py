@@ -98,7 +98,7 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
     <h2>Links:</h2>
     <ul>
         <li><a href="https://github.com/iriumlabs/irium">GitHub Repository</a></li>
-        <li><a href="http://207.244.247.86:8082/api/stats">Explorer API</a></li>
+        <li><a href="/api/stats">API Documentation</a></li>
     </ul>
 </body>
 </html>"""
@@ -183,8 +183,8 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
                 "network": "irium-mainnet",
                 "ticker": "IRM",
                 "ssl_enabled": True,
-                "endpoint": "https://207.244.247.86/api",
-                "logo_url": "http://207.244.247.86:8080/irium-logo-wallet.svg"
+                "endpoint": "/wallet",
+                "logo_url": "/irium-logo-wallet.svg"
             }
         }
         self.send_json_response(response)

@@ -84,3 +84,36 @@ Everyone is waiting for the next block to be mined (~6 hours average).
 - Your node requests and downloads the block
 
 No manual intervention needed! 🚀
+
+## API Usage
+
+### Explorer API Examples
+
+```bash
+# Check network status
+curl https://api.iriumlabs.org/api/stats
+
+# Get latest block
+curl https://api.iriumlabs.org/api/block/1
+
+# Get recent blocks
+curl https://api.iriumlabs.org/api/blocks?limit=5
+```
+
+### Wallet API Examples
+
+```bash
+# Access interactive documentation
+curl https://api.iriumlabs.org/wallet/
+
+# Check balance via API
+curl https://api.iriumlabs.org/wallet/balance
+
+# Create new address via API
+curl -X POST https://api.iriumlabs.org/wallet/new-address
+```
+
+### API Base URL
+```
+https://api.iriumlabs.org/
+```

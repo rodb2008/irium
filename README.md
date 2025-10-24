@@ -1,13 +1,13 @@
 # Irium Blockchain
 
-> **🎉 NEW: v1.1.8 Released!** - Critical P2P sync fix. [Download now →](https://github.com/iriumlabs/irium/releases/tag/v1.1.8)
+> **🎉 NEW: v1.1.9 Released!** - Critical P2P sync fix. [Download now →](https://github.com/iriumlabs/irium/releases/tag/v1.1.9)
 
 # Irium Blockchain (IRM)
 
 **A next-generation proof-of-work blockchain designed for true decentralization**
 
 [![Network](https://img.shields.io/badge/network-mainnet-green.svg)](https://github.com/iriumlabs/irium)
-[![Status](https://img.shields.io/badge/status-live-brightgreen.svg)](http://207.244.247.86:8082/api/stats)
+[![Status](https://img.shields.io/badge/status-live-brightgreen.svg)](https://api.iriumlabs.org/api/stats)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ---
@@ -79,17 +79,17 @@ The coinbase transaction can include hash pointers to off-chain data, enabling t
 
 ---
 
-## 🚀 Quick Start (v1.1.8)
+## 🚀 Quick Start (v1.1.9)
 
 ### 1. Download & Install
 
 ```bash
 # Download latest release
-wget https://iriumlabs.org/releases/v1.1.8/irium-bootstrap-v1.1.8.tar.gz
+wget https://iriumlabs.org/releases/v1.1.9/irium-bootstrap-v1.1.9.tar.gz
 
 # Extract
-tar -xzf irium-bootstrap-v1.1.8.tar.gz
-cd irium-bootstrap-v1.1.8
+tar -xzf irium-bootstrap-v1.1.9.tar.gz
+cd irium-bootstrap-v1.1.9
 
 # Install
 chmod +x install.sh
@@ -163,27 +163,116 @@ sudo systemctl restart irium-miner
 - Services: Operational ✅
 - P2P Peers: Growing 🌱
 
-### Public Services
+### 🌐 **API Base URL**
+## API Endpoints
 
-**Explorer API:**
+Irium provides REST APIs for blockchain exploration and wallet management:
+
+### 🌐 **API Base URL**
+```
+https://api.iriumlabs.org/
+```
+
+### 📊 **Explorer API**
+Get real-time blockchain statistics and block information:
+
 ```bash
-# Get blockchain stats
-curl http://207.244.247.86:8082/api/stats
+# Get network stats
+curl https://api.iriumlabs.org/api/stats
+
+# Get block by height
+curl https://api.iriumlabs.org/api/block/1
 
 # Get latest blocks
-curl http://207.244.247.86:8082/api/latest?count=10
+curl https://api.iriumlabs.org/api/blocks?limit=10
 ```
 
-**Wallet API:**
+**Available Endpoints:**
+- `GET /api/stats` - Network statistics
+- `GET /api/block/{height}` - Get block by height
+- `GET /api/blocks?limit=N` - Get latest N blocks
+- `GET /api/transaction/{txid}` - Get transaction details
+
+### 💰 **Wallet API**
+Interactive wallet management and documentation:
+
 ```bash
-# Get network info
-curl http://207.244.247.86:8080/api/network/info
+# Access wallet API documentation
+curl https://api.iriumlabs.org/wallet/
 
-# Get wallet status
-curl http://207.244.247.86:8080/api/wallet/status
+# Get wallet balance
+curl https://api.iriumlabs.org/wallet/balance
+
+# Create new address
+curl -X POST https://api.iriumlabs.org/wallet/new-address
 ```
 
----
+**Available Endpoints:**
+- `GET /wallet/` - Interactive API documentation
+- `GET /wallet/balance` - Get wallet balance
+- `POST /wallet/new-address` - Create new address
+- `POST /wallet/send` - Send transaction
+
+### 🎨 **Assets**
+- **Logo:** `https://api.iriumlabs.org/irium-logo-wallet.svg`
+- **API Root:** `https://api.iriumlabs.org/` (returns API info)
+
+### 🔒 **Security**
+- All APIs use HTTPS with SSL certificates
+- CORS enabled for cross-origin requests
+- Rate limiting and caching headers included
+```
+https://api.iriumlabs.org/
+```
+
+### 📊 **Explorer API**
+Get real-time blockchain statistics and block information:
+
+```bash
+# Get network stats
+curl https://api.iriumlabs.org/api/stats
+
+# Get block by height
+curl https://api.iriumlabs.org/api/block/1
+
+# Get latest blocks
+curl https://api.iriumlabs.org/api/blocks?limit=10
+```
+
+**Available Endpoints:**
+- `GET /api/stats` - Network statistics
+- `GET /api/block/{height}` - Get block by height
+- `GET /api/blocks?limit=N` - Get latest N blocks
+- `GET /api/transaction/{txid}` - Get transaction details
+
+### 💰 **Wallet API**
+Interactive wallet management and documentation:
+
+```bash
+# Access wallet API documentation
+curl https://api.iriumlabs.org/wallet/
+
+# Get wallet balance
+curl https://api.iriumlabs.org/wallet/balance
+
+# Create new address
+curl -X POST https://api.iriumlabs.org/wallet/new-address
+```
+
+**Available Endpoints:**
+- `GET /wallet/` - Interactive API documentation
+- `GET /wallet/balance` - Get wallet balance
+- `POST /wallet/new-address` - Create new address
+- `POST /wallet/send` - Send transaction
+
+### 🎨 **Assets**
+- **Logo:** `https://api.iriumlabs.org/irium-logo-wallet.svg`
+- **API Root:** `https://api.iriumlabs.org/` (returns API info)
+
+### 🔒 **Security**
+- All APIs use HTTPS with SSL certificates
+- CORS enabled for cross-origin requests
+- Rate limiting and caching headers included
 
 ## Documentation
 
@@ -285,7 +374,7 @@ Use Irium for payments:
 ## Community & Support
 
 - **GitHub:** https://github.com/iriumlabs/irium
-- **Explorer:** http://207.244.247.86:8082
+- **Explorer:** https://api.iriumlabs.org/api
 - **Email:** info@iriumlabs.org
 
 ---

@@ -523,8 +523,8 @@ Transactions are organized in a merkle tree:
 - Ready for miners and users
 
 **Public Services:**
-- Explorer: http://207.244.247.86:8082
-- Wallet API: http://207.244.247.86:8080
+- Explorer: https://api.iriumlabs.org/api
+- Wallet API: https://api.iriumlabs.org/wallet
 - P2P Network: 207.244.247.86:38291
 
 ---

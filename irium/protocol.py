@@ -142,18 +142,17 @@ class GetPeersMessage:
 class PeersMessage:
     """Response with peer list."""
     peers: List[str]  # List of multiaddrs
-    
+
     def to_message(self) -> Message:
         """Convert to generic Message."""
         payload = json.dumps({'peers': self.peers}).encode('utf-8')
         return Message(MessageType.PEERS, payload)
-    
+
     @classmethod
     def from_message(cls, msg: Message) -> PeersMessage:
         """Parse from generic Message."""
         data = json.loads(msg.payload.decode('utf-8'))
         return cls(peers=data['peers'])
-
 
 @dataclass
 class GetBlocksMessage:
