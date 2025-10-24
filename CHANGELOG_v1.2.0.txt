@@ -66,3 +66,9 @@ UPGRADE NOTES:
 - Runtime seedlist will auto-populate on first run
 - No configuration changes required
 - Recommended for all nodes
+
+## Infrastructure Fixes (Post-Release)
+- Fixed nginx proxy configuration for Explorer API
+- Added trailing slash handling for /api/ endpoint
+- Added rewrite rule to normalize API URLs
+- All API endpoints now accessible from documentation links
