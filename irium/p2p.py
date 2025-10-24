@@ -147,6 +147,7 @@ class P2PNode:
         asyncio.create_task(self._connect_to_peers())
         asyncio.create_task(self._ping_peers())
         asyncio.create_task(self._cleanup_dead_peers())
+        asyncio.create_task(self._discover_peers())
     
     async def stop(self) -> None:
         """Stop the P2P node."""
@@ -218,6 +219,14 @@ class P2PNode:
                 
                 
                 print(f"✅ Peer connected: {address} ({peer.agent}, height: {peer.height})")
+
+                # Share our peer list with new connections
+                peer_list = [p.address for p in self.peers.values() if p.address != peer.address]
+                if len(peer_list) > 0:
+                    peers_msg = PeersMessage(peers=peer_list[:50])
+                    await peer.send_message(peers_msg.to_message())
+                    print(f"  📤 Shared {len(peer_list)} peers with {peer.address}")
+
                 
 
                 # PUSH/PULL based on who is ahead
@@ -359,17 +368,37 @@ class P2PNode:
         peer.last_ping = time.time()
     
     async def _handle_get_peers(self, peer: Peer) -> None:
+        print(f"🔍 VPS: Received GET_PEERS request from {peer.address}")
         """Handle get peers request."""
         # Send list of known peers
         peer_list = [p.address for p in self.peers.values() if p.address != peer.address]
         peers_msg = PeersMessage(peers=peer_list[:50])  # Limit to 50
+        print(f"📤 VPS: Sending {len(peer_list)} peers to {peer.address}: {peer_list}")
         await peer.send_message(peers_msg.to_message())
     
     async def _handle_peers(self, peer: Peer, msg: Message) -> None:
         """Handle peers message."""
         peers_msg = PeersMessage.from_message(msg)
         print(f"📋 Received {len(peers_msg.peers)} peers from {peer.address}")
-        # Could connect to these peers
+        
+        # Connect to discovered peers
+        for peer_addr in peers_msg.peers:
+            try:
+                # Skip if we already have this peer
+                if self._is_peer_connected(peer_addr):
+                    continue
+                
+                # Skip if we're at max peers
+                if len(self.peers) >= self.max_peers:
+                    continue
+                
+                # Connect to the new peer
+                print(f"🔗 Connecting to discovered peer: {peer_addr}")
+                await self._connect_to_peer(peer_addr)
+                
+            except Exception as e:
+                # Show connection failures for debugging
+                print(f"  ❌ Failed to connect to {peer_addr}: {e}")
     
 
     async def _handle_get_blocks(self, peer: Peer, msg: Message) -> None:
@@ -610,7 +639,28 @@ class P2PNode:
             except Exception as e:
                 # Silently continue
                 await asyncio.sleep(10)
-    
+
+    async def _discover_peers(self) -> None:
+        """Background task to discover new peers."""
+        while self.running:
+            try:
+                # Request peers from connected nodes every 2 minutes
+                if len(self.peers) > 0:
+                    for peer in list(self.peers.values()):
+                        try:
+                            get_peers_msg = GetPeersMessage()
+                            await peer.send_message(get_peers_msg.to_message())
+                            print(f"🔍 Requesting peers from {peer.address}")
+                        except Exception as e:
+                            # Silently continue if peer is dead
+                            pass
+
+                await asyncio.sleep(120)  # Request peers every 2 minutes
+
+            except Exception as e:
+                # Silently continue
+                await asyncio.sleep(30)
+
     async def _disconnect_peer(self, peer: Peer, reason: str) -> None:
         """Disconnect a peer."""
         try:
