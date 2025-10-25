@@ -1,6 +1,3 @@
-# Irium Blockchain
-
-
 # Irium Blockchain (IRM)
 
 **A next-generation proof-of-work blockchain designed for true decentralization**
