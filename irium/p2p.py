@@ -754,11 +754,15 @@ class P2PNode:
         if peer.address in self.peers:
             del self.peers[peer.address]
         
-        # ✅ FIX #8: Cleanup message tasks
+        # ✅ FIX #8: Cleanup message tasks with proper cancellation
         if peer.address in self.message_tasks:
             task = self.message_tasks[peer.address]
             if not task.done():
                 task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             del self.message_tasks[peer.address]
             print(f"👋 Disconnected from {peer.address}: {reason}")
         
