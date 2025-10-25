@@ -1,6 +1,5 @@
 # Irium Blockchain
 
-> **🎉 NEW: v1.2.0 Released!** - P2P Network Resilience & NAT Stability. [Download now →](https://github.com/iriumlabs/irium/releases/tag/v1.2.0)
 
 # Irium Blockchain (IRM)
 
