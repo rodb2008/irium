@@ -46,3 +46,4 @@ script.js
 
 # Runtime state files
 state/peers.json
+bootstrap/seedlist.runtime
