@@ -191,7 +191,7 @@ class ExplorerAPI(BaseHTTPRequestHandler):
                 'total_supply': total_supply,
                 'total_supply_irm': total_supply / 100000000,
                 'latest_block': latest_block['hash'],
-                'latest_block_time': latest_block['time']
+                'latest_block_time': latest_block['timestamp']
             })
         
         except Exception as e:
