@@ -59,3 +59,7 @@ SUBSIDY_SCHEDULE: Final[SubsidySchedule] = SubsidySchedule(
     coinbase_maturity=100,
     halving_interval=210_000,
 )
+
+# Consensus validation constants
+MAX_FUTURE_BLOCK_TIME: Final[int] = 7200  # 2 hours (whitepaper: "within consensus range")
+COINBASE_MATURITY: Final[int] = 100  # blocks (whitepaper requirement)

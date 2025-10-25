@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 from .block import Block, BlockHeader
 from .constants import (
     BLOCK_TARGET_INTERVAL,
+    COINBASE_MATURITY,
     DIFFICULTY_RETARGET_INTERVAL,
+    MAX_FUTURE_BLOCK_TIME,
     MAX_MONEY,
     SUBSIDY_SCHEDULE,
 )
 from .pow import Target
 from .tx import Transaction, TxOutput
+from .wallet import verify_der_signature
+
+
+@dataclass
+class UTXOEntry:
+    """UTXO with height tracking for coinbase maturity."""
+    output: TxOutput
+    height: int
+    is_coinbase: bool
 
 
 @dataclass
@@ -28,7 +40,7 @@ class ChainState:
     height: int = 0
     chain: List[Block] = field(default_factory=list)
     total_work: int = 0
-    utxos: Dict[Tuple[bytes, int], TxOutput] = field(default_factory=dict)
+    utxos: Dict[Tuple[bytes, int], UTXOEntry] = field(default_factory=dict)
     issued: int = 0
 
     def __post_init__(self) -> None:
@@ -58,6 +70,7 @@ class ChainState:
         fees, coinbase_total, subsidy_created = self._validate_and_apply_transactions(
             block,
             block_reward,
+            expected_height,
             enforce_reward=True,
             max_subsidy=MAX_MONEY - self.issued,
         )
@@ -74,6 +87,7 @@ class ChainState:
         fees, coinbase_total, subsidy_created = self._validate_and_apply_transactions(
             block,
             block_reward=0,
+            height=0,
             enforce_reward=False,
             max_subsidy=MAX_MONEY,
         )
@@ -89,6 +103,14 @@ class ChainState:
         elif block.header.prev_hash != b"\x00" * 32:
             raise ValueError("Genesis block must reference null hash")
 
+        # FIX 2: TIMESTAMP VALIDATION (Whitepaper requirement)
+        current_time = int(time.time())
+        if block.header.time > current_time + MAX_FUTURE_BLOCK_TIME:
+            raise ValueError(f"Block timestamp too far in future (max {MAX_FUTURE_BLOCK_TIME}s)")
+        
+        if previous is not None and block.header.time <= previous.header.time:
+            raise ValueError("Block timestamp must be greater than previous block")
+
         recalculated_root = block.merkle_root()[::-1]
         if block.header.merkle_root != recalculated_root:
             raise ValueError("Block merkle root mismatch")
@@ -102,6 +124,7 @@ class ChainState:
         self,
         block: Block,
         block_reward: int,
+        height: int,
         *,
         enforce_reward: bool,
         max_subsidy: int | None = None,
@@ -114,7 +137,7 @@ class ChainState:
         if not coinbase.outputs:
             raise ValueError("Coinbase transaction must create outputs")
 
-        created: List[Tuple[bytes, int, TxOutput]] = []
+        created: List[Tuple[bytes, int, TxOutput, bool]] = []
         fees = 0
         seen_inputs: set[Tuple[bytes, int]] = set()
 
@@ -132,9 +155,23 @@ class ChainState:
                     raise ValueError("Transaction input index out of range")
                 if key in seen_inputs:
                     raise ValueError("Transaction input double spent within block")
-                utxo = self.utxos.get(key)
-                if utxo is None:
+                utxo_entry = self.utxos.get(key)
+                if utxo_entry is None:
                     raise ValueError("Referenced UTXO is missing")
+                
+                # FIX 1: COINBASE MATURITY CHECK (Whitepaper: 100 blocks)
+                if utxo_entry.is_coinbase:
+                    confirmations = height - utxo_entry.height
+                    if confirmations < COINBASE_MATURITY:
+                        raise ValueError(
+                            f"Coinbase UTXO not mature (needs {COINBASE_MATURITY} confirmations, has {confirmations})"
+                        )
+                
+                # FIX 3: SIGNATURE VERIFICATION (Whitepaper requirement)
+                utxo = utxo_entry.output
+                if not _verify_transaction_signature(txin, utxo):
+                    raise ValueError("Transaction signature verification failed")
+                
                 seen_inputs.add(key)
                 input_total += utxo.value
             output_total = 0
@@ -148,7 +185,7 @@ class ChainState:
                 raise ValueError("Fee accounting overflow")
             txid = tx.txid()
             for index, output in enumerate(tx.outputs):
-                created.append((txid, index, output))
+                created.append((txid, index, output, False))
 
         coinbase_total = 0
         for output in coinbase.outputs:
@@ -161,7 +198,7 @@ class ChainState:
 
         coinbase_txid = coinbase.txid()
         for index, output in enumerate(coinbase.outputs):
-            created.append((coinbase_txid, index, output))
+            created.append((coinbase_txid, index, output, True))
 
         available_fees = min(fees, coinbase_total)
         subsidy_created = coinbase_total - available_fees
@@ -174,8 +211,8 @@ class ChainState:
 
         for key in seen_inputs:
             self.utxos.pop(key, None)
-        for txid, index, output in created:
-            self.utxos[(txid, index)] = output
+        for txid, index, output, is_coinbase in created:
+            self.utxos[(txid, index)] = UTXOEntry(output, height, is_coinbase)
 
         return fees, coinbase_total, subsidy_created
 
@@ -195,3 +232,33 @@ def _validate_output(output: TxOutput) -> None:
         raise ValueError("Output value out of range")
     if len(output.script_pubkey) > 0xFF:
         raise ValueError("script_pubkey too large")
+
+
+def _verify_transaction_signature(txin, utxo: TxOutput) -> bool:
+    """Verify transaction input signature against UTXO script_pubkey."""
+    if len(utxo.script_pubkey) < 34:
+        return False
+    
+    pubkey_len = utxo.script_pubkey[0]
+    if pubkey_len not in (33, 65):
+        return False
+    
+    if len(utxo.script_pubkey) < 1 + pubkey_len:
+        return False
+    
+    pubkey = utxo.script_pubkey[1:1 + pubkey_len]
+    
+    if len(txin.script_sig) < 2:
+        return False
+    
+    sig_len = txin.script_sig[0]
+    if len(txin.script_sig) < 1 + sig_len:
+        return False
+    
+    signature = txin.script_sig[1:1 + sig_len]
+    digest = txin.prev_txid
+    
+    try:
+        return verify_der_signature(pubkey, digest, signature)
+    except Exception:
+        return False

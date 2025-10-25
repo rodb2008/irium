@@ -4,7 +4,7 @@ __version__ = "1.2.0"
 
 # Core blockchain
 from .block import Block, BlockHeader
-from .chain import ChainParams, ChainState
+from .chain import ChainParams, ChainState, UTXOEntry
 from .tx import Transaction, TxInput, TxOutput
 from .wallet import Wallet, KeyPair
 from .pow import Target
