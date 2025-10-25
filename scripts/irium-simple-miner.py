@@ -106,9 +106,9 @@ while not shutdown_requested:
             with open(block_file, 'w') as f:
                 json.dump({
                     'height': height,
-                    'hash': h[::-1].hex(),
-                    'prev_hash': prev_hash[::-1].hex(),
-                    'merkle_root': header.merkle_root[::-1].hex(),
+                    'hash': h.hex(),
+                    'prev_hash': prev_hash.hex(),
+                    'merkle_root': header.merkle_root.hex(),
                     'timestamp': header.time,
                     'bits': header.bits,
                     'nonce': header.nonce,

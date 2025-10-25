@@ -101,6 +101,9 @@ class IriumNode:
                     try:
                         with open(os.path.join(blocks_dir, block_file)) as bf:
                             block_data = json.load(bf)
+                            # Migration: Add version field if missing
+                            if "version" not in block_data:
+                                block_data["version"] = 1
                             print(f"  Updated height to {block_data['height']}")
                         if block_data["height"] > self.chain_state.height:
                             self.chain_state.height = block_data["height"]
@@ -148,6 +151,13 @@ class IriumNode:
                         return
             
             print(f"📦 Received block {height} from {peer.address}")
+
+            # VALIDATE HASH FORMAT (v1.3.1 fix)
+            block_hash = block_json.get('hash', '')
+            if not block_hash.startswith('00000000'):
+                print(f"   ❌ REJECTED: Block {height} has invalid hash format (doesn't start with 00000000)")
+                print(f"      Hash: {block_hash[:32]}...")
+                return
             os.makedirs(blocks_dir, exist_ok=True)
             block_file = os.path.join(blocks_dir, f"block_{height}.json")
             with open(block_file, "w") as f:
