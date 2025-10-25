@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Simple miner without P2P - just mines and saves blocks."""
-import sys, os, json, time
+import sys, os, json, time, signal
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from irium.wallet import Wallet
@@ -11,6 +11,19 @@ from irium.pow import Target
 
 BLOCKCHAIN_DIR = os.path.expanduser("~/.irium/blocks")
 WALLET_FILE = os.path.expanduser("~/.irium/irium-wallet.json")
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global shutdown_requested
+    print(f"\n🛑 Shutdown signal received (signal {signum}). Finishing current work...")
+    shutdown_requested = True
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 # Load wallet
 if not os.path.exists(WALLET_FILE):
@@ -36,7 +49,7 @@ def get_current_height():
               for f in os.listdir(BLOCKCHAIN_DIR) if f.startswith('block_') and f.endswith('.json')]
     return max(blocks) + 1 if blocks else 1
 
-while True:
+while not shutdown_requested:
     # Get current height
     height = get_current_height()
 
@@ -71,11 +84,15 @@ while True:
         nonce=0
     )
 
-    # Mine with TIME-BASED height checks (every 1 second)
+    # Mine with TIME-BASED height checks and PROGRESS output
     last_check_time = time.time()
-    check_interval = 1.0  # Check every 1 second
+    last_progress_time = time.time()
+    check_interval = 1.0  # Check for new blocks every 1 second
+    progress_interval = 10.0  # Show progress every 10 seconds
+    start_time = time.time()
+    nonce_at_last_progress = 0
 
-    while True:
+    while not shutdown_requested:
         h = header.hash()
         if int.from_bytes(h, 'big') < Target(header.bits).to_target():
             print(f"✅ Found block {height}! Hash: {h[::-1].hex()}")
@@ -103,11 +120,31 @@ while True:
 
         header.nonce += 1
 
-        # TIME-BASED check (every 1 second)
+        # NONCE OVERFLOW FIX: Reset nonce and update timestamp when exhausted
+        if header.nonce > 0xFFFFFFFF:  # Exceeded 4-byte limit (2^32 - 1)
+            print(f"  🔄 Nonce space exhausted (4.29B attempts), updating timestamp...")
+            header.nonce = 0
+            header.time = int(time.time())
+            start_time = time.time()  # Reset timer for new search space
+            nonce_at_last_progress = 0
+
         current_time = time.time()
+
+        # Show progress every 10 seconds
+        if current_time - last_progress_time >= progress_interval:
+            elapsed = current_time - start_time
+            nonces_tried = header.nonce - nonce_at_last_progress
+            hashrate = nonces_tried / progress_interval if progress_interval > 0 else 0
+            print(f"  📊 Block {height} | Nonce: {header.nonce:,} | Hashrate: {hashrate:,.0f} H/s | Time: {int(elapsed)}s")
+            last_progress_time = current_time
+            nonce_at_last_progress = header.nonce
+
+        # TIME-BASED check for new blocks (every 1 second)
         if current_time - last_check_time >= check_interval:
             last_check_time = current_time
             current_height = get_current_height()
             if current_height > height:
                 print(f"⚠️  Block {height} found by another miner! Moving to {current_height}")
                 break
+
+print("✅ Miner stopped gracefully.")
