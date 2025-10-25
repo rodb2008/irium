@@ -47,7 +47,7 @@ def main():
                         'hash': block['hash']
                     })
                     total_balance += reward
-            except:
+            except Exception:
                 pass
     
     # Sort by height

@@ -219,7 +219,7 @@ class IriumNode:
                                     block_data = json.load(bf)
                                     if block_data["height"] > max_height:
                                         max_height = block_data["height"]
-                            except:
+                            except Exception:
                                 pass
                         
                         if max_height > self.chain_state.height:

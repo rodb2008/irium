@@ -74,7 +74,7 @@ class Peer:
         """Close connection."""
         try:
             self.writer.close()
-        except:
+        except Exception:
             pass
 
 
@@ -131,7 +131,7 @@ class P2PNode:
             import urllib.request
             response = urllib.request.urlopen('https://api.ipify.org', timeout=5)
             return response.read().decode('utf-8').strip()
-        except:
+        except Exception:
             return None
 
 
@@ -160,7 +160,7 @@ class P2PNode:
                 local_ip = s.getsockname()[0]
                 s.close()
                 return ip == local_ip
-            except:
+            except Exception:
                 pass
         
         return False
@@ -638,7 +638,7 @@ class P2PNode:
                     if host == my_ip and port == self.port:
                         print(f"  ⏭️  Skipping outgoing self-connection: {host}:{port}")
                         return
-                except:
+                except Exception:
                     pass
                 
                 print(f"📤 Connecting to {address}...")
@@ -729,6 +729,13 @@ class P2PNode:
                         await self._disconnect_peer(peer, "Timeout")
                 
                 await asyncio.sleep(30)  # Check every 30 seconds
+
+                # MEMORY LEAK FIX: Cleanup old relayed_blocks (keep last 100 blocks only)
+                if self.relayed_blocks:
+                    current_height = self.chain_height
+                    old_heights = [h for h in self.relayed_blocks.keys() if h < current_height - 100]
+                    for old_height in old_heights:
+                        del self.relayed_blocks[old_height]
             
             except Exception as e:
                 # Silently continue
@@ -740,7 +747,7 @@ class P2PNode:
             # Send disconnect message
             disconnect = DisconnectMessage(reason=reason)
             await peer.send_message(disconnect.to_message())
-        except:
+        except Exception:
             pass
         
         # Remove from peers

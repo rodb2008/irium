@@ -58,6 +58,7 @@ class Block:
         self.header.merkle_root = self.merkle_root()[::-1]
 
     def mine(self) -> None:
+        """Mine the block with nonce overflow protection."""
         self.update_merkle_root()
         target = self.header.target
         nonce = 0
@@ -67,6 +68,11 @@ class Block:
             if int.from_bytes(block_hash, "big") <= target.to_target():
                 break
             nonce += 1
+            # Nonce overflow protection: reset and update timestamp
+            if nonce > 0xFFFFFFFF:
+                nonce = 0
+                self.header.time = int(time.time())
+                self.update_merkle_root()  # Recalculate with new timestamp
 
     @property
     def size(self) -> int:
