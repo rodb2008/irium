@@ -355,7 +355,7 @@ class IriumMiner:
                     with open(block_file, 'w') as f:
                         json.dump({
                             'height': height,
-                            'hash': block.header.hash().hex(),
+                            'hash': block.header.hash()[::-1].hex(),
                             'prev_hash': prev_hash.hex(),
                             'merkle_root': block.header.merkle_root.hex(),
                             'time': block.header.time,
