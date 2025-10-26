@@ -11,7 +11,6 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from irium.wallet import Wallet
-from irium.update_checker import UpdateChecker, display_update_notification
 from irium.chain import ChainParams, ChainState
 from irium.block import Block, BlockHeader
 from irium.tx import Transaction, TxInput, TxOutput
@@ -297,7 +296,7 @@ class IriumMiner:
         self.p2p = P2PNode(
             port=self.p2p_port,
             max_peers=8000,
-            agent="irium-miner/1.1.0",
+            agent="irium-miner/1.0",
             chain_height=self.chain_state.height
         )
 

@@ -9,8 +9,6 @@ from enum import IntEnum
 
 # Protocol version
 PROTOCOL_VERSION = 1
-MAX_MESSAGE_SIZE = 32 * 1024 * 1024  # 32 MB max message size
-MAX_BLOCK_SIZE = 4 * 1024 * 1024   # 4 MB max block size
 
 # Message types
 class MessageType(IntEnum):

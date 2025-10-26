@@ -10,7 +10,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from irium.p2p import P2PNode
 from irium.chain import ChainParams, ChainState
-from irium.update_checker import UpdateChecker, display_update_notification
 from irium.block import Block, BlockHeader
 from irium.tx import Transaction, TxInput, TxOutput
 from irium.pow import Target
@@ -205,7 +204,7 @@ class IriumNode:
         self.p2p = P2PNode(
             port=self.port,
             max_peers=8000,
-            agent="irium-node/1.1.0",
+            agent="irium-node/1.0",
             chain_height=self.chain_state.height
         )
         
@@ -261,15 +260,6 @@ class IriumNode:
         
         print()
         print("✅ Irium Node started successfully!")
-        
-        # Check for updates
-        import irium
-        checker = UpdateChecker(irium.__version__)
-        if checker.should_check_now():
-            update_info = checker.check_for_updates()
-            if update_info:
-                display_update_notification(update_info)
-            checker.save_check_time()
         print(f"🌐 Listening for P2P connections on port {self.port}")
         print(f"📊 Blockchain height: {self.chain_state.height}")
         print(f"👥 Max peers: {self.p2p.max_peers}")

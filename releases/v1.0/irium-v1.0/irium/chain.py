@@ -117,11 +117,6 @@ class ChainState:
 
         header_hash = block.header.hash()[::-1]
         target = self.target_for_height(height)
-        
-        # SECURITY FIX: Validate that block.header.bits matches expected bits
-        if block.header.target.bits != target.bits:
-            raise ValueError(f"Block bits mismatch: got {hex(block.header.target.bits)}, expected {hex(target.bits)}")
-        
         if int.from_bytes(header_hash, "big") > target.to_target():
             raise ValueError("Block does not satisfy proof-of-work target")
 

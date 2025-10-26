@@ -9,11 +9,6 @@ from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from irium.rate_limiter import RateLimiter
-
-# Initialize rate limiter
-rate_limiter = RateLimiter(requests_per_minute=120)  # 120 requests per minute
-
 BLOCKCHAIN_DIR = os.path.expanduser("~/.irium/blocks")
 MEMPOOL_DIR = os.path.expanduser("~/.irium/mempool")
 
@@ -22,16 +17,6 @@ class ExplorerAPI(BaseHTTPRequestHandler):
     """Blockchain Explorer REST API."""
     
     def do_GET(self):
-        # Rate limiting
-        client_ip = self.client_address[0]
-        if not rate_limiter.is_allowed(client_ip):
-            self.send_response(429)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Retry-After', '60')
-            self.end_headers()
-            self.wfile.write(b'{"error": "Rate limit exceeded. Try again later."}')
-            return
-        
         """Handle GET requests."""
         parsed_path = urlparse(self.path)
         path = parsed_path.path
@@ -204,9 +189,9 @@ class ExplorerAPI(BaseHTTPRequestHandler):
                 'height': latest_block['height'],
                 'total_blocks': len(block_files),
                 'total_supply': total_supply,
-                'supply_irm': total_supply / 100000000,
+                'total_supply_irm': total_supply / 100000000,
                 'latest_block': latest_block['hash'],
-                'latest_block_time': latest_block.get('time', 0)
+                'latest_block_time': latest_block['timestamp']
             })
         
         except Exception as e:

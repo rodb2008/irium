@@ -9,7 +9,6 @@ from typing import Dict, Set, Optional, Callable
 from dataclasses import dataclass, field
 
 from .protocol import (
-    MAX_MESSAGE_SIZE, MAX_BLOCK_SIZE,
     Message, MessageType,
     HandshakeMessage, PingMessage, PongMessage,
     GetPeersMessage, PeersMessage,
@@ -86,7 +85,7 @@ class P2PNode:
         self,
         port: int = 38291,
         max_peers: int = 8,
-        agent: str = "irium-node/1.1.0",
+        agent: str = "irium-node/1.0",
         chain_height: int = 0,
         ping_interval: int = None  # Auto-detect: 60s for public, 30s for NAT
     ):
