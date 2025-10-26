@@ -135,13 +135,15 @@ class IriumNode:
             except ValueError:
                 return
             
-            # FORK PREVENTION: Only accept next block in sequence
-            if height != self.chain_state.height + 1:
-                return  # Ignore old or future blocks
+            # FORK PREVENTION: Accept blocks that fill gaps or extend chain
+            blocks_dir = os.path.expanduser("~/.irium/blocks")
+            
+            # Skip blocks we already have
+            block_file = os.path.join(blocks_dir, f"block_{height}.json")
+            if os.path.exists(block_file):
+                return  # Already have this block
             
             # Validate it extends our current chain
-            blocks_dir = os.path.expanduser("~/.irium/blocks")
-            if self.chain_state.height > 0:
                 tip_file = os.path.join(blocks_dir, f"block_{self.chain_state.height}.json")
                 if os.path.exists(tip_file):
                     with open(tip_file) as f:
