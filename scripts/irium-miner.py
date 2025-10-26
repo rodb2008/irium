@@ -343,8 +343,19 @@ class IriumMiner:
 
                     # Broadcast block to P2P network
                     print(f"📡 Broadcasting block to {self.p2p.get_peer_count()} peers...")
-                    block_data = block.header.serialize() + b''.join(tx.serialize() for tx in block.transactions)
-                    await self.p2p.broadcast_block(block_data)
+                    block_json = json.dumps({
+                        'height': height,
+                        'hash': block.header.hash().hex(),
+                        'prev_hash': prev_hash.hex(),
+                        'merkle_root': block.header.merkle_root.hex(),
+                        'time': block.header.time,
+                        'bits': hex(block.header.bits),
+                        'nonce': block.header.nonce,
+                        'transactions': len(transactions),
+                        'reward': reward,
+                        'miner_address': self.mining_address
+                    })
+                    await self.p2p.broadcast_block(block_json.encode('utf-8'))
                     print(f"✅ Block broadcast complete")
                     print()
 
@@ -356,7 +367,7 @@ class IriumMiner:
                     with open(block_file, 'w') as f:
                         json.dump({
                             'height': height,
-                            'hash': block.header.hash()[::-1].hex(),
+                            'hash': block.header.hash().hex(),
                             'prev_hash': prev_hash.hex(),
                             'merkle_root': block.header.merkle_root.hex(),
                             'time': block.header.time,

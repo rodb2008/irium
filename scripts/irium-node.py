@@ -156,11 +156,42 @@ class IriumNode:
             
             print(f"📦 Received block {height} from {peer.address}")
 
-            # VALIDATE HASH FORMAT (v1.3.1 fix)
+            # VALIDATE PROOF-OF-WORK (v1.1.1 fix)
+            from irium.block import BlockHeader
+            from irium.pow import Target
+            
             block_hash = block_json.get('hash', '')
-            if not block_hash.startswith('0000'):
-                print(f"   ❌ REJECTED: Block {height} has invalid hash format (doesn't start with 0000)")
-                print(f"      Hash: {block_hash[:32]}...")
+            
+            # Reconstruct block header and verify PoW
+            try:
+                header = BlockHeader(
+                    version=1,
+                    prev_hash=bytes.fromhex(prev_hash),
+                    merkle_root=bytes.fromhex(block_json['merkle_root']),
+                    time=block_json['time'],
+                    bits=int(block_json['bits'], 16),
+                    nonce=block_json['nonce']
+                )
+                
+                # Calculate and verify hash
+                calculated_hash = header.hash().hex()
+                if calculated_hash != block_hash:
+                    print(f"   ❌ REJECTED: Block {height} has invalid hash (doesn't match header)")
+                    print(f"      Claimed:    {block_hash[:32]}...")
+                    print(f"      Calculated: {calculated_hash[:32]}...")
+                    return
+                
+                # Verify hash meets difficulty target
+                target = Target(header.bits)
+                hash_int = int.from_bytes(header.hash(), 'big')
+                if hash_int > target.to_target():
+                    print(f"   ❌ REJECTED: Block {height} doesn't meet difficulty target")
+                    print(f"      Hash: {hash_int}")
+                    print(f"      Target: {target.to_target()}")
+                    return
+                    
+            except Exception as e:
+                print(f"   ❌ REJECTED: Block {height} validation error: {e}")
                 return
             os.makedirs(blocks_dir, exist_ok=True)
             block_file = os.path.join(blocks_dir, f"block_{height}.json")
