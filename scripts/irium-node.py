@@ -144,6 +144,7 @@ class IriumNode:
                 return  # Already have this block
             
             # Validate it extends our current chain
+            if self.chain_state.height > 0:
                 tip_file = os.path.join(blocks_dir, f"block_{self.chain_state.height}.json")
                 if os.path.exists(tip_file):
                     with open(tip_file) as f:
@@ -167,6 +168,7 @@ class IriumNode:
             print(f"   💾 Saved block {height}")
             self.chain_state.height = height
             self.p2p.chain_height = height
+            peer.height = height
             print(f"   ✅ Height now {height}")
         except Exception as e:
             print(f"Error: {e}")

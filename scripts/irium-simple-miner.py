@@ -109,8 +109,8 @@ while not shutdown_requested:
                     'hash': h.hex(),
                     'prev_hash': prev_hash.hex(),
                     'merkle_root': header.merkle_root.hex(),
-                    'timestamp': header.time,
-                    'bits': header.bits,
+                    'time': header.time,
+                    'bits': hex(header.bits),
                     'nonce': header.nonce,
                     'transactions': [{'txid': coinbase.txid().hex(), 'data': coinbase.serialize().hex()}],
                     'miner_address': mining_address

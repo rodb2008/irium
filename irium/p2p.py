@@ -524,6 +524,10 @@ class P2PNode:
                     else:
                         print(f"  ⚠️  Block {height} not found on disk")
                         break
+                # Update peer height after sending all blocks
+                if blocks_to_send:
+                    peer.height = blocks_to_send[-1]
+                    print(f"  ✅ Updated peer height to {peer.height}")
         except Exception as e:
             print(f"  ❌ Error handling GET_BLOCKS: {e}")
             import traceback
