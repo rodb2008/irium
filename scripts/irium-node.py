@@ -107,7 +107,7 @@ class IriumNode:
                                 block_data["version"] = 1
                             print(f"  Updated height to {block_data['height']}")
                         if block_data["height"] > self.chain_state.height:
-                            self.chain_state.height = block_data["height"]
+                            self.chain_state.height = block_data["height"] + 1
                     except Exception as be:
                         pass
 
@@ -198,7 +198,7 @@ class IriumNode:
             with open(block_file, "w") as f:
                 json.dump(block_json, f, indent=2)
             print(f"   💾 Saved block {height}")
-            self.chain_state.height = height
+            self.chain_state.height = height + 1
             self.p2p.chain_height = height
             peer.height = height
             print(f"   ✅ Height now {height}")
@@ -270,7 +270,7 @@ class IriumNode:
                         
                         if max_height > self.chain_state.height:
                             old_height = self.chain_state.height
-                            self.chain_state.height = max_height
+                            self.chain_state.height = max_height + 1
                             self.p2p.chain_height = max_height
                             print(f"📊 Detected new blocks! Updated height: {old_height} -> {max_height}")
                             

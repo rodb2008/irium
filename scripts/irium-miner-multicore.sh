@@ -23,3 +23,13 @@ echo "📡 Blocks will be detected and broadcast by main node"
 echo ""
 echo "View logs: tail -f /tmp/miner-1.log"
 echo "Stop all: pkill -f irium-simple-miner.py"
+
+# Keep script running to prevent systemd from killing miners
+while true; do
+    sleep 60
+    # Check if miners are still running
+    if ! pgrep -f irium-simple-miner.py > /dev/null; then
+        echo "⚠️  All miners stopped, exiting..."
+        break
+    fi
+done
