@@ -154,8 +154,8 @@ class IriumNode:
 
             # VALIDATE HASH FORMAT (v1.3.1 fix)
             block_hash = block_json.get('hash', '')
-            if not block_hash.startswith('00000000'):
-                print(f"   ❌ REJECTED: Block {height} has invalid hash format (doesn't start with 00000000)")
+            if not block_hash.startswith('0000'):
+                print(f"   ❌ REJECTED: Block {height} has invalid hash format (doesn't start with 0000)")
                 print(f"      Hash: {block_hash[:32]}...")
                 return
             os.makedirs(blocks_dir, exist_ok=True)
