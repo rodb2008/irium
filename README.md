@@ -2,12 +2,12 @@
 
 **A next-generation proof-of-work blockchain designed for true decentralization**
 
-[![Version](https://img.shields.io/badge/version-v1.3.0-blue.svg)](https://github.com/iriumlabs/irium/releases/tag/v1.3.0)
+[![Version](https://img.shields.io/badge/version-v1.0-blue.svg)](https://github.com/iriumlabs/irium/releases/tag/v1.0)
 [![Network](https://img.shields.io/badge/network-mainnet-green.svg)](https://github.com/iriumlabs/irium)
 [![Status](https://img.shields.io/badge/status-live-brightgreen.svg)](https://api.iriumlabs.org/api/stats)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **🚨 Latest Release: v1.3.0** - Consensus Hard Fork with critical bug fixes and security improvements. [See Release Notes](releases/v1.3.0/RELEASE_NOTES.md)
+> **🚨 Latest Release: v1.0** - Production Release - Stable blockchain with fixed mining and P2P sync. [See Release Notes](releases/v1.0/RELEASE_NOTES.md)
 
 ---
 
@@ -79,7 +79,7 @@ The coinbase transaction can include hash pointers to off-chain data, enabling t
 ---
 
 
-## 🔒 Security & Consensus (v1.3.0)
+## 🔒 Security & Consensus (v1.0)
 
 **Latest Update:** October 25, 2025 - Consensus Hard Fork
 
@@ -95,21 +95,21 @@ The coinbase transaction can include hash pointers to off-chain data, enabling t
 - Improved graceful shutdown
 - Enhanced error handling
 
-**⚠️ Important:** v1.3.0 is a hard fork. All nodes must upgrade. [Deployment Guide](releases/v1.3.0/DEPLOYMENT_GUIDE.md)
+**⚠️ Important:** v1.0 is a hard fork. All nodes must upgrade. [Deployment Guide](releases/v1.0/DEPLOYMENT_GUIDE.md)
 
 ---
 
-## 🚀 Quick Start (v1.3.0)
+## 🚀 Quick Start (v1.0)
 
 ### 1. Download & Install
 
 ```bash
 # Download latest release
-wget https://iriumlabs.org/releases/v1.3.0/irium-bootstrap-v1.3.0.tar.gz
+wget https://iriumlabs.org/releases/v1.0/irium-bootstrap-v1.0.tar.gz
 
 # Extract
-tar -xzf irium-bootstrap-v1.3.0.tar.gz
-cd irium-bootstrap-v1.3.0
+tar -xzf irium-bootstrap-v1.0.tar.gz
+cd irium-bootstrap-v1.0
 
 # Install
 chmod +x install.sh

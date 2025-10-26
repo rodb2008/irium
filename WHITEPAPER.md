@@ -362,7 +362,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 Version (4 bytes)
 Previous Hash (32 bytes)
 Merkle Root (32 bytes)
-Timestamp (4 bytes)
+Time (4 bytes)
 Bits (4 bytes)
 Nonce (4 bytes)
 ```
