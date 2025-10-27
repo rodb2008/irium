@@ -60,10 +60,6 @@ class IriumMiner:
         print("  Wallet location: ~/.irium/wallet.dat")
         print("")
         import sys
-        sys.exit(1)
-        from irium.wallet import KeyPair
-        key = KeyPair.generate()
-        wif = key.to_wif()
         self.wallet.import_wif(wif)
 
         # Save wallet with new address
