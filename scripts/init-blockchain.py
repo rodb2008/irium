@@ -85,7 +85,7 @@ def init_blockchain():
     
     # Create PoW limit
     print("2. Creating PoW limit...")
-    pow_limit = Target(bits=0x1d00ffff)
+    pow_limit = Target(bits=int(genesis_data["bits"], 16))
     print(f"  ✅ PoW limit created")
     print(f"  ✅ Difficulty: {pow_limit.difficulty()}")
     print()

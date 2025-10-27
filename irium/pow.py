@@ -20,9 +20,11 @@ class Target:
             value = mantissa >> (8 * (3 - exponent))
         else:
             value = mantissa << (8 * (exponent - 3))
-        # Bitcoin compatibility fix: ensure minimum target is 2^224
+        
+        # Use target with 8 leading zeros for 10-minute blocks
         if self.bits == 0x1d00ffff:
-            return 2**224
+            return 0x00000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+        
         return value
 
     def difficulty(self) -> float:

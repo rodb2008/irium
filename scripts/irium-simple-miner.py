@@ -18,7 +18,7 @@ shutdown_requested = False
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully."""
     global shutdown_requested
-    print(f"\n🛑 Shutdown signal received (signal {signum}). Finishing current work...")
+    print("\n🛑 Shutdown signal received (signal " + str(signum) + "). Finishing current work...", flush=True)
     shutdown_requested = True
 
 # Register signal handlers
@@ -80,7 +80,7 @@ while not shutdown_requested:
         prev_hash=prev_hash,
         merkle_root=coinbase.txid(),
         time=int(time.time()),
-        bits=0x1d00ffff,
+        bits=int(genesis_data["bits"], 16),
         nonce=0
     )
 
@@ -147,4 +147,4 @@ while not shutdown_requested:
                 print(f"⚠️  Block {height} found by another miner! Moving to {current_height}")
                 break
 
-print("✅ Miner stopped gracefully.")
+print("✅ Miner stopped gracefully.", flush=True)
