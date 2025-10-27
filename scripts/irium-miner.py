@@ -297,7 +297,7 @@ class IriumMiner:
         self.p2p = P2PNode(
             port=self.p2p_port,
             max_peers=8000,
-            agent="irium-miner/1.1.0",
+            agent="irium-miner/1.0",
             chain_height=self.chain_state.height
         )
 

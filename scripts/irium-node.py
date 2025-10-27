@@ -111,7 +111,7 @@ class IriumNode:
                     except Exception as be:
                         pass
 
-            print(f"✅ Blockchain loaded at height {self.chain_state.height}")
+            print(f"✅ Blockchain loaded height: {self.chain_state.height - 1}")
             return True
         
         except Exception as e:
@@ -236,7 +236,7 @@ class IriumNode:
         self.p2p = P2PNode(
             port=self.port,
             max_peers=8000,
-            agent="irium-node/1.1.0",
+            agent="irium-node/1.0",
             chain_height=self.chain_state.height
         )
         
@@ -302,7 +302,7 @@ class IriumNode:
                 display_update_notification(update_info)
             checker.save_check_time()
         print(f"🌐 Listening for P2P connections on port {self.port}")
-        print(f"📊 Blockchain height: {self.chain_state.height}")
+        print(f"📊 Blockchain: height: {self.chain_state.height - 1}")
         print(f"👥 Max peers: {self.p2p.max_peers}")
         print()
         
@@ -314,7 +314,7 @@ class IriumNode:
             
             # Print status
             peer_count = self.p2p.get_peer_count()
-            print(f"📊 Status: {peer_count} peers connected, height {self.chain_state.height}")
+            print(f"📊 Status: {peer_count} peers connected, height: {self.chain_state.height - 1}")
             
             if peer_count > 0:
                 peers_info = self.p2p.get_peers_info()
