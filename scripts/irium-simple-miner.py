@@ -9,11 +9,12 @@ from irium.block import Block, BlockHeader
 from irium.tx import Transaction, TxInput, TxOutput
 from irium.pow import Target
 
-BLOCKCHAIN_DIR = os.path.expanduser("~/.irium/blocks")
-WALLET_FILE = os.path.expanduser("~/.irium/irium-wallet.json")
+# Load genesis data
+genesis_file = os.path.join(os.path.dirname(__file__), "..", "configs", "genesis.json")
+with open(genesis_file, "r") as f:
+    genesis_data = json.load(f)
 
-# Global flag for graceful shutdown
-shutdown_requested = False
+
 
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully."""
@@ -21,23 +22,25 @@ def signal_handler(signum, frame):
     print("\n🛑 Shutdown signal received (signal " + str(signum) + "). Finishing current work...", flush=True)
     shutdown_requested = True
 
+# Global shutdown flag
+shutdown_requested = False
+BLOCKCHAIN_DIR = os.path.expanduser("~/.irium/blocks")
 # Register signal handlers
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 # Load wallet
+# Load wallet
+WALLET_FILE = os.path.expanduser("~/.irium/irium-wallet.json")
 if not os.path.exists(WALLET_FILE):
     print("❌ Wallet not found! Create one first:")
     print("   python3 scripts/irium-wallet-proper.py create")
     exit(1)
 
-with open(WALLET_FILE, 'r') as f:
-    wallet_data = json.load(f)
 
-if not wallet_data.get('addresses'):
-    print("❌ No addresses in wallet!")
     exit(1)
 
+wallet_data = json.load(open(WALLET_FILE, "r"))
 mining_address = wallet_data['addresses'][0]
 print(f"💰 Mining to: {mining_address}")
 
@@ -59,7 +62,7 @@ while not shutdown_requested:
             prev_block = json.load(f)
         prev_hash = bytes.fromhex(prev_block['hash'])
     else:
-        prev_hash = bytes.fromhex('cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000')
+        prev_hash = bytes.fromhex('0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6')
 
     print(f"⛏️  Mining block {height}...")
 

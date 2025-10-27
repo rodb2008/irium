@@ -153,7 +153,7 @@ journalctl -u irium-node -n 20 | grep "peers connected"
 
 ## ⚠️ Important: Mining Difficulty
 
-**v1.2.0 Update**: Genesis difficulty has been increased 100x to prevent blocks mining too fast.
+**v1.0 Release: Uses standard Bitcoin difficulty (0x1d00ffff) with proper calculation
 
 - **Expected block time**: ~13 minutes (not seconds!)
 - **First block**: May take 15+ minutes to mine

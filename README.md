@@ -174,7 +174,7 @@ sudo systemctl restart irium-miner
 ### Live Mainnet
 
 **Genesis Block:**
-- Hash: `cbdd1b...000000`
+- Hash: `0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6`
 - Mined: October 16, 2025
 - Vesting: 3.5M IRM timelocked
 

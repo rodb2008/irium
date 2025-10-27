@@ -695,7 +695,7 @@ class P2PNode:
                 elif peer.height > self.chain_height:
                     print(f"  Peer is ahead ({peer.height} vs {self.chain_height}), requesting blocks...")
                     from irium.protocol import GetBlocksMessage
-                    genesis_hash = bytes.fromhex('cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000')
+                    genesis_hash = bytes.fromhex('0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6')
                     count = min(500, peer.height - self.chain_height)
                     get_blocks = GetBlocksMessage(start_hash=genesis_hash, count=count)
                     await peer.send_message(get_blocks.to_message())

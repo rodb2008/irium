@@ -93,7 +93,7 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
     
     <h2>Network Status:</h2>
     <p><strong>Network:</strong> Mainnet (LIVE)</p>
-    <p><strong>Genesis:</strong> cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000</p>
+    <p><strong>Genesis:</strong> 0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6</p>
     
     <h2>Links:</h2>
     <ul>

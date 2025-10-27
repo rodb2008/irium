@@ -3,7 +3,7 @@
 **Technical Whitepaper - Version 1.2.0**
 
 **Network Status:** LIVE on Mainnet
-**Genesis Hash:** cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000
+**Genesis Hash:** 0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6
 **Launch Date:** October 27, 2025
 
 ---
@@ -105,8 +105,8 @@ valid_block = block_hash < target
 - Existing mining infrastructure
 
 **Genesis Block:**
-- Nonce: 1,110,943,221
-- Hash: cbdd1b...000000 (valid mainnet PoW)
+- Nonce: 1,961,837,199
+- Hash: 0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6 (valid mainnet PoW)
 - Mined: October 27, 2025 after 5.4 billion hashes
 
 ### 3.2 Difficulty Adjustment
@@ -308,7 +308,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 ```json
 {
   "height": 0,
-  "hash": "cbdd1b913...",
+  "hash": "0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6",
   "timestamp": 1735689601,
   "signatures": ["..."]
 }
@@ -612,8 +612,8 @@ Irium represents a new generation of blockchain technology that addresses fundam
 
 ## Appendix A: Genesis Block
 
-**Hash:** cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000
-**Nonce:** 1,110,943,221
+**Hash:** 0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6
+**Nonce:** 1,961,837,199
 **Timestamp:** 1735689601 (October 27, 2025)
 **Merkle Root:** a0bd470d94bf7ef20539a0a6e2bd30629795f0bad5160d0495e07e85e4a5db04
 **Difficulty:** 0x1d00ffff (mainnet)
