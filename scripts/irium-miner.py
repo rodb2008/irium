@@ -2,8 +2,6 @@
 """Irium miner with P2P block broadcasting."""
 
 import sys
-        sys.exit(1)
-        return ""  # Never reached
 import os
 import asyncio
 import signal
