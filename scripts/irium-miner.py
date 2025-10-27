@@ -60,14 +60,6 @@ class IriumMiner:
         print("  Wallet location: ~/.irium/wallet.dat")
         print("")
         import sys
-        self.wallet.import_wif(wif)
-
-        # Save wallet with new address
-        wallet_data = {
-            'keys': {addr: self.wallet.get_wif(addr) for addr in self.wallet.addresses()},
-            'addresses': list(self.wallet.addresses())
-        }
-        os.makedirs(os.path.dirname(WALLET_FILE), exist_ok=True)
         with open(WALLET_FILE, 'w') as f:
             import json
             json.dump(wallet_data, f, indent=2)
@@ -422,6 +414,7 @@ async def main():
         except ValueError:
             print(f"Invalid port: {sys.argv[1]}")
             sys.exit(1)
+        return ""  # Never reached
 
     miner = IriumMiner(p2p_port=port)
 
