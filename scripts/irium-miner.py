@@ -50,7 +50,17 @@ class IriumMiner:
         if addresses:
             return addresses[0]
 
-        # No addresses - create new one and SAVE it
+        # No wallet found - require user to create one
+        print("\n❌ ERROR: No wallet found!")
+        print("\nYou must create a wallet BEFORE mining:")
+        print("  1. python3 scripts/irium-wallet-proper.py create")
+        print("  2. python3 scripts/irium-wallet-proper.py new-address")
+        print("  3. python3 scripts/irium-wallet-proper.py balance")
+        print("\n⚠️  IMPORTANT: Backup your wallet keys!")
+        print("  Wallet location: ~/.irium/wallet.dat")
+        print("")
+        import sys
+        sys.exit(1)
         from irium.wallet import KeyPair
         key = KeyPair.generate()
         wif = key.to_wif()
