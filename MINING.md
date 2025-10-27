@@ -1,3 +1,12 @@
+## ⚠️ v1.2.0 Difficulty Update
+
+**Important**: Genesis difficulty increased 100x. Blocks now take ~13 minutes to mine.
+
+- **Before**: 8 seconds per block (too fast)
+- **After**: ~13 minutes per block (realistic)
+- **Patience required**: First block may take 15+ minutes
+
+
 # Irium Mining Guide
 
 Complete guide to mining IRM cryptocurrency.

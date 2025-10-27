@@ -2,12 +2,12 @@
 
 **A next-generation proof-of-work blockchain designed for true decentralization**
 
-[![Version](https://img.shields.io/badge/version-v1.0-blue.svg)](https://github.com/iriumlabs/irium/releases/tag/v1.0)
+[![Version](https://img.shields.io/badge/version-v1.2.0-blue.svg)](https://github.com/iriumlabs/irium/releases/tag/v1.0)
 [![Network](https://img.shields.io/badge/network-mainnet-green.svg)](https://github.com/iriumlabs/irium)
 [![Status](https://img.shields.io/badge/status-live-brightgreen.svg)](https://api.iriumlabs.org/api/stats)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **🚨 Latest Release: v1.0** - Production Release - Stable blockchain with fixed mining and P2P sync. [See Release Notes](releases/v1.0/RELEASE_NOTES.md)
+> **🚨 Latest Release: v1.2.0** - Production Release - Stable blockchain with fixed mining and P2P sync. [See Release Notes](https://github.com/iriumlabs/irium/releases/tag/v1.2.0)
 
 ---
 
@@ -35,7 +35,7 @@ Irium is a **decentralized cryptocurrency** built from the ground up with a focu
 | **Max Supply** | 100,000,000 IRM | Hard cap, never changes |
 | **Genesis Vesting** | 3,500,000 IRM | Founder allocation (3.5%, timelocked 1y/2y/3y) |
 | **Mineable Supply** | 96,500,000 IRM | Available to public miners |
-| **Block Time** | 600 seconds | 10 minutes per block (like Bitcoin) |
+| **Block Time** | 780 seconds (~13 minutes per block) (like Bitcoin) |
 | **Initial Reward** | 50 IRM | First 210,000 blocks |
 | **Halving** | Every 210,000 blocks | Approximately every 4 years |
 | **Difficulty Retarget** | Every 2016 blocks | Approximately every 14 days |
@@ -326,7 +326,7 @@ Irium uses a **UTXO (Unspent Transaction Output)** model, similar to Bitcoin. Ev
 Every 2016 blocks (~14 days), difficulty adjusts based on actual vs target block time:
 - If blocks are too fast: Difficulty increases
 - If blocks are too slow: Difficulty decreases
-- Target: 10 minutes per block
+- Target: ~13 minutes per block
 
 ### Transaction Fees
 

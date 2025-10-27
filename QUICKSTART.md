@@ -150,3 +150,23 @@ journalctl -u irium-node -n 20 | grep "peers connected"
 ```
 
 **Note:** NAT-to-NAT direct connections are not possible (same limitation as Bitcoin).
+
+## ⚠️ Important: Mining Difficulty
+
+**v1.2.0 Update**: Genesis difficulty has been increased 100x to prevent blocks mining too fast.
+
+- **Expected block time**: ~13 minutes (not seconds!)
+- **First block**: May take 15+ minutes to mine
+- **Patience required**: This is normal behavior
+
+### Mining Expectations
+
+```bash
+# Start mining (be patient!)
+python3 scripts/irium-simple-miner.py
+
+# Monitor progress (blocks won't appear immediately)
+watch -n 30 'ls -lth ~/.irium/blocks/ | head -5'
+```
+
+**Note**: If no blocks appear after 20+ minutes, the difficulty may need further adjustment.
