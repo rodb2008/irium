@@ -47,3 +47,19 @@ script.js
 # Runtime state files
 state/peers.json
 bootstrap/seedlist.runtime
+
+# Runtime files
+state/
+bootstrap/seedlist.runtime
+*.log
+*.pid
+
+# Temporary files
+*.tmp
+*.bak
+*.old
+*.backup
+
+# OS files
+.DS_Store
+Thumbs.db
