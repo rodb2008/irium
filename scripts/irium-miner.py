@@ -298,7 +298,7 @@ class IriumMiner:
             port=self.p2p_port,
             max_peers=8000,
             agent="irium-miner/1.0",
-            chain_height=self.chain_state.height
+            chain_height=self.chain_state.height - 1
         )
 
         self.p2p.on_block = self.handle_peer_block
