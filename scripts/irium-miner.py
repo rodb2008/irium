@@ -2,6 +2,8 @@
 """Irium miner with P2P block broadcasting."""
 
 import sys
+        sys.exit(1)
+        return ""  # Never reached
 import os
 import asyncio
 import signal
@@ -60,6 +62,8 @@ class IriumMiner:
         print("  Wallet location: ~/.irium/wallet.dat")
         print("")
         import sys
+        sys.exit(1)
+        return ""  # Never reached
 
     def load_mempool(self):
         """Load pending transactions from mempool."""
