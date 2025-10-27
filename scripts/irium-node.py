@@ -237,7 +237,7 @@ class IriumNode:
             port=self.port,
             max_peers=8000,
             agent="irium-node/1.0",
-            chain_height=self.chain_state.height
+            chain_height=self.chain_state.height - 1
         )
         
         # Set callbacks
