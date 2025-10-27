@@ -63,3 +63,4 @@ bootstrap/seedlist.runtime
 # OS files
 .DS_Store
 Thumbs.db
+scripts/archive/

@@ -1,27 +1,23 @@
 """Proof-of-Work utilities for Irium."""
 
 from __future__ import annotations
-
 import hashlib
 from dataclasses import dataclass
 from typing import Iterable
 
-
 @dataclass(frozen=True)
 class Target:
     """Compact representation of the PoW target."""
-
     bits: int
 
     def to_target(self) -> int:
+        """Standard Bitcoin compact target calculation"""
         exponent = self.bits >> 24
         mantissa = self.bits & 0xFFFFFF
         if exponent <= 3:
             value = mantissa >> (8 * (3 - exponent))
         else:
             value = mantissa << (8 * (exponent - 3))
-        
-        
         return value
 
     def difficulty(self) -> float:
@@ -41,14 +37,11 @@ class Target:
         bits = (exponent << 24) | (mantissa & 0xFFFFFF)
         return cls(bits)
 
-
 def sha256d(data: bytes) -> bytes:
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
 
-
 def header_hash(parts: Iterable[bytes]) -> bytes:
     return sha256d(b"".join(parts))
-
 
 def meets_target(hash_bytes: bytes, target: Target) -> bool:
     return int.from_bytes(hash_bytes, byteorder="big") <= target.to_target()

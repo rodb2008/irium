@@ -153,7 +153,7 @@ journalctl -u irium-node -n 20 | grep "peers connected"
 
 ## ⚠️ Important: Mining Difficulty
 
-**v1.0 Release: Uses standard Bitcoin difficulty (0x1d00ffff) with proper calculation
+**v1.0 Release:** Uses standard Bitcoin difficulty (0x1d00ffff) with proper calculation
 
 - **Expected block time**: ~13 minutes (not seconds!)
 - **First block**: May take 15+ minutes to mine
@@ -163,7 +163,7 @@ journalctl -u irium-node -n 20 | grep "peers connected"
 
 ```bash
 # Start mining (be patient!)
-python3 scripts/irium-simple-miner.py
+python3 scripts/irium-miner.py
 
 # Monitor progress (blocks won't appear immediately)
 watch -n 30 'ls -lth ~/.irium/blocks/ | head -5'

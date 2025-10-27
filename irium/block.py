@@ -64,7 +64,7 @@ class Block:
         nonce = 0
         while True:
             self.header.nonce = nonce
-            block_hash = self.header.hash()[::-1]
+            block_hash = self.header.hash()
             if int.from_bytes(block_hash, "big") <= target.to_target():
                 break
             nonce += 1

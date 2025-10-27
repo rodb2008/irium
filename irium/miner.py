@@ -211,7 +211,7 @@ class Miner:
         target = block.header.target
         attempts = 0
         while True:
-            block_hash = block.header.hash()[::-1]
+            block_hash = block.header.hash()
             attempts += 1
             if int.from_bytes(block_hash, "big") <= target.to_target():
                 return True, attempts

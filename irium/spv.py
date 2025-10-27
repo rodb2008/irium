@@ -51,7 +51,7 @@ class SpvVerifier:
                 if Target(hdr.bits).to_target() > self.pow_limit.to_target():
                     return False
             # Verify PoW meets declared target
-            if int.from_bytes(hdr.hash()[::-1], "big") > Target(hdr.bits).to_target():
+            if int.from_bytes(hdr.hash(), "big") > Target(hdr.bits).to_target():
                 return False
         return True
 

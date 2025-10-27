@@ -83,7 +83,7 @@ def mine_genesis():
             nonce=nonce
         )
         
-        header_hash = header.hash()[::-1]
+        header_hash = header.hash()
         header_hash_int = int.from_bytes(header_hash, "big")
         
         hashes_done += 1

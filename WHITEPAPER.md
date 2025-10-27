@@ -1,6 +1,6 @@
 # Irium: DNS-Free Proof-of-Work Mainnet
 
-**Technical Whitepaper - Version 1.2.0**
+**Technical Whitepaper - Version 1.0**
 
 **Network Status:** LIVE on Mainnet
 **Genesis Hash:** 0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6
@@ -309,7 +309,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 {
   "height": 0,
   "hash": "0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6",
-  "timestamp": 1735689601,
+  "timestamp": 1735689600,
   "signatures": ["..."]
 }
 ```
@@ -614,7 +614,7 @@ Irium represents a new generation of blockchain technology that addresses fundam
 
 **Hash:** 0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6
 **Nonce:** 1,961,837,199
-**Timestamp:** 1735689601 (October 27, 2025)
+**Timestamp:** 1735689600 (October 27, 2025)
 **Merkle Root:** a0bd470d94bf7ef20539a0a6e2bd30629795f0bad5160d0495e07e85e4a5db04
 **Difficulty:** 0x1d00ffff (mainnet)
 
@@ -630,24 +630,27 @@ Irium represents a new generation of blockchain technology that addresses fundam
 
 *Built for true decentralization*
 
-## 9. Difficulty Adjustment (v1.2.0 Update)
+## 9. Difficulty Adjustment (v1.0 Release)
 
-### Genesis Difficulty Optimization
+**v1.0 uses standard Bitcoin difficulty:** 0x1d00ffff
 
-In v1.2.0, the genesis difficulty was increased 100x to prevent blocks from mining too quickly on modern hardware:
+The genesis block was mined with proper Bitcoin-standard difficulty calculation:
 
-- **Previous difficulty**: 0x1d00ffff (1.00 difficulty)
-- **New difficulty**: 0x1c028f5c (100.00 difficulty)
-- **Expected block time**: ~13 minutes (vs previous 8 seconds)
-- **Target**: Closer to 10-minute Bitcoin-style intervals
+- **Difficulty bits**: 0x1d00ffff (standard Bitcoin genesis difficulty)
+- **Expected block time**: ~10 minutes
+- **Proper PoW validation**: No hardcoded overrides
+- **Automatic adjustment**: Every 2016 blocks (~14 days)
 
 ### Technical Implementation
 
 ```python
-# Genesis difficulty calculation
-genesis_target = Target(0x1c028f5c)  # 100x harder
-expected_time = genesis_target.difficulty() * base_time
-# Result: ~13 minutes per block
+# Standard Bitcoin compact target calculation
+def to_target(bits: int) -> int:
+    exponent = bits >> 24
+    mantissa = bits & 0xFFFFFF
+    if exponent <= 3:
+        return mantissa >> (8 * (3 - exponent))
+    else:
+        return mantissa << (8 * (exponent - 3))
 ```
 
-This adjustment ensures sustainable mining rates while maintaining network security.

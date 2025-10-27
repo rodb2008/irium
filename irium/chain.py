@@ -115,7 +115,7 @@ class ChainState:
         if block.header.merkle_root != recalculated_root:
             raise ValueError("Block merkle root mismatch")
 
-        header_hash = block.header.hash()[::-1]
+        header_hash = block.header.hash()
         target = self.target_for_height(height)
         
         # SECURITY FIX: Validate that block.header.bits matches expected bits
