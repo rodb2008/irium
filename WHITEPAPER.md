@@ -1,10 +1,10 @@
 # Irium: DNS-Free Proof-of-Work Mainnet
 
-**Technical Whitepaper - Version 1.0.0**
+**Technical Whitepaper - Version 1.2.0**
 
 **Network Status:** LIVE on Mainnet
 **Genesis Hash:** cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000
-**Launch Date:** October 16, 2025
+**Launch Date:** October 27, 2025
 
 ---
 
@@ -20,7 +20,7 @@ Irium is a purpose-built proof-of-work blockchain designed to maximize network i
 
 Most established proof-of-work networks inherit architectural assumptions from Bitcoin, including DNS-based bootstrapping, addrman-driven peer discovery, and an absence of protocol-level incentives for fast relay. Irium rethinks these components to produce a mainnet that can launch and sustain itself even if all founding infrastructure disappears.
 
-**Irium launched on October 16, 2025 with:**
+**Irium launched on October 27, 2025 with:**
 - Mined genesis block (5.4 billion hashes, 7 hours)
 - Zero DNS dependencies
 - Complete P2P networking
@@ -107,7 +107,7 @@ valid_block = block_hash < target
 **Genesis Block:**
 - Nonce: 1,110,943,221
 - Hash: cbdd1b...000000 (valid mainnet PoW)
-- Mined: October 16, 2025 after 5.4 billion hashes
+- Mined: October 27, 2025 after 5.4 billion hashes
 
 ### 3.2 Difficulty Adjustment
 
@@ -547,7 +547,7 @@ Nodes maintain a dynamic peer list (`bootstrap/seedlist.runtime`):
 
 **Mainnet Status:** ✅ LIVE
 
-- Genesis mined: October 16, 2025
+- Genesis mined: October 27, 2025
 - All services operational
 - Public endpoints active
 - Ready for miners and users
@@ -614,7 +614,7 @@ Irium represents a new generation of blockchain technology that addresses fundam
 
 **Hash:** cbdd1b9134adc846b3af5e2128f68214e1d8154912ff8da40685f47700000000
 **Nonce:** 1,110,943,221
-**Timestamp:** 1735689601 (October 16, 2025)
+**Timestamp:** 1735689601 (October 27, 2025)
 **Merkle Root:** a0bd470d94bf7ef20539a0a6e2bd30629795f0bad5160d0495e07e85e4a5db04
 **Difficulty:** 0x1d00ffff (mainnet)
 
@@ -629,3 +629,25 @@ Irium represents a new generation of blockchain technology that addresses fundam
 **MIT License - Open Source**
 
 *Built for true decentralization*
+
+## 9. Difficulty Adjustment (v1.2.0 Update)
+
+### Genesis Difficulty Optimization
+
+In v1.2.0, the genesis difficulty was increased 100x to prevent blocks from mining too quickly on modern hardware:
+
+- **Previous difficulty**: 0x1d00ffff (1.00 difficulty)
+- **New difficulty**: 0x1c028f5c (100.00 difficulty)
+- **Expected block time**: ~13 minutes (vs previous 8 seconds)
+- **Target**: Closer to 10-minute Bitcoin-style intervals
+
+### Technical Implementation
+
+```python
+# Genesis difficulty calculation
+genesis_target = Target(0x1c028f5c)  # 100x harder
+expected_time = genesis_target.difficulty() * base_time
+# Result: ~13 minutes per block
+```
+
+This adjustment ensures sustainable mining rates while maintaining network security.
