@@ -348,6 +348,12 @@ class Wallet:
         self._keys[address] = key
         return address
 
+    def get_wif(self, address: str) -> str:
+        """Export WIF for a specific address."""
+        if address not in self._keys:
+            raise ValueError(f"Address {address} not found in wallet")
+        return self._keys[address].to_wif()
+
     def new_address(self, compressed: bool = True) -> str:
         key = KeyPair.generate()
         key.compressed = compressed
