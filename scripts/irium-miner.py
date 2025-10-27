@@ -60,12 +60,6 @@ class IriumMiner:
         print("  Wallet location: ~/.irium/wallet.dat")
         print("")
         import sys
-        with open(WALLET_FILE, 'w') as f:
-            import json
-            json.dump(wallet_data, f, indent=2)
-
-        print(f"💾 New wallet saved to {WALLET_FILE}")
-        return key.address()
 
     def load_mempool(self):
         """Load pending transactions from mempool."""
