@@ -106,7 +106,7 @@ class SimpleIriumMiner:
                     header=BlockHeader(
                         version=1,
                         prev_hash=prev_hash,
-                        merkle_root=coinbase_tx.hash(),
+                        merkle_root=coinbase_tx.txid(),
                         time=int(time.time()),
                         bits=0x1d00ffff,
                         nonce=0
