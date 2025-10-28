@@ -125,7 +125,7 @@ class SimpleIriumMiner:
                     block.header.nonce += 1
                     hashes += 1
                     
-                    if block.header.hash_int() <= target.to_int():
+                    if int.from_bytes(block.header.hash(), "big") <= target.to_target():
                         # Block found!
                         elapsed = time.time() - start_time
                         hashrate = hashes / elapsed if elapsed > 0 else 0
