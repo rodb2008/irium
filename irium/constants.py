@@ -1,6 +1,7 @@
+from __future__ import annotations
+import os
 """Network-wide constants for Irium mainnet."""
 
-from __future__ import annotations
 
 import dataclasses
 from typing import Final
@@ -63,3 +64,4 @@ SUBSIDY_SCHEDULE: Final[SubsidySchedule] = SubsidySchedule(
 # Consensus validation constants
 MAX_FUTURE_BLOCK_TIME: Final[int] = 7200  # 2 hours (whitepaper: "within consensus range")
 COINBASE_MATURITY: Final[int] = 100  # blocks (whitepaper requirement)
+BLOCKCHAIN_DIR = os.path.expanduser("~/.irium/blocks")

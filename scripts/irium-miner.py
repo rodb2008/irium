@@ -10,6 +10,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from irium.wallet import Wallet
 from irium.update_checker import UpdateChecker, display_update_notification
 from irium.chain import ChainParams, ChainState
@@ -305,7 +307,7 @@ class IriumMiner:
         # Mining loop
         while self.running:
             try:
-                height = self.chain_state.height + 1
+                height = self.chain_state.height
 
                 # Get prev_hash from the actual tip block file
                 if height == 1:
