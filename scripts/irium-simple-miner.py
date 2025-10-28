@@ -115,7 +115,7 @@ class SimpleIriumMiner:
                 )
 
                 # Mine the block
-                target = Target.from_compact(0x1d00ffff)
+                target = Target(bits=0x1d00ffff)
                 start_time = time.time()
                 hashes = 0
                 
