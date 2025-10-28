@@ -198,7 +198,7 @@ class IriumMiner:
             os.makedirs(BLOCKCHAIN_DIR, exist_ok=True)
             with open(os.path.join(BLOCKCHAIN_DIR, f"block_{height}.json"), 'w') as f:
                 json.dump(block_json, f, indent=2)
-            self.chain_state.height = height
+            self.chain_state.height = max(self.chain_state.height, height + 1)
             self.p2p.chain_height = height
             print(f"  ✅ Updated to height {height}")
         except Exception as e:
@@ -280,7 +280,7 @@ class IriumMiner:
                     try:
                         height = int(block_file.replace("block_", "").replace(".json", ""))
                         if height > self.chain_state.height:
-                            self.chain_state.height = height
+                            self.chain_state.height = max(self.chain_state.height, height + 1)
                     except ValueError:
                         pass
 
