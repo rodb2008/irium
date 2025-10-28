@@ -177,7 +177,7 @@ class ExplorerAPI(BaseHTTPRequestHandler):
                 })
                 return
             
-            block_files = [f for f in os.listdir(BLOCKCHAIN_DIR) if f.startswith('block_')]
+            block_files = [f for f in os.listdir(BLOCKCHAIN_DIR) if f.startswith('block_') and f.endswith('.json') and 'backup' not in f]
             
             if not block_files:
                 self.send_json_response({
