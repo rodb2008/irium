@@ -130,7 +130,7 @@ class P2PNode:
         """Get our public IP address."""
         try:
             import urllib.request
-            response = urllib.request.urlopen('https://api.ipify.org', timeout=5)
+            response = urllib.request.urlopen('https://ipv4.icanhazip.com', timeout=5)
             return response.read().decode('utf-8').strip()
         except Exception:
             return None
@@ -141,9 +141,6 @@ class P2PNode:
         if ':' in addr:
             ip, port = addr.split(':')
             
-            # Check port first (must match our listening port)
-            if port != str(self.port):
-                return False
             
             # Check if it's localhost
             if ip in ["127.0.0.1", "localhost"]:
