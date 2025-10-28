@@ -106,12 +106,12 @@ class IriumNode:
                             if "version" not in block_data:
                                 block_data["version"] = 1
                             print(f"  Updated height to {block_data['height']}")
-                        if block_data["height"] > self.chain_state.height:
-                            self.chain_state.height = block_data["height"] + 1
+                        self.chain_state.height = max(self.chain_state.height, block_data["height"] + 1)
                     except Exception as be:
                         pass
 
-            print(f"✅ Blockchain loaded height: {self.chain_state.height - 1}")
+            actual_height = self.chain_state.height - 1
+            print(f"✅ Blockchain loaded height: {actual_height}")
             return True
         
         except Exception as e:
