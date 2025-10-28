@@ -593,8 +593,9 @@ class P2PNode:
                     print(f"  📋 Seedlist: {len(seedlist)} nodes")
                     if seedlist:
                         # Try random peer
-                        multiaddr = random.choice(seedlist)
-                        await self._connect_to_peer(multiaddr)
+                        # Try all peers instead of just one random
+                        for multiaddr in seedlist:
+                            await self._connect_to_peer(multiaddr)
                 
                 await asyncio.sleep(30)  # Try every 30 seconds
             
