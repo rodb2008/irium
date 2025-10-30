@@ -1,4 +1,9 @@
 # Irium Blockchain (IRM)
+[![Release](https://img.shields.io/badge/release-v1.0-blue)](https://github.com/iriumlabs/irium/releases/tag/v1.0)
+[![Status](https://img.shields.io/badge/status-stable-brightgreen)](#)
+[![Network](https://img.shields.io/badge/network-LIVE-brightgreen)](#)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 
 A next-generation proof-of-work blockchain designed for true decentralization.
 
