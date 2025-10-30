@@ -1,172 +1,53 @@
-# Irium Quick Start Guide
+# Irium Quick Start (v1.0)
 
-## Installation
+- Latest Release: v1.0.0 (stable mining + P2P sync)
+- Release Notes: https://github.com/iriumlabs/irium/releases/tag/v1.0.0
 
-```bash
-git clone https://github.com/iriumlabs/irium.git
-cd irium
+## Install Dependencies
 pip3 install --user pycryptodome qrcode pillow
-```
 
-## Commands
+## 1) Download & Install
+wget https://iriumlabs.org/releases/v1.0/irium-bootstrap-v1.0.tar.gz
+tar -xzf irium-bootstrap-v1.0.tar.gz
+cd irium-bootstrap-v1.0
+chmod +x install.sh
+./install.sh
 
-**Create Wallet:**
-```bash
-python3 scripts/irium-wallet-proper.py new-address
-```
+## 2) Start Node
+sudo systemctl start irium-node
+sudo systemctl enable irium-node
+sudo journalctl -u irium-node -f
 
-**Run Node:**
-```bash
-python3 scripts/irium-node.py
-```
-
-**Start Mining:**
-```bash
-python3 scripts/irium-miner.py
-```
-
-**Check Balance:**
-```bash
-python3 scripts/irium-wallet-proper.py balance
-```
-
-## Resources
-- Website: https://www.iriumlabs.org
-- Whitepaper: https://www.iriumlabs.org/whitepaper.html
-- Telegram: https://t.me/iriumlabs
-
-## Wallet Management
-
-### Creating Addresses
-
-```bash
-# Create a new address
+## 3) Create Wallet
+python3 scripts/irium-wallet-proper.py create
 python3 scripts/irium-wallet-proper.py new-address
 
-# List all addresses
-python3 scripts/irium-wallet-proper.py list
+## 4) Start Mining
+# Single miner (full P2P)
+export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
+nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
+python3 scripts/irium-miner.py 38292
 
-# Check balance
-python3 scripts/irium-wallet-proper.py balance
-```
+# Multicore (full P2P)
+export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
+nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
+bash scripts/irium-miner-multicore.sh 4
+./scripts/tail-mining-logs.sh 4 38292
 
-### Important: Mining Address
+## 5) Status / Troubleshooting
+sudo journalctl -u irium-node -n 20
+ls ~/.irium/blocks/ | wc -l
 
-**The miner uses the wallet that exists when it starts.**
+## Specs (short)
+Algo: SHA-256d | Max: 100M IRM | Mineable: 96.5M IRM
+Block time: ~13m | Halving: 210k | Retarget: 2016 | Maturity: 100
+Min fee: 0.0001 IRM | P2P: 38291
 
-If you create a new address while mining:
-```bash
-# Restart miner to use the new address
-sudo systemctl restart irium-miner.service
-
-# Verify it's using the new address
-sudo journalctl -u irium-miner.service -n 20 | grep "Mining address"
-```
-
-
-## Understanding Blockchain Sync
-
-**"My node is stuck at height 3!"**
-
-Check the network:
-```bash
-# See what height peers are at
-journalctl -u irium-node.service -n 20 | grep "Status.*peers.*height"
-```
-
-If peers show "height 3", then **you're in sync!** ✅
-
-Everyone is waiting for the next block to be mined (~6 hours average).
-
-**Sync happens automatically when:**
-- A peer mines a new block
-- Your node detects they're ahead
-- Your node requests and downloads the block
-
-No manual intervention needed! 🚀
-
-## API Usage
-
-### Explorer API Examples
-
-```bash
-# Check network status
+## APIs
+Base: https://api.iriumlabs.org/
 curl https://api.iriumlabs.org/api/stats
-
-# Get latest block
 curl https://api.iriumlabs.org/api/block/1
+curl "https://api.iriumlabs.org/api/blocks?limit=10"
 
-# Get recent blocks
-curl https://api.iriumlabs.org/api/blocks?limit=5
-```
-
-### Wallet API Examples
-
-```bash
-# Access interactive documentation
-curl https://api.iriumlabs.org/wallet/
-
-# Check balance via API
-curl https://api.iriumlabs.org/wallet/balance
-
-# Create new address via API
-curl -X POST https://api.iriumlabs.org/wallet/new-address
-```
-
-### API Base URL
-```
-https://api.iriumlabs.org/
-```
-
-## NAT & Firewall Support
-
-**Irium works behind NAT/firewalls!** (Same as Bitcoin)
-
-### NAT Nodes (No Port Forwarding Required)
-- ✅ Can sync blockchain
-- ✅ Can mine blocks
-- ✅ Can broadcast transactions
-- ✅ Connect outbound to public nodes
-- ⚠️ Cannot accept incoming connections
-
-### Public Nodes (Port Forwarding Enabled)
-- ✅ All NAT node features PLUS
-- ✅ Accept incoming connections
-- ✅ Help bootstrap the network
-- ✅ Improve network resilience
-
-### Network Requirements
-- **Minimum:** 1 public bootstrap node (VPS: 207.244.247.86)
-- **Recommended:** Multiple public nodes for redundancy
-- **NAT nodes:** Unlimited (connect via public nodes)
-
-### Testing Your Node
-```bash
-# Check peer connections
-journalctl -u irium-node -n 20 | grep "peers connected"
-
-# If you see 1+ peers, you're connected! ✅
-# NAT nodes typically connect to 2-3 public peers
-```
-
-**Note:** NAT-to-NAT direct connections are not possible (same limitation as Bitcoin).
-
-## ⚠️ Important: Mining Difficulty
-
-**v1.0 Release:** Uses standard Bitcoin difficulty (0x1d00ffff) with proper calculation
-
-- **Expected block time**: ~13 minutes (not seconds!)
-- **First block**: May take 15+ minutes to mine
-- **Patience required**: This is normal behavior
-
-### Mining Expectations
-
-```bash
-# Start mining (be patient!)
-python3 scripts/irium-miner.py
-
-# Monitor progress (blocks won't appear immediately)
-watch -n 30 'ls -lth ~/.irium/blocks/ | head -5'
-```
-
-**Note**: If no blocks appear after 20+ minutes, the difficulty may need further adjustment.
+## Docs
+MINING.md (mining), README.md (overview)
