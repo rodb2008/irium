@@ -129,7 +129,7 @@ def main():
     elif command == "send":
         if len(sys.argv) < 4:
             print("Error: Usage: send <address> <amount_in_irm>")
-            print("Example: send Q5uT1k6DR7WpxqYuiy7sQQXp8pYDx6U4eS 1.5")
+            print("Example: send QXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 1.5")
             return
         
         to_address = sys.argv[2]
