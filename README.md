@@ -1,13 +1,8 @@
 # Irium Blockchain (IRM)
-[![Release](https://img.shields.io/badge/release-v1.0-blue)](https://github.com/iriumlabs/irium/releases/tag/v1.0)
-[![Status](https://img.shields.io/badge/status-stable-brightgreen)](#)
-[![Network](https://img.shields.io/badge/network-LIVE-brightgreen)](#)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-
 
 A next-generation proof-of-work blockchain designed for true decentralization.
 
-- Latest Release: v1.0 – Production Release (stable mining + P2P sync)
+- Release: v1.0 – Production Release (stable mining + P2P sync)
 - Release Notes: https://github.com/iriumlabs/irium/releases/tag/v1.0
 
 ## What is Irium?
@@ -25,45 +20,45 @@ Irium is a decentralized cryptocurrency built from the ground up with a focus on
 
 ## Technical Specifications
 
-| Parameter           | Value                    | Description                                   |
-|---------------------|--------------------------|-----------------------------------------------|
-| Ticker              | IRM                      | Official symbol                               |
-| Algorithm           | SHA-256d                 | Proof-of-Work (Bitcoin-compatible)            |
-| Max Supply          | 100,000,000 IRM          | Hard cap                                      |
-| Genesis Vesting     | 3,500,000 IRM            | 3.5% timelocked (1y/2y/3y)                    |
-| Mineable Supply     | 96,500,000 IRM           | Available to public miners                    |
-| Block Time          | ~13 minutes (780 sec)    | Bitcoin-like                                  |
-| Initial Reward      | 50 IRM                   | First 210,000 blocks                          |
-| Halving             | Every 210,000 blocks     | ~4 years                                      |
-| Retarget            | Every 2016 blocks        | ~14 days                                      |
-| Coinbase Maturity   | 100 blocks               | Rewards mature after 100 blocks               |
-| Min Transaction Fee | 0.0001 IRM               | 10,000 satoshis (ultra-low)                   |
-| P2P Port            | 38291                    | Default network port                          |
+| Parameter           | Value                    | Description                            |
+|--------------------|--------------------------|----------------------------------------|
+| Ticker             | IRM                      | Official symbol                        |
+| Algorithm          | SHA-256d                 | Proof-of-Work (Bitcoin-compatible)     |
+| Max Supply         | 100,000,000 IRM          | Hard cap                               |
+| Genesis Vesting    | 3,500,000 IRM            | 3.5% timelocked (1y/2y/3y)             |
+| Mineable Supply    | 96,500,000 IRM           | Available to public miners             |
+| Block Time         | ~13 minutes (780 sec)    | Bitcoin-like                           |
+| Initial Reward     | 50 IRM                   | First 210,000 blocks                   |
+| Halving            | Every 210,000 blocks     | ~4 years                               |
+| Retarget           | Every 2016 blocks        | ~14 days                               |
+| Coinbase Maturity  | 100 blocks               | Rewards mature after 100 blocks        |
+| Min Tx Fee         | 0.0001 IRM               | 10,000 satoshis (ultra-low)            |
+| P2P Port           | 38291                    | Default network port                   |
 
 ## 8 Unique Innovations
 
-1. Zero-DNS Bootstrap: signed IP multiaddr seedlist + checkpoint anchors.
-2. Self-Healing Peer Discovery: uptime proofs and peer reputation.
-3. Genesis Vesting with CLTV: 3 UTXOs timelocked (1y/2y/3y).
-4. Per-Transaction Relay Rewards: up to 10% of fees to relays.
-5. Sybil-Resistant Handshake: small PoW challenge on connect.
-6. Anchor-File Consensus: signed headers protect against eclipse.
-7. Light Client First (SPV + NiPoPoW): mobile/IoT without full chain.
-8. On-chain Metadata Commitments: hash pointers in coinbase.
+1) Zero-DNS Bootstrap: signed IP multiaddr seedlist + checkpoint anchors  
+2) Self-Healing Peer Discovery: uptime proofs and peer reputation  
+3) Genesis Vesting with CLTV: 3 UTXOs timelocked (1y/2y/3y)  
+4) Per-Transaction Relay Rewards: up to 10% of fees to relays  
+5) Sybil-Resistant Handshake: small PoW challenge on connect  
+6) Anchor-File Consensus: signed headers protect against eclipse  
+7) Light Client First (SPV + NiPoPoW): mobile/IoT without full chain  
+8) On-chain Metadata Commitments: hash pointers in coinbase
 
 ## Security & Consensus (v1.0)
 
-- Coinbase Maturity Enforcement: 100-block lock
-- Timestamp Validation: within a 2-hour window
-- Signature Verification: every transaction validated
-- UTXO Height Tracking: maturity + correctness
+- Coinbase Maturity Enforcement (100-block lock)  
+- Timestamp Validation (within a 2-hour window)  
+- Signature Verification (every transaction validated)  
+- UTXO Height Tracking (maturity + correctness)  
 - Fixes: nonce overflow, P2P memory leak; improved shutdown and errors
 
 Note: v1.0 is a consensus hard fork—upgrade required.
 
 ## Quick Start (v1.0)
 
-1) Download & Install
+### Download & Install
 ```bash
 wget https://iriumlabs.org/releases/v1.0/irium-bootstrap-v1.0.tar.gz
 tar -xzf irium-bootstrap-v1.0.tar.gz
@@ -72,40 +67,92 @@ chmod +x install.sh
 ./install.sh
 ```
 
-2) Start Node
+### Start Node
 ```bash
 sudo systemctl start irium-node
 sudo systemctl enable irium-node
 sudo journalctl -u irium-node -f
 ```
 
-3) Create Wallet
+### Create Wallet
 ```bash
 python3 scripts/irium-wallet-proper.py create
 python3 scripts/irium-wallet-proper.py new-address
 ```
 
-4) Start Mining
-- Single-core (full P2P):
+### Start Mining
+
+Single-core (full P2P):
 ```bash
 export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
-nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
-python3 scripts/irium-miner.py 38292
+nohup python3 -u scripts/irium-node.py 39291 > /tmp/node-39291.log 2>&1 &
+python3 scripts/irium-miner.py 39292
 ```
 
-- Multicore (full P2P):
+Multicore (full P2P):
 ```bash
 export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
-nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
+nohup python3 -u scripts/irium-node.py 39291 > /tmp/node-39291.log 2>&1 &
 bash scripts/irium-miner-multicore.sh 4
-./scripts/tail-mining-logs.sh 4 38292
+./scripts/tail-mining-logs.sh 4 39292
 ```
 
-5) Status / Troubleshooting
+### Status / Troubleshooting
 ```bash
 sudo journalctl -u irium-node -n 20
 ls ~/.irium/blocks/ | wc -l
 ```
+
+## Miner port usage (important)
+
+- The full miner expects the P2P port as a positional argument (no flag).
+  - Default (uses 38292):
+    ```bash
+    python3 scripts/irium-miner.py
+    ```
+  - Specific port (example 39292):
+    ```bash
+    python3 scripts/irium-miner.py 39292
+    ```
+- Do NOT include parentheses or URLs around the command; that breaks it.
+- If you prefer a flag, use the individual miner:
+  ```bash
+  python3 scripts/irium-miner-individual.py --wallet "$HOME/.irium/irium-wallet.json" --port 39292
+  ```
+
+### Multicore
+- Launch N workers (base port 38292 increments by 1 per worker):
+  ```bash
+  bash scripts/irium-miner-multicore.sh 4
+  ```
+- Tail logs:
+  ```bash
+  ./scripts/tail-mining-logs.sh 4 39292
+  ```
+
+### Troubleshooting
+- Ensure you’re on the main branch (not gh-pages):
+  ```bash
+  git branch --show-current  # should be: main
+  ```
+- Make sure a node is running (example 39291):
+  ```bash
+  nohup python3 -u scripts/irium-node.py 39291 > /tmp/node-39291.log 2>&1 &
+  ```
+- Check miner log shows “Starting mining loop” / “Nonce:” / “Hashrate:”:
+  ```bash
+  tail -n 120 /tmp/miner-39292.log
+  ```
+- If specifying a port “doesn’t work”:
+  - Remove any parentheses/links from the command
+  - Try a different free port:
+    ```bash
+    python3 scripts/irium-miner.py 40292
+    ```
+  - Or use:
+    ```bash
+    python3 scripts/irium-miner-individual.py --wallet "$HOME/.irium/irium-wallet.json" --port 39292
+    ```
 
 ## Network Information
 
@@ -141,9 +188,9 @@ curl -X POST https://207.244.247.86:8080/new-address
 
 ## Documentation
 
-- QUICKSTART.md — 5-minute setup
-- MINING.md — single + multicore, full P2P
-- WHITEPAPER.md — technical
+- QUICKSTART.md — 5-minute setup  
+- MINING.md — single + multicore, full P2P  
+- WHITEPAPER.md — technical  
 - CONTRIBUTING.md — how to contribute
 
 ## Important Notes
@@ -167,40 +214,11 @@ Blockchain Sync:
 
 ## Community & Support
 
-- GitHub: https://github.com/iriumlabs/irium
-- Discussions: https://github.com/iriumlabs/irium/discussions
-- Issues: https://github.com/iriumlabs/irium/issues
+- GitHub: https://github.com/iriumlabs/irium  
+- Discussions: https://github.com/iriumlabs/irium/discussions  
+- Issues: https://github.com/iriumlabs/irium/issues  
 - Email: info@iriumlabs.org
 
 ## License
 
 MIT — Free and open source.
-
-### Miner port usage (important)
-
-- The full miner expects the P2P port as a positional argument (no flag).
-  - Default (uses 38292):
-    python3 scripts/irium-miner.py
-  - Specific port (example 39292):
-    python3 scripts/irium-miner.py 39292
-- Do NOT include parentheses or URLs around the command; that breaks it.
-- If you prefer a flag, use the individual miner:
-  python3 scripts/irium-miner-individual.py --wallet "$HOME/.irium/irium-wallet.json" --port 39292
-
-#### Multicore
-- Launch N workers (base port 38292 increments by 1 per worker):
-  bash scripts/irium-miner-multicore.sh 4
-- Tail logs:
-  ./scripts/tail-mining-logs.sh 4 38292
-
-#### Troubleshooting
-- Ensure you’re on the main branch (not gh-pages):
-  git branch --show-current  # should be: main
-- Make sure a node is running (example 39291):
-  nohup python3 -u scripts/irium-node.py 39291 > /tmp/node-39291.log 2>&1 &
-- Check miner log shows “Starting mining loop” / “Nonce:” / “Hashrate:”:
-  tail -n 120 /tmp/miner-39292.log
-- If specifying a port “doesn’t work”:
-  - Remove any parentheses/links from the command
-  - Try a different free port: python3 scripts/irium-miner.py 40292
-  - Or use: python3 scripts/irium-miner-individual.py --wallet "$HOME/.irium/irium-wallet.json" --port 39292
