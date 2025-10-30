@@ -89,3 +89,24 @@ tail -n 120 /tmp/miner-39292.log
     ```bash
     python3 scripts/irium-miner-individual.py --wallet "$HOME/.irium/irium-wallet.json" --port 39292
     ```
+
+## Updated Mining Commands (v1.0)
+
+```bash
+cd ~/irium
+python3 -m venv .venv && . .venv/bin/activate
+export PYTHONPATH="$PWD"
+pip install pycryptodome qrcode pillow requests
+
+nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
+export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
+python3 -u scripts/irium-miner.py 38292
+
+# Multicore
+export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
+bash scripts/irium-miner-multicore.sh 4
+```
+
+Tips:
+- Miner port is positional (no --port).
+- If logs look empty, use: `tail -n 120 /tmp/miner-38292.log | tr '\r' '\n'`

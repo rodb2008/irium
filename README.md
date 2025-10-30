@@ -228,3 +228,41 @@ Blockchain Sync:
 ## License
 
 MIT — Free and open source.
+
+## Updated Mining Commands (v1.0)
+
+Use a virtualenv (PEP 668), set PYTHONPATH, and pass miner port positionally.
+
+```bash
+# 0) Repo root
+cd ~/irium
+
+# 1) venv + deps (first time)
+sudo apt install -y python3.12-venv
+python3 -m venv .venv
+. .venv/bin/activate
+export PYTHONPATH="$PWD"
+pip install pycryptodome qrcode pillow requests websockets aiohttp
+
+# 2) Start node (38291)
+nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
+
+# 3) Single miner (positional port; no --port)
+export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
+python3 -u scripts/irium-miner.py 38292
+
+# 4) Multicore (N workers; ports BASE..BASE+N-1)
+export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
+bash scripts/irium-miner-multicore.sh 4
+
+# 5) Logs (carriage-returns to newlines)
+tail -n 120 /tmp/miner-38292.log | tr '\r' '\n'
+
+# Stop miners
+pkill -f 'scripts/irium-miner\.py'
+```
+
+Notes:
+- Full miner uses positional port (e.g., `python3 scripts/irium-miner.py 38292`).
+- Use ASCII env var name `IRIUM_WALLET_FILE` (not lookalikes).
+- If pip is blocked (PEP 668), the venv step above fixes it.
