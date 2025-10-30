@@ -64,7 +64,7 @@ class IriumMiner:
         print("  Wallet location: ~/.irium/wallet.dat")
         print("")
         import sys
-        return ""  # Never reached
+        
 
     def load_mempool(self):
         """Load pending transactions from mempool."""
@@ -412,7 +412,7 @@ async def main():
             port = int(sys.argv[1])
         except ValueError:
             print(f"Invalid port: {sys.argv[1]}")
-        return ""  # Never reached
+        
 
     miner = IriumMiner(p2p_port=port)
 
