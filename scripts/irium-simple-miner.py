@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+
+print("❌ Deprecated: use scripts/irium-miner-individual.py with --wallet or --miner-id"); import sys; sys.exit(1)\n
 """Simple Irium miner - no P2P, just mining for multicore setups."""
 
 import sys
