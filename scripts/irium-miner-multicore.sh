@@ -1,35 +1,37 @@
 #!/bin/bash
-# Multi-core mining - miners run WITHOUT P2P, main node broadcasts
+set -euo pipefail
+# Multi-core mining using full P2P miner. Requires IRIUM_WALLET_FILE to be set.
 
-CORES=${1:-8}
+CORES=${1:-4}
+BASE_PORT=${BASE_PORT:-38292}
 
-echo "🔥 Starting $CORES mining processes (no P2P)..."
-echo "📡 Main node (port 38291) will handle all P2P and broadcasting"
+if [ -z "${IRIUM_WALLET_FILE:-}" ]; then
+  echo "❌ IRIUM_WALLET_FILE is not set. Example:"
+  echo "   export IRIUM_WALLET_FILE=/path/to/your/irium-wallet.json"
+  echo "   ./scripts/irium-miner-multicore.sh 4"
+  exit 1
+fi
+
+echo "🔥 Starting $CORES full miners with P2P"
+echo "💼 Wallet: $IRIUM_WALLET_FILE"
+echo "📡 Miner P2P base port: $BASE_PORT (one port per worker)"
 echo ""
 
-# Kill existing miners
-pkill -f irium-simple-miner.py
+# Stop any previous full miners launched by this script
+pkill -f 'scripts/irium-miner.py' || true
 
-# Start simple miners (no P2P)
-for i in $(seq 1 $CORES); do
-    nohup python3 -u scripts/irium-simple-miner.py > /tmp/miner-$i.log 2>&1 &
-    echo "  ✅ Miner $i started (PID: $!, log: /tmp/miner-$i.log)"
-    sleep 0.5
+# Spawn CORES full miners, each with its own P2P port
+for i in $(seq 0 $((CORES-1))); do
+  PORT=$((BASE_PORT + i))
+  LOG="/tmp/miner-$PORT.log"
+  nohup env IRIUM_WALLET_FILE="$IRIUM_WALLET_FILE" \
+    python3 -u scripts/irium-miner.py --port "$PORT" > "$LOG" 2>&1 &
+  echo "  ✅ Miner[$i] on port $PORT (PID $!) -> $LOG"
+  sleep 0.5
 done
 
 echo ""
-echo "⛏️  Mining with $CORES cores!"
-echo "📡 Blocks will be detected and broadcast by main node"
-echo ""
-echo "View logs: tail -f /tmp/miner-1.log"
-echo "Stop all: pkill -f irium-simple-miner.py"
-
-# Keep script running to prevent systemd from killing miners
-while true; do
-    sleep 60
-    # Check if miners are still running
-    if ! pgrep -f irium-simple-miner.py > /dev/null; then
-        echo "⚠️  All miners stopped, exiting..."
-        break
-    fi
-done
+echo "⛏️  Mining with $CORES workers."
+echo "ℹ️  Ensure a node is running (e.g., 'nohup python3 -u scripts/irium-node.py 38291 &')"
+echo "📄 View logs: tail -f /tmp/miner-$BASE_PORT.log"
+echo "🛑 Stop all: pkill -f 'scripts/irium-miner.py'"
