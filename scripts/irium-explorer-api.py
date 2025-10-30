@@ -14,8 +14,8 @@ from irium.rate_limiter import RateLimiter
 # Initialize rate limiter
 rate_limiter = RateLimiter(requests_per_minute=120)  # 120 requests per minute
 
-BLOCKCHAIN_DIR = os.path.expanduser("~/.irium/blocks")
-MEMPOOL_DIR = os.path.expanduser("~/.irium/mempool")
+BLOCKCHAIN_DIR = os.path.expanduser(os.getenv("IRIUM_BLOCKS_DIR", "~/.irium/blocks"))
+MEMPOOL_DIR = os.path.expanduser(os.getenv("IRIUM_MEMPOOL_DIR", "~/.irium/mempool"))
 
 
 class ExplorerAPI(BaseHTTPRequestHandler):
