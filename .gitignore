@@ -69,3 +69,6 @@ scripts/archive/
 *.backup
 *.bak
 *.old
+
+# Backups
+scripts/*.bak.*
