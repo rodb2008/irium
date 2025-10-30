@@ -25,7 +25,7 @@ for i in $(seq 0 $((CORES-1))); do
   PORT=$((BASE_PORT + i))
   LOG="/tmp/miner-$PORT.log"
   nohup env IRIUM_WALLET_FILE="$IRIUM_WALLET_FILE" \
-    python3 -u scripts/irium-miner.py --port "$PORT" > "$LOG" 2>&1 &
+    python3 -u scripts/irium-miner.py "$PORT" > "$LOG" 2>&1 &
   echo "  ✅ Miner[$i] on port $PORT (PID $!) -> $LOG"
   sleep 0.5
 done

@@ -22,9 +22,9 @@ from irium.tx import Transaction, TxInput, TxOutput
 from irium.pow import Target
 from irium.p2p import P2PNode
 
-WALLET_FILE = os.path.expanduser("~/.irium/irium-wallet.json")
-MEMPOOL_FILE = os.path.expanduser("~/.irium/mempool/pending.json")
-BLOCKCHAIN_DIR = os.path.expanduser("~/.irium/blocks")
+WALLET_FILE = os.path.expanduser(os.getenv("IRIUM_WALLET_FILE", "~/.irium/irium-wallet.json"))
+MEMPOOL_FILE = os.path.expanduser(os.getenv("IRIUM_MEMPOOL_FILE", "~/.irium/mempool/pending.json"))
+BLOCKCHAIN_DIR = os.path.expanduser(os.getenv("IRIUM_BLOCKS_DIR", "~/.irium/blocks"))
 
 
 class IriumMiner:
