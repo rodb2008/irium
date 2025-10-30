@@ -275,7 +275,7 @@ class IriumMiner:
         self.chain_state = ChainState(params=self.chain_params)
 
         # Scan for existing mined blocks
-        blocks_dir = os.path.expanduser("~/.irium/blocks")
+        blocks_dir = BLOCKCHAIN_DIR
         if os.path.exists(blocks_dir):
             block_files = os.listdir(blocks_dir)
             for block_file in block_files:
@@ -317,7 +317,7 @@ class IriumMiner:
                     prev_hash = tip_block.header.hash()
                 else:
                     # Load from disk
-                    prev_block_file = os.path.expanduser(f"~/.irium/blocks/block_{height-1}.json")
+                    prev_block_file = os.path.join(BLOCKCHAIN_DIR, f"block_{height-1}.json")
                     with open(prev_block_file, 'r') as f:
                         prev_block = json.load(f)
                     prev_hash = bytes.fromhex(prev_block['hash'])

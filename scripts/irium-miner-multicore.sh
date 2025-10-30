@@ -1,4 +1,6 @@
 #!/bin/bash
+PYTHONPATH=${PYTHONPATH:-$PWD}
+export PYTHONPATH
 set -euo pipefail
 # Multi-core mining using full P2P miner. Requires IRIUM_WALLET_FILE to be set.
 
