@@ -93,7 +93,7 @@ class IriumNode:
             
             # Load mined blocks from disk
             print("  Scanning for mined blocks...")
-            blocks_dir = os.path.expanduser("~/.irium/blocks")
+            blocks_dir = os.path.expanduser(os.getenv("IRIUM_BLOCKS_DIR","~/.irium/blocks"))
             print(f"  Blocks directory: {blocks_dir}")
             if os.path.exists(blocks_dir):
                 print(f"  Found blocks directory with files: {os.listdir(blocks_dir)}")
@@ -137,7 +137,7 @@ class IriumNode:
                 return
             
             # FORK PREVENTION: Accept blocks that fill gaps or extend chain
-            blocks_dir = os.path.expanduser("~/.irium/blocks")
+            blocks_dir = os.path.expanduser(os.getenv("IRIUM_BLOCKS_DIR","~/.irium/blocks"))
             
             # Skip blocks we already have
             block_file = os.path.join(blocks_dir, f"block_{height}.json")
@@ -254,7 +254,7 @@ class IriumNode:
             while True:
                 await asyncio.sleep(5)  # Check every 5 seconds
                 
-                blocks_dir = os.path.expanduser("~/.irium/blocks")
+                blocks_dir = os.path.expanduser(os.getenv("IRIUM_BLOCKS_DIR","~/.irium/blocks"))
                 if os.path.exists(blocks_dir):
                     block_files = sorted([f for f in os.listdir(blocks_dir) if f.endswith(".json")])
                     if block_files:
