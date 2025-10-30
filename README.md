@@ -529,3 +529,7 @@ cp ~/.irium/irium-wallet.json ~/irium-wallet-backup.json
 **Without your wallet, you lose access to mining rewards!**
 
 For complete mining guide, see: [MINING_SETUP.md](MINING_SETUP.md)
+
+## Mining
+See MINING.md for full instructions on single-miner and multicore full P2P mining:
+- MINING.md
