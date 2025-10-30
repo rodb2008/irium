@@ -4,7 +4,7 @@ if __name__ == "__main__":
     print("❌ Deprecated: use scripts/irium-miner-individual.py with --wallet or --miner-id")
     sys.exit(1)
 
-print("❌ Deprecated: use scripts/irium-miner-individual.py with --wallet or --miner-id"); import sys; sys.exit(1)\n
+print("❌ Deprecated: use scripts/irium-miner-individual.py with --wallet or --miner-id"); import sys; sys.exit(1)
 """Simple Irium miner - no P2P, just mining for multicore setups."""
 
 import sys
@@ -173,7 +173,7 @@ class SimpleIriumMiner:
                         print(f"   Nonce: {block.header.nonce:,} | Hashrate: {hashrate:,.0f} H/s")
 
             except KeyboardInterrupt:
-                print("\n🛑 Mining stopped")
+                print("🛑 Mining stopped")
                 break
             except Exception as e:
                 print(f"❌ Mining error: {e}")

@@ -4,7 +4,7 @@ if __name__ == "__main__":
     print("❌ Deprecated: use scripts/irium-miner-individual.py with --wallet or --miner-id")
     sys.exit(1)
 
-print("❌ Deprecated: use scripts/irium-miner-individual.py with --wallet or --miner-id"); import sys; sys.exit(1)\n
+print("❌ Deprecated: use scripts/irium-miner-individual.py with --wallet or --miner-id"); import sys; sys.exit(1)
 """Irium miner with P2P block broadcasting."""
 
 import sys
@@ -59,12 +59,12 @@ class IriumMiner:
             return addresses[0]
 
         # No wallet found - require user to create one
-        print("\n❌ ERROR: No wallet found!")
-        print("\nYou must create a wallet BEFORE mining:")
+        print("❌ ERROR: No wallet found!")
+        print("You must create a wallet BEFORE mining:")
         print("  1. python3 scripts/irium-wallet-proper.py create")
         print("  2. python3 scripts/irium-wallet-proper.py new-address")
         print("  3. python3 scripts/irium-wallet-proper.py balance")
-        print("\n⚠️  IMPORTANT: Backup your wallet keys!")
+        print("⚠️  IMPORTANT: Backup your wallet keys!")
         print("  Wallet location: ~/.irium/wallet.dat")
         print("")
         import sys
@@ -146,7 +146,7 @@ class IriumMiner:
                 elapsed = time.time() - start_time
                 hashrate = nonce / elapsed if elapsed > 0 else 0
 
-                print(f"\n✅ Block {height} mined!")
+                print(f"✅ Block {height} mined!")
                 print(f"  Hash: {header.hash().hex()}")
                 print(f"  Nonce: {nonce}")
                 print(f"  Time: {elapsed:.2f}s")
@@ -158,7 +158,7 @@ class IriumMiner:
 
             # NONCE OVERFLOW FIX: Reset nonce and update timestamp when exhausted
             if nonce > 0xFFFFFFFF:
-                print(f"\n  🔄 Nonce space exhausted (4.29B attempts), updating timestamp...")
+                print(f"  🔄 Nonce space exhausted (4.29B attempts), updating timestamp...")
                 nonce = 0
                 block_time = int(time.time())
                 start_time = time.time()  # Reset timer
@@ -199,10 +199,10 @@ class IriumMiner:
                     with open(tip_file) as f:
                         tip = json.load(f)
                     if prev_hash != tip['hash']:
-                        print(f"\n  ❌ FORK REJECTED: Block {height}")
+                        print(f"  ❌ FORK REJECTED: Block {height}")
                         return
 
-            print(f"\n📦 Received block {height}")
+            print(f"📦 Received block {height}")
             os.makedirs(BLOCKCHAIN_DIR, exist_ok=True)
             with open(os.path.join(BLOCKCHAIN_DIR, f"block_{height}.json"), 'w') as f:
                 json.dump(block_json, f, indent=2)
@@ -217,7 +217,7 @@ class IriumMiner:
     async def handle_peer_tx(self, peer, tx_data: bytes):
         """Handle transaction from peer."""
         try:
-            print(f"\n💸 Received transaction from {peer.address}")
+            print(f"💸 Received transaction from {peer.address}")
             # TODO: Add to mempool
         except Exception as e:
             print(f"❌ Error handling peer tx: {e}")
@@ -295,7 +295,7 @@ class IriumMiner:
         print(f"✅ Blockchain initialized at height {self.chain_state.height}")
 
         # Start P2P
-        print(f"\n🌐 Starting P2P networking on port {self.p2p_port}...")
+        print(f"🌐 Starting P2P networking on port {self.p2p_port}...")
         self.p2p = P2PNode(
             port=self.p2p_port,
             max_peers=8000,
@@ -400,7 +400,7 @@ class IriumMiner:
 
     async def stop(self):
         """Stop mining."""
-        print("\n🛑 Stopping Irium Miner...")
+        print("🛑 Stopping Irium Miner...")
         self.running = False
 
         if self.p2p:
