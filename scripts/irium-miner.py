@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 import sys
 if __name__ == "__main__":
-    print("❌ Deprecated: use scripts/irium-miner-individual.py with --wallet or --miner-id")
-    sys.exit(1)
 
-print("❌ Deprecated: use scripts/irium-miner-individual.py with --wallet or --miner-id"); import sys; sys.exit(1)
 """Irium miner with P2P block broadcasting."""
 
 import sys
@@ -68,7 +65,6 @@ class IriumMiner:
         print("  Wallet location: ~/.irium/wallet.dat")
         print("")
         import sys
-        sys.exit(1)
         return ""  # Never reached
 
     def load_mempool(self):
@@ -417,7 +413,6 @@ async def main():
             port = int(sys.argv[1])
         except ValueError:
             print(f"Invalid port: {sys.argv[1]}")
-            sys.exit(1)
         return ""  # Never reached
 
     miner = IriumMiner(p2p_port=port)
