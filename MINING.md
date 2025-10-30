@@ -1,160 +1,56 @@
-## ⚠️ v1.2.0 Difficulty Update
+# Irium Mining Guide (Full P2P Miner)
 
-**Important**: Genesis difficulty increased 100x. Blocks now take ~13 minutes to mine.
+This guide shows how to mine using the full P2P miner with your own wallet. No wallets or peers are hardcoded; everything is env/CLI driven (Bitcoin-style).
 
-- **Before**: 8 seconds per block (too fast)
-- **After**: ~13 minutes per block (realistic)
-- **Patience required**: First block may take 15+ minutes
-
-
-# Irium Mining Guide
-
-Complete guide to mining IRM cryptocurrency.
-
-## Mining Rewards
-- Current: 50 IRM per block
-- Halving: Every 210,000 blocks (~4 years)
-- Algorithm: SHA-256d (Bitcoin-compatible)
-
-## Quick Start
+## 1) Create a miner wallet (per-miner)
 ```bash
-# 1. Create wallet
-python3 scripts/irium-wallet-proper.py create
-
-# 2. Start mining
-python3 scripts/irium-miner.py
+# Creates ~/.irium-miners/<miner-id>/irium-wallet.json
+scripts/setup-miner.sh my-miner-1
 ```
 
-## Hardware
-- CPU: Any modern processor
-- GPU: Bitcoin SHA-256d compatible
-- ASIC: Bitcoin ASICs work
-
-## Expected Earnings
-- Block reward: 50 IRM
-- Block time: 10 minutes
-- Difficulty: Adjusts every 2016 blocks
-
-## Wallet and Mining Address
-
-### Important: Miner Loads Wallet at Startup
-
-The miner loads your wallet when it starts. If you create a new wallet address while the miner is running, you need to **restart the miner** to use the new address.
-
-### How It Works
-
-1. **First Time Mining:**
-   - If no wallet exists at `~/.irium/irium-wallet.json`, the miner creates one automatically
-   - The first address in the wallet is used for mining rewards
-
-2. **Using an Existing Wallet:**
-   - The miner loads `~/.irium/irium-wallet.json` at startup
-   - Uses the first address in the wallet for mining rewards
-
-3. **Creating a New Address:**
-   ```bash
-   # Create new address
-   python3 scripts/irium-wallet-proper.py new-address
-   
-   # Restart miner to use the NEW address
-   sudo systemctl restart irium-miner.service
-   
-   # Verify the mining address
-   sudo journalctl -u irium-miner.service -n 20 | grep "Mining address"
-   ```
-
-### Using a Specific Address for Mining
-
-If you want to mine to a specific address:
-
+## 2) Single miner run (recommended)
 ```bash
-# 1. Stop the miner
-sudo systemctl stop irium-miner.service
+# Select your wallet file
+export IRIUM_WALLET_FILE="$HOME/.irium-miners/my-miner-1/irium-wallet.json"
 
-# 2. Backup old wallet (optional)
-cp ~/.irium/irium-wallet.json ~/.irium/irium-wallet.json.backup
+# Start a node (pick a free port if 38291 is busy)
+nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
 
-# 3. Create new wallet with your desired address
-rm ~/.irium/irium-wallet.json
-python3 scripts/irium-wallet-proper.py new-address
-
-# 4. Start miner
-sudo systemctl start irium-miner.service
-
-# 5. Verify
-sudo journalctl -u irium-miner.service -n 20 | grep "Mining address"
+# Start one full P2P miner (positional P2P port, no --port flag)
+python3 scripts/irium-miner.py 38292
 ```
 
-### Check Current Mining Address
-
+Stop:
 ```bash
-# See what address the miner is currently using
-sudo journalctl -u irium-miner.service | grep "Mining address" | tail -1
-
-# See all addresses in your wallet
-python3 scripts/irium-wallet-proper.py list
+pkill -f 'scripts/irium-miner.py'
+pkill -f 'scripts/irium-node.py'
 ```
 
-**Remember:** Mining rewards go to the address that was loaded when the miner started, not addresses created afterwards!
-
-## Mining Faster
-
-### Coming in v1.1.0
-- Multi-threaded miner (uses all cores)
-- Full UTXO balance scanning
-- Transaction history
-
----
-
-## Mining with Multiple CPU Cores
-
-### Multi-Core Mining (Recommended)
-
-The default miner uses only 1 CPU core. To use all your cores and mine faster:
-
+## 3) Multicore mining (full P2P miners)
 ```bash
-# Stop single-core miner
-sudo systemctl stop irium-miner.service
+# Use your wallet (same as above)
+export IRIUM_WALLET_FILE="$HOME/.irium-miners/my-miner-1/irium-wallet.json"
 
-# Start multi-core mining (uses 4 cores by default)
+# Ensure a node is running (example)
+nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
+
+# Launch N miners; logs in /tmp/miner-<port>.log
 ./scripts/irium-miner-multicore.sh 4
-
-# Or use all 8 cores on an 8-core system
-./scripts/irium-miner-multicore.sh 8
 ```
 
-**Performance Comparison:**
-- Single core: ~210,000 H/s
-- 4 cores: ~840,000 H/s (4x faster)
-- 8 cores: ~1,680,000 H/s (8x faster)
+## 4) Environment and CLI (no hardcoding)
+- Wallet file: `IRIUM_WALLET_FILE=/path/to/irium-wallet.json`
+- P2P port (full miner): positional arg (e.g., `scripts/irium-miner.py 38292`)
+- Node port: positional arg (e.g., `scripts/irium-node.py 38291`)
+- Bootstrap peers (optional): `BOOTSTRAP_NODES="host1:port,host2:port"`
+- Data dirs (optional overrides):
+  - `IRIUM_BLOCKS_DIR` (default `~/.irium/blocks`)
+  - `IRIUM_MEMPOOL_DIR` (default `~/.irium/mempool`)
+  - `IRIUM_WALLET_FILE` (default `~/.irium/irium-wallet.json` for wallet API)
 
-**To stop multi-core mining:**
-```bash
-pkill -f irium-miner.py
-```
-
-**To view mining progress:**
-```bash
-# View logs from one miner
-tail -f /tmp/miner-38293.log
-
-# Check for new blocks
-ls -lth ~/.irium/blocks/
-```
-
-### Permanent Multi-Core Mining
-
-To run multi-core mining automatically on system boot, update the systemd service:
-
-```bash
-# Edit the miner service
-sudo nano /etc/systemd/system/irium-miner.service
-
-# Change the ExecStart line to:
-ExecStart=/home/irium/irium/scripts/irium-miner-multicore.sh 4
-
-# Reload and restart
-sudo systemctl daemon-reload
-sudo systemctl restart irium-miner.service
-```
-
+## 5) Troubleshooting
+- Port in use: pick different ports (e.g., node `39291`, miner `39292+`).
+- Wallet not found: ensure `IRIUM_WALLET_FILE` is set and file perms are `600`.
+- Logs:
+  - Node: `/tmp/node.log`
+  - Miners: `/tmp/miner-<P2PPORT>.log`
