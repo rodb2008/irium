@@ -283,7 +283,7 @@ class P2PNode:
                 if peer.height < self.chain_height:
                     # We're ahead - PUSH our blocks to them
                     print(f"  📊 We are ahead ({self.chain_height} vs {peer.height}) - pushing blocks...")
-                    blocks_dir = os.path.expanduser("~/.irium/blocks")
+                    blocks_dir = os.path.expanduser(os.getenv("IRIUM_BLOCKS_DIR","~/.irium/blocks"))
                     for h in range(peer.height + 1, self.chain_height + 1):
                         block_file = os.path.join(blocks_dir, f"block_{h}.json")
                         if os.path.exists(block_file):
@@ -493,7 +493,7 @@ class P2PNode:
             print(f"  📤 Peer {peer.address} requested {get_blocks_msg.count} blocks starting from hash {get_blocks_msg.start_hash.hex()[:16]}...")
 
             # Send blocks the peer needs
-            blocks_dir = os.path.expanduser("~/.irium/blocks")
+            blocks_dir = os.path.expanduser(os.getenv("IRIUM_BLOCKS_DIR","~/.irium/blocks"))
             if os.path.exists(blocks_dir):
                 # Find all blocks we have
                 available_blocks = []
@@ -678,7 +678,7 @@ class P2PNode:
                 # PUSH our blocks if peer is behind
                 if peer.height < self.chain_height:
                     print(f"  We are ahead ({self.chain_height} vs {peer.height}), pushing our blocks...")
-                    blocks_dir = os.path.expanduser("~/.irium/blocks")
+                    blocks_dir = os.path.expanduser(os.getenv("IRIUM_BLOCKS_DIR","~/.irium/blocks"))
                     for h in range(peer.height + 1, self.chain_height + 1):
                         block_file = os.path.join(blocks_dir, f"block_{h}.json")
                         if os.path.exists(block_file):
