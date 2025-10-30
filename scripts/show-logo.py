@@ -17,8 +17,8 @@ def show_network_info():
     print("\n" + "="*60)
     print("🌐 NETWORK INFORMATION")
     print("="*60)
-    print("🔗 Bootstrap Node: 207.244.247.86:19444")
-    print("🔐 Wallet API: https://207.244.247.86/api")
+    print("🔗 Bootstrap Node: configured via BOOTSTRAP_NODES env
+    print("🔐 Wallet API: configured by your deployment
     print("📱 Web3 Compatible: MetaMask, Trust Wallet")
     print("⚡ Consensus: Proof-of-Work (SHA-256d)")
     print("💰 Max Supply: 100,000,000 IRM")
