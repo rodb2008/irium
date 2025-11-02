@@ -1,83 +1,52 @@
-# Wallet files - NEVER push these!
+# 🔒 Wallet and sensitive data
 *.wallet
 *.wallet.json
 *wallet*.json
 .irium/
 ~/.irium/
 
-# Backup files
-*.backup
-*.backup_*
-*.bak
-*.old
-*~
-
-# Temporary files
-*.log
-*.tmp
-/tmp/
-nohup.out
-
-# Environment files
-.env
-*.env
-
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# IDE files
-.vscode/
-.idea/
-
-# Runtime data
-*.runtime
-
-# State/runtime data
+# 🧱 Blockchain runtime + state
 state/
-.env
-
-# Website assets (served from gh-pages branch)
-whitepaper.html
-script.js
-*-og-image.png
-
-# Runtime state files
 state/peers.json
 bootstrap/seedlist.runtime
 
-# Runtime files
-state/
-bootstrap/seedlist.runtime
-*.log
-*.pid
+# 🧩 Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
 
-# Temporary files
+# 🧰 Virtual environment
+.venv/
+
+# 🪶 Logs & temporary data
+*.log
 *.tmp
-*.bak
-*.old
-*.backup
+*.pid
+nohup.out
+miner-single.log
 
-# OS files
-.DS_Store
-Thumbs.db
-scripts/archive/
-
-# Backup files
-*.backup
-*.bak
-*.old
-
-# Backups
-scripts/*.bak.*
-# runtime / logs
-*.log
+# 🗂️ Database & runtime files
 *.sqlite
 *.db
 .mining*
-__pycache__/
-*.pyc
+
+# 🧠 IDE / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 🧾 Backups
+*.bak
+*.backup
+*.old
+
+# 🗃️ Archive bundles
+scripts/archive/
 irium-v1.0-mining-bundle.tar.gz
-miner-single.log
+
+# 🌐 Website / build artifacts
+whitepaper.html
+script.js
+*-og-image.png
