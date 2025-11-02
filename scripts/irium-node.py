@@ -15,6 +15,11 @@ from irium.block import Block, BlockHeader
 from irium.tx import Transaction, TxInput, TxOutput
 from irium.pow import Target
 import json
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--port", type=int, default=38291)
+args, _ = parser.parse_known_args()
+
 
 
 class IriumNode:
@@ -340,15 +345,15 @@ class IriumNode:
 async def main():
     """Main entry point."""
     # Parse port from command line
-    port = 38291
-    if len(sys.argv) > 1:
-        try:
-            port = int(sys.argv[1])
-        except ValueError:
-            print(f"Invalid port: {sys.argv[1]}")
-            sys.exit(1)
+    port = args.port
+#    if len(sys.argv) > 1:
+#        try:
+#            port = int(sys.argv[1])
+#        except ValueError:
+#            print(f"Invalid port: {sys.argv[1]}")
+#            sys.exit(1)
     
-    node = IriumNode(port=port)
+    node = IriumNode(port=args.port)
     
     # Handle shutdown signals
     def signal_handler(signum, frame):

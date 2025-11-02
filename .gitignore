@@ -72,3 +72,12 @@ scripts/archive/
 
 # Backups
 scripts/*.bak.*
+# runtime / logs
+*.log
+*.sqlite
+*.db
+.mining*
+__pycache__/
+*.pyc
+irium-v1.0-mining-bundle.tar.gz
+miner-single.log
