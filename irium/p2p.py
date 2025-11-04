@@ -3,6 +3,7 @@
 from __future__ import annotations
 import os
 import asyncio
+from irium.uptime import record_peer_uptime, prune_peers
 import time
 import random
 from typing import Dict, Set, Optional, Callable
@@ -152,6 +153,7 @@ class P2PNode:
             
             # Check if it's our local IP
             import socket
+            
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 s.connect(("8.8.8.8", 80))
@@ -160,7 +162,7 @@ class P2PNode:
                 return ip == local_ip
             except Exception:
                 pass
-        
+            
         return False
     def _is_peer_connected(self, addr: str) -> bool:
         """Check if we're already connected to this peer."""
@@ -603,7 +605,14 @@ class P2PNode:
                 # Silently continue trying
                 await asyncio.sleep(30)
     
-    async def _connect_to_peer(self, multiaddr: str) -> None:
+            async def _connect_to_peer(self, multiaddr: str) -> None:
+                peer_ip = multiaddr.split(":")[0].replace("/ip4/", "")
+                BLACKLISTED_PEERS = {"161.97.71.195"}
+                if peer_ip in BLACKLISTED_PEERS:
+                    print(f"⛔ Skipping blacklisted peer: {peer_ip}")
+                    return
+
+
         """Connect to a peer."""
         try:
             # Parse multiaddr (simplified)
@@ -636,6 +645,7 @@ class P2PNode:
                 
                 # Skip OUTGOING connections to self
                 import socket
+
                 try:
                     my_ip = socket.gethostbyname(socket.gethostname())
                     if host == my_ip and port == self.port:

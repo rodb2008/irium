@@ -210,3 +210,44 @@ class ReputationManager:
         
         if to_remove:
             self._save()
+
+
+# === AutoPatch: Peer uptime tracking ===
+import json, os, datetime
+SEED_FILE = os.path.expanduser("~/.irium/seeds.txt")
+
+def load_peer_uptime():
+    if not os.path.exists(SEED_FILE):
+        return {}
+    try:
+        with open(SEED_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_peer_uptime(data):
+    os.makedirs(os.path.dirname(SEED_FILE), exist_ok=True)
+    with open(SEED_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def record_peer_uptime(ip):
+    data = load_peer_uptime()
+    now = datetime.datetime.utcnow().timestamp()
+    peer = data.get(ip, {"first_seen": now, "last_seen": now})
+    peer["last_seen"] = now
+    data[ip] = peer
+    save_peer_uptime(data)
+
+def prune_peers():
+    data = load_peer_uptime()
+    now = datetime.datetime.utcnow().timestamp()
+    keep = {}
+    for ip, meta in data.items():
+        age_days = (now - meta["first_seen"]) / 86400
+        inactive = (now - meta["last_seen"]) / 86400
+        if age_days >= 7:
+            meta["trusted"] = True
+        if inactive < 1:
+            keep[ip] = meta
+    save_peer_uptime(keep)
+# === End AutoPatch ===
