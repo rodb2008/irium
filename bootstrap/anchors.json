@@ -14,5 +14,14 @@
       "description": "Genesis block - Mainnet launch"
     }
   ],
-  "last_updated": "2025-11-10T09:28:49Z"
+  "last_updated": "2025-11-10T09:28:49Z",
+  "signatures": [
+    {
+      "signer": "iriumlabs",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINEHKIQunD8c5vyIXqFdA4B5q+uMnm2r8esU59bSMezP signing@iriumlabs.org",
+      "namespace": "irium-anchor",
+      "algorithm": "ssh-ed25519",
+      "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg0QcohC6cPxzm/IheoV0DgHmr64yebavx6xTn1tIx7M8AAAAMaXJpdW0tYW5jaG9yAAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5AAAAQLPFIBWlhGh2zvn71HATGXgW5pd0U57BPbvAthERWqm4OBbesOSHU0iQZdTiAYm+I8oJEHblEcqi8tor8k0HPgQ="
+    }
+  ]
 }

@@ -182,10 +182,13 @@ These tests confirm the locked-genesis data matches the packaged header and that
 
 ## Anchor Signing
 
-The file `bootstrap/anchors.json` must be signed by the operators listed in `trusted_signers`. After regenerating the genesis header, update the anchor entry and attach signatures, then verify it locally:
+Use `python scripts/sign_anchor.py --signer <label>` to canonicalize `bootstrap/anchors.json`, sign it with `ssh-keygen -Y sign`, and append the base64 signature. By default the helper reads `~/.ssh/git-signing` and uses the `irium-anchor` namespace.
+
+Verify the resulting file before publishing:
 
 ```bash
 python3 irium/tools/verify_bootstrap.py --anchors bootstrap/anchors.json
+ssh-keygen -Y verify -f trusted_keys.txt -I <signer_label> -n irium-anchor -s bootstrap/anchors.json.sig < bootstrap/anchors.json
 ```
 
 Distribute the signed file with releases so new nodes can validate checkpoints before syncing.
