@@ -21,6 +21,9 @@ MEMPOOL_DIR = Path(os.path.expanduser(os.getenv("IRIUM_MEMPOOL_DIR", "~/.irium/m
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+EXPLORER_HOST = os.getenv("IRIUM_EXPLORER_HOST", "127.0.0.1")
+EXPLORER_PORT = int(os.getenv("IRIUM_EXPLORER_PORT", "8082"))
+
 def _genesis_block_dict():
     """Return a JSON-serialisable dict representing the locked genesis block."""
     block, payload = load_locked_genesis(REPO_ROOT)
@@ -300,22 +303,23 @@ curl http://localhost:8082/api/block/2</pre>
 
 
 def main():
-    port = 8082
+    host = EXPLORER_HOST
+    port = EXPLORER_PORT
     if len(sys.argv) > 1:
         port = int(sys.argv[1])
-    
-    server = HTTPServer(('0.0.0.0', port), ExplorerAPI)
-    print(f"🔗 Irium Blockchain Explorer API")
-    print(f"📡 Listening on http://0.0.0.0:{port}")
-    print(f"📊 API Documentation: http://localhost:{port}/")
+
+    server = HTTPServer((host, port), ExplorerAPI)
+    print("🔗 Irium Blockchain Explorer API")
+    print(f"📡 Listening on http://{host}:{port}")
+    print(f"📊 API Documentation: http://{host}:{port}/")
     print()
     print("Endpoints:")
-    print(f"  • http://localhost:{port}/api/stats")
-    print(f"  • http://localhost:{port}/api/blocks")
-    print(f"  • http://localhost:{port}/api/latest?count=10")
-    print(f"  • http://localhost:{port}/api/mempool")
+    print(f"  • http://{host}:{port}/api/stats")
+    print(f"  • http://{host}:{port}/api/blocks")
+    print(f"  • http://{host}:{port}/api/latest?count=10")
+    print(f"  • http://{host}:{port}/api/mempool")
     print()
-    
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:

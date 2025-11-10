@@ -22,6 +22,9 @@ GENESIS_META = {
 }
 
 
+WALLET_HOST = os.getenv("IRIUM_WALLET_HOST", "127.0.0.1")
+WALLET_PORT = int(os.getenv("IRIUM_WALLET_PORT", "8080"))
+
 class IriumWalletAPI(BaseHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         self.wallet = Wallet()
@@ -228,8 +231,10 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
 
 
 def main():
-    server = HTTPServer(('0.0.0.0', 8080), IriumWalletAPI)
-    print("Irium Wallet API running on http://0.0.0.0:8080")
+    host = WALLET_HOST
+    port = WALLET_PORT
+    server = HTTPServer((host, port), IriumWalletAPI)
+    print(f"Irium Wallet API running on http://{host}:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

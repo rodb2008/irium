@@ -160,6 +160,36 @@ ls ~/.irium/blocks/ | wc -l
     python3 scripts/irium-miner-individual.py --wallet "$HOME/.irium/irium-wallet.json" --port 39292
     ```
 
+## CLI Usage
+
+- Launch node: `python -m irium node --port 38291`
+- Launch miner: `python -m irium miner 38292`
+- Explorer API: `python -m irium explorer`
+- Wallet API: `python -m irium wallet-api`
+- Verify genesis: `python -m irium verify-genesis`
+
+All commands must run from the repo root so the CLI can locate the scripts and locked genesis files.
+
+## Testing & QA
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt pytest  # or just pip install pytest
+PYTHONPATH=$PWD pytest
+```
+
+These tests confirm the locked-genesis data matches the packaged header and that a fresh `ChainState` boots on top of it. Add new tests for consensus or networking changes before shipping a release.
+
+## Anchor Signing
+
+The file `bootstrap/anchors.json` must be signed by the operators listed in `trusted_signers`. After regenerating the genesis header, update the anchor entry and attach signatures, then verify it locally:
+
+```bash
+python3 irium/tools/verify_bootstrap.py --anchors bootstrap/anchors.json
+```
+
+Distribute the signed file with releases so new nodes can validate checkpoints before syncing.
+
 ## Network Information
 
 - Network: LIVE ✅
@@ -175,6 +205,8 @@ Genesis (locked):
 ## APIs
 
 - Base: https://api.iriumlabs.org/
+- Explorer env: set `IRIUM_EXPLORER_HOST` / `IRIUM_EXPLORER_PORT` (defaults to 127.0.0.1:8082) before `python -m irium explorer`.
+- Wallet env: set `IRIUM_WALLET_HOST` / `IRIUM_WALLET_PORT` (defaults to 127.0.0.1:8080) before `python -m irium wallet-api`; terminate TLS via nginx or Caddy.
 
 Explorer API
 ```bash
