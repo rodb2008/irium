@@ -1,0 +1,17 @@
+{
+  "network": "mainnet",
+  "version": 1,
+  "timestamp": 1735689600,
+  "time": 1735689600,
+  "bits": "1d00ffff",
+  "nonce": 1364084797,
+  "hash": "000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c",
+  "merkle_root": "cd78279c389b6f2f0a4edc567f3ba67b27daed60ab014342bb4a5b56c2ebb4db",
+  "allocations": [
+    {
+      "label": "founder_vesting_cltv",
+      "amount_sats": 350000000000000,
+      "script_pubkey": "03f06702b17576a9140ae5debfc6279fdb002c0da105be6d0645aac39888ac"
+    }
+  ]
+}

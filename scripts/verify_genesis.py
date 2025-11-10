@@ -1,20 +1,33 @@
-import json, sys, hashlib, struct
+import hashlib
+import json
+import struct
+from pathlib import Path
 
-with open("configs/genesis.header.json","r") as f:
-    g = json.load(f)
-h = g["header"]
+ROOT = Path(__file__).resolve().parents[1]
+GENESIS_LOCKED = ROOT / "config" / "genesis-locked.json"
 
-# pack header like Bitcoin-style (version|prev|merkle|time|bits|nonce)
-def h2b(x): return bytes.fromhex(x)[::-1]  # little-endian
-version = struct.pack("<I", h["version"])
-prev    = h2b(h["prev_hash"])
-merkle  = h2b(h["merkle_root"])
-time_   = struct.pack("<I", h["time"])
-bits    = bytes.fromhex(h["bits"])[::-1] if len(h["bits"])==8 else struct.pack("<I", int(h["bits"],16))
-nonce   = struct.pack("<I", h["nonce"])
-header  = version + prev + merkle + time_ + bits + nonce
+def _little_endian_bytes(hex_str: str) -> bytes:
+    return bytes.fromhex(hex_str)[::-1]
 
-hash_ = hashlib.sha256(hashlib.sha256(header).digest()).digest()[::-1].hex()
-print("derived header hash:", hash_)
-print("file header hash   :", h["hash"])
-print("match:", hash_.lower()==h["hash"].lower())
+with open(GENESIS_LOCKED, "r", encoding="utf-8") as fp:
+    payload = json.load(fp)
+
+header = payload["header"]
+
+version = struct.pack("<I", header["version"])
+prev_hash = _little_endian_bytes(header["prev_hash"])
+merkle_root = _little_endian_bytes(header["merkle_root"])
+time_bytes = struct.pack("<I", header["time"])
+bits_value = header["bits"]
+if isinstance(bits_value, str):
+    bits_compact = int(bits_value, 16)
+else:
+    bits_compact = int(bits_value)
+bits = struct.pack("<I", bits_compact)
+nonce = struct.pack("<I", header["nonce"])
+block_header = version + prev_hash + merkle_root + time_bytes + bits + nonce
+
+derived = hashlib.sha256(hashlib.sha256(block_header).digest()).digest()[::-1].hex()
+print("derived header hash:", derived)
+print("file header hash   :", header["hash"])
+print("match:", derived.lower() == header["hash"].lower())

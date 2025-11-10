@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 echo "[Irium Zero] Bootstrapping default seeds..."
 echo "Seed: seed.irium.io"
-echo "Anchor: 0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6"
+echo "Anchor: 000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c"

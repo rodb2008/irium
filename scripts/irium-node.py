@@ -5,15 +5,16 @@ import sys
 import os
 import asyncio
 import signal
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from irium.p2p import P2PNode
 from irium.chain import ChainParams, ChainState
 from irium.update_checker import UpdateChecker, display_update_notification
-from irium.block import Block, BlockHeader
-from irium.tx import Transaction, TxInput, TxOutput
+from irium.block import BlockHeader
 from irium.pow import Target
+from irium.tools.genesis_loader import load_locked_genesis
 import json
 import argparse
 parser = argparse.ArgumentParser()
@@ -28,6 +29,7 @@ class IriumNode:
     def __init__(self, port: int = 38291):
         self.port = port
         self.running = True
+        self.repo_root = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         
         # Initialize blockchain
         self.chain_params = None
@@ -40,59 +42,21 @@ class IriumNode:
         """Load blockchain from genesis."""
         print("📋 Loading blockchain...")
         
-        # Load genesis
-        genesis_file = os.path.join(os.path.dirname(__file__), '..', 'configs', 'genesis.json')
-        
-        if not os.path.exists(genesis_file):
-            print("❌ Genesis file not found")
-            return False
-        
         try:
-            with open(genesis_file, 'r') as f:
-                genesis_data = json.load(f)
-            
-            # Create genesis block
-            allocations = genesis_data.get('allocations', [])
-            outputs = []
-            for alloc in allocations:
-                script_pubkey = bytes.fromhex(alloc['script_pubkey'])
-                amount = alloc['amount_sats']
-                outputs.append(TxOutput(value=amount, script_pubkey=script_pubkey))
-            
-            coinbase_tx = Transaction(
-                version=1,
-                inputs=[TxInput(prev_txid=bytes(32), prev_index=0xFFFFFFFF, script_sig=b"Irium Genesis Block - SHA256d PoW")],
-                outputs=outputs
-            )
-            
-            # Calculate merkle root
-            temp_block = Block(
-                header=BlockHeader(
-                    version=1,
-                    prev_hash=bytes(32),
-                    merkle_root=bytes(32),
-                    time=genesis_data.get('time', genesis_data['timestamp']),
-                    bits=int(genesis_data['bits'], 16),
-                    nonce=genesis_data.get('nonce', 0)
-                ),
-                transactions=[coinbase_tx]
-            )
-            
-            merkle_root = temp_block.merkle_root()[::-1]
-            
-            genesis_header = BlockHeader(
-                version=1,
-                prev_hash=bytes(32),
-                merkle_root=merkle_root,
-                time=genesis_data.get('time', genesis_data['timestamp']),
-                bits=int(genesis_data['bits'], 16),
-                nonce=genesis_data.get('nonce', 0)
-            )
-            
-            genesis_block = Block(header=genesis_header, transactions=[coinbase_tx])
-            
+            genesis_block, locked_payload = load_locked_genesis(self.repo_root)
+            header = locked_payload["header"]
+
+            derived_hash = genesis_block.header.hash().hex()
+            if derived_hash.lower() != header["hash"].lower():
+                print("❌ Locked genesis hash mismatch")
+                print(f"   Expected: {header['hash']}")
+                print(f"   Derived : {derived_hash}")
+                return False
+
+            print(f"  🔐 Locked genesis hash: {header['hash']}")
+
             # Create chain params and state
-            pow_limit = Target(bits=int(genesis_data['bits'], 16))
+            pow_limit = Target(bits=int(header["bits"], 16))
             self.chain_params = ChainParams(genesis_block=genesis_block, pow_limit=pow_limit)
             self.chain_state = ChainState(params=self.chain_params)
             

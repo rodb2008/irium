@@ -97,7 +97,7 @@ class ChainState:
         self.issued = subsidy_created
 
     def _validate_block_header(self, block: Block, height: int, previous: Block | None) -> None:
-        if previous is not None and not (height == 0 and block.header.prev_hash in (b"\x00" * 32, bytes.fromhex("0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6"))):
+        if previous is not None and not (height == 0 and block.header.prev_hash in (b"\x00" * 32, bytes.fromhex("000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c"))):
             if block.header.prev_hash != previous.header.hash():
                 raise ValueError("Block does not extend the current tip")
         elif block.header.prev_hash != b"\x00" * 32:

@@ -3,7 +3,7 @@
 **Technical Whitepaper - Version 1.0**
 
 **Network Status:** LIVE on Mainnet
-**Genesis Hash:** 0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6
+**Genesis Hash:** 000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c
 **Launch Date:** October 27, 2025
 
 ---
@@ -21,7 +21,7 @@ Irium is a purpose-built proof-of-work blockchain designed to maximize network i
 Most established proof-of-work networks inherit architectural assumptions from Bitcoin, including DNS-based bootstrapping, addrman-driven peer discovery, and an absence of protocol-level incentives for fast relay. Irium rethinks these components to produce a mainnet that can launch and sustain itself even if all founding infrastructure disappears.
 
 **Irium launched on October 27, 2025 with:**
-- Mined genesis block (5.4 billion hashes, 7 hours)
+- Mined genesis block (1,364,084,798 hashes, ~104 minutes)
 - Zero DNS dependencies
 - Complete P2P networking
 - All services operational
@@ -105,9 +105,9 @@ valid_block = block_hash < target
 - Existing mining infrastructure
 
 **Genesis Block:**
-- Nonce: 1,961,837,199
-- Hash: 0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6 (valid mainnet PoW)
-- Mined: October 27, 2025 after 5.4 billion hashes
+- Nonce: 1,364,084,797
+- Hash: 000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c (valid mainnet PoW)
+- Mined: October 27, 2025 after 1,364,084,798 hashes
 
 ### 3.2 Difficulty Adjustment
 
@@ -308,7 +308,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 ```json
 {
   "height": 0,
-  "hash": "0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6",
+  "hash": "000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c",
   "timestamp": 1735689600,
   "signatures": ["..."]
 }
@@ -612,10 +612,10 @@ Irium represents a new generation of blockchain technology that addresses fundam
 
 ## Appendix A: Genesis Block
 
-**Hash:** 0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6
+**Hash:** 000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c
 **Nonce:** 1,961,837,199
 **Timestamp:** 1735689600 (October 27, 2025)
-**Merkle Root:** a0bd470d94bf7ef20539a0a6e2bd30629795f0bad5160d0495e07e85e4a5db04
+**Merkle Root:** cd78279c389b6f2f0a4edc567f3ba67b27daed60ab014342bb4a5b56c2ebb4db
 **Difficulty:** 0x1d00ffff (mainnet)
 
 **Mining Stats:**

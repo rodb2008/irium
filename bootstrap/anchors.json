@@ -7,12 +7,12 @@
   "anchors": [
     {
       "height": 0,
-      "hash": "0000000040e3eb5ed9db5cc8df56dd6db9c6f3009ca7e9114fb52400e0136fb6",
+      "hash": "000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c",
       "timestamp": 1735689600,
       "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-      "merkle_root": "a0bd470d94bf7ef20539a0a6e2bd30629795f0bad5160d0495e07e85e4a5db04",
+      "merkle_root": "cd78279c389b6f2f0a4edc567f3ba67b27daed60ab014342bb4a5b56c2ebb4db",
       "description": "Genesis block - Mainnet launch"
     }
   ],
-  "last_updated": "2025-10-16T17:30:00Z"
+  "last_updated": "2025-11-10T09:28:49Z"
 }

@@ -166,10 +166,11 @@ ls ~/.irium/blocks/ | wc -l
 - Services: Operational ✅
 - P2P Peers: Growing 🌱
 
-Genesis:
-- Hash: cbdd1b...000000
-- Mined: October 16, 2025
-- Vesting: 3.5M IRM timelocked (CLTV)
+Genesis (locked):
+- Hash: `000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c`
+- Merkle root: `cd78279c389b6f2f0a4edc567f3ba67b27daed60ab014342bb4a5b56c2ebb4db`
+- Nonce/Bits/Time: `1364084797 / 0x1d00ffff / 1735689600`
+- Vesting: 3.5M IRM timelocked to PxG1FmGiSnvfXJUcryLna2L5MB4iGG1KD7
 
 ## APIs
 
