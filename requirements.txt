@@ -1,4 +1,4 @@
-# Irium Blockchain v1.1.0 Dependencies
+# Irium Blockchain Core Dependencies
 
 # Core dependencies
 requests>=2.31.0
