@@ -6,7 +6,7 @@ import asyncio
 from irium.uptime import record_peer_uptime, prune_peers
 import time
 import random
-from typing import Dict, Set, Optional, Callable
+from typing import Dict, Set, Optional, Callable, Tuple
 from dataclasses import dataclass, field
 
 from .protocol import (
@@ -17,6 +17,7 @@ from .protocol import (
     BlockMessage, TxMessage, DisconnectMessage, GetBlocksMessage
 )
 from .network import PeerDirectory, SeedlistManager
+from .anchors import AnchorManager, EclipseProtection
 
 
 @dataclass
@@ -89,7 +90,8 @@ class P2PNode:
         max_peers: int = 8,
         agent: str = "irium-node/1.1.0",
         chain_height: int = 0,
-        ping_interval: int = None  # Auto-detect: 60s for public, 30s for NAT
+        ping_interval: int = None,  # Auto-detect: 60s for public, 30s for NAT
+        anchor_manager: Optional[AnchorManager] = None,
     ):
         self.port = port
         self.max_peers = max_peers
@@ -122,6 +124,62 @@ class P2PNode:
         # Detect our public IP to prevent self-connections
         self.public_ip = self._get_public_ip()
         self.relayed_blocks: Dict[int, Set[str]] = {}
+        self.anchor_manager = anchor_manager
+        self.eclipse_protection = EclipseProtection(anchor_manager) if anchor_manager else None
+    
+    def _latest_checkpoint(self) -> Tuple[Optional[int], Optional[str]]:
+        """Return the most recent signed checkpoint height/hash."""
+        if not self.anchor_manager:
+            return None, None
+        anchor = self.anchor_manager.get_latest_anchor()
+        if not anchor:
+            return None, None
+        return anchor.height, anchor.hash
+
+    def _build_handshake(self) -> HandshakeMessage:
+        """Construct a handshake message that advertises our checkpoint."""
+        checkpoint_height, checkpoint_hash = self._latest_checkpoint()
+        return HandshakeMessage(
+            version=1,
+            agent=self.agent,
+            height=self.chain_height,
+            timestamp=int(time.time()),
+            port=self.port,
+            checkpoint_height=checkpoint_height,
+            checkpoint_hash=checkpoint_hash,
+        )
+
+    def _validate_peer_checkpoint(self, handshake: HandshakeMessage) -> Tuple[bool, Optional[str]]:
+        """Validate the peer-reported checkpoint against our trusted anchors."""
+        if not self.anchor_manager:
+            return True, None
+        anchor = self.anchor_manager.get_latest_anchor()
+        if not anchor:
+            return True, None
+
+        advertised_height = getattr(handshake, "checkpoint_height", None)
+        advertised_hash = getattr(handshake, "checkpoint_hash", None)
+
+        if advertised_height is None or advertised_hash is None:
+            return False, "Peer missing checkpoint metadata"
+
+        if advertised_height < anchor.height:
+            return False, f"Peer anchor {advertised_height} behind locked {anchor.height}"
+
+        if advertised_hash.lower() != anchor.hash.lower():
+            return False, "Peer checkpoint hash mismatch"
+
+        return True, None
+
+    async def _disconnect_for_violation(self, peer: Peer, reason: str) -> None:
+        """Notify peer of violation and close connection."""
+        try:
+            msg = DisconnectMessage(reason=reason)
+            await peer.send_message(msg.to_message())
+        except Exception:
+            pass
+        finally:
+            peer.close()
 
     def _get_peer_ip(self, address: str) -> str:
         """Extract IP from address string (IP:PORT)."""
@@ -315,14 +373,7 @@ class P2PNode:
         try:
             if is_initiator:
                 # Send our handshake first
-                handshake = HandshakeMessage(
-                    version=1,
-                    agent=self.agent,
-                    height=self.chain_height,
-                    timestamp=int(time.time()),
-                    port=self.port
-                )
-                await peer.send_message(handshake.to_message())
+                await peer.send_message(self._build_handshake().to_message())
             
             # Receive their handshake
             msg = await asyncio.wait_for(peer.recv_message(), timeout=30.0)
@@ -332,6 +383,14 @@ class P2PNode:
             their_handshake = HandshakeMessage.from_message(msg)
             peer.agent = their_handshake.agent
             peer.height = their_handshake.height
+
+            checkpoint_ok, reason = self._validate_peer_checkpoint(their_handshake)
+            if not checkpoint_ok:
+                print(f"⚠️  Rejecting peer {peer.address}: {reason}")
+                if self.eclipse_protection:
+                    self.eclipse_protection.suspicious_peers.add(peer.address)
+                await self._disconnect_for_violation(peer, reason or "Checkpoint mismatch")
+                return False
             
             # Version check
             peer_version = their_handshake.node_version if hasattr(their_handshake, 'node_version') else "unknown"
@@ -341,14 +400,7 @@ class P2PNode:
             
             if not is_initiator:
                 # Send our handshake in response
-                handshake = HandshakeMessage(
-                    version=1,
-                    agent=self.agent,
-                    height=self.chain_height,
-                    timestamp=int(time.time()),
-                    port=self.port
-                )
-                await peer.send_message(handshake.to_message())
+                await peer.send_message(self._build_handshake().to_message())
             
             # Register peer with their announced listening port
             peer_ip = peer.address.split(':')[0]

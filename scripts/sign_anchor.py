@@ -6,12 +6,55 @@ import argparse
 import json
 import subprocess
 import tempfile
+import textwrap
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
-def canonical_json(path: Path) -> bytes:
+def canonical_payload_bytes(path: Path) -> bytes:
+    """Return canonical JSON bytes excluding signature entries."""
     data = json.loads(path.read_text())
-    return json.dumps(data, separators=(",", ":"), sort_keys=True).encode()
+    payload = dict(data)
+    payload.pop("signatures", None)
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+
+
+def write_signature_file(signature_b64: str, dest: Path) -> None:
+    """Write an SSH signature file with BEGIN/END wrappers."""
+    wrapped = textwrap.fill(signature_b64, 70)
+    dest.write_text(
+        "-----BEGIN SSH SIGNATURE-----\n"
+        f"{wrapped}\n"
+        "-----END SSH SIGNATURE-----\n"
+    )
+
+
+def create_signature(
+    tmp_payload: Path,
+    key_path: Path,
+    namespace: str,
+) -> Path:
+    """Invoke ssh-keygen -Y sign and return the resulting signature path."""
+    sig_path = tmp_payload.with_suffix(".sig")
+    if sig_path.exists():
+        sig_path.unlink()
+
+    cmd = [
+        "ssh-keygen",
+        "-Y",
+        "sign",
+        "-n",
+        namespace,
+        "-f",
+        str(key_path),
+        str(tmp_payload),
+    ]
+    subprocess.run(cmd, check=True)
+
+    if not sig_path.exists():
+        raise SystemExit("ssh-keygen did not produce a signature file")
+    return sig_path
 
 
 def extract_signature(sig_path: Path) -> str:
@@ -22,6 +65,14 @@ def extract_signature(sig_path: Path) -> str:
             continue
         lines.append(line)
     return "".join(lines)
+
+
+def upsert_signature(data: dict[str, Any], new_sig: dict[str, Any]) -> None:
+    """Replace existing signer entry (if any) and append the new signature."""
+    signatures = data.setdefault("signatures", [])
+    filtered = [entry for entry in signatures if entry.get("signer") != new_sig["signer"]]
+    filtered.append(new_sig)
+    data["signatures"] = filtered
 
 
 def main() -> None:
@@ -36,43 +87,41 @@ def main() -> None:
     if not anchors_path.exists():
         raise SystemExit(f"Anchors file not found: {anchors_path}")
 
-    canonical = canonical_json(anchors_path)
+    key_path = Path(args.key).expanduser()
+    if not key_path.exists():
+        raise SystemExit(f"Signing key not found: {key_path}")
+
+    canonical_bytes = canonical_payload_bytes(anchors_path)
+    data = json.loads(anchors_path.read_text())
+
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(canonical)
+        tmp.write(canonical_bytes)
         tmp_path = Path(tmp.name)
 
-    sig_file = tmp_path.with_suffix(".sig")
-    if sig_file.exists():
-        sig_file.unlink()
+    sig_path = None
+    try:
+        sig_path = create_signature(tmp_path, key_path, args.namespace)
+        signature_b64 = extract_signature(sig_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        if sig_path is not None:
+            sig_path.unlink(missing_ok=True)
 
-    key_path = Path(args.key).expanduser()
-    cmd = [
-        "ssh-keygen", "-Y", "sign",
-        "-n", args.namespace,
-        "-f", str(key_path),
-        str(tmp_path)
-    ]
-    subprocess.run(cmd, check=True)
+    pub_key_path = key_path.with_suffix(".pub")
+    if not pub_key_path.exists():
+        raise SystemExit(f"Missing public key: {pub_key_path}")
 
-    if not sig_file.exists():
-        raise SystemExit("ssh-keygen did not produce a signature file")
-
-    signature = extract_signature(sig_file)
     sig_entry = {
         "signer": args.signer,
-        "public_key": key_path.with_suffix(".pub").read_text().strip(),
+        "public_key": pub_key_path.read_text().strip(),
         "namespace": args.namespace,
         "algorithm": "ssh-ed25519",
-        "signature": signature,
+        "signature": signature_b64,
+        "signed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
-    anchors = json.loads(anchors_path.read_text())
-    anchors.setdefault("signatures", [])
-    anchors["signatures"].append(sig_entry)
-    anchors_path.write_text(json.dumps(anchors, indent=2) + "\n")
-
-    tmp_path.unlink(missing_ok=True)
-    sig_file.unlink(missing_ok=True)
+    upsert_signature(data, sig_entry)
+    anchors_path.write_text(json.dumps(data, indent=2) + "\n")
     print(f"Added signature from {args.signer} to {anchors_path}")
 
 

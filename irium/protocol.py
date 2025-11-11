@@ -67,16 +67,23 @@ class HandshakeMessage:
     height: int
     timestamp: int
     port: int = 0  # Peer's listening port
+    checkpoint_height: Optional[int] = None
+    checkpoint_hash: Optional[str] = None
     
     def to_message(self) -> Message:
         """Convert to generic Message."""
-        payload = json.dumps({
+        payload_dict = {
             'version': self.version,
             'agent': self.agent,
             'height': self.height,
             'timestamp': self.timestamp,
             'port': self.port,
-        }).encode('utf-8')
+        }
+        if self.checkpoint_height is not None:
+            payload_dict['checkpoint_height'] = self.checkpoint_height
+        if self.checkpoint_hash is not None:
+            payload_dict['checkpoint_hash'] = self.checkpoint_hash
+        payload = json.dumps(payload_dict).encode('utf-8')
         return Message(MessageType.HANDSHAKE, payload)
     
     @classmethod
@@ -88,9 +95,10 @@ class HandshakeMessage:
             agent=data['agent'],
             height=data['height'],
             timestamp=data['timestamp'],
-            port=data.get('port', 0)
+            port=data.get('port', 0),
+            checkpoint_height=data.get('checkpoint_height'),
+            checkpoint_hash=data.get('checkpoint_hash')
         )
-
 
 @dataclass
 class PingMessage:

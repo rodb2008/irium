@@ -23,6 +23,7 @@ from irium.tx import Transaction, TxInput, TxOutput
 from irium.pow import Target
 from irium.p2p import P2PNode
 from irium.tools.genesis_loader import load_locked_genesis
+from irium.anchors import AnchorManager, AnchorVerificationError
 
 WALLET_FILE = os.path.expanduser(os.getenv("IRIUM_WALLET_FILE", "~/.irium/irium-wallet.json"))
 MEMPOOL_FILE = os.path.expanduser(os.getenv("IRIUM_MEMPOOL_FILE", "~/.irium/mempool/pending.json"))
@@ -40,6 +41,7 @@ class IriumMiner:
         self.p2p_port = p2p_port
         self.p2p = None
         self.repo_root = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.anchor_manager = None
 
     def load_wallet(self):
         """Load wallet from file."""
@@ -186,6 +188,10 @@ class IriumMiner:
             except ValueError:
                 return
 
+            if self.anchor_manager and not self.anchor_manager.verify_block_against_anchors(height, block_hash):
+                print(f"  ❌ Anchor mismatch for block {height}")
+                return
+
             # FORK PREVENTION: Only accept next block
             if height != self.chain_state.height + 1:
                 return
@@ -237,6 +243,16 @@ class IriumMiner:
         pow_limit = Target(bits=int(header['bits'], 16))
         self.chain_params = ChainParams(genesis_block=genesis_block, pow_limit=pow_limit)
         self.chain_state = ChainState(params=self.chain_params)
+        
+        anchor_default = self.repo_root / "bootstrap/anchors.json"
+        anchors_env = os.getenv("IRIUM_ANCHORS_FILE", str(anchor_default))
+        try:
+            self.anchor_manager = AnchorManager(anchors_env)
+            if self.anchor_manager.payload_digest:
+                print(f"  📌 Anchors digest: {self.anchor_manager.payload_digest[:16]}...")
+        except AnchorVerificationError as exc:
+            print(f"❌ Anchor verification failed: {exc}")
+            return
 
         # Scan for existing mined blocks
         blocks_dir = BLOCKCHAIN_DIR
@@ -259,7 +275,8 @@ class IriumMiner:
             port=self.p2p_port,
             max_peers=8000,
             agent="irium-miner/1.0",
-            chain_height=self.chain_state.height - 1
+            chain_height=self.chain_state.height - 1,
+            anchor_manager=self.anchor_manager
         )
 
         self.p2p.on_block = self.handle_peer_block

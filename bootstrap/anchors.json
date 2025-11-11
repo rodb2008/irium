@@ -21,7 +21,8 @@
       "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINEHKIQunD8c5vyIXqFdA4B5q+uMnm2r8esU59bSMezP signing@iriumlabs.org",
       "namespace": "irium-anchor",
       "algorithm": "ssh-ed25519",
-      "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg0QcohC6cPxzm/IheoV0DgHmr64yebavx6xTn1tIx7M8AAAAMaXJpdW0tYW5jaG9yAAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5AAAAQLPFIBWlhGh2zvn71HATGXgW5pd0U57BPbvAthERWqm4OBbesOSHU0iQZdTiAYm+I8oJEHblEcqi8tor8k0HPgQ="
+      "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg0QcohC6cPxzm/IheoV0DgHmr64yebavx6xTn1tIx7M8AAAAMaXJpdW0tYW5jaG9yAAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5AAAAQKx5kt75POtHZnWPMwh0elOYZy6Blmh3ast661l1TwriKj07nOxhfA+qDCpBkbpH6daeh+8Do9DCZxF9jo4qnw8=",
+      "signed_at": "2025-11-10T12:37:20+00:00"
     }
   ]
 }

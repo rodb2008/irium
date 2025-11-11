@@ -15,6 +15,7 @@ from irium.update_checker import UpdateChecker, display_update_notification
 from irium.block import BlockHeader
 from irium.pow import Target
 from irium.tools.genesis_loader import load_locked_genesis
+from irium.anchors import AnchorManager, EclipseProtection, AnchorVerificationError
 import json
 import argparse
 parser = argparse.ArgumentParser()
@@ -34,6 +35,8 @@ class IriumNode:
         # Initialize blockchain
         self.chain_params = None
         self.chain_state = None
+        self.anchor_manager = None
+        self.eclipse_protection = None
         
         # P2P node
         self.p2p = None
@@ -59,6 +62,17 @@ class IriumNode:
             pow_limit = Target(bits=int(header["bits"], 16))
             self.chain_params = ChainParams(genesis_block=genesis_block, pow_limit=pow_limit)
             self.chain_state = ChainState(params=self.chain_params)
+            
+            anchor_default = self.repo_root / "bootstrap/anchors.json"
+            anchors_env = os.getenv("IRIUM_ANCHORS_FILE", str(anchor_default))
+            try:
+                self.anchor_manager = AnchorManager(anchors_env)
+                self.eclipse_protection = EclipseProtection(self.anchor_manager)
+                if self.anchor_manager.payload_digest:
+                    print(f"  📌 Anchors digest: {self.anchor_manager.payload_digest[:16]}...")
+            except AnchorVerificationError as exc:
+                print(f"❌ Anchor verification failed: {exc}")
+                return False
             
             # Load mined blocks from disk
             print("  Scanning for mined blocks...")
@@ -105,6 +119,10 @@ class IriumNode:
             except ValueError:
                 return
             
+            if self.anchor_manager and not self.anchor_manager.verify_block_against_anchors(height, block_hash):
+                print(f"   ❌ REJECTED: Block {height} mismatches signed anchor")
+                return
+
             # FORK PREVENTION: Accept blocks that fill gaps or extend chain
             blocks_dir = os.path.expanduser(os.getenv("IRIUM_BLOCKS_DIR","~/.irium/blocks"))
             
@@ -206,7 +224,8 @@ class IriumNode:
             port=self.port,
             max_peers=8000,
             agent="irium-node/1.0",
-            chain_height=self.chain_state.height - 1
+            chain_height=self.chain_state.height - 1,
+            anchor_manager=self.anchor_manager
         )
         
         # Set callbacks
