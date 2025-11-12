@@ -125,34 +125,35 @@ class AnchorManager:
         namespace = entry.get("namespace", "irium-anchor")
         signature = entry.get("signature")
         public_key = entry.get("public_key")
+        signer = entry.get("signer", "unknown")
 
         if not signature or not public_key:
             return False
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
-            payload_file = tmp_path / "payload.json"
             sig_file = tmp_path / "payload.sig"
-            pub_file = tmp_path / "signer.pub"
+            allowed_file = tmp_path / "allowed_signers"
 
-            payload_file.write_bytes(canonical)
             sig_file.write_text(_signature_file_contents(signature))
-            pub_file.write_text(public_key.strip() + "\n")
+            allowed_line = f"{signer} namespaces=\"{namespace}\" {public_key.strip()}\n"
+            allowed_file.write_text(allowed_line)
 
             cmd = [
                 "ssh-keygen",
                 "-Y",
                 "verify",
+                "-f",
+                str(allowed_file),
+                "-I",
+                signer,
                 "-n",
                 namespace,
-                "-f",
-                str(pub_file),
                 "-s",
                 str(sig_file),
-                str(payload_file),
             ]
             try:
-                subprocess.run(cmd, check=True, capture_output=True)
+                subprocess.run(cmd, check=True, capture_output=True, input=canonical)
                 return True
             except FileNotFoundError as exc:
                 raise AnchorVerificationError("ssh-keygen is required to verify anchors") from exc
