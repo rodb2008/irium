@@ -86,7 +86,7 @@ def decode_transaction_hex(tx_hex: str) -> Transaction:
 
 def load_locked_genesis(base_dir: Path | None = None) -> Tuple[Block, dict]:
     """
-    Load the canonical genesis block from config/genesis-locked.json.
+    Load the canonical genesis block from configs/genesis-locked.json.
 
     Returns the constructed Block plus the parsed JSON payload for callers
     that still need direct header fields.
