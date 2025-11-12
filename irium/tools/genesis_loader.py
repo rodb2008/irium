@@ -93,7 +93,7 @@ def load_locked_genesis(base_dir: Path | None = None) -> Tuple[Block, dict]:
     """
 
     repo_root = base_dir or Path(__file__).resolve().parents[2]
-    genesis_path = repo_root / "config" / "genesis-locked.json"
+    genesis_path = repo_root / "configs" / "genesis-locked.json"
     data = json.loads(genesis_path.read_text())
     header = data["header"]
     transactions = [decode_transaction_hex(tx_hex) for tx_hex in data.get("transactions", [])]
