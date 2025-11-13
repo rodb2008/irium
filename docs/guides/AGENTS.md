@@ -3,6 +3,8 @@
 ## Project Structure & Module Organization
 The repo centers on `irium/` (consensus, wallet, networking) with operational wrappers living in `scripts/`. Long-lived network data such as anchors, bootstrap peers, and genesis headers live under `bootstrap/` and `configs/`. Documentation for operators and researchers is kept in the Markdown guides at the top level plus `docs/`. Runtime artifacts (`state/`, `~/.irium/**`) must stay out of git.
 
+When the VPS runs the packaged systemd node, it reads `~/.irium/system-node-port` to decide which background port to use. Set that file (e.g., 39291) if you want the managed service off 38291 while you run manual nodes with `--port 38291`.
+
 ## Build, Test, and Development Commands
 - `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt` — provision a clean environment.
 - `PYTHONPATH=$PWD python3 scripts/irium-node.py 38291` — run a node on the chosen P2P port.

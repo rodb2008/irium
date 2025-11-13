@@ -18,8 +18,35 @@ from irium.tools.genesis_loader import load_locked_genesis
 from irium.anchors import AnchorManager, EclipseProtection, AnchorVerificationError
 import json
 import argparse
+
+BASE_NODE_PORT = 38291
+SYSTEM_NODE_PORT_FILE = Path.home() / ".irium" / "system-node-port"
+
+
+def _resolve_default_port() -> int:
+    """Pick default P2P port, allowing system services to override it."""
+    candidate = BASE_NODE_PORT
+    if os.environ.get("INVOCATION_ID") and SYSTEM_NODE_PORT_FILE.exists():
+        try:
+            configured = int(SYSTEM_NODE_PORT_FILE.read_text().strip())
+            if 1024 <= configured <= 65535:
+                candidate = configured
+            else:
+                print(f"⚠️  Ignoring invalid system-node-port value {configured}; using {BASE_NODE_PORT}")
+        except ValueError:
+            print("⚠️  Could not parse ~/.irium/system-node-port; using default 38291")
+    return candidate
+
+
 parser = argparse.ArgumentParser()
-parser.add_argument("--port", type=int, default=38291)
+parser.add_argument(
+    "--port",
+    type=int,
+    default=_resolve_default_port(),
+    help=(
+        "P2P port (defaults to 38291; systemd services can override via ~/.irium/system-node-port)"
+    ),
+)
 args, _ = parser.parse_known_args()
 
 

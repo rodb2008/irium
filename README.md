@@ -92,6 +92,9 @@ Single-core (full P2P):
 ```bash
 export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
 nohup python3 -u scripts/irium-node.py 39291 > /tmp/node-39291.log 2>&1 &
+
+> **Port overrides:** The systemd-managed node reads `~/.irium/system-node-port` on startup. Write a new port into that file (e.g., `39291`) to move the background service off 38291 so manual `python3 scripts/irium-node.py --port 38291` runs can bind cleanly. Manual shells still default to 38291 unless you pass `--port`.
+
 python3 scripts/irium-miner.py 39292
 ```
 
