@@ -5,303 +5,265 @@
 [![Network](https://img.shields.io/badge/network-LIVE-brightgreen)](#)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
+Irium is a purpose‑built proof‑of‑work blockchain for the IRM asset. The network is engineered for production use only—no bundled testnet—and is designed to:
 
-A next-generation proof-of-work blockchain designed for true decentralization.
+- Bootstrap without DNS dependence.
+- Persist peers and checkpoints via signed, machine‑readable artifacts.
+- Enforce transparent founder vesting and a fixed supply cap at the consensus layer.
+
+A next‑generation proof‑of‑work blockchain designed for true decentralization.
 
 - Release: v1.0 – Production Release (stable mining + P2P sync)
 - Release Notes: https://github.com/iriumlabs/irium/releases/tag/v1.0
 
-## What is Irium?
+## Table of Contents
+- [Network Specifications](#network-specifications)
+- [Key Features](#key-features)
+- [Repository Layout](#repository-layout)
+- [Getting Started](#getting-started)
+- [Bootstrapping Without DNS](#bootstrapping-without-dns)
+- [Automatic Peer Persistence](#automatic-peer-persistence)
+- [Genesis Configuration](#genesis-configuration)
+- [Consensus & Monetary Policy](#consensus--monetary-policy)
+- [P2P & Security](#p2p--security)
+- [Light Clients](#light-clients)
+- [Wallet Integration](#wallet-integration)
+- [Mining Toolkit](#mining-toolkit)
+- [Licensing](#licensing)
 
-Irium is a decentralized cryptocurrency built from the ground up with a focus on solving real problems in blockchain networks. Using proven SHA-256d proof-of-work (same as Bitcoin), Irium introduces 8 unique innovations that make it more resilient, accessible, and fair.
+## Network Specifications
 
-## Why Irium?
+| Parameter              | Value                                   |
+|------------------------|-----------------------------------------|
+| Ticker                 | IRM                                     |
+| Consensus              | Proof‑of‑Work (SHA‑256d)                |
+| Target Block Time      | 600 seconds                             |
+| Initial Block Subsidy  | 50 IRM                                  |
+| Halving Interval       | 210,000 blocks (config‑driven)          |
+| Coinbase Maturity      | 100 blocks                              |
+| Difficulty Retarget    | Every 2,016 blocks                      |
+| Maximum Supply         | 100,000,000 IRM                         |
+| Founder Allocation     | 3,500,000 IRM (CLTV‑locked timelock)    |
+| Mining Allocation      | ~96,500,000 IRM (PoW issuance)          |
 
-- True Decentralization: Zero-DNS bootstrap (no single point of failure)
-- Ultra-Low Fees: 0.0001 IRM per transaction
-- Fair Launch: No ICO, no premine (3.5% founder vesting with timelocks)
-- Energy Efficient: SHA-256d can leverage existing BTC mining infra
-- Mobile-First: SPV + NiPoPoW support
-- Incentivized Network: Relay rewards for node operators
+The exact monetary schedule and consensus parameters are defined in `configs/consensus.json` and the locked genesis payload in `configs/genesis-locked.json`.
 
-## Technical Specifications
+## Key Features
 
-| Parameter           | Value                    | Description                            |
-|--------------------|--------------------------|----------------------------------------|
-| Ticker             | IRM                      | Official symbol                        |
-| Algorithm          | SHA-256d                 | Proof-of-Work (Bitcoin-compatible)     |
-| Max Supply         | 100,000,000 IRM          | Hard cap                               |
-| Genesis Vesting    | 3,500,000 IRM            | 3.5% timelocked (1y/2y/3y)             |
-| Mineable Supply    | 96,500,000 IRM           | Available to public miners             |
-| Block Time         | ~13 minutes (780 sec)    | Bitcoin-like                           |
-| Initial Reward     | 50 IRM                   | First 210,000 blocks                   |
-| Halving            | Every 210,000 blocks     | ~4 years                               |
-| Retarget           | Every 2016 blocks        | ~14 days                               |
-| Coinbase Maturity  | 100 blocks               | Rewards mature after 100 blocks        |
-| Min Tx Fee         | 0.0001 IRM               | 10,000 satoshis (ultra-low)            |
-| P2P Port           | 38291                    | Default network port                   |
+- **Zero‑DNS bootstrap** – nodes join the network using signed seedlists and anchors instead of DNS seeds.
+- **Self‑healing peer discovery** – peers are persisted to disk and promoted into a runtime seedlist.
+- **Transparent founder vesting** – 3,500,000 IRM are timelocked on‑chain; the remaining supply is mined via PoW.
+- **Low, predictable fees** – protocol is tuned for small transaction fees suitable for everyday use.
+- **SPV‑ready from genesis** – light clients can validate headers and anchors without storing full blocks.
+- **Relay‑friendly design** – the protocol leaves room for optional fee‑sharing schemes that reward high‑quality relays.
 
-## 8 Unique Innovations
+## Repository Layout
 
-1) Zero-DNS Bootstrap: signed IP multiaddr seedlist + checkpoint anchors  
-2) Self-Healing Peer Discovery: uptime proofs and peer reputation  
-3) Genesis Vesting with CLTV: 3 UTXOs timelocked (1y/2y/3y)  
-4) Per-Transaction Relay Rewards: up to 10% of fees to relays  
-5) Sybil-Resistant Handshake: small PoW challenge on connect  
-6) Anchor-File Consensus: signed headers protect against eclipse  
-7) Light Client First (SPV + NiPoPoW): mobile/IoT without full chain  
-8) On-chain Metadata Commitments: hash pointers in coinbase
+High‑level structure at `/home/irium`:
 
-## Security & Consensus (v1.0)
-
-- Coinbase Maturity Enforcement (100-block lock)  
-- Timestamp Validation (within a 2-hour window)  
-- Signature Verification (every transaction validated)  
-- UTXO Height Tracking (maturity + correctness)  
-- Fixes: nonce overflow, P2P memory leak; improved shutdown and errors
-
-Note: v1.0 is a consensus hard fork—upgrade required.
-
-## Quick Start (v1.0)
-
-### Download & Install
-```bash
-wget https://iriumlabs.org/releases/v1.0/irium-bootstrap-v1.0.tar.gz
-tar -xzf irium-bootstrap-v1.0.tar.gz
-cd irium-bootstrap-v1.0
-chmod +x install.sh
-./install.sh
+```text
+configs/              # Consensus + genesis configuration (JSON)
+bootstrap/            # Signed seedlists, anchors, trust roots
+irium/                # Python package: blocks, chain state, P2P, wallet, tools
+scripts/              # Operational entrypoints (node, miner, wallet APIs, etc.)
+docs/                 # Architecture and whitepaper
+state/                # Runtime data produced by nodes (peers.json, etc.)
+LICENSE               # Project license
+README.md             # This document
+IRIUM_NETWORK_TRACKER.md  # Human‑readable mainnet status tracker
 ```
 
-### Start Node
-```bash
-sudo systemctl start irium-node
-sudo systemctl enable irium-node
-sudo journalctl -u irium-node -f
-```
+Runtime artifacts under `~/.irium/` (blocks, wallet files, logs) are never committed to the repository.
 
-### Create Wallet
-```bash
-python3 scripts/irium-wallet-proper.py create
-python3 scripts/irium-wallet-proper.py new-address
-```
+## Getting Started
 
-### Start Mining
+### 1. Environment
 
-Single-core (full P2P):
-```bash
-export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
-nohup python3 -u scripts/irium-node.py 39291 > /tmp/node-39291.log 2>&1 &
-
-> **Port overrides:** The systemd-managed node reads `~/.irium/system-node-port` on startup. Write a new port into that file (e.g., `39291`) to move the background service off 38291 so manual `python3 scripts/irium-node.py --port 38291` runs can bind cleanly. Manual shells still default to 38291 unless you pass `--port`.
-
-python3 scripts/irium-miner.py 39292
-```
-
-Multicore (full P2P):
-```bash
-export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
-nohup python3 -u scripts/irium-node.py 39291 > /tmp/node-39291.log 2>&1 &
-bash scripts/irium-miner-multicore.sh 4
-./scripts/tail-mining-logs.sh 4 39292
-```
-
-### Status / Troubleshooting
-```bash
-sudo journalctl -u irium-node -n 20
-ls ~/.irium/blocks/ | wc -l
-```
-
-## Miner port usage (important)
-
-- The full miner expects the P2P port as a positional argument (no flag).
-  - Default (uses 38292):
-    ```bash
-    python3 scripts/irium-miner.py
-    ```
-  - Specific port (example 39292):
-    ```bash
-    python3 scripts/irium-miner.py 39292
-    ```
-- Do NOT include parentheses or URLs around the command; that breaks it.
-- If you prefer a flag, use the individual miner:
-  ```bash
-  python3 scripts/irium-miner-individual.py --wallet "$HOME/.irium/irium-wallet.json" --port 39292
-  ```
-
-### Multicore
-- Launch N workers (base port 38292 increments by 1 per worker):
-  ```bash
-  bash scripts/irium-miner-multicore.sh 4
-  ```
-- Tail logs:
-  ```bash
-  ./scripts/tail-mining-logs.sh 4 39292
-  ```
-
-### Troubleshooting
-- Ensure you’re on the main branch (not gh-pages):
-  ```bash
-  git branch --show-current  # should be: main
-  ```
-- Make sure a node is running (example 39291):
-  ```bash
-  nohup python3 -u scripts/irium-node.py 39291 > /tmp/node-39291.log 2>&1 &
-  ```
-- Check miner log shows “Starting mining loop” / “Nonce:” / “Hashrate:”:
-  ```bash
-  tail -n 120 /tmp/miner-39292.log
-  ```
-- If specifying a port “doesn’t work”:
-  - Remove any parentheses/links from the command
-  - Try a different free port:
-    ```bash
-    python3 scripts/irium-miner.py 40292
-    ```
-  - Or use:
-    ```bash
-    python3 scripts/irium-miner-individual.py --wallet "$HOME/.irium/irium-wallet.json" --port 39292
-    ```
-
-## CLI Usage
-
-- Launch node: `python -m irium node --port 38291`
-- Launch miner: `python -m irium miner 38292`
-- Explorer API: `python -m irium explorer`
-- Wallet API: `python -m irium wallet-api`
-- Verify genesis: `python -m irium verify-genesis`
-
-All commands must run from the repo root so the CLI can locate the scripts and locked genesis files.
-
-## Testing & QA
+- Python 3.11 or newer.
+- Recommended: a virtual environment.
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt pytest  # or just pip install pytest
-PYTHONPATH=$PWD pytest
-```
-
-These tests confirm the locked-genesis data matches the packaged header and that a fresh `ChainState` boots on top of it. Add new tests for consensus or networking changes before shipping a release.
-
-## Anchor Signing
-
-Use `python scripts/sign_anchor.py --signer <label>` to canonicalize `bootstrap/anchors.json`, sign it with `ssh-keygen -Y sign`, and append the base64 signature. By default the helper reads `~/.ssh/git-signing` and uses the `irium-anchor` namespace.
-
-Verify the resulting file before publishing:
-
-```bash
-python3 irium/tools/verify_bootstrap.py --anchors bootstrap/anchors.json
-ssh-keygen -Y verify -f trusted_keys.txt -I <signer_label> -n irium-anchor -s bootstrap/anchors.json.sig < bootstrap/anchors.json
-```
-
-Distribute the signed file with releases so new nodes can validate checkpoints before syncing.
-
-## Network Information
-
-- Network: LIVE ✅
-- Services: Operational ✅
-- P2P Peers: Growing 🌱
-
-Genesis (locked):
-- Hash: `000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c`
-- Merkle root: `cd78279c389b6f2f0a4edc567f3ba67b27daed60ab014342bb4a5b56c2ebb4db`
-- Nonce/Bits/Time: `1364084797 / 0x1d00ffff / 1735689600`
-- Vesting: 3.5M IRM timelocked to PxG1FmGiSnvfXJUcryLna2L5MB4iGG1KD7
-
-## APIs
-
-- Base: https://api.iriumlabs.org/
-- Explorer env: set `IRIUM_EXPLORER_HOST` / `IRIUM_EXPLORER_PORT` (defaults to 127.0.0.1:8082) before `python -m irium explorer`.
-- Wallet env: set `IRIUM_WALLET_HOST` / `IRIUM_WALLET_PORT` (defaults to 127.0.0.1:8080) before `python -m irium wallet-api`; terminate TLS via nginx or Caddy.
-
-Explorer API
-```bash
-curl https://api.iriumlabs.org/api/stats
-curl https://api.iriumlabs.org/api/block/1
-curl "https://api.iriumlabs.org/api/blocks?limit=10"
-```
-
-Wallet API
-```bash
-# Docs
-curl https://207.244.247.86:8080/
-# Balance
-curl https://207.244.247.86:8080/api/wallet/balance
-# New address
-curl -X POST https://207.244.247.86:8080/new-address
-```
-
-## Documentation
-
-- QUICKSTART.md — 5-minute setup  
-- MINING.md — single + multicore, full P2P  
-- WHITEPAPER.md — technical  
-- CONTRIBUTING.md — how to contribute
-
-## Important Notes
-
-Dependencies:
-```bash
-pip3 install --user pycryptodome qrcode pillow
-```
-
-Wallet & Mining:
-- Miner loads your wallet at startup.
-- If you create a new address, restart your miner.
-- Check address:
-```bash
-sudo journalctl -u irium-miner.service | grep "Mining address" | tail -1
-```
-
-Blockchain Sync:
-- Node loads `~/.irium/blocks/`, connects to seed peers, compares heights, fetches if peers are ahead.
-- If everyone shows same height, the network is simply waiting for the next block.
-
-## Community & Support
-
-- GitHub: https://github.com/iriumlabs/irium  
-- Discussions: https://github.com/iriumlabs/irium/discussions  
-- Issues: https://github.com/iriumlabs/irium/issues  
-- Email: info@iriumlabs.org
-
-## License
-
-MIT — Free and open source.
-
-## Updated Mining Commands (v1.0)
-
-Use a virtualenv (PEP 668), set PYTHONPATH, and pass miner port positionally.
-
-```bash
-# 0) Repo root
-cd ~/irium
-
-# 1) venv + deps (first time)
-sudo apt install -y python3.12-venv
+git clone https://github.com/iriumlabs/irium.git
+cd irium
 python3 -m venv .venv
 . .venv/bin/activate
+pip install -r requirements.txt
 export PYTHONPATH="$PWD"
-pip install pycryptodome qrcode pillow requests websockets aiohttp
-
-# 2) Start node (38291)
-nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
-
-# 3) Single miner (positional port; no --port)
-export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
-python3 -u scripts/irium-miner.py 38292
-
-# 4) Multicore (N workers; ports BASE..BASE+N-1)
-export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
-bash scripts/irium-miner-multicore.sh 4
-
-# 5) Logs (carriage-returns to newlines)
-tail -n 120 /tmp/miner-38292.log | tr '\r' '\n'
-
-# Stop miners
-pkill -f 'scripts/irium-miner\.py'
 ```
 
-Notes:
-- Full miner uses positional port (e.g., `python3 scripts/irium-miner.py 38292`).
-- Use ASCII env var name `IRIUM_WALLET_FILE` (not lookalikes).
-- If pip is blocked (PEP 668), the venv step above fixes it.
+### 2. Verify Genesis and Anchors
+
+Before running a node, verify the locked genesis header and anchors shipped with the release:
+
+```bash
+python3 scripts/verify_genesis.py
+```
+
+You should see matching derived and file header hashes. Anchors and checkpoints are defined in `bootstrap/anchors.json`.
+
+### 3. Start a Node
+
+To run a local mainnet node directly from the repository:
+
+```bash
+export PYTHONPATH="$PWD"
+python3 scripts/irium-node.py 38291
+```
+
+On production systems, use the packaged systemd unit (see `irium/QUICKSTART.md`) so the node restarts automatically and logs to `journalctl`.
+
+### 4. Create a Wallet
+
+Use the reference wallet CLI to create and manage keys:
+
+```bash
+export PYTHONPATH="$PWD"
+python3 scripts/irium-wallet-proper.py create-wallet
+python3 scripts/irium-wallet-proper.py new-address
+python3 scripts/irium-wallet-proper.py show-wallet
+```
+
+Wallet state is stored in `~/.irium/irium-wallet.json`. Back this file up securely.
+
+### 5. Start Mining
+
+Once the node is in sync and a wallet address exists, you can start mining:
+
+```bash
+export PYTHONPATH="$PWD"
+export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
+
+nohup python3 -u scripts/irium-node.py 38291 > /tmp/node-38291.log 2>&1 &
+python3 -u scripts/irium-miner.py 38292
+```
+
+For multicore mining and more operational details, see `irium/QUICKSTART.md`.
+
+## Bootstrapping Without DNS
+
+Irium avoids DNS seeds. Instead, nodes rely on signed bootstrap artifacts:
+
+- `bootstrap/seedlist.txt` – authoritative set of initial peers, signed.
+- `bootstrap/seedlist.runtime` – node‑maintained cache of additional peers discovered at runtime.
+- `bootstrap/anchors.json` – signed anchor checkpoints used for eclipse protection.
+
+The `scripts/irium-zero.sh` helper can be used to fetch and validate bootstrap data on a fresh system:
+
+```bash
+./scripts/irium-zero.sh
+```
+
+At a high level it:
+
+1. Locates or downloads `seedlist.txt` and `anchors.json`.
+2. Verifies signatures against trusted keys.
+3. Produces libp2p‑compatible multiaddresses for dialing peers.
+4. Prints the latest checkpoints that new nodes must validate while syncing.
+
+This design removes DNS as a bootstrap dependency; artifacts can be mirrored via GitHub Releases, IPFS, or other distribution channels.
+
+## Automatic Peer Persistence
+
+When the node observes healthy peers, it updates two data sets:
+
+- `state/peers.json` – a local peer book with basic metadata.
+- `bootstrap/seedlist.runtime` – a rolling cache of observed multiaddresses.
+
+Tools that consume seed material should read both the signed `seedlist.txt` and the runtime `seedlist.runtime`. This allows nodes to continue discovering peers even if the original mirrors go offline, without mutating the signed release seedlist.
+
+## Genesis Configuration
+
+Genesis is specified in machine‑readable JSON and locked into the repository:
+
+- `configs/genesis.json` – human‑friendly description of the genesis layout.
+- `configs/genesis-locked.json` – canonical, locked genesis header and payload used by nodes and miners.
+- `bootstrap/anchors.json` – an anchored copy of the genesis hash, time, and merkle root.
+
+The locked genesis defines:
+
+- A single CLTV‑protected founder allocation of 3,500,000 IRM.
+- No other premine outputs.
+- A merkle root that encodes the text commitment visible in the coinbase.
+
+Nodes verify that the derived header from the payload matches the locked hash before accepting any chain as valid.
+
+## Consensus & Monetary Policy
+
+Consensus rules are centralized in `irium/` and parameterised by `configs/consensus.json`:
+
+- SHA‑256d proof‑of‑work with a 600‑second target block time.
+- Difficulty retarget every 2,016 blocks with bounded adjustment.
+- Initial block subsidy of 50 IRM, halving every 210,000 blocks.
+- Coinbase outputs mature after 100 confirmations.
+- A hard cap of 100,000,000 IRM enforced via cumulative subsidy checks.
+
+The `ChainState` implementation:
+
+- Re‑computes merkle roots and verifies header linkage.
+- Validates PoW targets against the configured limit.
+- Tracks cumulative subsidy and fees, rejecting coinbases that exceed the permitted reward.
+- Maintains a UTXO set to enforce value conservation and reject double spends.
+
+## P2P & Security
+
+The P2P stack (see `irium/p2p.py`) focuses on robustness and eclipse resistance:
+
+- **Zero‑DNS bootstrap** via signed seedlists and anchors.
+- **Self‑healing peer discovery** by persisting observed peers into `state/peers.json` and `bootstrap/seedlist.runtime`.
+- **Anchor‑based checkpoints** using `bootstrap/anchors.json` and `AnchorManager`/`EclipseProtection` to reject chains that diverge from signed anchors.
+
+The node and miner both expose configuration through environment variables such as:
+
+- `IRIUM_BLOCKS_DIR` – directory for `block_*.json` files.
+- `IRIUM_WALLET_FILE` – wallet JSON path.
+- `IRIUM_MEMPOOL_DIR` – mempool storage directory.
+- `IRIUM_EXPLORER_HOST` / `IRIUM_EXPLORER_PORT` – explorer API bind address.
+
+Defaults are safe for localhost operation and can be overridden per deployment.
+
+## Light Clients
+
+From genesis, Irium is designed to support light clients:
+
+- Header verification and PoW validation are available as library calls.
+- Anchors provide compact checkpoints for NiPoPoW/SPV clients.
+- Proof‑of‑inclusion logic can be layered on top of the existing merkle and block primitives.
+
+Wallet and explorer tooling can use these primitives to build SPV clients without requiring a full node on end‑user machines.
+
+## Wallet Integration
+
+The reference wallet (`irium.wallet.Wallet` and `scripts/irium-wallet-proper.py`) provides:
+
+- Deterministic key management and WIF import/export.
+- Balance tracking over UTXOs controlled by the wallet.
+- Transaction construction and signing using standard P2PKH scripts.
+
+Example:
+
+```python
+from irium.wallet import Wallet
+
+wallet = Wallet()
+address = wallet.import_wif("…your WIF here…")
+print("Address:", address)
+print("Balance (sats):", wallet.balance())
+```
+
+The wallet CLI wraps these primitives with commands for creating wallets, generating addresses, checking balances, sending transactions, and monitoring activity.
+
+## Mining Toolkit
+
+The reference miner (`scripts/irium-miner.py`) runs a P2P‑enabled mining loop:
+
+- Loads consensus parameters, genesis, and anchors.
+- Discovers peers and broadcasts solved blocks.
+- Assembles block templates with a coinbase paying to your configured wallet.
+- Iterates nonces and updates timestamps when the 32‑bit nonce space is exhausted.
+
+Rewards are paid to the first wallet address in `~/.irium/irium-wallet.json` (or the path provided via `IRIUM_WALLET_FILE`). Mined blocks are stored in `block_*.json` files under the configured `IRIUM_BLOCKS_DIR`.
+
+## Licensing
+
+Irium is released under the MIT License. See `LICENSE` for details.
+
