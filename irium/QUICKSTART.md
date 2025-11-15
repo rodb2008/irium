@@ -29,7 +29,7 @@ pip3 install --user pycryptodome qrcode pillow requests
 A pre‑packaged bootstrap tarball is available for some environments:
 
 ```bash
-wget https://iriumlabs.org/releases/v1.0/irium-bootstrap-v1.0.tar.gz
+wget https://github.com/iriumlabs/irium/releases/download/v1.0/irium-bootstrap-v1.0.tar.gz
 tar -xzf irium-bootstrap-v1.0.tar.gz
 cd irium-bootstrap-v1.0
 chmod +x install.sh

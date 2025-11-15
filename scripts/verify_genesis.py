@@ -4,7 +4,7 @@ import struct
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-GENESIS_LOCKED = ROOT / "config" / "genesis-locked.json"
+GENESIS_LOCKED = ROOT / "configs" / "genesis-locked.json"
 
 def _little_endian_bytes(hex_str: str) -> bytes:
     return bytes.fromhex(hex_str)[::-1]
