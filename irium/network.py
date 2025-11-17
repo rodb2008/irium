@@ -145,7 +145,8 @@ class PeerDirectory:
                 record.agent = agent
         # Refresh runtime seedlist based on long-lived, healthy peers.
         # Seeds are:
-        # - Non-miner agents
+        # - Non-miner agents (exclude dedicated miner processes)
+        # - Not on this node's own IP (avoid seeding ourselves)
         # - Connected for at least 7 days
         # - Seen within the last 24 hours
         now = time.time()
@@ -155,6 +156,27 @@ class PeerDirectory:
         for rec in self._records.values():
             if rec.agent and "miner" in rec.agent.lower():
                 continue
+            # Best-effort self-IP detection to avoid adding our own node/miner
+            try:
+                import socket
+                # Derive our outward-facing IP
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+            except Exception:
+                local_ip = None
+
+            # Parse multiaddr to extract peer IP
+            peer_ip = None
+            if rec.multiaddr.startswith("/ip4/"):
+                parts = rec.multiaddr.strip("/").split("/")
+                if len(parts) >= 2:
+                    peer_ip = parts[1]
+            # Skip peers that resolve to our own IP (self)
+            if peer_ip and local_ip and peer_ip == local_ip:
+                continue
+
             lifetime = now - rec.first_seen
             inactivity = now - rec.last_seen
             if lifetime >= seven_days and inactivity <= stale_cutoff:
