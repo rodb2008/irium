@@ -646,23 +646,23 @@ class P2PNode:
                     seedlist = list(self.seedlist_manager.merged_seedlist())
                     print(f"  📋 Seedlist: {len(seedlist)} nodes")
                     if seedlist:
-                        # Try random peer
-                        # Try all peers instead of just one random
+                        # Try all peers in the seedlist
                         for multiaddr in seedlist:
                             await self._connect_to_peer(multiaddr)
                 
                 await asyncio.sleep(30)  # Try every 30 seconds
             
-            except Exception as e:
+            except Exception:
                 # Silently continue trying
                 await asyncio.sleep(30)
-    
-            async def _connect_to_peer(self, multiaddr: str) -> None:
-                peer_ip = multiaddr.split(":")[0].replace("/ip4/", "")
-                BLACKLISTED_PEERS = {"161.97.71.195"}
-                if peer_ip in BLACKLISTED_PEERS:
-                    print(f"⛔ Skipping blacklisted peer: {peer_ip}")
-                    return
+
+    async def _connect_to_peer(self, multiaddr: str) -> None:
+        """Connect to a peer described by a multiaddr string."""
+        peer_ip = multiaddr.split(":")[0].replace("/ip4/", "")
+        BLACKLISTED_PEERS = {"161.97.71.195"}
+        if peer_ip in BLACKLISTED_PEERS:
+            print(f"⛔ Skipping blacklisted peer: {peer_ip}")
+            return
 
 
         """Connect to a peer."""
