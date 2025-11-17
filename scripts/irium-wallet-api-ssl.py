@@ -184,16 +184,16 @@ class IriumWalletAPI(BaseHTTPRequestHandler):
         self.send_json_response(response, status=201)
 
     def send_logo(self):
-        logo_path = REPO_ROOT / 'irium-logo-wallet.svg'
+        logo_path = REPO_ROOT / "assets" / "logo-wallet.svg"
         if logo_path.exists():
             self.send_response(200)
-            self.send_header('Content-type', 'image/svg+xml')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Cache-Control', 'public, max-age=3600')
+            self.send_header("Content-type", "image/svg+xml")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "public, max-age=3600")
             self.end_headers()
             self.wfile.write(logo_path.read_bytes())
         else:
-            self.send_error(404, 'Logo not found')
+            self.send_error(404, "Logo not found")
 
     def send_json_response(self, data, status=200):
         self.send_response(status)

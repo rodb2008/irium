@@ -104,7 +104,14 @@ class PeerDirectory:
     def _load(self) -> None:
         if not self.db_path.exists():
             return
-        data = json.loads(self.db_path.read_text())
+        try:
+            raw = self.db_path.read_text().strip()
+            if not raw:
+                return
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            # Corrupt or empty peers file; start with a clean directory.
+            return
         for multiaddr, payload in data.items():
             record = PeerRecord(
                 multiaddr=multiaddr,
@@ -141,4 +148,3 @@ class PeerDirectory:
 
     def peers(self) -> Iterable[PeerRecord]:
         return sorted(self._records.values(), key=lambda record: record.last_seen, reverse=True)
-

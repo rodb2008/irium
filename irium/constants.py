@@ -65,4 +65,4 @@ SUBSIDY_SCHEDULE: Final[SubsidySchedule] = SubsidySchedule(
 MAX_FUTURE_BLOCK_TIME: Final[int] = 7200  # 2 hours (whitepaper: "within consensus range")
 COINBASE_MATURITY: Final[int] = 100  # blocks (whitepaper requirement)
 BLOCKCHAIN_DIR = os.path.expanduser("~/.irium/blocks")
-WALLET_FILE = os.path.expanduser("~/.irium/wallet.json")
+WALLET_FILE = os.path.expanduser("~/.irium/irium-wallet.json")
