@@ -59,13 +59,14 @@ class SeedlistManager:
             entries.append(line)
         return entries
 
-    def record_peer(self, multiaddr: str) -> None:
-        entry = _normalize_multiaddr(multiaddr)
-        entries = list(dict.fromkeys([entry, *self._load_runtime_entries()]))
-        entries = entries[: self.limit]
+    def write_runtime_entries(self, entries: Iterable[str]) -> None:
+        """Persist the given iterable of multiaddrs as the runtime seedlist."""
+        normalised = [ _normalize_multiaddr(addr) for addr in entries ]
+        # De-duplicate while preserving order
+        unique = list(dict.fromkeys(normalised))[: self.limit]
         timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         header = f"# Runtime seedlist refreshed {timestamp}\n"
-        body = "\n".join(entries) + "\n"
+        body = "\n".join(unique) + ("\n" if unique else "")
         self.runtime.write_text(header + body)
 
     def merged_seedlist(self) -> Iterable[str]:
@@ -142,7 +143,23 @@ class PeerDirectory:
             record.touch()
             if agent:
                 record.agent = agent
-        self.seed_manager.record_peer(entry)
+        # Refresh runtime seedlist based on long-lived, healthy peers.
+        # Seeds are:
+        # - Non-miner agents
+        # - Connected for at least 7 days
+        # - Seen within the last 24 hours
+        now = time.time()
+        seven_days = 7 * 24 * 60 * 60
+        stale_cutoff = 24 * 60 * 60
+        eligible_entries = []
+        for rec in self._records.values():
+            if rec.agent and "miner" in rec.agent.lower():
+                continue
+            lifetime = now - rec.first_seen
+            inactivity = now - rec.last_seen
+            if lifetime >= seven_days and inactivity <= stale_cutoff:
+                eligible_entries.append(rec.multiaddr)
+        self.seed_manager.write_runtime_entries(eligible_entries)
         self._flush()
         return record
 

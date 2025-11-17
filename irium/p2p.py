@@ -196,31 +196,59 @@ class P2PNode:
 
 
     def _is_self_peer(self, addr: str) -> bool:
-        """Check if this peer is ourselves."""
-        if ':' in addr:
-            ip, port = addr.split(':')
-            
-            
-            # Check if it's localhost
-            if ip in ["127.0.0.1", "localhost"]:
+        """
+        Check if the given address refers to this node's own listening socket.
+
+        We only treat an address as "self" when both the IP and port match
+        our own P2P listen port. This allows multiple services on the same
+        host (e.g. node:38291 + miner:38292) to connect to each other.
+        """
+        ip: Optional[str] = None
+        port: Optional[int] = None
+
+        # Normalise multiaddr (/ip4/1.2.3.4/tcp/38291) to IP:PORT
+        if addr.startswith("/ip4/"):
+            parts = addr.strip("/").split("/")
+            if len(parts) >= 4 and parts[0] == "ip4" and parts[2] == "tcp":
+                ip = parts[1]
+                try:
+                    port = int(parts[3])
+                except ValueError:
+                    port = None
+        else:
+            # IP:PORT form
+            if ":" in addr:
+                ip_part, port_part = addr.split(":", 1)
+                ip = ip_part
+                try:
+                    port = int(port_part)
+                except ValueError:
+                    port = None
+
+        if ip is None or port is None:
+            return False
+
+        # Localhost addresses that match our listen port
+        if ip in ["127.0.0.1", "localhost"] and port == self.port:
+            return True
+
+        import socket
+
+        # Compare against detected public IP
+        if self.public_ip and ip == self.public_ip and port == self.port:
+            return True
+
+        # Compare against local interface IP
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            if ip == local_ip and port == self.port:
                 return True
-            
-            # Check if it's our public IP
-            if self.public_ip and ip == self.public_ip:
-                return True
-            
-            # Check if it's our local IP
-            import socket
-            
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-                s.close()
-                return ip == local_ip
-            except Exception:
-                pass
-            
+        except Exception:
+            pass
+
         return False
     def _is_peer_connected(self, addr: str) -> bool:
         """Check if we're already connected to this peer."""
