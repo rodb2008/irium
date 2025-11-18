@@ -503,15 +503,55 @@ class P2PNode:
         """Handle get peers request."""
         # Send list of known peers
         peer_list = []
+
+        # Detect if this node is configured as a bootstrap node.
+        # Bootstrap nodes should *not* advertise other services running on the
+        # same public IP (e.g. secondary nodes or miners on the same VPS),
+        # otherwise clients will keep trying unreachable same-IP ports.
+        import os
+        is_bootstrap = False
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            env_file = os.path.join(script_dir, "..", ".env")
+            if os.path.exists(env_file):
+                with open(env_file, "r") as f:
+                    if "BOOTSTRAP_NODE=true" in f.read():
+                        is_bootstrap = True
+        except Exception:
+            is_bootstrap = False
+
+        local_ip = None
+        if is_bootstrap:
+            # Best-effort outward-facing IP detection (matches SeedlistManager/PeerDirectory)
+            try:
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+            except Exception:
+                local_ip = None
+
         for p in self.peers.values():
-            if p.address != peer.address:
-                # Convert IP:PORT to multiaddr format /ip4/IP/tcp/PORT
-                if ':' in p.address:
-                    ip, port = p.address.split(':')
-                    peer_list.append(f"/ip4/{ip}/tcp/{port}")
-                else:
-                    peer_list.append(p.address)
-        
+            if p.address == peer.address:
+                continue
+
+            # Convert IP:PORT to multiaddr format /ip4/IP/tcp/PORT
+            if ":" in p.address:
+                ip, port = p.address.split(":")
+
+                # On configured bootstrap nodes, skip advertising peers that
+                # live on the same outward-facing IP. This prevents bootstrap
+                # nodes from telling others about their own sibling services
+                # (e.g. a second node on the same VPS like :39291), which can
+                # otherwise show up as noisy connection timeouts for clients.
+                if is_bootstrap and local_ip and ip == local_ip:
+                    continue
+
+                peer_list.append(f"/ip4/{ip}/tcp/{port}")
+            else:
+                peer_list.append(p.address)
+
         peers_msg = PeersMessage(peers=peer_list[:50])  # Limit to 50
         print(f"📤 Sending {len(peer_list)} peers to {peer.address}")
         await peer.send_message(peers_msg.to_message())
