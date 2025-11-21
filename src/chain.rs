@@ -728,12 +728,19 @@ fn verify_transaction_signature(txin: &TxInput, _utxo: &TxOutput) -> bool {
         return false;
     }
     let sig = &script[1..1 + sig_len];
+    if !sig.ends_with(&[0x01]) {
+        return false;
+    }
+    let der = &sig[..sig.len() - 1];
     let pk_len = script[1 + sig_len] as usize;
     let pk_off = 1 + sig_len + 1;
     if script.len() < pk_off + pk_len {
         return false;
     }
     let pubkey = &script[pk_off..pk_off + pk_len];
+    if !(pk_len == 33 || pk_len == 65) {
+        return false;
+    }
 
     if txin.prev_txid.len() != 32 {
         return false;
@@ -741,19 +748,17 @@ fn verify_transaction_signature(txin: &TxInput, _utxo: &TxOutput) -> bool {
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&txin.prev_txid);
 
-    if sig.len() < 8 {
-        return false;
-    }
-    let der = if let Some(0x01) = sig.last() {
-        &sig[..sig.len() - 1]
-    } else {
-        sig
-    };
-
     let signature = match Signature::from_der(der) {
         Ok(s) => s,
         Err(_) => return false,
     };
+    if let Some(norm) = signature.normalize_s() {
+        if norm != signature {
+            return false;
+        }
+    } else {
+        return false;
+    }
     let vk = match VerifyingKey::from_sec1_bytes(pubkey) {
         Ok(v) => v,
         Err(_) => return false,
