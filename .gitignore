@@ -50,6 +50,8 @@ irium-v1.0-mining-bundle.tar.gz
 whitepaper.html
 script.js
 *-og-image.png
+
 # Irium Rust node build & local env
-target/
 .env
+target/
+irium-node-rs/target/
