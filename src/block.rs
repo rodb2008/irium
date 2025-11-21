@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::pow::{header_hash, Target};
 use crate::tx::Transaction;
 

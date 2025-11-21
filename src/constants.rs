@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // Consensus and economic constants for Irium mainnet (Rust mirror of constants.py)
 
 pub const MAX_MONEY: u64 = 100_000_000 * 100_000_000; // 1e8 * 1e8 sat-equivalent
