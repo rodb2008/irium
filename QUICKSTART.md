@@ -1,190 +1,67 @@
-# Irium Quick Start (v1.0)
+# Irium Rust Quickstart (Mainnet)
 
-This guide walks through installing dependencies, running an Irium node, creating a wallet, and starting mining on a single VPS or workstation.
+This guide runs a Rust Irium node/miner on mainnet (no testnet, no DNS). Assumes Rust toolchain is installed (`source ~/.cargo/env`).
 
-> For production deployments with systemd units and nginx frontends, see `docs/nginx-config.md` and `IRIUM_NETWORK_TRACKER.md`.
+## 1) Verify bootstrap artifacts
+```
+cd /home/irium/irium
+# seeds + sig + trust root
+ls bootstrap/seedlist.txt bootstrap/seedlist.txt.sig bootstrap/trust/allowed_signers
+# anchors file is in bootstrap/anchors.json
+```
+The node verifies `seedlist.txt` against `allowed_signers` via `ssh-keygen -Y verify`.
 
-## 1. Install Dependencies
-
-On a fresh Linux system:
-
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip
-
-cd ~/irium
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
+## 2) Build and test
+```
+source ~/.cargo/env
+cargo test --quiet
 ```
 
-If you prefer installing only the minimal Python packages:
-
-```bash
-pip3 install --user pycryptodome qrcode pillow requests
+## 3) Configure (optional)
+Create `configs/node.json` if you want to set P2P bind/seed or relay address:
+```json
+{
+  "p2p_bind": "0.0.0.0:51001",
+  "p2p_seeds": [],
+  "relay_address": null
+}
+```
+Set env var to use it:
+```
+export IRIUM_NODE_CONFIG=/home/irium/irium/configs/node.json
 ```
 
-## 2. Download & Install Bootstrap Bundle (optional convenience)
+## 4) Run the node
+```
+source ~/.cargo/env
+RUST_LOG=info cargo run --release --bin iriumd
+```
+- Seeds: signed `bootstrap/seedlist.txt` + cached `bootstrap/seedlist.runtime` (unless `p2p_seeds` overrides).
+- HTTP API: defaults to 127.0.0.1:38300 (`IRIUM_NODE_HOST`, `IRIUM_NODE_PORT`).
+- P2P: bind from config; uses sybil-resistant handshake and header-first sync.
 
-A pre‑packaged bootstrap tarball is available for some environments:
+## 5) Mining
+```
+source ~/.cargo/env
+RUST_LOG=info cargo run --release --bin irium-miner
+```
+- Relies on the local node/mempool.
+- Set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
 
-```bash
-wget https://github.com/iriumlabs/irium/releases/download/v1.0/irium-bootstrap-v1.0.tar.gz
-tar -xzf irium-bootstrap-v1.0.tar.gz
-cd irium-bootstrap-v1.0
-chmod +x install.sh
-./install.sh
+## 6) SPV check
+```
+source ~/.cargo/env
+cargo run --release --bin irium-spv -- verify <height> <txid> <index> <proof_hex_csv>
 ```
 
-This helper installs the repository, systemd units, and nginx snippets appropriate for a typical VPS deployment.
+## 7) systemd (optional)
+See `scripts/iriumd.service.example`:
+- Copy to `/etc/systemd/system/iriumd.service` (adjust user/paths).
+- `systemctl daemon-reload && systemctl enable --now iriumd`.
+Logs go to `journalctl -u iriumd`.
 
-## 3. Start the Node
-
-### Via systemd (recommended on servers)
-
-```bash
-sudo systemctl start irium-node
-sudo systemctl enable irium-node
-sudo journalctl -u irium-node -f
-```
-
-### Directly from the repository (development)
-
-```bash
-cd ~/irium
-. .venv/bin/activate  # if using a venv
-export PYTHONPATH="$PWD"
-python3 scripts/irium-node.py 38291
-```
-
-## 4. Create a Wallet
-
-Use the wallet CLI to create a wallet file and at least one address:
-
-```bash
-cd ~/irium
-. .venv/bin/activate
-export PYTHONPATH="$PWD"
-
-python3 scripts/irium-wallet-proper.py create-wallet
-python3 scripts/irium-wallet-proper.py new-address
-python3 scripts/irium-wallet-proper.py balance
-```
-
-Wallet data is stored at `~/.irium/irium-wallet.json`. Back this file up securely before mining.
-
-## 5. Start Mining
-
-### Single‑core miner (with full P2P)
-
-```bash
-cd ~/irium
-. .venv/bin/activate
-export PYTHONPATH="$PWD"
-export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
-
-nohup python3 -u scripts/irium-node.py 38291 > /tmp/node-38291.log 2>&1 &
-python3 -u scripts/irium-miner.py 38292
-```
-
-### Multicore miner (with full P2P)
-
-```bash
-cd ~/irium
-. .venv/bin/activate
-export PYTHONPATH="$PWD"
-export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
-
-nohup python3 -u scripts/irium-node.py 38291 > /tmp/node-38291.log 2>&1 &
-bash scripts/irium-miner-multicore.sh 4
-./scripts/tail-mining-logs.sh 4 38292
-```
-
-### Miner port usage
-
-- The reference miner expects the P2P port as a **positional argument**:
-
-  ```bash
-  # Default (38292)
-  python3 scripts/irium-miner.py
-
-  # Explicit port (example 39292)
-  python3 scripts/irium-miner.py 39292
-  ```
-
-- If you prefer a CLI flag, use the individual miner:
-
-  ```bash
-  python3 scripts/irium-miner-individual.py \
-    --wallet "$HOME/.irium/irium-wallet.json" \
-    --port 39292
-  ```
-
-## 6. Status & Troubleshooting
-
-### Basic checks
-
-```bash
-# Node logs (systemd)
-sudo journalctl -u irium-node -n 20
-
-# Number of blocks stored locally
-ls ~/.irium/blocks/ | wc -l
-```
-
-Ensure you are on the main branch:
-
-```bash
-cd ~/irium
-git branch --show-current   # should print: main
-```
-
-### Miner logs
-
-If you run miners with `nohup`, logs typically go to `/tmp/miner-<port>.log`. For example:
-
-```bash
-tail -n 120 /tmp/miner-38292.log | tr '\r' '\n'
-```
-
-If specifying a port “doesn’t work”:
-
-- Remove any extra parentheses or shell prompt decorations if copying from docs.
-- Try a different free port:
-
-  ```bash
-  python3 scripts/irium-miner.py 40292
-  ```
-
-- Or switch to the individual miner:
-
-  ```bash
-  python3 scripts/irium-miner-individual.py \
-    --wallet "$HOME/.irium/irium-wallet.json" \
-    --port 39292
-  ```
-
-## 7. Updated Mining Commands (v1.0)
-
-End‑to‑end example on a fresh clone:
-
-```bash
-cd ~/irium
-python3 -m venv .venv && . .venv/bin/activate
-export PYTHONPATH="$PWD"
-pip install -r requirements.txt
-
-nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
-export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
-python3 -u scripts/irium-miner.py 38292
-
-# Multicore
-export IRIUM_WALLET_FILE="$HOME/.irium/irium-wallet.json"
-bash scripts/irium-miner-multicore.sh 4
-```
-
-Tips:
-
-- Miner port is positional (no `--port` flag on `irium-miner.py`).
-- If logs appear empty, make sure you are tailing the right file and replacing carriage returns as shown above.
-
+## Bootstrap/peer cache paths
+- Signed seeds: `bootstrap/seedlist.txt` (+ .sig + trust/allowed_signers)
+- Runtime peers: `bootstrap/seedlist.runtime`
+- Anchors: `bootstrap/anchors.json` (anchor enforcement planned)
+- Runtime state: `state/`

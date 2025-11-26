@@ -1,2 +1,0 @@
-# Irium mainnet bootstrap seeds (v1.0)
-/ip4/207.244.247.86/tcp/38291
