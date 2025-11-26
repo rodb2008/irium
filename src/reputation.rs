@@ -1,0 +1,217 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn now_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+fn default_reputation_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    PathBuf::from(home).join(".irium/peer_reputation.json")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerReputation {
+    pub peer_id: String,
+    pub score: i32,
+    pub successful_connections: u32,
+    pub failed_connections: u32,
+    pub blocks_received: u32,
+    pub invalid_blocks: u32,
+    pub uptime_proofs: u32,
+    pub last_seen: f64,
+}
+
+impl PeerReputation {
+    pub fn new(peer_id: String) -> PeerReputation {
+        PeerReputation {
+            peer_id,
+            score: 100,
+            successful_connections: 0,
+            failed_connections: 0,
+            blocks_received: 0,
+            invalid_blocks: 0,
+            uptime_proofs: 0,
+            last_seen: now_secs(),
+        }
+    }
+
+    pub fn update_score(&mut self) {
+        let mut score = 100_i32;
+        score += (self.successful_connections as i32) * 2;
+        score -= (self.failed_connections as i32) * 5;
+        score += (self.blocks_received as i32) * 10;
+        score -= (self.invalid_blocks as i32) * 50;
+        score += (self.uptime_proofs as i32) * 5;
+        if score < 0 {
+            score = 0;
+        }
+        if score > 1000 {
+            score = 1000;
+        }
+        self.score = score;
+    }
+
+    pub fn is_trusted(&self) -> bool {
+        self.score > 80
+    }
+
+    pub fn is_banned(&self) -> bool {
+        self.score < 20
+    }
+}
+
+#[derive(Debug)]
+pub struct ReputationManager {
+    path: PathBuf,
+    reputations: HashMap<String, PeerReputation>,
+}
+
+impl ReputationManager {
+    pub fn new() -> ReputationManager {
+        let path = default_reputation_path();
+        let mut mgr = ReputationManager {
+            path,
+            reputations: HashMap::new(),
+        };
+        mgr.load();
+        mgr
+    }
+
+    fn load(&mut self) {
+        let text = match fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let map = match parsed.as_object() {
+            Some(m) => m,
+            None => return,
+        };
+        for (peer_id, value) in map {
+            if let Some(obj) = value.as_object() {
+                let mut rep = PeerReputation::new(peer_id.clone());
+                rep.score = obj.get("score").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
+                rep.successful_connections = obj
+                    .get("successful_connections")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                rep.failed_connections = obj
+                    .get("failed_connections")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                rep.blocks_received = obj
+                    .get("blocks_received")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                rep.invalid_blocks = obj
+                    .get("invalid_blocks")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                rep.uptime_proofs = obj
+                    .get("uptime_proofs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                rep.last_seen = obj
+                    .get("last_seen")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or_else(now_secs);
+                rep.update_score();
+                self.reputations.insert(peer_id.clone(), rep);
+            }
+        }
+    }
+
+    fn save(&self) {
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut map = serde_json::Map::new();
+        for (peer_id, rep) in &self.reputations {
+            map.insert(
+                peer_id.clone(),
+                serde_json::json!({
+                    "score": rep.score,
+                    "successful_connections": rep.successful_connections,
+                    "failed_connections": rep.failed_connections,
+                    "blocks_received": rep.blocks_received,
+                    "invalid_blocks": rep.invalid_blocks,
+                    "uptime_proofs": rep.uptime_proofs,
+                    "last_seen": rep.last_seen,
+                }),
+            );
+        }
+        let value = serde_json::Value::Object(map);
+        if let Ok(text) = serde_json::to_string_pretty(&value) {
+            let _ = fs::write(&self.path, text);
+        }
+    }
+
+    pub fn get_reputation(&mut self, peer_id: &str) -> &mut PeerReputation {
+        self.reputations
+            .entry(peer_id.to_string())
+            .or_insert_with(|| PeerReputation::new(peer_id.to_string()))
+    }
+
+    pub fn record_success(&mut self, peer_id: &str) {
+        let rep = self.get_reputation(peer_id);
+        rep.successful_connections = rep.successful_connections.saturating_add(1);
+        rep.last_seen = now_secs();
+        rep.update_score();
+        self.save();
+    }
+
+    pub fn record_failure(&mut self, peer_id: &str) {
+        let rep = self.get_reputation(peer_id);
+        rep.failed_connections = rep.failed_connections.saturating_add(1);
+        rep.last_seen = now_secs();
+        rep.update_score();
+        self.save();
+    }
+
+    pub fn record_block(&mut self, peer_id: &str, valid: bool) {
+        let rep = self.get_reputation(peer_id);
+        if valid {
+            rep.blocks_received = rep.blocks_received.saturating_add(1);
+        } else {
+            rep.invalid_blocks = rep.invalid_blocks.saturating_add(1);
+        }
+        rep.last_seen = now_secs();
+        rep.update_score();
+        self.save();
+    }
+
+    pub fn record_uptime_proof(&mut self, peer_id: &str) {
+        let rep = self.get_reputation(peer_id);
+        rep.uptime_proofs = rep.uptime_proofs.saturating_add(1);
+        rep.last_seen = now_secs();
+        rep.update_score();
+        self.save();
+    }
+
+    pub fn is_banned(&mut self, peer_id: &str) -> bool {
+        self.get_reputation(peer_id).is_banned()
+    }
+
+    pub fn score_of(&mut self, peer_id: &str) -> i32 {
+        let rep = self.get_reputation(peer_id);
+        rep.score
+    }
+
+    pub fn record_decode_error(&mut self, peer_id: &str) {
+        let rep = self.get_reputation(peer_id);
+        rep.invalid_blocks = rep.invalid_blocks.saturating_add(1);
+        rep.last_seen = now_secs();
+        rep.update_score();
+        self.save();
+    }
+}
