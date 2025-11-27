@@ -1,13 +1,14 @@
 [Unit]
 Description=Irium Rust Node
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 User=irium
 WorkingDirectory=/home/irium/irium
 Environment=IRIUM_NODE_CONFIG=/home/irium/irium/configs/node.json
 Environment=RUST_LOG=info
-ExecStart=/home/irium/.cargo/bin/cargo run --release --bin iriumd
+ExecStart=/home/irium/irium/target/release/iriumd
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
