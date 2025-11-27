@@ -281,6 +281,7 @@ impl P2PNode {
         let relay_addr = self.relay_address.clone();
         let chain_for_sync = self.chain.clone();
         let _mempool_for_sync = self.mempool.clone();
+        let reputation = self.reputation.clone();
         tokio::spawn(async move {
             loop {
                 match read_message(&mut reader).await {
