@@ -1,5 +1,9 @@
 # Irium Blockchain (Rust Mainnet)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org)
+[![Network: Mainnet Only](https://img.shields.io/badge/network-mainnet--only-red.svg)](#run-the-rust-node)
+
 Irium is a production‑only proof‑of‑work blockchain for the IRM asset. The network launches with no testnet, no DNS seeds, and a locked genesis that enforces founder vesting and a 100 M IRM cap. This repository now contains the Rust implementation of the full node, miner, and SPV tooling.
 
 - Consensus: SHA‑256d, 600s target, 2016‑block retarget, 50 IRM starting subsidy, halving every 210,000 blocks, 100‑block coinbase maturity, 100 M max supply (3.5 M CLTV‑locked at genesis).
