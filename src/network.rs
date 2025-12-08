@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,15 +23,26 @@ fn repo_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn normalize_multiaddr(addr: &str) -> Result<String, String> {
+fn normalize_seed(addr: &str) -> Option<String> {
     let candidate = addr.trim();
     if candidate.is_empty() {
-        return Err("empty multiaddr".to_string());
+        return None;
     }
-    if !candidate.starts_with('/') {
-        return Err("multiaddr must start with '/'".to_string());
+    if candidate.starts_with("/ip4/") {
+        let parts: Vec<&str> = candidate.split('/').collect();
+        if parts.len() >= 3 {
+            return Some(parts[2].to_string());
+        }
+        return None;
     }
-    Ok(candidate.to_string())
+    if let Ok(ip) = candidate.parse::<IpAddr>() {
+        return Some(ip.to_string());
+    }
+    // handle host:port form; strip port
+    if let Ok(sock) = candidate.parse::<SocketAddr>() {
+        return Some(sock.ip().to_string());
+    }
+    None
 }
 
 /// Record of an observed peer, mirroring `PeerRecord` in Python.
@@ -41,6 +53,7 @@ pub struct PeerRecord {
     pub last_seen: f64,
     pub first_seen: f64,
     pub relay_address: Option<String>,
+    pub last_height: Option<u64>,
 }
 
 impl PeerRecord {
@@ -52,6 +65,7 @@ impl PeerRecord {
             last_seen: t,
             first_seen: t,
             relay_address: None,
+            last_height: None,
         }
     }
 
@@ -96,11 +110,11 @@ impl SeedlistManager {
             Err(_) => return entries,
         };
         for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
+            if let Some(ip) = normalize_seed(line) {
+                if !entries.contains(&ip) {
+                    entries.push(ip);
+                }
             }
-            entries.push(line.to_string());
         }
         entries
     }
@@ -109,22 +123,15 @@ impl SeedlistManager {
     where
         I: IntoIterator<Item = String>,
     {
-        let mut normalised = Vec::new();
-        for addr in entries {
-            match normalize_multiaddr(&addr) {
-                Ok(a) => normalised.push(a),
-                Err(e) => {
-                    eprintln!("Skipping invalid runtime seed {}: {}", addr, e);
-                }
-            }
-        }
         let mut unique = Vec::new();
-        for entry in normalised {
-            if !unique.contains(&entry) {
-                unique.push(entry);
-            }
-            if unique.len() >= self.limit {
-                break;
+        for addr in entries {
+            if let Some(ip) = normalize_seed(&addr) {
+                if !unique.contains(&ip) {
+                    unique.push(ip);
+                }
+                if unique.len() >= self.limit {
+                    break;
+                }
             }
         }
         let timestamp = chrono::Utc::now().to_rfc3339();
@@ -133,34 +140,23 @@ impl SeedlistManager {
             body.push_str(entry);
             body.push('\n');
         }
-        if let Err(e) = fs::write(&self.runtime, body) {
-            eprintln!(
-                "Failed to write runtime seedlist {}: {}",
-                self.runtime.display(),
-                e
-            );
-        }
+        let _ = fs::write(&self.runtime, body);
     }
 
     pub fn merged_seedlist(&self) -> Vec<String> {
-        let mut baseline_entries = Vec::new();
+        let mut combined = Vec::new();
         if let Ok(text) = fs::read_to_string(&self.baseline) {
             for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
+                if let Some(ip) = normalize_seed(line) {
+                    if !combined.contains(&ip) {
+                        combined.push(ip);
+                    }
                 }
-                baseline_entries.push(line.to_string());
             }
         }
-
-        let mut combined = Vec::new();
-        for e in baseline_entries
-            .into_iter()
-            .chain(self.load_runtime_entries())
-        {
-            if !combined.contains(&e) {
-                combined.push(e);
+        for ip in self.load_runtime_entries() {
+            if !combined.contains(&ip) {
+                combined.push(ip);
             }
             if combined.len() >= self.limit {
                 break;
@@ -226,6 +222,9 @@ impl PeerDirectory {
                     .get("relay_address")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let last_height = obj
+                    .get("last_height")
+                    .and_then(|v| v.as_u64());
                 self.records.insert(
                     addr.clone(),
                     PeerRecord {
@@ -234,6 +233,7 @@ impl PeerDirectory {
                         first_seen,
                         last_seen,
                         relay_address,
+                        last_height,
                     },
                 );
             }
@@ -270,6 +270,12 @@ impl PeerDirectory {
                         .unwrap_or_else(|| serde_json::Number::from(0)),
                 ),
             );
+            if let Some(h) = rec.last_height {
+                obj.insert(
+                    "last_height".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(h)),
+                );
+            }
             map.insert(addr.clone(), serde_json::Value::Object(obj));
         }
         let value = serde_json::Value::Object(map);
@@ -280,7 +286,7 @@ impl PeerDirectory {
         }
     }
 
-    /// Register a successful connection and optionally update runtime seedlist.
+    /// Register a successful connection and update runtime seedlist via policy.
     pub fn register_connection(
         &mut self,
         multiaddr: String,
@@ -296,11 +302,7 @@ impl PeerDirectory {
         entry.touch();
 
         self.flush();
-
-        // Simple heuristic: keep all observed peers in runtime seedlist,
-        // letting SeedlistManager enforce size limits and deduplication.
-        let entries: Vec<String> = self.records.keys().cloned().collect();
-        self.seed_manager.write_runtime_entries(entries);
+        self.refresh_seedlist_with_policy();
     }
 
     pub fn peers(&self) -> Vec<PeerRecord> {
@@ -312,5 +314,45 @@ impl PeerDirectory {
         self.records
             .get(&multiaddr)
             .and_then(|r| r.relay_address.clone())
+    }
+
+    /// Apply seedlist policy: keep baseline seeds, promote peers active >= 7 days,
+    /// drop peers idle > 24h.
+    pub fn refresh_seedlist_with_policy(&self) {
+        let mut seeds = self.seed_manager.merged_seedlist();
+        let now = now_secs();
+
+        for rec in self.records.values() {
+            let age_days = (now - rec.first_seen) / 86_400.0;
+            let idle_hours = (now - rec.last_seen) / 3600.0;
+            if age_days >= 7.0 && idle_hours <= 24.0 {
+                if let Some(ip) = normalize_seed(&rec.multiaddr) {
+                    if !seeds.contains(&ip) {
+                        seeds.push(ip);
+                    }
+                }
+            }
+        }
+
+        seeds.retain(|addr| {
+            if let Some(rec) = self.records.get(addr) {
+                let idle_hours = (now - rec.last_seen) / 3600.0;
+                idle_hours <= 24.0
+            } else {
+                true
+            }
+        });
+
+        seeds.sort();
+        seeds.dedup();
+        self.seed_manager.write_runtime_entries(seeds);
+    }
+
+    pub fn record_height(&mut self, multiaddr: &str, height: u64) {
+        if let Some(rec) = self.records.get_mut(multiaddr) {
+            rec.last_height = Some(height);
+            rec.touch();
+            self.flush();
+        }
     }
 }

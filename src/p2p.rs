@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use crate::block::Block;
 use crate::chain::ChainState;
 use crate::mempool::MempoolManager;
-use crate::network::PeerDirectory;
+use crate::network::{PeerDirectory, PeerRecord};
 use crate::protocol::{
     BlockPayload, EmptyPayload, GetBlocksPayload, GetDataPayload, GetHeadersPayload,
     HandshakePayload, HeadersPayload, InvPayload, MempoolPayload, Message, MessageType,
@@ -34,6 +34,18 @@ pub struct P2PNode {
 }
 
 impl P2PNode {
+    fn ts() -> String {
+        Utc::now().format("%H:%M:%S").to_string()
+    }
+
+    fn log(icon: &str, msg: impl AsRef<str>) {
+        println!("[{}] {} {}", Self::ts(), icon, msg.as_ref());
+    }
+
+    fn log_err(icon: &str, msg: impl AsRef<str>) {
+        eprintln!("[{}] {} {}", Self::ts(), icon, msg.as_ref());
+    }
+
     fn tip_hash(chain: &Option<Arc<StdMutex<ChainState>>>) -> [u8; 32] {
         if let Some(ref c) = chain {
             let guard = c.lock().unwrap();
@@ -69,7 +81,7 @@ impl P2PNode {
         let listener = TcpListener::bind(self.bind_addr)
             .await
             .map_err(|e| e.to_string())?;
-        println!("P2P listening on {}", self.bind_addr);
+        Self::log("📡", format!("P2P listening on {}", self.bind_addr));
 
         let peers_arc = self.peers.clone();
         let bind = self.bind_addr;
@@ -84,7 +96,7 @@ impl P2PNode {
             loop {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
-                        println!("Incoming P2P connection from {}", addr);
+                        Self::log("⬅️", format!("Incoming P2P connection from {}", addr));
                         let peers_inner = peers_arc.clone();
                         let dir = dir_arc.clone();
                         let rep = rep_arc.clone();
@@ -107,12 +119,12 @@ impl P2PNode {
                             )
                             .await
                             {
-                                eprintln!("P2P handshake error from {}: {}", addr, e);
+                                Self::log_err("⚠️", format!("P2P handshake error from {}: {}", addr, e));
                             }
                         });
                     }
                     Err(e) => {
-                        eprintln!("P2P accept error: {}", e);
+                        Self::log_err("⚠️", format!("P2P accept error: {}", e));
                     }
                 }
             }
@@ -122,6 +134,15 @@ impl P2PNode {
     }
 
     /// Broadcast a raw serialized block to all currently known peers.
+    pub async fn peer_count(&self) -> usize {
+        self.peers.lock().await.len()
+    }
+
+    pub async fn peers_snapshot(&self) -> Vec<PeerRecord> {
+        let dir = self.peers_directory.lock().await;
+        dir.peers()
+    }
+
     pub async fn broadcast_block(&self, block_bytes: &[u8]) -> Result<(), String> {
         let msg = BlockPayload {
             block_data: block_bytes.to_vec(),
@@ -197,7 +218,7 @@ impl P2PNode {
             rep.record_success(&peer_id);
         }
 
-        println!("P2P outbound {}: connected, awaiting challenge", addr);
+        Self::log("↗️", format!("P2P outbound {}: connected, awaiting challenge", addr));
         // Expect a sybil challenge from the remote and respond with a proof
         // before proceeding with the normal handshake.
         let challenge_msg = match read_message(&mut stream).await {
@@ -239,7 +260,7 @@ impl P2PNode {
             .write_all(&proof_ser)
             .await
             .map_err(|e| format!("send sybil proof to {} failed: {}", addr, e))?;
-        println!("P2P outbound {}: sent sybil proof", addr);
+        Self::log("🧠", format!("P2P outbound {}: sent sybil proof", addr));
 
         let payload = HandshakePayload {
             version: 1,
@@ -261,7 +282,7 @@ impl P2PNode {
             .write_all(&bytes)
             .await
             .map_err(|e| format!("send handshake to {} failed: {}", addr, e))?;
-        println!("P2P outbound {}: sent handshake", addr);
+        Self::log("🤝", format!("P2P outbound {}: sent handshake", addr));
 
         let (mut reader, writer_half) = stream.into_split();
         let writer = Arc::new(tokio::sync::Mutex::new(writer_half));
@@ -306,10 +327,7 @@ impl P2PNode {
                                     Some(agent_str.clone()),
                                     payload.relay_address.clone(),
                                 );
-                                println!(
-                                    "P2P outbound {}: received handshake (agent {}, height {})",
-                                    addr, agent_str, payload.height
-                                );
+                                Self::log("✅", format!("P2P outbound {}: received handshake (agent {}, height {})", addr, agent_str, payload.height));
                                 // If we have a relay address, advertise it back.
                                 if let Some(relay) = relay_addr.clone() {
                                     let relay_msg = RelayAddressPayload {
@@ -337,7 +355,7 @@ impl P2PNode {
                         _ => {}
                     },
                     Err(e) => {
-                        println!("P2P outbound {}: closing read loop: {}", addr, e);
+                        Self::log_err("⚠️", format!("P2P outbound {}: closing read loop: {}", addr, e));
                         let mut rep = reputation.lock().await;
                         rep.record_failure(&addr.to_string());
                         break;

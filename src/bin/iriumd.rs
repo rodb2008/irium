@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::{env, fs};
 
+use chrono::Utc;
 use axum::{
     extract::{ConnectInfo, Json as AxumJson, Query, State},
     http::StatusCode,
@@ -18,6 +19,7 @@ use irium_node_rs::block::{Block, BlockHeader};
 use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, OutPoint};
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::MempoolManager;
+use irium_node_rs::network::SeedlistManager;
 use irium_node_rs::p2p::P2PNode;
 use irium_node_rs::pow::Target;
 use irium_node_rs::rate_limiter::RateLimiter;
@@ -115,6 +117,19 @@ fn parse_seed_lines(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_seed_to_socketaddr(seed: &str, default_port: u16) -> Result<std::net::SocketAddr, String> {
+    if let Ok(addr) = seed.parse::<std::net::SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = seed.parse::<std::net::IpAddr>() {
+        return format!("{}:{}", ip, default_port)
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| e.to_string());
+    }
+    Err("invalid seed format".to_string())
+}
+
+
 fn load_runtime_seeds() -> Vec<String> {
     let path = std::path::Path::new("bootstrap/seedlist.runtime");
     std::fs::read_to_string(path)
@@ -207,15 +222,23 @@ async fn status(
     State(state): State<AppState>,
 ) -> Result<Json<StatusResponse>, StatusCode> {
     check_rate(&state, &addr)?;
-    let guard = state.chain.lock().unwrap();
-    Ok(Json(StatusResponse {
-        height: guard.height,
-        genesis_hash: state.genesis_hash.clone(),
-        anchors_digest: state
+    let peer_count = match state.p2p {
+        Some(ref p2p) => p2p.peer_count().await,
+        None => 0,
+    };
+    let (height, anchors_digest) = {
+        let guard = state.chain.lock().unwrap();
+        let anchors_digest = state
             .anchors
             .as_ref()
-            .map(|a| a.payload_digest().to_string()),
-        peer_count: state.p2p.as_ref().map(|_p| 0usize).unwrap_or(0),
+            .map(|a| a.payload_digest().to_string());
+        (guard.height, anchors_digest)
+    };
+    Ok(Json(StatusResponse {
+        height,
+        genesis_hash: state.genesis_hash.clone(),
+        anchors_digest,
+        peer_count,
     }))
 }
 
@@ -600,7 +623,7 @@ async fn main() {
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|raw| serde_json::from_str::<NodeConfig>(&raw).ok());
 
-    let agent_string = "iriumd-rs/0.1".to_string();
+    let agent_string = "Irium-Node".to_string();
     let relay_address = node_cfg
         .as_ref()
         .and_then(|c| c.relay_address.clone())
@@ -639,7 +662,14 @@ async fn main() {
     };
 
     // Build seed list: config overrides signed + runtime seeds.
-    let mut seeds: Vec<String> = if let Some(cfg) = &node_cfg {
+    let default_seed_port: u16 = node_cfg
+        .as_ref()
+        .and_then(|cfg| cfg.p2p_bind.as_ref())
+        .and_then(|b| b.split(':').last())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(38291);
+
+    let seeds_raw: Vec<String> = if let Some(cfg) = &node_cfg {
         if !cfg.p2p_seeds.is_empty() {
             cfg.p2p_seeds.clone()
         } else {
@@ -656,32 +686,101 @@ async fn main() {
         merged.dedup();
         merged
     };
+
     let mut rep_mgr = ReputationManager::new();
-    seeds.sort_by(|a, b| rep_mgr.score_of(b).cmp(&rep_mgr.score_of(a)));
+    let mut seeds: Vec<std::net::SocketAddr> = Vec::new();
+    for seed in seeds_raw {
+        match parse_seed_to_socketaddr(&seed, default_seed_port) {
+            Ok(addr) => seeds.push(addr),
+            Err(e) => eprintln!("Invalid P2P seed {}: {}", seed, e),
+        }
+    }
+    seeds.sort_by(|a, b| rep_mgr.score_of(&b.to_string()).cmp(&rep_mgr.score_of(&a.to_string())));
 
     // Connect to seed peers using a basic handshake.
     if let Some(ref node) = p2p {
-        for seed in &seeds {
-            let addr: SocketAddr = match seed.parse() {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("Invalid P2P seed address {}: {}", seed, e);
-                    continue;
-                }
-            };
-
+        for addr in &seeds {
             let height = {
                 let chain = shared_state.lock().unwrap();
                 chain.height
             };
 
             if let Err(e) = node
-                .connect_and_handshake(addr, height, &agent_string)
+                .connect_and_handshake(*addr, height, &agent_string)
                 .await
             {
                 eprintln!("Failed outbound P2P handshake with {}: {}", addr, e);
             }
         }
+    }
+
+// Periodic heartbeat logging to surface peers and seedlist.
+    if let Some(ref node) = p2p {
+        let node_clone = node.clone();
+        let chain_clone = shared_state.clone();
+        tokio::spawn(async move {
+            let seed_mgr = SeedlistManager::new(128);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let peers = node_clone.peers_snapshot().await;
+                let seeds = seed_mgr.merged_seedlist();
+
+                let mut peer_ips = std::collections::HashSet::new();
+                let mut peer_list: Vec<String> = Vec::new();
+                for p in peers.iter() {
+                    let parts: Vec<&str> = p.multiaddr.split('/').collect();
+                    if parts.len() >= 5 {
+                        let ip = parts[2];
+                        let port = parts[4];
+                        if peer_ips.insert(ip.to_string()) {
+                            let h = p.last_height.map(|v| format!("h={}", v)).unwrap_or_else(|| "h=-".to_string());
+                            let label = match &p.agent {
+                                Some(agent) => format!("{}:{} ({} {})", ip, port, h, agent),
+                                None => format!("{}:{} ({})", ip, port, h),
+                            };
+                            peer_list.push(label);
+                        }
+                    } else if peer_ips.insert(p.multiaddr.clone()) {
+                        let h = p.last_height.map(|v| format!("h={}", v)).unwrap_or_else(|| "h=-".to_string());
+                        peer_list.push(format!("{} ({})", p.multiaddr, h));
+                    }
+                }
+                if peer_list.is_empty() {
+                    peer_list.push("-".to_string());
+                }
+
+                let mut seed_ips = std::collections::HashSet::new();
+                let mut seed_list: Vec<String> = Vec::new();
+                for s in seeds.iter() {
+                    let parts: Vec<&str> = s.split('/').collect();
+                    if parts.len() >= 5 {
+                        let ip = parts[2];
+                        let port = parts[4];
+                        if seed_ips.insert(ip.to_string()) {
+                            seed_list.push(format!("{}:{}", ip, port));
+                        }
+                    } else if seed_ips.insert(s.clone()) {
+                        seed_list.push(s.clone());
+                    }
+                }
+                if seed_list.is_empty() {
+                    seed_list.push("-".to_string());
+                }
+
+                let local_height = {
+                    let g = chain_clone.lock().unwrap();
+                    g.height
+                };
+
+                println!("[{}] 🔁 heartbeat peers={} [{}] seeds=[{}] height={}",
+                    Utc::now().format("%H:%M:%S"),
+                    peer_ips.len(),
+                    peer_list.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+                    seed_list.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+                    local_height
+                );
+            }
+        });
     }
 
     let app_state = AppState {
