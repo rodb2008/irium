@@ -614,7 +614,7 @@ async fn main() {
         tokio::spawn(async move {
             let seed_mgr = SeedlistManager::new(128);
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let peers = node_clone.peers_snapshot().await;
                 let seeds = seed_mgr.merged_seedlist();
 
