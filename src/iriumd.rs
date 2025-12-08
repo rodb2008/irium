@@ -35,11 +35,25 @@ struct AppState {
 }
 
 #[derive(Serialize)]
+struct PeerInfo {
+    multiaddr: String,
+    agent: Option<String>,
+    height: Option<u64>,
+    last_seen: f64,
+}
+
+#[derive(Serialize)]
+struct PeersResponse {
+    peers: Vec<PeerInfo>,
+}
+
+#[derive(Serialize)]
 struct StatusResponse {
     height: u64,
     genesis_hash: String,
     anchors_digest: Option<String>,
     peer_count: usize,
+    anchor_loaded: bool,
 }
 
 #[derive(Serialize)]
@@ -160,6 +174,25 @@ async fn status(
         anchors_digest,
         peer_count,
     }))
+}
+
+async fn peers(State(state): State<AppState>) -> Result<Json<PeersResponse>, StatusCode> {
+    if let Some(ref p2p) = state.p2p {
+        let list = p2p
+            .peers_snapshot()
+            .await
+            .into_iter()
+            .map(|p| PeerInfo {
+                multiaddr: p.multiaddr,
+                agent: p.agent,
+                height: p.last_height,
+                last_seen: p.last_seen,
+            })
+            .collect();
+        Ok(Json(PeersResponse { peers: list }))
+    } else {
+        Ok(Json(PeersResponse { peers: Vec::new() }))
+    }
 }
 
 async fn get_utxo(
@@ -646,11 +679,15 @@ async fn main() {
                 let mut seed_list: Vec<String> = Vec::new();
                 for s in seeds.iter() {
                     let parts: Vec<&str> = s.split('/').collect();
-                    if parts.len() >= 5 {
+                    if parts.len() >= 3 {
                         let ip = parts[2];
-                        let port = parts[4];
                         if seed_ips.insert(ip.to_string()) {
-                            seed_list.push(format!("{}:{}", ip, port));
+                            seed_list.push(ip.to_string());
+                        }
+                    } else if let Some(pos) = s.find(":") {
+                        let ip = &s[..pos];
+                        if seed_ips.insert(ip.to_string()) {
+                            seed_list.push(ip.to_string());
                         }
                     } else if seed_ips.insert(s.clone()) {
                         seed_list.push(s.clone());
@@ -687,6 +724,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/status", get(status))
+        .route("/peers", get(peers))
         .route("/rpc/utxo", get(get_utxo))
         .route("/rpc/block", get(get_block))
         .route("/rpc/submit_block", post(submit_block))
