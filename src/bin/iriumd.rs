@@ -656,7 +656,18 @@ async fn main() {
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|raw| serde_json::from_str::<NodeConfig>(&raw).ok());
 
-    let agent_string = "Irium-Node".to_string();
+        // Enforce anchor consistency if anchors are present
+    if let Some(ref a) = anchors {
+        if let Some(latest) = a.get_latest_anchor() {
+            let expected = latest.hash.to_lowercase();
+            let tip_hash = genesis_hash.to_lowercase();
+            if latest.height <= 1 && expected != tip_hash {
+                panic!("Anchors mismatch: latest anchor hash {} != genesis hash {}", expected, tip_hash);
+            }
+        }
+    }
+
+let agent_string = "Irium-Node".to_string();
     let relay_address = node_cfg
         .as_ref()
         .and_then(|c| c.relay_address.clone())
@@ -721,30 +732,45 @@ async fn main() {
     };
 
     let mut rep_mgr = ReputationManager::new();
+    let self_ip = node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.as_ref()).and_then(|b| b.split(":").next().map(|s| s.to_string()));
+
     let mut seeds: Vec<std::net::SocketAddr> = Vec::new();
     for seed in seeds_raw {
         match parse_seed_to_socketaddr(&seed, default_seed_port) {
-            Ok(addr) => seeds.push(addr),
+            Ok(addr) => {
+                if let Some(ref ip) = self_ip {
+                    if &addr.ip().to_string() == ip {
+                        continue;
+                    }
+                }
+                seeds.push(addr)
+            }
             Err(e) => eprintln!("Invalid P2P seed {}: {}", seed, e),
         }
     }
     seeds.sort_by(|a, b| rep_mgr.score_of(&b.to_string()).cmp(&rep_mgr.score_of(&a.to_string())));
 
-    // Connect to seed peers using a basic handshake.
-    if let Some(ref node) = p2p {
-        for addr in &seeds {
-            let height = {
-                let chain = shared_state.lock().unwrap();
-                chain.height
-            };
-
-            if let Err(e) = node
-                .connect_and_handshake(*addr, height, &agent_string)
-                .await
-            {
-                eprintln!("Failed outbound P2P handshake with {}: {}", addr, e);
+    // Connect to seed peers using a basic handshake and keep retrying in background.
+    if let Some(node) = p2p.clone() {
+        let seeds_clone = seeds.clone();
+        let agent_clone = agent_string.clone();
+        let shared_clone = shared_state.clone();
+        tokio::spawn(async move {
+            let node = node;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                for addr in &seeds_clone {
+                    let height = {
+                        let chain = shared_clone.lock().unwrap();
+                        chain.height
+                    };
+                    if let Err(e) = node.connect_and_handshake(*addr, height, &agent_clone).await {
+                        eprintln!("Failed outbound P2P handshake with {}: {}", addr, e);
+                    }
+                }
+                interval.tick().await;
             }
-        }
+        });
     }
 
 // Periodic heartbeat logging to surface peers and seedlist.
