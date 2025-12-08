@@ -5,6 +5,8 @@ use std::{env, fs};
 use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use bs58;
 
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
@@ -32,6 +34,22 @@ fn mempool_file() -> PathBuf {
         let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
         PathBuf::from(home).join(".irium/mempool/pending.json")
     }
+}
+
+fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
+    let data = bs58::decode(addr).into_vec().ok()?;
+    if data.len() < 25 { return None; }
+    let (body, checksum) = data.split_at(data.len() - 4);
+    let mut hasher = Sha256::new();
+    hasher.update(body);
+    let first = hasher.finalize_reset();
+    hasher.update(first);
+    let second = hasher.finalize();
+    if &second[0..4] != checksum { return None; }
+    if body.len() < 21 { return None; }
+    let payload = &body[1..];
+    if payload.len() != 20 { return None; }
+    Some(payload.to_vec())
 }
 
 fn script_from_relay_address(addr: &str) -> Result<Vec<u8>, String> {
@@ -89,7 +107,14 @@ mod tests {
 fn miner_pubkey_hash() -> Option<Vec<u8>> {
     if let Ok(hex) = env::var("IRIUM_MINER_PKH") {
         if hex.len() == 40 {
-            return hex::decode(hex).ok();
+            if let Ok(pkh) = hex::decode(hex) {
+                return Some(pkh);
+            }
+        }
+    }
+    if let Ok(addr) = env::var("IRIUM_MINER_ADDRESS") {
+        if let Some(pkh) = base58_p2pkh_to_hash(&addr) {
+            return Some(pkh);
         }
     }
     None
