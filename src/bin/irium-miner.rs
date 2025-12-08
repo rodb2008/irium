@@ -401,11 +401,11 @@ fn mine_once(chain: &mut ChainState) -> Result<(), String> {
         let h = block.header.hash();
         if meets_target(&h, target) {
             let elapsed = start.elapsed().as_secs_f64();
-            println!("✅ Mined block at height {}", height);
-            println!("  hash   = {}", hex::encode(h));
-            println!("  nonce  = {}", nonce);
+            println!("[✅] Mined block at height {}", height);
+            println!("   🔗 hash   = {}", hex::encode(h));
+            println!("   🎯 nonce  = {}", nonce);
             if elapsed > 0.0 {
-                println!("  rate   = {:.2} H/s", nonce as f64 / elapsed);
+                println!("   ⚡ rate   = {:.2} H/s", nonce as f64 / elapsed);
             }
 
             // Connect block to chain (updates UTXOs, height, etc.)
@@ -435,7 +435,7 @@ fn mine_once(chain: &mut ChainState) -> Result<(), String> {
                     nonce as f64 / elapsed
                 );
             } else {
-                println!("  mining height {}: nonce {}", height, nonce);
+                println!("[⏱️] height {} nonce {}", height, nonce);
             }
         }
     }
@@ -452,20 +452,20 @@ fn main() {
 
     let mut state = ChainState::new(params);
 
-    println!("Irium Rust miner starting at height {}", state.height);
+    println!("[⛏️] Irium Rust miner starting at height {}", state.height);
 
     // Optionally report anchors digest if anchors.json is available.
     if let Ok(manager) = AnchorManager::from_default_repo_root(PathBuf::from(".")) {
-        println!("Anchors digest: {}", manager.payload_digest());
+        println!("[🪝] Anchors digest: {}", manager.payload_digest());
     }
 
     if let Some(pkh) = miner_pubkey_hash() {
-        println!("Using miner PKH: {}", hex::encode(pkh));
+        println!("[💰] Using miner PKH: {}", hex::encode(pkh));
     } else {
-        println!("WARNING: IRIUM_MINER_PKH not set or invalid; rewards will be unspendable");
+        println!("[⚠️] WARNING: IRIUM_MINER_PKH not set or invalid; rewards will be unspendable");
     }
 
     if let Err(e) = mine_once(&mut state) {
-        eprintln!("Mining failed: {e}");
+        eprintln!("[⚠️] Mining failed: {e}");
     }
 }
