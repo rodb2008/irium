@@ -10,6 +10,7 @@ use crate::block::Block;
 use crate::chain::ChainState;
 use crate::mempool::MempoolManager;
 use crate::network::{PeerDirectory, PeerRecord};
+use rand_core::RngCore;
 use crate::protocol::{
     BlockPayload, EmptyPayload, GetBlocksPayload, GetDataPayload, GetHeadersPayload,
     HandshakePayload, HeadersPayload, InvPayload, MempoolPayload, Message, MessageType,
@@ -21,6 +22,8 @@ use crate::tx::decode_full_tx;
 
 /// Minimal P2P node skeleton: accepts incoming connections and can
 /// broadcast raw block bytes to all connected peers.
+const MAX_PEERS: usize = 64;
+
 #[derive(Clone)]
 pub struct P2PNode {
     bind_addr: SocketAddr,
@@ -96,6 +99,11 @@ impl P2PNode {
             loop {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
+                        let current = { let g = peers_arc.blocking_lock(); g.len() };
+                        if current >= MAX_PEERS {
+                            Self::log_err("⚠️", format!("Rejecting inbound {}: max peers reached", addr));
+                            continue;
+                        }
                         Self::log("⬅️", format!("Incoming P2P connection from {}", addr));
                         let peers_inner = peers_arc.clone();
                         let dir = dir_arc.clone();
@@ -204,6 +212,9 @@ impl P2PNode {
         local_height: u64,
         agent: &str,
     ) -> Result<(), String> {
+        // Simple jittered delay before connecting to avoid thundering herd.
+        let jitter_ms = (rand_core::OsRng.next_u32() % 5000) as u64;
+        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
         let mut stream = TcpStream::connect(addr)
             .await
             .map_err(|e| format!("connect to {} failed: {}", addr, e))?;

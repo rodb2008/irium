@@ -667,6 +667,15 @@ async fn main() {
         }
     }
 
+    // Validate anchors against genesis if available.
+    if let Some(ref a) = anchors {
+        if let Some(latest) = a.get_latest_anchor() {
+            if latest.height <= 1 && latest.hash.to_lowercase() != genesis_hash.to_lowercase() {
+                panic!("Anchors mismatch: latest anchor hash {} != genesis hash {}", latest.hash, genesis_hash);
+            }
+        }
+    }
+
 let agent_string = "Irium-Node".to_string();
     let relay_address = node_cfg
         .as_ref()

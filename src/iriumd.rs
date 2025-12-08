@@ -581,7 +581,16 @@ async fn main() {
         .and_then(|c| c.relay_address.clone())
         .or_else(|| std::env::var("IRIUM_RELAY_ADDRESS").ok());
 
-    let agent_string = "Irium-Node".to_string();
+        // Validate anchors against genesis if available.
+    if let Some(ref a) = anchors {
+        if let Some(latest) = a.get_latest_anchor() {
+            if latest.height <= 1 && latest.hash.to_lowercase() != genesis_hash.to_lowercase() {
+                panic!("Anchors mismatch: latest anchor hash {} != genesis hash {}", latest.hash, genesis_hash);
+            }
+        }
+    }
+
+let agent_string = "Irium-Node".to_string();
 
     // Set up P2P node if configured.
     let p2p: Option<P2PNode> = if let Some(ref cfg) = node_cfg {
