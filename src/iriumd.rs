@@ -195,6 +195,24 @@ async fn peers(State(state): State<AppState>) -> Result<Json<PeersResponse>, Sta
     }
 }
 
+async fn metrics(State(state): State<AppState>) -> String {
+    let (height, anchor_loaded) = {
+        let g = state.chain.lock().unwrap();
+        (g.height, state.anchors.is_some())
+    };
+    let peer_count = match state.p2p {
+        Some(ref p2p) => p2p.peer_count().await,
+        None => 0,
+    };
+    format!("irium_height {}
+irium_peers {}
+irium_anchor_loaded {}
+",
+        height,
+        peer_count,
+        anchor_loaded as u8)
+}
+
 async fn get_utxo(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -734,6 +752,7 @@ let agent_string = "Irium-Node".to_string();
     let app = Router::new()
         .route("/status", get(status))
         .route("/peers", get(peers))
+        .route("/metrics", get(metrics))
         .route("/rpc/utxo", get(get_utxo))
         .route("/rpc/block", get(get_block))
         .route("/rpc/submit_block", post(submit_block))

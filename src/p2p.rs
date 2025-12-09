@@ -1,7 +1,9 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use chrono::Utc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -30,6 +32,7 @@ pub struct P2PNode {
     peers: Arc<Mutex<Vec<Arc<Mutex<OwnedWriteHalf>>>>>,
     peers_directory: Arc<Mutex<PeerDirectory>>,
     reputation: Arc<Mutex<ReputationManager>>,
+    accept_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
     agent: String,
@@ -71,6 +74,7 @@ impl P2PNode {
             peers: Arc::new(Mutex::new(Vec::new())),
             peers_directory: Arc::new(Mutex::new(PeerDirectory::new())),
             reputation: Arc::new(Mutex::new(ReputationManager::new())),
+            accept_log: Arc::new(Mutex::new(HashMap::new())),
             chain,
             mempool,
             agent,
@@ -94,11 +98,23 @@ impl P2PNode {
         let mempool = self.mempool.clone();
         let agent = self.agent.clone();
         let relay_address = self.relay_address.clone();
+        let accept_log = self.accept_log.clone();
 
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
+                        let ip = addr.ip();
+                        let mut log_guard = accept_log.lock().await;
+                        if let Some(last) = log_guard.get(&ip) {
+                            if last.elapsed() < Duration::from_millis(500) {
+                                Self::log_err("⚠️", format!("Rejecting inbound {}: rate limit", addr));
+                                continue;
+                            }
+                        }
+                        log_guard.insert(ip, Instant::now());
+                        drop(log_guard);
+
                         let current = { let g = peers_arc.blocking_lock(); g.len() };
                         if current >= MAX_PEERS {
                             Self::log_err("⚠️", format!("Rejecting inbound {}: max peers reached", addr));
