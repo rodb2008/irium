@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::{env, fs};
 
 use chrono::Utc;
@@ -193,6 +193,11 @@ fn load_signed_seeds() -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+fn json_log_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("IRIUM_JSON_LOG").ok().map(|v| v == "1" || v.to_lowercase() == "true").unwrap_or(false))
 }
 
 fn blocks_dir() -> PathBuf {
@@ -867,13 +872,19 @@ let agent_string = "Irium-Node".to_string();
                     g.height
                 };
 
-                println!("[{}] 🔁 heartbeat peers={} [{}] seeds=[{}] height={}",
-                    Utc::now().format("%H:%M:%S"),
-                    peer_ips.len(),
-                    peer_list.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
-                    seed_list.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
-                    local_height
-                );
+                let peer_sample = peer_list.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                let seed_sample = seed_list.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                if json_log_enabled() {
+                    println!("{}", json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "heartbeat", "peers": peer_ips.len(), "peer_sample": peer_sample, "seeds": seed_sample, "height": local_height}));
+                } else {
+                    println!("[{}] 🔁 heartbeat peers={} [{}] seeds=[{}] height={}",
+                        Utc::now().format("%H:%M:%S"),
+                        peer_ips.len(),
+                        peer_sample,
+                        seed_sample,
+                        local_height
+                    );
+                }
             }
         });
     }
@@ -908,7 +919,11 @@ let agent_string = "Irium-Node".to_string();
         .parse()
         .expect("valid bind address");
 
-    println!("Irium Rust node HTTP listening on http://{}:{}", host, port);
+    if json_log_enabled() {
+        println!("{}", json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "http_listen", "host": host, "port": port}));
+    } else {
+        println!("Irium Rust node HTTP listening on http://{}:{}", host, port);
+    }
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
