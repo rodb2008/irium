@@ -196,21 +196,31 @@ async fn peers(State(state): State<AppState>) -> Result<Json<PeersResponse>, Sta
 }
 
 async fn metrics(State(state): State<AppState>) -> String {
-    let (height, anchor_loaded) = {
+    let (height, anchor_loaded, tip_hash) = {
         let g = state.chain.lock().unwrap();
-        (g.height, state.anchors.is_some())
+        let tip_hash = g
+            .chain
+            .last()
+            .map(|b| hex::encode(b.header.hash()))
+            .unwrap_or_else(|| state.genesis_hash.clone());
+        (g.height, state.anchors.is_some(), tip_hash)
     };
     let peer_count = match state.p2p {
         Some(ref p2p) => p2p.peer_count().await,
         None => 0,
     };
+    let mempool_sz = state.mempool.lock().unwrap().len();
     format!("irium_height {}
 irium_peers {}
 irium_anchor_loaded {}
+irium_tip_hash {}
+irium_mempool_size {}
 ",
         height,
         peer_count,
-        anchor_loaded as u8)
+        anchor_loaded as u8,
+        tip_hash,
+        mempool_sz)
 }
 
 async fn get_utxo(
