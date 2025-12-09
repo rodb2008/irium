@@ -1,6 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use chrono::Utc;
 use std::time::{Duration, Instant};
@@ -13,6 +13,7 @@ use crate::chain::ChainState;
 use crate::mempool::MempoolManager;
 use crate::network::{PeerDirectory, PeerRecord};
 use rand_core::RngCore;
+use serde_json::json;
 use crate::protocol::{
     BlockPayload, EmptyPayload, GetBlocksPayload, GetDataPayload, GetHeadersPayload,
     HandshakePayload, HeadersPayload, InvPayload, MempoolPayload, Message, MessageType,
@@ -44,12 +45,27 @@ impl P2PNode {
         Utc::now().format("%H:%M:%S").to_string()
     }
 
+    fn json_log_enabled() -> bool {
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        *FLAG.get_or_init(|| std::env::var("IRIUM_JSON_LOG").ok().map(|v| v == "1" || v.to_lowercase() == "true").unwrap_or(false))
+    }
+
     fn log(icon: &str, msg: impl AsRef<str>) {
-        println!("[{}] {} {}", Self::ts(), icon, msg.as_ref());
+        if Self::json_log_enabled() {
+            let payload = json!({"ts": Self::ts(), "level": "info", "icon": icon, "msg": msg.as_ref()});
+            println!("{}", payload);
+        } else {
+            println!("[{}] {} {}", Self::ts(), icon, msg.as_ref());
+        }
     }
 
     fn log_err(icon: &str, msg: impl AsRef<str>) {
-        eprintln!("[{}] {} {}", Self::ts(), icon, msg.as_ref());
+        if Self::json_log_enabled() {
+            let payload = json!({"ts": Self::ts(), "level": "error", "icon": icon, "msg": msg.as_ref()});
+            eprintln!("{}", payload);
+        } else {
+            eprintln!("[{}] {} {}", Self::ts(), icon, msg.as_ref());
+        }
     }
 
     fn tip_hash(chain: &Option<Arc<StdMutex<ChainState>>>) -> [u8; 32] {
