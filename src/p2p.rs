@@ -26,6 +26,7 @@ use crate::tx::decode_full_tx;
 /// Minimal P2P node skeleton: accepts incoming connections and can
 /// broadcast raw block bytes to all connected peers.
 const MAX_PEERS: usize = 64;
+const MAX_MSGS_PER_SEC: u32 = 200;
 
 #[derive(Clone)]
 pub struct P2PNode {
@@ -347,7 +348,19 @@ impl P2PNode {
         let _mempool_for_sync = self.mempool.clone();
         let reputation = self.reputation.clone();
         tokio::spawn(async move {
+            let mut msg_count: u32 = 0;
+            let mut window_start = Instant::now();
             loop {
+                if window_start.elapsed() < Duration::from_secs(1) {
+                    msg_count += 1;
+                    if msg_count > MAX_MSGS_PER_SEC {
+                        Self::log_err("⚠️", format!("P2P outbound {}: rate limit", addr));
+                        break;
+                    }
+                } else {
+                    window_start = Instant::now();
+                    msg_count = 1;
+                }
                 match read_message(&mut reader).await {
                     Ok(msg) => match msg.msg_type {
                         MessageType::Ping => {
@@ -546,8 +559,19 @@ async fn handle_incoming_with_sybil(
         let _ = send_message(&writer, msg, addr).await;
     }
 
+    let mut msg_count: u32 = 0;
+    let mut window_start = Instant::now();
     // Process messages from the peer.
     loop {
+        if window_start.elapsed() < Duration::from_secs(1) {
+            msg_count += 1;
+            if msg_count > MAX_MSGS_PER_SEC {
+                return Err("message rate limit exceeded".to_string());
+            }
+        } else {
+            window_start = Instant::now();
+            msg_count = 1;
+        }
         let msg = match read_message(&mut reader).await {
             Ok(m) => m,
             Err(e) => return Err(e),
