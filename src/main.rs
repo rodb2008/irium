@@ -1,7 +1,7 @@
+mod anchors;
 mod block;
 mod chain;
 mod constants;
-mod anchors;
 mod genesis;
 mod pow;
 mod tx;

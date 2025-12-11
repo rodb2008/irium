@@ -1,9 +1,14 @@
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use chrono::Utc;
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+use std::process::{Command, Stdio};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -12,8 +17,6 @@ use crate::block::Block;
 use crate::chain::ChainState;
 use crate::mempool::MempoolManager;
 use crate::network::{PeerDirectory, PeerRecord};
-use rand_core::RngCore;
-use serde_json::json;
 use crate::protocol::{
     BlockPayload, EmptyPayload, GetBlocksPayload, GetDataPayload, GetHeadersPayload,
     HandshakePayload, HeadersPayload, InvPayload, MempoolPayload, Message, MessageType,
@@ -22,6 +25,8 @@ use crate::protocol::{
 use crate::reputation::ReputationManager;
 use crate::sybil::{SybilChallenge, SybilProof, SybilResistantHandshake};
 use crate::tx::decode_full_tx;
+use rand_core::{OsRng, RngCore};
+use serde_json::json;
 
 /// Minimal P2P node skeleton: accepts incoming connections and can
 /// broadcast raw block bytes to all connected peers.
@@ -39,6 +44,8 @@ pub struct P2PNode {
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
     agent: String,
     relay_address: Option<String>,
+    node_id: Vec<u8>,
+    banned_ips: Arc<HashSet<IpAddr>>,
 }
 
 impl P2PNode {
@@ -48,12 +55,18 @@ impl P2PNode {
 
     fn json_log_enabled() -> bool {
         static FLAG: OnceLock<bool> = OnceLock::new();
-        *FLAG.get_or_init(|| std::env::var("IRIUM_JSON_LOG").ok().map(|v| v == "1" || v.to_lowercase() == "true").unwrap_or(false))
+        *FLAG.get_or_init(|| {
+            std::env::var("IRIUM_JSON_LOG")
+                .ok()
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false)
+        })
     }
 
     fn log(icon: &str, msg: impl AsRef<str>) {
         if Self::json_log_enabled() {
-            let payload = json!({"ts": Self::ts(), "level": "info", "icon": icon, "msg": msg.as_ref()});
+            let payload =
+                json!({"ts": Self::ts(), "level": "info", "icon": icon, "msg": msg.as_ref()});
             println!("{}", payload);
         } else {
             println!("[{}] {} {}", Self::ts(), icon, msg.as_ref());
@@ -62,11 +75,16 @@ impl P2PNode {
 
     fn log_err(icon: &str, msg: impl AsRef<str>) {
         if Self::json_log_enabled() {
-            let payload = json!({"ts": Self::ts(), "level": "error", "icon": icon, "msg": msg.as_ref()});
+            let payload =
+                json!({"ts": Self::ts(), "level": "error", "icon": icon, "msg": msg.as_ref()});
             eprintln!("{}", payload);
         } else {
             eprintln!("[{}] {} {}", Self::ts(), icon, msg.as_ref());
         }
+    }
+
+    fn is_banned(&self, ip: &IpAddr) -> bool {
+        self.banned_ips.contains(ip)
     }
 
     fn tip_hash(chain: &Option<Arc<StdMutex<ChainState>>>) -> [u8; 32] {
@@ -77,6 +95,87 @@ impl P2PNode {
             }
         }
         [0u8; 32]
+    }
+
+    fn load_banned_ips() -> Arc<HashSet<IpAddr>> {
+        let path = std::env::var("IRIUM_BANNED_LIST")
+            .unwrap_or_else(|_| "bootstrap/banned_peers.txt".to_string());
+        let sig_path = format!("{}{}", path, ".sig");
+        let allowlist = std::env::var("IRIUM_BANNED_TRUST")
+            .unwrap_or_else(|_| "bootstrap/trust/allowed_ban_signers".to_string());
+        let mut ips = HashSet::new();
+        let data = match fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => return Arc::new(ips),
+        };
+        // Optional signature verification if both files exist.
+        if PathBuf::from(&sig_path).exists() && PathBuf::from(&allowlist).exists() {
+            let mut child = Command::new("ssh-keygen")
+                .arg("-Y")
+                .arg("verify")
+                .arg("-f")
+                .arg(&allowlist)
+                .arg("-I")
+                .arg("ban-signer")
+                .arg("-n")
+                .arg("file")
+                .arg("-s")
+                .arg(&sig_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            if let Ok(child) = child.as_mut() {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(data.as_bytes());
+                }
+            }
+            let ok = match child {
+                Ok(mut c) => c.wait().map(|s| s.success()).unwrap_or(false),
+                Err(_) => false,
+            };
+            if !ok {
+                eprintln!("banlist signature verification failed; ignoring bans");
+                return Arc::new(HashSet::new());
+            }
+        }
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Ok(ip) = line.parse::<IpAddr>() {
+                ips.insert(ip);
+            }
+        }
+        Arc::new(ips)
+    }
+
+    fn sybil_difficulty() -> u8 {
+        std::env::var("IRIUM_SYBIL_DIFFICULTY")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(10)
+    }
+
+    fn load_or_create_node_id() -> Vec<u8> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let path = PathBuf::from(home).join(".irium/node_id");
+        if let Ok(existing) = fs::read_to_string(&path) {
+            if let Ok(bytes) = hex::decode(existing.trim()) {
+                if bytes.len() == 32 {
+                    return bytes;
+                }
+            }
+        }
+        let mut buf = [0u8; 32];
+        OsRng.fill_bytes(&mut buf);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&path, hex::encode(buf));
+        buf.to_vec()
     }
 
     pub fn new(
@@ -96,6 +195,8 @@ impl P2PNode {
             mempool,
             agent,
             relay_address,
+            node_id: Self::load_or_create_node_id(),
+            banned_ips: Self::load_banned_ips(),
         }
     }
 
@@ -116,25 +217,40 @@ impl P2PNode {
         let agent = self.agent.clone();
         let relay_address = self.relay_address.clone();
         let accept_log = self.accept_log.clone();
+        let node_id = self.node_id.clone();
+        let banned_ips = self.banned_ips.clone();
 
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
                         let ip = addr.ip();
+                        if banned_ips.contains(&ip) {
+                            Self::log_err("⛔", format!("Rejecting inbound {}: banned", addr));
+                            continue;
+                        }
                         let mut log_guard = accept_log.lock().await;
                         if let Some(last) = log_guard.get(&ip) {
                             if last.elapsed() < Duration::from_millis(500) {
-                                Self::log_err("⚠️", format!("Rejecting inbound {}: rate limit", addr));
+                                Self::log_err(
+                                    "⚠️",
+                                    format!("Rejecting inbound {}: rate limit", addr),
+                                );
                                 continue;
                             }
                         }
                         log_guard.insert(ip, Instant::now());
                         drop(log_guard);
 
-                        let current = { let g = peers_arc.blocking_lock(); g.len() };
+                        let current = {
+                            let g = peers_arc.blocking_lock();
+                            g.len()
+                        };
                         if current >= MAX_PEERS {
-                            Self::log_err("⚠️", format!("Rejecting inbound {}: max peers reached", addr));
+                            Self::log_err(
+                                "⚠️",
+                                format!("Rejecting inbound {}: max peers reached", addr),
+                            );
                             continue;
                         }
                         Self::log("⬅️", format!("Incoming P2P connection from {}", addr));
@@ -145,6 +261,7 @@ impl P2PNode {
                         let mempool_peer = mempool.clone();
                         let agent_peer = agent.clone();
                         let relay_peer = relay_address.clone();
+                        let node_id_peer = node_id.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_incoming_with_sybil(
                                 socket,
@@ -157,10 +274,14 @@ impl P2PNode {
                                 mempool_peer,
                                 agent_peer,
                                 relay_peer,
+                                node_id_peer,
                             )
                             .await
                             {
-                                Self::log_err("⚠️", format!("P2P handshake error from {}: {}", addr, e));
+                                Self::log_err(
+                                    "⚠️",
+                                    format!("P2P handshake error from {}: {}", addr, e),
+                                );
                             }
                         });
                     }
@@ -182,6 +303,44 @@ impl P2PNode {
     pub async fn peers_snapshot(&self) -> Vec<PeerRecord> {
         let dir = self.peers_directory.lock().await;
         dir.peers()
+    }
+
+    /// Request peer lists from all connected peers.
+    pub async fn request_peers(&self) -> Result<(), String> {
+        let msg = EmptyPayload::to_message(MessageType::GetPeers)?;
+        let bytes = msg.serialize();
+        let mut guard = self.peers.lock().await;
+        for socket in guard.iter_mut() {
+            if let Err(e) = socket.lock().await.write_all(&bytes).await {
+                return Err(format!("failed to send getpeers: {}", e));
+            }
+        }
+        Ok(())
+    }
+
+    /// Force a refresh of the runtime seedlist based on current peer directory.
+    pub async fn refresh_seedlist(&self) {
+        let dir = self.peers_directory.lock().await;
+        dir.refresh_seedlist_with_policy();
+    }
+
+    pub async fn current_sybil_difficulty(&self) -> u8 {
+        let base = Self::sybil_difficulty();
+        let max = std::env::var("IRIUM_SYBIL_DIFFICULTY_MAX")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(20);
+        let banned = {
+            let rep = self.reputation.lock().await;
+            rep.banned_count() as u8
+        };
+        let adj = base.saturating_add(banned.min(5));
+        adj.min(max)
+    }
+
+    pub fn node_id_hex(&self) -> String {
+        hex::encode(&self.node_id)
     }
 
     pub async fn broadcast_block(&self, block_bytes: &[u8]) -> Result<(), String> {
@@ -245,6 +404,9 @@ impl P2PNode {
         local_height: u64,
         agent: &str,
     ) -> Result<(), String> {
+        if self.is_banned(&addr.ip()) {
+            return Err(format!("peer {} is banned (banlist)", addr));
+        }
         // Simple jittered delay before connecting to avoid thundering herd.
         let jitter_ms = (rand_core::OsRng.next_u32() % 5000) as u64;
         tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
@@ -262,7 +424,10 @@ impl P2PNode {
             rep.record_success(&peer_id);
         }
 
-        Self::log("↗️", format!("P2P outbound {}: connected, awaiting challenge", addr));
+        Self::log(
+            "↗️",
+            format!("P2P outbound {}: connected, awaiting challenge", addr),
+        );
         // Expect a sybil challenge from the remote and respond with a proof
         // before proceeding with the normal handshake.
         let challenge_msg = match read_message(&mut stream).await {
@@ -287,9 +452,8 @@ impl P2PNode {
             }
         };
 
-        // For now, use a fixed 32-byte token as the peer "pubkey"
-        // for the purposes of sybil proof binding.
-        let peer_pubkey = vec![0u8; 32];
+        // Bind proof-of-work to a persistent node identity derived from disk.
+        let peer_pubkey = self.node_id.clone();
         let handshake = SybilResistantHandshake::new(challenge.difficulty);
         let proof = handshake
             .solve_challenge(challenge, peer_pubkey.to_vec())
@@ -315,6 +479,7 @@ impl P2PNode {
             checkpoint_height: None,
             checkpoint_hash: None,
             relay_address: self.relay_address.clone(),
+            node_id: Some(hex::encode(&self.node_id)),
         };
 
         let msg = payload
@@ -339,7 +504,7 @@ impl P2PNode {
         {
             let mut dir = self.peers_directory.lock().await;
             let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
-            dir.register_connection(multiaddr, None, self.relay_address.clone());
+            dir.register_connection(multiaddr, None, self.relay_address.clone(), None);
         }
 
         let dir = self.peers_directory.clone();
@@ -362,56 +527,70 @@ impl P2PNode {
                     msg_count = 1;
                 }
                 match read_message(&mut reader).await {
-                    Ok(msg) => match msg.msg_type {
-                        MessageType::Ping => {
-                            if let Ok(ping) = PingPayload::from_message(&msg) {
-                                let mut payload = Vec::new();
-                                payload.extend_from_slice(&ping.nonce.to_be_bytes());
-                                let pong = Message {
-                                    msg_type: MessageType::Pong,
-                                    payload,
-                                };
-                                let _ = send_message(&writer, pong, addr).await;
-                            }
-                        }
-                        MessageType::Handshake => {
-                            if let Ok(payload) = HandshakePayload::from_message(&msg) {
-                                let agent_str = payload.agent.clone();
-                                let mut dir_guard = dir.lock().await;
-                                dir_guard.register_connection(
-                                    format!("/ip4/{}/tcp/{}", addr.ip(), addr.port()),
-                                    Some(agent_str.clone()),
-                                    payload.relay_address.clone(),
-                                );
-                                Self::log("✅", format!("P2P outbound {}: received handshake (agent {}, height {})", addr, agent_str, payload.height));
-                                // If we have a relay address, advertise it back.
-                                if let Some(relay) = relay_addr.clone() {
-                                    let relay_msg = RelayAddressPayload {
-                                        txid: String::new(),
-                                        address: relay,
+                    Ok(msg) => {
+                        match msg.msg_type {
+                            MessageType::Ping => {
+                                if let Ok(ping) = PingPayload::from_message(&msg) {
+                                    let mut payload = Vec::new();
+                                    payload.extend_from_slice(&ping.nonce.to_be_bytes());
+                                    let pong = Message {
+                                        msg_type: MessageType::Pong,
+                                        payload,
                                     };
-                                    if let Ok(msg) = relay_msg.to_message() {
-                                        let _ = send_message(&writer, msg, addr).await;
-                                    }
-                                }
-                                // Basic header-first sync trigger: if peer is ahead, request blocks.
-                                if payload.height > local_height {
-                                    let start_hash = P2PNode::tip_hash(&chain_for_sync);
-                                    let get_blocks = GetBlocksPayload {
-                                        start_hash: start_hash.to_vec(),
-                                        count: 512,
-                                    };
-                                    if let Ok(msg) = get_blocks.to_message() {
-                                        let _ = send_message(&writer, msg, addr).await;
-                                    }
+                                    let _ = send_message(&writer, pong, addr).await;
                                 }
                             }
+                            MessageType::Handshake => {
+                                if let Ok(payload) = HandshakePayload::from_message(&msg) {
+                                    let agent_str = payload.agent.clone();
+                                    let node_id = payload.node_id.clone();
+                                    {
+                                        let mut dir_guard = dir.lock().await;
+                                        dir_guard.register_connection(
+                                            format!("/ip4/{}/tcp/{}", addr.ip(), addr.port()),
+                                            Some(agent_str.clone()),
+                                            payload.relay_address.clone(),
+                                            node_id.clone(),
+                                        );
+                                    }
+                                    Self::log("✅", format!("P2P outbound {}: received handshake (agent {}, height {})", addr, agent_str, payload.height));
+                                    // If we have a relay address, advertise it back.
+                                    if let Some(relay) = relay_addr.clone() {
+                                        let relay_msg = RelayAddressPayload {
+                                            txid: String::new(),
+                                            address: relay,
+                                        };
+                                        if let Ok(msg) = relay_msg.to_message() {
+                                            let _ = send_message(&writer, msg, addr).await;
+                                        }
+                                    }
+                                    // Ask for peers to grow the mesh.
+                                    if let Ok(msg) = EmptyPayload::to_message(MessageType::GetPeers)
+                                    {
+                                        let _ = send_message(&writer, msg, addr).await;
+                                    }
+                                    // Basic header-first sync trigger: if peer is ahead, request blocks.
+                                    if payload.height > local_height {
+                                        let start_hash = P2PNode::tip_hash(&chain_for_sync);
+                                        let get_blocks = GetBlocksPayload {
+                                            start_hash: start_hash.to_vec(),
+                                            count: 512,
+                                        };
+                                        if let Ok(msg) = get_blocks.to_message() {
+                                            let _ = send_message(&writer, msg, addr).await;
+                                        }
+                                    }
+                                }
+                            }
+                            MessageType::Disconnect => break,
+                            _ => {}
                         }
-                        MessageType::Disconnect => break,
-                        _ => {}
-                    },
+                    }
                     Err(e) => {
-                        Self::log_err("⚠️", format!("P2P outbound {}: closing read loop: {}", addr, e));
+                        Self::log_err(
+                            "⚠️",
+                            format!("P2P outbound {}: closing read loop: {}", addr, e),
+                        );
                         let mut rep = reputation.lock().await;
                         rep.record_failure(&addr.to_string());
                         break;
@@ -494,9 +673,21 @@ async fn handle_incoming_with_sybil(
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
     agent: String,
     relay_address: Option<String>,
+    node_id: Vec<u8>,
 ) -> Result<(), String> {
-    // Issue a fresh challenge with default difficulty 8.
-    let handshake = SybilResistantHandshake::new(8);
+    // Issue a fresh challenge with adaptive difficulty.
+    let base = P2PNode::sybil_difficulty();
+    let max = std::env::var("IRIUM_SYBIL_DIFFICULTY_MAX")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(20);
+    let banned = {
+        let rep = reputation.lock().await;
+        rep.banned_count() as u8
+    };
+    let difficulty = std::cmp::min(max, base.saturating_add(banned.min(5)));
+    let handshake = SybilResistantHandshake::new(difficulty);
     let challenge = handshake.create_challenge();
     let challenge_bytes = challenge.to_bytes();
     let challenge_msg = Message {
@@ -540,7 +731,8 @@ async fn handle_incoming_with_sybil(
     {
         let mut dir = directory.lock().await;
         let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
-        dir.register_connection(multiaddr, None, None);
+        let node_id = hex::encode(&proof.peer_pubkey);
+        dir.register_connection(multiaddr, None, None, Some(node_id));
     }
 
     // Reply with our handshake so outbound peers learn our agent/height.
@@ -554,6 +746,7 @@ async fn handle_incoming_with_sybil(
         checkpoint_height: None,
         checkpoint_hash: None,
         relay_address: relay_address.clone(),
+        node_id: Some(hex::encode(&node_id)),
     };
     if let Ok(msg) = payload.to_message() {
         let _ = send_message(&writer, msg, addr).await;
@@ -592,6 +785,7 @@ async fn handle_incoming_with_sybil(
                             multiaddr,
                             Some(payload.agent.clone()),
                             payload.relay_address.clone(),
+                            payload.node_id.clone(),
                         );
                     }
 
@@ -604,9 +798,14 @@ async fn handle_incoming_with_sybil(
                         checkpoint_height: None,
                         checkpoint_hash: None,
                         relay_address: relay_address.clone(),
+                        node_id: Some(hex::encode(&node_id)),
                     };
                     if let Ok(handshake_msg) = response.to_message() {
                         let _ = send_message(&writer, handshake_msg, addr).await;
+                    }
+                    // Ask peer for its view of the network.
+                    if let Ok(msg) = EmptyPayload::to_message(MessageType::GetPeers) {
+                        let _ = send_message(&writer, msg, addr).await;
                     }
                     if payload.height > local_h {
                         // Request headers first for basic sync.
@@ -647,7 +846,7 @@ async fn handle_incoming_with_sybil(
                 if let Ok(list) = PeersPayload::from_message(&msg) {
                     let mut dir = directory.lock().await;
                     for p in list.peers {
-                        dir.register_connection(p, None, None);
+                        dir.register_connection(p, None, None, None);
                     }
                 }
             }
@@ -737,7 +936,9 @@ async fn handle_incoming_with_sybil(
                             let request = {
                                 let guard = chain_arc.lock().unwrap();
                                 if let Some(best) = guard.best_header_if_better() {
-                                    if let Some(path) = guard.header_path_to_known(best.header.hash()) {
+                                    if let Some(path) =
+                                        guard.header_path_to_known(best.header.hash())
+                                    {
                                         if let Some(first_hash) = path.first() {
                                             let start_hash = guard
                                                 .headers
@@ -986,7 +1187,7 @@ async fn handle_incoming_with_sybil(
                             // Peer is advertising a default relay address; update directory mapping.
                             let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
                             let mut dir = directory.lock().await;
-                            dir.register_connection(multiaddr, None, Some(relay.address));
+                            dir.register_connection(multiaddr, None, Some(relay.address), None);
                         }
                     }
                 }

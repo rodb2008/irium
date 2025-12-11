@@ -25,6 +25,12 @@ cargo test --quiet
 ```
 
 ## Run the Rust Node
+
+### Important runtime env vars
+- `IRIUM_ANCHOR_MIN_SIGNERS`: minimum valid signatures required for `bootstrap/anchors.json` (default 1).
+- `IRIUM_SYBIL_DIFFICULTY` / `IRIUM_SYBIL_DIFFICULTY_MAX`: base and cap for sybil handshake PoW (default 10/20).
+- `IRIUM_BANNED_LIST` / `IRIUM_BANNED_TRUST`: optional signed banlist path and allowed signer file (default `bootstrap/banned_peers.txt` + `.sig`, `bootstrap/trust/allowed_ban_signers`).
+
 ```bash
 # optional: set a config JSON with p2p_bind, relay_address, etc.
 export IRIUM_NODE_CONFIG=/home/irium/irium/configs/node.json
@@ -57,6 +63,11 @@ cargo run --release --bin irium-spv -- verify <height> <txid> <index> <proof_hex
 
 ## Systemd Example
 See `scripts/iriumd.service.example` for a unit that runs the node under journald with automatic restart.
+
+
+### Banlist signing
+Use SSH signatures for banlists: `ssh-keygen -Y sign -f <signing_key> -n file - < bootstrap/banned_peers.txt > bootstrap/banned_peers.txt.sig`.
+Verify with `ssh-keygen -Y verify -f bootstrap/trust/allowed_ban_signers -I ban-signer -n file -s bootstrap/banned_peers.txt.sig < bootstrap/banned_peers.txt`.
 
 ## Status / TODO
 - Fork‑aware sync, header tracking, relay‑address coinbase support are in place.

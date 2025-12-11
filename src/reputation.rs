@@ -74,6 +74,10 @@ pub struct ReputationManager {
 }
 
 impl ReputationManager {
+    pub fn banned_count(&self) -> usize {
+        self.reputations.values().filter(|r| r.is_banned()).count()
+    }
+
     pub fn new() -> ReputationManager {
         let path = default_reputation_path();
         let mut mgr = ReputationManager {

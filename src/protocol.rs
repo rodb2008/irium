@@ -110,6 +110,8 @@ pub struct HandshakePayload {
     pub checkpoint_hash: Option<String>,
     #[serde(default)]
     pub relay_address: Option<String>,
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 impl HandshakePayload {

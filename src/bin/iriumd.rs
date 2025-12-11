@@ -3,18 +3,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::{env, fs};
 
-use chrono::Utc;
 use axum::{
     extract::{ConnectInfo, Json as AxumJson, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use irium_node_rs::anchors::AnchorManager;
-use irium_node_rs::reputation::ReputationManager;
 use irium_node_rs::block::{Block, BlockHeader};
 use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, OutPoint};
 use irium_node_rs::genesis::load_locked_genesis;
@@ -23,6 +22,7 @@ use irium_node_rs::network::SeedlistManager;
 use irium_node_rs::p2p::P2PNode;
 use irium_node_rs::pow::Target;
 use irium_node_rs::rate_limiter::RateLimiter;
+use irium_node_rs::reputation::ReputationManager;
 use irium_node_rs::tx::{decode_full_tx, Transaction, TxInput, TxOutput};
 
 #[derive(Clone)]
@@ -55,6 +55,8 @@ struct StatusResponse {
     anchors_digest: Option<String>,
     peer_count: usize,
     anchor_loaded: bool,
+    node_id: Option<String>,
+    sybil_difficulty: Option<u8>,
 }
 
 #[derive(Serialize)]
@@ -116,7 +118,6 @@ struct NodeConfig {
     #[serde(default)]
     relay_address: Option<String>,
 }
-
 
 fn parse_seed_lines(raw: &str) -> Vec<String> {
     raw.lines()
@@ -197,7 +198,12 @@ fn load_signed_seeds() -> Vec<String> {
 
 fn json_log_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("IRIUM_JSON_LOG").ok().map(|v| v == "1" || v.to_lowercase() == "true").unwrap_or(false))
+    *FLAG.get_or_init(|| {
+        std::env::var("IRIUM_JSON_LOG")
+            .ok()
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false)
+    })
 }
 
 fn blocks_dir() -> PathBuf {
@@ -240,9 +246,13 @@ async fn status(
     State(state): State<AppState>,
 ) -> Result<Json<StatusResponse>, StatusCode> {
     check_rate(&state, &addr)?;
-    let peer_count = match state.p2p {
-        Some(ref p2p) => p2p.peer_count().await,
-        None => 0,
+    let (peer_count, node_id, sybil_diff) = match state.p2p {
+        Some(ref p2p) => (
+            p2p.peer_count().await,
+            Some(p2p.node_id_hex()),
+            Some(p2p.current_sybil_difficulty().await),
+        ),
+        None => (0, None, None),
     };
     let (height, anchors_digest) = {
         let guard = state.chain.lock().unwrap();
@@ -258,6 +268,8 @@ async fn status(
         anchors_digest,
         peer_count,
         anchor_loaded: state.anchors.is_some(),
+        node_id,
+        sybil_difficulty: sybil_diff,
     }))
 }
 
@@ -281,33 +293,53 @@ async fn peers(State(state): State<AppState>) -> Result<Json<PeersResponse>, Sta
 }
 
 async fn metrics(State(state): State<AppState>) -> String {
-    let (height, anchor_loaded, tip_hash) = {
+    let (height, anchor_loaded, tip_hash, anchor_digest) = {
         let g = state.chain.lock().unwrap();
         let tip_hash = g
             .chain
             .last()
             .map(|b| hex::encode(b.header.hash()))
             .unwrap_or_else(|| state.genesis_hash.clone());
-        (g.height, state.anchors.is_some(), tip_hash)
+        let digest = state
+            .anchors
+            .as_ref()
+            .map(|a| a.payload_digest().to_string())
+            .unwrap_or_default();
+        (g.height, state.anchors.is_some(), tip_hash, digest)
     };
-    let peer_count = match state.p2p {
-        Some(ref p2p) => p2p.peer_count().await,
-        None => 0,
+    let (peer_count, node_id_hex, sybil_diff) = match state.p2p {
+        Some(ref p2p) => {
+            let peers = p2p.peer_count().await;
+            let node_id = p2p.node_id_hex();
+            let diff = p2p.current_sybil_difficulty().await;
+            (peers, node_id, diff)
+        }
+        None => (0usize, String::new(), 0u8),
     };
+    let seeds = SeedlistManager::new(128).merged_seedlist();
     let mempool_sz = state.mempool.lock().unwrap().len();
-    format!("irium_height {}
+    format!(
+        "irium_height {}
 irium_peers {}
 irium_anchor_loaded {}
 irium_tip_hash {}
 irium_mempool_size {}
+irium_anchor_digest {}
+irium_node_id {}
+irium_sybil_difficulty {}
+irium_seed_count {}
 ",
         height,
         peer_count,
         anchor_loaded as u8,
         tip_hash,
-        mempool_sz)
+        mempool_sz,
+        anchor_digest,
+        node_id_hex,
+        sybil_diff,
+        seeds.len()
+    )
 }
-
 async fn get_utxo(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -676,12 +708,17 @@ async fn main() {
 
     // Attempt to load anchors from the repo root if present. On mainnet,
     // the anchors file is shipped and verified out-of-band.
-    let anchors = AnchorManager::from_default_repo_root(PathBuf::from(".")).ok();
+    let anchors = match AnchorManager::from_default_repo_root(PathBuf::from(".")) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            eprintln!("Failed to load anchors: {}", e);
+            std::process::exit(1);
+        }
+    };
     if let Some(a) = anchors.clone() {
         let mut guard = shared_state.lock().unwrap();
         guard.set_anchors(a);
     }
-
 
     // Optional node configuration from JSON file, e.g. configs/node.json.
     let node_cfg: Option<NodeConfig> = std::env::var("IRIUM_NODE_CONFIG")
@@ -689,13 +726,16 @@ async fn main() {
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|raw| serde_json::from_str::<NodeConfig>(&raw).ok());
 
-        // Enforce anchor consistency if anchors are present
+    // Enforce anchor consistency if anchors are present
     if let Some(ref a) = anchors {
         if let Some(latest) = a.get_latest_anchor() {
             let expected = latest.hash.to_lowercase();
             let tip_hash = genesis_hash.to_lowercase();
             if latest.height <= 1 && expected != tip_hash {
-                panic!("Anchors mismatch: latest anchor hash {} != genesis hash {}", expected, tip_hash);
+                panic!(
+                    "Anchors mismatch: latest anchor hash {} != genesis hash {}",
+                    expected, tip_hash
+                );
             }
         }
     }
@@ -704,12 +744,16 @@ async fn main() {
     if let Some(ref a) = anchors {
         if let Some(latest) = a.get_latest_anchor() {
             if latest.height <= 1 && latest.hash.to_lowercase() != genesis_hash.to_lowercase() {
-                panic!("Anchors mismatch: latest anchor hash {} != genesis hash {}", latest.hash, genesis_hash);
+                panic!(
+                    "Anchors mismatch: latest anchor hash {} != genesis hash {}",
+                    latest.hash, genesis_hash
+                );
             }
         }
     }
 
-let agent_string = "Irium-Node".to_string();
+    let agent_string =
+        std::env::var("IRIUM_NODE_AGENT").unwrap_or_else(|_| "Irium-Node".to_string());
     let relay_address = node_cfg
         .as_ref()
         .and_then(|c| c.relay_address.clone())
@@ -774,7 +818,10 @@ let agent_string = "Irium-Node".to_string();
     };
 
     let mut rep_mgr = ReputationManager::new();
-    let self_ip = node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.as_ref()).and_then(|b| b.split(":").next().map(|s| s.to_string()));
+    let self_ip = node_cfg
+        .as_ref()
+        .and_then(|cfg| cfg.p2p_bind.as_ref())
+        .and_then(|b| b.split(":").next().map(|s| s.to_string()));
 
     let mut seeds: Vec<std::net::SocketAddr> = Vec::new();
     for seed in seeds_raw {
@@ -790,7 +837,11 @@ let agent_string = "Irium-Node".to_string();
             Err(e) => eprintln!("Invalid P2P seed {}: {}", seed, e),
         }
     }
-    seeds.sort_by(|a, b| rep_mgr.score_of(&b.to_string()).cmp(&rep_mgr.score_of(&a.to_string())));
+    seeds.sort_by(|a, b| {
+        rep_mgr
+            .score_of(&b.to_string())
+            .cmp(&rep_mgr.score_of(&a.to_string()))
+    });
 
     // Connect to seed peers using a basic handshake and keep retrying in background.
     if let Some(node) = p2p.clone() {
@@ -806,7 +857,10 @@ let agent_string = "Irium-Node".to_string();
                         let chain = shared_clone.lock().unwrap();
                         chain.height
                     };
-                    if let Err(e) = node.connect_and_handshake(*addr, height, &agent_clone).await {
+                    if let Err(e) = node
+                        .connect_and_handshake(*addr, height, &agent_clone)
+                        .await
+                    {
                         eprintln!("Failed outbound P2P handshake with {}: {}", addr, e);
                     }
                 }
@@ -815,7 +869,7 @@ let agent_string = "Irium-Node".to_string();
         });
     }
 
-// Periodic heartbeat logging to surface peers and seedlist.
+    // Periodic heartbeat logging to surface peers and seedlist.
     if let Some(ref node) = p2p {
         let node_clone = node.clone();
         let chain_clone = shared_state.clone();
@@ -824,6 +878,8 @@ let agent_string = "Irium-Node".to_string();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let peers = node_clone.peers_snapshot().await;
+                node_clone.refresh_seedlist().await;
+                let _ = node_clone.request_peers().await;
                 let seeds = seed_mgr.merged_seedlist();
 
                 let mut peer_ips = std::collections::HashSet::new();
@@ -834,7 +890,10 @@ let agent_string = "Irium-Node".to_string();
                         let ip = parts[2];
                         let port = parts[4];
                         if peer_ips.insert(ip.to_string()) {
-                            let h = p.last_height.map(|v| format!("h={}", v)).unwrap_or_else(|| "h=-".to_string());
+                            let h = p
+                                .last_height
+                                .map(|v| format!("h={}", v))
+                                .unwrap_or_else(|| "h=-".to_string());
                             let label = match &p.agent {
                                 Some(agent) => format!("{}:{} ({} {})", ip, port, h, agent),
                                 None => format!("{}:{} ({})", ip, port, h),
@@ -842,7 +901,10 @@ let agent_string = "Irium-Node".to_string();
                             peer_list.push(label);
                         }
                     } else if peer_ips.insert(p.multiaddr.clone()) {
-                        let h = p.last_height.map(|v| format!("h={}", v)).unwrap_or_else(|| "h=-".to_string());
+                        let h = p
+                            .last_height
+                            .map(|v| format!("h={}", v))
+                            .unwrap_or_else(|| "h=-".to_string());
                         peer_list.push(format!("{} ({})", p.multiaddr, h));
                     }
                 }
@@ -872,12 +934,26 @@ let agent_string = "Irium-Node".to_string();
                     g.height
                 };
 
-                let peer_sample = peer_list.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
-                let seed_sample = seed_list.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                let peer_sample = peer_list
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let seed_sample = seed_list
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 if json_log_enabled() {
-                    println!("{}", json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "heartbeat", "peers": peer_ips.len(), "peer_sample": peer_sample, "seeds": seed_sample, "height": local_height}));
+                    println!(
+                        "{}",
+                        json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "heartbeat", "peers": peer_ips.len(), "peer_sample": peer_sample, "seeds": seed_sample, "height": local_height})
+                    );
                 } else {
-                    println!("[{}] 🔁 heartbeat peers={} [{}] seeds=[{}] height={}",
+                    println!(
+                        "[{}] 🔁 heartbeat peers={} [{}] seeds=[{}] height={}",
                         Utc::now().format("%H:%M:%S"),
                         peer_ips.len(),
                         peer_sample,
@@ -920,7 +996,10 @@ let agent_string = "Irium-Node".to_string();
         .expect("valid bind address");
 
     if json_log_enabled() {
-        println!("{}", json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "http_listen", "host": host, "port": port}));
+        println!(
+            "{}",
+            json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "http_listen", "host": host, "port": port})
+        );
     } else {
         println!("Irium Rust node HTTP listening on http://{}:{}", host, port);
     }

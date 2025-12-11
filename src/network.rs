@@ -54,6 +54,7 @@ pub struct PeerRecord {
     pub first_seen: f64,
     pub relay_address: Option<String>,
     pub last_height: Option<u64>,
+    pub node_id: Option<String>,
 }
 
 impl PeerRecord {
@@ -66,6 +67,7 @@ impl PeerRecord {
             first_seen: t,
             relay_address: None,
             last_height: None,
+            node_id: None,
         }
     }
 
@@ -222,9 +224,11 @@ impl PeerDirectory {
                     .get("relay_address")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let last_height = obj
-                    .get("last_height")
-                    .and_then(|v| v.as_u64());
+                let last_height = obj.get("last_height").and_then(|v| v.as_u64());
+                let node_id = obj
+                    .get("node_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 self.records.insert(
                     addr.clone(),
                     PeerRecord {
@@ -234,6 +238,7 @@ impl PeerDirectory {
                         last_seen,
                         relay_address,
                         last_height,
+                        node_id,
                     },
                 );
             }
@@ -276,6 +281,9 @@ impl PeerDirectory {
                     serde_json::Value::Number(serde_json::Number::from(h)),
                 );
             }
+            if let Some(id) = &rec.node_id {
+                obj.insert("node_id".to_string(), serde_json::Value::String(id.clone()));
+            }
             map.insert(addr.clone(), serde_json::Value::Object(obj));
         }
         let value = serde_json::Value::Object(map);
@@ -292,6 +300,7 @@ impl PeerDirectory {
         multiaddr: String,
         agent: Option<String>,
         relay_address: Option<String>,
+        node_id: Option<String>,
     ) {
         let entry = self
             .records
@@ -299,6 +308,7 @@ impl PeerDirectory {
             .or_insert_with(|| PeerRecord::new(multiaddr.clone(), agent.clone()));
         entry.agent = agent;
         entry.relay_address = relay_address.or(entry.relay_address.clone());
+        entry.node_id = node_id.or(entry.node_id.clone());
         entry.touch();
 
         self.flush();

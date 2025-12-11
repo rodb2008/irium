@@ -13,7 +13,7 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(80);
         out.extend_from_slice(&self.version.to_le_bytes());
@@ -41,8 +41,8 @@ impl BlockHeader {
     }
 
     /// Deserialize a header from the 80-byte compact encoding.
-#[allow(dead_code)]
-#[allow(dead_code)]
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn deserialize(raw: &[u8]) -> Result<(Self, usize), String> {
         if raw.len() < 80 {
             return Err("header too short".to_string());

@@ -2,12 +2,12 @@ use std::path::PathBuf;
 use std::time::Instant;
 use std::{env, fs, sync::OnceLock};
 
+use bs58;
 use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use bs58;
 
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
@@ -21,7 +21,12 @@ use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
 
 fn json_log_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("IRIUM_JSON_LOG").ok().map(|v| v == "1" || v.to_lowercase() == "true").unwrap_or(false))
+    *FLAG.get_or_init(|| {
+        std::env::var("IRIUM_JSON_LOG")
+            .ok()
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false)
+    })
 }
 
 fn blocks_dir() -> PathBuf {
@@ -44,17 +49,25 @@ fn mempool_file() -> PathBuf {
 
 fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
     let data = bs58::decode(addr).into_vec().ok()?;
-    if data.len() < 25 { return None; }
+    if data.len() < 25 {
+        return None;
+    }
     let (body, checksum) = data.split_at(data.len() - 4);
     let mut hasher = Sha256::new();
     hasher.update(body);
     let first = hasher.finalize_reset();
     hasher.update(first);
     let second = hasher.finalize();
-    if &second[0..4] != checksum { return None; }
-    if body.len() < 21 { return None; }
+    if &second[0..4] != checksum {
+        return None;
+    }
+    if body.len() < 21 {
+        return None;
+    }
     let payload = &body[1..];
-    if payload.len() != 20 { return None; }
+    if payload.len() != 20 {
+        return None;
+    }
     Some(payload.to_vec())
 }
 
@@ -448,7 +461,11 @@ fn mine_once(chain: &mut ChainState) -> Result<(), String> {
         if nonce % 1_000_000 == 0 {
             let elapsed = start.elapsed().as_secs_f64();
             if json_log_enabled() {
-                let rate = if elapsed > 0.0 { Some(nonce as f64 / elapsed) } else { None };
+                let rate = if elapsed > 0.0 {
+                    Some(nonce as f64 / elapsed)
+                } else {
+                    None
+                };
                 println!(
                     "{}",
                     json!({
@@ -487,7 +504,10 @@ fn main() {
     let mut state = ChainState::new(params);
 
     if json_log_enabled() {
-        println!("{}", json!({"event": "miner_start", "height": state.height, "ts": Utc::now().format("%H:%M:%S").to_string()}));
+        println!(
+            "{}",
+            json!({"event": "miner_start", "height": state.height, "ts": Utc::now().format("%H:%M:%S").to_string()})
+        );
     } else {
         println!("[⛏️] Irium Rust miner starting at height {}", state.height);
     }
@@ -495,7 +515,10 @@ fn main() {
     // Optionally report anchors digest if anchors.json is available.
     if let Ok(manager) = AnchorManager::from_default_repo_root(PathBuf::from(".")) {
         if json_log_enabled() {
-            println!("{}", json!({"event": "anchors_digest", "digest": manager.payload_digest(), "ts": Utc::now().format("%H:%M:%S").to_string()}));
+            println!(
+                "{}",
+                json!({"event": "anchors_digest", "digest": manager.payload_digest(), "ts": Utc::now().format("%H:%M:%S").to_string()})
+            );
         } else {
             println!("[🪝] Anchors digest: {}", manager.payload_digest());
         }
@@ -503,21 +526,32 @@ fn main() {
 
     if let Some(pkh) = miner_pubkey_hash() {
         if json_log_enabled() {
-            println!("{}", json!({"event": "miner_pkh", "pkh": hex::encode(pkh), "ts": Utc::now().format("%H:%M:%S").to_string()}));
+            println!(
+                "{}",
+                json!({"event": "miner_pkh", "pkh": hex::encode(pkh), "ts": Utc::now().format("%H:%M:%S").to_string()})
+            );
         } else {
             println!("[💰] Using miner PKH: {}", hex::encode(pkh));
         }
     } else {
         if json_log_enabled() {
-            println!("{}", json!({"event": "miner_pkh_missing", "ts": Utc::now().format("%H:%M:%S").to_string()}));
+            println!(
+                "{}",
+                json!({"event": "miner_pkh_missing", "ts": Utc::now().format("%H:%M:%S").to_string()})
+            );
         } else {
-            println!("[⚠️] WARNING: IRIUM_MINER_PKH not set or invalid; rewards will be unspendable");
+            println!(
+                "[⚠️] WARNING: IRIUM_MINER_PKH not set or invalid; rewards will be unspendable"
+            );
         }
     }
 
     if let Err(e) = mine_once(&mut state) {
         if json_log_enabled() {
-            eprintln!("{}", json!({"event": "mining_failed", "error": e.to_string(), "ts": Utc::now().format("%H:%M:%S").to_string()}));
+            eprintln!(
+                "{}",
+                json!({"event": "mining_failed", "error": e.to_string(), "ts": Utc::now().format("%H:%M:%S").to_string()})
+            );
         } else {
             eprintln!("[⚠️] Mining failed: {e}");
         }

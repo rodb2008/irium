@@ -623,7 +623,7 @@ async fn main() {
         }
     }
 
-let agent_string = "Irium-Node".to_string();
+    let agent_string = std::env::var("IRIUM_NODE_AGENT").unwrap_or_else(|_| "Irium-Node".to_string());
 
     // Set up P2P node if configured.
     let p2p: Option<P2PNode> = if let Some(ref cfg) = node_cfg {

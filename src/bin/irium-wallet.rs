@@ -1,18 +1,26 @@
-use std::env;
 use sha2::{Digest, Sha256};
+use std::env;
 
 // Base58 P2PKH decoder (version byte + 20-byte hash + 4-byte checksum)
 fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
     let data = bs58::decode(addr).into_vec().ok()?;
-    if data.len() < 25 { return None; }
+    if data.len() < 25 {
+        return None;
+    }
     let (body, checksum) = data.split_at(data.len() - 4);
     // double SHA256
     let first = Sha256::digest(body);
     let second = Sha256::digest(&first);
-    if &second[0..4] != checksum { return None; }
-    if body.len() < 21 { return None; }
+    if &second[0..4] != checksum {
+        return None;
+    }
+    if body.len() < 21 {
+        return None;
+    }
     let payload = &body[1..];
-    if payload.len() != 20 { return None; }
+    if payload.len() != 20 {
+        return None;
+    }
     Some(payload.to_vec())
 }
 

@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
 
+use crate::anchors::AnchorManager;
 use chrono::Utc;
 use hex;
-use crate::anchors::AnchorManager;
 use num_bigint::BigUint;
 use num_traits::Zero;
 
@@ -84,7 +84,9 @@ impl ChainState {
             anchors: None,
         };
         let genesis = state.params.genesis_block.clone();
-        state.connect_genesis(genesis.clone()).expect("valid genesis block");
+        state
+            .connect_genesis(genesis.clone())
+            .expect("valid genesis block");
         let genesis_hash = genesis.header.hash();
         let work = ChainState::block_work(&genesis);
         state.block_store.insert(genesis_hash, genesis);
@@ -240,8 +242,8 @@ impl ChainState {
             return Err("header does not meet target".to_string());
         }
 
-        let work = parent_work.clone()
-            + BigUint::from(0xffff_ffffu64) / header.target().to_target();
+        let work =
+            parent_work.clone() + BigUint::from(0xffff_ffffu64) / header.target().to_target();
         let height = parent_height + 1;
         self.headers.insert(
             hash,
@@ -555,7 +557,9 @@ impl ChainState {
         let genesis = &branch[0];
         new_state.connect_genesis(genesis.clone())?;
         let mut cumulative = ChainState::block_work(genesis);
-        new_state.block_store.insert(genesis.header.hash(), genesis.clone());
+        new_state
+            .block_store
+            .insert(genesis.header.hash(), genesis.clone());
         new_state.heights.insert(genesis.header.hash(), 1);
         new_state
             .cumulative_work
@@ -584,10 +588,7 @@ impl ChainState {
 
         let parent_hash = block.header.prev_hash;
         if parent_hash != [0u8; 32] && !self.block_store.contains_key(&parent_hash) {
-            self.orphan_pool
-                .entry(parent_hash)
-                .or_default()
-                .push(block);
+            self.orphan_pool.entry(parent_hash).or_default().push(block);
             return Err("block stored as orphan (prev hash unknown)".to_string());
         }
 
@@ -617,7 +618,6 @@ impl ChainState {
                 return Err("block violates anchor checkpoint".to_string());
             }
         }
-
 
         self.block_store.insert(hash, block.clone());
         self.heights.insert(hash, height);
