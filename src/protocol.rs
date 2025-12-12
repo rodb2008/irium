@@ -49,6 +49,9 @@ impl TryFrom<u8> for MessageType {
             11 => Mempool,
             12 => SybilChallenge,
             13 => SybilProof,
+            14 => RelayAddress,
+            15 => Inv,
+            16 => GetData,
             99 => Disconnect,
             other => return Err(format!("Unknown message type: {}", other)),
         };
