@@ -1,0 +1,107 @@
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use chrono::Utc;
+use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState};
+use irium_node_rs::genesis::load_locked_genesis;
+use irium_node_rs::mempool::MempoolManager;
+use irium_node_rs::p2p::P2PNode;
+use irium_node_rs::pow::Target;
+
+/// Simple standalone P2P runner that mirrors the Python reference logs.
+#[tokio::main]
+async fn main() {
+    fn mempool_file() -> PathBuf {
+        if let Ok(path) = std::env::var("IRIUM_MEMPOOL_FILE") {
+            PathBuf::from(path)
+        } else {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+            PathBuf::from(home).join(".irium/mempool/pending.json")
+        }
+    }
+
+    // Build minimal chain + mempool context so peer handshakes can advertise height
+    // and accept transaction inventory.
+    let locked = load_locked_genesis().expect("load locked genesis");
+    let block = block_from_locked(&locked);
+    let pow_limit = Target { bits: 0x1d00_ffff };
+    let params = ChainParams {
+        genesis_block: block,
+        pow_limit,
+    };
+    let chain = Arc::new(Mutex::new(ChainState::new(params)));
+    let mempool = Arc::new(Mutex::new(MempoolManager::new(
+        mempool_file(),
+        1000,
+        1.0,
+    )));
+
+    let bind: SocketAddr = std::env::var("IRIUM_P2P_BIND")
+        .unwrap_or_else(|_| "0.0.0.0:38291".to_string())
+        .parse()
+        .expect("valid bind address");
+    let agent = std::env::var("IRIUM_NODE_AGENT").unwrap_or_else(|_| "Irium-Rust".to_string());
+    let relay_address = std::env::var("IRIUM_RELAY_ADDRESS").ok();
+
+    println!(
+        "[{}] 🚀 Starting Irium P2P node on {} (agent {})",
+        Utc::now().format("%H:%M:%S"),
+        bind,
+        agent
+    );
+    println!(
+        "[{}] 🔗 chain initialized at height {}",
+        Utc::now().format("%H:%M:%S"),
+        chain.lock().unwrap().height
+    );
+
+    let node = P2PNode::new(bind, agent.clone(), Some(chain.clone()), Some(mempool.clone()), relay_address);
+    if let Err(e) = node.start().await {
+        eprintln!("Failed to start P2P listener: {e}");
+        return;
+    }
+
+    // Optional comma-separated seed list: "host1:port,host2:port".
+    let seeds: Vec<SocketAddr> = std::env::var("IRIUM_P2P_SEEDS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    if !seeds.is_empty() {
+        let agent_clone = agent.clone();
+        let chain_clone = chain.clone();
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            for addr in seeds {
+                let h = chain_clone.lock().unwrap().height;
+                if let Err(e) = node_clone.connect_and_handshake(addr, h, &agent_clone).await {
+                    eprintln!("Failed outbound handshake with {addr}: {e}");
+                }
+            }
+        });
+    }
+
+    // Heartbeat similar to the Python reference output so operators can observe liveness.
+    let node_clone = node.clone();
+    tokio::spawn(async move {
+        loop {
+            let peers = node_clone.peers_snapshot().await;
+            let height = chain.lock().unwrap().height;
+            println!(
+                "[{}] 🔁 peers={} height={}",
+                Utc::now().format("%H:%M:%S"),
+                peers.len(),
+                height
+            );
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+
+    // Keep process alive.
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
