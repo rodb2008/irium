@@ -558,14 +558,38 @@ fn main() {
         }
     }
 
-    if let Err(e) = mine_once(&mut state) {
+    loop {
         if json_log_enabled() {
-            eprintln!(
+            println!(
                 "{}",
-                json!({"event": "mining_failed", "error": e.to_string(), "ts": Utc::now().format("%H:%M:%S").to_string()})
+                json!({"event": "mining_start", "height": state.height, "ts": Utc::now().format("%H:%M:%S").to_string()})
             );
         } else {
-            eprintln!("[⚠️] Mining failed: {e}");
+            println!("[▶️] Mining height {}", state.height);
         }
+
+        if let Err(e) = mine_once(&mut state) {
+            if json_log_enabled() {
+                eprintln!(
+                    "{}",
+                    json!({"event": "mining_failed", "error": e.to_string(), "height": state.height, "ts": Utc::now().format("%H:%M:%S").to_string()})
+                );
+            } else {
+                eprintln!("[⚠️] Mining failed at height {}: {e}", state.height);
+            }
+            break;
+        }
+
+        if json_log_enabled() {
+            println!(
+                "{}",
+                json!({"event": "mined_block_written", "height": state.height.saturating_sub(1), "ts": Utc::now().format("%H:%M:%S").to_string()})
+            );
+        } else {
+            println!("[💾] Wrote block_{}.json", state.height.saturating_sub(1));
+        }
+
+        // Immediately proceed to the next height, mirroring the continuous loop in the
+        // reference miner screenshot.
     }
 }
