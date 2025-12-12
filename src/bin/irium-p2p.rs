@@ -90,11 +90,14 @@ async fn main() {
         loop {
             let peers = node_clone.peers_snapshot().await;
             let height = chain.lock().unwrap().height;
+            let seeds = irium_node_rs::network::SeedlistManager::new(128).merged_seedlist();
             println!(
-                "[{}] 🔁 peers={} height={}",
+                "[{}] 🔁 height={} peers={} seeds={} [{}]",
                 Utc::now().format("%H:%M:%S"),
+                height,
                 peers.len(),
-                height
+                seeds.len(),
+                seeds.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
             );
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
