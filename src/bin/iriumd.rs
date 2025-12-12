@@ -196,6 +196,16 @@ fn load_signed_seeds() -> Vec<String> {
     }
 }
 
+fn verbose_p2p() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("IRIUM_VERBOSE_P2P")
+            .ok()
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false)
+    })
+}
+
 fn json_log_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
