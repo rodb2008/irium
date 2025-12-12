@@ -949,16 +949,31 @@ async fn main() {
                 if json_log_enabled() {
                     println!(
                         "{}",
-                        json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "heartbeat", "peers": peer_ips.len(), "peer_sample": peer_sample, "seeds": seed_sample, "height": local_height})
+                        json!({
+                            "ts": Utc::now().format("%H:%M:%S").to_string(),
+                            "level": "info",
+                            "event": "heartbeat",
+                            "height": local_height,
+                            "peers": peer_ips.len(),
+                            "peer_sample": peer_sample,
+                            "seeds": seed_sample,
+                            "seed_count": seed_list.len(),
+                            "agent": std::env::var("IRIUM_NODE_AGENT").unwrap_or_else(|_| "Irium-Node".to_string()),
+                            "tip": seed_sample,
+                            "mempool": chain_clone.lock().unwrap().height,
+                        })
                     );
                 } else {
                     println!(
-                        "[{}] 🔁 heartbeat peers={} [{}] seeds=[{}] height={}",
+                        "[{}] 🔁 height={} tip={} peers={} seeds={} [{}] peers=[{}] mempool={}",
                         Utc::now().format("%H:%M:%S"),
-                        peer_ips.len(),
-                        peer_sample,
+                        local_height,
                         seed_sample,
-                        local_height
+                        peer_ips.len(),
+                        seed_list.len(),
+                        seed_sample,
+                        peer_sample,
+                        chain_clone.lock().unwrap().height
                     );
                 }
             }

@@ -131,11 +131,23 @@ fn miner_pubkey_hash() -> Option<Vec<u8>> {
             }
         }
     }
-    if let Ok(addr) = env::var("IRIUM_MINER_ADDRESS") {
-        if let Some(pkh) = base58_p2pkh_to_hash(&addr) {
-            return Some(pkh);
+
+    for var in ["IRIUM_MINER_ADDRESS", "IRIUM_RELAY_ADDRESS"] {
+        if let Ok(addr) = env::var(var) {
+            // Accept base58 P2PKH or 40-char hex PKH.
+            if addr.len() == 40 {
+                if let Ok(pkh) = hex::decode(&addr) {
+                    if pkh.len() == 20 {
+                        return Some(pkh);
+                    }
+                }
+            }
+            if let Some(pkh) = base58_p2pkh_to_hash(&addr) {
+                return Some(pkh);
+            }
         }
     }
+
     None
 }
 
@@ -541,7 +553,7 @@ fn main() {
             );
         } else {
             println!(
-                "[⚠️] WARNING: IRIUM_MINER_PKH not set or invalid; rewards will be unspendable"
+                "[⚠️] WARNING: Set IRIUM_MINER_ADDRESS (base58) or IRIUM_MINER_PKH (40-hex) so rewards are spendable"
             );
         }
     }
