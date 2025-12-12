@@ -61,23 +61,21 @@ impl P2PNode {
         })
     }
 
-    fn log(icon: &str, msg: impl AsRef<str>) {
+    fn log(msg: impl AsRef<str>) {
         if Self::json_log_enabled() {
-            let payload =
-                json!({"ts": Self::ts(), "level": "info", "icon": icon, "msg": msg.as_ref()});
+            let payload = json!({"ts": Self::ts(), "level": "info", "msg": msg.as_ref()});
             println!("{}", payload);
         } else {
-            println!("[{}] {} {}", Self::ts(), icon, msg.as_ref());
+            println!("[{}] {}", Self::ts(), msg.as_ref());
         }
     }
 
-    fn log_err(icon: &str, msg: impl AsRef<str>) {
+    fn log_err(msg: impl AsRef<str>) {
         if Self::json_log_enabled() {
-            let payload =
-                json!({"ts": Self::ts(), "level": "error", "icon": icon, "msg": msg.as_ref()});
+            let payload = json!({"ts": Self::ts(), "level": "error", "msg": msg.as_ref()});
             eprintln!("{}", payload);
         } else {
-            eprintln!("[{}] {} {}", Self::ts(), icon, msg.as_ref());
+            eprintln!("[{}] {}", Self::ts(), msg.as_ref());
         }
     }
 
@@ -98,16 +96,11 @@ impl P2PNode {
     fn load_banned_ips() -> Arc<HashSet<IpAddr>> {
         let path = std::env::var("IRIUM_BANNED_LIST")
             .unwrap_or_else(|_| "bootstrap/banned_peers.txt".to_string());
-        let sig_path = format!("{}{}", path, ".sig");
-        let allowlist = std::env::var("IRIUM_BANNED_TRUST")
-            .unwrap_or_else(|_| "bootstrap/trust/allowed_ban_signers".to_string());
         let mut ips = HashSet::new();
         let data = match fs::read_to_string(&path) {
             Ok(d) => d,
             Err(_) => return Arc::new(ips),
         };
-        // Optional signature verification if both files exist; skipped in async context to avoid blocking.
-        let _ = (sig_path, allowlist); // placeholder; currently bypassed
         for line in data.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -175,7 +168,7 @@ impl P2PNode {
         let listener = TcpListener::bind(self.bind_addr)
             .await
             .map_err(|e| e.to_string())?;
-        Self::log("📡", format!("P2P listening on {}", self.bind_addr));
+        Self::log(format!("P2P listening on {}", self.bind_addr));
 
         let peers_arc = self.peers.clone();
         let bind = self.bind_addr;
@@ -195,34 +188,25 @@ impl P2PNode {
                     Ok((socket, addr)) => {
                         let ip = addr.ip();
                         if banned_ips.contains(&ip) {
-                            Self::log_err("⛔", format!("Rejecting inbound {}: banned", addr));
+                            Self::log_err(format!("Rejecting inbound {}: banned", addr));
                             continue;
                         }
                         let mut log_guard = accept_log.lock().await;
                         if let Some(last) = log_guard.get(&ip) {
                             if last.elapsed() < Duration::from_millis(500) {
-                                Self::log_err(
-                                    "⚠️",
-                                    format!("Rejecting inbound {}: rate limit", addr),
-                                );
+                                Self::log_err(format!("Rejecting inbound {}: rate limit", addr));
                                 continue;
                             }
                         }
                         log_guard.insert(ip, Instant::now());
                         drop(log_guard);
 
-                        let current = {
-                            let g = peers_arc.blocking_lock();
-                            g.len()
-                        };
+                        let current = peers_arc.lock().await.len();
                         if current >= MAX_PEERS {
-                            Self::log_err(
-                                "⚠️",
-                                format!("Rejecting inbound {}: max peers reached", addr),
-                            );
+                            Self::log_err(format!("Rejecting inbound {}: max peers reached", addr));
                             continue;
                         }
-                        Self::log("⬅️", format!("Incoming P2P connection from {}", addr));
+                        Self::log(format!("Incoming P2P connection from {}", addr));
                         let peers_inner = peers_arc.clone();
                         let dir = dir_arc.clone();
                         let rep = rep_arc.clone();
@@ -247,15 +231,12 @@ impl P2PNode {
                             )
                             .await
                             {
-                                Self::log_err(
-                                    "⚠️",
-                                    format!("P2P handshake error from {}: {}", addr, e),
-                                );
+                                Self::log_err(format!("P2P handshake error from {}: {}", addr, e));
                             }
                         });
                     }
                     Err(e) => {
-                        Self::log_err("⚠️", format!("P2P accept error: {}", e));
+                        Self::log_err(format!("P2P accept error: {}", e));
                     }
                 }
             }
@@ -393,10 +374,10 @@ impl P2PNode {
             rep.record_success(&peer_id);
         }
 
-        Self::log(
-            "↗️",
-            format!("P2P outbound {}: connected, awaiting challenge", addr),
-        );
+        Self::log(format!(
+            "P2P outbound {}: connected, awaiting challenge",
+            addr
+        ));
         // Expect a sybil challenge from the remote and respond with a proof
         // before proceeding with the normal handshake.
         let challenge_msg = match read_message(&mut stream).await {
@@ -437,7 +418,7 @@ impl P2PNode {
             .write_all(&proof_ser)
             .await
             .map_err(|e| format!("send sybil proof to {} failed: {}", addr, e))?;
-        Self::log("🧠", format!("P2P outbound {}: sent sybil proof", addr));
+        Self::log(format!("P2P outbound {}: sent sybil proof", addr));
 
         let payload = HandshakePayload {
             version: 1,
@@ -460,7 +441,7 @@ impl P2PNode {
             .write_all(&bytes)
             .await
             .map_err(|e| format!("send handshake to {} failed: {}", addr, e))?;
-        Self::log("🤝", format!("P2P outbound {}: sent handshake", addr));
+        Self::log(format!("P2P outbound {}: sent handshake", addr));
 
         let (mut reader, writer_half) = stream.into_split();
         let writer = Arc::new(tokio::sync::Mutex::new(writer_half));
@@ -488,7 +469,7 @@ impl P2PNode {
                 if window_start.elapsed() < Duration::from_secs(1) {
                     msg_count += 1;
                     if msg_count > MAX_MSGS_PER_SEC {
-                        Self::log_err("⚠️", format!("P2P outbound {}: rate limit", addr));
+                        Self::log_err(format!("P2P outbound {}: rate limit", addr));
                         break;
                     }
                 } else {
@@ -522,7 +503,10 @@ impl P2PNode {
                                             node_id.clone(),
                                         );
                                     }
-                                    Self::log("✅", format!("P2P outbound {}: received handshake (agent {}, height {})", addr, agent_str, payload.height));
+                                    Self::log(format!(
+                                        "P2P outbound {}: received handshake (agent {}, height {})",
+                                        addr, agent_str, payload.height
+                                    ));
                                     // If we have a relay address, advertise it back.
                                     if let Some(relay) = relay_addr.clone() {
                                         let relay_msg = RelayAddressPayload {
@@ -556,10 +540,7 @@ impl P2PNode {
                         }
                     }
                     Err(e) => {
-                        Self::log_err(
-                            "⚠️",
-                            format!("P2P outbound {}: closing read loop: {}", addr, e),
-                        );
+                        Self::log_err(format!("P2P outbound {}: closing read loop: {}", addr, e));
                         let mut rep = reputation.lock().await;
                         rep.record_failure(&addr.to_string());
                         break;
