@@ -852,16 +852,33 @@ async fn main() {
             let node = node;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
+                if seeds_clone.is_empty() {
+                    println!(
+                        "[{}] no seeds configured; waiting",
+                        Utc::now().format("%H:%M:%S")
+                    );
+                }
                 for addr in &seeds_clone {
                     let height = {
                         let chain = shared_clone.lock().unwrap();
                         chain.height
                     };
+                    println!(
+                        "[{}] dialing seed {} (h={})",
+                        Utc::now().format("%H:%M:%S"),
+                        addr,
+                        height
+                    );
                     if let Err(e) = node
                         .connect_and_handshake(*addr, height, &agent_clone)
                         .await
                     {
-                        eprintln!("Failed outbound P2P handshake with {}: {}", addr, e);
+                        eprintln!(
+                            "[{}] outbound {} failed: {}",
+                            Utc::now().format("%H:%M:%S"),
+                            addr,
+                            e
+                        );
                     }
                 }
                 interval.tick().await;
@@ -873,6 +890,8 @@ async fn main() {
     if let Some(ref node) = p2p {
         let node_clone = node.clone();
         let chain_clone = shared_state.clone();
+        let mempool_clone = mempool.clone();
+        let genesis_hex = genesis_hash.clone();
         tokio::spawn(async move {
             let seed_mgr = SeedlistManager::new(128);
             loop {
@@ -929,9 +948,15 @@ async fn main() {
                     seed_list.push("-".to_string());
                 }
 
-                let local_height = {
+                let (local_height, tip_hash, mempool_size) = {
                     let g = chain_clone.lock().unwrap();
-                    g.height
+                    let tip = g
+                        .chain
+                        .last()
+                        .map(|b| hex::encode(b.header.hash()))
+                        .unwrap_or_else(|| genesis_hex.clone());
+                    let mem_sz = mempool_clone.lock().unwrap().len();
+                    (g.height, tip, mem_sz)
                 };
 
                 let peer_sample = peer_list
@@ -959,8 +984,8 @@ async fn main() {
                             "seeds": seed_sample,
                             "seed_count": seed_list.len(),
                             "agent": std::env::var("IRIUM_NODE_AGENT").unwrap_or_else(|_| "Irium-Node".to_string()),
-                            "tip": seed_sample,
-                            "mempool": chain_clone.lock().unwrap().height,
+                            "tip": tip_hash,
+                            "mempool": mempool_size,
                         })
                     );
                 } else {
@@ -968,12 +993,12 @@ async fn main() {
                         "[{}] 🔁 height={} tip={} peers={} seeds={} [{}] peers=[{}] mempool={}",
                         Utc::now().format("%H:%M:%S"),
                         local_height,
-                        seed_sample,
+                        tip_hash,
                         peer_ips.len(),
                         seed_list.len(),
                         seed_sample,
                         peer_sample,
-                        chain_clone.lock().unwrap().height
+                        mempool_size
                     );
                 }
             }

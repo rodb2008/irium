@@ -32,11 +32,7 @@ async fn main() {
         pow_limit,
     };
     let chain = Arc::new(Mutex::new(ChainState::new(params)));
-    let mempool = Arc::new(Mutex::new(MempoolManager::new(
-        mempool_file(),
-        1000,
-        1.0,
-    )));
+    let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));
 
     let bind: SocketAddr = std::env::var("IRIUM_P2P_BIND")
         .unwrap_or_else(|_| "0.0.0.0:38291".to_string())
@@ -57,7 +53,13 @@ async fn main() {
         chain.lock().unwrap().height
     );
 
-    let node = P2PNode::new(bind, agent.clone(), Some(chain.clone()), Some(mempool.clone()), relay_address);
+    let node = P2PNode::new(
+        bind,
+        agent.clone(),
+        Some(chain.clone()),
+        Some(mempool.clone()),
+        relay_address,
+    );
     if let Err(e) = node.start().await {
         eprintln!("Failed to start P2P listener: {e}");
         return;
@@ -77,7 +79,10 @@ async fn main() {
         tokio::spawn(async move {
             for addr in seeds {
                 let h = chain_clone.lock().unwrap().height;
-                if let Err(e) = node_clone.connect_and_handshake(addr, h, &agent_clone).await {
+                if let Err(e) = node_clone
+                    .connect_and_handshake(addr, h, &agent_clone)
+                    .await
+                {
                     eprintln!("Failed outbound handshake with {addr}: {e}");
                 }
             }
