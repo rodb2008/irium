@@ -1,4 +1,5 @@
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::{env, fs};
@@ -24,6 +25,7 @@ use irium_node_rs::pow::Target;
 use irium_node_rs::rate_limiter::RateLimiter;
 use irium_node_rs::reputation::ReputationManager;
 use irium_node_rs::tx::{decode_full_tx, Transaction, TxInput, TxOutput};
+use get_if_addrs::get_if_addrs;
 
 #[derive(Clone)]
 struct AppState {
@@ -143,6 +145,24 @@ fn parse_seed_to_socketaddr(seed: &str, default_port: u16) -> Result<std::net::S
     }
     Err("invalid seed format".to_string())
 }
+fn local_ip_set(bind: Option<&String>) -> HashSet<IpAddr> {
+    let mut ips = HashSet::new();
+    if let Some(bind) = bind {
+        if let Ok(addr) = bind.parse::<SocketAddr>() {
+            ips.insert(addr.ip());
+        }
+    }
+    if let Ok(ifaces) = get_if_addrs() {
+        for iface in ifaces {
+            ips.insert(iface.ip());
+        }
+    }
+    ips.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    ips.insert(IpAddr::V6(Ipv6Addr::LOCALHOST));
+    ips
+}
+
+
 
 fn load_runtime_seeds() -> Vec<String> {
     let path = std::path::Path::new("bootstrap/seedlist.runtime");
@@ -828,19 +848,14 @@ async fn main() {
     };
 
     let mut rep_mgr = ReputationManager::new();
-    let self_ip = node_cfg
-        .as_ref()
-        .and_then(|cfg| cfg.p2p_bind.as_ref())
-        .and_then(|b| b.split(":").next().map(|s| s.to_string()));
+    let local_ips = local_ip_set(node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.as_ref()));
 
     let mut seeds: Vec<std::net::SocketAddr> = Vec::new();
     for seed in seeds_raw {
         match parse_seed_to_socketaddr(&seed, default_seed_port) {
             Ok(addr) => {
-                if let Some(ref ip) = self_ip {
-                    if &addr.ip().to_string() == ip {
-                        continue;
-                    }
+                if local_ips.contains(&addr.ip()) {
+                    continue;
                 }
                 seeds.push(addr)
             }
