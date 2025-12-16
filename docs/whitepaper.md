@@ -193,9 +193,10 @@ Each block must satisfy:
 
 - Runtime peer cache `bootstrap/seedlist.runtime` persists discovered peers  
 - Peer scoring with per-peer state in the P2P layer (promotion/demotion based on outcomes)  
+- Outbound dialer periodically connects to learned peers (not just static seeds) to grow the mesh, even behind NAT  
 - Works without centralized trackers  
 
-**Status:** Implemented; scoring continues to be iterated in Rust.
+**Status:** Implemented; scoring and dial cadence continue to be iterated in Rust.
 
 ### 5.3 Genesis Vesting with On-chain CLTV
 
