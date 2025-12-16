@@ -1014,15 +1014,16 @@ async fn main() {
                         })
                     );
                 } else {
+                    let short_tip = tip_hash.chars().take(12).collect::<String>();
                     println!(
-                        "[{}] 🔁 height={} tip={} peers={} seeds={} [{}] peers=[{}] mempool={}",
+                        "[{}] 🔁 h={} ⛏ tip={} 👥 {} [{}] 🌱 {} [{}] 🧺 mem={}",
                         Utc::now().format("%H:%M:%S"),
                         local_height,
-                        tip_hash,
+                        short_tip,
                         peer_ips.len(),
+                        peer_sample,
                         seed_list.len(),
                         seed_sample,
-                        peer_sample,
                         mempool_size
                     );
                 }
