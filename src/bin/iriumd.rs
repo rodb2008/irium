@@ -164,6 +164,48 @@ fn local_ip_set(bind: Option<&String>) -> HashSet<IpAddr> {
 
 
 
+fn mask_ip(ip: &str) -> String {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            let oct = v4.octets();
+            format!("{}.{}.*.*", oct[0], oct[1])
+        }
+        Ok(IpAddr::V6(v6)) => {
+            let seg = v6.segments();
+            format!("{:x}:{:x}::*", seg[0], seg[1])
+        }
+        Err(_) => ip.to_string(),
+    }
+}
+
+fn mask_peer_label(label: &str) -> String {
+    let mut parts = label.split_whitespace();
+    let addr = parts.next().unwrap_or(label);
+    let rest = parts.collect::<Vec<_>>().join(" ");
+    let (ip, port) = addr.split_once(':').unwrap_or((addr, ""));
+    let masked_ip = mask_ip(ip);
+    let masked_addr = if port.is_empty() {
+        masked_ip
+    } else {
+        format!("{}:{}", masked_ip, port)
+    };
+    if rest.is_empty() {
+        masked_addr
+    } else {
+        format!("{} {}", masked_addr, rest)
+    }
+}
+
+fn mask_seed_label(seed: &str) -> String {
+    let (ip, port) = seed.split_once(':').unwrap_or((seed, ""));
+    let masked_ip = mask_ip(ip);
+    if port.is_empty() {
+        masked_ip
+    } else {
+        format!("{}:{}", masked_ip, port)
+    }
+}
+
 fn load_runtime_seeds() -> Vec<String> {
     let path = std::path::Path::new("bootstrap/seedlist.runtime");
     std::fs::read_to_string(path)
@@ -352,7 +394,17 @@ async fn metrics(
     };
     let seeds = SeedlistManager::new(128).merged_seedlist();
     let mempool_sz = state.mempool.lock().unwrap().len();
-    Ok(format!(irium_height {}nirium_peers {}nirium_anchor_loaded {}nirium_tip_hash {}nirium_mempool_size {}nirium_anchor_digest {}nirium_node_id {}nirium_sybil_difficulty {}nirium_seed_count {}n,
+    Ok(format!(
+        "irium_height {}
+irium_peers {}
+irium_anchor_loaded {}
+irium_tip_hash {}
+irium_mempool_size {}
+irium_anchor_digest {}
+irium_node_id {}
+irium_sybil_difficulty {}
+irium_seed_count {}
+",
         height,
         peer_count,
         anchor_loaded as u8,
@@ -364,6 +416,7 @@ async fn metrics(
         seeds.len()
     ))
 }
+
 async fn get_utxo(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -978,17 +1031,20 @@ async fn main() {
                     (g.height, tip, mem_sz)
                 };
 
-                let masked_peers: Vec<String> = peer_list
+                                let peer_sample = peer_list
                     .iter()
-                    .map(|p| mask_peer_label(p))
-                    .collect();
-                let peer_sample = masked_peers.iter().take(5).cloned().collect::<Vec<_>>().join(, );
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let seed_sample = seed_list
                     .iter()
                     .take(5)
                     .cloned()
                     .collect::<Vec<_>>()
-                    .join(, );
+                    .join(", ");
+
+
 
                 if json_log_enabled() {
                     println!(
@@ -1010,7 +1066,7 @@ async fn main() {
                 } else {
                     let short_tip = tip_hash.chars().take(12).collect::<String>();
                     println!(
-                        "[{}] 🔁 h={} ⛏ tip={} 👥 {} [{}] 🌱 {} [{}] 🧺 mem={}",
+                        "[{}] ❤️ heartbeat height={} ⛏ tip={} 👥 peers={} [{}] 🌱 seedlist={} [{}] 🧺 mempool={}",
                         Utc::now().format("%H:%M:%S"),
                         local_height,
                         short_tip,

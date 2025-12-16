@@ -28,7 +28,7 @@ use serde_json::json;
 
 /// Minimal P2P node skeleton: accepts incoming connections and can
 /// broadcast raw block bytes to all connected peers.
-const MAX_PEERS: usize = 64;
+const MAX_PEERS: usize = 100;
 const MAX_MSGS_PER_SEC: u32 = 200;
 
 #[derive(Clone)]
@@ -38,6 +38,8 @@ pub struct P2PNode {
     peers_directory: Arc<Mutex<PeerDirectory>>,
     reputation: Arc<Mutex<ReputationManager>>,
     accept_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    handshake_failures: Arc<StdMutex<HashMap<IpAddr, (u32, Instant)>>>,
+    dynamic_bans: Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
     agent: String,
@@ -80,7 +82,29 @@ impl P2PNode {
     }
 
     fn is_banned(&self, ip: &IpAddr) -> bool {
-        self.banned_ips.contains(ip)
+        if self.banned_ips.contains(ip) {
+            return true;
+        }
+        Self::is_banned_ip(ip, &self.banned_ips, &self.dynamic_bans)
+    }
+
+    fn is_banned_ip(
+        ip: &IpAddr,
+        static_bans: &HashSet<IpAddr>,
+        dynamic_bans: &Arc<StdMutex<HashMap<IpAddr, Instant>>>,
+    ) -> bool {
+        if static_bans.contains(ip) {
+            return true;
+        }
+        let mut guard = dynamic_bans.lock().unwrap();
+        let expire = Duration::from_secs(600);
+        if let Some(ts) = guard.get(ip) {
+            if ts.elapsed() < expire {
+                return true;
+            }
+            guard.remove(ip);
+        }
+        false
     }
 
     fn tip_hash(chain: &Option<Arc<StdMutex<ChainState>>>) -> [u8; 32] {
@@ -153,6 +177,8 @@ impl P2PNode {
             peers_directory: Arc::new(Mutex::new(PeerDirectory::new())),
             reputation: Arc::new(Mutex::new(ReputationManager::new())),
             accept_log: Arc::new(Mutex::new(HashMap::new())),
+            handshake_failures: Arc::new(StdMutex::new(HashMap::new())),
+            dynamic_bans: Arc::new(StdMutex::new(HashMap::new())),
             chain,
             mempool,
             agent,
@@ -179,6 +205,8 @@ impl P2PNode {
         let agent = self.agent.clone();
         let relay_address = self.relay_address.clone();
         let accept_log = self.accept_log.clone();
+        let handshake_failures = self.handshake_failures.clone();
+        let dynamic_bans = self.dynamic_bans.clone();
         let node_id = self.node_id.clone();
         let banned_ips = self.banned_ips.clone();
 
@@ -187,7 +215,8 @@ impl P2PNode {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
                         let ip = addr.ip();
-                        if banned_ips.contains(&ip) {
+                        let dynamic_bans_check = dynamic_bans.clone();
+                        if P2PNode::is_banned_ip(&ip, &banned_ips, &dynamic_bans_check) {
                             Self::log_err(format!("Rejecting inbound {}: banned", addr));
                             continue;
                         }
@@ -207,6 +236,8 @@ impl P2PNode {
                             continue;
                         }
                         Self::log(format!("Incoming P2P connection from {}", addr));
+                        let handshake_failures_task = handshake_failures.clone();
+                        let dynamic_bans_task = dynamic_bans.clone();
                         let peers_inner = peers_arc.clone();
                         let dir = dir_arc.clone();
                         let rep = rep_arc.clone();
@@ -232,6 +263,25 @@ impl P2PNode {
                             .await
                             {
                                 Self::log_err(format!("P2P handshake error from {}: {}", addr, e));
+                                if e.contains("early eof") || e.contains("message header") {
+                                    let ip = addr.ip();
+                                    let mut fails = handshake_failures_task.lock().unwrap();
+                                    let entry = fails.entry(ip).or_insert((0, Instant::now()));
+                                    if entry.1.elapsed() > Duration::from_secs(600) {
+                                        *entry = (0, Instant::now());
+                                    }
+                                    entry.0 = entry.0.saturating_add(1);
+                                    let count = entry.0;
+                                    drop(fails);
+                                    if count >= 3 {
+                                        let mut dyn_bans = dynamic_bans_task.lock().unwrap();
+                                        dyn_bans.insert(ip, Instant::now());
+                                        drop(dyn_bans);
+                                        Self::log_err(format!("Temporarily banning {} for repeated handshake errors", addr));
+                                        let mut fails = handshake_failures_task.lock().unwrap();
+                                        fails.remove(&ip);
+                                    }
+                                }
                             }
                         });
                     }
