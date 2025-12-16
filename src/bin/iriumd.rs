@@ -978,18 +978,18 @@ async fn main() {
                     (g.height, tip, mem_sz)
                 };
 
-                let peer_sample = peer_list
+                let masked_peers: Vec<String> = peer_list
                     .iter()
-                    .take(5)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                    .map(|p| mask_peer_label(p))
+                    .collect();
+                let peer_sample = masked_peers.iter().take(5).cloned().collect::<Vec<_>>().join(, );
                 let seed_sample = seed_list
                     .iter()
                     .take(5)
                     .cloned()
                     .collect::<Vec<_>>()
-                    .join(", ");
+                    .join(, );
+
                 if json_log_enabled() {
                     println!(
                         "{}",
