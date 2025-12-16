@@ -352,16 +352,7 @@ async fn metrics(
     };
     let seeds = SeedlistManager::new(128).merged_seedlist();
     let mempool_sz = state.mempool.lock().unwrap().len();
-    Ok(format!(
-        irium_height {}n
-        irium_peers {}n
-        irium_anchor_loaded {}n
-        irium_tip_hash {}n
-        irium_mempool_size {}n
-        irium_anchor_digest {}n
-        irium_node_id {}n
-        irium_sybil_difficulty {}n
-        irium_seed_count {}n,
+    Ok(format!(irium_height {}nirium_peers {}nirium_anchor_loaded {}nirium_tip_hash {}nirium_mempool_size {}nirium_anchor_digest {}nirium_node_id {}nirium_sybil_difficulty {}nirium_seed_count {}n,
         height,
         peer_count,
         anchor_loaded as u8,
