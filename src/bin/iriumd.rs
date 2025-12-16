@@ -322,7 +322,11 @@ async fn peers(State(state): State<AppState>) -> Result<Json<PeersResponse>, Sta
     }
 }
 
-async fn metrics(State(state): State<AppState>) -> String {
+async fn metrics(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Result<String, StatusCode> {
+    check_rate(&state, &addr)?;
     let (height, anchor_loaded, tip_hash, anchor_digest) = {
         let g = state.chain.lock().unwrap();
         let tip_hash = g
@@ -348,17 +352,16 @@ async fn metrics(State(state): State<AppState>) -> String {
     };
     let seeds = SeedlistManager::new(128).merged_seedlist();
     let mempool_sz = state.mempool.lock().unwrap().len();
-    format!(
-        "irium_height {}
-irium_peers {}
-irium_anchor_loaded {}
-irium_tip_hash {}
-irium_mempool_size {}
-irium_anchor_digest {}
-irium_node_id {}
-irium_sybil_difficulty {}
-irium_seed_count {}
-",
+    Ok(format!(
+        irium_height {}n
+        irium_peers {}n
+        irium_anchor_loaded {}n
+        irium_tip_hash {}n
+        irium_mempool_size {}n
+        irium_anchor_digest {}n
+        irium_node_id {}n
+        irium_sybil_difficulty {}n
+        irium_seed_count {}n,
         height,
         peer_count,
         anchor_loaded as u8,
@@ -368,7 +371,7 @@ irium_seed_count {}
         node_id_hex,
         sybil_diff,
         seeds.len()
-    )
+    ))
 }
 async fn get_utxo(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
