@@ -557,6 +557,8 @@ impl P2PNode {
         let chain_for_sync = self.chain.clone();
         let _mempool_for_sync = self.mempool.clone();
         let reputation = self.reputation.clone();
+        let peers_vec = self.peers.clone();
+        let writer_for_drop = writer.clone();
         tokio::spawn(async move {
             let mut msg_count: u32 = 0;
             let mut window_start = Instant::now();
@@ -641,6 +643,10 @@ impl P2PNode {
                         break;
                     }
                 }
+            }
+            {
+                let mut guard = peers_vec.lock().await;
+                guard.retain(|p| !Arc::ptr_eq(p, &writer_for_drop));
             }
         });
 
@@ -1243,6 +1249,9 @@ async fn handle_incoming_with_sybil(
             }
         }
     }
-
+    {
+        let mut guard = peers.lock().await;
+        guard.retain(|p| !Arc::ptr_eq(p, &writer));
+    }
     Ok(())
 }
