@@ -305,6 +305,62 @@ impl P2PNode {
         dir.refresh_seedlist_with_policy();
     }
 
+    /// Parse a multiaddr like /ip4/1.2.3.4/tcp/38291 into a SocketAddr.
+    fn parse_multiaddr(multiaddr: &str) -> Option<std::net::SocketAddr> {
+        let parts: Vec<&str> = multiaddr.split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.len() < 4 {
+            return None;
+        }
+        match parts[0] {
+            "ip4" | "ip6" => {}
+            _ => return None,
+        }
+        let ip: std::net::IpAddr = parts[1].parse().ok()?;
+        if parts[2] != "tcp" {
+            return None;
+        }
+        let port: u16 = parts[3].parse().ok()?;
+        Some(std::net::SocketAddr::new(ip, port))
+    }
+
+    fn local_height_value(&self) -> u64 {
+        local_height(&self.chain)
+    }
+
+    /// Opportunistically dial peers we have learned about from gossip.
+    pub async fn connect_known_peers(&self, max_new: usize) {
+        let current = self.peer_count().await;
+        let mut added = 0usize;
+        let peers = {
+            let dir = self.peers_directory.lock().await;
+            dir.peers()
+        };
+
+        for record in peers {
+            if current + added >= MAX_PEERS || added >= max_new {
+                break;
+            }
+            if let Some(addr) = Self::parse_multiaddr(&record.multiaddr) {
+                // Skip connecting to ourselves or banned peers.
+                if (addr.ip() == self.bind_addr.ip() && addr.port() == self.bind_addr.port())
+                    || self.is_banned(&addr.ip())
+                {
+                    continue;
+                }
+                if self
+                    .connect_and_handshake(addr, self.local_height_value(), &self.agent)
+                    .await
+                    .is_ok()
+                {
+                    added += 1;
+                }
+            }
+        }
+    }
+
+
     pub async fn current_sybil_difficulty(&self) -> u8 {
         let base = Self::sybil_difficulty();
         let max = std::env::var("IRIUM_SYBIL_DIFFICULTY_MAX")

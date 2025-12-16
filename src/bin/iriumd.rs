@@ -245,7 +245,6 @@ fn load_signed_seeds() -> Vec<String> {
     };
 
     if let Some(stdin) = child.stdin.as_mut() {
-        let _ = stdin.write_all(seed_data.as_bytes());
     }
     let status = match child.wait() {
         Ok(s) => s,
@@ -970,7 +969,7 @@ async fn main() {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let peers = node_clone.peers_snapshot().await;
                 node_clone.refresh_seedlist().await;
-                let _ = node_clone.request_peers().await;
+                let _ = node_clone.connect_known_peers(3).await;
                 let seeds = seed_mgr.merged_seedlist();
 
                 let mut peer_ips = std::collections::HashSet::new();
