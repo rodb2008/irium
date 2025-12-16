@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
@@ -337,10 +337,18 @@ impl P2PNode {
             let dir = self.peers_directory.lock().await;
             dir.peers()
         };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
 
         for record in peers {
             if current + added >= MAX_PEERS || added >= max_new {
                 break;
+            }
+            // Skip peers we just connected to recently.
+            if now > record.last_seen && (now - record.last_seen) < 30.0 {
+                continue;
             }
             if let Some(addr) = Self::parse_multiaddr(&record.multiaddr) {
                 // Skip connecting to ourselves or banned peers.
