@@ -263,25 +263,6 @@ impl P2PNode {
                             .await
                             {
                                 Self::log_err(format!("P2P handshake error from {}: {}", addr, e));
-                                if e.contains("early eof") || e.contains("message header") {
-                                    let ip = addr.ip();
-                                    let mut fails = handshake_failures_task.lock().unwrap();
-                                    let entry = fails.entry(ip).or_insert((0, Instant::now()));
-                                    if entry.1.elapsed() > Duration::from_secs(600) {
-                                        *entry = (0, Instant::now());
-                                    }
-                                    entry.0 = entry.0.saturating_add(1);
-                                    let count = entry.0;
-                                    drop(fails);
-                                    if count >= 3 {
-                                        let mut dyn_bans = dynamic_bans_task.lock().unwrap();
-                                        dyn_bans.insert(ip, Instant::now());
-                                        drop(dyn_bans);
-                                        Self::log_err(format!("Temporarily banning {} for repeated handshake errors", addr));
-                                        let mut fails = handshake_failures_task.lock().unwrap();
-                                        fails.remove(&ip);
-                                    }
-                                }
                             }
                         });
                     }
