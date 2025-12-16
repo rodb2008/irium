@@ -1031,20 +1031,13 @@ async fn main() {
                     (g.height, tip, mem_sz)
                 };
 
-                                let peer_sample = peer_list
+                let peer_sample = peer_list
                     .iter()
                     .take(5)
                     .cloned()
                     .collect::<Vec<_>>()
                     .join(", ");
-                let seed_sample = seed_list
-                    .iter()
-                    .take(5)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-
+                let seed_count = seed_list.len();
 
                 if json_log_enabled() {
                     println!(
@@ -1056,8 +1049,7 @@ async fn main() {
                             "height": local_height,
                             "peers": peer_ips.len(),
                             "peer_sample": peer_sample,
-                            "seeds": seed_sample,
-                            "seed_count": seed_list.len(),
+                            "seed_count": seed_count,
                             "agent": std::env::var("IRIUM_NODE_AGENT").unwrap_or_else(|_| "Irium-Node".to_string()),
                             "tip": tip_hash,
                             "mempool": mempool_size,
@@ -1066,17 +1058,17 @@ async fn main() {
                 } else {
                     let short_tip = tip_hash.chars().take(12).collect::<String>();
                     println!(
-                        "[{}] ❤️ heartbeat height={} ⛏ tip={} 👥 peers={} [{}] 🌱 seedlist={} [{}] 🧺 mempool={}",
+                        "[{}] ❤️ heartbeat height={} ⛏ tip={} 👥 peers={} [{}] 🌱 seedlist={} 🧺 mempool={}",
                         Utc::now().format("%H:%M:%S"),
                         local_height,
                         short_tip,
                         peer_ips.len(),
                         peer_sample,
-                        seed_list.len(),
-                        seed_sample,
+                        seed_count,
                         mempool_size
                     );
                 }
+
             }
         });
     }
