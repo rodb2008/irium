@@ -972,7 +972,7 @@ async fn main() {
                 let peers = node_clone.peers_snapshot().await;
                 println!("[{}] heartbeat got {} peers", Utc::now().format("%H:%M:%S"), peers.len());
                 node_clone.refresh_seedlist().await;
-                let _ = node_clone.connect_known_peers(3).await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), node_clone.connect_known_peers(3)).await;
                 println!("[{}] heartbeat after connect_known_peers", Utc::now().format("%H:%M:%S"));
                 let seeds = seed_mgr.merged_seedlist();
 

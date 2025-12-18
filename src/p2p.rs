@@ -346,7 +346,7 @@ impl P2PNode {
 
         for record in peers {
             scanned += 1;
-            if scanned > 50 {
+            if scanned > 10 {
                 break;
             }
             if current + added >= MAX_PEERS || added >= max_new {
