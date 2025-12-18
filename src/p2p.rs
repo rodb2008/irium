@@ -330,6 +330,7 @@ impl P2PNode {
     }
 
     /// Opportunistically dial peers we have learned about from gossip.
+    /// Opportunistically dial peers we have learned about from gossip.
     pub async fn connect_known_peers(&self, max_new: usize) {
         let current = self.peer_count().await;
         let mut added = 0usize;
@@ -341,8 +342,13 @@ impl P2PNode {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
+        let mut scanned = 0usize;
 
         for record in peers {
+            scanned += 1;
+            if scanned > 50 {
+                break;
+            }
             if current + added >= MAX_PEERS || added >= max_new {
                 break;
             }
