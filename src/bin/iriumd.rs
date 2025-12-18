@@ -970,8 +970,10 @@ async fn main() {
                 println!("[{}] heartbeat tick", Utc::now().format("%H:%M:%S"));
                 println!("[{}] heartbeat before snapshot", Utc::now().format("%H:%M:%S"));
                 let peers = node_clone.peers_snapshot().await;
+                println!("[{}] heartbeat got {} peers", Utc::now().format("%H:%M:%S"), peers.len());
                 node_clone.refresh_seedlist().await;
                 let _ = node_clone.connect_known_peers(3).await;
+                println!("[{}] heartbeat after connect_known_peers", Utc::now().format("%H:%M:%S"));
                 let seeds = seed_mgr.merged_seedlist();
 
                 let mut peer_ips = std::collections::HashSet::new();
@@ -1074,6 +1076,7 @@ async fn main() {
                         seed_count,
                         mempool_size
                     );
+                println!("[{}] heartbeat end", Utc::now().format("%H:%M:%S"));
                 }
 
             }
