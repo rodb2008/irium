@@ -968,6 +968,7 @@ async fn main() {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 println!("[{}] heartbeat tick", Utc::now().format("%H:%M:%S"));
+                println!("[{}] heartbeat before snapshot", Utc::now().format("%H:%M:%S"));
                 let peers = node_clone.peers_snapshot().await;
                 node_clone.refresh_seedlist().await;
                 let _ = node_clone.connect_known_peers(3).await;
