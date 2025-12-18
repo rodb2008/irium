@@ -1022,13 +1022,19 @@ async fn main() {
                 }
 
                 let (local_height, tip_hash, mempool_size) = {
-                    let g = chain_clone.lock().unwrap();
+                    let g = match chain_clone.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
                     let tip = g
                         .chain
                         .last()
                         .map(|b| hex::encode(b.header.hash()))
                         .unwrap_or_else(|| genesis_hex.clone());
-                    let mem_sz = mempool_clone.lock().unwrap().len();
+                    let mem_sz = match mempool_clone.lock() {
+                        Ok(g) => g.len(),
+                        Err(poisoned) => poisoned.into_inner().len(),
+                    };
                     (g.height, tip, mem_sz)
                 };
 
