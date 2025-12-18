@@ -758,7 +758,20 @@ async fn handle_incoming_with_sybil(
         .map_err(|e| format!("failed to send sybil challenge to {}: {}", addr, e))?;
 
     // Expect a proof in response.
-    let proof_msg = read_message(&mut socket).await?;
+    let proof_msg = match read_message(&mut socket).await {
+        Ok(m) => m,
+        Err(e) => {
+            if e.contains("early eof") {
+                let peer_id = addr.to_string();
+                let mut rep = reputation.lock().await;
+                for _ in 0..5 {
+                    rep.record_failure(&peer_id);
+                }
+                return Err(format!("early eof during sybil proof from {}: {}", addr, e));
+            }
+            return Err(e);
+        }
+    };
     if proof_msg.msg_type != MessageType::SybilProof {
         return Err("expected sybil proof from peer".to_string());
     }
