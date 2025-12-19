@@ -897,8 +897,8 @@ async fn main() {
     let local_ips = local_ip_set(node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.as_ref()));
 
     let mut seeds: Vec<std::net::SocketAddr> = Vec::new();
-    for seed in seeds_raw {
-        match parse_seed_to_socketaddr(&seed, default_seed_port) {
+    for seed in seeds_raw.iter() {
+        match parse_seed_to_socketaddr(seed, default_seed_port) {
             Ok(addr) => {
                 if local_ips.contains(&addr.ip()) {
                     continue;
@@ -906,6 +906,15 @@ async fn main() {
                 seeds.push(addr)
             }
             Err(e) => eprintln!("Invalid P2P seed {}: {}", seed, e),
+        }
+    }
+    // If all seeds were filtered out (e.g., only our own IP), keep the first raw seed so
+    // we still attempt outbound connect rather than logging "no seeds configured" forever.
+    if seeds.is_empty() {
+        if let Some(first) = seeds_raw.first() {
+            if let Ok(addr) = parse_seed_to_socketaddr(first, default_seed_port) {
+                seeds.push(addr);
+            }
         }
     }
     seeds.sort_by(|a, b| {
