@@ -1,5 +1,6 @@
+use reqwest::blocking::Client;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{env, fs, sync::OnceLock};
 
 use bs58;
@@ -270,6 +271,57 @@ struct JsonBlock {
     tx_hex: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct SubmitBlockRequest {
+    height: u64,
+    header: JsonHeader,
+    tx_hex: Vec<String>,
+}
+
+fn node_rpc_base() -> String {
+    env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "http://127.0.0.1:38300".to_string())
+}
+
+fn submit_block_to_node(height: u64, block: &Block) -> Result<(), String> {
+    let header = &block.header;
+    let hash = header.hash();
+    let payload = SubmitBlockRequest {
+        height,
+        header: JsonHeader {
+            version: header.version,
+            prev_hash: hex::encode(header.prev_hash),
+            merkle_root: hex::encode(header.merkle_root),
+            time: header.time,
+            bits: format!("{:08x}", header.bits),
+            nonce: header.nonce,
+            hash: hex::encode(hash),
+        },
+        tx_hex: block
+            .transactions
+            .iter()
+            .map(|tx| hex::encode(tx.serialize()))
+            .collect(),
+    };
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("build client: {e}"))?;
+
+    let base = node_rpc_base();
+    let url = format!("{}/rpc/submit_block", base.trim_end_matches("/"));
+    let resp = client
+        .post(url)
+        .json(&payload)
+        .send()
+        .map_err(|e| format!("submit failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("submit failed: HTTP {}", resp.status()));
+    }
+    Ok(())
+}
+
 fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
     let dir = blocks_dir();
     fs::create_dir_all(&dir)?;
@@ -458,6 +510,24 @@ fn mine_once(chain: &mut ChainState) -> Result<(), String> {
 
             // Write JSON file
             write_block_json(height as u64, &block).map_err(|e| e.to_string())?;
+
+            // Submit to local node HTTP RPC so the network sees the block.
+            match submit_block_to_node(height as u64, &block) {
+                Ok(_) => {
+                    if json_log_enabled() {
+                        println!("{}", json!({"event": "submit_block", "height": height, "status": "accepted"}));
+                    } else {
+                        println!("[📡] Submitted block {} to local node", height);
+                    }
+                }
+                Err(e) => {
+                    if json_log_enabled() {
+                        eprintln!("{}", json!({"event": "submit_block_failed", "height": height, "error": e}));
+                    } else {
+                        eprintln!("[⚠️] Failed to submit block {} to node: {}", height, e);
+                    }
+                }
+            }
             return Ok(());
         }
 

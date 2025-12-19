@@ -49,6 +49,7 @@ export IRIUM_MINER_ADDRESS=Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa   # or set IRIUM_M
 source ~/.cargo/env
 ./target/release/irium-miner
 ```
+- Mined blocks are auto-submitted to http://127.0.0.1:38300/rpc/submit_block; set `IRIUM_NODE_RPC` if your node listens elsewhere.
 Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
 
 ## SPV Tooling
