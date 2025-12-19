@@ -245,6 +245,9 @@ fn load_signed_seeds() -> Vec<String> {
     };
 
     if let Some(stdin) = child.stdin.as_mut() {
+        if stdin.write_all(seed_data.as_bytes()).is_err() {
+            return Vec::new();
+        }
     }
     let status = match child.wait() {
         Ok(s) => s,
@@ -255,6 +258,40 @@ fn load_signed_seeds() -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+fn build_seed_addrs(
+    config_seeds: &[String],
+    signed_seeds: &[String],
+    default_seed_port: u16,
+    local_ips: &HashSet<IpAddr>,
+) -> Vec<std::net::SocketAddr> {
+    let mut seeds_raw: Vec<String> = Vec::new();
+    seeds_raw.extend(config_seeds.iter().cloned());
+    seeds_raw.extend(signed_seeds.iter().cloned());
+    seeds_raw.extend(load_runtime_seeds());
+    seeds_raw.sort();
+    seeds_raw.dedup();
+
+    let mut seeds: Vec<std::net::SocketAddr> = Vec::new();
+    for seed in seeds_raw.iter() {
+        match parse_seed_to_socketaddr(seed, default_seed_port) {
+            Ok(addr) => {
+                if local_ips.contains(&addr.ip()) {
+                    continue;
+                }
+                seeds.push(addr)
+            }
+            Err(e) => eprintln!("Invalid P2P seed {}: {}", seed, e),
+        }
+    }
+    let rep_mgr = ReputationManager::new();
+    seeds.sort_by(|a, b| {
+        rep_mgr
+            .score_of(&b.to_string())
+            .cmp(&rep_mgr.score_of(&a.to_string()))
+    });
+    seeds
 }
 
 fn verbose_p2p() -> bool {
@@ -867,78 +904,42 @@ async fn main() {
         None
     };
 
-    // Build seed list: config overrides signed + runtime seeds.
+    // Build seed list: merge config, signed, and runtime seeds; filter locals.
     let default_seed_port: u16 = node_cfg
         .as_ref()
         .and_then(|cfg| cfg.p2p_bind.as_ref())
-        .and_then(|b| b.split(':').last())
+        .and_then(|b| b.split(":").last())
         .and_then(|p| p.parse().ok())
         .unwrap_or(38291);
 
-    let seeds_raw: Vec<String> = if let Some(cfg) = &node_cfg {
-        if !cfg.p2p_seeds.is_empty() {
-            cfg.p2p_seeds.clone()
-        } else {
-            let mut merged = load_signed_seeds();
-            merged.extend(load_runtime_seeds());
-            merged.sort();
-            merged.dedup();
-            merged
-        }
-    } else {
-        let mut merged = load_signed_seeds();
-        merged.extend(load_runtime_seeds());
-        merged.sort();
-        merged.dedup();
-        merged
-    };
-
-    let mut rep_mgr = ReputationManager::new();
+    let config_seeds: Vec<String> = node_cfg
+        .as_ref()
+        .map(|cfg| cfg.p2p_seeds.clone())
+        .unwrap_or_default();
+    let signed_seeds = load_signed_seeds();
     let local_ips = local_ip_set(node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.as_ref()));
-
-    let mut seeds: Vec<std::net::SocketAddr> = Vec::new();
-    for seed in seeds_raw.iter() {
-        match parse_seed_to_socketaddr(seed, default_seed_port) {
-            Ok(addr) => {
-                if local_ips.contains(&addr.ip()) {
-                    continue;
-                }
-                seeds.push(addr)
-            }
-            Err(e) => eprintln!("Invalid P2P seed {}: {}", seed, e),
-        }
-    }
-    // If all seeds were filtered out (e.g., only our own IP), keep the first raw seed so
-    // we still attempt outbound connect rather than logging "no seeds configured" forever.
-    if seeds.is_empty() {
-        if let Some(first) = seeds_raw.first() {
-            if let Ok(addr) = parse_seed_to_socketaddr(first, default_seed_port) {
-                seeds.push(addr);
-            }
-        }
-    }
-    seeds.sort_by(|a, b| {
-        rep_mgr
-            .score_of(&b.to_string())
-            .cmp(&rep_mgr.score_of(&a.to_string()))
-    });
 
     // Connect to seed peers using a basic handshake and keep retrying in background.
     if let Some(node) = p2p.clone() {
-        let seeds_clone = seeds.clone();
+        let config_seeds = config_seeds.clone();
+        let signed_seeds = signed_seeds.clone();
+        let local_ips = local_ips.clone();
         let agent_clone = agent_string.clone();
         let shared_clone = shared_state.clone();
         tokio::spawn(async move {
             let node = node;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
-                if seeds_clone.is_empty() {
+                let seeds = build_seed_addrs(&config_seeds, &signed_seeds, default_seed_port, &local_ips);
+                if seeds.is_empty() {
                     println!(
                         "[{}] no seeds configured; waiting",
                         Utc::now().format("%H:%M:%S")
                     );
+                    interval.tick().await;
+                    continue;
                 }
-                for addr in &seeds_clone {
+                for addr in &seeds {
                     let height = {
                         let chain = shared_clone.lock().unwrap();
                         chain.height
