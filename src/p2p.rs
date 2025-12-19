@@ -36,6 +36,7 @@ pub struct P2PNode {
     bind_addr: SocketAddr,
     peers: Arc<Mutex<Vec<Arc<Mutex<OwnedWriteHalf>>>>>,
     peers_directory: Arc<Mutex<PeerDirectory>>,
+    connected: Arc<Mutex<HashSet<SocketAddr>>>,
     reputation: Arc<Mutex<ReputationManager>>,
     accept_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     handshake_failures: Arc<StdMutex<HashMap<IpAddr, (u32, Instant)>>>,
@@ -175,6 +176,7 @@ impl P2PNode {
             bind_addr,
             peers: Arc::new(Mutex::new(Vec::new())),
             peers_directory: Arc::new(Mutex::new(PeerDirectory::new())),
+            connected: Arc::new(Mutex::new(HashSet::new())),
             reputation: Arc::new(Mutex::new(ReputationManager::new())),
             accept_log: Arc::new(Mutex::new(HashMap::new())),
             handshake_failures: Arc::new(StdMutex::new(HashMap::new())),
@@ -200,6 +202,7 @@ impl P2PNode {
         let bind = self.bind_addr;
         let dir_arc = self.peers_directory.clone();
         let rep_arc = self.reputation.clone();
+        let connected = self.connected.clone();
         let chain = self.chain.clone();
         let mempool = self.mempool.clone();
         let agent = self.agent.clone();
@@ -239,6 +242,7 @@ impl P2PNode {
                         let handshake_failures_task = handshake_failures.clone();
                         let dynamic_bans_task = dynamic_bans.clone();
                         let peers_inner = peers_arc.clone();
+                        let connected_inner = connected.clone();
                         let dir = dir_arc.clone();
                         let rep = rep_arc.clone();
                         let chain_peer = chain.clone();
@@ -252,6 +256,7 @@ impl P2PNode {
                                 addr,
                                 bind,
                                 peers_inner,
+                                connected_inner.clone(),
                                 dir.clone(),
                                 rep.clone(),
                                 chain_peer,
@@ -394,6 +399,11 @@ impl P2PNode {
         hex::encode(&self.node_id)
     }
 
+    pub async fn is_connected(&self, addr: &SocketAddr) -> bool {
+        let guard = self.connected.lock().await;
+        guard.contains(addr)
+    }
+
     pub async fn broadcast_block(&self, block_bytes: &[u8]) -> Result<(), String> {
         let msg = BlockPayload {
             block_data: block_bytes.to_vec(),
@@ -455,6 +465,9 @@ impl P2PNode {
         local_height: u64,
         agent: &str,
     ) -> Result<(), String> {
+        if self.is_connected(&addr).await {
+            return Ok(());
+        }
         if self.is_banned(&addr.ip()) {
             return Err(format!("peer {} is banned (banlist)", addr));
         }
@@ -551,6 +564,10 @@ impl P2PNode {
             let mut guard = self.peers.lock().await;
             guard.push(writer.clone());
         }
+        {
+            let mut guard = self.connected.lock().await;
+            guard.insert(addr);
+        }
 
         {
             let mut dir = self.peers_directory.lock().await;
@@ -564,6 +581,7 @@ impl P2PNode {
         let _mempool_for_sync = self.mempool.clone();
         let reputation = self.reputation.clone();
         let peers_vec = self.peers.clone();
+        let connected_vec = self.connected.clone();
         let writer_for_drop = writer.clone();
         tokio::spawn(async move {
             let mut msg_count: u32 = 0;
@@ -654,6 +672,10 @@ impl P2PNode {
                 let mut guard = peers_vec.lock().await;
                 guard.retain(|p| !Arc::ptr_eq(p, &writer_for_drop));
             }
+            {
+                let mut guard = connected_vec.lock().await;
+                guard.remove(&addr);
+            }
         });
 
         Ok(())
@@ -724,6 +746,7 @@ async fn handle_incoming_with_sybil(
     addr: SocketAddr,
     bind_addr: SocketAddr,
     peers: Arc<Mutex<Vec<Arc<Mutex<OwnedWriteHalf>>>>>,
+    connected: Arc<Mutex<HashSet<SocketAddr>>>,
     directory: Arc<Mutex<PeerDirectory>>,
     reputation: Arc<Mutex<ReputationManager>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
@@ -788,6 +811,10 @@ async fn handle_incoming_with_sybil(
     {
         let mut rep = reputation.lock().await;
         rep.record_success(&addr.to_string());
+    }
+    {
+        let mut guard = connected.lock().await;
+        guard.insert(addr);
     }
     // At this point, accept the peer and start reading further messages.
     let (mut reader, writer_half) = socket.into_split();
