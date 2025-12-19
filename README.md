@@ -42,12 +42,14 @@ RUST_LOG=info cargo run --release --bin iriumd
 - P2P bind/seed overrides can be supplied in `configs/node.json`.
 
 ## Mining
-The miner binary (`irium-miner`) assembles blocks from the local mempool and searches nonces:
+The miner binary (`irium-miner`) assembles blocks from the local mempool and searches nonces. Always set a payout address so rewards are spendable:
 ```bash
+cd /home/irium/irium
+export IRIUM_MINER_ADDRESS=Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa   # or set IRIUM_MINER_PKH (40-hex)
 source ~/.cargo/env
-RUST_LOG=info cargo run --release --bin irium-miner
+./target/release/irium-miner
 ```
-Set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
+Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
 
 ## SPV Tooling
 `irium-spv` verifies merkle proofs against stored block JSON snapshots:

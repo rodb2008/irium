@@ -41,12 +41,15 @@ RUST_LOG=info cargo run --release --bin iriumd
 - P2P: bind from config; uses sybil-resistant handshake and header-first sync.
 
 ## 5) Mining
+Set a payout address (or PKH) so rewards are spendable:
 ```
+cd /home/irium/irium
+export IRIUM_MINER_ADDRESS=Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa   # or set IRIUM_MINER_PKH (40-hex)
 source ~/.cargo/env
-RUST_LOG=info cargo run --release --bin irium-miner
+./target/release/irium-miner
 ```
 - Relies on the local node/mempool.
-- Set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
+- Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
 
 ## 6) SPV check
 ```
