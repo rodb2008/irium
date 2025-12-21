@@ -157,6 +157,14 @@ fn local_ip_set(bind: Option<&String>) -> HashSet<IpAddr> {
             ips.insert(iface.ip());
         }
     }
+    // Probe the default outbound interface to capture the externally routable IP.
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = sock.local_addr() {
+                ips.insert(addr.ip());
+            }
+        }
+    }
     ips.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
     ips.insert(IpAddr::V6(Ipv6Addr::LOCALHOST));
     ips
