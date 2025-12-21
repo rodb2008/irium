@@ -157,6 +157,18 @@ fn local_ip_set(bind: Option<&String>) -> HashSet<IpAddr> {
             ips.insert(iface.ip());
         }
     }
+    // Also query hostname -I so we capture addresses exposed by the OS (e.g., public IPv4 on seeds).
+    if let Ok(output) = std::process::Command::new("hostname").arg("-I").output() {
+        if output.status.success() {
+            if let Ok(list) = String::from_utf8(output.stdout) {
+                for part in list.split_whitespace() {
+                    if let Ok(ip) = part.parse::<IpAddr>() {
+                        ips.insert(ip);
+                    }
+                }
+            }
+        }
+    }
     // Probe the default outbound interface to capture the externally routable IP.
     if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
         if sock.connect("8.8.8.8:80").is_ok() {
