@@ -305,7 +305,7 @@ fn build_seed_addrs(
             Err(e) => eprintln!("Invalid P2P seed {}: {}", seed, e),
         }
     }
-    let rep_mgr = ReputationManager::new();
+    let mut rep_mgr = ReputationManager::new();
     seeds.sort_by(|a, b| {
         rep_mgr
             .score_of(&b.to_string())
