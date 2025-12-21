@@ -1029,14 +1029,14 @@ async fn main() {
                                 Some(agent) => format!("{}:{} ({} {})", ip, port, h, agent),
                                 None => format!("{}:{} ({})", ip, port, h),
                             };
-                            peer_list.push(label);
+                            peer_list.push(mask_peer_label(&label));
                         }
                     } else if peer_ips.insert(p.multiaddr.clone()) {
                         let h = p
                             .last_height
                             .map(|v| format!("h={}", v))
                             .unwrap_or_else(|| "h=-".to_string());
-                        peer_list.push(format!("{} ({})", p.multiaddr, h));
+                        peer_list.push(mask_peer_label(&format!("{} ({})", p.multiaddr, h)));
                     }
                 }
                 if peer_list.is_empty() {
@@ -1050,10 +1050,10 @@ async fn main() {
                     if parts.len() >= 5 {
                         let ip = parts[2];
                         if seed_ips.insert(ip.to_string()) {
-                            seed_list.push(ip.to_string());
+                            seed_list.push(mask_seed_label(ip));
                         }
                     } else if seed_ips.insert(s.clone()) {
-                        seed_list.push(s.clone());
+                        seed_list.push(mask_seed_label(s));
                     }
                 }
                 if seed_list.is_empty() {
