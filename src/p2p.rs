@@ -1310,5 +1310,11 @@ async fn handle_incoming_with_sybil(
         let mut guard = peers.lock().await;
         guard.retain(|p| !Arc::ptr_eq(p, &writer));
     }
+    {
+        let mut guard = connected.lock().await;
+        if guard.remove(&addr) {
+            P2PNode::log(format!("P2P inbound {}: disconnected", addr));
+        }
+    }
     Ok(())
 }
