@@ -288,7 +288,17 @@ impl P2PNode {
 
     pub async fn peers_snapshot(&self) -> Vec<PeerRecord> {
         let dir = self.peers_directory.lock().await;
+        let connected = self.connected.lock().await;
         dir.peers()
+            .into_iter()
+            .filter(|rec| {
+                if let Some(addr) = Self::parse_multiaddr(&rec.multiaddr) {
+                    connected.contains(&addr)
+                } else {
+                    false
+                }
+            })
+            .collect()
     }
 
     /// Request peer lists from all connected peers.
