@@ -305,6 +305,14 @@ fn build_seed_addrs(
             Err(e) => eprintln!("Invalid P2P seed {}: {}", seed, e),
         }
     }
+    // If everything was filtered as local, fall back to the first seed to retain outbound dial capability.
+    if seeds.is_empty() {
+        if let Some(first) = seeds_raw.first() {
+            if let Ok(addr) = parse_seed_to_socketaddr(first, default_seed_port) {
+                seeds.push(addr);
+            }
+        }
+    }
     let mut rep_mgr = ReputationManager::new();
     seeds.sort_by(|a, b| {
         rep_mgr
