@@ -968,6 +968,9 @@ async fn main() {
                     continue;
                 }
                 for addr in &seeds {
+                    if node.is_connected(addr).await {
+                        continue;
+                    }
                     let height = {
                         let chain = shared_clone.lock().unwrap();
                         chain.height
