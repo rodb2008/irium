@@ -889,11 +889,12 @@ async fn handle_incoming_with_sybil(
                     {
                         let mut dir = directory.lock().await;
                         dir.register_connection(
-                            multiaddr,
+                            multiaddr.clone(),
                             Some(payload.agent.clone()),
                             payload.relay_address.clone(),
                             payload.node_id.clone(),
                         );
+                        dir.record_height(&multiaddr, payload.height);
                     }
 
                     let response = HandshakePayload {
