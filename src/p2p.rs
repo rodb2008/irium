@@ -627,12 +627,15 @@ impl P2PNode {
                                     let node_id = payload.node_id.clone();
                                     {
                                         let mut dir_guard = dir.lock().await;
+                                        let multiaddr =
+                                            format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
                                         dir_guard.register_connection(
-                                            format!("/ip4/{}/tcp/{}", addr.ip(), addr.port()),
+                                            multiaddr.clone(),
                                             Some(agent_str.clone()),
                                             payload.relay_address.clone(),
                                             node_id.clone(),
                                         );
+                                        dir_guard.record_height(&multiaddr, payload.height);
                                     }
                                     Self::log(format!(
                                         "P2P outbound {}: received handshake (agent {}, height {})",
@@ -839,7 +842,8 @@ async fn handle_incoming_with_sybil(
         let mut dir = directory.lock().await;
         let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
         let node_id = hex::encode(&proof.peer_pubkey);
-        dir.register_connection(multiaddr, None, None, Some(node_id));
+        dir.register_connection(multiaddr.clone(), None, None, Some(node_id));
+        dir.record_height(&multiaddr, local_height(&chain));
     }
 
     // Reply with our handshake so outbound peers learn our agent/height.
