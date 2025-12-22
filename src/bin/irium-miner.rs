@@ -124,32 +124,36 @@ mod tests {
     }
 }
 
-fn miner_pubkey_hash() -> Option<Vec<u8>> {
-    if let Ok(hex) = env::var("IRIUM_MINER_PKH") {
-        if hex.len() == 40 {
-            if let Ok(pkh) = hex::decode(hex) {
-                return Some(pkh);
-            }
+fn miner_address_info() -> Option<(String, Vec<u8>)> {
+    if let Ok(addr) = env::var("IRIUM_MINER_ADDRESS") {
+        if let Some(pkh) = base58_p2pkh_to_hash(&addr) {
+            return Some((addr, pkh));
         }
     }
 
-    for var in ["IRIUM_MINER_ADDRESS", "IRIUM_RELAY_ADDRESS"] {
-        if let Ok(addr) = env::var(var) {
-            // Accept base58 P2PKH or 40-char hex PKH.
-            if addr.len() == 40 {
-                if let Ok(pkh) = hex::decode(&addr) {
-                    if pkh.len() == 20 {
-                        return Some(pkh);
-                    }
-                }
-            }
-            if let Some(pkh) = base58_p2pkh_to_hash(&addr) {
-                return Some(pkh);
+    if let Ok(addr) = env::var("IRIUM_RELAY_ADDRESS") {
+        if let Some(pkh) = base58_p2pkh_to_hash(&addr) {
+            return Some((addr, pkh));
+        }
+    }
+
+    if let Ok(hex) = env::var("IRIUM_MINER_PKH") {
+        if hex.len() == 40 {
+            if let Ok(pkh) = hex::decode(&hex) {
+                return Some((format!("pkh:{hex}"), pkh));
             }
         }
     }
 
     None
+}
+
+
+
+
+
+fn miner_pubkey_hash() -> Option<Vec<u8>> {
+    miner_address_info().map(|(_, pkh)| pkh)
 }
 
 fn build_coinbase(height: u64, reward: u64) -> Transaction {
@@ -606,14 +610,15 @@ fn main() {
         }
     }
 
-    if let Some(pkh) = miner_pubkey_hash() {
+    if let Some((addr, pkh)) = miner_address_info() {
+        let pkh_hex = hex::encode(pkh);
         if json_log_enabled() {
             println!(
                 "{}",
-                json!({"event": "miner_pkh", "pkh": hex::encode(pkh), "ts": Utc::now().format("%H:%M:%S").to_string()})
+                json!({"event": "miner_address", "address": addr, "pkh": pkh_hex, "ts": Utc::now().format("%H:%M:%S").to_string()})
             );
         } else {
-            println!("[💰] Using miner PKH: {}", hex::encode(pkh));
+            println!("[💰] Using miner address: {} (pkh={})", addr, pkh_hex);
         }
     } else {
         if json_log_enabled() {
