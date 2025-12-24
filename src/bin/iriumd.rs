@@ -625,11 +625,39 @@ async fn get_block(
     Query(q): Query<BlockQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     check_rate(&state, &addr)?;
+    // Prefer on-disk JSON if present for compatibility with miner files.
     let dir = blocks_dir();
     let path = dir.join(format!("block_{}.json", q.height));
-    let data = fs::read_to_string(&path).map_err(|_| StatusCode::NOT_FOUND)?;
-    let v: Value = serde_json::from_str(&data).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(v))
+    if let Ok(data) = fs::read_to_string(&path) {
+        let v: Value = serde_json::from_str(&data).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(Json(v));
+    }
+
+    // Fallback: serve directly from in-memory chain state.
+    let block_json = {
+        let guard = state.chain.lock().unwrap();
+        let idx = if q.height == 0 { 0 } else { (q.height.saturating_sub(1)) as usize };
+        if idx >= guard.chain.len() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let block = &guard.chain[idx];
+        let header = &block.header;
+        serde_json::json!({
+            "height": q.height,
+            "header": {
+                "version": header.version,
+                "prev_hash": hex::encode(header.prev_hash),
+                "merkle_root": hex::encode(header.merkle_root),
+                "time": header.time,
+                "bits": format!("{:08x}", header.bits),
+                "nonce": header.nonce,
+                "hash": hex::encode(header.hash()),
+            },
+            "tx_hex": block.transactions.iter().map(|tx| hex::encode(tx.serialize())).collect::<Vec<_>>()
+        })
+    };
+
+    Ok(Json(block_json))
 }
 
 fn decode_compact_tx(raw: &[u8]) -> Result<Transaction, String> {

@@ -1203,9 +1203,10 @@ async fn handle_incoming_with_sybil(
                     if let Ok(payload) = BlockPayload::from_message(&msg) {
                         match Block::deserialize(&payload.block_data) {
                             Ok((block, _)) => {
-                                let ok = {
+                                let (ok, new_height_opt) = {
                                     let mut guard = chain_arc.lock().unwrap();
-                                    match guard.process_block(block.clone()) {
+                                    let mut new_height_opt = None;
+                                    let ok = match guard.process_block(block.clone()) {
                                         Ok((new_height, _tip)) => {
                                             let bhash = block.header.hash();
                                             let short = hex::encode(bhash);
@@ -1223,6 +1224,7 @@ async fn handle_incoming_with_sybil(
                                             // Update headers to reflect advanced tip.
                                             guard.headers.clear();
                                             guard.header_chain.clear();
+                                            new_height_opt = Some(new_height);
                                             true
                                         }
                                         Err(e) => {
@@ -1232,8 +1234,14 @@ async fn handle_incoming_with_sybil(
                                             );
                                             false
                                         }
-                                    }
+                                    };
+                                    (ok, new_height_opt)
                                 };
+                                if let Some(new_height) = new_height_opt {
+                                    let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
+                                    let mut directory = directory.lock().await;
+                                    directory.record_height(&multiaddr, new_height.saturating_sub(1));
+                                }
                                 let mut rep = reputation.lock().await;
                                 rep.record_block(&addr.to_string(), ok);
                             }
