@@ -5,8 +5,6 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
-use std::env;
-use hex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,6 +24,7 @@ use crate::reputation::ReputationManager;
 use crate::sybil::{SybilChallenge, SybilProof, SybilResistantHandshake};
 use crate::tx::decode_full_tx;
 use rand_core::{OsRng, RngCore};
+use hex;
 use serde_json::json;
 
 /// Minimal P2P node skeleton: accepts incoming connections and can
@@ -33,40 +32,6 @@ use serde_json::json;
 const MAX_PEERS: usize = 100;
 const MAX_MSGS_PER_SEC: u32 = 200;
 
-
-fn blocks_dir() -> PathBuf {
-    if let Ok(dir) = env::var("IRIUM_BLOCKS_DIR") {
-        PathBuf::from(dir)
-    } else {
-        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        PathBuf::from(home).join(".irium/blocks")
-    }
-}
-
-fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
-    let dir = blocks_dir();
-    fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("block_{}.json", height));
-
-    let header = &block.header;
-    let hash = header.hash();
-
-    let json_block = serde_json::json!({
-        "height": height,
-        "header": {
-            "version": header.version,
-            "prev_hash": hex::encode(header.prev_hash),
-            "merkle_root": hex::encode(header.merkle_root),
-            "time": header.time,
-            "bits": format!("{:08x}", header.bits),
-            "nonce": header.nonce,
-            "hash": hex::encode(hash),
-        },
-        "tx_hex": block.transactions.iter().map(|tx| hex::encode(tx.serialize())).collect::<Vec<_>>()
-    });
-
-    fs::write(path, serde_json::to_string_pretty(&json_block)?)
-}
 #[derive(Clone)]
 pub struct P2PNode {
     bind_addr: SocketAddr,
@@ -693,12 +658,30 @@ impl P2PNode {
                                         let _ = send_message(&writer, msg, addr).await;
                                     }
                                     // Basic header-first sync trigger: if peer is ahead, request blocks.
+                                    let local_height = {
+                                        if let Some(ref c) = chain_for_sync {
+                                            c.lock().unwrap().height
+                                        } else {
+                                            0
+                                        }
+                                    };
                                     if payload.height > local_height {
                                         let start_hash = P2PNode::tip_hash(&chain_for_sync);
                                         let get_blocks = GetBlocksPayload {
                                             start_hash: start_hash.to_vec(),
                                             count: 512,
                                         };
+                                        let short = {
+                                            let h = hex::encode(start_hash);
+                                            h.get(0..12).unwrap_or(&h).to_string()
+                                        };
+                                        Self::log(format!(
+                                            "P2P {}: peer ahead ({} > {}), requesting up to 512 blocks from tip {}",
+                                            addr,
+                                            payload.height,
+                                            local_height,
+                                            short
+                                        ));
                                         if let Ok(msg) = get_blocks.to_message() {
                                             let _ = send_message(&writer, msg, addr).await;
                                         }
@@ -1171,7 +1154,7 @@ async fn handle_incoming_with_sybil(
             MessageType::GetBlocks => {
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = GetBlocksPayload::from_message(&msg) {
-                        let blocks: Vec<Vec<u8>> = {
+                        let (blocks, start_height) = {
                             let guard = chain_arc.lock().unwrap();
                             let mut start_idx = 0usize;
                             if payload.start_hash.len() == 32 {
@@ -1183,14 +1166,31 @@ async fn handle_incoming_with_sybil(
                                     start_idx = pos + 1;
                                 }
                             }
-                            guard
+                            let mut blocks = Vec::new();
+                            let mut heights = Vec::new();
+                            for (idx, b) in guard
                                 .chain
                                 .iter()
+                                .enumerate()
                                 .skip(start_idx)
                                 .take(payload.count as usize)
-                                .map(|b| b.serialize())
-                                .collect()
+                            {
+                                blocks.push(b.serialize());
+                                heights.push((idx + 1) as u64);
+                            }
+                            let start_h: u64 = heights.first().copied().unwrap_or(0);
+                            (blocks, start_h)
                         };
+                        if !blocks.is_empty() {
+                            let end_h = start_height + blocks.len() as u64 - 1;
+                            P2PNode::log(format!(
+                                "P2P {}: sending {} blocks [{}-{}]",
+                                addr,
+                                blocks.len(),
+                                start_height,
+                                end_h
+                            ));
+                        }
                         for block_data in blocks {
                             let msg = BlockPayload { block_data }.to_message();
                             let _ = send_message(&writer, msg, addr).await;
@@ -1207,15 +1207,19 @@ async fn handle_incoming_with_sybil(
                                     let mut guard = chain_arc.lock().unwrap();
                                     match guard.process_block(block.clone()) {
                                         Ok((new_height, _tip)) => {
+                                            let bhash = block.header.hash();
+                                            let short = hex::encode(bhash);
+                                            let short = short.get(0..12).unwrap_or(&short);
+                                            P2PNode::log(format!(
+                                                "P2P {}: accepted block height {} hash {}",
+                                                addr, new_height.saturating_sub(1), short
+                                            ));
                                             if let Some(ref mem) = mempool {
                                                 let mut mem_guard = mem.lock().unwrap();
                                                 for tx in block.transactions.iter().skip(1) {
                                                     mem_guard.remove(&tx.txid());
                                                 }
                                             }
-                                            // Persist the newly accepted block for miners/peers.
-                                            let persist_height = new_height.saturating_sub(1);
-                                            let _ = write_block_json(persist_height, &block);
                                             // Update headers to reflect advanced tip.
                                             guard.headers.clear();
                                             guard.header_chain.clear();
