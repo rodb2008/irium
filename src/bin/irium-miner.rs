@@ -359,6 +359,117 @@ fn submit_block_to_node(height: u64, block: &Block) -> Result<(), String> {
     Ok(())
 }
 
+
+fn load_persisted_blocks(state: &mut ChainState) {
+    let dir = blocks_dir();
+    if !dir.exists() {
+        return;
+    }
+    let mut entries: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    if let Ok(read_dir) = dir.read_dir() {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(stripped) = name.strip_prefix("block_") {
+                    if let Some(num_part) = stripped.strip_suffix(".json") {
+                        if let Ok(h) = num_part.parse::<u64>() {
+                            entries.push((h, path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    entries.sort_by_key(|(h, _)| *h);
+
+    for (h, path) in entries {
+        match std::fs::read_to_string(&path) {
+            Ok(data) => {
+                let parsed: serde_json::Value = match serde_json::from_str(&data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[⚠️] Failed to parse {}: {}", path.display(), e);
+                        continue;
+                    }
+                };
+                let header_obj = match parsed.get("header") {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let get_hex32 = |key: &str| -> Option<[u8; 32]> {
+                    let s = header_obj.get(key)?.as_str()?;
+                    let bytes = hex::decode(s).ok()?;
+                    if bytes.len() != 32 {
+                        return None;
+                    }
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&bytes);
+                    Some(out)
+                };
+                let prev_hash = match get_hex32("prev_hash") {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let merkle_root = match get_hex32("merkle_root") {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let version = header_obj.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                let time = header_obj.get("time").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+                let bits_str = header_obj.get("bits").and_then(|v| v.as_str()).unwrap_or("1d00ffff");
+                let bits = u32::from_str_radix(bits_str, 16).unwrap_or(0x1d00_ffff);
+                let nonce = header_obj.get("nonce").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+
+                let txs = match parsed.get("tx_hex").and_then(|v| v.as_array()) {
+                    Some(arr) => {
+                        let mut out = Vec::new();
+                        for t in arr {
+                            if let Some(s) = t.as_str() {
+                                if let Ok(bytes) = hex::decode(s) {
+                                    let tx = decode_compact_tx(&bytes);
+                                    out.push(tx);
+                                }
+                            }
+                        }
+                        out
+                    }
+                    None => Vec::new(),
+                };
+
+                let mut block = Block {
+                    header: BlockHeader {
+                        version,
+                        prev_hash,
+                        merkle_root,
+                        time,
+                        bits,
+                        nonce,
+                    },
+                    transactions: txs,
+                };
+                // Recompute merkle to be safe.
+                block.header.merkle_root = block.merkle_root();
+
+                if let Err(e) = state.connect_block(block) {
+                    eprintln!("[⚠️] Failed to connect persisted block {}: {}", h, e);
+                }
+            }
+            Err(e) => eprintln!("[⚠️] Failed to read {}: {}", path.display(), e),
+        }
+    }
+
+    if state.height > 1 {
+        if json_log_enabled() {
+            println!(
+                "{}",
+                json!({"event": "resume_height", "height": state.height, "ts": Utc::now().format("%H:%M:%S").to_string()})
+            );
+        } else {
+            println!("[↩️] Resumed chain height {} from persisted blocks", state.height);
+        }
+    }
+}
+
 fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
     let dir = blocks_dir();
     fs::create_dir_all(&dir)?;
@@ -642,6 +753,9 @@ fn main() {
             println!("[🪝] Anchors digest: {}", manager.payload_digest());
         }
     }
+
+    // Load any persisted blocks so we resume from last mined height.
+    load_persisted_blocks(&mut state);
 
     if let Some((addr, pkh)) = miner_address_info() {
         let pkh_hex = hex::encode(pkh);
