@@ -666,6 +666,29 @@ impl P2PNode {
                                         if let Ok(msg) = get_blocks.to_message() {
                                             let _ = send_message(&writer, msg, addr).await;
                                         }
+                                    } else if payload.height < local_height {
+                                        // Peer is behind; push our next headers to trigger their sync and send bodies directly.
+                                        if let Some(ref chain_arc) = chain_for_sync {
+                                            let (headers_bytes, blocks_bytes) = {
+                                                let guard = chain_arc.lock().unwrap();
+                                                let start = payload.height as usize;
+                                                let mut headers = Vec::new();
+                                                let mut blocks = Vec::new();
+                                                for block in guard.chain.iter().skip(start).take(32) {
+                                                    headers.extend_from_slice(&block.header.serialize());
+                                                    blocks.push(block.serialize());
+                                                }
+                                                (headers, blocks)
+                                            };
+                                            if !headers_bytes.is_empty() {
+                                                let msg = HeadersPayload { headers: headers_bytes }.to_message();
+                                                let _ = send_message(&writer, msg, addr).await;
+                                            }
+                                            for blk in blocks_bytes {
+                                                let msg = BlockPayload { block_data: blk }.to_message();
+                                                let _ = send_message(&writer, msg, addr).await;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -928,6 +951,29 @@ async fn handle_incoming_with_sybil(
                         };
                         if let Ok(msg) = get_headers.to_message() {
                             let _ = send_message(&writer, msg, addr).await;
+                        }
+                    } else if payload.height < local_h {
+                        // Peer is behind; send it our next headers to prompt block download and include bodies for small catch-up.
+                        if let Some(ref chain_arc) = chain {
+                            let (headers_bytes, blocks_bytes) = {
+                                let guard = chain_arc.lock().unwrap();
+                                let start = payload.height as usize;
+                                let mut headers = Vec::new();
+                                let mut blocks = Vec::new();
+                                for block in guard.chain.iter().skip(start).take(32) {
+                                    headers.extend_from_slice(&block.header.serialize());
+                                    blocks.push(block.serialize());
+                                }
+                                (headers, blocks)
+                            };
+                            if !headers_bytes.is_empty() {
+                                let msg = HeadersPayload { headers: headers_bytes }.to_message();
+                                let _ = send_message(&writer, msg, addr).await;
+                            }
+                            for blk in blocks_bytes {
+                                let msg = BlockPayload { block_data: blk }.to_message();
+                                let _ = send_message(&writer, msg, addr).await;
+                            }
                         }
                     }
                 }

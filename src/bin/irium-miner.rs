@@ -1,7 +1,9 @@
 use reqwest::blocking::Client;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use std::{env, fs, sync::OnceLock};
+use std::{env, fs, sync::{OnceLock, Arc, atomic::{AtomicBool, AtomicU32, Ordering}}};
+use std::sync::mpsc;
+use std::thread;
 
 use bs58;
 use chrono::Utc;
@@ -151,6 +153,37 @@ fn miner_address_info() -> Option<(String, Vec<u8>)> {
 
 
 
+
+fn miner_threads() -> usize {
+    // CLI flags take precedence over env; fallback to available CPUs.
+    let mut threads: Option<usize> = None;
+
+    let mut args = env::args();
+    let _ = args.next(); // skip binary name
+    while let Some(arg) = args.next() {
+        if arg == "--threads" || arg == "-t" {
+            if let Some(v) = args.next() {
+                if let Ok(n) = v.parse::<usize>() {
+                    threads = Some(n.max(1));
+                }
+            }
+        } else if let Some(rest) = arg.strip_prefix("--threads=") {
+            if let Ok(n) = rest.parse::<usize>() {
+                threads = Some(n.max(1));
+            }
+        }
+    }
+
+    if threads.is_none() {
+        if let Ok(val) = env::var("IRIUM_MINER_THREADS") {
+            if let Ok(n) = val.parse::<usize>() {
+                threads = Some(n.max(1));
+            }
+        }
+    }
+
+    threads.unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+}
 
 fn miner_pubkey_hash() -> Option<Vec<u8>> {
     miner_address_info().map(|(_, pkh)| pkh)
