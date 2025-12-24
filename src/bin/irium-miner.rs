@@ -470,6 +470,169 @@ fn load_persisted_blocks(state: &mut ChainState) {
     }
 }
 
+
+fn node_http_client() -> Result<Client, String> {
+    Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("build client: {e}"))
+}
+
+fn fetch_status_height(client: &Client) -> Result<u64, String> {
+    #[derive(Deserialize)]
+    struct StatusResp {
+        height: u64,
+    }
+    let base = node_rpc_base();
+    let url = format!("{}/status", base.trim_end_matches('/'));
+    let resp = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("status failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("status failed: HTTP {}", resp.status()));
+    }
+    let parsed: StatusResp = resp
+        .json()
+        .map_err(|e| format!("status parse: {e}"))?;
+    Ok(parsed.height)
+}
+
+fn fetch_block_json(client: &Client, height: u64) -> Result<serde_json::Value, String> {
+    let base = node_rpc_base();
+    let url = format!("{}/rpc/block?height={}", base.trim_end_matches('/'), height);
+    let resp = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("get block {height} failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("get block {height} failed: HTTP {}", resp.status()));
+    }
+    resp.json()
+        .map_err(|e| format!("block {height} parse: {e}"))
+}
+
+fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Result<(), String> {
+    let header_obj = v.get("header").ok_or("missing header")?;
+    let get_hex32 = |key: &str| -> Result<[u8; 32], String> {
+        let s = header_obj
+            .get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("missing {key}"))?;
+        let bytes = hex::decode(s).map_err(|e| format!("{key} decode: {e}"))?;
+        if bytes.len() != 32 {
+            return Err(format!("{key} len {} != 32", bytes.len()));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    };
+    let prev_hash = get_hex32("prev_hash")?;
+    let merkle_root = get_hex32("merkle_root")?;
+    let version = header_obj
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
+    let time = header_obj
+        .get("time")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as u32;
+    let bits_str = header_obj
+        .get("bits")
+        .and_then(|v| v.as_str())
+        .unwrap_or("1d00ffff");
+    let bits = u32::from_str_radix(bits_str, 16).unwrap_or(0x1d00_ffff);
+    let nonce = header_obj
+        .get("nonce")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as u32;
+
+    let txs = match v.get("tx_hex").and_then(|v| v.as_array()) {
+        Some(arr) => {
+            let mut out = Vec::new();
+            for t in arr {
+                if let Some(s) = t.as_str() {
+                    if let Ok(bytes) = hex::decode(s) {
+                        let tx = decode_compact_tx(&bytes);
+                        out.push(tx);
+                    }
+                }
+            }
+            out
+        }
+        None => Vec::new(),
+    };
+
+    let mut block = Block {
+        header: BlockHeader {
+            version,
+            prev_hash,
+            merkle_root,
+            time,
+            bits,
+            nonce,
+        },
+        transactions: txs,
+    };
+    block.header.merkle_root = block.merkle_root();
+    state.connect_block(block).map(|_| ())
+}
+
+fn sync_from_node(state: &mut ChainState) {
+    let client = match node_http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[warn] Miner could not build HTTP client: {e}");
+            return;
+        }
+    };
+
+    let remote_height = match fetch_status_height(&client) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[warn] Miner could not fetch node status: {e}");
+            return;
+        }
+    };
+
+    if remote_height <= state.height {
+        return;
+    }
+
+    let start = state.height;
+    let target = remote_height;
+    println!(
+        "[sync] Miner downloading blocks {}..{} from node",
+        start,
+        target.saturating_sub(1)
+    );
+
+    for h in start..target {
+        match fetch_block_json(&client, h as u64) {
+            Ok(v) => {
+                if let Err(e) = connect_block_from_json(state, &v) {
+                    eprintln!("[warn] Miner failed to connect block {}: {}", h, e);
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("[warn] Miner failed to download block {}: {}", h, e);
+                break;
+            }
+        }
+    }
+
+    if state.height < target {
+        eprintln!(
+            "[warn] Miner sync incomplete (local height {} < remote {})",
+            state.height,
+            target
+        );
+    } else {
+        println!("[ok] Miner caught up to node at height {}", state.height);
+    }
+}
+
 fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
     let dir = blocks_dir();
     fs::create_dir_all(&dir)?;
@@ -756,6 +919,7 @@ fn main() {
 
     // Load any persisted blocks so we resume from last mined height.
     load_persisted_blocks(&mut state);
+    sync_from_node(&mut state);
 
     if let Some((addr, pkh)) = miner_address_info() {
         let pkh_hex = hex::encode(pkh);
