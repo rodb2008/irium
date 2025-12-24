@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
+use std::env;
+use hex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,6 +33,40 @@ use serde_json::json;
 const MAX_PEERS: usize = 100;
 const MAX_MSGS_PER_SEC: u32 = 200;
 
+
+fn blocks_dir() -> PathBuf {
+    if let Ok(dir) = env::var("IRIUM_BLOCKS_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        PathBuf::from(home).join(".irium/blocks")
+    }
+}
+
+fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
+    let dir = blocks_dir();
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("block_{}.json", height));
+
+    let header = &block.header;
+    let hash = header.hash();
+
+    let json_block = serde_json::json!({
+        "height": height,
+        "header": {
+            "version": header.version,
+            "prev_hash": hex::encode(header.prev_hash),
+            "merkle_root": hex::encode(header.merkle_root),
+            "time": header.time,
+            "bits": format!("{:08x}", header.bits),
+            "nonce": header.nonce,
+            "hash": hex::encode(hash),
+        },
+        "tx_hex": block.transactions.iter().map(|tx| hex::encode(tx.serialize())).collect::<Vec<_>>()
+    });
+
+    fs::write(path, serde_json::to_string_pretty(&json_block)?)
+}
 #[derive(Clone)]
 pub struct P2PNode {
     bind_addr: SocketAddr,
@@ -1170,13 +1206,16 @@ async fn handle_incoming_with_sybil(
                                 let ok = {
                                     let mut guard = chain_arc.lock().unwrap();
                                     match guard.process_block(block.clone()) {
-                                        Ok((_h, _tip)) => {
+                                        Ok((new_height, _tip)) => {
                                             if let Some(ref mem) = mempool {
                                                 let mut mem_guard = mem.lock().unwrap();
                                                 for tx in block.transactions.iter().skip(1) {
                                                     mem_guard.remove(&tx.txid());
                                                 }
                                             }
+                                            // Persist the newly accepted block for miners/peers.
+                                            let persist_height = new_height.saturating_sub(1);
+                                            let _ = write_block_json(persist_height, &block);
                                             // Update headers to reflect advanced tip.
                                             guard.headers.clear();
                                             guard.header_chain.clear();
