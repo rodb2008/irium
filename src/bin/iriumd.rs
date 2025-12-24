@@ -13,6 +13,7 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use hex;
 
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
@@ -348,6 +349,111 @@ fn blocks_dir() -> PathBuf {
     } else {
         let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
         PathBuf::from(home).join(".irium/blocks")
+    }
+}
+
+
+fn load_persisted_blocks(state: &mut ChainState) {
+    let dir = blocks_dir();
+    if !dir.exists() {
+        return;
+    }
+    let mut entries: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    if let Ok(read_dir) = dir.read_dir() {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some(stripped) = name.strip_prefix("block_") {
+                    if let Some(num_part) = stripped.strip_suffix(".json") {
+                        if let Ok(h) = num_part.parse::<u64>() {
+                            entries.push((h, path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    entries.sort_by_key(|(h, _)| *h);
+
+    for (h, path) in entries {
+        match std::fs::read_to_string(&path) {
+            Ok(data) => {
+                let parsed: serde_json::Value = match serde_json::from_str(&data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[⚠️] Failed to parse {}: {}", path.display(), e);
+                        continue;
+                    }
+                };
+                let header_obj = match parsed.get("header") {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let get_hex32 = |key: &str| -> Option<[u8; 32]> {
+                    let s = header_obj.get(key)?.as_str()?;
+                    let bytes = hex::decode(s).ok()?;
+                    if bytes.len() != 32 {
+                        return None;
+                    }
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&bytes);
+                    Some(out)
+                };
+                let prev_hash = match get_hex32("prev_hash") {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let merkle_root = match get_hex32("merkle_root") {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let version = header_obj.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                let time = header_obj.get("time").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let bits_str = header_obj.get("bits").and_then(|v| v.as_str()).unwrap_or("1d00ffff");
+                let bits = u32::from_str_radix(bits_str, 16).unwrap_or(0x1d00_ffff);
+                let nonce = header_obj.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
+                let txs: Vec<Transaction> = match parsed.get("tx_hex").and_then(|v| v.as_array()) {
+                    Some(arr) => {
+                        let mut out = Vec::new();
+                        for t in arr {
+                            if let Some(s) = t.as_str() {
+                                if let Ok(bytes) = hex::decode(s) {
+                                    match decode_compact_tx(&bytes) {
+                                        Ok(tx) => out.push(tx),
+                                        Err(e) => eprintln!("[⚠️] Failed to decode tx in {}: {}", path.display(), e),
+                                    }
+                                }
+                            }
+                        }
+                        out
+                    }
+                    None => Vec::new(),
+                };
+
+                let mut block = Block {
+                    header: BlockHeader {
+                        version,
+                        prev_hash,
+                        merkle_root,
+                        time,
+                        bits,
+                        nonce,
+                    },
+                    transactions: txs,
+                };
+                block.header.merkle_root = block.merkle_root();
+
+                if let Err(e) = state.connect_block(block) {
+                    eprintln!("[⚠️] Failed to connect persisted block {}: {}", h, e);
+                }
+            }
+            Err(e) => eprintln!("[⚠️] Failed to read {}: {}", path.display(), e),
+        }
+    }
+
+    if state.height > 1 {
+        println!("[↩️] Resumed node height {} from persisted blocks", state.height);
     }
 }
 
@@ -841,7 +947,8 @@ async fn main() {
         genesis_block: block,
         pow_limit,
     };
-    let state = ChainState::new(params);
+    let mut state = ChainState::new(params);
+    load_persisted_blocks(&mut state);
     let shared_state = Arc::new(Mutex::new(state));
     let genesis_hash = locked.header.hash.clone();
     let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));
