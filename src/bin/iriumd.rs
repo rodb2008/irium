@@ -199,24 +199,6 @@ fn mask_ip(ip: &str) -> String {
     }
 }
 
-fn mask_peer_label(label: &str) -> String {
-    let mut parts = label.split_whitespace();
-    let addr = parts.next().unwrap_or(label);
-    let rest = parts.collect::<Vec<_>>().join(" ");
-    let (ip, port) = addr.split_once(':').unwrap_or((addr, ""));
-    let masked_ip = mask_ip(ip);
-    let masked_addr = if port.is_empty() {
-        masked_ip
-    } else {
-        format!("{}:{}", masked_ip, port)
-    };
-    if rest.is_empty() {
-        masked_addr
-    } else {
-        format!("{} {}", masked_addr, rest)
-    }
-}
-
 fn mask_seed_label(seed: &str) -> String {
     let (ip, port) = seed.split_once(':').unwrap_or((seed, ""));
     let masked_ip = mask_ip(ip);
@@ -321,16 +303,6 @@ fn build_seed_addrs(
             .cmp(&rep_mgr.score_of(&a.to_string()))
     });
     seeds
-}
-
-fn verbose_p2p() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("IRIUM_VERBOSE_P2P")
-            .ok()
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false)
-    })
 }
 
 fn json_log_enabled() -> bool {
@@ -502,7 +474,7 @@ async fn status(
             .anchors
             .as_ref()
             .map(|a| a.payload_digest().to_string());
-        (guard.height, anchors_digest)
+        (guard.tip_height(), anchors_digest)
     };
     Ok(Json(StatusResponse {
         height,
@@ -551,7 +523,7 @@ async fn metrics(
             .as_ref()
             .map(|a| a.payload_digest().to_string())
             .unwrap_or_default();
-        (g.height, state.anchors.is_some(), tip_hash, digest)
+        (g.tip_height(), state.anchors.is_some(), tip_hash, digest)
     };
     let (peer_count, node_id_hex, sybil_diff) = match state.p2p {
         Some(ref p2p) => {
@@ -636,7 +608,7 @@ async fn get_block(
     // Fallback: serve directly from in-memory chain state.
     let block_json = {
         let guard = state.chain.lock().unwrap();
-        let idx = if q.height == 0 { 0 } else { (q.height.saturating_sub(1)) as usize };
+        let idx = q.height as usize;
         if idx >= guard.chain.len() {
             return Err(StatusCode::NOT_FOUND);
         }
@@ -867,7 +839,7 @@ async fn submit_block(
         }
 
         let tip_hash = block.header.hash();
-        (chain.height, hex::encode(tip_hash))
+        (chain.tip_height(), hex::encode(tip_hash))
     };
 
     // If anchors are loaded, enforce anchor consistency on the new tip.
@@ -1108,7 +1080,7 @@ async fn main() {
                     }
                     let height = {
                         let chain = shared_clone.lock().unwrap();
-                        chain.height
+                        chain.tip_height()
                     };
                     println!(
                         "[{}] dialing seed {} (h={})",
@@ -1212,7 +1184,7 @@ async fn main() {
                         Ok(g) => g.len(),
                         Err(poisoned) => poisoned.into_inner().len(),
                     };
-                    (g.height, tip, mem_sz)
+                    (g.tip_height(), tip, mem_sz)
                 };
 
                 let peer_sample = peer_list

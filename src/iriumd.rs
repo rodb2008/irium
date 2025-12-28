@@ -171,7 +171,7 @@ async fn status(
             .anchors
             .as_ref()
             .map(|a| a.payload_digest().to_string());
-        (guard.height, anchors_digest)
+        (guard.tip_height(), anchors_digest)
     };
     Ok(Json(StatusResponse {
         height,
@@ -208,7 +208,7 @@ async fn metrics(State(state): State<AppState>) -> String {
             .last()
             .map(|b| hex::encode(b.header.hash()))
             .unwrap_or_else(|| state.genesis_hash.clone());
-        (g.height, state.anchors.is_some(), tip_hash)
+        (g.tip_height(), state.anchors.is_some(), tip_hash)
     };
     let peer_count = match state.p2p {
         Some(ref p2p) => p2p.peer_count().await,
@@ -480,7 +480,7 @@ async fn submit_block(
         }
 
         let tip_hash = block.header.hash();
-        (chain.height, hex::encode(tip_hash))
+        (chain.tip_height(), hex::encode(tip_hash))
     };
 
     // If anchors are loaded, enforce anchor consistency on the new tip.
@@ -670,7 +670,7 @@ async fn main() {
 
             let height = {
                 let chain = shared_state.lock().unwrap();
-                chain.height
+                chain.tip_height()
             };
 
             if let Err(e) = node
@@ -741,7 +741,7 @@ async fn main() {
 
                 let local_height = {
                     let g = chain_clone.lock().unwrap();
-                    g.height
+                    g.tip_height()
                 };
 
                 let peer_sample = peer_list.iter().take(5).cloned().collect::<Vec<_>>().join(", ");

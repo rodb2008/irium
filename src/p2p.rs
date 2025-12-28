@@ -40,7 +40,6 @@ pub struct P2PNode {
     connected: Arc<Mutex<HashSet<SocketAddr>>>,
     reputation: Arc<Mutex<ReputationManager>>,
     accept_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
-    handshake_failures: Arc<StdMutex<HashMap<IpAddr, (u32, Instant)>>>,
     dynamic_bans: Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
@@ -65,22 +64,66 @@ impl P2PNode {
         })
     }
 
-    fn log(msg: impl AsRef<str>) {
+    fn log_event(level: &str, category: &str, msg: impl AsRef<str>) {
         if Self::json_log_enabled() {
-            let payload = json!({"ts": Self::ts(), "level": "info", "msg": msg.as_ref()});
-            println!("{}", payload);
+            let payload = json!({
+                "ts": Self::ts(),
+                "level": level,
+                "cat": category,
+                "msg": msg.as_ref(),
+            });
+            if level == "error" {
+                eprintln!("{}", payload);
+            } else {
+                println!("{}", payload);
+            }
         } else {
-            println!("[{}] {}", Self::ts(), msg.as_ref());
+            let line = format!("[{}] [{}] {}", Self::ts(), category, msg.as_ref());
+            if level == "error" {
+                eprintln!("{}", line);
+            } else {
+                println!("{}", line);
+            }
         }
     }
 
+    fn log(msg: impl AsRef<str>) {
+        Self::log_event("info", "p2p", msg);
+    }
+
     fn log_err(msg: impl AsRef<str>) {
-        if Self::json_log_enabled() {
-            let payload = json!({"ts": Self::ts(), "level": "error", "msg": msg.as_ref()});
-            eprintln!("{}", payload);
-        } else {
-            eprintln!("[{}] {}", Self::ts(), msg.as_ref());
-        }
+        Self::log_event("error", "p2p", msg);
+    }
+
+    fn verbose_messages() -> bool {
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        *FLAG.get_or_init(|| {
+            std::env::var("IRIUM_VERBOSE_P2P")
+                .ok()
+                .map(|v| {
+                    let v = v.to_lowercase();
+                    !(v == "0" || v == "false" || v == "off")
+                })
+                .unwrap_or(true)
+        })
+    }
+
+    fn ping_interval() -> Duration {
+        let secs = std::env::var("IRIUM_P2P_PING_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+        let bounded = secs.max(5).min(300);
+        Duration::from_secs(bounded)
+    }
+
+    fn peer_timeout() -> Duration {
+        let secs = std::env::var("IRIUM_P2P_PEER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(180);
+        let bounded = secs.max(30).min(600);
+        Duration::from_secs(bounded)
     }
 
     fn is_banned(&self, ip: &IpAddr) -> bool {
@@ -180,7 +223,6 @@ impl P2PNode {
             connected: Arc::new(Mutex::new(HashSet::new())),
             reputation: Arc::new(Mutex::new(ReputationManager::new())),
             accept_log: Arc::new(Mutex::new(HashMap::new())),
-            handshake_failures: Arc::new(StdMutex::new(HashMap::new())),
             dynamic_bans: Arc::new(StdMutex::new(HashMap::new())),
             chain,
             mempool,
@@ -209,7 +251,6 @@ impl P2PNode {
         let agent = self.agent.clone();
         let relay_address = self.relay_address.clone();
         let accept_log = self.accept_log.clone();
-        let handshake_failures = self.handshake_failures.clone();
         let dynamic_bans = self.dynamic_bans.clone();
         let node_id = self.node_id.clone();
         let banned_ips = self.banned_ips.clone();
@@ -240,9 +281,7 @@ impl P2PNode {
                             continue;
                         }
                         Self::log(format!("Incoming P2P connection from {}", addr));
-                        let handshake_failures_task = handshake_failures.clone();
-                        let dynamic_bans_task = dynamic_bans.clone();
-                        let peers_inner = peers_arc.clone();
+                                                        let peers_inner = peers_arc.clone();
                         let connected_inner = connected.clone();
                         let dir = dir_arc.clone();
                         let rep = rep_arc.clone();
@@ -505,7 +544,7 @@ impl P2PNode {
         ));
         // Expect a sybil challenge from the remote and respond with a proof
         // before proceeding with the normal handshake.
-        let challenge_msg = match read_message(&mut stream).await {
+        let challenge_msg = match read_message_with_timeout(&mut stream, Self::peer_timeout()).await {
             Ok(m) => m,
             Err(e) => {
                 let mut rep = self.reputation.lock().await;
@@ -586,10 +625,30 @@ impl P2PNode {
             dir.register_connection(multiaddr, None, self.relay_address.clone(), None);
         }
 
+        let ping_writer = writer.clone();
+        let ping_addr = addr;
+        tokio::spawn(async move {
+            let interval = P2PNode::ping_interval();
+            loop {
+                tokio::time::sleep(interval).await;
+                let nonce = rand_core::OsRng.next_u64();
+                let ping = PingPayload { nonce };
+                let msg = ping.to_message();
+                if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
+                    P2PNode::log_event(
+                        "warn",
+                        "net",
+                        format!("P2P {}: ping failed: {}", ping_addr, e),
+                    );
+                    break;
+                }
+            }
+        });
+
         let dir = self.peers_directory.clone();
         let relay_addr = self.relay_address.clone();
         let chain_for_sync = self.chain.clone();
-        let _mempool_for_sync = self.mempool.clone();
+        let mempool_for_sync = self.mempool.clone();
         let reputation = self.reputation.clone();
         let peers_vec = self.peers.clone();
         let connected_vec = self.connected.clone();
@@ -608,8 +667,15 @@ impl P2PNode {
                     window_start = Instant::now();
                     msg_count = 1;
                 }
-                match read_message(&mut reader).await {
+                match read_message_with_timeout(&mut reader, P2PNode::peer_timeout()).await {
                     Ok(msg) => {
+                        if P2PNode::verbose_messages() {
+                            P2PNode::log_event(
+                                "info",
+                                "net",
+                                format!("P2P {}: recv {:?}", addr, msg.msg_type),
+                            );
+                        }
                         match msg.msg_type {
                             MessageType::Ping => {
                                 if let Ok(ping) = PingPayload::from_message(&msg) {
@@ -660,7 +726,7 @@ impl P2PNode {
                                     // Basic header-first sync trigger: if peer is ahead, request blocks.
                                     let local_height = {
                                         if let Some(ref c) = chain_for_sync {
-                                            c.lock().unwrap().height
+                                            c.lock().unwrap().tip_height()
                                         } else {
                                             0
                                         }
@@ -690,7 +756,7 @@ impl P2PNode {
                                         if let Some(ref chain_arc) = chain_for_sync {
                                             let (headers_bytes, blocks_bytes) = {
                                                 let guard = chain_arc.lock().unwrap();
-                                                let start = payload.height as usize;
+                                                let start = payload.height.saturating_add(1) as usize;
                                                 let mut headers = Vec::new();
                                                 let mut blocks = Vec::new();
                                                 for block in guard.chain.iter().skip(start).take(32) {
@@ -707,6 +773,437 @@ impl P2PNode {
                                                 let msg = BlockPayload { block_data: blk }.to_message();
                                                 let _ = send_message(&writer, msg, addr).await;
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                            MessageType::Pong => {
+                                if P2PNode::verbose_messages() {
+                                    P2PNode::log_event(
+                                        "info",
+                                        "net",
+                                        format!("P2P {}: received pong", addr),
+                                    );
+                                }
+                            }
+                            MessageType::GetPeers => {
+                                let peers_payload = {
+                                    let dir = dir.lock().await;
+                                    PeersPayload {
+                                        peers: dir.peers().iter().map(|p| p.multiaddr.clone()).collect(),
+                                    }
+                                };
+                                if let Ok(resp) = peers_payload.to_message() {
+                                    let _ = send_message(&writer, resp, addr).await;
+                                }
+                            }
+                            MessageType::Peers => {
+                                if let Ok(list) = PeersPayload::from_message(&msg) {
+                                    let mut dir = dir.lock().await;
+                                    for p in list.peers {
+                                        dir.register_connection(p, None, None, None);
+                                    }
+                                }
+                            }
+                            MessageType::GetHeaders => {
+                                if let Some(ref chain_arc) = chain_for_sync {
+                                    if let Ok(payload) = GetHeadersPayload::from_message(&msg) {
+                                        let headers_bytes = {
+                                            let guard = chain_arc.lock().unwrap();
+
+                                            let mut start_idx = 0usize;
+                                            if !payload.start_hash.is_empty() && payload.start_hash.len() == 32 {
+                                                let mut target = [0u8; 32];
+                                                target.copy_from_slice(&payload.start_hash);
+                                                if let Some(pos) =
+                                                    guard.chain.iter().position(|b| b.header.hash() == target)
+                                                {
+                                                    start_idx = pos;
+                                                }
+                                            }
+
+                                            let mut bytes = Vec::new();
+                                            for block in guard
+                                                .chain
+                                                .iter()
+                                                .skip(start_idx)
+                                                .take(payload.count as usize)
+                                            {
+                                                bytes.extend_from_slice(&block.header.serialize());
+                                            }
+                                            bytes
+                                        };
+
+                                        let msg = HeadersPayload { headers: headers_bytes }.to_message();
+                                        let _ = send_message(&writer, msg, addr).await;
+                                    }
+                                }
+                            }
+                            MessageType::Headers => {
+                                if let Some(ref chain_arc) = chain_for_sync {
+                                    if let Ok(payload) = HeadersPayload::from_message(&msg) {
+                                        let mut offset = 0usize;
+                                        while offset + 80 <= payload.headers.len() {
+                                            let slice = &payload.headers[offset..offset + 80];
+                                            let (header, used) = match crate::block::BlockHeader::deserialize(slice)
+                                            {
+                                                Ok(v) => v,
+                                                Err(e) => {
+                                                    eprintln!("Failed to parse header from {}: {}", addr, e);
+                                                    break;
+                                                }
+                                            };
+                                            offset += used;
+
+                                            let mut maybe_request: Option<Message> = None;
+                                            {
+                                                let mut guard = chain_arc.lock().unwrap();
+                                                match guard.add_header(header.clone()) {
+                                                    Ok(h) => {
+                                                        if guard.connects_to_tip(&header) {
+                                                            let get_blocks = GetBlocksPayload {
+                                                                start_hash: header.prev_hash.to_vec(),
+                                                                count: 1,
+                                                            };
+                                                            maybe_request = get_blocks.to_message().ok();
+                                                        } else {
+                                                            let _ = h;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("Header from {} rejected: {}", addr, e);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            if let Some(msg) = maybe_request.take() {
+                                                let _ = send_message(&writer, msg, addr).await;
+                                            }
+                                        }
+
+                                        if let Some(ref chain_arc) = chain_for_sync {
+                                            let request = {
+                                                let guard = chain_arc.lock().unwrap();
+                                                if let Some(best) = guard.best_header_if_better() {
+                                                    if let Some(path) =
+                                                        guard.header_path_to_known(best.header.hash())
+                                                    {
+                                                        if let Some(first_hash) = path.first() {
+                                                            let start_hash = guard
+                                                                .headers
+                                                                .get(first_hash)
+                                                                .map(|hw| hw.header.prev_hash)
+                                                                .unwrap_or([0u8; 32]);
+                                                            let count = path.len() as u32;
+                                                            if count > 0 {
+                                                                Some((start_hash, count))
+                                                            } else {
+                                                                None
+                                                            }
+                                                        } else {
+                                                            None
+                                                        }
+                                                    } else {
+                                                        None
+                                                    }
+                                                } else {
+                                                    None
+                                                }
+                                            };
+                                            if let Some((start_hash, count)) = request {
+                                                let get_blocks = GetBlocksPayload {
+                                                    start_hash: start_hash.to_vec(),
+                                                    count,
+                                                };
+                                                if let Ok(msg) = get_blocks.to_message() {
+                                                    let _ = send_message(&writer, msg, addr).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            MessageType::GetBlocks => {
+                                if let Some(ref chain_arc) = chain_for_sync {
+                                    if let Ok(payload) = GetBlocksPayload::from_message(&msg) {
+                                        let (blocks, start_height) = {
+                                            let guard = chain_arc.lock().unwrap();
+                                            let mut start_idx = 0usize;
+                                            if payload.start_hash.len() == 32 {
+                                                let mut target = [0u8; 32];
+                                                target.copy_from_slice(&payload.start_hash);
+                                                if let Some(pos) =
+                                                    guard.chain.iter().position(|b| b.header.hash() == target)
+                                                {
+                                                    start_idx = pos + 1;
+                                                }
+                                            }
+                                            let mut blocks = Vec::new();
+                                            let mut heights = Vec::new();
+                                            for (idx, b) in guard
+                                                .chain
+                                                .iter()
+                                                .enumerate()
+                                                .skip(start_idx)
+                                                .take(payload.count as usize)
+                                            {
+                                                blocks.push(b.serialize());
+                                                heights.push(idx as u64);
+                                            }
+                                            let start_h: u64 = heights.first().copied().unwrap_or(0);
+                                            (blocks, start_h)
+                                        };
+                                        if !blocks.is_empty() {
+                                            let end_h = start_height + blocks.len() as u64 - 1;
+                                            P2PNode::log(format!(
+                                                "P2P {}: sending {} blocks [{}-{}]",
+                                                addr,
+                                                blocks.len(),
+                                                start_height,
+                                                end_h
+                                            ));
+                                        }
+                                        for block_data in blocks {
+                                            let msg = BlockPayload { block_data }.to_message();
+                                            let _ = send_message(&writer, msg, addr).await;
+                                        }
+                                    }
+                                }
+                            }
+                            MessageType::Block => {
+                                if let Some(ref chain_arc) = chain_for_sync {
+                                    if let Ok(payload) = BlockPayload::from_message(&msg) {
+                                        match Block::deserialize(&payload.block_data) {
+                                            Ok((block, _)) => {
+                                                let (ok, new_height_opt) = {
+                                                    let mut guard = chain_arc.lock().unwrap();
+                                                    let mut new_height_opt = None;
+                                                    let ok = match guard.process_block(block.clone()) {
+                                                        Ok((new_height, _tip)) => {
+                                                            let bhash = block.header.hash();
+                                                            let short = hex::encode(bhash);
+                                                            let short = short.get(0..12).unwrap_or(&short);
+                                                            P2PNode::log(format!(
+                                                                "P2P {}: accepted block height {} hash {}",
+                                                                addr, new_height.saturating_sub(1), short
+                                                            ));
+                                                            if let Some(ref mem) = mempool_for_sync {
+                                                                let mut mem_guard = mem.lock().unwrap();
+                                                                for tx in block.transactions.iter().skip(1) {
+                                                                    mem_guard.remove(&tx.txid());
+                                                                }
+                                                            }
+                                                            guard.headers.clear();
+                                                            guard.header_chain.clear();
+                                                            new_height_opt = Some(new_height);
+                                                            true
+                                                        }
+                                                        Err(e) => {
+                                                            eprintln!(
+                                                                "Rejecting block from {} during P2P sync: {}",
+                                                                addr, e
+                                                            );
+                                                            false
+                                                        }
+                                                    };
+                                                    (ok, new_height_opt)
+                                                };
+                                                if let Some(new_height) = new_height_opt {
+                                                    let multiaddr = format!(
+                                                        "/ip4/{}/tcp/{}",
+                                                        addr.ip(),
+                                                        addr.port()
+                                                    );
+                                                    let mut directory = dir.lock().await;
+                                                    directory.record_height(
+                                                        &multiaddr,
+                                                        new_height.saturating_sub(1),
+                                                    );
+                                                }
+                                                let mut rep = reputation.lock().await;
+                                                rep.record_block(&addr.to_string(), ok);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Failed to decode block payload from {}: {}", addr, e);
+                                                let mut rep = reputation.lock().await;
+                                                rep.record_decode_error(&addr.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            MessageType::Tx => {
+                                if let Ok(payload) = TxPayload::from_message(&msg) {
+                                    match decode_full_tx(&payload.tx_data) {
+                                        Ok(tx) => {
+                                            if let (Some(ref chain_arc), Some(ref mem)) =
+                                                (&chain_for_sync, &mempool_for_sync)
+                                            {
+                                                let inv_bytes = {
+                                                    let fee = {
+                                                        let guard = chain_arc.lock().unwrap();
+                                                        match guard.calculate_fees(&tx) {
+                                                            Ok(f) => f,
+                                                            Err(e) => {
+                                                                eprintln!("Rejecting tx from {}: {}", addr, e);
+                                                                continue;
+                                                            }
+                                                        }
+                                                    };
+                                                    let relay_addr = {
+                                                        let dir = dir.lock().await;
+                                                        dir.relay_address_for_peer(&addr)
+                                                    };
+                                                    let mut mem_guard = mem.lock().unwrap();
+                                                    let peer_addr = addr.to_string();
+                                                    let txid = tx.txid();
+                                                    let txid_hex = hex::encode(txid);
+                                                    match mem_guard.add_transaction(
+                                                        tx.clone(),
+                                                        payload.tx_data.clone(),
+                                                        fee,
+                                                    ) {
+                                                        Ok(outcome) => {
+                                                            P2PNode::log_event(
+                                                                "info",
+                                                                "mempool",
+                                                                format!(
+                                                                    "P2P {}: accepted tx {} fee {}",
+                                                                    addr, txid_hex, fee
+                                                                ),
+                                                            );
+                                                            if let Some(evicted) = outcome.evicted {
+                                                                let evicted_hex = hex::encode(evicted);
+                                                                P2PNode::log_event(
+                                                                    "info",
+                                                                    "mempool",
+                                                                    format!(
+                                                                        "P2P {}: evicted tx {}",
+                                                                        addr, evicted_hex
+                                                                    ),
+                                                                );
+                                                            }
+                                                            mem_guard.record_relay(&outcome.txid, peer_addr.clone());
+                                                        }
+                                                        Err(e) => {
+                                                            P2PNode::log_event(
+                                                                "warn",
+                                                                "mempool",
+                                                                format!(
+                                                                    "P2P {}: rejected tx {}: {}",
+                                                                    addr, txid_hex, e
+                                                                ),
+                                                            );
+                                                            mem_guard.record_relay(&txid, peer_addr);
+                                                        }
+                                                    }
+                                                    if let Some(relay_addr) = relay_addr {
+                                                        mem_guard.record_relay_address(&txid, relay_addr);
+                                                    }
+                                                    InvPayload {
+                                                        txids: vec![hex::encode(tx.txid())],
+                                                    }
+                                                    .to_message()
+                                                    .ok()
+                                                    .map(|m| m.serialize())
+                                                };
+
+                                                if let Some(inv_bytes) = inv_bytes {
+                                                    let mut peers_guard = peers_vec.lock().await;
+                                                    for socket in peers_guard.iter_mut() {
+                                                        let _ = socket.lock().await.write_all(&inv_bytes).await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to decode tx from {}: {}", addr, e);
+                                        }
+                                    }
+                                }
+                            }
+                            MessageType::Inv => {
+                                if let Some(ref mem) = mempool_for_sync {
+                                    if let Ok(inv) = InvPayload::from_message(&msg) {
+                                        let mut needed = Vec::new();
+                                        {
+                                            let guard = mem.lock().unwrap();
+                                            for txid_hex in inv.txids {
+                                                if let Ok(bytes) = hex::decode(&txid_hex) {
+                                                    if bytes.len() == 32 {
+                                                        let mut txid = [0u8; 32];
+                                                        txid.copy_from_slice(&bytes);
+                                                        if !guard.contains(&txid) {
+                                                            needed.push(txid_hex.clone());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if !needed.is_empty() {
+                                            let gd = GetDataPayload { txids: needed };
+                                            if let Ok(msg) = gd.to_message() {
+                                                let _ = send_message(&writer, msg, addr).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            MessageType::GetData => {
+                                if let Some(ref mem) = mempool_for_sync {
+                                    if let Ok(gd) = GetDataPayload::from_message(&msg) {
+                                        let mut responses: Vec<Message> = Vec::new();
+                                        {
+                                            let guard = mem.lock().unwrap();
+                                            for txid_hex in gd.txids {
+                                                if let Ok(bytes) = hex::decode(&txid_hex) {
+                                                    if bytes.len() != 32 {
+                                                        continue;
+                                                    }
+                                                    let mut txid = [0u8; 32];
+                                                    txid.copy_from_slice(&bytes);
+                                                    if let Some(raw) = guard.raw_tx(&txid) {
+                                                        responses.push(TxPayload { tx_data: raw }.to_message());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        for msg in responses {
+                                            let _ = send_message(&writer, msg, addr).await;
+                                        }
+                                    }
+                                }
+                            }
+                            MessageType::Mempool => {
+                                if let Some(ref mem) = mempool_for_sync {
+                                    let tx_hashes: Vec<String> = {
+                                        let guard = mem.lock().unwrap();
+                                        guard.txids_hex()
+                                    };
+                                    let payload = MempoolPayload { tx_hashes };
+                                    if let Ok(msg) = payload.to_message() {
+                                        let _ = send_message(&writer, msg, addr).await;
+                                    }
+                                } else if let Ok(msg) = EmptyPayload::to_message(MessageType::Mempool) {
+                                    let _ = send_message(&writer, msg, addr).await;
+                                }
+                            }
+                            MessageType::RelayAddress => {
+                                if let Some(ref mem) = mempool_for_sync {
+                                    if let Ok(relay) = RelayAddressPayload::from_message(&msg) {
+                                        if relay.txid.len() == 64 {
+                                            if let Ok(bytes) = hex::decode(relay.txid) {
+                                                if bytes.len() == 32 {
+                                                    let mut txid = [0u8; 32];
+                                                    txid.copy_from_slice(&bytes);
+                                                    let mut guard = mem.lock().unwrap();
+                                                    guard.record_relay_address(&txid, relay.address);
+                                                }
+                                            }
+                                        } else if relay.txid.is_empty() {
+                                            let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
+                                            let mut dir = dir.lock().await;
+                                            dir.register_connection(multiaddr, None, Some(relay.address), None);
                                         }
                                     }
                                 }
@@ -772,6 +1269,19 @@ where
     Message::deserialize(&[&header[..], &payload[..]].concat())
 }
 
+async fn read_message_with_timeout<R>(
+    stream: &mut R,
+    timeout: Duration,
+) -> Result<Message, String>
+where
+    R: AsyncReadExt + Unpin,
+{
+    match tokio::time::timeout(timeout, read_message(stream)).await {
+        Ok(res) => res,
+        Err(_) => Err("peer read timeout".to_string()),
+    }
+}
+
 async fn send_message(
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     msg: Message,
@@ -789,7 +1299,7 @@ async fn send_message(
 fn local_height(chain: &Option<Arc<StdMutex<ChainState>>>) -> u64 {
     chain
         .as_ref()
-        .and_then(|c| c.lock().ok().map(|g| g.height))
+        .and_then(|c| c.lock().ok().map(|g| g.tip_height()))
         .unwrap_or(0)
 }
 
@@ -836,7 +1346,7 @@ async fn handle_incoming_with_sybil(
         .map_err(|e| format!("failed to send sybil challenge to {}: {}", addr, e))?;
 
     // Expect a proof in response.
-    let proof_msg = match read_message(&mut socket).await {
+    let proof_msg = match read_message_with_timeout(&mut socket, P2PNode::peer_timeout()).await {
         Ok(m) => m,
         Err(e) => {
             if e.contains("early eof") {
@@ -879,6 +1389,26 @@ async fn handle_incoming_with_sybil(
         guard.push(writer.clone());
     }
 
+    let ping_writer = writer.clone();
+    let ping_addr = addr;
+    tokio::spawn(async move {
+        let interval = P2PNode::ping_interval();
+        loop {
+            tokio::time::sleep(interval).await;
+            let nonce = rand_core::OsRng.next_u64();
+            let ping = PingPayload { nonce };
+            let msg = ping.to_message();
+            if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
+                P2PNode::log_event(
+                    "warn",
+                    "net",
+                    format!("P2P {}: ping failed: {}", ping_addr, e),
+                );
+                break;
+            }
+        }
+    });
+
     // Register the peer in the directory for future runtime seedlist updates.
     {
         let mut dir = directory.lock().await;
@@ -918,10 +1448,14 @@ async fn handle_incoming_with_sybil(
             window_start = Instant::now();
             msg_count = 1;
         }
-        let msg = match read_message(&mut reader).await {
+        let msg = match read_message_with_timeout(&mut reader, P2PNode::peer_timeout()).await {
             Ok(m) => m,
             Err(e) => return Err(e),
         };
+
+        if P2PNode::verbose_messages() {
+            P2PNode::log_event("info", "net", format!("P2P {}: recv {:?}", addr, msg.msg_type));
+        }
 
         match msg.msg_type {
             MessageType::Handshake => {
@@ -976,7 +1510,7 @@ async fn handle_incoming_with_sybil(
                         if let Some(ref chain_arc) = chain {
                             let (headers_bytes, blocks_bytes) = {
                                 let guard = chain_arc.lock().unwrap();
-                                let start = payload.height as usize;
+                                let start = payload.height.saturating_add(1) as usize;
                                 let mut headers = Vec::new();
                                 let mut blocks = Vec::new();
                                 for block in guard.chain.iter().skip(start).take(32) {
@@ -1176,7 +1710,7 @@ async fn handle_incoming_with_sybil(
                                 .take(payload.count as usize)
                             {
                                 blocks.push(b.serialize());
-                                heights.push((idx + 1) as u64);
+                                heights.push(idx as u64);
                             }
                             let start_h: u64 = heights.first().copied().unwrap_or(0);
                             (blocks, start_h)

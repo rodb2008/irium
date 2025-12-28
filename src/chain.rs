@@ -90,7 +90,7 @@ impl ChainState {
         let genesis_hash = genesis.header.hash();
         let work = ChainState::block_work(&genesis);
         state.block_store.insert(genesis_hash, genesis);
-        state.heights.insert(genesis_hash, 1);
+        state.heights.insert(genesis_hash, 0);
         state.cumulative_work.insert(genesis_hash, work.clone());
         state.total_work = work;
         state
@@ -99,6 +99,10 @@ impl ChainState {
     #[allow(dead_code)]
     pub fn expected_time(&self, height: u64) -> u64 {
         height * BLOCK_TARGET_INTERVAL
+    }
+
+    pub fn tip_height(&self) -> u64 {
+        self.height.saturating_sub(1)
     }
 
     pub fn target_for_height(&self, height: u64) -> Target {
@@ -194,7 +198,7 @@ impl ChainState {
         self.issued = new_supply;
 
         self.block_store.insert(hash, block);
-        self.heights.insert(hash, self.height);
+        self.heights.insert(hash, expected_height);
         self.cumulative_work.insert(hash, self.total_work.clone());
 
         Ok(())
@@ -560,7 +564,7 @@ impl ChainState {
         new_state
             .block_store
             .insert(genesis.header.hash(), genesis.clone());
-        new_state.heights.insert(genesis.header.hash(), 1);
+        new_state.heights.insert(genesis.header.hash(), 0);
         new_state
             .cumulative_work
             .insert(genesis.header.hash(), cumulative.clone());
@@ -572,7 +576,7 @@ impl ChainState {
             cumulative += ChainState::block_work(block);
             let h = block.header.hash();
             new_state.block_store.insert(h, block.clone());
-            new_state.heights.insert(h, (idx as u64) + 1);
+            new_state.heights.insert(h, idx as u64);
             new_state.cumulative_work.insert(h, cumulative.clone());
         }
 

@@ -50,7 +50,7 @@ async fn main() {
     println!(
         "[{}] 🔗 chain initialized at height {}",
         Utc::now().format("%H:%M:%S"),
-        chain.lock().unwrap().height
+        chain.lock().unwrap().tip_height()
     );
 
     let node = P2PNode::new(
@@ -78,7 +78,7 @@ async fn main() {
         let node_clone = node.clone();
         tokio::spawn(async move {
             for addr in seeds {
-                let h = chain_clone.lock().unwrap().height;
+                let h = chain_clone.lock().unwrap().tip_height();
                 if let Err(e) = node_clone
                     .connect_and_handshake(addr, h, &agent_clone)
                     .await
@@ -94,7 +94,7 @@ async fn main() {
     tokio::spawn(async move {
         loop {
             let peers = node_clone.peers_snapshot().await;
-            let height = chain.lock().unwrap().height;
+            let height = chain.lock().unwrap().tip_height();
             let seeds = irium_node_rs::network::SeedlistManager::new(128).merged_seedlist();
             println!(
                 "[{}] 🔁 height={} peers={} seeds={} [{}]",
