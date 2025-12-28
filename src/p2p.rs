@@ -126,6 +126,11 @@ impl P2PNode {
         Duration::from_secs(bounded)
     }
 
+    fn is_soft_block_reject(reason: &str) -> bool {
+        let msg = reason.to_lowercase();
+        msg.contains("duplicate block") || msg.contains("orphan") || msg.contains("unknown parent")
+    }
+
     fn is_banned(&self, ip: &IpAddr) -> bool {
         if self.banned_ips.contains(ip) {
             return true;
@@ -975,14 +980,15 @@ impl P2PNode {
                                     if let Ok(payload) = BlockPayload::from_message(&msg) {
                                         match Block::deserialize(&payload.block_data) {
                                             Ok((block, _)) => {
-                                                let (ok, new_height_opt) = {
+                                                let bhash = block.header.hash();
+                                                let short = hex::encode(bhash);
+                                                let short = short.get(0..12).unwrap_or(&short);
+                                                let (new_height_opt, record_verdict) = {
                                                     let mut guard = chain_arc.lock().unwrap();
                                                     let mut new_height_opt = None;
-                                                    let ok = match guard.process_block(block.clone()) {
+                                                    let mut record_verdict = None;
+                                                    match guard.process_block(block.clone()) {
                                                         Ok((new_height, _tip)) => {
-                                                            let bhash = block.header.hash();
-                                                            let short = hex::encode(bhash);
-                                                            let short = short.get(0..12).unwrap_or(&short);
                                                             P2PNode::log(format!(
                                                                 "P2P {}: accepted block height {} hash {}",
                                                                 addr, new_height.saturating_sub(1), short
@@ -996,17 +1002,32 @@ impl P2PNode {
                                                             guard.headers.clear();
                                                             guard.header_chain.clear();
                                                             new_height_opt = Some(new_height);
-                                                            true
+                                                            record_verdict = Some(true);
                                                         }
                                                         Err(e) => {
-                                                            eprintln!(
-                                                                "Rejecting block from {} during P2P sync: {}",
-                                                                addr, e
-                                                            );
-                                                            false
+                                                            if P2PNode::is_soft_block_reject(&e) {
+                                                                P2PNode::log_event(
+                                                                    "info",
+                                                                    "chain",
+                                                                    format!(
+                                                                        "P2P {}: ignored block {} ({})",
+                                                                        addr, short, e
+                                                                    ),
+                                                                );
+                                                            } else {
+                                                                P2PNode::log_event(
+                                                                    "warn",
+                                                                    "chain",
+                                                                    format!(
+                                                                        "P2P {}: rejected block {}: {}",
+                                                                        addr, short, e
+                                                                    ),
+                                                                );
+                                                                record_verdict = Some(false);
+                                                            }
                                                         }
-                                                    };
-                                                    (ok, new_height_opt)
+                                                    }
+                                                    (new_height_opt, record_verdict)
                                                 };
                                                 if let Some(new_height) = new_height_opt {
                                                     let multiaddr = format!(
@@ -1020,8 +1041,10 @@ impl P2PNode {
                                                         new_height.saturating_sub(1),
                                                     );
                                                 }
-                                                let mut rep = reputation.lock().await;
-                                                rep.record_block(&addr.to_string(), ok);
+                                                if let Some(ok) = record_verdict {
+                                                    let mut rep = reputation.lock().await;
+                                                    rep.record_block(&addr.to_string(), ok);
+                                                }
                                             }
                                             Err(e) => {
                                                 eprintln!("Failed to decode block payload from {}: {}", addr, e);
@@ -1737,14 +1760,15 @@ async fn handle_incoming_with_sybil(
                     if let Ok(payload) = BlockPayload::from_message(&msg) {
                         match Block::deserialize(&payload.block_data) {
                             Ok((block, _)) => {
-                                let (ok, new_height_opt) = {
+                                let bhash = block.header.hash();
+                                let short = hex::encode(bhash);
+                                let short = short.get(0..12).unwrap_or(&short);
+                                let (new_height_opt, record_verdict) = {
                                     let mut guard = chain_arc.lock().unwrap();
                                     let mut new_height_opt = None;
-                                    let ok = match guard.process_block(block.clone()) {
+                                    let mut record_verdict = None;
+                                    match guard.process_block(block.clone()) {
                                         Ok((new_height, _tip)) => {
-                                            let bhash = block.header.hash();
-                                            let short = hex::encode(bhash);
-                                            let short = short.get(0..12).unwrap_or(&short);
                                             P2PNode::log(format!(
                                                 "P2P {}: accepted block height {} hash {}",
                                                 addr, new_height.saturating_sub(1), short
@@ -1759,25 +1783,42 @@ async fn handle_incoming_with_sybil(
                                             guard.headers.clear();
                                             guard.header_chain.clear();
                                             new_height_opt = Some(new_height);
-                                            true
+                                            record_verdict = Some(true);
                                         }
                                         Err(e) => {
-                                            eprintln!(
-                                                "Rejecting block from {} during P2P sync: {}",
-                                                addr, e
-                                            );
-                                            false
+                                            if P2PNode::is_soft_block_reject(&e) {
+                                                P2PNode::log_event(
+                                                    "info",
+                                                    "chain",
+                                                    format!(
+                                                        "P2P {}: ignored block {} ({})",
+                                                        addr, short, e
+                                                    ),
+                                                );
+                                            } else {
+                                                P2PNode::log_event(
+                                                    "warn",
+                                                    "chain",
+                                                    format!(
+                                                        "P2P {}: rejected block {}: {}",
+                                                        addr, short, e
+                                                    ),
+                                                );
+                                                record_verdict = Some(false);
+                                            }
                                         }
-                                    };
-                                    (ok, new_height_opt)
+                                    }
+                                    (new_height_opt, record_verdict)
                                 };
                                 if let Some(new_height) = new_height_opt {
                                     let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
                                     let mut directory = directory.lock().await;
                                     directory.record_height(&multiaddr, new_height.saturating_sub(1));
                                 }
-                                let mut rep = reputation.lock().await;
-                                rep.record_block(&addr.to_string(), ok);
+                                if let Some(ok) = record_verdict {
+                                    let mut rep = reputation.lock().await;
+                                    rep.record_block(&addr.to_string(), ok);
+                                }
                             }
                             Err(e) => {
                                 eprintln!("Failed to decode block payload from {}: {}", addr, e);
