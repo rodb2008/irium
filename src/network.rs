@@ -326,32 +326,21 @@ impl PeerDirectory {
             .and_then(|r| r.relay_address.clone())
     }
 
-    /// Apply seedlist policy: keep baseline seeds, promote peers active >= 7 days,
-    /// drop peers idle > 24h.
+    /// Apply seedlist policy: promote peers active >= 7 days,
+    /// drop peers idle > 24h. Baseline seeds remain in the static seedlist file.
     pub fn refresh_seedlist_with_policy(&self) {
-        let mut seeds = self.seed_manager.merged_seedlist();
         let now = now_secs();
+        let mut seeds = Vec::new();
 
         for rec in self.records.values() {
             let age_days = (now - rec.first_seen) / 86_400.0;
             let idle_hours = (now - rec.last_seen) / 3600.0;
             if age_days >= 7.0 && idle_hours <= 24.0 {
                 if let Some(ip) = normalize_seed(&rec.multiaddr) {
-                    if !seeds.contains(&ip) {
-                        seeds.push(ip);
-                    }
+                    seeds.push(ip);
                 }
             }
         }
-
-        seeds.retain(|addr| {
-            if let Some(rec) = self.records.get(addr) {
-                let idle_hours = (now - rec.last_seen) / 3600.0;
-                idle_hours <= 24.0
-            } else {
-                true
-            }
-        });
 
         seeds.sort();
         seeds.dedup();
