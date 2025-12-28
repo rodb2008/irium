@@ -752,7 +752,7 @@ async fn main() {
                 if json_log_enabled() {
                     println!("{}", json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "heartbeat", "peers": peer_ips.len(), "peer_sample": peer_sample, "seeds": seed_sample, "height": local_height, "local_height": local_height, "chain_height": chain_height}));
                 } else {
-                    println!("[{}] 🔁 heartbeat chain={} local={} peers={} [{}] seeds=[{}]",                        Utc::now().format("%H:%M:%S"),                        chain_height,                        local_height,                        peer_ips.len(),                        peer_sample,                        seed_sample                    );
+                    println!("[{}] 🔁 heartbeat Irium chain height={} local height={} peers={} [{}] seeds=[{}]",                        Utc::now().format("%H:%M:%S"),                        chain_height,                        local_height,                        peer_ips.len(),                        peer_sample,                        seed_sample                    );
                 }
             }
         });

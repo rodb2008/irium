@@ -1219,7 +1219,7 @@ async fn main() {
                 } else {
                     let short_tip = tip_hash.chars().take(12).collect::<String>();
                     println!(
-                        "[{}] ❤️ heartbeat chain={} local={} ⛏ tip={} 👥 peers={} [{}] 🌱 seedlist={} 🧺 mempool={}",
+                        "[{}] ❤️ heartbeat Irium chain height={} local height={} ⛏ tip={} 👥 peers={} [{}] 🌱 seedlist={} 🧺 mempool={}",
                         Utc::now().format("%H:%M:%S"),
                         chain_height,
                         local_height,
