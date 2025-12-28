@@ -1153,6 +1153,8 @@ async fn main() {
                     peer_list.push("-".to_string());
                 }
 
+                let best_peer_height = peers.iter().filter_map(|p| p.last_height).max();
+
                 let mut seed_ips = std::collections::HashSet::new();
                 let mut seed_list: Vec<String> = Vec::new();
                 for s in seeds.iter() {
@@ -1186,6 +1188,7 @@ async fn main() {
                     };
                     (g.tip_height(), tip, mem_sz)
                 };
+                let chain_height = best_peer_height.unwrap_or(local_height);
 
                 let peer_sample = peer_list
                     .iter()
@@ -1203,6 +1206,8 @@ async fn main() {
                             "level": "info",
                             "event": "heartbeat",
                             "height": local_height,
+                            "local_height": local_height,
+                            "chain_height": chain_height,
                             "peers": peer_ips.len(),
                             "peer_sample": peer_sample,
                             "seed_count": seed_count,
@@ -1214,8 +1219,9 @@ async fn main() {
                 } else {
                     let short_tip = tip_hash.chars().take(12).collect::<String>();
                     println!(
-                        "[{}] ❤️ heartbeat height={} ⛏ tip={} 👥 peers={} [{}] 🌱 seedlist={} 🧺 mempool={}",
+                        "[{}] ❤️ heartbeat chain={} local={} ⛏ tip={} 👥 peers={} [{}] 🌱 seedlist={} 🧺 mempool={}",
                         Utc::now().format("%H:%M:%S"),
+                        chain_height,
                         local_height,
                         short_tip,
                         peer_ips.len(),

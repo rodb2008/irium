@@ -717,6 +717,8 @@ async fn main() {
                     peer_list.push("-".to_string());
                 }
 
+                let best_peer_height = peers.iter().filter_map(|p| p.last_height).max();
+
                 let mut seed_ips = std::collections::HashSet::new();
                 let mut seed_list: Vec<String> = Vec::new();
                 for s in seeds.iter() {
@@ -743,19 +745,14 @@ async fn main() {
                     let g = chain_clone.lock().unwrap();
                     g.tip_height()
                 };
+                let chain_height = best_peer_height.unwrap_or(local_height);
 
                 let peer_sample = peer_list.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
                 let seed_sample = seed_list.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
                 if json_log_enabled() {
-                    println!("{}", json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "heartbeat", "peers": peer_ips.len(), "peer_sample": peer_sample, "seeds": seed_sample, "height": local_height}));
+                    println!("{}", json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "heartbeat", "peers": peer_ips.len(), "peer_sample": peer_sample, "seeds": seed_sample, "height": local_height, "local_height": local_height, "chain_height": chain_height}));
                 } else {
-                    println!("[{}] 🔁 heartbeat peers={} [{}] seeds=[{}] height={}",
-                        Utc::now().format("%H:%M:%S"),
-                        peer_ips.len(),
-                        peer_sample,
-                        seed_sample,
-                        local_height
-                    );
+                    println!("[{}] 🔁 heartbeat chain={} local={} peers={} [{}] seeds=[{}]",                        Utc::now().format("%H:%M:%S"),                        chain_height,                        local_height,                        peer_ips.len(),                        peer_sample,                        seed_sample                    );
                 }
             }
         });
