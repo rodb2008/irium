@@ -834,6 +834,7 @@ fn mine_once(chain: &mut ChainState) -> Result<(), String> {
                     json!({
                         "event": "progress",
                         "height": height,
+                        "tip_height": height.saturating_sub(1),
                         "nonce": nonce,
                         "rate_hs": rate,
                         "ts": Utc::now().format("%H:%M:%S").to_string()
@@ -842,13 +843,14 @@ fn mine_once(chain: &mut ChainState) -> Result<(), String> {
             } else {
                 if elapsed > 0.0 {
                     println!(
-                        "  mining height {}: nonce {} rate {:.2} H/s",
+                        "  mining next height {} (tip {}): nonce {} rate {:.2} H/s",
                         height,
+                        height.saturating_sub(1),
                         nonce,
                         nonce as f64 / elapsed
                     );
                 } else {
-                    println!("[⏱️] height {} nonce {}", height, nonce);
+                    println!("[⏱️] next height {} tip {} nonce {}", height, height.saturating_sub(1), nonce);
                 }
             }
         }
@@ -869,10 +871,10 @@ fn main() {
     if json_log_enabled() {
         println!(
             "{}",
-            json!({"event": "miner_start", "height": state.height, "ts": Utc::now().format("%H:%M:%S").to_string()})
+            json!({"event": "miner_start", "height": state.height, "tip_height": state.tip_height(), "ts": Utc::now().format("%H:%M:%S").to_string()})
         );
     } else {
-        println!("[⛏️] Irium Rust miner starting at height {}", state.height);
+        println!("[⛏️] Irium Rust miner starting at tip {} (next {})", state.tip_height(), state.height);
     }
 
     // Optionally report anchors digest if anchors.json is available.
@@ -918,20 +920,20 @@ fn main() {
         if json_log_enabled() {
             println!(
                 "{}",
-                json!({"event": "mining_start", "height": state.height, "ts": Utc::now().format("%H:%M:%S").to_string()})
+                json!({"event": "mining_start", "height": state.height, "tip_height": state.tip_height(), "ts": Utc::now().format("%H:%M:%S").to_string()})
             );
         } else {
-            println!("[▶️] Mining height {}", state.height);
+            println!("[▶️] Mining next height {} (tip {})", state.height, state.tip_height());
         }
 
         if let Err(e) = mine_once(&mut state) {
             if json_log_enabled() {
                 eprintln!(
                     "{}",
-                    json!({"event": "mining_failed", "error": e.to_string(), "height": state.height, "ts": Utc::now().format("%H:%M:%S").to_string()})
+                    json!({"event": "mining_failed", "error": e.to_string(), "height": state.height, "tip_height": state.tip_height(), "ts": Utc::now().format("%H:%M:%S").to_string()})
                 );
             } else {
-                eprintln!("[⚠️] Mining failed at height {}: {e}", state.height);
+                eprintln!("[⚠️] Mining failed at next height {} (tip {}): {e}", state.height, state.tip_height());
             }
             break;
         }
