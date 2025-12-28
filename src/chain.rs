@@ -164,9 +164,14 @@ impl ChainState {
         self.anchors = Some(anchors);
     }
 
-    /// Approximate work for a block based on its target.
+    /// Work for a block based on its target (Bitcoin-style).
     pub fn block_work(block: &Block) -> BigUint {
-        BigUint::from(0xffff_ffffu64) / block.header.target().to_target()
+        let target = block.header.target().to_target();
+        if target.is_zero() {
+            return BigUint::zero();
+        }
+        let max = BigUint::from(1u8) << 256;
+        max / (target + BigUint::from(1u8))
     }
 
     #[allow(dead_code)]
@@ -330,7 +335,7 @@ impl ChainState {
         let (_fees, _coinbase_total, subsidy_created) =
             self.validate_and_apply_transactions(&block, 0, 0, false, Some(MAX_MONEY))?;
 
-        self.total_work = BigUint::from(0xffff_ffffu64) / block.header.target().to_target();
+        self.total_work = ChainState::block_work(&block);
         self.chain.push(block);
         self.height = 1;
         self.issued = subsidy_created;
