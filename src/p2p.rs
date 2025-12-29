@@ -158,6 +158,15 @@ impl P2PNode {
         Duration::from_secs(bounded)
     }
 
+    fn handshake_interval() -> Duration {
+        let secs = std::env::var("IRIUM_P2P_HANDSHAKE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
+        let bounded = secs.max(30).min(600);
+        Duration::from_secs(bounded)
+    }
+
     fn peer_timeout() -> Duration {
         let secs = std::env::var("IRIUM_P2P_PEER_TIMEOUT_SECS")
             .ok()
@@ -597,7 +606,7 @@ impl P2PNode {
     pub async fn connect_and_handshake(
         &self,
         addr: SocketAddr,
-        local_height: u64,
+        local_height_val: u64,
         agent: &str,
     ) -> Result<(), String> {
         if self.is_connected(&addr).await {
@@ -678,7 +687,7 @@ impl P2PNode {
         let payload = HandshakePayload {
             version: 1,
             agent: agent.to_string(),
-            height: local_height,
+            height: local_height_val,
             timestamp: Utc::now().timestamp(),
             port: self.bind_addr.port(),
             checkpoint_height: None,
@@ -718,8 +727,15 @@ impl P2PNode {
 
         let ping_writer = writer.clone();
         let ping_addr = addr;
+        let ping_chain = self.chain.clone();
+        let ping_agent = agent.to_string();
+        let ping_relay = self.relay_address.clone();
+        let ping_port = self.bind_addr.port();
+        let ping_node_id = self.node_id.clone();
         tokio::spawn(async move {
             let interval = P2PNode::ping_interval();
+            let mut last_height = crate::p2p::local_height(&ping_chain);
+            let mut last_handshake = Instant::now();
             loop {
                 tokio::time::sleep(interval).await;
                 let nonce = rand_core::OsRng.next_u64();
@@ -732,6 +748,26 @@ impl P2PNode {
                         format!("P2P {}: ping failed: {}", ping_addr, e),
                     );
                     break;
+                }
+                let current_height = crate::p2p::local_height(&ping_chain);
+                let handshake_due = last_handshake.elapsed() >= P2PNode::handshake_interval();
+                if handshake_due || current_height != last_height {
+                    let payload = HandshakePayload {
+                        version: 1,
+                        agent: ping_agent.clone(),
+                        height: current_height,
+                        timestamp: Utc::now().timestamp(),
+                        port: ping_port,
+                        checkpoint_height: None,
+                        checkpoint_hash: None,
+                        relay_address: ping_relay.clone(),
+                        node_id: Some(hex::encode(&ping_node_id)),
+                    };
+                    if let Ok(msg) = payload.to_message() {
+                        let _ = send_message(&ping_writer, msg, ping_addr).await;
+                    }
+                    last_height = current_height;
+                    last_handshake = Instant::now();
                 }
             }
         });
@@ -1508,8 +1544,15 @@ async fn handle_incoming_with_sybil(
 
     let ping_writer = writer.clone();
     let ping_addr = addr;
+    let ping_chain = chain.clone();
+    let ping_agent = agent.clone();
+    let ping_relay = relay_address.clone();
+    let ping_port = bind_addr.port();
+    let ping_node_id = node_id.clone();
     tokio::spawn(async move {
         let interval = P2PNode::ping_interval();
+        let mut last_height = crate::p2p::local_height(&ping_chain);
+        let mut last_handshake = Instant::now();
         loop {
             tokio::time::sleep(interval).await;
             let nonce = rand_core::OsRng.next_u64();
@@ -1522,6 +1565,26 @@ async fn handle_incoming_with_sybil(
                     format!("P2P {}: ping failed: {}", ping_addr, e),
                 );
                 break;
+            }
+            let current_height = crate::p2p::local_height(&ping_chain);
+            let handshake_due = last_handshake.elapsed() >= P2PNode::handshake_interval();
+            if handshake_due || current_height != last_height {
+                let payload = HandshakePayload {
+                    version: 1,
+                    agent: ping_agent.clone(),
+                    height: current_height,
+                    timestamp: Utc::now().timestamp(),
+                    port: ping_port,
+                    checkpoint_height: None,
+                    checkpoint_hash: None,
+                    relay_address: ping_relay.clone(),
+                    node_id: Some(hex::encode(&ping_node_id)),
+                };
+                if let Ok(msg) = payload.to_message() {
+                    let _ = send_message(&ping_writer, msg, ping_addr).await;
+                }
+                last_height = current_height;
+                last_handshake = Instant::now();
             }
         }
     });
