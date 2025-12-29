@@ -52,8 +52,8 @@ fn format_irm(amount: u64) -> String {
 
 #[derive(Deserialize)]
 struct BalanceResponse {
-    address: String,
     balance: u64,
+    utxo_count: usize,
 }
 
 fn main() {
@@ -131,9 +131,9 @@ fn main() {
                 format!("{} IRM", irm_display)
             };
             println!(
-                "address {} balance {}",
-                payload.address,
-                balance_display
+                "balance {} blocks {}",
+                balance_display,
+                payload.utxo_count
             );
         }
         _ => {
