@@ -1250,6 +1250,7 @@ async fn main() {
                     };
                     (g.tip_height(), tip, mem_sz)
                 };
+                let next_height = local_height.saturating_add(1);
                 let peer_height = best_peer_height.unwrap_or(0);
                 let chain_height = std::cmp::max(local_height, peer_height);
 
@@ -1272,6 +1273,7 @@ async fn main() {
                             "local_height": local_height,
                             "chain_height": chain_height,
                             "peer_height": peer_height,
+                            "next_height": next_height,
                             "peers": peer_ips.len(),
                             "peer_sample": peer_sample,
                             "seed_count": seed_count,
@@ -1283,10 +1285,11 @@ async fn main() {
                 } else {
                     let short_tip = tip_hash.chars().take(12).collect::<String>();
                     println!(
-                        "[{}] ❤️ heartbeat Irium chain height={} local height={} ⛏ tip={} 👥 peers={} 🌱 seedlist={} 🧺 mempool={}",
+                        "[{}] ❤️ heartbeat Irium chain height={} local height={} 🧱 next height={} ⛏ tip={} 👥 peers={} 🌱 seedlist={} 🧺 mempool={}",
                         Utc::now().format("%H:%M:%S"),
                         chain_height,
                         local_height,
+                        next_height,
                         short_tip,
                         peer_ips.len(),
                         seed_count,
