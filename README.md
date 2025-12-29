@@ -52,6 +52,16 @@ source ~/.cargo/env
 - Mined blocks are auto-submitted to http://127.0.0.1:38300/rpc/submit_block; set `IRIUM_NODE_RPC` if your node listens elsewhere.
 Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
 
+## Wallet
+The wallet CLI can query balances from a running node:
+```bash
+cd /home/irium/irium
+source ~/.cargo/env
+export IRIUM_RPC_URL=http://127.0.0.1:38300
+./target/release/irium-wallet balance <base58_address>
+```
+Use `irium-wallet address-to-pkh <base58_address>` to convert an address to its 20-byte pubkey hash.
+
 ## SPV Tooling
 `irium-spv` verifies merkle proofs against stored block JSON snapshots:
 ```bash

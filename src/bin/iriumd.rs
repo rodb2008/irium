@@ -13,8 +13,10 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use hex;
 
+use bs58;
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
 use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, OutPoint};
@@ -69,10 +71,24 @@ struct UtxoResponse {
     is_coinbase: bool,
 }
 
+#[derive(Serialize)]
+struct BalanceResponse {
+    address: String,
+    pkh: String,
+    balance: u64,
+    utxo_count: usize,
+    height: u64,
+}
+
 #[derive(Deserialize)]
 struct UtxoQuery {
     txid: String,
     index: u32,
+}
+
+#[derive(Deserialize)]
+struct BalanceQuery {
+    address: String,
 }
 
 #[derive(Deserialize)]
@@ -336,6 +352,42 @@ fn json_log_enabled() -> bool {
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false)
     })
+}
+
+fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
+    let data = bs58::decode(addr).into_vec().ok()?;
+    if data.len() < 25 {
+        return None;
+    }
+    let (body, checksum) = data.split_at(data.len() - 4);
+    let first = Sha256::digest(body);
+    let second = Sha256::digest(&first);
+    if &second[0..4] != checksum {
+        return None;
+    }
+    if body.len() < 21 {
+        return None;
+    }
+    let payload = &body[1..];
+    if payload.len() != 20 {
+        return None;
+    }
+    Some(payload.to_vec())
+}
+
+fn p2pkh_hash_from_script(script: &[u8]) -> Option<[u8; 20]> {
+    if script.len() != 25 {
+        return None;
+    }
+    if script[0] != 0x76 || script[1] != 0xa9 || script[2] != 0x14 {
+        return None;
+    }
+    if script[23] != 0x88 || script[24] != 0xac {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&script[3..23]);
+    Some(out)
 }
 
 fn blocks_dir() -> PathBuf {
@@ -682,6 +734,43 @@ async fn get_utxo(
     } else {
         Err(StatusCode::NOT_FOUND)
     }
+}
+
+async fn get_balance(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Query(q): Query<BalanceQuery>,
+) -> Result<Json<BalanceResponse>, StatusCode> {
+    check_rate(&state, &addr)?;
+    let pkh = base58_p2pkh_to_hash(&q.address).ok_or(StatusCode::BAD_REQUEST)?;
+    if pkh.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut pkh_arr = [0u8; 20];
+    pkh_arr.copy_from_slice(&pkh);
+
+    let (balance, utxo_count, height) = {
+        let guard = state.chain.lock().unwrap();
+        let mut balance = 0u64;
+        let mut utxo_count = 0usize;
+        for utxo in guard.utxos.values() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if script_pkh == pkh_arr {
+                    balance = balance.saturating_add(utxo.output.value);
+                    utxo_count += 1;
+                }
+            }
+        }
+        (balance, utxo_count, guard.tip_height())
+    };
+
+    Ok(Json(BalanceResponse {
+        address: q.address,
+        pkh: hex::encode(pkh_arr),
+        balance,
+        utxo_count,
+        height,
+    }))
 }
 
 async fn get_block(
@@ -1341,6 +1430,7 @@ async fn main() {
         .route("/status", get(status))
         .route("/peers", get(peers))
         .route("/metrics", get(metrics))
+        .route("/rpc/balance", get(get_balance))
         .route("/rpc/utxo", get(get_utxo))
         .route("/rpc/block", get(get_block))
         .route("/rpc/submit_block", post(submit_block))
