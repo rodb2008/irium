@@ -801,6 +801,8 @@ impl P2PNode {
         tokio::spawn(async move {
             let mut msg_count: u32 = 0;
             let mut window_start = Instant::now();
+            let mut last_handshake_height: Option<u64> = None;
+            let mut last_handshake_agent: Option<String> = None;
             loop {
                 if window_start.elapsed() < Duration::from_secs(1) {
                     msg_count += 1;
@@ -816,7 +818,7 @@ impl P2PNode {
                     Ok(msg) => {
                         if P2PNode::verbose_messages() {
                             match msg.msg_type {
-                                MessageType::Ping | MessageType::Pong => {}
+                                MessageType::Ping | MessageType::Pong | MessageType::Handshake | MessageType::Peers => {}
                                 _ => {
                                     P2PNode::log_event(
                                         "info",
@@ -871,10 +873,16 @@ impl P2PNode {
                                         );
                                         dir_guard.record_height(&multiaddr, payload.height);
                                     }
-                                    Self::log(format!(
-                                        "P2P outbound {}: received handshake (agent {}, height {})",
-                                        addr, agent_str, payload.height
-                                    ));
+                                    let should_log = last_handshake_height != Some(payload.height)
+                                        || last_handshake_agent.as_deref() != Some(agent_str.as_str());
+                                    if should_log {
+                                        Self::log(format!(
+                                            "P2P outbound {}: received handshake (agent {}, height {})",
+                                            addr, agent_str, payload.height
+                                        ));
+                                    }
+                                    last_handshake_height = Some(payload.height);
+                                    last_handshake_agent = Some(agent_str.clone());
                                     // If we have a relay address, advertise it back.
                                     if let Some(relay) = relay_addr.clone() {
                                         let relay_msg = RelayAddressPayload {
@@ -1654,7 +1662,7 @@ async fn handle_incoming_with_sybil(
 
         if P2PNode::verbose_messages() {
             match msg.msg_type {
-                MessageType::Ping | MessageType::Pong => {}
+                MessageType::Ping | MessageType::Pong | MessageType::Handshake | MessageType::Peers => {}
                 _ => {
                     P2PNode::log_event("info", "net", format!("P2P {}: recv {:?}", addr, msg.msg_type));
                 }
