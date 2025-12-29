@@ -1,4 +1,5 @@
 use reqwest::blocking::Client;
+use reqwest::Certificate;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::{env, fs, sync::OnceLock};
@@ -311,6 +312,27 @@ struct SubmitBlockRequest {
     tx_hex: Vec<String>,
 }
 
+fn rpc_client() -> Result<Client, String> {
+    let mut builder = Client::builder().timeout(Duration::from_secs(5));
+    if let Ok(path) = env::var("IRIUM_RPC_CA") {
+        let pem = fs::read(&path).map_err(|e| format!("read CA {path}: {e}"))?;
+        let cert = Certificate::from_pem(&pem)
+            .map_err(|e| format!("invalid CA {path}: {e}"))?;
+        builder = builder.add_root_certificate(cert);
+    }
+    let insecure = env::var("IRIUM_RPC_INSECURE")
+        .ok()
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false);
+    if insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build().map_err(|e| format!("build client: {e}"))
+}
+
 fn node_rpc_base() -> String {
     env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "http://127.0.0.1:38300".to_string())
 }
@@ -336,10 +358,7 @@ fn submit_block_to_node(height: u64, block: &Block) -> Result<(), String> {
             .collect(),
     };
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("build client: {e}"))?;
+    let client = rpc_client()?;
 
     let base = node_rpc_base();
     let url = format!("{}/rpc/submit_block", base.trim_end_matches("/"));
@@ -468,10 +487,7 @@ fn load_persisted_blocks(state: &mut ChainState) {
 
 
 fn node_http_client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("build client: {e}"))
+    rpc_client()
 }
 
 fn fetch_status_height(client: &Client) -> Result<u64, String> {

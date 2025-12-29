@@ -2,6 +2,7 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::env;
+use std::fs;
 use std::time::Duration;
 
 // Base58 P2PKH decoder (version byte + 20-byte hash + 4-byte checksum)
@@ -48,6 +49,27 @@ fn format_irm(amount: u64) -> String {
     } else {
         format!("{}.{}", whole, format!("{:08}", frac))
     }
+}
+
+fn rpc_client() -> Result<Client, String> {
+    let mut builder = Client::builder().timeout(Duration::from_secs(10));
+    if let Ok(path) = env::var("IRIUM_RPC_CA") {
+        let pem = fs::read(&path).map_err(|e| format!("read CA {path}: {e}"))?;
+        let cert = reqwest::Certificate::from_pem(&pem)
+            .map_err(|e| format!("invalid CA {path}: {e}"))?;
+        builder = builder.add_root_certificate(cert);
+    }
+    let insecure = env::var("IRIUM_RPC_INSECURE")
+        .ok()
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false);
+    if insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build().map_err(|e| format!("build client: {e}"))
 }
 
 #[derive(Deserialize)]
@@ -98,7 +120,7 @@ fn main() {
             }
             let base = rpc_url.trim_end_matches('/');
             let url = format!("{}/rpc/balance?address={}", base, addr);
-            let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
+            let client = match rpc_client() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Failed to init HTTP client: {}", e);
