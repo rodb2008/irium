@@ -1119,21 +1119,11 @@ async fn main() {
         tokio::spawn(async move {
             let node = node;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            let mut last_bootstrap_log: Option<std::time::Instant> = None;
             loop {
                 let (seeds, seed_info) = build_seed_addrs(&config_seeds, &signed_seeds, default_seed_port, &local_ips);
                 if seeds.is_empty() {
                     if seed_info.total > 0 && seed_info.filtered_local == seed_info.total {
-                        let should_log = last_bootstrap_log
-                            .map(|t| t.elapsed() > std::time::Duration::from_secs(300))
-                            .unwrap_or(true);
-                        if should_log {
-                            println!(
-                                "[{}] bootstrap mode: all seeds are local; waiting for inbound peers",
-                                Utc::now().format("%H:%M:%S")
-                            );
-                            last_bootstrap_log = Some(std::time::Instant::now());
-                        }
+                        // All seeds are local; wait for inbound peers quietly.
                     } else {
                         println!(
                             "[{}] no seeds configured; waiting",
@@ -1143,7 +1133,6 @@ async fn main() {
                     interval.tick().await;
                     continue;
                 }
-                last_bootstrap_log = None;
                 for addr in &seeds {
                     if node.is_connected(addr).await {
                         continue;
