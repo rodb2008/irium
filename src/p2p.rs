@@ -889,14 +889,7 @@ impl P2PNode {
                                 let mut dir_guard = dir.lock().await;
                                 let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
                                 dir_guard.mark_seen(&multiaddr);
-                                if P2PNode::verbose_messages() {
-                                    P2PNode::log_event(
-                                        "info",
-                                        "net",
-                                        format!("P2P {}: received pong", addr),
-                                    );
-                                }
-                            }
+                                                            }
                             MessageType::GetPeers => {
                                 let peers_payload = {
                                     let dir = dir.lock().await;
