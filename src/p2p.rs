@@ -55,6 +55,21 @@ async fn sync_request_allowed(
     true
 }
 
+async fn sync_block_request_allowed(
+    block_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    ip: IpAddr,
+) -> bool {
+    let mut guard = block_requests.lock().await;
+    let now = Instant::now();
+    if let Some(last) = guard.get(&ip) {
+        if now.duration_since(*last) < sync_cooldown() {
+            return false;
+        }
+    }
+    guard.insert(ip, now);
+    true
+}
+
 #[derive(Clone)]
 pub struct P2PNode {
     bind_addr: SocketAddr,
@@ -64,6 +79,7 @@ pub struct P2PNode {
     reputation: Arc<Mutex<ReputationManager>>,
     accept_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     sync_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    block_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     dynamic_bans: Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
@@ -254,6 +270,7 @@ impl P2PNode {
             reputation: Arc::new(Mutex::new(ReputationManager::new())),
             accept_log: Arc::new(Mutex::new(HashMap::new())),
             sync_requests: Arc::new(Mutex::new(HashMap::new())),
+            block_requests: Arc::new(Mutex::new(HashMap::new())),
             self_ips: Arc::new(Mutex::new(HashSet::new())),
             dynamic_bans: Arc::new(StdMutex::new(HashMap::new())),
             chain,
@@ -284,6 +301,7 @@ impl P2PNode {
         let relay_address = self.relay_address.clone();
         let accept_log = self.accept_log.clone();
         let sync_requests = self.sync_requests.clone();
+        let block_requests = self.block_requests.clone();
         let self_ips = self.self_ips.clone();
         let dynamic_bans = self.dynamic_bans.clone();
         let node_id = self.node_id.clone();
@@ -337,6 +355,7 @@ impl P2PNode {
                         let node_id_peer = node_id.clone();
                         let self_ip_peer = self_ips.clone();
                         let sync_peer = sync_requests.clone();
+                        let block_peer = block_requests.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_incoming_with_sybil(
                                 socket,
@@ -347,6 +366,7 @@ impl P2PNode {
                                 dir.clone(),
                                 rep.clone(),
                                 sync_peer,
+                                block_peer,
                                 self_ip_peer,
                                 chain_peer,
                                 mempool_peer,
@@ -722,6 +742,7 @@ impl P2PNode {
         let mempool_for_sync = self.mempool.clone();
         let reputation = self.reputation.clone();
         let sync_requests = self.sync_requests.clone();
+        let block_requests = self.block_requests.clone();
         let self_ips = self.self_ips.clone();
         let peers_vec = self.peers.clone();
         let connected_vec = self.connected.clone();
@@ -994,7 +1015,7 @@ impl P2PNode {
                                                     start_hash: start_hash.to_vec(),
                                                     count,
                                                 };
-                                                if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                                if sync_block_request_allowed(&block_requests, addr.ip()).await {
                                                     if let Ok(msg) = get_blocks.to_message() {
                                                         let _ = send_message(&writer, msg, addr).await;
                                                     }
@@ -1414,6 +1435,7 @@ async fn handle_incoming_with_sybil(
     directory: Arc<Mutex<PeerDirectory>>,
     reputation: Arc<Mutex<ReputationManager>>,
     sync_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    block_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
@@ -1779,7 +1801,7 @@ async fn handle_incoming_with_sybil(
                                     start_hash: start_hash.to_vec(),
                                     count,
                                 };
-                                if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                if sync_block_request_allowed(&block_requests, addr.ip()).await {
                                     if let Ok(msg) = get_blocks.to_message() {
                                         let _ = send_message(&writer, msg, addr).await;
                                     }
