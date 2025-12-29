@@ -221,6 +221,13 @@ fn load_runtime_seeds() -> Vec<String> {
         .unwrap_or_default()
 }
 
+
+#[derive(Clone, Copy)]
+struct SeedDialInfo {
+    total: usize,
+    filtered_local: usize,
+}
+
 fn load_signed_seeds() -> Vec<String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -273,7 +280,7 @@ fn build_seed_addrs(
     signed_seeds: &[String],
     default_seed_port: u16,
     local_ips: &HashSet<IpAddr>,
-) -> Vec<std::net::SocketAddr> {
+) -> (Vec<std::net::SocketAddr>, SeedDialInfo) {
     let mut seeds_raw: Vec<String> = Vec::new();
     seeds_raw.extend(config_seeds.iter().cloned());
     seeds_raw.extend(signed_seeds.iter().cloned());
@@ -281,11 +288,16 @@ fn build_seed_addrs(
     seeds_raw.sort();
     seeds_raw.dedup();
 
+    let mut info = SeedDialInfo {
+        total: seeds_raw.len(),
+        filtered_local: 0,
+    };
     let mut seeds: Vec<std::net::SocketAddr> = Vec::new();
     for seed in seeds_raw.iter() {
         match parse_seed_to_socketaddr(seed, default_seed_port) {
             Ok(addr) => {
                 if local_ips.contains(&addr.ip()) {
+                    info.filtered_local += 1;
                     continue;
                 }
                 seeds.push(addr)
@@ -313,7 +325,7 @@ fn build_seed_addrs(
             .score_of(&b.to_string())
             .cmp(&rep_mgr.score_of(&a.to_string()))
     });
-    seeds
+    (seeds, info)
 }
 
 fn json_log_enabled() -> bool {
@@ -1076,12 +1088,19 @@ async fn main() {
             let node = node;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
-                let seeds = build_seed_addrs(&config_seeds, &signed_seeds, default_seed_port, &local_ips);
+                let (seeds, seed_info) = build_seed_addrs(&config_seeds, &signed_seeds, default_seed_port, &local_ips);
                 if seeds.is_empty() {
-                    println!(
-                        "[{}] no seeds configured; waiting",
-                        Utc::now().format("%H:%M:%S")
-                    );
+                    if seed_info.total > 0 && seed_info.filtered_local == seed_info.total {
+                        println!(
+                            "[{}] bootstrap mode: all seeds are local; waiting for inbound peers",
+                            Utc::now().format("%H:%M:%S")
+                        );
+                    } else {
+                        println!(
+                            "[{}] no seeds configured; waiting",
+                            Utc::now().format("%H:%M:%S")
+                        );
+                    }
                     interval.tick().await;
                     continue;
                 }
