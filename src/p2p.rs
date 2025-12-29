@@ -109,6 +109,9 @@ impl P2PNode {
         let icon = match category {
             "net" => "📡",
             "p2p" => "🔌",
+            "chain" => "⛓️",
+            "sync" => "🔁",
+            "reputation" => "🛡️",
             _ => "",
         };
         if Self::json_log_enabled() {
