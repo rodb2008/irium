@@ -106,11 +106,17 @@ impl P2PNode {
     }
 
     fn log_event(level: &str, category: &str, msg: impl AsRef<str>) {
+        let icon = match category {
+            "net" => "📡",
+            "p2p" => "🔌",
+            _ => "",
+        };
         if Self::json_log_enabled() {
             let payload = json!({
                 "ts": Self::ts(),
                 "level": level,
                 "cat": category,
+                "icon": icon,
                 "msg": msg.as_ref(),
             });
             if level == "error" {
@@ -119,7 +125,12 @@ impl P2PNode {
                 println!("{}", payload);
             }
         } else {
-            let line = format!("[{}] [{}] {}", Self::ts(), category, msg.as_ref());
+            let tag = if icon.is_empty() {
+                category.to_string()
+            } else {
+                format!("{} {}", icon, category)
+            };
+            let line = format!("[{}] [{}] {}", Self::ts(), tag, msg.as_ref());
             if level == "error" {
                 eprintln!("{}", line);
             } else {
@@ -801,11 +812,16 @@ impl P2PNode {
                 match read_message_with_timeout(&mut reader, P2PNode::peer_timeout()).await {
                     Ok(msg) => {
                         if P2PNode::verbose_messages() {
-                            P2PNode::log_event(
-                                "info",
-                                "net",
-                                format!("P2P {}: recv {:?}", addr, msg.msg_type),
-                            );
+                            match msg.msg_type {
+                                MessageType::Ping | MessageType::Pong => {}
+                                _ => {
+                                    P2PNode::log_event(
+                                        "info",
+                                        "net",
+                                        format!("P2P {}: recv {:?}", addr, msg.msg_type),
+                                    );
+                                }
+                            }
                         }
                         match msg.msg_type {
                             MessageType::Ping => {
@@ -1634,7 +1650,12 @@ async fn handle_incoming_with_sybil(
         };
 
         if P2PNode::verbose_messages() {
-            P2PNode::log_event("info", "net", format!("P2P {}: recv {:?}", addr, msg.msg_type));
+            match msg.msg_type {
+                MessageType::Ping | MessageType::Pong => {}
+                _ => {
+                    P2PNode::log_event("info", "net", format!("P2P {}: recv {:?}", addr, msg.msg_type));
+                }
+            }
         }
 
         match msg.msg_type {
