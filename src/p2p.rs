@@ -70,6 +70,14 @@ async fn sync_block_request_allowed(
     true
 }
 
+fn getblocks_grace() -> Duration {
+    let secs = std::env::var("IRIUM_P2P_GETBLOCKS_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(8);
+    Duration::from_secs(secs.max(2).min(60))
+}
+
 #[derive(Clone)]
 pub struct P2PNode {
     bind_addr: SocketAddr,
@@ -80,6 +88,7 @@ pub struct P2PNode {
     accept_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     sync_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     block_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    getblocks_seen: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     dynamic_bans: Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
@@ -112,6 +121,7 @@ impl P2PNode {
             "chain" => "⛓️",
             "sync" => "🔁",
             "reputation" => "🛡️",
+            "mempool" => "🧺",
             _ => "",
         };
         if Self::json_log_enabled() {
@@ -294,6 +304,7 @@ impl P2PNode {
             accept_log: Arc::new(Mutex::new(HashMap::new())),
             sync_requests: Arc::new(Mutex::new(HashMap::new())),
             block_requests: Arc::new(Mutex::new(HashMap::new())),
+            getblocks_seen: Arc::new(Mutex::new(HashMap::new())),
             self_ips: Arc::new(Mutex::new(HashSet::new())),
             dynamic_bans: Arc::new(StdMutex::new(HashMap::new())),
             chain,
@@ -325,6 +336,7 @@ impl P2PNode {
         let accept_log = self.accept_log.clone();
         let sync_requests = self.sync_requests.clone();
         let block_requests = self.block_requests.clone();
+        let getblocks_seen = self.getblocks_seen.clone();
         let self_ips = self.self_ips.clone();
         let dynamic_bans = self.dynamic_bans.clone();
         let node_id = self.node_id.clone();
@@ -379,6 +391,7 @@ impl P2PNode {
                         let self_ip_peer = self_ips.clone();
                         let sync_peer = sync_requests.clone();
                         let block_peer = block_requests.clone();
+                        let getblocks_peer = getblocks_seen.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_incoming_with_sybil(
                                 socket,
@@ -390,6 +403,7 @@ impl P2PNode {
                                 rep.clone(),
                                 sync_peer,
                                 block_peer,
+                                getblocks_peer,
                                 self_ip_peer,
                                 chain_peer,
                                 mempool_peer,
@@ -793,6 +807,7 @@ impl P2PNode {
         let reputation = self.reputation.clone();
         let sync_requests = self.sync_requests.clone();
         let block_requests = self.block_requests.clone();
+        let getblocks_seen = self.getblocks_seen.clone();
         let self_ips = self.self_ips.clone();
         let peers_vec = self.peers.clone();
         let connected_vec = self.connected.clone();
@@ -929,7 +944,8 @@ impl P2PNode {
                                             }
                                         }
                                     } else if payload.height < local_height {
-                                        // Peer is behind; push our next headers to trigger their sync and send bodies directly.
+                                        // Peer is behind; push headers and fall back to block push if needed.
+                                        let behind_height = payload.height;
                                         if let Some(ref chain_arc) = chain_for_sync {
                                             let headers_bytes = {
                                                 let guard = chain_arc.lock().unwrap();
@@ -945,6 +961,58 @@ impl P2PNode {
                                                 let _ = send_message(&writer, msg, addr).await;
                                             }
                                         }
+                                        let fallback_writer = writer.clone();
+                                        let fallback_chain = chain_for_sync.clone();
+                                        let fallback_seen = getblocks_seen.clone();
+                                        let fallback_addr = addr;
+                                        tokio::spawn(async move {
+                                            let grace = getblocks_grace();
+                                            tokio::time::sleep(grace).await;
+                                            let now = Instant::now();
+                                            {
+                                                let mut guard = fallback_seen.lock().await;
+                                                if let Some(last) = guard.get(&fallback_addr.ip()) {
+                                                    if now.duration_since(*last) < grace {
+                                                        return;
+                                                    }
+                                                }
+                                                guard.insert(fallback_addr.ip(), now);
+                                            }
+                                            let (blocks, start_height) = if let Some(ref chain_arc) = fallback_chain {
+                                                let guard = chain_arc.lock().unwrap();
+                                                let start_idx = behind_height.saturating_add(1) as usize;
+                                                if start_idx >= guard.chain.len() {
+                                                    (Vec::new(), 0)
+                                                } else {
+                                                    let mut blocks = Vec::new();
+                                                    for b in guard.chain.iter().skip(start_idx).take(32) {
+                                                        blocks.push(b.serialize());
+                                                    }
+                                                    (blocks, start_idx as u64)
+                                                }
+                                            } else {
+                                                (Vec::new(), 0)
+                                            };
+                                            if blocks.is_empty() {
+                                                return;
+                                            }
+                                            let end_h = start_height + blocks.len() as u64 - 1;
+                                            P2PNode::log_event(
+                                                "info",
+                                                "sync",
+                                                format!(
+                                                    "P2P {}: no getblocks after headers, pushing {} blocks [{}-{}]",
+                                                    fallback_addr,
+                                                    blocks.len(),
+                                                    start_height,
+                                                    end_h
+                                                ),
+                                            );
+                                            for block_data in blocks {
+                                                let msg = BlockPayload { block_data }.to_message();
+                                                let _ = send_message(&fallback_writer, msg, fallback_addr).await;
+                                            }
+                                        });
                                     }
                                 }
                             }
@@ -1082,6 +1150,10 @@ impl P2PNode {
                                 }
                             }
                             MessageType::GetBlocks => {
+                                {
+                                    let mut guard = getblocks_seen.lock().await;
+                                    guard.insert(addr.ip(), Instant::now());
+                                }
                                 if let Some(ref chain_arc) = chain_for_sync {
                                     if let Ok(payload) = GetBlocksPayload::from_message(&msg) {
                                         let (blocks, start_height) = {
@@ -1492,6 +1564,7 @@ async fn handle_incoming_with_sybil(
     reputation: Arc<Mutex<ReputationManager>>,
     sync_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     block_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    getblocks_seen: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
@@ -1734,7 +1807,8 @@ async fn handle_incoming_with_sybil(
                             }
                         }
                     } else if payload.height < local_h {
-                        // Peer is behind; send it headers and let it request bodies explicitly.
+                        // Peer is behind; send headers and fall back to block push if needed.
+                        let behind_height = payload.height;
                         if let Some(ref chain_arc) = chain {
                             let headers_bytes = {
                                 let guard = chain_arc.lock().unwrap();
@@ -1750,6 +1824,58 @@ async fn handle_incoming_with_sybil(
                                 let _ = send_message(&writer, msg, addr).await;
                             }
                         }
+                        let fallback_writer = writer.clone();
+                        let fallback_chain = chain.clone();
+                        let fallback_seen = getblocks_seen.clone();
+                        let fallback_addr = addr;
+                        tokio::spawn(async move {
+                            let grace = getblocks_grace();
+                            tokio::time::sleep(grace).await;
+                            let now = Instant::now();
+                            {
+                                let mut guard = fallback_seen.lock().await;
+                                if let Some(last) = guard.get(&fallback_addr.ip()) {
+                                    if now.duration_since(*last) < grace {
+                                        return;
+                                    }
+                                }
+                                guard.insert(fallback_addr.ip(), now);
+                            }
+                            let (blocks, start_height) = if let Some(ref chain_arc) = fallback_chain {
+                                let guard = chain_arc.lock().unwrap();
+                                let start_idx = behind_height.saturating_add(1) as usize;
+                                if start_idx >= guard.chain.len() {
+                                    (Vec::new(), 0)
+                                } else {
+                                    let mut blocks = Vec::new();
+                                    for b in guard.chain.iter().skip(start_idx).take(32) {
+                                        blocks.push(b.serialize());
+                                    }
+                                    (blocks, start_idx as u64)
+                                }
+                            } else {
+                                (Vec::new(), 0)
+                            };
+                            if blocks.is_empty() {
+                                return;
+                            }
+                            let end_h = start_height + blocks.len() as u64 - 1;
+                            P2PNode::log_event(
+                                "info",
+                                "sync",
+                                format!(
+                                    "P2P {}: no getblocks after headers, pushing {} blocks [{}-{}]",
+                                    fallback_addr,
+                                    blocks.len(),
+                                    start_height,
+                                    end_h
+                                ),
+                            );
+                            for block_data in blocks {
+                                let msg = BlockPayload { block_data }.to_message();
+                                let _ = send_message(&fallback_writer, msg, fallback_addr).await;
+                            }
+                        });
                     }
                 }
             }
@@ -1900,6 +2026,10 @@ async fn handle_incoming_with_sybil(
                 }
             }
             MessageType::GetBlocks => {
+                {
+                    let mut guard = getblocks_seen.lock().await;
+                    guard.insert(addr.ip(), Instant::now());
+                }
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = GetBlocksPayload::from_message(&msg) {
                         let (blocks, start_height) = {
