@@ -293,11 +293,17 @@ fn build_seed_addrs(
             Err(e) => eprintln!("Invalid P2P seed {}: {}", seed, e),
         }
     }
-    // If everything was filtered as local, fall back to the first seed to retain outbound dial capability.
+    // If everything was filtered as local, only fall back when explicitly allowed.
     if seeds.is_empty() {
-        if let Some(first) = seeds_raw.first() {
-            if let Ok(addr) = parse_seed_to_socketaddr(first, default_seed_port) {
-                seeds.push(addr);
+        let allow = std::env::var("IRIUM_ALLOW_LOCAL_SEED_FALLBACK")
+            .ok()
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        if allow {
+            if let Some(first) = seeds_raw.first() {
+                if let Ok(addr) = parse_seed_to_socketaddr(first, default_seed_port) {
+                    seeds.push(addr);
+                }
             }
         }
     }
