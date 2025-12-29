@@ -43,16 +43,17 @@ fn color_enabled() -> bool {
 fn format_irm(amount: u64) -> String {
     let whole = amount / 100_000_000;
     let frac = amount % 100_000_000;
-    format!("{}.{}", whole, format!("{:08}", frac))
+    if frac == 0 {
+        format!("{}", whole)
+    } else {
+        format!("{}.{}", whole, format!("{:08}", frac))
+    }
 }
 
 #[derive(Deserialize)]
 struct BalanceResponse {
     address: String,
-    pkh: String,
     balance: u64,
-    utxo_count: usize,
-    height: u64,
 }
 
 fn main() {
@@ -130,12 +131,9 @@ fn main() {
                 format!("{} IRM", irm_display)
             };
             println!(
-                "address {} pkh {} balance {} utxos {} height {}",
+                "address {} balance {}",
                 payload.address,
-                payload.pkh,
-                balance_display,
-                payload.utxo_count,
-                payload.height
+                balance_display
             );
         }
         _ => {
