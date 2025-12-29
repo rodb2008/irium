@@ -825,45 +825,39 @@ impl P2PNode {
                                     if payload.height > local_height {
                                         if sync_request_allowed(&sync_requests, addr.ip()).await {
                                             let start_hash = P2PNode::tip_hash(&chain_for_sync);
-                                            let get_blocks = GetBlocksPayload {
+                                            let get_headers = GetHeadersPayload {
                                                 start_hash: start_hash.to_vec(),
-                                                count: 512,
+                                                count: 64,
                                             };
                                             let short = {
                                                 let h = hex::encode(start_hash);
                                                 h.get(0..12).unwrap_or(&h).to_string()
                                             };
                                             Self::log(format!(
-                                                "P2P {}: peer ahead ({} > {}), requesting up to 512 blocks from tip {}",
+                                                "P2P {}: peer ahead ({} > {}), requesting headers from tip {}",
                                                 addr,
                                                 payload.height,
                                                 local_height,
                                                 short
                                             ));
-                                            if let Ok(msg) = get_blocks.to_message() {
+                                            if let Ok(msg) = get_headers.to_message() {
                                                 let _ = send_message(&writer, msg, addr).await;
                                             }
                                         }
                                     } else if payload.height < local_height {
                                         // Peer is behind; push our next headers to trigger their sync and send bodies directly.
                                         if let Some(ref chain_arc) = chain_for_sync {
-                                            let (headers_bytes, blocks_bytes) = {
+                                            let headers_bytes = {
                                                 let guard = chain_arc.lock().unwrap();
                                                 let start = payload.height.saturating_add(1) as usize;
                                                 let mut headers = Vec::new();
-                                                let mut blocks = Vec::new();
                                                 for block in guard.chain.iter().skip(start).take(32) {
                                                     headers.extend_from_slice(&block.header.serialize());
-                                                    blocks.push(block.serialize());
                                                 }
-                                                (headers, blocks)
+                                                headers
                                             };
                                             if !headers_bytes.is_empty() {
                                                 let msg = HeadersPayload { headers: headers_bytes }.to_message();
-                                                let _ = send_message(&writer, msg, addr).await;
-                                            }
-                                            for blk in blocks_bytes {
-                                                let msg = BlockPayload { block_data: blk }.to_message();
                                                 let _ = send_message(&writer, msg, addr).await;
                                             }
                                         }
@@ -951,30 +945,11 @@ impl P2PNode {
                                             };
                                             offset += used;
 
-                                            let mut maybe_request: Option<Message> = None;
                                             {
                                                 let mut guard = chain_arc.lock().unwrap();
-                                                match guard.add_header(header.clone()) {
-                                                    Ok(h) => {
-                                                        if guard.connects_to_tip(&header) {
-                                                            let get_blocks = GetBlocksPayload {
-                                                                start_hash: header.prev_hash.to_vec(),
-                                                                count: 1,
-                                                            };
-                                                            maybe_request = get_blocks.to_message().ok();
-                                                        } else {
-                                                            let _ = h;
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!("Header from {} rejected: {}", addr, e);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            if let Some(msg) = maybe_request.take() {
-                                                if sync_request_allowed(&sync_requests, addr.ip()).await {
-                                                    let _ = send_message(&writer, msg, addr).await;
+                                                if let Err(e) = guard.add_header(header.clone()) {
+                                                    eprintln!("Header from {} rejected: {}", addr, e);
+                                                    break;
                                                 }
                                             }
                                         }
@@ -1643,25 +1618,19 @@ async fn handle_incoming_with_sybil(
                             }
                         }
                     } else if payload.height < local_h {
-                        // Peer is behind; send it our next headers to prompt block download and include bodies for small catch-up.
+                        // Peer is behind; send it headers and let it request bodies explicitly.
                         if let Some(ref chain_arc) = chain {
-                            let (headers_bytes, blocks_bytes) = {
+                            let headers_bytes = {
                                 let guard = chain_arc.lock().unwrap();
                                 let start = payload.height.saturating_add(1) as usize;
                                 let mut headers = Vec::new();
-                                let mut blocks = Vec::new();
                                 for block in guard.chain.iter().skip(start).take(32) {
                                     headers.extend_from_slice(&block.header.serialize());
-                                    blocks.push(block.serialize());
                                 }
-                                (headers, blocks)
+                                headers
                             };
                             if !headers_bytes.is_empty() {
                                 let msg = HeadersPayload { headers: headers_bytes }.to_message();
-                                let _ = send_message(&writer, msg, addr).await;
-                            }
-                            for blk in blocks_bytes {
-                                let msg = BlockPayload { block_data: blk }.to_message();
                                 let _ = send_message(&writer, msg, addr).await;
                             }
                         }
@@ -1754,32 +1723,11 @@ async fn handle_incoming_with_sybil(
                             };
                             offset += used;
 
-                            let mut maybe_request: Option<Message> = None;
                             {
                                 let mut guard = chain_arc.lock().unwrap();
-                                match guard.add_header(header.clone()) {
-                                    Ok(h) => {
-                                        // Only request body if it extends the current main tip.
-                                        if guard.connects_to_tip(&header) {
-                                            let get_blocks = GetBlocksPayload {
-                                                start_hash: header.prev_hash.to_vec(),
-                                                count: 1,
-                                            };
-                                            maybe_request = get_blocks.to_message().ok();
-                                        } else {
-                                            // Header added to tree but not current tip; skip body for now.
-                                            let _ = h;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Header from {} rejected: {}", addr, e);
-                                        break;
-                                    }
-                                }
-                            }
-                            if let Some(msg) = maybe_request.take() {
-                                if sync_request_allowed(&sync_requests, addr.ip()).await {
-                                    let _ = send_message(&writer, msg, addr).await;
+                                if let Err(e) = guard.add_header(header.clone()) {
+                                    eprintln!("Header from {} rejected: {}", addr, e);
+                                    break;
                                 }
                             }
                         }
