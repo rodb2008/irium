@@ -1203,26 +1203,12 @@ async fn main() {
                     if parts.len() >= 5 {
                         let ip = parts[2];
                         if peer_ips.insert(ip.to_string()) {
-                            let h = p
-                                .last_height
-                                .map(|v| format!("h={}", v))
-                                .unwrap_or_else(|| "h=-".to_string());
-                            let label = match &p.agent {
-                                Some(agent) => format!("{} {}", agent, h),
-                                None => h,
-                            };
+                            let label = p.agent.clone().unwrap_or_else(|| "peer".to_string());
                             peer_list.push(label);
                         }
                     } else if peer_ips.insert(p.multiaddr.clone()) {
-                        let h = p
-                            .last_height
-                            .map(|v| format!("h={}", v))
-                            .unwrap_or_else(|| "h=-".to_string());
-                        let label = match &p.agent {
-                            Some(agent) => format!("{} {}", agent, h),
-                            None => h,
-                        };
-                        peer_list.push(label);
+                            let label = p.agent.clone().unwrap_or_else(|| "peer".to_string());
+                            peer_list.push(label);
                     }
                 }
                 if peer_list.is_empty() {
