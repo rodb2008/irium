@@ -32,6 +32,29 @@ use serde_json::json;
 const MAX_PEERS: usize = 100;
 const MAX_MSGS_PER_SEC: u32 = 200;
 
+fn sync_cooldown() -> Duration {
+    let secs = std::env::var("IRIUM_P2P_SYNC_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10);
+    Duration::from_secs(secs.max(1).min(300))
+}
+
+async fn sync_request_allowed(
+    sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    ip: IpAddr,
+) -> bool {
+    let mut guard = sync_requests.lock().await;
+    let now = Instant::now();
+    if let Some(last) = guard.get(&ip) {
+        if now.duration_since(*last) < sync_cooldown() {
+            return false;
+        }
+    }
+    guard.insert(ip, now);
+    true
+}
+
 #[derive(Clone)]
 pub struct P2PNode {
     bind_addr: SocketAddr,
@@ -40,6 +63,7 @@ pub struct P2PNode {
     connected: Arc<Mutex<HashSet<SocketAddr>>>,
     reputation: Arc<Mutex<ReputationManager>>,
     accept_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    sync_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     dynamic_bans: Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
@@ -228,6 +252,7 @@ impl P2PNode {
             connected: Arc::new(Mutex::new(HashSet::new())),
             reputation: Arc::new(Mutex::new(ReputationManager::new())),
             accept_log: Arc::new(Mutex::new(HashMap::new())),
+            sync_requests: Arc::new(Mutex::new(HashMap::new())),
             dynamic_bans: Arc::new(StdMutex::new(HashMap::new())),
             chain,
             mempool,
@@ -256,6 +281,7 @@ impl P2PNode {
         let agent = self.agent.clone();
         let relay_address = self.relay_address.clone();
         let accept_log = self.accept_log.clone();
+        let sync_requests = self.sync_requests.clone();
         let dynamic_bans = self.dynamic_bans.clone();
         let node_id = self.node_id.clone();
         let banned_ips = self.banned_ips.clone();
@@ -295,6 +321,7 @@ impl P2PNode {
                         let agent_peer = agent.clone();
                         let relay_peer = relay_address.clone();
                         let node_id_peer = node_id.clone();
+                        let sync_peer = sync_requests.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_incoming_with_sybil(
                                 socket,
@@ -304,6 +331,7 @@ impl P2PNode {
                                 connected_inner.clone(),
                                 dir.clone(),
                                 rep.clone(),
+                                sync_peer,
                                 chain_peer,
                                 mempool_peer,
                                 agent_peer,
@@ -423,6 +451,9 @@ impl P2PNode {
                 {
                     continue;
                 }
+                if self.is_ip_connected(addr.ip()).await {
+                    continue;
+                }
                 if self
                     .connect_and_handshake(addr, self.local_height_value(), &self.agent)
                     .await
@@ -457,6 +488,11 @@ impl P2PNode {
     pub async fn is_connected(&self, addr: &SocketAddr) -> bool {
         let guard = self.connected.lock().await;
         guard.contains(addr)
+    }
+
+    pub async fn is_ip_connected(&self, ip: IpAddr) -> bool {
+        let guard = self.connected.lock().await;
+        guard.iter().any(|addr| addr.ip() == ip)
     }
 
     pub async fn broadcast_block(&self, block_bytes: &[u8]) -> Result<(), String> {
@@ -521,6 +557,9 @@ impl P2PNode {
         agent: &str,
     ) -> Result<(), String> {
         if self.is_connected(&addr).await {
+            return Ok(());
+        }
+        if self.is_ip_connected(addr.ip()).await {
             return Ok(());
         }
         if self.is_banned(&addr.ip()) {
@@ -655,6 +694,7 @@ impl P2PNode {
         let chain_for_sync = self.chain.clone();
         let mempool_for_sync = self.mempool.clone();
         let reputation = self.reputation.clone();
+        let sync_requests = self.sync_requests.clone();
         let peers_vec = self.peers.clone();
         let connected_vec = self.connected.clone();
         let writer_for_drop = writer.clone();
@@ -740,24 +780,26 @@ impl P2PNode {
                                         }
                                     };
                                     if payload.height > local_height {
-                                        let start_hash = P2PNode::tip_hash(&chain_for_sync);
-                                        let get_blocks = GetBlocksPayload {
-                                            start_hash: start_hash.to_vec(),
-                                            count: 512,
-                                        };
-                                        let short = {
-                                            let h = hex::encode(start_hash);
-                                            h.get(0..12).unwrap_or(&h).to_string()
-                                        };
-                                        Self::log(format!(
-                                            "P2P {}: peer ahead ({} > {}), requesting up to 512 blocks from tip {}",
-                                            addr,
-                                            payload.height,
-                                            local_height,
-                                            short
-                                        ));
-                                        if let Ok(msg) = get_blocks.to_message() {
-                                            let _ = send_message(&writer, msg, addr).await;
+                                        if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                            let start_hash = P2PNode::tip_hash(&chain_for_sync);
+                                            let get_blocks = GetBlocksPayload {
+                                                start_hash: start_hash.to_vec(),
+                                                count: 512,
+                                            };
+                                            let short = {
+                                                let h = hex::encode(start_hash);
+                                                h.get(0..12).unwrap_or(&h).to_string()
+                                            };
+                                            Self::log(format!(
+                                                "P2P {}: peer ahead ({} > {}), requesting up to 512 blocks from tip {}",
+                                                addr,
+                                                payload.height,
+                                                local_height,
+                                                short
+                                            ));
+                                            if let Ok(msg) = get_blocks.to_message() {
+                                                let _ = send_message(&writer, msg, addr).await;
+                                            }
                                         }
                                     } else if payload.height < local_height {
                                         // Peer is behind; push our next headers to trigger their sync and send bodies directly.
@@ -888,7 +930,9 @@ impl P2PNode {
                                                 }
                                             }
                                             if let Some(msg) = maybe_request.take() {
-                                                let _ = send_message(&writer, msg, addr).await;
+                                                if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                                    let _ = send_message(&writer, msg, addr).await;
+                                                }
                                             }
                                         }
 
@@ -926,8 +970,10 @@ impl P2PNode {
                                                     start_hash: start_hash.to_vec(),
                                                     count,
                                                 };
-                                                if let Ok(msg) = get_blocks.to_message() {
-                                                    let _ = send_message(&writer, msg, addr).await;
+                                                if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                                    if let Ok(msg) = get_blocks.to_message() {
+                                                        let _ = send_message(&writer, msg, addr).await;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1343,6 +1389,7 @@ async fn handle_incoming_with_sybil(
     connected: Arc<Mutex<HashSet<SocketAddr>>>,
     directory: Arc<Mutex<PeerDirectory>>,
     reputation: Arc<Mutex<ReputationManager>>,
+    sync_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
     agent: String,
@@ -1526,13 +1573,15 @@ async fn handle_incoming_with_sybil(
                     }
                     if payload.height > local_h {
                         // Request headers first for basic sync.
-                        let start_hash = P2PNode::tip_hash(&chain);
-                        let get_headers = GetHeadersPayload {
-                            start_hash: start_hash.to_vec(),
-                            count: 64,
-                        };
-                        if let Ok(msg) = get_headers.to_message() {
-                            let _ = send_message(&writer, msg, addr).await;
+                        if sync_request_allowed(&sync_requests, addr.ip()).await {
+                            let start_hash = P2PNode::tip_hash(&chain);
+                            let get_headers = GetHeadersPayload {
+                                start_hash: start_hash.to_vec(),
+                                count: 64,
+                            };
+                            if let Ok(msg) = get_headers.to_message() {
+                                let _ = send_message(&writer, msg, addr).await;
+                            }
                         }
                     } else if payload.height < local_h {
                         // Peer is behind; send it our next headers to prompt block download and include bodies for small catch-up.

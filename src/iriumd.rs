@@ -745,12 +745,13 @@ async fn main() {
                     let g = chain_clone.lock().unwrap();
                     g.tip_height()
                 };
-                let chain_height = best_peer_height.unwrap_or(local_height);
+                let peer_height = best_peer_height.unwrap_or(0);
+                let chain_height = std::cmp::max(local_height, peer_height);
 
                 let peer_sample = peer_list.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
                 let seed_sample = seed_list.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
                 if json_log_enabled() {
-                    println!("{}", json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "heartbeat", "peers": peer_ips.len(), "peer_sample": peer_sample, "seeds": seed_sample, "height": local_height, "local_height": local_height, "chain_height": chain_height}));
+                    println!("{}", json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "heartbeat", "peers": peer_ips.len(), "peer_sample": peer_sample, "seeds": seed_sample, "height": local_height, "local_height": local_height, "chain_height": chain_height, "peer_height": peer_height}));
                 } else {
                     println!("[{}] 🔁 heartbeat Irium chain height={} local height={} peers={} [{}] seeds=[{}]",                        Utc::now().format("%H:%M:%S"),                        chain_height,                        local_height,                        peer_ips.len(),                        peer_sample,                        seed_sample                    );
                 }

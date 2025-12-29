@@ -1188,7 +1188,8 @@ async fn main() {
                     };
                     (g.tip_height(), tip, mem_sz)
                 };
-                let chain_height = best_peer_height.unwrap_or(local_height);
+                let peer_height = best_peer_height.unwrap_or(0);
+                let chain_height = std::cmp::max(local_height, peer_height);
 
                 let peer_sample = peer_list
                     .iter()
@@ -1208,6 +1209,7 @@ async fn main() {
                             "height": local_height,
                             "local_height": local_height,
                             "chain_height": chain_height,
+                            "peer_height": peer_height,
                             "peers": peer_ips.len(),
                             "peer_sample": peer_sample,
                             "seed_count": seed_count,
