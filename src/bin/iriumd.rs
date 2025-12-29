@@ -153,6 +153,11 @@ fn local_ip_set(bind: Option<&String>) -> HashSet<IpAddr> {
             ips.insert(addr.ip());
         }
     }
+    if let Ok(raw) = env::var("IRIUM_NODE_PUBLIC_IP").or_else(|_| env::var("IRIUM_PUBLIC_IP")) {
+        if let Ok(ip) = raw.parse::<IpAddr>() {
+            ips.insert(ip);
+        }
+    }
     if let Ok(ifaces) = get_if_addrs() {
         for iface in ifaces {
             ips.insert(iface.ip());
