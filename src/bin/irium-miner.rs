@@ -39,6 +39,35 @@ fn blocks_dir() -> PathBuf {
     }
 }
 
+fn prune_blocks_above(height: u64) {
+    let dir = blocks_dir();
+    if !dir.exists() {
+        return;
+    }
+    let read_dir = match dir.read_dir() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stripped) = name.strip_prefix("block_") else {
+            continue;
+        };
+        let Some(num_part) = stripped.strip_suffix(".json") else {
+            continue;
+        };
+        let Ok(h) = num_part.parse::<u64>() else {
+            continue;
+        };
+        if h > height {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 fn mempool_file() -> PathBuf {
     if let Ok(path) = env::var("IRIUM_MEMPOOL_FILE") {
         PathBuf::from(path)
@@ -545,7 +574,7 @@ fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Res
     state.connect_block(block).map(|_| ())
 }
 
-fn sync_from_node(state: &mut ChainState) {
+fn reconcile_with_node(state: &mut ChainState, params: &ChainParams) {
     let client = match node_http_client() {
         Ok(c) => c,
         Err(e) => {
@@ -565,11 +594,29 @@ fn sync_from_node(state: &mut ChainState) {
     let local_tip = state.tip_height();
     let remote_tip = remote_height;
 
-    if remote_tip <= local_tip {
+    if remote_tip < local_tip {
+        let allow_ahead = env::var("IRIUM_MINER_ALLOW_LOCAL_AHEAD")
+            .ok()
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        if !allow_ahead {
+            eprintln!(
+                "[warn] Miner ahead of node (local {} > remote {}), resetting to node",
+                local_tip,
+                remote_tip
+            );
+            prune_blocks_above(remote_tip);
+            *state = ChainState::new(params.clone());
+        } else {
+            return;
+        }
+    }
+
+    if remote_tip <= state.tip_height() {
         return;
     }
 
-    let start = local_tip.saturating_add(1);
+    let start = state.tip_height().saturating_add(1);
     let target = remote_tip;
     println!(
         "[sync] Miner downloading blocks {}..{} from node",
@@ -866,7 +913,7 @@ fn main() {
         pow_limit,
     };
 
-    let mut state = ChainState::new(params);
+    let mut state = ChainState::new(params.clone());
 
     if json_log_enabled() {
         println!(
@@ -891,7 +938,7 @@ fn main() {
 
     // Load any persisted blocks so we resume from last mined height.
     load_persisted_blocks(&mut state);
-    sync_from_node(&mut state);
+    reconcile_with_node(&mut state, &params);
 
     if let Some((addr, pkh)) = miner_address_info() {
         let pkh_hex = hex::encode(pkh);
@@ -917,6 +964,8 @@ fn main() {
     }
 
     loop {
+        reconcile_with_node(&mut state, &params);
+
         if json_log_enabled() {
             println!(
                 "{}",
