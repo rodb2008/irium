@@ -955,6 +955,7 @@ impl P2PNode {
                                         }
 
                                         if let Some(ref chain_arc) = chain_for_sync {
+                                            let header_count = (payload.headers.len() / 80) as u32;
                                             let request = {
                                                 let guard = chain_arc.lock().unwrap();
                                                 if let Some(best) = guard.best_header_if_better() {
@@ -983,7 +984,12 @@ impl P2PNode {
                                                     None
                                                 }
                                             };
-                                            if let Some((start_hash, count)) = request {
+                                            let fallback = if request.is_none() && header_count > 0 {
+                                                Some((P2PNode::tip_hash(&chain_for_sync), header_count))
+                                            } else {
+                                                None
+                                            };
+                                            if let Some((start_hash, count)) = request.or(fallback) {
                                                 let get_blocks = GetBlocksPayload {
                                                     start_hash: start_hash.to_vec(),
                                                     count,
@@ -1734,6 +1740,7 @@ async fn handle_incoming_with_sybil(
 
                         // After processing headers, check if a better-work fork exists and request its blocks.
                         if let Some(ref chain_arc) = chain {
+                            let header_count = (payload.headers.len() / 80) as u32;
                             let request = {
                                 let guard = chain_arc.lock().unwrap();
                                 if let Some(best) = guard.best_header_if_better() {
@@ -1762,7 +1769,12 @@ async fn handle_incoming_with_sybil(
                                     None
                                 }
                             };
-                            if let Some((start_hash, count)) = request {
+                            let fallback = if request.is_none() && header_count > 0 {
+                                Some((P2PNode::tip_hash(&chain), header_count))
+                            } else {
+                                None
+                            };
+                            if let Some((start_hash, count)) = request.or(fallback) {
                                 let get_blocks = GetBlocksPayload {
                                     start_hash: start_hash.to_vec(),
                                     count,
