@@ -64,6 +64,7 @@ pub struct P2PNode {
     reputation: Arc<Mutex<ReputationManager>>,
     accept_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     sync_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     dynamic_bans: Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
@@ -253,6 +254,7 @@ impl P2PNode {
             reputation: Arc::new(Mutex::new(ReputationManager::new())),
             accept_log: Arc::new(Mutex::new(HashMap::new())),
             sync_requests: Arc::new(Mutex::new(HashMap::new())),
+            self_ips: Arc::new(Mutex::new(HashSet::new())),
             dynamic_bans: Arc::new(StdMutex::new(HashMap::new())),
             chain,
             mempool,
@@ -282,6 +284,7 @@ impl P2PNode {
         let relay_address = self.relay_address.clone();
         let accept_log = self.accept_log.clone();
         let sync_requests = self.sync_requests.clone();
+        let self_ips = self.self_ips.clone();
         let dynamic_bans = self.dynamic_bans.clone();
         let node_id = self.node_id.clone();
         let banned_ips = self.banned_ips.clone();
@@ -295,6 +298,17 @@ impl P2PNode {
                         if P2PNode::is_banned_ip(&ip, &banned_ips, &dynamic_bans_check) {
                             Self::log_err(format!("Rejecting inbound {}: banned", addr));
                             continue;
+                        }
+                        {
+                            let guard = self_ips.lock().await;
+                            if guard.contains(&ip) {
+                                P2PNode::log_event(
+                                    "warn",
+                                    "net",
+                                    format!("Rejecting inbound {}: self-connection", addr),
+                                );
+                                continue;
+                            }
                         }
                         let mut log_guard = accept_log.lock().await;
                         if let Some(last) = log_guard.get(&ip) {
@@ -312,7 +326,7 @@ impl P2PNode {
                             continue;
                         }
                         Self::log(format!("Incoming P2P connection from {}", addr));
-                                                        let peers_inner = peers_arc.clone();
+                        let peers_inner = peers_arc.clone();
                         let connected_inner = connected.clone();
                         let dir = dir_arc.clone();
                         let rep = rep_arc.clone();
@@ -321,6 +335,7 @@ impl P2PNode {
                         let agent_peer = agent.clone();
                         let relay_peer = relay_address.clone();
                         let node_id_peer = node_id.clone();
+                        let self_ip_peer = self_ips.clone();
                         let sync_peer = sync_requests.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_incoming_with_sybil(
@@ -332,6 +347,7 @@ impl P2PNode {
                                 dir.clone(),
                                 rep.clone(),
                                 sync_peer,
+                                self_ip_peer,
                                 chain_peer,
                                 mempool_peer,
                                 agent_peer,
@@ -451,6 +467,9 @@ impl P2PNode {
                 {
                     continue;
                 }
+                if self.is_self_ip(addr.ip()).await {
+                    continue;
+                }
                 if self.is_ip_connected(addr.ip()).await {
                     continue;
                 }
@@ -493,6 +512,11 @@ impl P2PNode {
     pub async fn is_ip_connected(&self, ip: IpAddr) -> bool {
         let guard = self.connected.lock().await;
         guard.iter().any(|addr| addr.ip() == ip)
+    }
+
+    pub async fn is_self_ip(&self, ip: IpAddr) -> bool {
+        let guard = self.self_ips.lock().await;
+        guard.contains(&ip)
     }
 
     pub async fn broadcast_block(&self, block_bytes: &[u8]) -> Result<(), String> {
@@ -557,6 +581,9 @@ impl P2PNode {
         agent: &str,
     ) -> Result<(), String> {
         if self.is_connected(&addr).await {
+            return Ok(());
+        }
+        if self.is_self_ip(addr.ip()).await {
             return Ok(());
         }
         if self.is_ip_connected(addr.ip()).await {
@@ -695,9 +722,11 @@ impl P2PNode {
         let mempool_for_sync = self.mempool.clone();
         let reputation = self.reputation.clone();
         let sync_requests = self.sync_requests.clone();
+        let self_ips = self.self_ips.clone();
         let peers_vec = self.peers.clone();
         let connected_vec = self.connected.clone();
         let writer_for_drop = writer.clone();
+        let local_node_id = hex::encode(&self.node_id);
         tokio::spawn(async move {
             let mut msg_count: u32 = 0;
             let mut window_start = Instant::now();
@@ -738,6 +767,20 @@ impl P2PNode {
                             }
                             MessageType::Handshake => {
                                 if let Ok(payload) = HandshakePayload::from_message(&msg) {
+                                    if let Some(ref remote_id) = payload.node_id {
+                                        if remote_id == &local_node_id {
+                                            {
+                                                let mut guard = self_ips.lock().await;
+                                                guard.insert(addr.ip());
+                                            }
+                                            P2PNode::log_event(
+                                                "warn",
+                                                "net",
+                                                format!("P2P {}: self-connection detected, closing", addr),
+                                            );
+                                            break;
+                                        }
+                                    }
                                     let agent_str = payload.agent.clone();
                                     let node_id = payload.node_id.clone();
                                     {
@@ -1390,12 +1433,14 @@ async fn handle_incoming_with_sybil(
     directory: Arc<Mutex<PeerDirectory>>,
     reputation: Arc<Mutex<ReputationManager>>,
     sync_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
     agent: String,
     relay_address: Option<String>,
     node_id: Vec<u8>,
 ) -> Result<(), String> {
+    let local_node_id = hex::encode(&node_id);
     // Issue a fresh challenge with adaptive difficulty.
     let base = P2PNode::sybil_difficulty();
     let max = std::env::var("IRIUM_SYBIL_DIFFICULTY_MAX")
@@ -1536,6 +1581,20 @@ async fn handle_incoming_with_sybil(
         match msg.msg_type {
             MessageType::Handshake => {
                 if let Ok(payload) = HandshakePayload::from_message(&msg) {
+                    if let Some(ref remote_id) = payload.node_id {
+                        if remote_id == &local_node_id {
+                            {
+                                let mut guard = self_ips.lock().await;
+                                guard.insert(addr.ip());
+                            }
+                            P2PNode::log_event(
+                                "warn",
+                                "net",
+                                format!("P2P {}: self-connection detected, dropping", addr),
+                            );
+                            break;
+                        }
+                    }
                     let advertised_port = if payload.port > 0 {
                         payload.port
                     } else {
@@ -1719,7 +1778,9 @@ async fn handle_incoming_with_sybil(
                                 }
                             }
                             if let Some(msg) = maybe_request.take() {
-                                let _ = send_message(&writer, msg, addr).await;
+                                if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                    let _ = send_message(&writer, msg, addr).await;
+                                }
                             }
                         }
 
@@ -1758,8 +1819,10 @@ async fn handle_incoming_with_sybil(
                                     start_hash: start_hash.to_vec(),
                                     count,
                                 };
-                                if let Ok(msg) = get_blocks.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
+                                if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                    if let Ok(msg) = get_blocks.to_message() {
+                                        let _ = send_message(&writer, msg, addr).await;
+                                    }
                                 }
                             }
                         }
