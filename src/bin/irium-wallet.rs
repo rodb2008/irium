@@ -36,6 +36,10 @@ fn default_rpc_url() -> String {
     env::var("IRIUM_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:38300".to_string())
 }
 
+fn color_enabled() -> bool {
+    env::var("NO_COLOR").is_err()
+}
+
 #[derive(Deserialize)]
 struct BalanceResponse {
     address: String,
@@ -112,11 +116,17 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            let use_color = color_enabled();
+            let balance_display = if use_color {
+                format!("\x1b[32m{}\x1b[0m", payload.balance)
+            } else {
+                payload.balance.to_string()
+            };
             println!(
                 "address {} pkh {} balance {} utxos {} height {}",
                 payload.address,
                 payload.pkh,
-                payload.balance,
+                balance_display,
                 payload.utxo_count,
                 payload.height
             );
