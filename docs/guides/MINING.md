@@ -44,7 +44,7 @@ nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
 - Node port: positional arg (e.g., `scripts/irium-node.py 38291`)
 - Bootstrap peers (optional): `BOOTSTRAP_NODES="host1:port,host2:port"`
 - Data dirs (optional overrides):
-  - `IRIUM_BLOCKS_DIR` (default `~/.irium/blocks`)
+  - `IRIUM_BLOCKS_DIR` (default `~/.irium/miner/blocks`)
   - `IRIUM_MEMPOOL_DIR` (default `~/.irium/mempool`)
   - `IRIUM_WALLET_FILE` (default `~/.irium/irium-wallet.json` for wallet API)
 

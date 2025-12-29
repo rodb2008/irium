@@ -347,6 +347,34 @@ fn blocks_dir() -> PathBuf {
     }
 }
 
+fn prune_blocks_above(height: u64) {
+    let dir = blocks_dir();
+    if !dir.exists() {
+        return;
+    }
+    let read_dir = match dir.read_dir() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stripped) = name.strip_prefix("block_") else {
+            continue;
+        };
+        let Some(num_part) = stripped.strip_suffix(".json") else {
+            continue;
+        };
+        let Ok(h) = num_part.parse::<u64>() else {
+            continue;
+        };
+        if h > height {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
 
 fn load_persisted_blocks(state: &mut ChainState) {
     let dir = blocks_dir();
@@ -441,6 +469,10 @@ fn load_persisted_blocks(state: &mut ChainState) {
 
                 if let Err(e) = state.connect_block(block) {
                     eprintln!("[⚠️] Failed to connect persisted block {}: {}", h, e);
+                    let tip = state.tip_height();
+                    prune_blocks_above(tip);
+                    println!("[🧹] Pruned persisted blocks above height {}", tip);
+                    break;
                 }
             }
             Err(e) => eprintln!("[⚠️] Failed to read {}: {}", path.display(), e),

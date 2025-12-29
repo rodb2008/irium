@@ -35,7 +35,7 @@ fn blocks_dir() -> PathBuf {
         PathBuf::from(dir)
     } else {
         let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        PathBuf::from(home).join(".irium/blocks")
+        PathBuf::from(home).join(".irium/miner/blocks")
     }
 }
 
