@@ -1078,6 +1078,12 @@ async fn main() {
                     if node.is_connected(addr).await {
                         continue;
                     }
+                    if node.is_self_ip(addr.ip()).await {
+                        continue;
+                    }
+                    if node.is_ip_connected(addr.ip()).await {
+                        continue;
+                    }
                     let height = {
                         let chain = shared_clone.lock().unwrap();
                         chain.tip_height()
