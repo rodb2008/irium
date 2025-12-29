@@ -131,7 +131,7 @@ fn main() {
                 format!("{} IRM", irm_display)
             };
             println!(
-                "balance {} blocks {}",
+                "balance {} blocks mined {}",
                 balance_display,
                 payload.utxo_count
             );

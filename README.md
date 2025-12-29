@@ -30,6 +30,7 @@ cargo test --quiet
 - `IRIUM_ANCHOR_MIN_SIGNERS`: minimum valid signatures required for `bootstrap/anchors.json` (default 1).
 - `IRIUM_SYBIL_DIFFICULTY` / `IRIUM_SYBIL_DIFFICULTY_MAX`: base and cap for sybil handshake PoW (default 10/20).
 - `IRIUM_BANNED_LIST` / `IRIUM_BANNED_TRUST`: optional signed banlist path and allowed signer file (default `bootstrap/banned_peers.txt` + `.sig`, `bootstrap/trust/allowed_ban_signers`).
+- `IRIUM_TLS_CERT` / `IRIUM_TLS_KEY`: PEM paths to enable HTTPS for the HTTP API (if unset, HTTP is used).
 
 ```bash
 # optional: set a config JSON with p2p_bind, relay_address, etc.

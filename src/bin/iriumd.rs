@@ -10,6 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1448,18 +1449,38 @@ async fn main() {
         .parse()
         .expect("valid bind address");
 
-    if json_log_enabled() {
-        println!(
-            "{}",
-            json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "http_listen", "host": host, "port": port})
-        );
+    let tls_cert = std::env::var("IRIUM_TLS_CERT").ok();
+    let tls_key = std::env::var("IRIUM_TLS_KEY").ok();
+    if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
+        let config = RustlsConfig::from_pem_file(cert_path, key_path)
+            .await
+            .expect("failed to load TLS cert/key");
+        if json_log_enabled() {
+            println!(
+                "{}",
+                json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "http_listen", "host": host, "port": port, "scheme": "https"})
+            );
+        } else {
+            println!("Irium Rust node HTTPS listening on https://{}:{}", host, port);
+        }
+        axum_server::bind_rustls(addr, config)
+            .serve(app)
+            .await
+            .expect("server error");
     } else {
-        println!("Irium Rust node HTTP listening on http://{}:{}", host, port);
+        if json_log_enabled() {
+            println!(
+                "{}",
+                json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "http_listen", "host": host, "port": port, "scheme": "http"})
+            );
+        } else {
+            println!("Irium Rust node HTTP listening on http://{}:{}", host, port);
+        }
+
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("bind failed");
+
+        axum::serve(listener, app).await.expect("server error");
     }
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("bind failed");
-
-    axum::serve(listener, app).await.expect("server error");
 }
