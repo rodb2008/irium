@@ -691,6 +691,9 @@ impl P2PNode {
                                         payload,
                                     };
                                     let _ = send_message(&writer, pong, addr).await;
+                                    let mut dir_guard = dir.lock().await;
+                                    let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
+                                    dir_guard.mark_seen(&multiaddr);
                                 }
                             }
                             MessageType::Handshake => {
@@ -783,6 +786,9 @@ impl P2PNode {
                                 }
                             }
                             MessageType::Pong => {
+                                let mut dir_guard = dir.lock().await;
+                                let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
+                                dir_guard.mark_seen(&multiaddr);
                                 if P2PNode::verbose_messages() {
                                     P2PNode::log_event(
                                         "info",
@@ -806,7 +812,7 @@ impl P2PNode {
                                 if let Ok(list) = PeersPayload::from_message(&msg) {
                                     let mut dir = dir.lock().await;
                                     for p in list.peers {
-                                        dir.register_connection(p, None, None, None);
+                                        dir.register_peer_hint(p);
                                     }
                                 }
                             }
@@ -1563,6 +1569,9 @@ async fn handle_incoming_with_sybil(
                         payload,
                     };
                     let _ = send_message(&writer, pong, addr).await;
+                    let mut dir_guard = directory.lock().await;
+                    let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
+                    dir_guard.mark_seen(&multiaddr);
                 }
             }
             MessageType::GetPeers => {
@@ -1580,7 +1589,7 @@ async fn handle_incoming_with_sybil(
                 if let Ok(list) = PeersPayload::from_message(&msg) {
                     let mut dir = directory.lock().await;
                     for p in list.peers {
-                        dir.register_connection(p, None, None, None);
+                        dir.register_peer_hint(p);
                     }
                 }
             }

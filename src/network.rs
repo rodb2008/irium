@@ -17,6 +17,11 @@ fn now_secs() -> f64 {
         .as_secs_f64()
 }
 
+
+fn now_day() -> i64 {
+    (now_secs() / 86_400.0).floor() as i64
+}
+
 fn repo_root() -> PathBuf {
     std::env::var("IRIUM_REPO_ROOT")
         .map(PathBuf::from)
@@ -52,6 +57,8 @@ pub struct PeerRecord {
     pub agent: Option<String>,
     pub last_seen: f64,
     pub first_seen: f64,
+    #[serde(default)]
+    pub seen_days: Vec<i64>,
     pub relay_address: Option<String>,
     pub last_height: Option<u64>,
     pub node_id: Option<String>,
@@ -60,11 +67,13 @@ pub struct PeerRecord {
 impl PeerRecord {
     pub fn new(multiaddr: String, agent: Option<String>) -> PeerRecord {
         let t = now_secs();
+        let day = (t / 86_400.0).floor() as i64;
         PeerRecord {
             multiaddr,
             agent,
             last_seen: t,
             first_seen: t,
+            seen_days: vec![day],
             relay_address: None,
             last_height: None,
             node_id: None,
@@ -73,6 +82,15 @@ impl PeerRecord {
 
     pub fn touch(&mut self) {
         self.last_seen = now_secs();
+        let day = now_day();
+        if !self.seen_days.contains(&day) {
+            self.seen_days.push(day);
+            self.seen_days.sort_unstable();
+            if self.seen_days.len() > 30 {
+                let start = self.seen_days.len() - 30;
+                self.seen_days = self.seen_days[start..].to_vec();
+            }
+        }
     }
 }
 
@@ -212,6 +230,15 @@ impl PeerDirectory {
                     .get("agent")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let seen_days = obj
+                    .get("seen_days")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_i64())
+                            .collect::<Vec<i64>>()
+                    })
+                    .unwrap_or_default();
                 let first_seen = obj
                     .get("first_seen")
                     .and_then(|v| v.as_f64())
@@ -236,6 +263,7 @@ impl PeerDirectory {
                         agent,
                         first_seen,
                         last_seen,
+                        seen_days,
                         relay_address,
                         last_height,
                         node_id,
@@ -260,6 +288,14 @@ impl PeerDirectory {
                     "relay_address".to_string(),
                     serde_json::Value::String(relay.clone()),
                 );
+            }
+            if !rec.seen_days.is_empty() {
+                let arr = rec
+                    .seen_days
+                    .iter()
+                    .map(|v| serde_json::Value::Number(serde_json::Number::from(*v)))
+                    .collect();
+                obj.insert("seen_days".to_string(), serde_json::Value::Array(arr));
             }
             obj.insert(
                 "first_seen".to_string(),
@@ -315,6 +351,39 @@ impl PeerDirectory {
         self.refresh_seedlist_with_policy();
     }
 
+    /// Register a peer from a hint list without marking it active.
+    pub fn register_peer_hint(&mut self, multiaddr: String) {
+        if self.records.contains_key(&multiaddr) {
+            return;
+        }
+        let t = now_secs();
+        self.records.insert(
+            multiaddr.clone(),
+            PeerRecord {
+                multiaddr,
+                agent: None,
+                last_seen: 0.0,
+                first_seen: t,
+                seen_days: Vec::new(),
+                relay_address: None,
+                last_height: None,
+                node_id: None,
+            },
+        );
+        self.flush();
+    }
+
+    /// Mark a peer as seen without changing its metadata.
+    pub fn mark_seen(&mut self, multiaddr: &str) {
+        if let Some(rec) = self.records.get_mut(multiaddr) {
+            let before = rec.seen_days.len();
+            rec.touch();
+            if rec.seen_days.len() != before {
+                self.flush();
+            }
+        }
+    }
+
     pub fn peers(&self) -> Vec<PeerRecord> {
         self.records.values().cloned().collect()
     }
@@ -326,16 +395,22 @@ impl PeerDirectory {
             .and_then(|r| r.relay_address.clone())
     }
 
-    /// Apply seedlist policy: promote peers active >= 7 days,
+    /// Apply seedlist policy: promote peers active for 7 consecutive days,
     /// drop peers idle > 24h. Baseline seeds remain in the static seedlist file.
     pub fn refresh_seedlist_with_policy(&self) {
         let now = now_secs();
+        let today = now_day();
         let mut seeds = Vec::new();
 
         for rec in self.records.values() {
-            let age_days = (now - rec.first_seen) / 86_400.0;
             let idle_hours = (now - rec.last_seen) / 3600.0;
-            if age_days >= 7.0 && idle_hours <= 24.0 {
+            let mut active_days = 0;
+            for day in (today - 6)..=today {
+                if rec.seen_days.contains(&day) {
+                    active_days += 1;
+                }
+            }
+            if active_days >= 7 && idle_hours <= 24.0 {
                 if let Some(ip) = normalize_seed(&rec.multiaddr) {
                     seeds.push(ip);
                 }
