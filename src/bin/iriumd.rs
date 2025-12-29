@@ -347,8 +347,26 @@ fn blocks_dir() -> PathBuf {
     }
 }
 
-fn prune_blocks_above(height: u64) {
-    let dir = blocks_dir();
+fn miner_blocks_dir() -> PathBuf {
+    if let Ok(dir) = env::var("IRIUM_MINER_BLOCKS_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        PathBuf::from(home).join(".irium/miner/blocks")
+    }
+}
+
+fn same_dir(a: &PathBuf, b: &PathBuf) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn prune_blocks_above_dir(dir: &std::path::Path, height: u64) {
     if !dir.exists() {
         return;
     }
@@ -376,11 +394,19 @@ fn prune_blocks_above(height: u64) {
     }
 }
 
-fn load_persisted_blocks(state: &mut ChainState) {
-    let dir = blocks_dir();
+fn load_persisted_blocks_from(
+    state: &mut ChainState,
+    dir: &std::path::Path,
+    skip_below_tip: bool,
+) {
     if !dir.exists() {
         return;
     }
+    let base_height = if skip_below_tip {
+        state.tip_height()
+    } else {
+        0
+    };
     let mut entries: Vec<(u64, std::path::PathBuf)> = Vec::new();
     if let Ok(read_dir) = dir.read_dir() {
         for entry in read_dir.flatten() {
@@ -389,6 +415,9 @@ fn load_persisted_blocks(state: &mut ChainState) {
                 if let Some(stripped) = name.strip_prefix("block_") {
                     if let Some(num_part) = stripped.strip_suffix(".json") {
                         if let Ok(h) = num_part.parse::<u64>() {
+                            if skip_below_tip && h <= base_height {
+                                continue;
+                            }
                             entries.push((h, path));
                         }
                     }
@@ -470,13 +499,22 @@ fn load_persisted_blocks(state: &mut ChainState) {
                 if let Err(e) = state.connect_block(block) {
                     eprintln!("[⚠️] Failed to connect persisted block {}: {}", h, e);
                     let tip = state.tip_height();
-                    prune_blocks_above(tip);
+                    prune_blocks_above_dir(dir, tip);
                     println!("[🧹] Pruned persisted blocks above height {}", tip);
                     break;
                 }
             }
             Err(e) => eprintln!("[⚠️] Failed to read {}: {}", path.display(), e),
         }
+    }
+}
+
+fn load_persisted_blocks(state: &mut ChainState) {
+    let node_dir = blocks_dir();
+    load_persisted_blocks_from(state, &node_dir, false);
+    let miner_dir = miner_blocks_dir();
+    if !same_dir(&node_dir, &miner_dir) {
+        load_persisted_blocks_from(state, &miner_dir, true);
     }
 
     if state.height > 1 {
