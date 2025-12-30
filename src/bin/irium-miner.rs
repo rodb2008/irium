@@ -312,6 +312,14 @@ struct SubmitBlockRequest {
     tx_hex: Vec<String>,
 }
 
+fn rpc_base_is_localhost() -> bool {
+    let base = node_rpc_base();
+    base.contains("127.0.0.1")
+        || base.contains("localhost")
+        || base.contains("[::1]")
+        || base.contains("::1")
+}
+
 fn rpc_client() -> Result<Client, String> {
     let mut builder = Client::builder().timeout(Duration::from_secs(5));
     if let Ok(path) = env::var("IRIUM_RPC_CA") {
@@ -320,13 +328,23 @@ fn rpc_client() -> Result<Client, String> {
             .map_err(|e| format!("invalid CA {path}: {e}"))?;
         builder = builder.add_root_certificate(cert);
     }
-    let insecure = env::var("IRIUM_RPC_INSECURE")
+    let mut insecure = env::var("IRIUM_RPC_INSECURE")
         .ok()
         .map(|v| {
             let v = v.to_lowercase();
             v == "1" || v == "true" || v == "yes"
         })
         .unwrap_or(false);
+    let strict = env::var("IRIUM_RPC_STRICT")
+        .ok()
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false);
+    if !insecure && !strict && rpc_base_is_localhost() {
+        insecure = true;
+    }
     if insecure {
         builder = builder.danger_accept_invalid_certs(true);
     }
@@ -499,10 +517,11 @@ fn fetch_status_height(client: &Client) -> Result<u64, String> {
     }
     let base = node_rpc_base();
     let url = format!("{}/status", base.trim_end_matches('/'));
-    let resp = client
-        .get(url)
-        .send()
-        .map_err(|e| format!("status failed: {e}"))?;
+    let mut req = client.get(url);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().map_err(|e| format!("status failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("status failed: HTTP {}", resp.status()));
     }
@@ -515,8 +534,11 @@ fn fetch_status_height(client: &Client) -> Result<u64, String> {
 fn fetch_block_json(client: &Client, height: u64) -> Result<serde_json::Value, String> {
     let base = node_rpc_base();
     let url = format!("{}/rpc/block?height={}", base.trim_end_matches('/'), height);
-    let resp = client
-        .get(url)
+    let mut req = client.get(url);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
         .send()
         .map_err(|e| format!("get block {height} failed: {e}"))?;
     if !resp.status().is_success() {
@@ -524,6 +546,17 @@ fn fetch_block_json(client: &Client, height: u64) -> Result<serde_json::Value, S
     }
     resp.json()
         .map_err(|e| format!("block {height} parse: {e}"))
+}
+
+
+fn fetch_block_hash(client: &Client, height: u64) -> Result<String, String> {
+    let v = fetch_block_json(client, height)?;
+    let hash = v
+        .get("header")
+        .and_then(|h| h.get("hash"))
+        .and_then(|h| h.as_str())
+        .ok_or_else(|| "block hash missing".to_string())?;
+    Ok(hash.to_string())
 }
 
 fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Result<(), String> {
@@ -609,7 +642,33 @@ fn reconcile_with_node(state: &mut ChainState, params: &ChainParams) {
         }
     };
 
-    let local_tip = state.tip_height();
+    let mut local_tip = state.tip_height();
+    if local_tip > 0 {
+        match fetch_block_hash(&client, local_tip) {
+            Ok(remote_hash) => {
+                let local_hash = state
+                    .chain
+                    .last()
+                    .map(|b| hex::encode(b.header.hash()))
+                    .unwrap_or_default();
+                if local_hash != remote_hash {
+                    eprintln!(
+                        "[warn] Miner chain diverged at height {} (local {} != remote {}), resetting to node",
+                        local_tip,
+                        local_hash,
+                        remote_hash
+                    );
+                    prune_blocks_above(0);
+                    *state = ChainState::new(params.clone());
+                    local_tip = state.tip_height();
+                }
+            }
+            Err(e) => {
+                eprintln!("[warn] Miner could not verify tip hash: {e}");
+            }
+        }
+    }
+
     let remote_tip = remote_height;
 
     if remote_tip < local_tip {
