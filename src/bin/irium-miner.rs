@@ -227,9 +227,66 @@ struct LegacyMempoolEntry {
     hex: String,
 }
 
+#[derive(Deserialize)]
+struct TemplateTx {
+    hex: String,
+    fee: Option<u64>,
+    relay_addresses: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct BlockTemplate {
+    height: u64,
+    prev_hash: String,
+    bits: String,
+    time: u32,
+    txs: Vec<TemplateTx>,
+}
+
 /// Load mempool transactions, accepting either the new structured mempool
 /// file or the legacy hex-only format.
-fn load_mempool_entries(chain: &ChainState) -> Vec<irium_node_rs::mempool::MempoolEntry> {
+fn mempool_entries_from_template(
+    chain: &ChainState,
+    template: &BlockTemplate,
+) -> Vec<irium_node_rs::mempool::MempoolEntry> {
+    let mut out = Vec::new();
+    for tx in &template.txs {
+        let raw = match hex::decode(&tx.hex) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Invalid template tx hex: {e}");
+                continue;
+            }
+        };
+        let tx_obj = decode_compact_tx(&raw);
+        if let Err(e) = chain.validate_transaction(&tx_obj) {
+            eprintln!("Skipping invalid template tx: {e}");
+            continue;
+        }
+        let fee = tx.fee.unwrap_or(0);
+        let size = raw.len();
+        let fee_per_byte = if size > 0 { fee as f64 / size as f64 } else { 0.0 };
+        out.push(irium_node_rs::mempool::MempoolEntry {
+            tx: tx_obj,
+            raw,
+            fee,
+            size,
+            fee_per_byte,
+            added: 0,
+            relays: Vec::new(),
+            relay_addresses: tx.relay_addresses.clone().unwrap_or_default(),
+        });
+    }
+    out
+}
+
+fn load_mempool_entries(
+    chain: &ChainState,
+    template: Option<&BlockTemplate>,
+) -> Vec<irium_node_rs::mempool::MempoolEntry> {
+    if let Some(template) = template {
+        return mempool_entries_from_template(chain, template);
+    }
     // First try the structured mempool manager.
     let mgr = MempoolManager::new(mempool_file(), 1000, 1.0);
     let mut out = Vec::new();
@@ -514,25 +571,21 @@ fn node_http_client() -> Result<Client, String> {
     rpc_client()
 }
 
-fn fetch_status_height(client: &Client) -> Result<u64, String> {
-    #[derive(Deserialize)]
-    struct StatusResp {
-        height: u64,
-    }
+fn fetch_block_template(client: &Client) -> Result<BlockTemplate, String> {
     let base = node_rpc_base();
-    let url = format!("{}/status", base.trim_end_matches('/'));
+    let url = format!("{}/rpc/getblocktemplate", base.trim_end_matches("/"));
     let mut req = client.get(url);
     if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
         req = req.bearer_auth(token);
     }
-    let resp = req.send().map_err(|e| format!("status failed: {e}"))?;
+    let resp = req
+        .send()
+        .map_err(|e| format!("template failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("status failed: HTTP {}", resp.status()));
+        return Err(format!("template failed: HTTP {}", resp.status()));
     }
-    let parsed: StatusResp = resp
-        .json()
-        .map_err(|e| format!("status parse: {e}"))?;
-    Ok(parsed.height)
+    resp.json()
+        .map_err(|e| format!("template parse: {e}"))
 }
 
 fn fetch_block_json(client: &Client, height: u64) -> Result<serde_json::Value, String> {
@@ -553,14 +606,9 @@ fn fetch_block_json(client: &Client, height: u64) -> Result<serde_json::Value, S
 }
 
 
-fn fetch_block_hash(client: &Client, height: u64) -> Result<String, String> {
-    let v = fetch_block_json(client, height)?;
-    let hash = v
-        .get("header")
-        .and_then(|h| h.get("hash"))
-        .and_then(|h| h.as_str())
-        .ok_or_else(|| "block hash missing".to_string())?;
-    Ok(hash.to_string())
+fn parse_bits(bits_str: &str) -> Result<u32, String> {
+    let trimmed = bits_str.trim_start_matches("0x");
+    u32::from_str_radix(trimmed, 16).map_err(|e| format!("invalid bits field: {e}"))
 }
 
 fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Result<(), String> {
@@ -629,51 +677,40 @@ fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Res
     state.connect_block(block).map(|_| ())
 }
 
-fn reconcile_with_node(state: &mut ChainState, params: &ChainParams) {
-    let client = match node_http_client() {
-        Ok(c) => c,
+fn reconcile_with_template(state: &mut ChainState, params: &ChainParams, template: &BlockTemplate, client: &Client) {
+    let remote_tip = template.height.saturating_sub(1);
+    let prev_bytes = match hex::decode(&template.prev_hash) {
+        Ok(v) => v,
         Err(e) => {
-            eprintln!("[warn] Miner could not build HTTP client: {e}");
+            eprintln!("[warn] Miner template prev_hash decode failed: {e}");
             return;
         }
     };
-
-    let remote_height = match fetch_status_height(&client) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("[warn] Miner could not fetch node status: {e}");
-            return;
-        }
-    };
+    if prev_bytes.len() != 32 {
+        eprintln!("[warn] Miner template prev_hash length {} != 32", prev_bytes.len());
+        return;
+    }
+    let mut remote_prev = [0u8; 32];
+    remote_prev.copy_from_slice(&prev_bytes);
 
     let mut local_tip = state.tip_height();
-    if local_tip > 0 {
-        match fetch_block_hash(&client, local_tip) {
-            Ok(remote_hash) => {
-                let local_hash = state
-                    .chain
-                    .last()
-                    .map(|b| hex::encode(b.header.hash()))
-                    .unwrap_or_default();
-                if local_hash != remote_hash {
-                    eprintln!(
-                        "[warn] Miner chain diverged at height {} (local {} != remote {}), resetting to node",
-                        local_tip,
-                        local_hash,
-                        remote_hash
-                    );
-                    prune_blocks_above(0);
-                    *state = ChainState::new(params.clone());
-                    local_tip = state.tip_height();
-                }
-            }
-            Err(e) => {
-                eprintln!("[warn] Miner could not verify tip hash: {e}");
-            }
-        }
-    }
+    let local_hash = state
+        .chain
+        .last()
+        .map(|b| b.header.hash())
+        .unwrap_or([0u8; 32]);
 
-    let remote_tip = remote_height;
+    if local_tip == remote_tip && local_hash != remote_prev {
+        eprintln!(
+            "[warn] Miner chain diverged at height {} (local {} != remote {}), resetting to node",
+            local_tip,
+            hex::encode(local_hash),
+            template.prev_hash
+        );
+        prune_blocks_above(0);
+        *state = ChainState::new(params.clone());
+        local_tip = state.tip_height();
+    }
 
     if remote_tip < local_tip {
         let allow_ahead = env::var("IRIUM_MINER_ALLOW_LOCAL_AHEAD")
@@ -706,7 +743,7 @@ fn reconcile_with_node(state: &mut ChainState, params: &ChainParams) {
     );
 
     for h in start..=target {
-        match fetch_block_json(&client, h as u64) {
+        match fetch_block_json(client, h as u64) {
             Ok(v) => {
                 if let Err(e) = connect_block_from_json(state, &v) {
                     eprintln!("[warn] Miner failed to connect block {}: {}", h, e);
@@ -761,17 +798,57 @@ fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
     fs::write(path, json)
 }
 
-fn mine_once(chain: &mut ChainState) -> Result<(), String> {
-    let height = chain.height; // next block height
-    let tip_hash = if let Some(last) = chain.chain.last() {
-        last.header.hash()
-    } else {
-        [0u8; 32]
-    };
+fn template_changed(client: &Client, template: &BlockTemplate) -> bool {
+    match fetch_block_template(client) {
+        Ok(next) => next.height != template.height || next.prev_hash != template.prev_hash,
+        Err(_) => false,
+    }
+}
 
-    let reward = block_reward(height as u64);
+fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client) -> Result<bool, String> {
+    let height = template.height; // next block height
+    if chain.height != height {
+        return Err(format!(
+            "Template height {} does not match local height {}",
+            height, chain.height
+        ));
+    }
 
-    let mempool_entries = load_mempool_entries(chain);
+    let prev_bytes = hex::decode(&template.prev_hash)
+        .map_err(|e| format!("template prev_hash decode: {e}"))?;
+    if prev_bytes.len() != 32 {
+        return Err(format!(
+            "template prev_hash len {} != 32",
+            prev_bytes.len()
+        ));
+    }
+    let mut prev_hash = [0u8; 32];
+    prev_hash.copy_from_slice(&prev_bytes);
+
+    let local_prev = chain
+        .chain
+        .last()
+        .map(|b| b.header.hash())
+        .unwrap_or([0u8; 32]);
+    if local_prev != prev_hash {
+        return Err("template prev_hash does not match local tip".to_string());
+    }
+
+    let bits = parse_bits(&template.bits)?;
+    let expected = chain.target_for_height(height);
+    if expected.bits != bits {
+        eprintln!(
+            "[warn] Template bits {:08x} != expected {:08x}",
+            bits, expected.bits
+        );
+    }
+    let target = Target { bits };
+
+    let prev_time = chain.chain.last().map(|b| b.header.time).unwrap_or(0);
+    let now = Utc::now().timestamp() as u32;
+    let mut header_time = template.time.max(prev_time.saturating_add(1)).max(now);
+
+    let mempool_entries = load_mempool_entries(chain, Some(template));
     println!(
         "Including {} mempool txs in template",
         mempool_entries.len()
@@ -853,6 +930,7 @@ fn mine_once(chain: &mut ChainState) -> Result<(), String> {
     let mut txs = Vec::new();
     // Miner gets subsidy plus remaining fees after relay pool.
     let relay_total: u64 = relay_commitments.iter().map(|c| c.amount).sum();
+    let reward = block_reward(height as u64);
     let miner_reward = reward + (total_fees as u64).saturating_sub(relay_total);
     let mut coinbase = build_coinbase(height as u64, miner_reward);
 
@@ -869,10 +947,10 @@ fn mine_once(chain: &mut ChainState) -> Result<(), String> {
 
     let header = BlockHeader {
         version: 1,
-        prev_hash: tip_hash,
+        prev_hash,
         merkle_root: [0u8; 32],
-        time: Utc::now().timestamp() as u32,
-        bits: chain.target_for_height(height).bits,
+        time: header_time,
+        bits,
         nonce: 0,
     };
 
@@ -882,8 +960,6 @@ fn mine_once(chain: &mut ChainState) -> Result<(), String> {
     };
     let merkle = block.merkle_root();
     block.header.merkle_root = merkle;
-
-    let target = chain.target_for_height(height);
 
     let mut nonce: u32 = 0;
     let start = Instant::now();
@@ -937,13 +1013,16 @@ fn mine_once(chain: &mut ChainState) -> Result<(), String> {
                     }
                 }
             }
-            return Ok(());
+            return Ok(true);
         }
 
         nonce = nonce.wrapping_add(1);
         if nonce == 0 {
-            // Wrapped; refresh timestamp and merkle root
-            block.header.time = Utc::now().timestamp() as u32;
+            header_time = Utc::now().timestamp() as u32;
+            if header_time <= prev_time {
+                header_time = prev_time.saturating_add(1);
+            }
+            block.header.time = header_time;
             block.transactions = txs.clone();
             let merkle = block.merkle_root();
             block.header.merkle_root = merkle;
@@ -980,6 +1059,15 @@ fn mine_once(chain: &mut ChainState) -> Result<(), String> {
                 } else {
                     println!("[⏱️] next height {} tip {} nonce {}", height, height.saturating_sub(1), nonce);
                 }
+            }
+
+            if template_changed(client, template) {
+                if json_log_enabled() {
+                    println!("{}", json!({"event": "template_updated", "height": height, "ts": Utc::now().format("%H:%M:%S").to_string()}));
+                } else {
+                    println!("[🔄] Template updated; restarting mining");
+                }
+                return Ok(false);
             }
         }
     }
@@ -1019,7 +1107,6 @@ fn main() {
 
     // Load any persisted blocks so we resume from last mined height.
     load_persisted_blocks(&mut state);
-    reconcile_with_node(&mut state, &params);
 
     if let Some((addr, pkh)) = miner_address_info() {
         let pkh_hex = hex::encode(pkh);
@@ -1045,7 +1132,34 @@ fn main() {
     }
 
     loop {
-        reconcile_with_node(&mut state, &params);
+        let client = match node_http_client() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[warn] Miner could not build HTTP client: {e}");
+                std::thread::sleep(Duration::from_secs(3));
+                continue;
+            }
+        };
+
+        let template = match fetch_block_template(&client) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[warn] Miner could not fetch block template: {e}");
+                std::thread::sleep(Duration::from_secs(3));
+                continue;
+            }
+        };
+
+        reconcile_with_template(&mut state, &params, &template, &client);
+
+        if state.height != template.height {
+            eprintln!(
+                "[warn] Template height {} does not match local height {}",
+                template.height, state.height
+            );
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        }
 
         if json_log_enabled() {
             println!(
@@ -1056,25 +1170,31 @@ fn main() {
             println!("[▶️] Mining next height {} (tip {})", state.height, state.tip_height());
         }
 
-        if let Err(e) = mine_once(&mut state) {
-            if json_log_enabled() {
-                eprintln!(
-                    "{}",
-                    json!({"event": "mining_failed", "error": e.to_string(), "height": state.height, "tip_height": state.tip_height(), "ts": Utc::now().format("%H:%M:%S").to_string()})
-                );
-            } else {
-                eprintln!("[⚠️] Mining failed at next height {} (tip {}): {e}", state.height, state.tip_height());
+        match mine_once(&mut state, &template, &client) {
+            Ok(true) => {
+                if json_log_enabled() {
+                    println!(
+                        "{}",
+                        json!({"event": "mined_block_written", "height": state.height.saturating_sub(1), "ts": Utc::now().format("%H:%M:%S").to_string()})
+                    );
+                } else {
+                    println!("[💾] Wrote block_{}.json", state.height.saturating_sub(1));
+                }
             }
-            break;
-        }
-
-        if json_log_enabled() {
-            println!(
-                "{}",
-                json!({"event": "mined_block_written", "height": state.height.saturating_sub(1), "ts": Utc::now().format("%H:%M:%S").to_string()})
-            );
-        } else {
-            println!("[💾] Wrote block_{}.json", state.height.saturating_sub(1));
+            Ok(false) => {
+                // Template changed; restart loop for a fresh template.
+            }
+            Err(e) => {
+                if json_log_enabled() {
+                    eprintln!(
+                        "{}",
+                        json!({"event": "mining_failed", "error": e.to_string(), "height": state.height, "tip_height": state.tip_height(), "ts": Utc::now().format("%H:%M:%S").to_string()})
+                    );
+                } else {
+                    eprintln!("[⚠️] Mining failed at next height {} (tip {}): {e}", state.height, state.tip_height());
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
         }
 
         // Immediately proceed to the next height, mirroring the continuous loop in the

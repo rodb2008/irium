@@ -21,6 +21,7 @@ use bs58;
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
 use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, OutPoint};
+use irium_node_rs::constants::block_reward;
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::MempoolManager;
 use irium_node_rs::network::SeedlistManager;
@@ -106,6 +107,26 @@ struct SubmitTxRequest {
 struct SubmitTxResponse {
     txid: String,
     accepted: bool,
+}
+
+#[derive(Serialize)]
+struct TemplateTx {
+    hex: String,
+    fee: u64,
+    relay_addresses: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct BlockTemplateResponse {
+    height: u64,
+    prev_hash: String,
+    bits: String,
+    target: String,
+    time: u32,
+    txs: Vec<TemplateTx>,
+    total_fees: u64,
+    coinbase_value: u64,
+    mempool_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -806,6 +827,58 @@ async fn get_balance(
     }))
 }
 
+async fn get_block_template(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<BlockTemplateResponse>, StatusCode> {
+    check_rate(&state, &addr)?;
+    require_rpc_auth(&headers)?;
+
+    let (height, prev_hash, bits, target, time, txs, total_fees, mempool_count) = {
+        let guard = state.chain.lock().unwrap();
+        let tip = guard.chain.last();
+        let prev_hash = tip
+            .map(|b| hex::encode(b.header.hash()))
+            .unwrap_or_else(|| "00".repeat(32));
+        let height = guard.height;
+        let target = guard.target_for_height(height);
+        let bits = target.bits;
+        let prev_time = tip.map(|b| b.header.time).unwrap_or(0);
+        let now = Utc::now().timestamp() as u32;
+        let time = now.max(prev_time.saturating_add(1));
+        let mempool_entries = state.mempool.lock().unwrap().ordered_entries();
+        let mempool_count = mempool_entries.len();
+        let mut total_fees = 0u64;
+        let txs = mempool_entries
+            .into_iter()
+            .map(|entry| {
+                total_fees = total_fees.saturating_add(entry.fee);
+                TemplateTx {
+                    hex: hex::encode(entry.raw),
+                    fee: entry.fee,
+                    relay_addresses: entry.relay_addresses,
+                }
+            })
+            .collect();
+        (height, prev_hash, bits, target_hex(bits), time, txs, total_fees, mempool_count)
+    };
+
+    let coinbase_value = block_reward(height).saturating_add(total_fees);
+
+    Ok(Json(BlockTemplateResponse {
+        height,
+        prev_hash,
+        bits: format!("{:08x}", bits),
+        target,
+        time,
+        txs,
+        total_fees,
+        coinbase_value,
+        mempool_count,
+    }))
+}
+
 async fn get_block(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -978,6 +1051,17 @@ fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
 
     let json = serde_json::to_string_pretty(&jb)?;
     fs::write(path, json)
+}
+
+fn target_hex(bits: u32) -> String {
+    let target = Target { bits }.to_target();
+    let mut bytes = target.to_bytes_be();
+    if bytes.len() < 32 {
+        let mut padded = vec![0u8; 32 - bytes.len()];
+        padded.extend_from_slice(&bytes);
+        bytes = padded;
+    }
+    hex::encode(bytes)
 }
 
 fn parse_header_bits(bits_str: &str) -> Result<u32, String> {
@@ -1479,6 +1563,7 @@ async fn main() {
         .route("/metrics", get(metrics))
         .route("/rpc/balance", get(get_balance))
         .route("/rpc/utxo", get(get_utxo))
+        .route("/rpc/getblocktemplate", get(get_block_template))
         .route("/rpc/block", get(get_block))
         .route("/rpc/submit_block", post(submit_block))
         .route("/rpc/submit_tx", post(submit_tx))
