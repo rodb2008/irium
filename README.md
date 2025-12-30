@@ -17,6 +17,37 @@ Irium is a production‑only proof‑of‑work blockchain for the IRM asset. The
 - `scripts/` – ops helpers (systemd example, setup scripts).
 - `state/` – runtime data (peers.json, etc.).
 
+
+## Get Started (Download + Run Services)
+```bash
+git clone https://github.com/iriumlabs/irium.git
+cd irium
+source ~/.cargo/env
+cargo build --release
+```
+Run each service in its own terminal:
+```bash
+# Terminal 1: node
+RUST_LOG=info ./target/release/iriumd
+```
+```bash
+# Terminal 2: create an address (save the privkey) and start mining
+./target/release/irium-wallet new-address
+export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>
+./target/release/irium-miner
+```
+```bash
+# Terminal 3: check balance
+./target/release/irium-wallet balance <YOUR_IRIUM_ADDRESS>
+```
+```bash
+# Optional: SPV tool
+./target/release/irium-spv --help
+```
+Notes:
+- If the node requires `IRIUM_RPC_TOKEN`, export the same token for the miner and wallet.
+- Keep the printed private key safe; it controls the funds for that address.
+
 ## Build & Test
 ```bash
 cd /home/irium/irium
@@ -59,10 +90,13 @@ source ~/.cargo/env
 Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
 
 ## Wallet
-The wallet CLI can query balances from a running node:
+The wallet CLI can create a new address and query balances from a running node:
 ```bash
 cd /home/irium/irium
 source ~/.cargo/env
+./target/release/irium-wallet new-address
+```
+```bash
 export IRIUM_RPC_URL=http://127.0.0.1:38300
 # if the node requires auth
 # export IRIUM_RPC_TOKEN=...

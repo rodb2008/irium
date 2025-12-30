@@ -1,9 +1,15 @@
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::SecretKey;
+use rand_core::OsRng;
 use reqwest::blocking::Client;
+use ripemd::Ripemd160;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::time::Duration;
+
+const IRIUM_P2PKH_VERSION: u8 = 0x39;
 
 // Base58 P2PKH decoder (version byte + 20-byte hash + 4-byte checksum)
 fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
@@ -27,8 +33,29 @@ fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
     Some(payload.to_vec())
 }
 
+fn hash160(data: &[u8]) -> [u8; 20] {
+    let sha = Sha256::digest(data);
+    let rip = Ripemd160::digest(&sha);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&rip);
+    out
+}
+
+fn base58_p2pkh_from_hash(pkh: &[u8; 20]) -> String {
+    let mut body = Vec::with_capacity(1 + 20);
+    body.push(IRIUM_P2PKH_VERSION);
+    body.extend_from_slice(pkh);
+    let first = Sha256::digest(&body);
+    let second = Sha256::digest(&first);
+    let checksum = &second[0..4];
+    let mut full = body;
+    full.extend_from_slice(checksum);
+    bs58::encode(full).into_string()
+}
+
 fn usage() {
     eprintln!("Usage:");
+    eprintln!("  irium-wallet new-address");
     eprintln!("  irium-wallet address-to-pkh <base58_addr>");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
 }
@@ -86,6 +113,20 @@ fn main() {
     }
 
     match args[0].as_str() {
+        "new-address" => {
+            if args.len() != 1 {
+                usage();
+                std::process::exit(1);
+            }
+            let secret = SecretKey::random(&mut OsRng);
+            let public = secret.public_key();
+            let pubkey = public.to_encoded_point(true);
+            let pkh = hash160(pubkey.as_bytes());
+            let address = base58_p2pkh_from_hash(&pkh);
+            println!("address {}", address);
+            println!("pubkey {}", hex::encode(pubkey.as_bytes()));
+            println!("privkey {}", hex::encode(secret.to_bytes()));
+        }
         "address-to-pkh" => {
             if args.len() != 2 {
                 usage();

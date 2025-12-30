@@ -2,6 +2,14 @@
 
 This guide runs a Rust Irium node/miner on mainnet (no testnet, no DNS). Assumes Rust toolchain is installed (`source ~/.cargo/env`).
 
+## 0) Download and build
+```
+git clone https://github.com/iriumlabs/irium.git
+cd irium
+source ~/.cargo/env
+cargo build --release
+```
+
 ## 1) Verify bootstrap artifacts
 ```
 cd /home/irium/irium
@@ -11,7 +19,7 @@ ls bootstrap/seedlist.txt bootstrap/seedlist.txt.sig bootstrap/trust/allowed_sig
 ```
 The node verifies `seedlist.txt` against `allowed_signers` via `ssh-keygen -Y verify`.
 
-## 2) Build and test
+## 2) Test (optional)
 ```
 source ~/.cargo/env
 cargo test --quiet
@@ -34,13 +42,19 @@ export IRIUM_NODE_CONFIG=/home/irium/irium/configs/node.json
 ## 4) Run the node
 ```
 source ~/.cargo/env
-RUST_LOG=info cargo run --release --bin iriumd
+RUST_LOG=info ./target/release/iriumd
 ```
 - Seeds: signed `bootstrap/seedlist.txt` + cached `bootstrap/seedlist.runtime` (unless `p2p_seeds` overrides).
 - HTTP API: defaults to 127.0.0.1:38300 (`IRIUM_NODE_HOST`, `IRIUM_NODE_PORT`).
 - P2P: bind from config; uses sybil-resistant handshake and header-first sync.
 
-## 5) Mining
+## 5) Create a wallet address
+```
+./target/release/irium-wallet new-address
+```
+Save the printed private key. It controls the funds for that address.
+
+## 6) Start mining
 Set a payout address (or PKH) so rewards are spendable:
 ```
 cd /home/irium/irium
@@ -50,14 +64,20 @@ source ~/.cargo/env
 ```
 - Relies on the local node/mempool and auto-submits mined blocks to http://127.0.0.1:38300/rpc/submit_block (override with `IRIUM_NODE_RPC`).
 - Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
+- If `IRIUM_RPC_TOKEN` is set on the node, export the same token for the miner.
 
-## 6) SPV check
+## 7) Check balance
+```
+./target/release/irium-wallet balance <YOUR_IRIUM_ADDRESS>
+```
+
+## 8) SPV check
 ```
 source ~/.cargo/env
 cargo run --release --bin irium-spv -- verify <height> <txid> <index> <proof_hex_csv>
 ```
 
-## 7) systemd (optional)
+## 9) systemd (optional)
 See `scripts/iriumd.service.example`:
 - Copy to `/etc/systemd/system/iriumd.service` (adjust user/paths).
 - `systemctl daemon-reload && systemctl enable --now iriumd`.
