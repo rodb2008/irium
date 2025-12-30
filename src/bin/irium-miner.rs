@@ -312,6 +312,7 @@ struct SubmitBlockRequest {
     tx_hex: Vec<String>,
 }
 
+
 fn rpc_base_is_localhost() -> bool {
     let base = node_rpc_base();
     base.contains("127.0.0.1")
@@ -342,6 +343,9 @@ fn rpc_client() -> Result<Client, String> {
             v == "1" || v == "true" || v == "yes"
         })
         .unwrap_or(false);
+    if strict {
+        insecure = false;
+    }
     if !insecure && !strict && rpc_base_is_localhost() {
         insecure = true;
     }
