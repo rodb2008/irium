@@ -87,4 +87,5 @@ Logs go to `journalctl -u iriumd`.
 - Signed seeds: `bootstrap/seedlist.txt` (+ .sig + trust/allowed_signers)
 - Runtime peers: `bootstrap/seedlist.runtime`
 - Anchors: `bootstrap/anchors.json` (anchor enforcement planned)
+- Peer cache: `state/peers.json` (used when seeds are unavailable)
 - Runtime state: `state/`

@@ -1283,20 +1283,30 @@ async fn main() {
         tokio::spawn(async move {
             let node = node;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut no_seed_logged = false;
             loop {
                 let (seeds, seed_info) = build_seed_addrs(&config_seeds, &signed_seeds, default_seed_port, &local_ips);
                 if seeds.is_empty() {
-                    if seed_info.total > 0 && seed_info.filtered_local == seed_info.total {
-                        // All seeds are local; wait for inbound peers quietly.
-                    } else {
-                        println!(
-                            "[{}] no seeds configured; waiting",
-                            Utc::now().format("%H:%M:%S")
-                        );
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        node.connect_known_peers(5),
+                    )
+                    .await;
+                    if !no_seed_logged {
+                        if seed_info.total > 0 && seed_info.filtered_local == seed_info.total {
+                            // All seeds are local; wait for inbound peers quietly.
+                        } else {
+                            println!(
+                                "[{}] no seeds configured; trying peer cache",
+                                Utc::now().format("%H:%M:%S")
+                            );
+                        }
+                        no_seed_logged = true;
                     }
                     interval.tick().await;
                     continue;
                 }
+                no_seed_logged = false;
                 for addr in &seeds {
                     if node.is_connected(addr).await {
                         continue;

@@ -115,6 +115,7 @@ cargo run --release --bin irium-spv -- verify <height> <txid> <index> <proof_hex
 - `bootstrap/seedlist.txt` + `seedlist.txt.sig` – signed initial peers.
 - `bootstrap/seedlist.runtime` – node‑learned peers (auto‑updated at runtime).
 - `bootstrap/anchors.json` – anchor checkpoints (validation planned).
+- `state/peers.json` – peer cache used when seeds are unavailable.
 
 ## Systemd Example
 See `scripts/iriumd.service.example` for a unit that runs the node under journald with automatic restart.
