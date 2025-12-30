@@ -1,56 +1,58 @@
-# Irium Mining Guide (Full P2P Miner)
+# Irium Mining Guide (Rust Miner)
 
-This guide shows how to mine using the full P2P miner with your own wallet. No wallets or peers are hardcoded; everything is env/CLI driven (Bitcoin-style).
+This guide covers solo mining against your own node and optional Stratum pool mining. The Rust miner pulls block templates from the node (Bitcoin-style) and auto-submits blocks back to the node.
 
-## 1) Create a miner wallet (per-miner)
+## 1) Build the binaries
 ```bash
-# Creates ~/.irium-miners/<miner-id>/irium-wallet.json
-scripts/setup-miner.sh my-miner-1
+cd /home/irium/irium
+source ~/.cargo/env
+cargo build --release
 ```
 
-## 2) Single miner run (recommended)
+## 2) Run the node
 ```bash
-# Select your wallet file
-export IRIUM_WALLET_FILE="$HOME/.irium-miners/my-miner-1/irium-wallet.json"
-
-# Start a node (pick a free port if 38291 is busy)
-nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
-
-# Start one full P2P miner (positional P2P port, no --port flag)
-python3 scripts/irium-miner.py 38292
+RUST_LOG=info ./target/release/iriumd
 ```
 
-Stop:
+## 3) Create a wallet address
 ```bash
-pkill -f 'scripts/irium-miner.py'
-pkill -f 'scripts/irium-node.py'
+./target/release/irium-wallet new-address
+```
+Save the printed private key. It controls the funds for that address.
+
+## 4) Solo mining (recommended)
+```bash
+export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>
+export IRIUM_NODE_RPC=http://127.0.0.1:38300
+# If the node requires auth, export IRIUM_RPC_TOKEN too.
+./target/release/irium-miner
 ```
 
-## 3) Multicore mining (full P2P miners)
+Template tuning (optional):
+- `IRIUM_GBT_MAX_TXS`: cap the number of mempool txs included in templates.
+- `IRIUM_GBT_MIN_FEE`: minimum fee/byte to include in templates.
+- `IRIUM_GBT_LONGPOLL=1`: enable long-poll template refresh.
+- `IRIUM_GBT_LONGPOLL_SECS`: long-poll timeout (default 25s, max 120s).
+- `IRIUM_MINER_STRICT_RPC=1`: stop mining if RPC/template fetch fails.
+
+## 5) Stratum pool mining (optional)
+Set a Stratum URL to enable pool mode (disables solo template mining):
 ```bash
-# Use your wallet (same as above)
-export IRIUM_WALLET_FILE="$HOME/.irium-miners/my-miner-1/irium-wallet.json"
+export IRIUM_STRATUM_URL=stratum+tcp://pool.example.com:3333
+export IRIUM_STRATUM_USER=<POOL_USER>
+export IRIUM_STRATUM_PASS=<POOL_PASS>
+./target/release/irium-miner
+```
+Notes:
+- Stratum is TCP-only in the current miner.
+- Pool mining uses the pool-provided coinbase/merkle and submits shares via `mining.submit`.
 
-# Ensure a node is running (example)
-nohup python3 -u scripts/irium-node.py 38291 > /tmp/node.log 2>&1 &
-
-# Launch N miners; logs in /tmp/miner-<port>.log
-./scripts/irium-miner-multicore.sh 4
+## 6) Check balance
+```bash
+./target/release/irium-wallet balance <YOUR_IRIUM_ADDRESS>
 ```
 
-## 4) Environment and CLI (no hardcoding)
-- Wallet file: `IRIUM_WALLET_FILE=/path/to/irium-wallet.json`
-- P2P port (full miner): positional arg (e.g., `scripts/irium-miner.py 38292`)
-- Node port: positional arg (e.g., `scripts/irium-node.py 38291`)
-- Bootstrap peers (optional): `BOOTSTRAP_NODES="host1:port,host2:port"`
-- Data dirs (optional overrides):
-  - `IRIUM_BLOCKS_DIR` (default `~/.irium/miner/blocks`)
-  - `IRIUM_MEMPOOL_DIR` (default `~/.irium/mempool`)
-  - `IRIUM_WALLET_FILE` (default `~/.irium/irium-wallet.json` for wallet API)
-
-## 5) Troubleshooting
-- Port in use: pick different ports (e.g., node `39291`, miner `39292+`).
-- Wallet not found: ensure `IRIUM_WALLET_FILE` is set and file perms are `600`.
-- Logs:
-  - Node: `/tmp/node.log`
-  - Miners: `/tmp/miner-<P2PPORT>.log`
+## Troubleshooting
+- RPC unauthorized: ensure `IRIUM_RPC_TOKEN` matches the node.
+- No templates: confirm node is running and reachable at `IRIUM_NODE_RPC`.
+- Low hashrate: check CPU governor and ensure the miner is not throttled.

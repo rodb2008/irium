@@ -1,6 +1,10 @@
 use reqwest::blocking::Client;
 use reqwest::Certificate;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, fs, sync::OnceLock};
 
@@ -10,6 +14,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use num_bigint::BigUint;
 
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
@@ -17,7 +22,7 @@ use irium_node_rs::chain::{block_from_locked, decode_compact_tx, ChainParams, Ch
 use irium_node_rs::constants::block_reward;
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::MempoolManager;
-use irium_node_rs::pow::{meets_target, Target};
+use irium_node_rs::pow::{meets_target, sha256d, Target};
 use irium_node_rs::relay::RelayCommitment;
 use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
 
@@ -571,10 +576,54 @@ fn node_http_client() -> Result<Client, String> {
     rpc_client()
 }
 
-fn fetch_block_template(client: &Client) -> Result<BlockTemplate, String> {
+fn strict_rpc_enabled() -> bool {
+    env::var("IRIUM_MINER_STRICT_RPC")
+        .ok()
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+        || env::var("IRIUM_MINER_FAIL_FAST")
+            .ok()
+            .map(|v| {
+                let v = v.to_lowercase();
+                v == "1" || v == "true" || v == "yes"
+            })
+            .unwrap_or(false)
+}
+
+fn gbt_longpoll_enabled() -> bool {
+    env::var("IRIUM_GBT_LONGPOLL")
+        .ok()
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+fn gbt_query_params(longpoll: bool) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    if longpoll {
+        params.push(("longpoll".to_string(), "1".to_string()));
+    }
+    if let Ok(v) = env::var("IRIUM_GBT_LONGPOLL_SECS") {
+        params.push(("poll_secs".to_string(), v));
+    }
+    if let Ok(v) = env::var("IRIUM_GBT_MAX_TXS") {
+        params.push(("max_txs".to_string(), v));
+    }
+    if let Ok(v) = env::var("IRIUM_GBT_MIN_FEE") {
+        params.push(("min_fee".to_string(), v));
+    }
+    params
+}
+
+fn fetch_block_template(client: &Client, longpoll: bool) -> Result<BlockTemplate, String> {
     let base = node_rpc_base();
     let url = format!("{}/rpc/getblocktemplate", base.trim_end_matches("/"));
-    let mut req = client.get(url);
+    let mut req = client.get(url).query(&gbt_query_params(longpoll));
     if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
         req = req.bearer_auth(token);
     }
@@ -799,7 +848,8 @@ fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
 }
 
 fn template_changed(client: &Client, template: &BlockTemplate) -> bool {
-    match fetch_block_template(client) {
+    let longpoll = gbt_longpoll_enabled();
+    match fetch_block_template(client, longpoll) {
         Ok(next) => next.height != template.height || next.prev_hash != template.prev_hash,
         Err(_) => false,
     }
@@ -1073,6 +1123,357 @@ fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client) 
     }
 }
 
+
+#[derive(Clone)]
+struct StratumJob {
+    job_id: String,
+    prev_hash: String,
+    coinbase1: String,
+    coinbase2: String,
+    merkle_branch: Vec<String>,
+    version: String,
+    nbits: String,
+    ntime: String,
+    _clean_jobs: bool,
+}
+
+struct StratumState {
+    extranonce1: String,
+    extranonce2_size: usize,
+    difficulty: f64,
+    target: Option<BigUint>,
+    job: Option<StratumJob>,
+}
+
+fn stratum_url() -> Option<String> {
+    env::var("IRIUM_STRATUM_URL").ok()
+}
+
+fn stratum_user() -> String {
+    env::var("IRIUM_STRATUM_USER").unwrap_or_else(|_| "irium".to_string())
+}
+
+fn stratum_pass() -> String {
+    env::var("IRIUM_STRATUM_PASS").unwrap_or_else(|_| "x".to_string())
+}
+
+fn stratum_normalize_url(url: &str) -> String {
+    let trimmed = url.trim();
+    for prefix in ["stratum+tcp://", "stratum://", "tcp://"].iter() {
+        if trimmed.starts_with(prefix) {
+            return trimmed[prefix.len()..].to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn stratum_send(writer: &Mutex<TcpStream>, value: &serde_json::Value) -> Result<(), String> {
+    let mut stream = writer.lock().unwrap();
+    let line = format!("{}
+", value.to_string());
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("stratum send: {e}"))
+}
+
+fn stratum_read_line(reader: &mut BufReader<TcpStream>) -> Result<serde_json::Value, String> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("stratum read: {e}"))?;
+    if line.is_empty() {
+        return Err("stratum EOF".to_string());
+    }
+    serde_json::from_str(&line).map_err(|e| format!("stratum json: {e}"))
+}
+
+fn stratum_target_from_difficulty(diff: f64) -> BigUint {
+    let pow_limit = Target { bits: 0x1d00_ffff }.to_target();
+    if diff <= 0.0 {
+        return pow_limit;
+    }
+    let scale: u64 = 1_000_000;
+    let scaled = (diff * scale as f64) as u64;
+    if scaled == 0 {
+        return pow_limit;
+    }
+    let scale_big = BigUint::from(scale);
+    let scaled_big = BigUint::from(scaled);
+    pow_limit * scale_big / scaled_big
+}
+
+fn stratum_target_from_hex(hex_str: &str) -> Option<BigUint> {
+    let bytes = hex::decode(hex_str).ok()?;
+    Some(BigUint::from_bytes_be(&bytes))
+}
+
+fn merkle_root_from_stratum(
+    job: &StratumJob,
+    extranonce1: &str,
+    extranonce2: &str,
+) -> Result<[u8; 32], String> {
+    let coinbase_hex = format!(
+        "{}{}{}{}",
+        job.coinbase1, extranonce1, extranonce2, job.coinbase2
+    );
+    let coinbase = hex::decode(&coinbase_hex)
+        .map_err(|e| format!("coinbase decode: {e}"))?;
+    let mut merkle = sha256d(&coinbase);
+    for branch in &job.merkle_branch {
+        let branch_bytes = hex::decode(branch)
+            .map_err(|e| format!("merkle branch decode: {e}"))?;
+        let mut data = Vec::with_capacity(64);
+        data.extend_from_slice(&merkle);
+        data.extend_from_slice(&branch_bytes);
+        merkle = sha256d(&data);
+    }
+    Ok(merkle)
+}
+
+fn parse_u32_hex(hex_str: &str) -> Result<u32, String> {
+    let trimmed = hex_str.trim_start_matches("0x");
+    u32::from_str_radix(trimmed, 16).map_err(|e| format!("invalid hex: {e}"))
+}
+
+fn stratum_reader(
+    mut reader: BufReader<TcpStream>,
+    state: Arc<Mutex<StratumState>>,
+    job_version: Arc<AtomicU64>,
+) {
+    loop {
+        let msg = match stratum_read_line(&mut reader) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[warn] Stratum read failed: {e}");
+                break;
+            }
+        };
+        let method = msg.get("method").and_then(|m| m.as_str());
+        let params = msg.get("params").and_then(|p| p.as_array());
+        match (method, params) {
+            (Some("mining.set_difficulty"), Some(p)) => {
+                if let Some(diff) = p.get(0).and_then(|v| v.as_f64()) {
+                    let mut guard = state.lock().unwrap();
+                    guard.difficulty = diff;
+                    guard.target = None;
+                }
+            }
+            (Some("mining.set_target"), Some(p)) => {
+                if let Some(t) = p.get(0).and_then(|v| v.as_str()) {
+                    let mut guard = state.lock().unwrap();
+                    guard.target = stratum_target_from_hex(t);
+                }
+            }
+            (Some("mining.set_extranonce"), Some(p)) => {
+                if let (Some(en1), Some(size)) = (p.get(0).and_then(|v| v.as_str()), p.get(1).and_then(|v| v.as_u64())) {
+                    let mut guard = state.lock().unwrap();
+                    guard.extranonce1 = en1.to_string();
+                    guard.extranonce2_size = size as usize;
+                }
+            }
+            (Some("mining.notify"), Some(p)) => {
+                if p.len() >= 9 {
+                    let job = StratumJob {
+                        job_id: p[0].as_str().unwrap_or("").to_string(),
+                        prev_hash: p[1].as_str().unwrap_or("").to_string(),
+                        coinbase1: p[2].as_str().unwrap_or("").to_string(),
+                        coinbase2: p[3].as_str().unwrap_or("").to_string(),
+                        merkle_branch: p[4]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                        version: p[5].as_str().unwrap_or("").to_string(),
+                        nbits: p[6].as_str().unwrap_or("").to_string(),
+                        ntime: p[7].as_str().unwrap_or("").to_string(),
+                        _clean_jobs: p[8].as_bool().unwrap_or(false),
+                    };
+                    let mut guard = state.lock().unwrap();
+                    guard.job = Some(job);
+                    job_version.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn mine_stratum_job(
+    job: &StratumJob,
+    extranonce1: &str,
+    extranonce2: &str,
+    share_target: &BigUint,
+    writer: &Mutex<TcpStream>,
+    user: &str,
+    submit_id: &AtomicU64,
+    job_version: u64,
+    job_version_ref: &AtomicU64,
+) -> Result<bool, String> {
+    let prev_bytes = hex::decode(&job.prev_hash)
+        .map_err(|e| format!("prev_hash decode: {e}"))?;
+    if prev_bytes.len() != 32 {
+        return Err(format!("prev_hash len {} != 32", prev_bytes.len()));
+    }
+    let mut prev_hash = [0u8; 32];
+    prev_hash.copy_from_slice(&prev_bytes);
+
+    let merkle_root = merkle_root_from_stratum(job, extranonce1, extranonce2)?;
+
+    let version = parse_u32_hex(&job.version)?;
+    let bits = parse_bits(&job.nbits)?;
+    let time = parse_u32_hex(&job.ntime)?;
+
+    let network_target = Target { bits }.to_target();
+
+    let mut nonce: u32 = 0;
+    let start = Instant::now();
+
+    loop {
+        if job_version_ref.load(Ordering::SeqCst) != job_version {
+            return Ok(true);
+        }
+        let header = BlockHeader {
+            version,
+            prev_hash,
+            merkle_root,
+            time,
+            bits,
+            nonce,
+        };
+        let hash = header.hash();
+        let hash_value = BigUint::from_bytes_be(&hash);
+        if &hash_value <= share_target {
+            let submit = json!({
+                "id": submit_id.fetch_add(1, Ordering::SeqCst),
+                "method": "mining.submit",
+                "params": [user, job.job_id.as_str(), extranonce2, job.ntime.as_str(), format!("{:08x}", nonce)]
+            });
+            let _ = stratum_send(writer, &submit);
+            if hash_value <= network_target {
+                println!("[🏁] Stratum share meets network target at height? hash={}", hex::encode(hash));
+            }
+        }
+        nonce = nonce.wrapping_add(1);
+        if nonce == 0 {
+            return Ok(false);
+        }
+        if nonce % 1_000_000 == 0 {
+            let elapsed = start.elapsed().as_secs_f64();
+            if elapsed > 0.0 {
+                println!(
+                    "  stratum mining nonce {} rate {:.2} H/s",
+                    nonce,
+                    nonce as f64 / elapsed
+                );
+            }
+        }
+    }
+}
+
+fn run_stratum_miner() -> Result<(), String> {
+    let url = match stratum_url() {
+        Some(u) => u,
+        None => return Err("IRIUM_STRATUM_URL not set".to_string()),
+    };
+    let addr = stratum_normalize_url(&url);
+    let stream = TcpStream::connect(&addr)
+        .map_err(|e| format!("stratum connect: {e}"))?;
+    let _ = stream.set_nodelay(true);
+    let writer = Arc::new(Mutex::new(stream));
+    let mut reader = BufReader::new(writer.lock().unwrap().try_clone().map_err(|e| e.to_string())?);
+
+    let subscribe = json!({"id": 1, "method": "mining.subscribe", "params": ["irium-miner/0.1"]});
+    stratum_send(&writer, &subscribe)?;
+    let sub_resp = stratum_read_line(&mut reader)?;
+    let (extranonce1, extranonce2_size) = match sub_resp.get("result").and_then(|v| v.as_array()) {
+        Some(arr) if arr.len() >= 3 => {
+            let en1 = arr[1].as_str().unwrap_or("").to_string();
+            let size = arr[2].as_u64().unwrap_or(0) as usize;
+            (en1, size)
+        }
+        _ => return Err("stratum subscribe failed".to_string()),
+    };
+
+    let user = stratum_user();
+    let pass = stratum_pass();
+    let auth = json!({"id": 2, "method": "mining.authorize", "params": [user.clone(), pass.clone()]});
+    stratum_send(&writer, &auth)?;
+
+    let state = Arc::new(Mutex::new(StratumState {
+        extranonce1,
+        extranonce2_size,
+        difficulty: 1.0,
+        target: None,
+        job: None,
+    }));
+    let job_version = Arc::new(AtomicU64::new(0));
+    let reader_state = Arc::clone(&state);
+    let reader_version = Arc::clone(&job_version);
+
+    thread::spawn(move || {
+        stratum_reader(reader, reader_state, reader_version);
+    });
+
+    let submit_id = AtomicU64::new(10);
+    let mut extranonce_counter: u64 = 0;
+    let mut last_job_version = 0u64;
+
+    loop {
+        let (job, extranonce1, extranonce2_size, share_target) = {
+            let guard = state.lock().unwrap();
+            let job = guard.job.clone();
+            let share_target = guard
+                .target
+                .clone()
+                .unwrap_or_else(|| stratum_target_from_difficulty(guard.difficulty));
+            (job, guard.extranonce1.clone(), guard.extranonce2_size, share_target)
+        };
+
+        let job = match job {
+            Some(j) => j,
+            None => {
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
+
+        let current_version = job_version.load(Ordering::SeqCst);
+        if current_version != last_job_version {
+            extranonce_counter = 0;
+            last_job_version = current_version;
+        }
+
+        let width = extranonce2_size * 2;
+        let extranonce2 = format!("{:0width$x}", extranonce_counter, width = width);
+
+        match mine_stratum_job(
+            &job,
+            &extranonce1,
+            &extranonce2,
+            &share_target,
+            &writer,
+            &user,
+            &submit_id,
+            current_version,
+            &job_version,
+        ) {
+            Ok(true) => {
+                // job changed
+            }
+            Ok(false) => {
+                extranonce_counter = extranonce_counter.saturating_add(1);
+            }
+            Err(e) => {
+                eprintln!("[warn] Stratum mining error: {e}");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+}
+
 fn main() {
     let locked = load_locked_genesis().expect("load locked genesis");
     let block = block_from_locked(&locked);
@@ -1103,6 +1504,13 @@ fn main() {
         } else {
             println!("[🪝] Anchors digest: {}", manager.payload_digest());
         }
+    }
+
+    if stratum_url().is_some() {
+        if let Err(e) = run_stratum_miner() {
+            eprintln!("[warn] Stratum miner exited: {e}");
+        }
+        return;
     }
 
     // Load any persisted blocks so we resume from last mined height.
@@ -1136,15 +1544,21 @@ fn main() {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[warn] Miner could not build HTTP client: {e}");
+                if strict_rpc_enabled() {
+                    std::process::exit(1);
+                }
                 std::thread::sleep(Duration::from_secs(3));
                 continue;
             }
         };
 
-        let template = match fetch_block_template(&client) {
+        let template = match fetch_block_template(&client, false) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("[warn] Miner could not fetch block template: {e}");
+                if strict_rpc_enabled() {
+                    std::process::exit(1);
+                }
                 std::thread::sleep(Duration::from_secs(3));
                 continue;
             }
@@ -1192,6 +1606,9 @@ fn main() {
                     );
                 } else {
                     eprintln!("[⚠️] Mining failed at next height {} (tip {}): {e}", state.height, state.tip_height());
+                }
+                if strict_rpc_enabled() {
+                    std::process::exit(1);
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }

@@ -87,6 +87,9 @@ source ~/.cargo/env
 ```
 - Mined blocks are auto-submitted to http://127.0.0.1:38300/rpc/submit_block; set `IRIUM_NODE_RPC` if your node listens elsewhere.
 - If `IRIUM_RPC_TOKEN` is set on the node, export the same token for the miner.
+- The miner pulls templates from `/rpc/getblocktemplate` and honors `IRIUM_GBT_MAX_TXS`, `IRIUM_GBT_MIN_FEE`, `IRIUM_GBT_LONGPOLL`, and `IRIUM_GBT_LONGPOLL_SECS`.
+- Set `IRIUM_MINER_STRICT_RPC=1` to stop mining if RPC/template fetch fails.
+- Pool mining (Stratum v1, TCP): set `IRIUM_STRATUM_URL`, `IRIUM_STRATUM_USER`, `IRIUM_STRATUM_PASS`.
 Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
 
 ## Wallet

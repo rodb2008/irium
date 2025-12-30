@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
+
 use std::sync::{Arc, Mutex, OnceLock};
 use std::{env, fs};
 
@@ -96,6 +98,14 @@ struct BalanceQuery {
 #[derive(Deserialize)]
 struct BlockQuery {
     height: u64,
+}
+
+#[derive(Deserialize)]
+struct TemplateQuery {
+    longpoll: Option<u8>,
+    poll_secs: Option<u64>,
+    max_txs: Option<usize>,
+    min_fee: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -831,11 +841,46 @@ async fn get_block_template(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(q): Query<TemplateQuery>,
 ) -> Result<Json<BlockTemplateResponse>, StatusCode> {
     check_rate(&state, &addr)?;
     require_rpc_auth(&headers)?;
 
-    let (height, prev_hash, bits, target, time, txs, total_fees, mempool_count) = {
+    let longpoll = q.longpoll.unwrap_or(0) == 1;
+    let poll_secs = q.poll_secs.unwrap_or(25).max(1).min(120);
+    let max_txs = q.max_txs;
+    let min_fee = q.min_fee;
+
+    if longpoll {
+        let last_tip = {
+            let guard = state.chain.lock().unwrap();
+            guard
+                .chain
+                .last()
+                .map(|b| hex::encode(b.header.hash()))
+                .unwrap_or_else(|| state.genesis_hash.clone())
+        };
+        let last_mempool = state.mempool.lock().unwrap().len();
+
+        let start = std::time::Instant::now();
+        while start.elapsed().as_secs() < poll_secs {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let current_tip = {
+                let guard = state.chain.lock().unwrap();
+                guard
+                    .chain
+                    .last()
+                    .map(|b| hex::encode(b.header.hash()))
+                    .unwrap_or_else(|| state.genesis_hash.clone())
+            };
+            let current_mempool = state.mempool.lock().unwrap().len();
+            if current_tip != last_tip || current_mempool != last_mempool {
+                break;
+            }
+        }
+    }
+
+    let (height, prev_hash, bits, target, time) = {
         let guard = state.chain.lock().unwrap();
         let tip = guard.chain.last();
         let prev_hash = tip
@@ -847,22 +892,31 @@ async fn get_block_template(
         let prev_time = tip.map(|b| b.header.time).unwrap_or(0);
         let now = Utc::now().timestamp() as u32;
         let time = now.max(prev_time.saturating_add(1));
-        let mempool_entries = state.mempool.lock().unwrap().ordered_entries();
-        let mempool_count = mempool_entries.len();
-        let mut total_fees = 0u64;
-        let txs = mempool_entries
-            .into_iter()
-            .map(|entry| {
-                total_fees = total_fees.saturating_add(entry.fee);
-                TemplateTx {
-                    hex: hex::encode(entry.raw),
-                    fee: entry.fee,
-                    relay_addresses: entry.relay_addresses,
-                }
-            })
-            .collect();
-        (height, prev_hash, bits, target_hex(bits), time, txs, total_fees, mempool_count)
+        (height, prev_hash, bits, target_hex(bits), time)
     };
+
+    let mut mempool_entries = state.mempool.lock().unwrap().ordered_entries();
+    if let Some(min_fee) = min_fee {
+        mempool_entries.retain(|e| e.fee_per_byte >= min_fee);
+    }
+    if let Some(max) = max_txs {
+        if mempool_entries.len() > max {
+            mempool_entries.truncate(max);
+        }
+    }
+    let mempool_count = mempool_entries.len();
+    let mut total_fees = 0u64;
+    let txs = mempool_entries
+        .into_iter()
+        .map(|entry| {
+            total_fees = total_fees.saturating_add(entry.fee);
+            TemplateTx {
+                hex: hex::encode(entry.raw),
+                fee: entry.fee,
+                relay_addresses: entry.relay_addresses,
+            }
+        })
+        .collect();
 
     let coinbase_value = block_reward(height).saturating_add(total_fees);
 
