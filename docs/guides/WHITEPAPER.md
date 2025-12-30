@@ -554,8 +554,8 @@ Nodes maintain a dynamic peer list (`bootstrap/seedlist.runtime`):
 - Ready for miners and users
 
 **Public Services:**
-- [Explorer API](https://api.iriumlabs.org/api) - Blockchain statistics and block data
-- [Wallet API](https://api.iriumlabs.org/wallet) - Wallet management and documentation
+- Explorer API: self-hosted via `/api` (reverse proxy optional)
+- Wallet API: self-hosted via `/wallet` (reverse proxy optional)
 - P2P Network: see `bootstrap/seedlist.txt` for bootstrap seeds
 
 ---

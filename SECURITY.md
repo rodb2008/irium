@@ -26,11 +26,9 @@
   - Consensus trust roots are defined by:
     - `bootstrap/anchors.json` / `irium/bootstrap/anchors.json` (anchor checkpoints).
     - `bootstrap/seedlist.txt` / `irium/bootstrap/seedlist.txt` (bootstrap seeds).
-  - These files are signed with the Irium signing keys registered on GitHub
-    and verified via `ssh-keygen` in `irium/anchors.py` and
-    `bootstrap/trust/allowed_signers`.
-  - The `v1.0` git tag and current main commits are GPG-signed using the
-    `info@iriumlabs.org` key.
+  - These files are signed with maintainer keys listed in
+    `bootstrap/trust/allowed_signers` and verified via `ssh-keygen`.
+  - The `v1.0` git tag and current main commits are GPG-signed by maintainers.
 
   To decentralize further over time, additional independent anchor signers
   and seeds should be added to these files and signatures.

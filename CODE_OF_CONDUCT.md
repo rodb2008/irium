@@ -27,7 +27,7 @@ Violations may result in:
 2. Temporary ban
 3. Permanent ban
 
-Report issues to: info@iriumlabs.org
+Report issues to the project maintainers.
 
 ## Attribution
 

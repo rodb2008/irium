@@ -132,4 +132,3 @@ Rewards are spendable after 100 block confirmations (coinbase maturity).
 
 - GitHub Issues: https://github.com/iriumlabs/irium/issues
 - Discussions: https://github.com/iriumlabs/irium/discussions
-- Email: info@iriumlabs.org

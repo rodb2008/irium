@@ -51,7 +51,7 @@ Found a bug or have a suggestion? [Open an issue](https://github.com/iriumlabs/i
 
 If you discover a security vulnerability:
 - **DO NOT** open a public issue
-- Email: info@iriumlabs.org
+- Contact the maintainers via the project issue tracker or security process.
 - Include details and reproduction steps
 - We'll respond within 48 hours
 
@@ -87,7 +87,7 @@ Join the Irium community and connect with other contributors:
   - 🛠️ Development - Technical development discussions
 
 - **Issues**: https://github.com/iriumlabs/irium/issues - Bug reports and feature requests
-- **Email**: info@iriumlabs.org - Security issues and direct contact
+- **Security**: use the private reporting process or reach maintainers via the issue tracker
 
 ## 📜 License
 

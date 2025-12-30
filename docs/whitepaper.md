@@ -351,8 +351,8 @@ Handshake (1), Ping (2), Pong (3), GetPeers (4), Peers (5), GetBlocks (6), Block
 - **Bootstrap seeds:** `bootstrap/seedlist.txt` (signed) + `bootstrap/seedlist.extra` (unsigned additions)  
 - **Anchors:** `bootstrap/anchors.json` (signed)  
 - **APIs:**  
-  - Explorer API: https://api.iriumlabs.org/api  
-  - Wallet API: https://api.iriumlabs.org/wallet  
+  - Explorer API: self-hosted via `/api`  
+  - Wallet API: self-hosted via `/wallet`  
 
 ---
 
