@@ -348,7 +348,7 @@ Handshake (1), Ping (2), Pong (3), GetPeers (4), Peers (5), GetBlocks (6), Block
 ### 9.3 Network Launch
 
 - **Mainnet:** LIVE  
-- **Bootstrap seed:** 207.244.247.86:38291 (in `bootstrap/seedlist.txt`)  
+- **Bootstrap seeds:** `bootstrap/seedlist.txt` (signed) + `bootstrap/seedlist.extra` (unsigned additions)  
 - **Anchors:** `bootstrap/anchors.json` (signed)  
 - **APIs:**  
   - Explorer API: https://api.iriumlabs.org/api  

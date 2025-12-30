@@ -238,6 +238,12 @@ fn load_runtime_seeds() -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn load_extra_seeds() -> Vec<String> {
+    let path = std::path::Path::new("bootstrap/seedlist.extra");
+    std::fs::read_to_string(path)
+        .map(|raw| parse_seed_lines(&raw))
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Copy)]
 struct SeedDialInfo {
@@ -301,6 +307,7 @@ fn build_seed_addrs(
     let mut seeds_raw: Vec<String> = Vec::new();
     seeds_raw.extend(config_seeds.iter().cloned());
     seeds_raw.extend(signed_seeds.iter().cloned());
+    seeds_raw.extend(load_extra_seeds());
     seeds_raw.extend(load_runtime_seeds());
     seeds_raw.sort();
     seeds_raw.dedup();

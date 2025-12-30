@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SEEDLIST_BASELINE: &str = "bootstrap/seedlist.txt";
+const DEFAULT_SEEDLIST_EXTRA: &str = "bootstrap/seedlist.extra";
 const DEFAULT_SEEDLIST_RUNTIME: &str = "bootstrap/seedlist.runtime";
 const DEFAULT_PEER_DB: &str = "state/peers.json";
 
@@ -98,6 +99,7 @@ impl PeerRecord {
 #[derive(Debug)]
 pub struct SeedlistManager {
     baseline: PathBuf,
+    extra: PathBuf,
     runtime: PathBuf,
     limit: usize,
 }
@@ -106,6 +108,7 @@ impl SeedlistManager {
     pub fn new(limit: usize) -> SeedlistManager {
         let root = repo_root();
         let baseline = root.join(DEFAULT_SEEDLIST_BASELINE);
+        let extra = root.join(DEFAULT_SEEDLIST_EXTRA);
         let runtime = root.join(DEFAULT_SEEDLIST_RUNTIME);
         if let Some(parent) = runtime.parent() {
             let _ = fs::create_dir_all(parent);
@@ -118,14 +121,15 @@ impl SeedlistManager {
         }
         SeedlistManager {
             baseline,
+            extra,
             runtime,
             limit,
         }
     }
 
-    fn load_runtime_entries(&self) -> Vec<String> {
+    fn load_seed_entries(&self, path: &PathBuf) -> Vec<String> {
         let mut entries = Vec::new();
-        let text = match fs::read_to_string(&self.runtime) {
+        let text = match fs::read_to_string(path) {
             Ok(t) => t,
             Err(_) => return entries,
         };
@@ -137,6 +141,14 @@ impl SeedlistManager {
             }
         }
         entries
+    }
+
+    fn load_runtime_entries(&self) -> Vec<String> {
+        self.load_seed_entries(&self.runtime)
+    }
+
+    fn load_extra_entries(&self) -> Vec<String> {
+        self.load_seed_entries(&self.extra)
     }
 
     pub fn write_runtime_entries<I>(&self, entries: I)
@@ -165,13 +177,14 @@ impl SeedlistManager {
 
     pub fn merged_seedlist(&self) -> Vec<String> {
         let mut combined = Vec::new();
-        if let Ok(text) = fs::read_to_string(&self.baseline) {
-            for line in text.lines() {
-                if let Some(ip) = normalize_seed(line) {
-                    if !combined.contains(&ip) {
-                        combined.push(ip);
-                    }
-                }
+        for ip in self.load_seed_entries(&self.baseline) {
+            if !combined.contains(&ip) {
+                combined.push(ip);
+            }
+        }
+        for ip in self.load_extra_entries() {
+            if !combined.contains(&ip) {
+                combined.push(ip);
             }
         }
         for ip in self.load_runtime_entries() {

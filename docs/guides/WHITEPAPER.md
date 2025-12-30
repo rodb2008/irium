@@ -515,8 +515,9 @@ Irium fully supports nodes behind NAT/firewalls (same as Bitcoin):
 - **Network Topology:** Mesh network through public nodes
 - **Limitation:** NAT-to-NAT direct connections not possible (network limitation)
 
-The network requires at least one public bootstrap node. Current bootstrap:
-- VPS: 207.244.247.86:38291 (mainnet seed node)
+The network requires at least one public bootstrap node. Bootstrap seeds are listed in:
+- `bootstrap/seedlist.txt` (signed baseline)
+- `bootstrap/seedlist.extra` (unsigned additions)
 
 **Runtime Seedlist:**
 
@@ -555,7 +556,7 @@ Nodes maintain a dynamic peer list (`bootstrap/seedlist.runtime`):
 **Public Services:**
 - [Explorer API](https://api.iriumlabs.org/api) - Blockchain statistics and block data
 - [Wallet API](https://api.iriumlabs.org/wallet) - Wallet management and documentation
-- P2P Network: 207.244.247.86:38291
+- P2P Network: see `bootstrap/seedlist.txt` for bootstrap seeds
 
 ---
 
