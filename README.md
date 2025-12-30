@@ -50,7 +50,7 @@ RUST_LOG=info cargo run --release --bin iriumd
 The miner binary (`irium-miner`) assembles blocks from the local mempool and searches nonces. Always set a payout address so rewards are spendable:
 ```bash
 cd /home/irium/irium
-export IRIUM_MINER_ADDRESS=Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa   # or set IRIUM_MINER_PKH (40-hex)
+export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>   # or set IRIUM_MINER_PKH (40-hex)
 source ~/.cargo/env
 ./target/release/irium-miner
 ```

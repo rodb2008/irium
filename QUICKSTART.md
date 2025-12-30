@@ -44,7 +44,7 @@ RUST_LOG=info cargo run --release --bin iriumd
 Set a payout address (or PKH) so rewards are spendable:
 ```
 cd /home/irium/irium
-export IRIUM_MINER_ADDRESS=Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa   # or set IRIUM_MINER_PKH (40-hex)
+export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>   # or set IRIUM_MINER_PKH (40-hex)
 source ~/.cargo/env
 ./target/release/irium-miner
 ```
