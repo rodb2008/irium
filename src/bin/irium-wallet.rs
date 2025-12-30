@@ -127,7 +127,11 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let resp = match client.get(&url).send() {
+            let mut req = client.get(&url);
+            if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+                req = req.bearer_auth(token);
+            }
+            let resp = match req.send() {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("Balance request failed: {}", e);

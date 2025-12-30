@@ -1,5 +1,15 @@
 # Breaking Changes
 
+## Unreleased (Consensus Tightening)
+
+**⚠️ This is a consensus change. All nodes must upgrade.**
+
+### Consensus Changes:
+- P2PKH signature verification now enforces pubkey-hash matching and SIGHASH_ALL over full transactions.
+- Non-P2PKH outputs are treated as unspendable.
+
+---
+
 ## v1.3.0 (Hard Fork - October 25, 2025)
 
 **⚠️ This is a HARD FORK. All nodes must upgrade.**

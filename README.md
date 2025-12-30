@@ -33,6 +33,8 @@ cargo test --quiet
 - `IRIUM_TLS_CERT` / `IRIUM_TLS_KEY`: PEM paths to enable HTTPS for the HTTP API (if unset, HTTP is used).
 - `IRIUM_RPC_CA`: optional PEM CA/cert to trust when calling HTTPS RPC endpoints.
 - `IRIUM_RPC_INSECURE`: set to `1` to skip TLS validation for HTTPS RPC calls (dev-only).
+- `IRIUM_RPC_TOKEN`: optional bearer token required for `POST /rpc/submit_block` and `POST /rpc/submit_tx`.
+- `IRIUM_RPC_BODY_MAX`: max HTTP RPC body size in bytes (default 32MB).
 
 ```bash
 # optional: set a config JSON with p2p_bind, relay_address, etc.
@@ -53,6 +55,7 @@ source ~/.cargo/env
 ./target/release/irium-miner
 ```
 - Mined blocks are auto-submitted to http://127.0.0.1:38300/rpc/submit_block; set `IRIUM_NODE_RPC` if your node listens elsewhere.
+- If `IRIUM_RPC_TOKEN` is set on the node, export the same token for the miner.
 Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
 
 ## Wallet
@@ -61,6 +64,8 @@ The wallet CLI can query balances from a running node:
 cd /home/irium/irium
 source ~/.cargo/env
 export IRIUM_RPC_URL=http://127.0.0.1:38300
+# if the node requires auth
+# export IRIUM_RPC_TOKEN=...
 ./target/release/irium-wallet balance <base58_address>
 ```
 Use `irium-wallet address-to-pkh <base58_address>` to convert an address to its 20-byte pubkey hash.

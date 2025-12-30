@@ -362,9 +362,11 @@ fn submit_block_to_node(height: u64, block: &Block) -> Result<(), String> {
 
     let base = node_rpc_base();
     let url = format!("{}/rpc/submit_block", base.trim_end_matches("/"));
-    let resp = client
-        .post(url)
-        .json(&payload)
+    let mut req = client.post(url).json(&payload);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
         .send()
         .map_err(|e| format!("submit failed: {e}"))?;
 

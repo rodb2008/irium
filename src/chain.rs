@@ -7,13 +7,16 @@ use hex;
 use num_bigint::BigUint;
 use num_traits::Zero;
 
+use ripemd::Ripemd160;
+use sha2::{Digest, Sha256};
+
 use crate::block::{Block, BlockHeader};
 use crate::constants::{
     block_reward, BLOCK_TARGET_INTERVAL, COINBASE_MATURITY, DIFFICULTY_RETARGET_INTERVAL,
     MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
 };
 use crate::genesis::LockedGenesis;
-use crate::pow::{meets_target, Target};
+use crate::pow::{meets_target, sha256d, Target};
 use crate::tx::{decode_hex, Transaction, TxInput, TxOutput};
 
 /// Chain parameters for the Irium mainnet.
@@ -658,7 +661,7 @@ impl ChainState {
         fees: &mut i64,
     ) -> Result<(), String> {
         let mut input_total: i64 = 0;
-        for txin in &tx.inputs {
+        for (input_index, txin) in tx.inputs.iter().enumerate() {
             if txin.prev_txid.len() != 32 {
                 return Err("Transaction input has invalid txid length".to_string());
             }
@@ -681,7 +684,7 @@ impl ChainState {
                 }
             }
 
-            if !verify_transaction_signature(txin, &utxo_entry.output) {
+            if !verify_transaction_signature(tx, input_index, txin, &utxo_entry.output) {
                 return Err("Transaction signature verification failed".to_string());
             }
 
@@ -724,7 +727,49 @@ fn validate_output(output: &TxOutput) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_transaction_signature(txin: &TxInput, _utxo: &TxOutput) -> bool {
+fn hash160(data: &[u8]) -> [u8; 20] {
+    let sha = Sha256::digest(data);
+    let rip = Ripemd160::digest(sha);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&rip);
+    out
+}
+
+fn p2pkh_hash_from_script(script: &[u8]) -> Option<[u8; 20]> {
+    if script.len() != 25 {
+        return None;
+    }
+    if script[0] != 0x76 || script[1] != 0xa9 || script[2] != 0x14 {
+        return None;
+    }
+    if script[23] != 0x88 || script[24] != 0xac {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&script[3..23]);
+    Some(out)
+}
+
+fn signature_digest(tx: &Transaction, input_index: usize, script_pubkey: &[u8]) -> [u8; 32] {
+    let mut tx_copy = tx.clone();
+    for (idx, input) in tx_copy.inputs.iter_mut().enumerate() {
+        if idx == input_index {
+            input.script_sig = script_pubkey.to_vec();
+        } else {
+            input.script_sig.clear();
+        }
+    }
+    let mut data = tx_copy.serialize();
+    data.extend_from_slice(&1u32.to_le_bytes());
+    sha256d(&data)
+}
+
+fn verify_transaction_signature(
+    tx: &Transaction,
+    input_index: usize,
+    txin: &TxInput,
+    utxo: &TxOutput,
+) -> bool {
     use k256::ecdsa::signature::Verifier;
     use k256::ecdsa::{Signature, VerifyingKey};
 
@@ -733,17 +778,17 @@ fn verify_transaction_signature(txin: &TxInput, _utxo: &TxOutput) -> bool {
         return false;
     }
     let sig_len = script[0] as usize;
-    if script.len() < 1 + sig_len + 2 {
+    if sig_len == 0 || script.len() < 1 + sig_len + 1 {
         return false;
     }
     let sig = &script[1..1 + sig_len];
-    if !sig.ends_with(&[0x01]) {
+    if sig.last() != Some(&0x01) {
         return false;
     }
     let der = &sig[..sig.len() - 1];
     let pk_len = script[1 + sig_len] as usize;
     let pk_off = 1 + sig_len + 1;
-    if script.len() < pk_off + pk_len {
+    if pk_len == 0 || script.len() != pk_off + pk_len {
         return false;
     }
     let pubkey = &script[pk_off..pk_off + pk_len];
@@ -751,11 +796,18 @@ fn verify_transaction_signature(txin: &TxInput, _utxo: &TxOutput) -> bool {
         return false;
     }
 
-    if txin.prev_txid.len() != 32 {
+    let expected_pkh = match p2pkh_hash_from_script(&utxo.script_pubkey) {
+        Some(v) => v,
+        None => return false,
+    };
+    if hash160(pubkey) != expected_pkh {
         return false;
     }
-    let mut digest = [0u8; 32];
-    digest.copy_from_slice(&txin.prev_txid);
+
+    if input_index >= tx.inputs.len() {
+        return false;
+    }
+    let digest = signature_digest(tx, input_index, &utxo.script_pubkey);
 
     let signature = match Signature::from_der(der) {
         Ok(s) => s,

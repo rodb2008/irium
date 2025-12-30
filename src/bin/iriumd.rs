@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::{env, fs};
 
 use axum::{
-    extract::{ConnectInfo, Json as AxumJson, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, DefaultBodyLimit, Json as AxumJson, Query, State},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -599,6 +599,27 @@ fn rate_limiter() -> RateLimiter {
     RateLimiter::new(rpm)
 }
 
+fn rpc_body_limit_bytes() -> usize {
+    env::var("IRIUM_RPC_BODY_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(32 * 1024 * 1024)
+}
+
+fn require_rpc_auth(headers: &HeaderMap) -> Result<(), StatusCode> {
+    let token = match env::var("IRIUM_RPC_TOKEN") {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let expected = format!("Bearer {}", token);
+    let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+    if header == Some(expected.as_str()) {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
 fn check_rate(state: &AppState, addr: &SocketAddr) -> Result<(), StatusCode> {
     let mut limiter = state.limiter.lock().unwrap();
     if limiter.is_allowed(&addr.ip().to_string()) {
@@ -640,7 +661,11 @@ async fn status(
     }))
 }
 
-async fn peers(State(state): State<AppState>) -> Result<Json<PeersResponse>, StatusCode> {
+async fn peers(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Result<Json<PeersResponse>, StatusCode> {
+    check_rate(&state, &addr)?;
     if let Some(ref p2p) = state.p2p {
         let list = p2p
             .peers_snapshot()
@@ -963,9 +988,11 @@ fn parse_header_bits(bits_str: &str) -> Result<u32, String> {
 async fn submit_block(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumJson(req): AxumJson<SubmitBlockRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     check_rate(&state, &addr)?;
+    require_rpc_auth(&headers)?;
     // Rebuild header from JSON.
     let header = &req.header;
 
@@ -1080,9 +1107,11 @@ async fn submit_block(
 async fn submit_tx(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumJson(req): AxumJson<SubmitTxRequest>,
 ) -> Result<Json<SubmitTxResponse>, StatusCode> {
     check_rate(&state, &addr)?;
+    require_rpc_auth(&headers)?;
     let bytes = match hex::decode(&req.tx_hex) {
         Ok(b) => b,
         Err(_) => return Err(StatusCode::BAD_REQUEST),
@@ -1443,6 +1472,7 @@ async fn main() {
         .route("/rpc/block", get(get_block))
         .route("/rpc/submit_block", post(submit_block))
         .route("/rpc/submit_tx", post(submit_tx))
+        .layer(DefaultBodyLimit::max(rpc_body_limit_bytes()))
         .with_state(app_state)
         .into_make_service_with_connect_info::<SocketAddr>();
 
