@@ -66,6 +66,8 @@ cargo test --quiet
 - `IRIUM_RPC_INSECURE`: set to `1` to skip TLS validation for HTTPS RPC calls (dev-only).
 - `IRIUM_RPC_TOKEN`: optional bearer token required for `POST /rpc/submit_block` and `POST /rpc/submit_tx`.
 - `IRIUM_RPC_BODY_MAX`: max HTTP RPC body size in bytes (default 32MB).
+- `IRIUM_NODE_PUBLIC_IP` / `IRIUM_PUBLIC_IP`: optional public IP override for seed nodes.
+- `IRIUM_PUBLIC_IP_PROBE_TARGET`: optional `host:port` to probe for outbound IP discovery.
 
 ```bash
 # optional: set a config JSON with p2p_bind, relay_address, etc.

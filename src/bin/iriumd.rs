@@ -223,11 +223,13 @@ fn local_ip_set(bind: Option<&String>) -> HashSet<IpAddr> {
             }
         }
     }
-    // Probe the default outbound interface to capture the externally routable IP.
-    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        if sock.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = sock.local_addr() {
-                ips.insert(addr.ip());
+    // Optional: probe the outbound interface using a user-supplied target.
+    if let Ok(target) = env::var("IRIUM_PUBLIC_IP_PROBE_TARGET") {
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if sock.connect(&target).is_ok() {
+                if let Ok(addr) = sock.local_addr() {
+                    ips.insert(addr.ip());
+                }
             }
         }
     }
