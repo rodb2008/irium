@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 pub struct GenesisHeader {
@@ -32,12 +32,14 @@ pub enum GenesisError {
 }
 
 pub fn repo_root() -> PathBuf {
-    // Assume this crate lives in `<repo>/irium-node-rs`.
-    // The repo root is its parent directory.
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    Path::new(manifest_dir)
+    // Prefer the manifest dir if it already contains configs/.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if manifest_dir.join("configs").join("genesis-locked.json").exists() {
+        return manifest_dir;
+    }
+    manifest_dir
         .parent()
-        .unwrap_or_else(|| Path::new(manifest_dir))
+        .unwrap_or_else(|| manifest_dir.as_path())
         .to_path_buf()
 }
 
