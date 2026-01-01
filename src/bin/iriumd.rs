@@ -794,9 +794,10 @@ irium_seed_count {}
 async fn get_utxo(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<UtxoQuery>,
 ) -> Result<Json<UtxoResponse>, StatusCode> {
-    check_rate(&state, &addr)?;
+    check_rate_with_auth(&state, &addr, &headers)?;
     let bytes = match hex::decode(&q.txid) {
         Ok(b) => b,
         Err(_) => return Err(StatusCode::BAD_REQUEST),
@@ -826,9 +827,10 @@ async fn get_utxo(
 async fn get_balance(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<BalanceQuery>,
 ) -> Result<Json<BalanceResponse>, StatusCode> {
-    check_rate(&state, &addr)?;
+    check_rate_with_auth(&state, &addr, &headers)?;
     let pkh = base58_p2pkh_to_hash(&q.address).ok_or(StatusCode::BAD_REQUEST)?;
     if pkh.len() != 20 {
         return Err(StatusCode::BAD_REQUEST);
