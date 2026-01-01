@@ -9,9 +9,9 @@ User=irium
 Environment=IRIUM_RPC_WAIT_HOST=127.0.0.1
 Environment=IRIUM_RPC_WAIT_PORT=38300
 EnvironmentFile=-/etc/irium/miner.env
-WorkingDirectory=/home/%u/irium
+WorkingDirectory=@IRIUM_HOME@
 ExecStartPre=/bin/bash -c "for i in {1..60}; do if (echo > /dev/tcp/$IRIUM_RPC_WAIT_HOST/$IRIUM_RPC_WAIT_PORT) >/dev/null 2>&1; then exit 0; fi; sleep 1; done; exit 1"
-ExecStart=/home/%u/irium/target/release/irium-miner
+ExecStart=@IRIUM_HOME@/target/release/irium-miner
 Restart=always
 RestartSec=10
 

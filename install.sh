@@ -24,6 +24,7 @@ echo "🧩 Installing systemd units..."
 sudo mkdir -p /etc/irium
 sudo cp systemd/iriumd.service /etc/systemd/system/iriumd.service
 sudo cp systemd/irium-miner.service /etc/systemd/system/irium-miner.service
+sudo sed -i "s|@IRIUM_HOME@|$ROOT_DIR|g" /etc/systemd/system/iriumd.service /etc/systemd/system/irium-miner.service
 
 if [ ! -f /etc/irium/iriumd.env ]; then
   sudo cp systemd/iriumd.env.example /etc/irium/iriumd.env
