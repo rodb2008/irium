@@ -553,6 +553,10 @@ fn load_persisted_blocks(state: &mut ChainState) {
 
                 if let Err(e) = state.connect_block(block) {
                     eprintln!("[⚠️] Failed to connect persisted block {}: {}", h, e);
+                    let tip = state.tip_height();
+                    prune_blocks_above(tip);
+                    println!("[🧹] Pruned persisted blocks above height {}", tip);
+                    break;
                 }
             }
             Err(e) => eprintln!("[⚠️] Failed to read {}: {}", path.display(), e),
@@ -848,8 +852,7 @@ fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
 }
 
 fn template_changed(client: &Client, template: &BlockTemplate) -> bool {
-    let longpoll = gbt_longpoll_enabled();
-    match fetch_block_template(client, longpoll) {
+    match fetch_block_template(client, false) {
         Ok(next) => next.height != template.height || next.prev_hash != template.prev_hash,
         Err(_) => false,
     }
@@ -1552,7 +1555,8 @@ fn main() {
             }
         };
 
-        let template = match fetch_block_template(&client, false) {
+        let longpoll = gbt_longpoll_enabled();
+        let template = match fetch_block_template(&client, longpoll) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("[warn] Miner could not fetch block template: {e}");

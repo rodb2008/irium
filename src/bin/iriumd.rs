@@ -651,6 +651,27 @@ fn require_rpc_auth(headers: &HeaderMap) -> Result<(), StatusCode> {
     }
 }
 
+fn rpc_authorized(headers: &HeaderMap) -> bool {
+    let token = match env::var("IRIUM_RPC_TOKEN") {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let expected = format!("Bearer {}", token);
+    let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+    header == Some(expected.as_str())
+}
+
+fn check_rate_with_auth(
+    state: &AppState,
+    addr: &SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), StatusCode> {
+    if rpc_authorized(headers) {
+        return Ok(());
+    }
+    check_rate(state, addr)
+}
+
 fn check_rate(state: &AppState, addr: &SocketAddr) -> Result<(), StatusCode> {
     let mut limiter = state.limiter.lock().unwrap();
     if limiter.is_allowed(&addr.ip().to_string()) {
@@ -843,7 +864,7 @@ async fn get_block_template(
     headers: HeaderMap,
     Query(q): Query<TemplateQuery>,
 ) -> Result<Json<BlockTemplateResponse>, StatusCode> {
-    check_rate(&state, &addr)?;
+    check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
 
     let longpoll = q.longpoll.unwrap_or(0) == 1;
@@ -936,9 +957,10 @@ async fn get_block_template(
 async fn get_block(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<BlockQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_rate(&state, &addr)?;
+    check_rate_with_auth(&state, &addr, &headers)?;
     // Prefer on-disk JSON if present for compatibility with miner files.
     let dir = blocks_dir();
     let path = dir.join(format!("block_{}.json", q.height));
@@ -1129,7 +1151,7 @@ async fn submit_block(
     headers: HeaderMap,
     AxumJson(req): AxumJson<SubmitBlockRequest>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_rate(&state, &addr)?;
+    check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
     // Rebuild header from JSON.
     let header = &req.header;
@@ -1248,7 +1270,7 @@ async fn submit_tx(
     headers: HeaderMap,
     AxumJson(req): AxumJson<SubmitTxRequest>,
 ) -> Result<Json<SubmitTxResponse>, StatusCode> {
-    check_rate(&state, &addr)?;
+    check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
     let bytes = match hex::decode(&req.tx_hex) {
         Ok(b) => b,
