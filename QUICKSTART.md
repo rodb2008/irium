@@ -80,11 +80,18 @@ source ~/.cargo/env
 cargo run --release --bin irium-spv -- verify <height> <txid> <index> <proof_hex_csv>
 ```
 
-## 9) systemd (optional)
-See `scripts/iriumd.service.example`:
-- Copy to `/etc/systemd/system/iriumd.service` (adjust user/paths).
-- `systemctl daemon-reload && systemctl enable --now iriumd`.
-Logs go to `journalctl -u iriumd`.
+## 9) systemd (recommended)
+Install systemd units so the node/miner survive reboots:
+```
+cd /home/irium/irium
+./install.sh
+```
+- Edit `/etc/irium/iriumd.env` and `/etc/irium/miner.env` for your paths and wallet.
+- Enable the miner after setting `IRIUM_MINER_ADDRESS`:
+```
+sudo systemctl enable --now irium-miner.service
+```
+Logs go to `journalctl -u iriumd` and `journalctl -u irium-miner`.
 
 ## Bootstrap/peer cache paths
 - Signed seeds: `bootstrap/seedlist.txt` (+ .sig + trust/allowed_signers)

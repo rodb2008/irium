@@ -1,0 +1,19 @@
+[Unit]
+Description=Irium Rust Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=irium
+Environment=IRIUM_HOME=%h/irium
+EnvironmentFile=-/etc/irium/iriumd.env
+WorkingDirectory=${IRIUM_HOME}
+ExecStart=${IRIUM_HOME}/target/release/iriumd
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

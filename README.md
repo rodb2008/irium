@@ -79,6 +79,17 @@ RUST_LOG=info cargo run --release --bin iriumd
 - HTTP API binds to `IRIUM_NODE_HOST:IRIUM_NODE_PORT` (defaults 127.0.0.1:38300).
 - P2P bind/seed overrides can be supplied in `configs/node.json`.
 
+## System Services
+Run the node/miner as systemd services so they restart after reboots:
+```bash
+cd /home/irium/irium
+./install.sh
+# edit env files, then enable miner
+sudo systemctl enable --now irium-miner.service
+```
+- Node env: `/etc/irium/iriumd.env`
+- Miner env: `/etc/irium/miner.env`
+
 ## Mining
 The miner binary (`irium-miner`) assembles blocks from the local mempool and searches nonces. Always set a payout address so rewards are spendable:
 ```bash

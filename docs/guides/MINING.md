@@ -9,6 +9,14 @@ source ~/.cargo/env
 cargo build --release
 ```
 
+## 2) Optional systemd setup
+If you want the node/miner to survive reboots:
+```bash
+cd /home/irium/irium
+./install.sh
+```
+Edit `/etc/irium/iriumd.env` and `/etc/irium/miner.env` before enabling the miner.
+
 ## 2) Run the node
 ```bash
 RUST_LOG=info ./target/release/iriumd
