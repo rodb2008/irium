@@ -833,7 +833,7 @@ impl P2PNode {
                     Ok(msg) => {
                         if P2PNode::verbose_messages() {
                             match msg.msg_type {
-                                MessageType::Ping | MessageType::Pong | MessageType::Handshake | MessageType::Peers | MessageType::GetPeers | MessageType::GetHeaders | MessageType::GetBlocks => {}
+                                MessageType::Ping | MessageType::Pong | MessageType::Handshake | MessageType::Peers | MessageType::GetPeers | MessageType::GetHeaders | MessageType::GetBlocks | MessageType::Headers => {}
                                 _ => {
                                     P2PNode::log_event(
                                         "info",
@@ -1735,7 +1735,7 @@ async fn handle_incoming_with_sybil(
 
         if P2PNode::verbose_messages() {
             match msg.msg_type {
-                MessageType::Ping | MessageType::Pong | MessageType::Handshake | MessageType::Peers | MessageType::GetPeers | MessageType::GetHeaders | MessageType::GetBlocks => {}
+                MessageType::Ping | MessageType::Pong | MessageType::Handshake | MessageType::Peers | MessageType::GetPeers | MessageType::GetHeaders | MessageType::GetBlocks | MessageType::Headers => {}
                 _ => {
                     P2PNode::log_event("info", "net", format!("P2P {}: recv {:?}", addr, msg.msg_type));
                 }
