@@ -100,6 +100,7 @@ source ~/.cargo/env
 ```
 - Mined blocks are auto-submitted to `IRIUM_NODE_RPC` (default http://127.0.0.1:38300).
 - If the node is running HTTPS + `IRIUM_RPC_TOKEN`, set `IRIUM_NODE_RPC=https://127.0.0.1:38300` and export the same `IRIUM_RPC_TOKEN` for the miner.
+- If `IRIUM_RPC_TOKEN` is set to an empty value in env files, miners will still send an empty token and get 401; either remove the line or set a real token.
 - The miner pulls templates from `/rpc/getblocktemplate` and honors `IRIUM_GBT_MAX_TXS`, `IRIUM_GBT_MIN_FEE`, `IRIUM_GBT_LONGPOLL`, and `IRIUM_GBT_LONGPOLL_SECS`.
 - Set `IRIUM_MINER_STRICT_RPC=1` to stop mining if RPC/template fetch fails.
 - Pool mining (Stratum v1, TCP): set `IRIUM_STRATUM_URL`, `IRIUM_STRATUM_USER`, `IRIUM_STRATUM_PASS`.

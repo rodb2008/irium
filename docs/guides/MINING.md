@@ -62,6 +62,7 @@ Notes:
 
 ## Troubleshooting
 - RPC unauthorized: ensure `IRIUM_RPC_TOKEN` matches the node.
+- Empty RPC token: remove `IRIUM_RPC_TOKEN=` or set a real token in `/etc/irium/*.env`.
 - HTTPS mismatch: set `IRIUM_NODE_RPC=https://127.0.0.1:38300` if the node is running TLS.
 - No templates: confirm node is running and reachable at `IRIUM_NODE_RPC`.
 - Low hashrate: check CPU governor and ensure the miner is not throttled.
