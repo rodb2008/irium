@@ -98,8 +98,8 @@ export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>   # or set IRIUM_MINER_PKH (40-h
 source ~/.cargo/env
 ./target/release/irium-miner
 ```
-- Mined blocks are auto-submitted to http://127.0.0.1:38300/rpc/submit_block; set `IRIUM_NODE_RPC` if your node listens elsewhere.
-- If `IRIUM_RPC_TOKEN` is set on the node, export the same token for the miner.
+- Mined blocks are auto-submitted to `IRIUM_NODE_RPC` (default http://127.0.0.1:38300).
+- If the node is running HTTPS + `IRIUM_RPC_TOKEN`, set `IRIUM_NODE_RPC=https://127.0.0.1:38300` and export the same `IRIUM_RPC_TOKEN` for the miner.
 - The miner pulls templates from `/rpc/getblocktemplate` and honors `IRIUM_GBT_MAX_TXS`, `IRIUM_GBT_MIN_FEE`, `IRIUM_GBT_LONGPOLL`, and `IRIUM_GBT_LONGPOLL_SECS`.
 - Set `IRIUM_MINER_STRICT_RPC=1` to stop mining if RPC/template fetch fails.
 - Pool mining (Stratum v1, TCP): set `IRIUM_STRATUM_URL`, `IRIUM_STRATUM_USER`, `IRIUM_STRATUM_PASS`.

@@ -62,10 +62,10 @@ export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>   # or set IRIUM_MINER_PKH (40-h
 source ~/.cargo/env
 ./target/release/irium-miner
 ```
-- Relies on the local node/mempool and auto-submits mined blocks to http://127.0.0.1:38300/rpc/submit_block (override with `IRIUM_NODE_RPC`).
+- Relies on the local node/mempool and auto-submits mined blocks to `IRIUM_NODE_RPC` (default http://127.0.0.1:38300).
 - Uses `/rpc/getblocktemplate`; tune with `IRIUM_GBT_MAX_TXS`, `IRIUM_GBT_MIN_FEE`, `IRIUM_GBT_LONGPOLL`, `IRIUM_GBT_LONGPOLL_SECS`.
 - Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
-- If `IRIUM_RPC_TOKEN` is set on the node, export the same token for the miner.
+- If the node is using HTTPS + `IRIUM_RPC_TOKEN`, set `IRIUM_NODE_RPC=https://127.0.0.1:38300` and export the same `IRIUM_RPC_TOKEN` for the miner.
 - Set `IRIUM_MINER_STRICT_RPC=1` to stop mining if RPC/template fetch fails.
 - Pool mining (Stratum v1, TCP): set `IRIUM_STRATUM_URL`, `IRIUM_STRATUM_USER`, `IRIUM_STRATUM_PASS`.
 
