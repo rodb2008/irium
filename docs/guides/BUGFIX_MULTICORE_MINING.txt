@@ -1,54 +1,33 @@
 # MULTICORE MINING BUG FIX
 **Date:** October 24, 2025
-**Version:** Post v1.2.0 (will be in v1.2.1)
+**Version:** Rust miner (current)
 **Severity:** High - Wasted mining effort
 
-## Bug Report
-**Reporter:** User feedback
-**Issue:** When using multicore mining (irium-miner-multicore.sh):
-  - One core finds block N
-  - Other cores continue mining block N for 30+ seconds
-  - Result: Local node ahead of network, wasted mining power
+## Summary
+Legacy Python mining scripts are retired. The Rust miner now refreshes its block template whenever the node tip changes and restarts mining immediately, so other threads do not waste time on stale work.
 
-## Root Causes
-1. **Main node rescan too slow:** 30 second interval to detect new blocks
-2. **No miner coordination:** Each process runs independently
-3. **No height checks:** Miners only checked height once per block attempt
+## Root Causes (Legacy)
+1. Slow node rescan interval
+2. No coordination between miner processes
+3. Height checked only once per block attempt
 
-## Fixes Applied
-
-### Fix #1: Main Node Rescan Interval
-**File:** scripts/irium-node.py
-**Line:** 209
-**Change:** `await asyncio.sleep(30)` → `await asyncio.sleep(5)`
-**Impact:** 6x faster block detection and broadcasting
-
-### Fix #2: Periodic Height Checks in Simple Miner
-**File:** scripts/irium-simple-miner.py
-**Changes:**
-  - Added `get_current_height()` function
-  - Added `check_interval = 10000` (check every 10k nonces)
-  - Added height check in mining loop
-  - Break immediately when another miner finds the block
-
-**Impact:** Miners detect new blocks within 1-2 seconds
+## Fixes Applied (Rust)
+- Miner re-fetches `/rpc/getblocktemplate` when the node advances and logs template updates.
+- Miner restarts nonce search when a new tip is detected.
+- `--threads <n>` controls parallel hashing within a single process.
 
 ## Expected Results
-- **Before:** 3 cores waste ~30 seconds on stale block
-- **After:** 3 cores stop within 1-2 seconds
-- **Improvement:** ~95% reduction in wasted mining effort
+- Stale work is discarded as soon as a new block arrives.
+- Multiple cores mine the same current template, not outdated tips.
 
 ## Testing Instructions
-1. Restart main node: `sudo systemctl restart irium-node`
-2. Stop existing miners: `pkill -f irium-simple-miner`
-3. Start multicore mining: `bash scripts/irium-miner-multicore.sh 4`
-4. Monitor logs: `tail -f /tmp/miner-*.log`
+1. Start the node: `./target/release/iriumd`
+2. Start the miner: `./target/release/irium-miner --threads 4 --verbose`
+3. Watch logs for template refreshes and new tip heights.
 
 ## Status
 ✅ Fixed and ready for testing
-⏳ Awaiting user confirmation
 
 ## Next Steps
-- Test with 4+ cores
-- Verify block propagation timing
-- Consider for v1.2.1 release
+- Verify with multiple nodes to confirm rapid template updates.
+- Keep `IRIUM_MINER_STRICT_RPC=1` if you want mining to pause when RPC fails.

@@ -1,25 +1,25 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-The repo centers on `irium/` (consensus, wallet, networking) with operational wrappers living in `scripts/`. Long-lived network data such as anchors, bootstrap peers, and genesis headers live under `bootstrap/` and `configs/`. Documentation for operators and researchers is kept in the Markdown guides at the top level plus `docs/`. Runtime artifacts (`state/`, `~/.irium/**`) must stay out of git.
-
-When the VPS runs the packaged systemd node, it reads `~/.irium/system-node-port` to decide which background port to use. Set that file (e.g., 39291) if you want the managed service off 38291 while you run manual nodes with `--port 38291`.
+The repo centers on Rust sources in `src/` (consensus, wallet, networking) with binaries defined under `src/bin`. Long-lived network data such as anchors, bootstrap peers, and genesis headers live under `bootstrap/` and `configs/`. Systemd templates live in `systemd/`, and optional shell helpers live in `scripts/` (no Python entrypoints). Documentation for operators and researchers is kept in the Markdown guides at the top level plus `docs/`. Runtime artifacts (`state/`, `~/.irium/**`) must stay out of git.
 
 ## Build, Test, and Development Commands
-- `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt` — provision a clean environment.
-- `PYTHONPATH=$PWD python3 scripts/irium-node.py 38291` — run a node on the chosen P2P port.
-- `PYTHONPATH=$PWD python3 scripts/irium-miner.py 38292` — launch the reference miner aimed at the node.
-- `PYTHONPATH=$PWD python3 scripts/verify_genesis.py` — sanity-check the locked genesis metadata.
-- `PYTHONPATH=$PWD python3 -m pytest tests` — execute the Python test suite (unit + smoke tests).
+- `source ~/.cargo/env` — load Rust toolchain (if needed).
+- `cargo build --release` — build node/miner/wallet.
+- `./target/release/iriumd` — run the node (HTTP + P2P).
+- `./target/release/irium-miner` — run the miner (use `IRIUM_MINER_ADDRESS`).
+- `./target/release/irium-wallet` — wallet CLI (new-address, balance).
+- `./target/release/irium-spv` — SPV proof tooling.
+- `cargo test --quiet` — run Rust tests.
 
 ## Coding Style & Naming Conventions
-Adhere to PEP 8 with 4-space indents, snake_case functions, PascalCase classes, and meaningful module names. Keep consensus-critical constants in config files rather than hardcoded literals. Prefer dataclasses and type hints for anything serialized over the network or persisted on disk. Log via the existing structured logger utilities instead of ad-hoc `print` statements.
+Follow idiomatic Rust style (`rustfmt`, `clippy`) and keep modules cohesive (`chain.rs`, `pow.rs`, `wallet.rs`). Keep consensus-critical constants in `configs/` or `bootstrap/` rather than hardcoded literals. Log via the structured logger utilities instead of ad-hoc `println!` statements for network paths.
 
 ## Testing Guidelines
-Every new consensus or networking change needs a matching test under `tests/`, mirroring the module path (`tests/test_chain.py` for `irium/chain.py`, etc.). Use realistic fixtures (e.g., `tests/fixtures/genesis.json`) and cover both valid and invalid flows. Run `pytest -k <component>` for focused checks and capture relevant log excerpts in PR descriptions.
+Add unit tests inline with modules and integration tests under `tests/` where needed. Cover consensus-critical flows (block validation, PoW, wallet, networking) and include fixtures for sample blocks under `tests/fixtures/` when relevant.
 
 ## Commit & Pull Request Guidelines
 Use short, imperative messages, optionally emoji-prefixed (see git history). Describe why the change matters, what was touched, and how it was validated. Pull requests should link to the corresponding tracker entry, summarize behavioural changes, list testing commands, and mention any follow-up tasks. Include screenshots or telemetry snippets only when the docs or monitoring outputs change.
 
 ## Security & Configuration Tips
-Never commit private keys, WIFs, or node credentials. Rely on environment variables like `IRIUM_WALLET_FILE`, `IRIUM_RPC_BIND`, and `IRIUM_GENESIS_PATH` or per-node JSON files under `configs/`. When exposing APIs publicly, place them behind TLS and rate limiting (see `scripts/irium-wallet-api-ssl.py`). Rotate anchors and bootstrap signatures whenever consensus parameters shift, and document the new fingerprints in `docs/security.md`.
+Never commit private keys, WIFs, or node credentials. Rely on environment variables like `IRIUM_RPC_TOKEN`, `IRIUM_TLS_CERT`, `IRIUM_TLS_KEY`, `IRIUM_RPC_CA`, and JSON configs under `configs/`. When exposing APIs publicly, place them behind TLS and rate limiting (see `src/rate_limiter.rs`). Rotate anchors and bootstrap signatures whenever consensus parameters shift, and document the new fingerprints in `docs/security.md`.

@@ -14,7 +14,8 @@ Irium is a production‑only proof‑of‑work blockchain for the IRM asset. The
 - `src/` – Rust sources (node, P2P, miner, SPV, wallet primitives).
 - `bootstrap/` – signed seedlist, anchors, trust roots.
 - `configs/` – genesis/consensus config.
-- `scripts/` – ops helpers (systemd example, setup scripts).
+- `systemd/` – systemd unit templates + env examples.
+- `scripts/` – optional shell helpers (no Python entrypoints).
 - `state/` – runtime data (peers.json, etc.).
 
 
@@ -136,7 +137,7 @@ cargo run --release --bin irium-spv -- verify <height> <txid> <index> <proof_hex
 - `state/peers.json` – peer cache used when seeds are unavailable.
 
 ## Systemd Example
-See `scripts/iriumd.service.example` for a unit that runs the node under journald with automatic restart.
+See `systemd/iriumd.service` and `systemd/irium-miner.service` for units that run the node/miner under journald with automatic restart.
 
 
 ### Banlist signing

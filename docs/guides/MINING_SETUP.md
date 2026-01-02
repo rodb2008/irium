@@ -5,128 +5,66 @@
 ### Quick Start (Recommended)
 
 ```bash
-# 1. Create your wallet address
-python3 scripts/irium-wallet-proper.py new-address
+# 1) Create a wallet address (save the private key)
+./target/release/irium-wallet new-address
 
-# This creates:
-# - New address: Q1abc...xyz (where your rewards go)
-# - Private key: Saved in ~/.irium/irium-wallet.json
-# - IMPORTANT: Backup your wallet file!
-
-# 2. Start mining
-python3 scripts/irium-miner.py
-
-# You'll see:
-# 💰 Mining address: Q1abc...xyz
-# ⛏️  Mining block 4...
-
-# 3. Mining rewards will go to your address!
+# 2) Start mining with that address
+export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>
+./target/release/irium-miner --threads 4 --verbose
 ```
 
-### Verify Your Mining Address
+### Verify the Mining Address
 
 ```bash
-# Check what address the miner is using
-journalctl -u irium-miner.service | grep "Mining address" | tail -1
-
-# Or if running manually:
-# Look for "💰 Mining address: Q..."
+# systemd service logs
+journalctl -u irium-miner.service -f --no-pager
 ```
+Look for the `Using miner address:` line when the miner starts.
 
-### Important: Wallet is Loaded at Startup
+### Miner Address Is Read at Startup
 
-**The miner loads your wallet when it starts!**
-
-If you create a new address AFTER the miner started:
+If you change your payout address, restart the miner:
 ```bash
-# 1. Stop miner
-sudo systemctl stop irium-miner.service
-
-# 2. Create new address
-python3 scripts/irium-wallet-proper.py new-address
-
-# 3. Restart miner to use new address
-sudo systemctl start irium-miner.service
-
-# 4. Verify
-sudo journalctl -u irium-miner.service -n 20 | grep "Mining address"
+sudo systemctl restart irium-miner.service
 ```
 
 ### Managing Multiple Addresses
 
-```bash
-# List all your addresses
-python3 scripts/irium-wallet-proper.py list
+The miner uses a single address at a time. Switch by updating `IRIUM_MINER_ADDRESS` (or `IRIUM_MINER_PKH`) and restarting the miner.
 
-# Check balance
-python3 scripts/irium-wallet-proper.py balance
-
-# The miner uses the FIRST address in your wallet
-```
-
-### Starting Fresh with New Address
+### Starting Fresh with a New Address
 
 ```bash
-# 1. Backup existing wallet (optional)
-cp ~/.irium/irium-wallet.json ~/.irium/wallet-backup.json
+# 1) Generate a new address
+./target/release/irium-wallet new-address
 
-# 2. Remove old wallet
-rm ~/.irium/irium-wallet.json
-
-# 3. Create new address
-python3 scripts/irium-wallet-proper.py new-address
-
-# 4. Start mining
-python3 scripts/irium-miner.py
-# OR
-sudo systemctl restart irium-miner.service
+# 2) Export it and restart the miner
+export IRIUM_MINER_ADDRESS=<NEW_ADDRESS>
+./target/release/irium-miner --threads 4 --verbose
 ```
 
-### Backup Your Wallet!
+### Backup Your Keys
 
-**CRITICAL: Always backup your wallet file!**
-
-```bash
-# Backup wallet
-cp ~/.irium/irium-wallet.json ~/irium-wallet-backup-$(date +%Y%m%d).json
-
-# Or copy to safe location
-scp ~/.irium/irium-wallet.json user@backup-server:~/irium-backups/
-```
-
-**Without your wallet file, you LOSE ACCESS to your mining rewards!**
+**CRITICAL: Save the printed private key.** The Rust wallet CLI does not store a wallet file for you.
 
 ### Troubleshooting
 
-**"Miner is using a different address than I created"**
+**"Miner is using a different address"**
 
-This means the miner was already running. Restart it:
-```bash
-sudo systemctl restart irium-miner.service
-```
-
-**"I want to mine to multiple addresses"**
-
-The miner uses one address at a time. To switch:
-1. Stop miner
-2. Edit wallet or create new one
-3. Restart miner
+The miner was already running. Restart it after updating `IRIUM_MINER_ADDRESS`.
 
 **"How do I check my mining rewards?"**
 
 ```bash
-python3 scripts/irium-wallet-proper.py balance
+./target/release/irium-wallet balance <YOUR_IRIUM_ADDRESS>
 ```
-
 Rewards are spendable after 100 block confirmations (coinbase maturity).
 
 ### Mining Tips
 
-- ✅ Always backup your wallet
-- ✅ Write down your address and WIF
-- ✅ Verify mining address after starting miner
-- ✅ Keep your system updated (git pull regularly)
-- ✅ Monitor miner logs for errors
+- Save your private key and address offline.
+- Keep your system updated (`git pull`, rebuild).
+- Monitor miner logs for template errors or RPC failures.
 
 ### Need Help?
 

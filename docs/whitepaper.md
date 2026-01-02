@@ -87,7 +87,7 @@ Irium separates responsibilities into modular subsystems.
 - `bootstrap/seedlist.runtime` — Runtime peer cache saved locally  
 - `configs/node.json` — Optional node configuration (P2P bind/seed overrides, relay address)  
 - `scripts/irium-zero.sh` — DNS-free bootstrap helper  
-- `scripts/iriumd.service.example` — systemd unit example  
+- `systemd/iriumd.service` and `systemd/irium-miner.service` — systemd unit templates  
 
 ---
 
@@ -116,14 +116,14 @@ valid_block = block_hash < target
 **Retarget Interval:** Every 2016 blocks (~14 days)  
 
 **Algorithm:**
-```python
+```text
 expected_time = 2016 * 600  # 1,209,600 seconds
 actual_time = last_block_time - first_block_time
 new_difficulty = old_difficulty * (actual_time / expected_time)
 ```
 
 **Compact Target (Bitcoin-standard):**
-```python
+```text
 def to_target(bits: int) -> int:
     exponent = bits >> 24
     mantissa = bits & 0xFFFFFF

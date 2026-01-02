@@ -60,32 +60,34 @@ Most established proof-of-work networks inherit architectural assumptions from B
 
 Irium separates responsibilities into modular subsystems:
 
-### 2.1 Core Modules (irium/ package)
+### 2.1 Core Modules (src/)
 
-- **block.py** - Block and BlockHeader structures
-- **chain.py** - ChainState, ChainParams, consensus validation
-- **tx.py** - Transaction, TxInput, TxOutput classes
-- **wallet.py** - Key management, signing, WIF format
-- **pow.py** - SHA-256d hashing, Target difficulty
-- **network.py** - PeerDirectory, SeedlistManager
-- **protocol.py** - P2P binary message protocol
-- **p2p.py** - P2P node with peer management
-- **mempool.py** - Transaction pool with fee prioritization
-- **uptime.py** - Peer reputation and uptime proofs
-- **sybil.py** - Sybil-resistant handshake protocol
-- **relay.py** - Relay reward calculation and tracking
-- **anchors.py** - Checkpoint verification, eclipse protection
-- **spv.py** - SPV client with NiPoPoW support
+- **block.rs** - Block and BlockHeader structures
+- **chain.rs** - ChainState, consensus validation, chain state
+- **tx.rs** - Transaction, TxInput, TxOutput structures
+- **wallet.rs** - Address helpers, signing utilities
+- **pow.rs** - SHA-256d hashing, target difficulty
+- **network.rs** - Peer directory, seedlist management
+- **protocol.rs** - P2P binary message protocol
+- **p2p.rs** - P2P node with peer management and header-first sync
+- **mempool.rs** - Transaction pool with fee prioritization
+- **reputation.rs** - Peer scoring and ban tracking
+- **sybil.rs** - Sybil-resistant handshake protocol
+- **relay.rs** - Relay reward calculation and tracking
+- **anchors.rs** - Checkpoint verification, eclipse protection
+- **spv.rs** - Header chain + merkle proof verification
 
-### 2.2 Executable Scripts
+### 2.2 Binaries
 
-- **irium-node.py** - Full node with P2P networking
-- **irium-miner.py** - PoW miner with block broadcasting
-- **irium-wallet-api-ssl.py** - Wallet REST API server
-- **irium-explorer-api.py** - Blockchain explorer API
-- **mine-genesis.py** - Genesis block mining tool
+- **iriumd** - Full node with HTTP API and P2P networking
+- **irium-miner** - PoW miner with block broadcasting
+- **irium-wallet** - Wallet CLI (address creation, balance queries)
+- **irium-spv** - SPV proof verification tool
+- **irium-p2p** - P2P-only diagnostic node
 
 ---
+
+
 
 ## 3. Consensus Mechanics
 
@@ -115,7 +117,7 @@ valid_block = block_hash < target
 **Retarget Interval:** Every 2016 blocks (~14 days)
 
 **Algorithm:**
-```python
+```text
 expected_time = 2016 * 600  # 1,209,600 seconds
 actual_time = last_block_time - first_block_time
 new_difficulty = old_difficulty * (actual_time / expected_time)
@@ -133,7 +135,7 @@ Each block must satisfy:
 5. Coinbase reward ≤ subsidy + fees
 6. Block connects to valid chain tip
 
-**Implementation:** irium/chain.py (_validate_block_header)
+**Implementation:** src/chain.rs (block header validation)
 
 ---
 
@@ -193,7 +195,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 **Irium Solution:**
 - Signed `seedlist.txt` with raw IP multiaddrs (IPv4 + IPv6)
 - Signed `anchors.json` with checkpoint block headers
-- Bootstrap script: `irium-zero.sh` (no DNS queries)
+- Bootstrap script: `scripts/irium-zero.sh` (no DNS queries)
 - Distributed via GitHub, IPFS, torrents
 - Signature verification with secp256k1
 
@@ -215,7 +217,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 - Network 'remembers' reliable peers
 - `seedlist.runtime` updated automatically
 
-**Status:** ✅ Implemented (irium/uptime.py, irium/network.py)
+**Status:** ✅ Implemented (src/reputation.rs, src/network.rs)
 
 **Reputation Factors:**
 - Successful connections: +2 points each
@@ -262,7 +264,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 - Included in coinbase transaction
 - No supply inflation (comes from tx fees)
 
-**Status:** ✅ Implemented (irium/relay.py)
+**Status:** ✅ Implemented (src/relay.rs)
 
 **Example:**
 - Transaction fee: 0.001 IRM
@@ -283,7 +285,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 - Configurable difficulty (default: 8 bits)
 - Trivial for legitimate nodes, prohibitive for bots
 
-**Status:** ✅ Implemented (irium/sybil.py)
+**Status:** ✅ Implemented (src/sybil.rs)
 
 **Process:**
 1. Node A sends PoW challenge to Node B
@@ -302,7 +304,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 - New nodes verify chain against anchors
 - Protects even if all peers are malicious
 
-**Status:** ✅ Implemented (irium/anchors.py)
+**Status:** ✅ Implemented (src/anchors.rs)
 
 **Anchor Structure:**
 ```json
@@ -325,7 +327,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 - Merkle proof verification
 - Superblock proofs for ultra-light clients
 
-**Status:** ✅ Implemented (irium/spv.py)
+**Status:** ✅ Implemented (src/spv.rs)
 
 **Light Client Benefits:**
 - Download only headers (~80 bytes per block)
@@ -644,7 +646,7 @@ The genesis block was mined with proper Bitcoin-standard difficulty calculation:
 
 ### Technical Implementation
 
-```python
+```text
 # Standard Bitcoin compact target calculation
 def to_target(bits: int) -> int:
     exponent = bits >> 24
