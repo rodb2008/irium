@@ -67,6 +67,7 @@ source ~/.cargo/env
 - Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
 - If the node is using HTTPS + `IRIUM_RPC_TOKEN`, set `IRIUM_NODE_RPC=https://127.0.0.1:38300` and export the same `IRIUM_RPC_TOKEN` for the miner.
 - If `IRIUM_RPC_TOKEN` is present but empty in `/etc/irium/*.env`, miners will send an empty token and get 401; delete the line or set a real token.
+- For HTTPS with a local self-signed cert, set `IRIUM_RPC_CA=/etc/irium/tls/irium-ca.crt` instead of `IRIUM_RPC_INSECURE=1`.
 - Set `IRIUM_MINER_STRICT_RPC=1` to stop mining if RPC/template fetch fails.
 - Pool mining (Stratum v1, TCP): set `IRIUM_STRATUM_URL`, `IRIUM_STRATUM_USER`, `IRIUM_STRATUM_PASS`.
 
