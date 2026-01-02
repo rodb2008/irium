@@ -1100,14 +1100,14 @@ fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client) 
                     if json_log_enabled() {
                         println!("{}", json!({"event": "submit_block", "height": height, "status": "accepted"}));
                     } else {
-                        println!("[📡] Submitted block {} to local node", height);
+                        println!("[✅] Block accepted by node at height {}", height);
                     }
                 }
                 Err(e) => {
                     if json_log_enabled() {
                         eprintln!("{}", json!({"event": "submit_block_failed", "height": height, "error": e}));
                     } else {
-                        eprintln!("[⚠️] Failed to submit block {} to node: {}", height, e);
+                        eprintln!("[❌] Block rejected at height {}: {}", height, e);
                     }
                 }
             }
