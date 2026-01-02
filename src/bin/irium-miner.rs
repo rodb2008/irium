@@ -421,6 +421,32 @@ fn node_rpc_base() -> String {
     env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "http://127.0.0.1:38300".to_string())
 }
 
+fn is_tls_mismatch(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("invalid http version")
+}
+
+fn with_rpc_base<T, F>(f: F) -> Result<T, String>
+where
+    F: Fn(&str) -> Result<T, String>,
+{
+    let base = node_rpc_base();
+    match f(&base) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if base.starts_with("http://") && is_tls_mismatch(&e) {
+                let https = base.replacen("http://", "https://", 1);
+                if let Ok(v) = f(&https) {
+                    env::set_var("IRIUM_NODE_RPC", &https);
+                    eprintln!("[warn] RPC scheme mismatch; switching to {https}");
+                    return Ok(v);
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 fn submit_block_to_node(height: u64, block: &Block) -> Result<(), String> {
     let header = &block.header;
     let hash = header.hash();
@@ -444,9 +470,16 @@ fn submit_block_to_node(height: u64, block: &Block) -> Result<(), String> {
 
     let client = rpc_client()?;
 
-    let base = node_rpc_base();
+    with_rpc_base(|base| submit_block_to_node_with_base(&client, base, &payload))
+}
+
+fn submit_block_to_node_with_base(
+    client: &Client,
+    base: &str,
+    payload: &SubmitBlockRequest,
+) -> Result<(), String> {
     let url = format!("{}/rpc/submit_block", base.trim_end_matches("/"));
-    let mut req = client.post(url).json(&payload);
+    let mut req = client.post(url).json(payload);
     if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
         req = req.bearer_auth(token);
     }
@@ -459,7 +492,6 @@ fn submit_block_to_node(height: u64, block: &Block) -> Result<(), String> {
     }
     Ok(())
 }
-
 
 fn load_persisted_blocks(state: &mut ChainState) {
     let dir = blocks_dir();
@@ -625,7 +657,14 @@ fn gbt_query_params(longpoll: bool) -> Vec<(String, String)> {
 }
 
 fn fetch_block_template(client: &Client, longpoll: bool) -> Result<BlockTemplate, String> {
-    let base = node_rpc_base();
+    with_rpc_base(|base| fetch_block_template_with_base(client, base, longpoll))
+}
+
+fn fetch_block_template_with_base(
+    client: &Client,
+    base: &str,
+    longpoll: bool,
+) -> Result<BlockTemplate, String> {
     let url = format!("{}/rpc/getblocktemplate", base.trim_end_matches("/"));
     let mut req = client.get(url).query(&gbt_query_params(longpoll));
     if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
@@ -642,8 +681,15 @@ fn fetch_block_template(client: &Client, longpoll: bool) -> Result<BlockTemplate
 }
 
 fn fetch_block_json(client: &Client, height: u64) -> Result<serde_json::Value, String> {
-    let base = node_rpc_base();
-    let url = format!("{}/rpc/block?height={}", base.trim_end_matches('/'), height);
+    with_rpc_base(|base| fetch_block_json_with_base(client, base, height))
+}
+
+fn fetch_block_json_with_base(
+    client: &Client,
+    base: &str,
+    height: u64,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{}/rpc/block?height={}", base.trim_end_matches('/') , height);
     let mut req = client.get(url);
     if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
         req = req.bearer_auth(token);
@@ -657,7 +703,6 @@ fn fetch_block_json(client: &Client, height: u64) -> Result<serde_json::Value, S
     resp.json()
         .map_err(|e| format!("block {height} parse: {e}"))
 }
-
 
 fn parse_bits(bits_str: &str) -> Result<u32, String> {
     let trimmed = bits_str.trim_start_matches("0x");
