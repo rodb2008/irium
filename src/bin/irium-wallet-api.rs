@@ -1,0 +1,201 @@
+use std::env;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::{
+    extract::{ConnectInfo, Query, State},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    routing::{get, post},
+    Json, Router,
+};
+use irium_node_rs::rate_limiter::RateLimiter;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Clone)]
+struct AppState {
+    client: Client,
+    node_base: String,
+    limiter: Arc<Mutex<RateLimiter>>,
+    api_token: Option<String>,
+    rpc_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BalanceQuery {
+    address: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SubmitTxRequest {
+    tx_hex: String,
+}
+
+fn build_client() -> Result<Client, String> {
+    let mut builder = Client::builder().timeout(Duration::from_secs(10));
+    if let Ok(path) = env::var("IRIUM_RPC_CA") {
+        let pem = std::fs::read(&path).map_err(|e| format!("read CA {path}: {e}"))?;
+        let cert = reqwest::Certificate::from_pem(&pem)
+            .map_err(|e| format!("invalid CA {path}: {e}"))?;
+        builder = builder.add_root_certificate(cert);
+    }
+    let insecure = env::var("IRIUM_RPC_INSECURE")
+        .ok()
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false);
+    if insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build().map_err(|e| format!("build client: {e}"))
+}
+
+fn api_authorized(headers: &HeaderMap, token: &Option<String>) -> bool {
+    let token = match token {
+        Some(t) if !t.is_empty() => t,
+        _ => return true,
+    };
+    let expected = format!("Bearer {}", token);
+    let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+    header == Some(expected.as_str())
+}
+
+fn check_rate(state: &AppState, addr: &SocketAddr, headers: &HeaderMap) -> Result<(), StatusCode> {
+    if api_authorized(headers, &state.api_token) {
+        return Ok(());
+    }
+    let mut limiter = state.limiter.lock().unwrap();
+    if limiter.is_allowed(&addr.ip().to_string()) {
+        Ok(())
+    } else {
+        Err(StatusCode::TOO_MANY_REQUESTS)
+    }
+}
+
+fn map_status(status: reqwest::StatusCode) -> StatusCode {
+    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY)
+}
+
+fn node_url(base: &str, path: &str) -> String {
+    format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
+}
+
+async fn proxy_json(state: &AppState, path: &str) -> Result<Json<Value>, StatusCode> {
+    let url = node_url(&state.node_base, path);
+    let mut req = state.client.get(url);
+    if let Some(token) = &state.rpc_token {
+        if !token.is_empty() {
+            req = req.bearer_auth(token);
+        }
+    }
+    let resp = req.send().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if !resp.status().is_success() {
+        return Err(map_status(resp.status()));
+    }
+    let payload = resp.json::<Value>().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(payload))
+}
+
+async fn post_json(state: &AppState, path: &str, body: &SubmitTxRequest) -> Result<Json<Value>, StatusCode> {
+    let url = node_url(&state.node_base, path);
+    let mut req = state.client.post(url).json(body);
+    if let Some(token) = &state.rpc_token {
+        if !token.is_empty() {
+            req = req.bearer_auth(token);
+        }
+    }
+    let resp = req.send().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if !resp.status().is_success() {
+        return Err(map_status(resp.status()));
+    }
+    let payload = resp.json::<Value>().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(payload))
+}
+
+async fn status(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    proxy_json(&state, "/status").await
+}
+
+async fn balance(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<BalanceQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    proxy_json(&state, &format!("/rpc/balance?address={}", q.address)).await
+}
+
+async fn submit_tx(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SubmitTxRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    if !api_authorized(&headers, &state.api_token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    check_rate(&state, &addr, &headers)?;
+    post_json(&state, "/rpc/submit_tx", &body).await
+}
+
+#[tokio::main]
+async fn main() {
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to init HTTP client: {e}");
+            std::process::exit(1);
+        }
+    };
+    let node_base = env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "http://127.0.0.1:38300".to_string());
+    let api_token = env::var("IRIUM_WALLET_API_TOKEN").ok();
+    let rpc_token = env::var("IRIUM_RPC_TOKEN").ok();
+    let rate = env::var("IRIUM_WALLET_API_RATE_LIMIT_PER_MIN")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(120);
+
+    let state = AppState {
+        client,
+        node_base: node_base.trim_end_matches('/').to_string(),
+        limiter: Arc::new(Mutex::new(RateLimiter::new(rate))),
+        api_token,
+        rpc_token,
+    };
+
+    let app = Router::new()
+        .route("/status", get(status))
+        .route("/balance", get(balance))
+        .route("/submit_tx", post(submit_tx))
+        .with_state(state)
+        .into_make_service_with_connect_info::<SocketAddr>();
+
+    let host = env::var("IRIUM_WALLET_API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = env::var("IRIUM_WALLET_API_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(38320);
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .expect("valid bind address");
+
+    println!(
+        "Irium wallet API listening on http://{}:{} (node rpc {})",
+        host, port, node_base
+    );
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind failed");
+    axum::serve(listener, app).await.expect("server error");
+}

@@ -89,11 +89,15 @@ cd /home/irium/irium
 ./install.sh
 ```
 - Edit `/etc/irium/iriumd.env` and `/etc/irium/miner.env` for your paths and wallet.
+- Optional API services: `/etc/irium/explorer.env` and `/etc/irium/wallet-api.env`.
 - Enable the miner after setting `IRIUM_MINER_ADDRESS`:
 ```
 sudo systemctl enable --now irium-miner.service
+# optional APIs
+sudo systemctl enable --now irium-explorer.service
+sudo systemctl enable --now irium-wallet-api.service
 ```
-Logs go to `journalctl -u iriumd` and `journalctl -u irium-miner`.
+Logs go to `journalctl -u iriumd`, `journalctl -u irium-miner`, `journalctl -u irium-explorer`, and `journalctl -u irium-wallet-api`.
 
 ## Bootstrap/peer cache paths
 - Signed seeds: `bootstrap/seedlist.txt` (+ .sig + trust/allowed_signers)

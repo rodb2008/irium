@@ -90,6 +90,8 @@ sudo systemctl enable --now irium-miner.service
 ```
 - Node env: `/etc/irium/iriumd.env`
 - Miner env: `/etc/irium/miner.env`
+- Explorer env: `/etc/irium/explorer.env` (service `irium-explorer.service`)
+- Wallet API env: `/etc/irium/wallet-api.env` (service `irium-wallet-api.service`)
 
 ## Mining
 The miner binary (`irium-miner`) assembles blocks from the local mempool and searches nonces. Always set a payout address so rewards are spendable:
