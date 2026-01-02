@@ -7,13 +7,14 @@ Thank you for your interest in contributing to the Irium blockchain! We welcome 
 ### 1. Run a Node
 Help secure the network by running a full node:
 ```bash
-python3 scripts/irium-node.py
+./target/release/iriumd
 ```
 
 ### 2. Mine Blocks
 Contribute hash power to the network:
 ```bash
-python3 scripts/irium-miner.py
+export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>
+./target/release/irium-miner
 ```
 
 ### 3. Report Issues
@@ -24,21 +25,20 @@ Found a bug or have a suggestion? [Open an issue](https://github.com/iriumlabs/i
 - Create a feature branch (`git checkout -b feature/your-feature`)
 - Make your changes
 - Write tests if applicable
-- Commit with clear messages (`git commit -S -m "Add feature"`)
+- Commit with clear messages (`git commit -m "Add feature"`)
 - Push to your fork (`git push origin feature/your-feature`)
 - Open a Pull Request
 
 ## 📋 Code Guidelines
 
-### Python Code Style
-- Follow PEP 8 style guide
-- Use type hints where possible
-- Write docstrings for functions and classes
-- Keep functions focused and small
+### Rust Code Style
+- Follow idiomatic Rust (`rustfmt`, `clippy`)
+- Keep modules cohesive (`chain.rs`, `pow.rs`, `wallet.rs`)
+- Add focused comments only where needed
+- Avoid hardcoding infrastructure (IPs, DNS, credentials)
 
 ### Commit Messages
 - Use clear, descriptive commit messages
-- Sign your commits with SSH or GPG
 - Reference issues when applicable (`Fixes #123`)
 
 ### Pull Requests
@@ -51,20 +51,23 @@ Found a bug or have a suggestion? [Open an issue](https://github.com/iriumlabs/i
 
 If you discover a security vulnerability:
 - **DO NOT** open a public issue
-- Contact the maintainers via the project issue tracker or security process.
+- Follow the private reporting process in `SECURITY.md`
 - Include details and reproduction steps
-- We'll respond within 48 hours
 
 ## 🧪 Testing
 
 Before submitting code:
 ```bash
-# Test the node
-python3 scripts/irium-node.py --test
+source ~/.cargo/env
+cargo test --quiet
+```
 
-# Test wallet functionality
-python3 scripts/irium-wallet-proper.py new
-python3 scripts/irium-wallet-proper.py balance
+For runtime validation:
+```bash
+./target/release/iriumd
+./target/release/irium-wallet new-address
+export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>
+./target/release/irium-miner
 ```
 
 ## 📚 Documentation
@@ -87,7 +90,7 @@ Join the Irium community and connect with other contributors:
   - 🛠️ Development - Technical development discussions
 
 - **Issues**: https://github.com/iriumlabs/irium/issues - Bug reports and feature requests
-- **Security**: use the private reporting process or reach maintainers via the issue tracker
+- **Security**: see `SECURITY.md` for private reporting
 
 ## 📜 License
 
