@@ -30,6 +30,7 @@ use irium_node_rs::network::SeedlistManager;
 use irium_node_rs::p2p::P2PNode;
 use irium_node_rs::pow::Target;
 use irium_node_rs::rate_limiter::RateLimiter;
+use irium_node_rs::storage;
 use irium_node_rs::reputation::ReputationManager;
 use irium_node_rs::tx::{decode_full_tx, Transaction, TxInput, TxOutput};
 use get_if_addrs::get_if_addrs;
@@ -238,8 +239,6 @@ fn local_ip_set(bind: Option<&String>) -> HashSet<IpAddr> {
     ips
 }
 
-
-
 fn mask_ip(ip: &str) -> String {
     match ip.parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => {
@@ -431,15 +430,6 @@ fn p2pkh_hash_from_script(script: &[u8]) -> Option<[u8; 20]> {
     Some(out)
 }
 
-fn blocks_dir() -> PathBuf {
-    if let Ok(dir) = env::var("IRIUM_BLOCKS_DIR") {
-        PathBuf::from(dir)
-    } else {
-        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        PathBuf::from(home).join(".irium/blocks")
-    }
-}
-
 fn miner_blocks_dir() -> PathBuf {
     if let Ok(dir) = env::var("IRIUM_MINER_BLOCKS_DIR") {
         PathBuf::from(dir)
@@ -459,7 +449,7 @@ fn same_dir(a: &PathBuf, b: &PathBuf) -> bool {
     }
 }
 
-fn prune_blocks_above_dir(dir: &std::path::Path, height: u64) {
+fn quarantine_blocks_above_dir(dir: &std::path::Path, height: u64) {
     if !dir.exists() {
         return;
     }
@@ -467,6 +457,12 @@ fn prune_blocks_above_dir(dir: &std::path::Path, height: u64) {
         Ok(r) => r,
         Err(_) => return,
     };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let backup_dir = dir.join(format!("orphaned_{}", stamp));
+    let _ = fs::create_dir_all(&backup_dir);
     for entry in read_dir.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -482,10 +478,12 @@ fn prune_blocks_above_dir(dir: &std::path::Path, height: u64) {
             continue;
         };
         if h > height {
-            let _ = fs::remove_file(&path);
+            let dest = backup_dir.join(name);
+            let _ = fs::rename(&path, &dest);
         }
     }
 }
+
 
 fn load_persisted_blocks_from(
     state: &mut ChainState,
@@ -592,8 +590,8 @@ fn load_persisted_blocks_from(
                 if let Err(e) = state.connect_block(block) {
                     eprintln!("[⚠️] Failed to connect persisted block {}: {}", h, e);
                     let tip = state.tip_height();
-                    prune_blocks_above_dir(dir, tip);
-                    println!("[🧹] Pruned persisted blocks above height {}", tip);
+                    quarantine_blocks_above_dir(dir, tip);
+                    println!("[🧹] Quarantined persisted blocks above height {}", tip);
                     break;
                 }
             }
@@ -603,7 +601,7 @@ fn load_persisted_blocks_from(
 }
 
 fn load_persisted_blocks(state: &mut ChainState) {
-    let node_dir = blocks_dir();
+    let node_dir = storage::blocks_dir();
     load_persisted_blocks_from(state, &node_dir, false);
     let miner_dir = miner_blocks_dir();
     if !same_dir(&node_dir, &miner_dir) {
@@ -966,7 +964,7 @@ async fn get_block(
 ) -> Result<Json<Value>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
     // Prefer on-disk JSON if present for compatibility with miner files.
-    let dir = blocks_dir();
+    let dir = storage::blocks_dir();
     let path = dir.join(format!("block_{}.json", q.height));
     if let Ok(data) = fs::read_to_string(&path) {
         let v: Value = serde_json::from_str(&data).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1085,54 +1083,6 @@ fn decode_compact_tx(raw: &[u8]) -> Result<Transaction, String> {
     })
 }
 
-#[derive(Serialize)]
-struct JsonHeader {
-    version: u32,
-    prev_hash: String,
-    merkle_root: String,
-    time: u32,
-    bits: String,
-    nonce: u32,
-    hash: String,
-}
-
-#[derive(Serialize)]
-struct JsonBlock {
-    height: u64,
-    header: JsonHeader,
-    tx_hex: Vec<String>,
-}
-
-fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
-    let dir = blocks_dir();
-    fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("block_{}.json", height));
-
-    let header = &block.header;
-    let hash = header.hash();
-
-    let jb = JsonBlock {
-        height,
-        header: JsonHeader {
-            version: header.version,
-            prev_hash: hex::encode(header.prev_hash),
-            merkle_root: hex::encode(header.merkle_root),
-            time: header.time,
-            bits: format!("{:08x}", header.bits),
-            nonce: header.nonce,
-            hash: hex::encode(hash),
-        },
-        tx_hex: block
-            .transactions
-            .iter()
-            .map(|tx| hex::encode(tx.serialize()))
-            .collect(),
-    };
-
-    let json = serde_json::to_string_pretty(&jb)?;
-    fs::write(path, json)
-}
-
 fn target_hex(bits: u32) -> String {
     let target = Target { bits }.to_target();
     let mut bytes = target.to_bytes_be();
@@ -1231,7 +1181,7 @@ async fn submit_block(
     }
 
     // Persist JSON representation alongside miner-written blocks.
-    if let Err(_e) = write_block_json(req.height, &block) {
+    if let Err(_e) = storage::write_block_json(req.height, &block) {
         // The block is already in memory; surface a server error if disk write fails.
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }

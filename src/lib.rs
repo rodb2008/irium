@@ -12,6 +12,7 @@ pub mod rate_limiter;
 pub mod relay;
 pub mod reputation;
 pub mod spv;
+pub mod storage;
 pub mod sybil;
 pub mod tx;
 pub mod wallet;

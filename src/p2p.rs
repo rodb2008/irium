@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::block::Block;
 use crate::chain::ChainState;
+use crate::storage;
 use crate::mempool::MempoolManager;
 use crate::network::{PeerDirectory, PeerRecord};
 use crate::protocol::{
@@ -1208,10 +1209,11 @@ impl P2PNode {
                                                 let bhash = block.header.hash();
                                                 let short = hex::encode(bhash);
                                                 let short = short.get(0..12).unwrap_or(&short);
-                                                let (new_height_opt, record_verdict) = {
+                                                let (new_height_opt, record_verdict, persist_height) = {
                                                     let mut guard = chain_arc.lock().unwrap();
                                                     let mut new_height_opt = None;
                                                     let mut record_verdict = None;
+                                                    let mut persist_height = None;
                                                     match guard.process_block(block.clone()) {
                                                         Ok((new_height, _tip)) => {
                                                             P2PNode::log(format!(
@@ -1228,6 +1230,9 @@ impl P2PNode {
                                                             guard.header_chain.clear();
                                                             new_height_opt = Some(new_height);
                                                             record_verdict = Some(true);
+                                                            if guard.tip_hash() == bhash {
+                                                                persist_height = Some(guard.tip_height());
+                                                            }
                                                         }
                                                         Err(e) => {
                                                             if P2PNode::is_soft_block_reject(&e) {
@@ -1252,8 +1257,20 @@ impl P2PNode {
                                                             }
                                                         }
                                                     }
-                                                    (new_height_opt, record_verdict)
+                                                    (new_height_opt, record_verdict, persist_height)
                                                 };
+                                                if let Some(height) = persist_height {
+                                                    if let Err(e) = storage::write_block_json(height, &block) {
+                                                        P2PNode::log_event(
+                                                            "warn",
+                                                            "chain",
+                                                            format!(
+                                                                "P2P {}: failed to persist block {}: {}",
+                                                                addr, short, e
+                                                            ),
+                                                        );
+                                                    }
+                                                }
                                                 if let Some(new_height) = new_height_opt {
                                                     let multiaddr = format!(
                                                         "/ip4/{}/tcp/{}",
@@ -2084,10 +2101,11 @@ async fn handle_incoming_with_sybil(
                                 let bhash = block.header.hash();
                                 let short = hex::encode(bhash);
                                 let short = short.get(0..12).unwrap_or(&short);
-                                let (new_height_opt, record_verdict) = {
+                                let (new_height_opt, record_verdict, persist_height) = {
                                     let mut guard = chain_arc.lock().unwrap();
                                     let mut new_height_opt = None;
                                     let mut record_verdict = None;
+                                    let mut persist_height = None;
                                     match guard.process_block(block.clone()) {
                                         Ok((new_height, _tip)) => {
                                             P2PNode::log(format!(
@@ -2105,6 +2123,9 @@ async fn handle_incoming_with_sybil(
                                             guard.header_chain.clear();
                                             new_height_opt = Some(new_height);
                                             record_verdict = Some(true);
+                                            if guard.tip_hash() == bhash {
+                                                persist_height = Some(guard.tip_height());
+                                            }
                                         }
                                         Err(e) => {
                                             if P2PNode::is_soft_block_reject(&e) {
@@ -2129,8 +2150,20 @@ async fn handle_incoming_with_sybil(
                                             }
                                         }
                                     }
-                                    (new_height_opt, record_verdict)
+                                    (new_height_opt, record_verdict, persist_height)
                                 };
+                                if let Some(height) = persist_height {
+                                    if let Err(e) = storage::write_block_json(height, &block) {
+                                        P2PNode::log_event(
+                                            "warn",
+                                            "chain",
+                                            format!(
+                                                "P2P {}: failed to persist block {}: {}",
+                                                addr, short, e
+                                            ),
+                                        );
+                                    }
+                                }
                                 if let Some(new_height) = new_height_opt {
                                     let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
                                     let mut directory = directory.lock().await;
