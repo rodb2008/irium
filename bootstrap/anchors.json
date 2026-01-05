@@ -1,28 +1,28 @@
 {
-  "network": "mainnet",
-  "description": "Irium blockchain checkpoint anchors for eclipse protection",
-  "trusted_signers": [
-    "iriumlabs"
-  ],
   "anchors": [
     {
+      "description": "Genesis block - Mainnet launch",
+      "hash": "0000000028f25d65557e9d8d9e991f516c00d68f5aeae10b750645b398bd10a3",
       "height": 0,
-      "hash": "000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c",
-      "timestamp": 1735689600,
-      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
       "merkle_root": "cd78279c389b6f2f0a4edc567f3ba67b27daed60ab014342bb4a5b56c2ebb4db",
-      "description": "Genesis block - Mainnet launch"
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "timestamp": 1767583930
     }
   ],
-  "last_updated": "2025-11-10T09:28:49Z",
+  "description": "Irium blockchain checkpoint anchors for eclipse protection",
+  "last_updated": "2026-01-05T03:46:26Z",
+  "network": "mainnet",
   "signatures": [
     {
-      "signer": "iriumlabs",
-      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINEHKIQunD8c5vyIXqFdA4B5q+uMnm2r8esU59bSMezP signing@iriumlabs.org",
-      "namespace": "irium-anchor",
       "algorithm": "ssh-ed25519",
-      "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg0QcohC6cPxzm/IheoV0DgHmr64yebavx6xTn1tIx7M8AAAAMaXJpdW0tYW5jaG9yAAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5AAAAQKx5kt75POtHZnWPMwh0elOYZy6Blmh3ast661l1TwriKj07nOxhfA+qDCpBkbpH6daeh+8Do9DCZxF9jo4qnw8=",
-      "signed_at": "2025-11-12T01:19:23+00:00"
+      "namespace": "irium-anchor",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID1kiQ+hbA8URyVCGDLjeDGcN18rBBURyBH6xppP9qsk info@iriumlabs.org",
+      "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgPWSJD6FsDxRHJUIYMuN4MZw3XysEFRHIEfrGmk/2qyQAAAAMaXJpdW0tYW5jaG9yAAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5AAAAQHSJw1TuUhU1AY78JIGFeYmHc86X1QYF8jOQwcsg1neYyLjYccTsGc6R+8o1HaXBYGfvlmvl1U4bfXQosvhkFwo=",
+      "signed_at": "2026-01-05T03:46:26Z",
+      "signer": "iriumlabs"
     }
+  ],
+  "trusted_signers": [
+    "iriumlabs"
   ]
 }

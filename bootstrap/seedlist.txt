@@ -1,2 +1,3 @@
-# seed baseline with VPS IP only
+# seed baseline with VPS IPs
 207.244.247.86
+157.173.116.134

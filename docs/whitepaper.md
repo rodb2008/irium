@@ -3,9 +3,9 @@
 **Technical Whitepaper — Version 1.0**
 
 **Network Status:** LIVE on Mainnet  
-**Genesis Hash:** 000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c  
+**Genesis Hash:** 0000000028f25d65557e9d8d9e991f516c00d68f5aeae10b750645b398bd10a3  
 **Genesis File:** `configs/genesis-locked.json` (matched by `bootstrap/anchors.json`)  
-**Launch Date:** January 1, 2025 (genesis timestamp: 1735689600)
+**Launch Date:** January 5, 2026 (genesis timestamp: 1767583930)
 
 ---
 
@@ -103,11 +103,11 @@ valid_block = block_hash < target
 ```
 
 **Genesis Block (from `configs/genesis-locked.json`):**
-- Hash: 000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c  
+- Hash: 0000000028f25d65557e9d8d9e991f516c00d68f5aeae10b750645b398bd10a3  
 - Merkle Root: cd78279c389b6f2f0a4edc567f3ba67b27daed60ab014342bb4a5b56c2ebb4db  
 - Nonce: 1,364,084,797  
 - Bits: 0x1d00ffff  
-- Timestamp: 1735689600 (January 1, 2025)  
+- Timestamp: 1767583930 (January 5, 2026)  
 - Anchored in `bootstrap/anchors.json` (signed by `iriumlabs`)  
 
 ### 3.2 Difficulty Adjustment
@@ -411,11 +411,11 @@ Irium addresses fundamental challenges in decentralization, security, and access
 ## Appendix A: Genesis Block (Mainnet)
 
 - File: `configs/genesis-locked.json`  
-- Hash: 000000001f83c27ca5f3447e75a00ef1c66966af157fc12a823675b897f2fd6c  
+- Hash: 0000000028f25d65557e9d8d9e991f516c00d68f5aeae10b750645b398bd10a3  
 - Merkle Root: cd78279c389b6f2f0a4edc567f3ba67b27daed60ab014342bb4a5b56c2ebb4db  
 - Nonce: 1,364,084,797  
 - Bits: 0x1d00ffff  
-- Timestamp: 1735689600 (January 1, 2025)  
+- Timestamp: 1767583930 (January 5, 2026)  
 - Anchors: `bootstrap/anchors.json` (signed)  
 
 ---
