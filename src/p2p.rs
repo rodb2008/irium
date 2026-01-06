@@ -19,7 +19,7 @@ use crate::network::{PeerDirectory, PeerRecord};
 use crate::protocol::{
     BlockPayload, EmptyPayload, GetBlocksPayload, GetDataPayload, GetHeadersPayload,
     HandshakePayload, HeadersPayload, InvPayload, MempoolPayload, Message, MessageType,
-    PeersPayload, PingPayload, RelayAddressPayload, TxPayload, MAX_MESSAGE_SIZE,
+    PeersPayload, PingPayload, RelayAddressPayload, TxPayload, MAX_BLOCKS_PER_REQUEST, MAX_HEADERS_PER_REQUEST, MAX_MESSAGE_SIZE,
 };
 use crate::reputation::ReputationManager;
 use crate::sybil::{SybilChallenge, SybilProof, SybilResistantHandshake};
@@ -1058,12 +1058,13 @@ impl P2PNode {
                                                 }
                                             }
 
+                                            let count = payload.count.min(MAX_HEADERS_PER_REQUEST) as usize;
                                             let mut bytes = Vec::new();
                                             for block in guard
                                                 .chain
                                                 .iter()
                                                 .skip(start_idx)
-                                                .take(payload.count as usize)
+                                                .take(count)
                                             {
                                                 bytes.extend_from_slice(&block.header.serialize());
                                             }
@@ -1171,12 +1172,13 @@ impl P2PNode {
                                             }
                                             let mut blocks = Vec::new();
                                             let mut heights = Vec::new();
+                                            let count = payload.count.min(MAX_BLOCKS_PER_REQUEST) as usize;
                                             for (idx, b) in guard
                                                 .chain
                                                 .iter()
                                                 .enumerate()
                                                 .skip(start_idx)
-                                                .take(payload.count as usize)
+                                                .take(count)
                                             {
                                                 blocks.push(b.serialize());
                                                 heights.push(idx as u64);

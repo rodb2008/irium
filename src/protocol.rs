@@ -7,6 +7,10 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_MESSAGE_SIZE: u32 = 32 * 1024 * 1024;
 /// 4 MB max block size.
 pub const MAX_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
+/// Max headers per getheaders request.
+pub const MAX_HEADERS_PER_REQUEST: u32 = 2000;
+/// Max blocks per getblocks request.
+pub const MAX_BLOCKS_PER_REQUEST: u32 = 512;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +190,9 @@ impl BlockPayload {
         if msg.msg_type != MessageType::Block {
             return Err("Not a block message".to_string());
         }
+        if msg.payload.len() as u32 > MAX_BLOCK_SIZE {
+            return Err("Block payload too large".to_string());
+        }
         Ok(BlockPayload {
             block_data: msg.payload.clone(),
         })
@@ -281,6 +288,12 @@ impl GetBlocksPayload {
         count_bytes.copy_from_slice(&msg.payload[0..4]);
         let count = u32::from_be_bytes(count_bytes);
         let start_hash = msg.payload[4..].to_vec();
+        if !start_hash.is_empty() && start_hash.len() != 32 {
+            return Err("get_blocks start_hash invalid".to_string());
+        }
+        if count == 0 || count > MAX_BLOCKS_PER_REQUEST {
+            return Err("get_blocks count out of range".to_string());
+        }
         Ok(GetBlocksPayload { start_hash, count })
     }
 }
@@ -314,6 +327,12 @@ impl GetHeadersPayload {
         count_bytes.copy_from_slice(&msg.payload[0..4]);
         let count = u32::from_be_bytes(count_bytes);
         let start_hash = msg.payload[4..].to_vec();
+        if !start_hash.is_empty() && start_hash.len() != 32 {
+            return Err("get_headers start_hash invalid".to_string());
+        }
+        if count == 0 || count > MAX_HEADERS_PER_REQUEST {
+            return Err("get_headers count out of range".to_string());
+        }
         Ok(GetHeadersPayload { start_hash, count })
     }
 }

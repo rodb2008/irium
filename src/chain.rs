@@ -19,6 +19,8 @@ use crate::genesis::LockedGenesis;
 use crate::pow::{meets_target, sha256d, Target};
 use crate::tx::{decode_hex, Transaction, TxInput, TxOutput};
 
+const MAX_ORPHAN_BLOCKS: usize = 100;
+
 /// Chain parameters for the Irium mainnet.
 #[derive(Debug, Clone)]
 pub struct ChainParams {
@@ -106,6 +108,20 @@ impl ChainState {
 
     pub fn tip_height(&self) -> u64 {
         self.height.saturating_sub(1)
+    }
+
+    fn orphan_pool_size(&self) -> usize {
+        self.orphan_pool.values().map(|v| v.len()).sum()
+    }
+
+    fn prune_orphan_pool(&mut self) {
+        while self.orphan_pool_size() > MAX_ORPHAN_BLOCKS {
+            let key = match self.orphan_pool.keys().next().cloned() {
+                Some(k) => k,
+                None => break,
+            };
+            self.orphan_pool.remove(&key);
+        }
     }
 
     pub fn target_for_height(&self, height: u64) -> Target {
@@ -601,6 +617,7 @@ impl ChainState {
         let parent_hash = block.header.prev_hash;
         if parent_hash != [0u8; 32] && !self.block_store.contains_key(&parent_hash) {
             self.orphan_pool.entry(parent_hash).or_default().push(block);
+            self.prune_orphan_pool();
             return Err("block stored as orphan (prev hash unknown)".to_string());
         }
 
@@ -637,8 +654,17 @@ impl ChainState {
 
         let should_reorg = cumulative > self.total_work;
         if should_reorg {
-            let rebuilt = self.rebuild_to_tip(hash)?;
-            *self = rebuilt;
+            match self.rebuild_to_tip(hash) {
+                Ok(rebuilt) => {
+                    *self = rebuilt;
+                }
+                Err(e) => {
+                    self.block_store.remove(&hash);
+                    self.heights.remove(&hash);
+                    self.cumulative_work.remove(&hash);
+                    return Err(e);
+                }
+            }
         }
 
         let mut new_hash = self.tip_hash();
