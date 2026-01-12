@@ -34,13 +34,18 @@ RUST_LOG=info ./target/release/iriumd
 ```bash
 # Terminal 2: create an address (save the privkey) and start mining
 ./target/release/irium-wallet init
+./target/release/irium-wallet new-address
 ./target/release/irium-wallet list-addresses
+./target/release/irium-wallet address-to-pkh <YOUR_IRIUM_ADDRESS>
 export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>
 ./target/release/irium-miner
 ```
 ```bash
-# Terminal 3: check balance
+# Terminal 3: check wallet
 ./target/release/irium-wallet balance <YOUR_IRIUM_ADDRESS>
+./target/release/irium-wallet list-unspent <YOUR_IRIUM_ADDRESS>
+./target/release/irium-wallet history <YOUR_IRIUM_ADDRESS>
+./target/release/irium-wallet estimate-fee
 ```
 ```bash
 # Optional: SPV tool

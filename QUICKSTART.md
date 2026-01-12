@@ -51,7 +51,9 @@ RUST_LOG=info ./target/release/iriumd
 ## 5) Create a wallet address
 ```
 ./target/release/irium-wallet init
+./target/release/irium-wallet new-address
 ./target/release/irium-wallet list-addresses
+./target/release/irium-wallet address-to-pkh <base58_address>
 ```
 This creates `~/.irium/wallet.json` and prints the first address. Back up the wallet file.
 
@@ -78,6 +80,8 @@ source ~/.cargo/env
 ./target/release/irium-wallet list-unspent <YOUR_IRIUM_ADDRESS>
 ./target/release/irium-wallet history <YOUR_IRIUM_ADDRESS>
 ./target/release/irium-wallet estimate-fee
+./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm>
+./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm> --coin-select largest
 ```
 
 ## 8) SPV check
