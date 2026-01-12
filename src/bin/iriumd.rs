@@ -81,7 +81,9 @@ struct BalanceResponse {
     address: String,
     pkh: String,
     balance: u64,
+    mined_balance: u64,
     utxo_count: usize,
+    mined_blocks: usize,
     height: u64,
 }
 
@@ -836,26 +838,40 @@ async fn get_balance(
     let mut pkh_arr = [0u8; 20];
     pkh_arr.copy_from_slice(&pkh);
 
-    let (balance, utxo_count, height) = {
+    let (balance, utxo_count, mined_balance, mined_blocks, height) = {
         let guard = state.chain.lock().unwrap();
         let mut balance = 0u64;
         let mut utxo_count = 0usize;
+        let mut mined_balance = 0u64;
+        let mut mined_blocks = 0usize;
         for utxo in guard.utxos.values() {
             if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
                 if script_pkh == pkh_arr {
                     balance = balance.saturating_add(utxo.output.value);
                     utxo_count += 1;
+                    if utxo.is_coinbase {
+                        mined_balance = mined_balance.saturating_add(utxo.output.value);
+                        mined_blocks += 1;
+                    }
                 }
             }
         }
-        (balance, utxo_count, guard.tip_height())
+        (
+            balance,
+            utxo_count,
+            mined_balance,
+            mined_blocks,
+            guard.tip_height(),
+        )
     };
 
     Ok(Json(BalanceResponse {
         address: q.address,
         pkh: hex::encode(pkh_arr),
         balance,
+        mined_balance,
         utxo_count,
+        mined_blocks,
         height,
     }))
 }

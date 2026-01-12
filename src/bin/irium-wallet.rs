@@ -103,6 +103,7 @@ fn rpc_client() -> Result<Client, String> {
 struct BalanceResponse {
     balance: u64,
     utxo_count: usize,
+    mined_blocks: Option<usize>,
 }
 
 fn main() {
@@ -197,10 +198,11 @@ fn main() {
             } else {
                 format!("{} IRM", irm_display)
             };
+            let mined_blocks = payload.mined_blocks.unwrap_or(payload.utxo_count);
             println!(
                 "balance {} blocks mined {}",
                 balance_display,
-                payload.utxo_count
+                mined_blocks
             );
         }
         _ => {
