@@ -33,7 +33,8 @@ RUST_LOG=info ./target/release/iriumd
 ```
 ```bash
 # Terminal 2: create an address (save the privkey) and start mining
-./target/release/irium-wallet new-address
+./target/release/irium-wallet init
+./target/release/irium-wallet list-addresses
 export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>
 ./target/release/irium-miner
 ```
@@ -111,17 +112,19 @@ source ~/.cargo/env
 Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
 
 ## Wallet
-The wallet CLI can create a new address and query balances from a running node:
+The wallet CLI stores keys in `~/.irium/wallet.json` (override with `IRIUM_WALLET_FILE`).
 ```bash
 cd /home/irium/irium
 source ~/.cargo/env
-./target/release/irium-wallet new-address
+./target/release/irium-wallet init
+./target/release/irium-wallet list-addresses
 ```
 ```bash
-export IRIUM_RPC_URL=http://127.0.0.1:38300
-# if the node requires auth
-# export IRIUM_RPC_TOKEN=...
 ./target/release/irium-wallet balance <base58_address>
+./target/release/irium-wallet list-unspent <base58_address>
+```
+```bash
+./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm>
 ```
 Use `irium-wallet address-to-pkh <base58_address>` to convert an address to its 20-byte pubkey hash.
 

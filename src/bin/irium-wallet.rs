@@ -1,16 +1,64 @@
+use irium_node_rs::constants::COINBASE_MATURITY;
+use irium_node_rs::pow::sha256d;
+use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
+use k256::ecdsa::signature::hazmat::PrehashSigner;
+use k256::ecdsa::{Signature, SigningKey};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
 use rand_core::OsRng;
 use reqwest::blocking::Client;
 use ripemd::Ripemd160;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
+const DEFAULT_FEE_PER_BYTE: u64 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct WalletFile {
+    version: u32,
+    keys: Vec<WalletKey>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct WalletKey {
+    address: String,
+    pkh: String,
+    pubkey: String,
+    privkey: String,
+}
+
+#[derive(Deserialize)]
+struct BalanceResponse {
+    balance: u64,
+    utxo_count: usize,
+    mined_blocks: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct UtxosResponse {
+    height: u64,
+    utxos: Vec<UtxoItem>,
+}
+
+#[derive(Deserialize, Clone)]
+struct UtxoItem {
+    txid: String,
+    index: u32,
+    value: u64,
+    height: u64,
+    is_coinbase: bool,
+    script_pubkey: String,
+}
+
+#[derive(Serialize)]
+struct SubmitTxRequest {
+    tx_hex: String,
+}
 
 // Base58 P2PKH decoder (version byte + 20-byte hash + 4-byte checksum)
 fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
@@ -54,11 +102,72 @@ fn base58_p2pkh_from_hash(pkh: &[u8; 20]) -> String {
     bs58::encode(full).into_string()
 }
 
+fn wallet_path() -> PathBuf {
+    if let Ok(path) = env::var("IRIUM_WALLET_FILE") {
+        return PathBuf::from(path);
+    }
+    let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    PathBuf::from(home).join(".irium/wallet.json")
+}
+
+fn load_wallet(path: &Path) -> Result<WalletFile, String> {
+    let data = fs::read_to_string(path).map_err(|e| format!("read wallet: {e}"))?;
+    serde_json::from_str(&data).map_err(|e| format!("parse wallet: {e}"))
+}
+
+fn save_wallet(path: &Path, wallet: &WalletFile) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create wallet dir: {e}"))?;
+    }
+    let data = serde_json::to_string_pretty(wallet).map_err(|e| format!("serialize wallet: {e}"))?;
+    fs::write(path, data).map_err(|e| format!("write wallet: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, perms).map_err(|e| format!("chmod wallet: {e}"))?;
+    }
+    Ok(())
+}
+
+fn ensure_wallet(path: &Path) -> Result<WalletFile, String> {
+    if path.exists() {
+        load_wallet(path)
+    } else {
+        Ok(WalletFile {
+            version: 1,
+            keys: Vec::new(),
+        })
+    }
+}
+
+fn generate_key() -> WalletKey {
+    let secret = SecretKey::random(&mut OsRng);
+    let public = secret.public_key();
+    let pubkey = public.to_encoded_point(true);
+    let pkh = hash160(pubkey.as_bytes());
+    let address = base58_p2pkh_from_hash(&pkh);
+    WalletKey {
+        address,
+        pkh: hex::encode(pkh),
+        pubkey: hex::encode(pubkey.as_bytes()),
+        privkey: hex::encode(secret.to_bytes()),
+    }
+}
+
+fn find_key<'a>(wallet: &'a WalletFile, addr: &str) -> Option<&'a WalletKey> {
+    wallet.keys.iter().find(|k| k.address == addr)
+}
+
 fn usage() {
     eprintln!("Usage:");
+    eprintln!("  irium-wallet init");
     eprintln!("  irium-wallet new-address");
+    eprintln!("  irium-wallet list-addresses");
     eprintln!("  irium-wallet address-to-pkh <base58_addr>");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
+    eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
+    eprintln!("  irium-wallet send <from_addr> <to_addr> <amount_irm> [--fee <irm>] [--rpc <url>]");
 }
 
 fn default_rpc_url() -> String {
@@ -77,6 +186,33 @@ fn format_irm(amount: u64) -> String {
     } else {
         format!("{}.{}", whole, format!("{:08}", frac))
     }
+}
+
+fn parse_irm(s: &str) -> Result<u64, String> {
+    if s.trim().is_empty() {
+        return Err("empty amount".to_string());
+    }
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() > 2 {
+        return Err("invalid amount".to_string());
+    }
+    let whole: u64 = parts[0].parse().map_err(|_| "invalid amount".to_string())?;
+    let frac = if parts.len() == 2 {
+        let frac_str = parts[1];
+        if frac_str.len() > 8 {
+            return Err("too many decimals".to_string());
+        }
+        let mut frac_val: u64 = frac_str.parse().map_err(|_| "invalid amount".to_string())?;
+        for _ in frac_str.len()..8 {
+            frac_val *= 10;
+        }
+        frac_val
+    } else {
+        0
+    };
+    Ok(whole
+        .saturating_mul(100_000_000)
+        .saturating_add(frac))
 }
 
 fn rpc_client() -> Result<Client, String> {
@@ -108,11 +244,84 @@ fn rpc_client() -> Result<Client, String> {
     builder.build().map_err(|e| format!("build client: {e}"))
 }
 
-#[derive(Deserialize)]
-struct BalanceResponse {
-    balance: u64,
-    utxo_count: usize,
-    mined_blocks: Option<usize>,
+fn p2pkh_script(pkh: &[u8; 20]) -> Vec<u8> {
+    let mut script = Vec::with_capacity(25);
+    script.push(0x76);
+    script.push(0xa9);
+    script.push(0x14);
+    script.extend_from_slice(pkh);
+    script.push(0x88);
+    script.push(0xac);
+    script
+}
+
+fn signature_digest(tx: &Transaction, input_index: usize, script_pubkey: &[u8]) -> [u8; 32] {
+    let mut tx_copy = tx.clone();
+    for (idx, input) in tx_copy.inputs.iter_mut().enumerate() {
+        if idx == input_index {
+            input.script_sig = script_pubkey.to_vec();
+        } else {
+            input.script_sig.clear();
+        }
+    }
+    let mut data = tx_copy.serialize();
+    data.extend_from_slice(&1u32.to_le_bytes());
+    sha256d(&data)
+}
+
+fn hex_to_32(s: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(s).map_err(|_| "invalid hex".to_string())?;
+    if bytes.len() != 32 {
+        return Err("invalid txid length".to_string());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn fetch_balance(client: &Client, base: &str, addr: &str) -> Result<BalanceResponse, String> {
+    let url = format!("{}/rpc/balance?address={}", base, addr);
+    let mut req = client.get(&url);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().map_err(|e| format!("balance request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("balance request failed: {}", resp.status()));
+    }
+    resp.json::<BalanceResponse>()
+        .map_err(|e| format!("parse balance response: {e}"))
+}
+
+fn fetch_utxos(client: &Client, base: &str, addr: &str) -> Result<UtxosResponse, String> {
+    let url = format!("{}/rpc/utxos?address={}", base, addr);
+    let mut req = client.get(&url);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().map_err(|e| format!("utxos request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("utxos request failed: {}", resp.status()));
+    }
+    resp.json::<UtxosResponse>()
+        .map_err(|e| format!("parse utxos response: {e}"))
+}
+
+fn submit_tx(client: &Client, base: &str, tx: &Transaction) -> Result<(), String> {
+    let raw = tx.serialize();
+    let req_body = SubmitTxRequest {
+        tx_hex: hex::encode(raw),
+    };
+    let url = format!("{}/rpc/submit_tx", base);
+    let mut req = client.post(&url).json(&req_body);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().map_err(|e| format!("submit tx failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("submit tx failed: {}", resp.status()));
+    }
+    Ok(())
 }
 
 fn main() {
@@ -123,19 +332,55 @@ fn main() {
     }
 
     match args[0].as_str() {
-        "new-address" => {
-            if args.len() != 1 {
-                usage();
+        "init" => {
+            let path = wallet_path();
+            if path.exists() {
+                eprintln!("Wallet already exists: {}", path.display());
                 std::process::exit(1);
             }
-            let secret = SecretKey::random(&mut OsRng);
-            let public = secret.public_key();
-            let pubkey = public.to_encoded_point(true);
-            let pkh = hash160(pubkey.as_bytes());
-            let address = base58_p2pkh_from_hash(&pkh);
-            println!("address {}", address);
-            println!("pubkey {}", hex::encode(pubkey.as_bytes()));
-            println!("privkey {}", hex::encode(secret.to_bytes()));
+            let mut wallet = WalletFile {
+                version: 1,
+                keys: Vec::new(),
+            };
+            let key = generate_key();
+            println!("address {}", key.address);
+            wallet.keys.push(key);
+            if let Err(e) = save_wallet(&path, &wallet) {
+                eprintln!("Failed to save wallet: {}", e);
+                std::process::exit(1);
+            }
+            println!("wallet {}", path.display());
+        }
+        "new-address" => {
+            let path = wallet_path();
+            let mut wallet = match ensure_wallet(&path) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Failed to load wallet: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let key = generate_key();
+            println!("address {}", key.address);
+            wallet.keys.push(key);
+            if let Err(e) = save_wallet(&path, &wallet) {
+                eprintln!("Failed to save wallet: {}", e);
+                std::process::exit(1);
+            }
+            println!("wallet {}", path.display());
+        }
+        "list-addresses" => {
+            let path = wallet_path();
+            let wallet = match load_wallet(&path) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Failed to load wallet: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            for key in wallet.keys {
+                println!("{}", key.address);
+            }
         }
         "address-to-pkh" => {
             if args.len() != 2 {
@@ -170,7 +415,6 @@ fn main() {
                 rpc_url = args[3].clone();
             }
             let base = rpc_url.trim_end_matches('/');
-            let url = format!("{}/rpc/balance?address={}", base, addr);
             let client = match rpc_client() {
                 Ok(c) => c,
                 Err(e) => {
@@ -178,25 +422,10 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let mut req = client.get(&url);
-            if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
-                req = req.bearer_auth(token);
-            }
-            let resp = match req.send() {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("Balance request failed: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            if !resp.status().is_success() {
-                eprintln!("Balance request failed: {}", resp.status());
-                std::process::exit(1);
-            }
-            let payload: BalanceResponse = match resp.json() {
+            let payload = match fetch_balance(&client, base, addr) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("Failed to parse balance response: {}", e);
+                    eprintln!("{}", e);
                     std::process::exit(1);
                 }
             };
@@ -208,11 +437,274 @@ fn main() {
                 format!("{} IRM", irm_display)
             };
             let mined_blocks = payload.mined_blocks.unwrap_or(payload.utxo_count);
-            println!(
-                "balance {} blocks mined {}",
-                balance_display,
-                mined_blocks
-            );
+            println!("balance {} blocks mined {}", balance_display, mined_blocks);
+        }
+        "list-unspent" => {
+            if args.len() != 2 && args.len() != 4 {
+                usage();
+                std::process::exit(1);
+            }
+            let addr = &args[1];
+            if base58_p2pkh_to_hash(addr).is_none() {
+                eprintln!("Invalid address or checksum");
+                std::process::exit(1);
+            }
+            let mut rpc_url = default_rpc_url();
+            if args.len() == 4 {
+                if args[2] != "--rpc" {
+                    usage();
+                    std::process::exit(1);
+                }
+                rpc_url = args[3].clone();
+            }
+            let base = rpc_url.trim_end_matches('/');
+            let client = match rpc_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to init HTTP client: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let payload = match fetch_utxos(&client, base, addr) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            for utxo in payload.utxos {
+                let confirmations = payload.height.saturating_sub(utxo.height);
+                if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+                    continue;
+                }
+                let val = format_irm(utxo.value);
+                println!(
+                    "{}:{} {} IRM height {} coinbase {}",
+                    utxo.txid,
+                    utxo.index,
+                    val,
+                    utxo.height,
+                    utxo.is_coinbase
+                );
+            }
+        }
+        "send" => {
+            if args.len() < 4 {
+                usage();
+                std::process::exit(1);
+            }
+            let from_addr = &args[1];
+            let to_addr = &args[2];
+            let amount = match parse_irm(&args[3]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Invalid amount: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            if base58_p2pkh_to_hash(from_addr).is_none() || base58_p2pkh_to_hash(to_addr).is_none() {
+                eprintln!("Invalid address or checksum");
+                std::process::exit(1);
+            }
+            let mut fee_override: Option<u64> = None;
+            let mut rpc_url = default_rpc_url();
+            let mut i = 4;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--fee" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Missing --fee value");
+                            std::process::exit(1);
+                        }
+                        fee_override = Some(match parse_irm(&args[i + 1]) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("Invalid fee: {}", e);
+                                std::process::exit(1);
+                            }
+                        });
+                        i += 2;
+                    }
+                    "--rpc" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Missing --rpc value");
+                            std::process::exit(1);
+                        }
+                        rpc_url = args[i + 1].clone();
+                        i += 2;
+                    }
+                    _ => {
+                        usage();
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            let path = wallet_path();
+            let wallet = match load_wallet(&path) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Failed to load wallet: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let key = match find_key(&wallet, from_addr) {
+                Some(k) => k.clone(),
+                None => {
+                    eprintln!("From address not found in wallet");
+                    std::process::exit(1);
+                }
+            };
+
+            let client = match rpc_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to init HTTP client: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let base = rpc_url.trim_end_matches('/');
+            let payload = match fetch_utxos(&client, base, from_addr) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let mut utxos = payload.utxos.clone();
+            utxos.sort_by_key(|u| u.value);
+
+            let mut selected = Vec::new();
+            let mut total = 0u64;
+            let mut fee = fee_override.unwrap_or(0);
+            for utxo in utxos.iter() {
+                let confirmations = payload.height.saturating_sub(utxo.height);
+                if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+                    continue;
+                }
+                selected.push(utxo.clone());
+                total = total.saturating_add(utxo.value);
+                if total >= amount.saturating_add(fee) {
+                    break;
+                }
+            }
+
+            let mut fee_per_byte = DEFAULT_FEE_PER_BYTE;
+            if let Some(f) = fee_override {
+                fee = f;
+            } else {
+                fee = 0;
+                fee_per_byte = DEFAULT_FEE_PER_BYTE;
+            }
+
+            if total < amount.saturating_add(fee) {
+                eprintln!("Insufficient funds");
+                std::process::exit(1);
+            }
+
+            let to_pkh = base58_p2pkh_to_hash(to_addr).unwrap();
+            let mut to_arr = [0u8; 20];
+            to_arr.copy_from_slice(&to_pkh);
+            let to_script = p2pkh_script(&to_arr);
+
+            let from_pkh = base58_p2pkh_to_hash(from_addr).unwrap();
+            let mut from_arr = [0u8; 20];
+            from_arr.copy_from_slice(&from_pkh);
+            let change_script = p2pkh_script(&from_arr);
+
+            let priv_bytes = hex::decode(&key.privkey).expect("privkey hex");
+            let signing_key = SigningKey::from_bytes(priv_bytes.as_slice().into())
+                .expect("valid signing key");
+            let pub_bytes = hex::decode(&key.pubkey).expect("pubkey hex");
+
+            let mut inputs: Vec<TxInput> = Vec::new();
+            for utxo in &selected {
+                let txid = match hex_to_32(&utxo.txid) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Invalid utxo txid: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                inputs.push(TxInput {
+                    prev_txid: txid,
+                    prev_index: utxo.index,
+                    script_sig: Vec::new(),
+                    sequence: 0xffff_ffff,
+                });
+            }
+
+            let mut outputs = vec![TxOutput {
+                value: amount,
+                script_pubkey: to_script,
+            }];
+
+            let mut change = total.saturating_sub(amount).saturating_sub(fee);
+            if change > 0 {
+                outputs.push(TxOutput {
+                    value: change,
+                    script_pubkey: change_script.clone(),
+                });
+            }
+
+            let mut tx = Transaction {
+                version: 1,
+                inputs,
+                outputs,
+                locktime: 0,
+            };
+
+            for _ in 0..2 {
+                for (idx, utxo) in selected.iter().enumerate() {
+                    let script_pubkey = hex::decode(&utxo.script_pubkey).unwrap_or_else(|_| change_script.clone());
+                    let digest = signature_digest(&tx, idx, &script_pubkey);
+                    let sig: Signature = signing_key
+                        .sign_prehash(&digest)
+                        .expect("sign prehash");
+                    let sig = sig.normalize_s().unwrap_or(sig);
+                    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+                    sig_bytes.push(0x01);
+
+                    let mut script = Vec::new();
+                    script.push(sig_bytes.len() as u8);
+                    script.extend_from_slice(&sig_bytes);
+                    script.push(pub_bytes.len() as u8);
+                    script.extend_from_slice(&pub_bytes);
+                    tx.inputs[idx].script_sig = script;
+                }
+
+                let size = tx.serialize().len() as u64;
+                if fee_override.is_some() {
+                    break;
+                }
+                let needed_fee = size.saturating_mul(fee_per_byte);
+                if needed_fee > fee {
+                    let extra = needed_fee - fee;
+                    if change >= extra {
+                        fee = needed_fee;
+                        change = change.saturating_sub(extra);
+                        if tx.outputs.len() > 1 {
+                            tx.outputs[1].value = change;
+                        } else if change > 0 {
+                            tx.outputs.push(TxOutput {
+                                value: change,
+                                script_pubkey: change_script.clone(),
+                            });
+                        }
+                        continue;
+                    } else {
+                        eprintln!("Insufficient funds for fee");
+                        std::process::exit(1);
+                    }
+                }
+                break;
+            }
+
+            if let Err(e) = submit_tx(&client, base, &tx) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+            println!("txid {}", hex::encode(tx.txid()));
         }
         _ => {
             usage();

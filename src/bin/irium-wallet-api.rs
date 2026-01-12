@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum_server::tls_rustls::RustlsConfig;
 use axum::{
     extract::{ConnectInfo, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
@@ -135,6 +136,17 @@ async fn balance(
     proxy_json(&state, &format!("/rpc/balance?address={}", q.address)).await
 }
 
+
+async fn utxos(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<BalanceQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    proxy_json(&state, &format!("/rpc/utxos?address={}", q.address)).await
+}
+
 async fn submit_tx(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -157,7 +169,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let node_base = env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "http://127.0.0.1:38300".to_string());
+    let node_base = env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string());
     let api_token = env::var("IRIUM_WALLET_API_TOKEN").ok();
     let rpc_token = env::var("IRIUM_RPC_TOKEN").ok();
     let rate = env::var("IRIUM_WALLET_API_RATE_LIMIT_PER_MIN")
@@ -176,11 +188,12 @@ async fn main() {
     let app = Router::new()
         .route("/status", get(status))
         .route("/balance", get(balance))
+        .route("/utxos", get(utxos))
         .route("/submit_tx", post(submit_tx))
         .with_state(state)
         .into_make_service_with_connect_info::<SocketAddr>();
 
-    let host = env::var("IRIUM_WALLET_API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let host = env::var("IRIUM_WALLET_API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let port: u16 = env::var("IRIUM_WALLET_API_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -189,13 +202,28 @@ async fn main() {
         .parse()
         .expect("valid bind address");
 
-    println!(
-        "Irium wallet API listening on http://{}:{} (node rpc {})",
-        host, port, node_base
-    );
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("bind failed");
-    axum::serve(listener, app).await.expect("server error");
+    let tls_cert = env::var("IRIUM_WALLET_API_TLS_CERT").ok();
+    let tls_key = env::var("IRIUM_WALLET_API_TLS_KEY").ok();
+    if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
+        let config = RustlsConfig::from_pem_file(cert_path, key_path)
+            .await
+            .expect("failed to load TLS cert/key");
+        println!(
+            "Irium wallet API listening on https://{}:{} (node rpc {})",
+            host, port, node_base
+        );
+        axum_server::bind_rustls(addr, config)
+            .serve(app)
+            .await
+            .expect("server error");
+    } else {
+        println!(
+            "Irium wallet API listening on http://{}:{} (node rpc {})",
+            host, port, node_base
+        );
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("bind failed");
+        axum::serve(listener, app).await.expect("server error");
+    }
 }

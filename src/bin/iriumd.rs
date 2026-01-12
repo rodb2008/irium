@@ -87,6 +87,24 @@ struct BalanceResponse {
     height: u64,
 }
 
+#[derive(Serialize)]
+struct UtxoItem {
+    txid: String,
+    index: u32,
+    value: u64,
+    height: u64,
+    is_coinbase: bool,
+    script_pubkey: String,
+}
+
+#[derive(Serialize)]
+struct UtxosResponse {
+    address: String,
+    pkh: String,
+    height: u64,
+    utxos: Vec<UtxoItem>,
+}
+
 #[derive(Deserialize)]
 struct UtxoQuery {
     txid: String,
@@ -95,6 +113,11 @@ struct UtxoQuery {
 
 #[derive(Deserialize)]
 struct BalanceQuery {
+    address: String,
+}
+
+#[derive(Deserialize)]
+struct UtxosQuery {
     address: String,
 }
 
@@ -876,6 +899,49 @@ async fn get_balance(
     }))
 }
 
+
+async fn get_utxos(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<UtxosQuery>,
+) -> Result<Json<UtxosResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    let pkh = base58_p2pkh_to_hash(&q.address).ok_or(StatusCode::BAD_REQUEST)?;
+    if pkh.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut pkh_arr = [0u8; 20];
+    pkh_arr.copy_from_slice(&pkh);
+
+    let (utxos, height) = {
+        let guard = state.chain.lock().unwrap();
+        let mut items = Vec::new();
+        for (outpoint, utxo) in guard.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if script_pkh == pkh_arr {
+                    items.push(UtxoItem {
+                        txid: hex::encode(outpoint.txid),
+                        index: outpoint.index,
+                        value: utxo.output.value,
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        script_pubkey: hex::encode(&utxo.output.script_pubkey),
+                    });
+                }
+            }
+        }
+        (items, guard.tip_height())
+    };
+
+    Ok(Json(UtxosResponse {
+        address: q.address,
+        pkh: hex::encode(pkh_arr),
+        height,
+        utxos,
+    }))
+}
+
 async fn get_block_template(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -1608,6 +1674,7 @@ async fn main() {
         .route("/peers", get(peers))
         .route("/metrics", get(metrics))
         .route("/rpc/balance", get(get_balance))
+        .route("/rpc/utxos", get(get_utxos))
         .route("/rpc/utxo", get(get_utxo))
         .route("/rpc/getblocktemplate", get(get_block_template))
         .route("/rpc/block", get(get_block))

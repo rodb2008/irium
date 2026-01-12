@@ -50,9 +50,10 @@ RUST_LOG=info ./target/release/iriumd
 
 ## 5) Create a wallet address
 ```
-./target/release/irium-wallet new-address
+./target/release/irium-wallet init
+./target/release/irium-wallet list-addresses
 ```
-Save the printed private key. It controls the funds for that address.
+This creates `~/.irium/wallet.json` and prints the first address. Back up the wallet file.
 
 ## 6) Start mining
 Set a payout address (or PKH) so rewards are spendable:
@@ -74,6 +75,7 @@ source ~/.cargo/env
 ## 7) Check balance
 ```
 ./target/release/irium-wallet balance <YOUR_IRIUM_ADDRESS>
+./target/release/irium-wallet list-unspent <YOUR_IRIUM_ADDRESS>
 ```
 
 ## 8) SPV check

@@ -1,10 +1,21 @@
 # Irium Wallet Guide
 
-## Create Address
+## Initialize Wallet File
+```bash
+./target/release/irium-wallet init
+```
+Creates `~/.irium/wallet.json` (or `IRIUM_WALLET_FILE`) and prints a new address.
+
+## Add a New Address
 ```bash
 ./target/release/irium-wallet new-address
 ```
-The command prints `address`, `pubkey`, and `privkey`. Save the private key securely; the CLI does not store a wallet file for you.
+Adds a new key to the wallet file and prints the address.
+
+## List Addresses
+```bash
+./target/release/irium-wallet list-addresses
+```
 
 ## Convert Address to PKH
 ```bash
@@ -13,7 +24,31 @@ The command prints `address`, `pubkey`, and `privkey`. Save the private key secu
 
 ## Check Balance
 ```bash
-IRIUM_RPC_URL=http://127.0.0.1:38300 IRIUM_RPC_TOKEN=<node_token> ./target/release/irium-wallet balance <base58_address>
+./target/release/irium-wallet balance <base58_address>
 ```
-- For HTTPS with a self-signed cert, set `IRIUM_RPC_CA=/etc/irium/tls/irium-ca.crt`.
-- For dev-only, you can set `IRIUM_RPC_INSECURE=1` to skip TLS validation.
+- Defaults to `https://127.0.0.1:38300`.
+- For self-signed TLS, the wallet auto-loads `/etc/irium/tls/irium-ca.crt` if present.
+- Override with `IRIUM_RPC_URL` or `IRIUM_RPC_CA` as needed.
+
+## List Spendable UTXOs
+```bash
+./target/release/irium-wallet list-unspent <base58_address>
+```
+Coinbase UTXOs are filtered until they reach maturity.
+
+## Send a Transaction
+```bash
+./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm>
+```
+Optional fee override:
+```bash
+./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm> --fee 0.01
+```
+If `--fee` is not provided, the wallet uses a default fee of 1 atom/byte.
+
+## Public Balance Access
+For public read-only access, run the wallet API on `0.0.0.0` and expose `/balance` and `/utxos`:
+- `IRIUM_WALLET_API_HOST=0.0.0.0`
+- Optional TLS: `IRIUM_WALLET_API_TLS_CERT` and `IRIUM_WALLET_API_TLS_KEY`
+
+Keep `submit_tx` protected with `IRIUM_WALLET_API_TOKEN`.

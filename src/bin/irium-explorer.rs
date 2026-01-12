@@ -173,7 +173,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let node_base = env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "http://127.0.0.1:38300".to_string());
+    let node_base = env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string());
     let api_token = env::var("IRIUM_EXPLORER_TOKEN").ok();
     let rpc_token = env::var("IRIUM_RPC_TOKEN").ok();
     let rate = env::var("IRIUM_EXPLORER_RATE_LIMIT_PER_MIN")

@@ -1,64 +1,27 @@
 # Understanding Your IRM Balance
 
-## How Blockchain Balances Work
+## How Balances Work
+Irium uses a UTXO model, like Bitcoin. Your spendable balance is the sum of unspent outputs that pay to your address.
 
-Your balance = Blocks YOU mined (not blocks you synced from others)
-
-### Example:
-
-**You start mining at 14:16 on Oct 18**
-
-When you sync the blockchain, you get all existing blocks (2-8).
-These blocks were mined by OTHER people before you started.
-
-**Blocks 2-8:** Synced from network = 0 IRM for you
-**Blocks 9-10:** YOU mined them = 100 IRM for you! ✅
-
-## How to Verify Your Balance
-
-### 1. Check when YOU started mining
+## Check Your Balance
 ```bash
-ps -p <your_miner_PID> -o lstart
+./target/release/irium-wallet balance <base58_address>
 ```
+This shows the spendable balance and the number of mined blocks that are still unspent.
 
-### 2. Check when blocks were created
+## List Spendable UTXOs
 ```bash
-ls -lt ~/.irium/blocks/
+./target/release/irium-wallet list-unspent <base58_address>
 ```
+Coinbase outputs are filtered until they reach maturity, so only spendable UTXOs are listed.
 
-### 3. Match timestamps
+## Mining Rewards
+- Rewards are paid to the address you set in `IRIUM_MINER_ADDRESS` or `IRIUM_MINER_PKH`.
+- Coinbase rewards are locked until `COINBASE_MATURITY` confirmations.
 
-Any block created AFTER you started mining = YOURS!
-
-Example:
-- Started mining: 14:16
-- block_9.json created: 16:09 ✅ YOURS (50 IRM)
-- block_10.json created: 16:39 ✅ YOURS (50 IRM)
-- **Total: 100 IRM**
-
-## Current Limitation
-
-The `check-balance.py` script doesn't parse the coinbase transaction yet.
-
-It can't automatically tell which blocks are yours vs synced.
-
-**For now:** Manually check block creation times vs your mining start time.
-
-**Coming in v1.1.0:** Full UTXO scanning with automatic address matching.
-
-## Your Mining Address
-
-Check your mining address:
-```bash
-cat ~/.irium/irium-wallet.json
+## Wallet File
+By default, wallet keys are stored in:
 ```
-
-This address receives rewards when you mine blocks.
-
-## Summary
-
-✅ If you mined blocks 9 & 10: You have 100 IRM
-✅ Keep mining: You'll earn 50 IRM per block
-✅ With 14 cores: You'll mine MANY more blocks!
-
-Happy mining! ⛏️
+~/.irium/wallet.json
+```
+Override with `IRIUM_WALLET_FILE`.
