@@ -7,6 +7,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::time::Duration;
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
@@ -80,7 +81,15 @@ fn format_irm(amount: u64) -> String {
 
 fn rpc_client() -> Result<Client, String> {
     let mut builder = Client::builder().timeout(Duration::from_secs(10));
-    if let Ok(path) = env::var("IRIUM_RPC_CA") {
+    let ca_path = env::var("IRIUM_RPC_CA").ok().or_else(|| {
+        let fallback = Path::new("/etc/irium/tls/irium-ca.crt");
+        if fallback.exists() {
+            Some(fallback.display().to_string())
+        } else {
+            None
+        }
+    });
+    if let Some(path) = ca_path {
         let pem = fs::read(&path).map_err(|e| format!("read CA {path}: {e}"))?;
         let cert = reqwest::Certificate::from_pem(&pem)
             .map_err(|e| format!("invalid CA {path}: {e}"))?;
