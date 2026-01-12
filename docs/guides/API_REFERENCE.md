@@ -18,6 +18,12 @@ Spendable balance + mined block count for the address.
 ### GET /rpc/utxos?address=<base58>
 List UTXOs for an address (includes `is_coinbase` + `height`).
 
+### GET /rpc/history?address=<base58>
+History entries for an address (received/spent/net per tx).
+
+### GET /rpc/fee_estimate
+Returns the minimum fee rate (atoms/byte) and mempool size.
+
 ### GET /rpc/utxo?txid=<hex>&index=<n>
 Look up a specific UTXO.
 
@@ -44,6 +50,8 @@ Submit a raw block (requires RPC auth).
 ### GET /status
 ### GET /balance?address=<base58>
 ### GET /utxos?address=<base58>
+### GET /history?address=<base58>
+### GET /fee_estimate
 ### POST /submit_tx
 
 Set `IRIUM_WALLET_API_TOKEN` to protect `submit_tx`.

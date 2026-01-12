@@ -76,6 +76,8 @@ source ~/.cargo/env
 ```
 ./target/release/irium-wallet balance <YOUR_IRIUM_ADDRESS>
 ./target/release/irium-wallet list-unspent <YOUR_IRIUM_ADDRESS>
+./target/release/irium-wallet history <YOUR_IRIUM_ADDRESS>
+./target/release/irium-wallet estimate-fee
 ```
 
 ## 8) SPV check

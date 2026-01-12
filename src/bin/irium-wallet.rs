@@ -10,6 +10,7 @@ use reqwest::blocking::Client;
 use ripemd::Ripemd160;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,28 @@ struct BalanceResponse {
 struct UtxosResponse {
     height: u64,
     utxos: Vec<UtxoItem>,
+}
+
+#[derive(Deserialize)]
+struct HistoryResponse {
+    height: u64,
+    txs: Vec<HistoryItem>,
+}
+
+#[derive(Deserialize)]
+struct HistoryItem {
+    txid: String,
+    height: u64,
+    received: u64,
+    spent: u64,
+    net: i64,
+    is_coinbase: bool,
+}
+
+#[derive(Deserialize)]
+struct FeeEstimateResponse {
+    min_fee_per_byte: f64,
+    mempool_size: usize,
 }
 
 #[derive(Deserialize, Clone)]
@@ -167,7 +190,9 @@ fn usage() {
     eprintln!("  irium-wallet address-to-pkh <base58_addr>");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
-    eprintln!("  irium-wallet send <from_addr> <to_addr> <amount_irm> [--fee <irm>] [--rpc <url>]");
+    eprintln!("  irium-wallet history <base58_addr> [--rpc <url>]");
+    eprintln!("  irium-wallet estimate-fee [--rpc <url>]");
+    eprintln!("  irium-wallet send <from_addr> <to_addr> <amount_irm> [--fee <irm>] [--coin-select smallest|largest] [--rpc <url>]");
 }
 
 fn default_rpc_url() -> String {
@@ -213,6 +238,10 @@ fn parse_irm(s: &str) -> Result<u64, String> {
     Ok(whole
         .saturating_mul(100_000_000)
         .saturating_add(frac))
+}
+
+fn estimate_tx_size(inputs: usize, outputs: usize) -> u64 {
+    10 + inputs as u64 * 148 + outputs as u64 * 34
 }
 
 fn rpc_client() -> Result<Client, String> {
@@ -305,6 +334,35 @@ fn fetch_utxos(client: &Client, base: &str, addr: &str) -> Result<UtxosResponse,
     }
     resp.json::<UtxosResponse>()
         .map_err(|e| format!("parse utxos response: {e}"))
+}
+
+
+fn fetch_history(client: &Client, base: &str, addr: &str) -> Result<HistoryResponse, String> {
+    let url = format!("{}/rpc/history?address={}", base, addr);
+    let mut req = client.get(&url);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().map_err(|e| format!("history request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("history request failed: {}", resp.status()));
+    }
+    resp.json::<HistoryResponse>()
+        .map_err(|e| format!("parse history response: {e}"))
+}
+
+fn fetch_fee_estimate(client: &Client, base: &str) -> Result<FeeEstimateResponse, String> {
+    let url = format!("{}/rpc/fee_estimate", base);
+    let mut req = client.get(&url);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().map_err(|e| format!("fee estimate failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("fee estimate failed: {}", resp.status()));
+    }
+    resp.json::<FeeEstimateResponse>()
+        .map_err(|e| format!("parse fee estimate response: {e}"))
 }
 
 fn submit_tx(client: &Client, base: &str, tx: &Transaction) -> Result<(), String> {
@@ -488,6 +546,93 @@ fn main() {
                 );
             }
         }
+
+        "history" => {
+            if args.len() != 2 && args.len() != 4 {
+                usage();
+                std::process::exit(1);
+            }
+            let addr = &args[1];
+            if base58_p2pkh_to_hash(addr).is_none() {
+                eprintln!("Invalid address or checksum");
+                std::process::exit(1);
+            }
+            let mut rpc_url = default_rpc_url();
+            if args.len() == 4 {
+                if args[2] != "--rpc" {
+                    usage();
+                    std::process::exit(1);
+                }
+                rpc_url = args[3].clone();
+            }
+            let base = rpc_url.trim_end_matches('/');
+            let client = match rpc_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to init HTTP client: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let payload = match fetch_history(&client, base, addr) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let _height = payload.height;
+            for item in payload.txs {
+                let received = format_irm(item.received);
+                let spent = format_irm(item.spent);
+                let net = if item.net >= 0 {
+                    format!("+{}", format_irm(item.net as u64))
+                } else {
+                    format!("-{}", format_irm((-item.net) as u64))
+                };
+                println!(
+                    "{} height {} net {} recv {} spent {} coinbase {}",
+                    item.txid,
+                    item.height,
+                    net,
+                    received,
+                    spent,
+                    item.is_coinbase
+                );
+            }
+        }
+        "estimate-fee" => {
+            let mut rpc_url = default_rpc_url();
+            if args.len() == 3 {
+                if args[1] != "--rpc" {
+                    usage();
+                    std::process::exit(1);
+                }
+                rpc_url = args[2].clone();
+            } else if args.len() != 1 {
+                usage();
+                std::process::exit(1);
+            }
+            let base = rpc_url.trim_end_matches('/');
+            let client = match rpc_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to init HTTP client: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let payload = match fetch_fee_estimate(&client, base) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            println!(
+                "min_fee_per_byte {} mempool_size {}",
+                payload.min_fee_per_byte,
+                payload.mempool_size
+            );
+        }
         "send" => {
             if args.len() < 4 {
                 usage();
@@ -508,6 +653,7 @@ fn main() {
             }
             let mut fee_override: Option<u64> = None;
             let mut rpc_url = default_rpc_url();
+            let mut coin_select = String::from("smallest");
             let mut i = 4;
             while i < args.len() {
                 match args[i].as_str() {
@@ -523,6 +669,19 @@ fn main() {
                                 std::process::exit(1);
                             }
                         });
+                        i += 2;
+                    }
+                    "--coin-select" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Missing --coin-select value");
+                            std::process::exit(1);
+                        }
+                        let mode = &args[i + 1];
+                        if mode != "smallest" && mode != "largest" {
+                            eprintln!("Invalid --coin-select value: {}", mode);
+                            std::process::exit(1);
+                        }
+                        coin_select = mode.clone();
                         i += 2;
                     }
                     "--rpc" => {
@@ -572,7 +731,21 @@ fn main() {
                 }
             };
             let mut utxos = payload.utxos.clone();
-            utxos.sort_by_key(|u| u.value);
+            match coin_select.as_str() {
+                "smallest" => utxos.sort_by_key(|u| u.value),
+                "largest" => utxos.sort_by_key(|u| Reverse(u.value)),
+                _ => {}
+            }
+
+            let mut fee_per_byte = DEFAULT_FEE_PER_BYTE;
+            if fee_override.is_none() {
+                if let Ok(est) = fetch_fee_estimate(&client, base) {
+                    let est_fee = est.min_fee_per_byte.ceil() as u64;
+                    if est_fee > fee_per_byte {
+                        fee_per_byte = est_fee;
+                    }
+                }
+            }
 
             let mut selected = Vec::new();
             let mut total = 0u64;
@@ -584,17 +757,13 @@ fn main() {
                 }
                 selected.push(utxo.clone());
                 total = total.saturating_add(utxo.value);
+                if fee_override.is_none() {
+                    let outputs = if total > amount { 2 } else { 1 };
+                    fee = estimate_tx_size(selected.len(), outputs).saturating_mul(fee_per_byte);
+                }
                 if total >= amount.saturating_add(fee) {
                     break;
                 }
-            }
-
-            let mut fee_per_byte = DEFAULT_FEE_PER_BYTE;
-            if let Some(f) = fee_override {
-                fee = f;
-            } else {
-                fee = 0;
-                fee_per_byte = DEFAULT_FEE_PER_BYTE;
             }
 
             if total < amount.saturating_add(fee) {

@@ -147,6 +147,26 @@ async fn utxos(
     proxy_json(&state, &format!("/rpc/utxos?address={}", q.address)).await
 }
 
+
+async fn history(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<BalanceQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    proxy_json(&state, &format!("/rpc/history?address={}", q.address)).await
+}
+
+async fn fee_estimate(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    proxy_json(&state, "/rpc/fee_estimate").await
+}
+
 async fn submit_tx(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -189,6 +209,8 @@ async fn main() {
         .route("/status", get(status))
         .route("/balance", get(balance))
         .route("/utxos", get(utxos))
+        .route("/history", get(history))
+        .route("/fee_estimate", get(fee_estimate))
         .route("/submit_tx", post(submit_tx))
         .with_state(state)
         .into_make_service_with_connect_info::<SocketAddr>();

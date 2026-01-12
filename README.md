@@ -122,9 +122,12 @@ source ~/.cargo/env
 ```bash
 ./target/release/irium-wallet balance <base58_address>
 ./target/release/irium-wallet list-unspent <base58_address>
+./target/release/irium-wallet history <base58_address>
+./target/release/irium-wallet estimate-fee
 ```
 ```bash
 ./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm>
+./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm> --coin-select largest
 ```
 Use `irium-wallet address-to-pkh <base58_address>` to convert an address to its 20-byte pubkey hash.
 

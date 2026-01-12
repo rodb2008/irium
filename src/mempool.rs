@@ -221,6 +221,10 @@ impl MempoolManager {
         self.entries.len()
     }
 
+    pub fn min_fee_per_byte(&self) -> f64 {
+        self.min_fee_per_byte
+    }
+
     pub fn ordered_transactions(&self) -> Vec<Transaction> {
         let mut vec: Vec<&MempoolEntry> = self.entries.values().collect();
         vec.sort_by(|a, b| {

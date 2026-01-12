@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -103,6 +103,30 @@ struct UtxosResponse {
     pkh: String,
     height: u64,
     utxos: Vec<UtxoItem>,
+}
+
+#[derive(Serialize)]
+struct HistoryItem {
+    txid: String,
+    height: u64,
+    received: u64,
+    spent: u64,
+    net: i64,
+    is_coinbase: bool,
+}
+
+#[derive(Serialize)]
+struct HistoryResponse {
+    address: String,
+    pkh: String,
+    height: u64,
+    txs: Vec<HistoryItem>,
+}
+
+#[derive(Serialize)]
+struct FeeEstimateResponse {
+    min_fee_per_byte: f64,
+    mempool_size: usize,
 }
 
 #[derive(Deserialize)]
@@ -942,6 +966,109 @@ async fn get_utxos(
     }))
 }
 
+
+async fn get_history(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<BalanceQuery>,
+) -> Result<Json<HistoryResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    let pkh = base58_p2pkh_to_hash(&q.address).ok_or(StatusCode::BAD_REQUEST)?;
+    if pkh.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut pkh_arr = [0u8; 20];
+    pkh_arr.copy_from_slice(&pkh);
+
+    let (height, txs) = {
+        let guard = state.chain.lock().unwrap();
+        let mut owned: HashMap<OutPoint, u64> = HashMap::new();
+        let mut map: HashMap<[u8; 32], HistoryItem> = HashMap::new();
+
+        for (h, block) in guard.chain.iter().enumerate() {
+            let height = h as u64;
+            for tx in &block.transactions {
+                let txid = tx.txid();
+                let is_coinbase = tx.inputs.len() == 1
+                    && tx.inputs[0].prev_txid == [0u8; 32]
+                    && tx.inputs[0].prev_index == 0xffff_ffff;
+
+                let mut received = 0u64;
+                let mut spent = 0u64;
+
+                if !is_coinbase {
+                    for input in &tx.inputs {
+                        let outpoint = OutPoint {
+                            txid: input.prev_txid,
+                            index: input.prev_index,
+                        };
+                        if let Some(value) = owned.remove(&outpoint) {
+                            spent = spent.saturating_add(value);
+                        }
+                    }
+                }
+
+                for (idx, output) in tx.outputs.iter().enumerate() {
+                    if let Some(script_pkh) = p2pkh_hash_from_script(&output.script_pubkey) {
+                        if script_pkh == pkh_arr {
+                            received = received.saturating_add(output.value);
+                            owned.insert(
+                                OutPoint {
+                                    txid,
+                                    index: idx as u32,
+                                },
+                                output.value,
+                            );
+                        }
+                    }
+                }
+
+                if received > 0 || spent > 0 {
+                    let entry = map.entry(txid).or_insert(HistoryItem {
+                        txid: hex::encode(txid),
+                        height,
+                        received: 0,
+                        spent: 0,
+                        net: 0,
+                        is_coinbase,
+                    });
+                    entry.received = entry.received.saturating_add(received);
+                    entry.spent = entry.spent.saturating_add(spent);
+                    entry.net = entry.received as i64 - entry.spent as i64;
+                }
+            }
+        }
+
+        let mut txs: Vec<HistoryItem> = map.into_values().collect();
+        txs.sort_by(|a, b| b.height.cmp(&a.height));
+        (guard.tip_height(), txs)
+    };
+
+    Ok(Json(HistoryResponse {
+        address: q.address,
+        pkh: hex::encode(pkh_arr),
+        height,
+        txs,
+    }))
+}
+
+async fn get_fee_estimate(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<FeeEstimateResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    let (min_fee_per_byte, mempool_size) = {
+        let mempool = state.mempool.lock().unwrap();
+        (mempool.min_fee_per_byte(), mempool.len())
+    };
+    Ok(Json(FeeEstimateResponse {
+        min_fee_per_byte,
+        mempool_size,
+    }))
+}
+
 async fn get_block_template(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -1675,6 +1802,8 @@ async fn main() {
         .route("/metrics", get(metrics))
         .route("/rpc/balance", get(get_balance))
         .route("/rpc/utxos", get(get_utxos))
+        .route("/rpc/history", get(get_history))
+        .route("/rpc/fee_estimate", get(get_fee_estimate))
         .route("/rpc/utxo", get(get_utxo))
         .route("/rpc/getblocktemplate", get(get_block_template))
         .route("/rpc/block", get(get_block))

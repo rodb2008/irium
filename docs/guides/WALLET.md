@@ -36,18 +36,31 @@ Adds a new key to the wallet file and prints the address.
 ```
 Coinbase UTXOs are filtered until they reach maturity.
 
+## Transaction History
+```bash
+./target/release/irium-wallet history <base58_address>
+```
+Shows received/spent/net values for each transaction affecting the address.
+
+## Fee Estimate
+```bash
+./target/release/irium-wallet estimate-fee
+```
+Reports the node minimum fee rate (atoms/byte) and mempool size.
+
 ## Send a Transaction
 ```bash
 ./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm>
 ```
-Optional fee override:
+Optional overrides:
 ```bash
 ./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm> --fee 0.01
+./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm> --coin-select largest
 ```
-If `--fee` is not provided, the wallet uses a default fee of 1 atom/byte.
+If `--fee` is not provided, the wallet uses the node `min_fee_per_byte` estimate (fallback 1 atom/byte).
 
 ## Public Balance Access
-For public read-only access, run the wallet API on `0.0.0.0` and expose `/balance` and `/utxos`:
+For public read-only access, run the wallet API on `0.0.0.0` and expose `/balance`, `/utxos`, `/history`, and `/fee_estimate`:
 - `IRIUM_WALLET_API_HOST=0.0.0.0`
 - Optional TLS: `IRIUM_WALLET_API_TLS_CERT` and `IRIUM_WALLET_API_TLS_KEY`
 
