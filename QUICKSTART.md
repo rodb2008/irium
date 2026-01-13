@@ -1,30 +1,30 @@
 # Irium Rust Quickstart (Mainnet)
 
 
-## Plain-English Quickstart
-If you are new to this, follow these steps in order. Keep the node running while you mine.
 
-1) Install Rust (skip if already installed):
-   - Visit https://rustup.rs and install, then open a new terminal.
-2) Download and build:
+## Super Simple Start (No Tech)
+Follow these steps in order. Keep the node running while you mine.
+
+1) Install Rust (one time):
+   - Go to https://rustup.rs and install. Open a new terminal.
+2) Download the code:
 ```
 git clone https://github.com/iriumlabs/irium.git
 cd irium
+```
+3) Build it:
+```
 source ~/.cargo/env
 cargo build --release
 ```
-3) Start the node (leave this running):
+4) Start the node (leave this running):
 ```
 ./target/release/iriumd
 ```
-4) Create a wallet address (copy it):
+5) Make a wallet address (copy the one that starts with Q):
 ```
 ./target/release/irium-wallet init
 ./target/release/irium-wallet new-address
-```
-5) Optional but recommended: set a simple RPC token to avoid rate limits:
-```
-export IRIUM_RPC_TOKEN=$(openssl rand -hex 24)
 ```
 6) Start mining (use your address):
 ```
@@ -35,9 +35,17 @@ export IRIUM_MINER_ADDRESS=<YOUR_ADDRESS>
 ```
 ./target/release/irium-wallet balance <YOUR_ADDRESS>
 ```
-Notes:
-- If the miner starts at height 1, the node is not reachable. Start `iriumd` or set `IRIUM_NODE_RPC=http://<node>:38300`.
-- If you use `IRIUM_RPC_TOKEN`, the node and miner must use the same token value.
+
+Quick fixes:
+- Miner says height 1? The node is not running. Start `iriumd` first.
+- If you see `HTTP 429`, add this before starting the node AND miner (same value in both terminals):
+```
+export IRIUM_RPC_TOKEN=$(openssl rand -hex 24)
+```
+- Mining on another machine? Point the miner to a node:
+```
+export IRIUM_NODE_RPC=http://<node-ip>:38300
+```
 
 If you want the detailed/advanced steps, continue below.
 
