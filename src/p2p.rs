@@ -206,6 +206,10 @@ impl P2PNode {
         msg.contains("duplicate block") || msg.contains("orphan") || msg.contains("unknown parent")
     }
 
+    fn is_duplicate_block(reason: &str) -> bool {
+        reason.to_lowercase().contains("duplicate block")
+    }
+
     fn is_banned(&self, ip: &IpAddr) -> bool {
         if self.banned_ips.contains(ip) {
             return true;
@@ -1238,14 +1242,16 @@ impl P2PNode {
                                                         }
                                                         Err(e) => {
                                                             if P2PNode::is_soft_block_reject(&e) {
-                                                                P2PNode::log_event(
-                                                                    "info",
-                                                                    "chain",
-                                                                    format!(
-                                                                        "P2P {}: ignored block {} ({})",
-                                                                        addr, short, e
-                                                                    ),
-                                                                );
+                                                                if !P2PNode::is_duplicate_block(&e) {
+                                                                    P2PNode::log_event(
+                                                                        "info",
+                                                                        "chain",
+                                                                        format!(
+                                                                            "P2P {}: ignored block {} ({})",
+                                                                            addr, short, e
+                                                                        ),
+                                                                    );
+                                                                }
                                                             } else {
                                                                 P2PNode::log_event(
                                                                     "warn",
@@ -2131,14 +2137,16 @@ async fn handle_incoming_with_sybil(
                                         }
                                         Err(e) => {
                                             if P2PNode::is_soft_block_reject(&e) {
-                                                P2PNode::log_event(
-                                                    "info",
-                                                    "chain",
-                                                    format!(
-                                                        "P2P {}: ignored block {} ({})",
-                                                        addr, short, e
-                                                    ),
-                                                );
+                                                if !P2PNode::is_duplicate_block(&e) {
+                                                    P2PNode::log_event(
+                                                        "info",
+                                                        "chain",
+                                                        format!(
+                                                            "P2P {}: ignored block {} ({})",
+                                                            addr, short, e
+                                                        ),
+                                                    );
+                                                }
                                             } else {
                                                 P2PNode::log_event(
                                                     "warn",
