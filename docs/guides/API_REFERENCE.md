@@ -40,6 +40,8 @@ Submit a raw transaction (requires RPC auth).
 Submit a raw block (requires RPC auth).
 
 ## Explorer API (default 38310)
+### GET /stats
+### GET /blocks?limit=<n>
 ### GET /status
 ### GET /peers
 ### GET /metrics

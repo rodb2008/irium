@@ -10,10 +10,11 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use irium_node_rs::constants::block_reward;
 use irium_node_rs::rate_limiter::RateLimiter;
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[derive(Clone)]
 struct AppState {
@@ -28,6 +29,11 @@ struct AppState {
 struct UtxoQuery {
     txid: String,
     index: u32,
+}
+
+#[derive(Deserialize)]
+struct BlocksQuery {
+    limit: Option<usize>,
 }
 
 fn build_client() -> Result<Client, String> {
@@ -97,6 +103,11 @@ async fn proxy_json(state: &AppState, path: &str) -> Result<Json<Value>, StatusC
     Ok(Json(payload))
 }
 
+
+async fn proxy_value(state: &AppState, path: &str) -> Result<Value, StatusCode> {
+    let Json(payload) = proxy_json(state, path).await?;
+    Ok(payload)
+}
 async fn proxy_text(state: &AppState, path: &str) -> Result<Response, StatusCode> {
     let url = node_url(&state.node_base, path);
     let mut req = state.client.get(url);
@@ -140,6 +151,57 @@ async fn metrics(
     proxy_text(&state, "/metrics").await
 }
 
+
+async fn stats(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    let status = proxy_value(&state, "/status").await?;
+    let height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut total = 0u64;
+    for h in 1..=height {
+        total = total.saturating_add(block_reward(h));
+    }
+    let payload = json!({
+        "height": height,
+        "total_blocks": height,
+        "total": height,
+        "supply_irm": (total as f64) / 100_000_000.0,
+        "genesis_hash": status.get("genesis_hash"),
+        "peer_count": status.get("peer_count"),
+    });
+    Ok(Json(payload))
+}
+
+async fn blocks(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<BlocksQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    let status = proxy_value(&state, "/status").await?;
+    let height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+    let limit = q.limit.unwrap_or(50).min(200);
+    let mut blocks = Vec::new();
+    let mut h = height as i64;
+    while h >= 0 && blocks.len() < limit {
+        let path = format!("/rpc/block?height={}", h);
+        if let Ok(block) = proxy_value(&state, &path).await {
+            blocks.push(block);
+        }
+        h -= 1;
+    }
+    let payload = json!({
+        "height": height,
+        "total_blocks": height,
+        "total": height,
+        "blocks": blocks,
+    });
+    Ok(Json(payload))
+}
 async fn block(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -190,6 +252,8 @@ async fn main() {
     };
 
     let app = Router::new()
+        .route("/stats", get(stats))
+        .route("/blocks", get(blocks))
         .route("/status", get(status))
         .route("/peers", get(peers))
         .route("/metrics", get(metrics))
