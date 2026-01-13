@@ -3,7 +3,7 @@ use reqwest::Certificate;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
+use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, fs, sync::OnceLock};
@@ -419,6 +419,32 @@ fn rpc_client() -> Result<Client, String> {
 
 fn node_rpc_base() -> String {
     env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "http://127.0.0.1:38300".to_string())
+}
+
+static RPC_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
+
+fn maybe_log_rpc_hint(err: &str) {
+    if RPC_HINT_SHOWN.load(Ordering::Relaxed) {
+        return;
+    }
+    let lower = err.to_lowercase();
+    let is_unreachable = lower.contains("connection refused")
+        || lower.contains("error trying to connect")
+        || lower.contains("tcp connect")
+        || lower.contains("timed out")
+        || lower.contains("dns")
+        || lower.contains("no such host")
+        || lower.contains("network unreachable")
+        || lower.contains("failed to lookup address")
+        || lower.contains("connection error");
+    if is_unreachable {
+        let base = node_rpc_base();
+        eprintln!(
+            "[hint] No node RPC reachable at {}. Start iriumd or set IRIUM_NODE_RPC=http://<node>:38300 (and IRIUM_RPC_TOKEN if required).",
+            base
+        );
+        RPC_HINT_SHOWN.store(true, Ordering::Relaxed);
+    }
 }
 
 fn is_tls_mismatch(err: &str) -> bool {
@@ -1605,6 +1631,7 @@ fn main() {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("[warn] Miner could not fetch block template: {e}");
+                maybe_log_rpc_hint(&e);
                 if strict_rpc_enabled() {
                     std::process::exit(1);
                 }

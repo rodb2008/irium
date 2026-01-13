@@ -108,6 +108,7 @@ source ~/.cargo/env
 ./target/release/irium-miner
 ```
 - Mined blocks are auto-submitted to `IRIUM_NODE_RPC` (default http://127.0.0.1:38300).
+- If you run only the miner, point it at a reachable node RPC with `IRIUM_NODE_RPC=http://<node>:38300` (and `IRIUM_RPC_TOKEN` if required).
 - If the node is running HTTPS + `IRIUM_RPC_TOKEN`, set `IRIUM_NODE_RPC=https://127.0.0.1:38300` and export the same `IRIUM_RPC_TOKEN` for the miner.
 - If `IRIUM_RPC_TOKEN` is set to an empty value in env files, miners will still send an empty token and get 401; either remove the line or set a real token.
 - For HTTPS with a local self-signed cert, set `IRIUM_RPC_CA=/etc/irium/tls/irium-ca.crt` instead of `IRIUM_RPC_INSECURE=1`.
