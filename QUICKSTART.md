@@ -66,6 +66,8 @@ source ~/.cargo/env
 ./target/release/irium-miner
 ```
 - Relies on the local node/mempool and auto-submits mined blocks to `IRIUM_NODE_RPC` (default http://127.0.0.1:38300).
+- RPC auth tokens are user-defined. Example: `export IRIUM_RPC_TOKEN=$(openssl rand -hex 24)` and set the same value in `/etc/irium/iriumd.env` and `/etc/irium/miner.env`.
+- Control CPU usage with `--threads N` or `IRIUM_MINER_THREADS=N` (default 1).
 - If you run only the miner, point it at a reachable node RPC with `IRIUM_NODE_RPC=http://<node>:38300` (and `IRIUM_RPC_TOKEN` if required).
 - Uses `/rpc/getblocktemplate`; tune with `IRIUM_GBT_MAX_TXS`, `IRIUM_GBT_MIN_FEE`, `IRIUM_GBT_LONGPOLL`, `IRIUM_GBT_LONGPOLL_SECS`.
 - Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.

@@ -447,6 +447,29 @@ fn maybe_log_rpc_hint(err: &str) {
     }
 }
 
+fn miner_thread_count() -> usize {
+    let mut threads: Option<usize> = None;
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--threads" || arg == "-t" {
+            if let Some(val) = args.next() {
+                threads = val.parse::<usize>().ok();
+            }
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--threads=") {
+            threads = val.parse::<usize>().ok();
+        }
+    }
+    if threads.is_none() {
+        if let Ok(val) = env::var("IRIUM_MINER_THREADS") {
+            threads = val.parse::<usize>().ok();
+        }
+    }
+    let n = threads.unwrap_or(1);
+    if n == 0 { 1 } else { n }
+}
+
 fn is_tls_mismatch(err: &str) -> bool {
     let lower = err.to_lowercase();
     lower.contains("invalid http version")
@@ -922,14 +945,14 @@ fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
     fs::write(path, json)
 }
 
-fn template_changed(client: &Client, template: &BlockTemplate) -> bool {
+fn template_changed(client: &Client, height: u64, prev_hash: &str) -> bool {
     match fetch_block_template(client, false) {
-        Ok(next) => next.height != template.height || next.prev_hash != template.prev_hash,
+        Ok(next) => next.height != height || next.prev_hash != prev_hash,
         Err(_) => false,
     }
 }
 
-fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client) -> Result<bool, String> {
+fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client, threads: usize) -> Result<bool, String> {
     let height = template.height; // next block height
     if chain.height != height {
         return Err(format!(
@@ -970,7 +993,7 @@ fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client) 
 
     let prev_time = chain.chain.last().map(|b| b.header.time).unwrap_or(0);
     let now = Utc::now().timestamp() as u32;
-    let mut header_time = template.time.max(prev_time.saturating_add(1)).max(now);
+    let header_time = template.time.max(prev_time.saturating_add(1)).max(now);
 
     let mempool_entries = load_mempool_entries(chain, Some(template));
     println!(
@@ -1085,116 +1108,184 @@ fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client) 
     let merkle = block.merkle_root();
     block.header.merkle_root = merkle;
 
-    let mut nonce: u32 = 0;
+    let threads = threads.max(1);
     let start = Instant::now();
+    const LOG_EVERY: u64 = 1_000_000;
 
-    loop {
-        block.header.nonce = nonce;
-        let h = block.header.hash();
-        if meets_target(&h, target) {
-            let elapsed = start.elapsed().as_secs_f64();
-            if json_log_enabled() {
-                println!(
-                    "{}",
-                    json!({
-                        "event": "mined_block",
-                        "height": height,
-                        "hash": hex::encode(h),
-                        "nonce": nonce,
-                        "rate_hs": if elapsed > 0.0 { Some(nonce as f64 / elapsed) } else { None },
-                        "ts": Utc::now().format("%H:%M:%S").to_string()
-                    })
-                );
-            } else {
-                println!("[✅] Mined block at height {}", height);
-                println!("   🔗 hash   = {}", hex::encode(h));
-                println!("   🎯 nonce  = {}", nonce);
-                if elapsed > 0.0 {
-                    println!("   ⚡ rate   = {:.2} H/s", nonce as f64 / elapsed);
+    let stop = Arc::new(AtomicBool::new(false));
+    let found = Arc::new(AtomicBool::new(false));
+    let template_changed_flag = Arc::new(AtomicBool::new(false));
+    let attempts = Arc::new(AtomicU64::new(0));
+    let result = Arc::new(Mutex::new(None::<(Block, [u8; 32], u32)>));
+    let prev_hash_str = template.prev_hash.clone();
+
+    let mut handles = Vec::new();
+    for tid in 0..threads {
+        let stop = Arc::clone(&stop);
+        let found = Arc::clone(&found);
+        let template_changed_flag = Arc::clone(&template_changed_flag);
+        let attempts = Arc::clone(&attempts);
+        let result = Arc::clone(&result);
+        let mut block = block.clone();
+        let txs = txs.clone();
+        let client = client.clone();
+        let target = target;
+        let prev_hash_str = prev_hash_str.clone();
+        let height = height;
+        let prev_time = prev_time;
+        let step = threads as u32;
+        let mut nonce = tid as u32;
+
+        handles.push(thread::spawn(move || {
+            let mut local_attempts: u64 = 0;
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
                 }
-            }
+                block.header.nonce = nonce;
+                let h = block.header.hash();
+                if meets_target(&h, target) {
+                    if !found.swap(true, Ordering::SeqCst) {
+                        let mut guard = result.lock().unwrap();
+                        *guard = Some((block.clone(), h, nonce));
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
 
-            // Connect block to chain (updates UTXOs, height, etc.)
-            chain.connect_block(block.clone())?;
+                nonce = nonce.wrapping_add(step);
+                local_attempts += 1;
 
-            // Write JSON file
-            write_block_json(height as u64, &block).map_err(|e| e.to_string())?;
+                if local_attempts >= LOG_EVERY {
+                    attempts.fetch_add(local_attempts, Ordering::Relaxed);
+                    local_attempts = 0;
+                    if tid == 0 {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let attempts_total = attempts.load(Ordering::Relaxed);
+                        if json_log_enabled() {
+                            let rate = if elapsed > 0.0 {
+                                Some(attempts_total as f64 / elapsed)
+                            } else {
+                                None
+                            };
+                            println!(
+                                "{}",
+                                json!({
+                                    "event": "progress",
+                                    "height": height,
+                                    "tip_height": height.saturating_sub(1),
+                                    "nonce": attempts_total,
+                                    "rate_hs": rate,
+                                    "ts": Utc::now().format("%H:%M:%S").to_string()
+                                })
+                            );
+                        } else if elapsed > 0.0 {
+                            println!(
+                                "  mining next height {} (tip {}): hashes {} rate {:.2} H/s",
+                                height,
+                                height.saturating_sub(1),
+                                attempts_total,
+                                attempts_total as f64 / elapsed
+                            );
+                        } else {
+                            println!(
+                                "[⏱️] next height {} tip {} hashes {}",
+                                height,
+                                height.saturating_sub(1),
+                                attempts_total
+                            );
+                        }
 
-            // Submit to local node HTTP RPC so the network sees the block.
-            match submit_block_to_node(height as u64, &block) {
-                Ok(_) => {
-                    if json_log_enabled() {
-                        println!("{}", json!({"event": "submit_block", "height": height, "status": "accepted"}));
-                    } else {
-                        println!("[✅] Block accepted by node at height {}", height);
+                        if template_changed(&client, height, &prev_hash_str) {
+                            if json_log_enabled() {
+                                println!("{}", json!({"event": "template_updated", "height": height, "ts": Utc::now().format("%H:%M:%S").to_string()}));
+                            } else {
+                                println!("[🔄] Template updated; restarting mining");
+                            }
+                            template_changed_flag.store(true, Ordering::Relaxed);
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    if json_log_enabled() {
-                        eprintln!("{}", json!({"event": "submit_block_failed", "height": height, "error": e}));
-                    } else {
-                        eprintln!("[❌] Block rejected at height {}: {}", height, e);
+
+                if nonce < step {
+                    let mut new_time = Utc::now().timestamp() as u32;
+                    if new_time <= prev_time {
+                        new_time = prev_time.saturating_add(1);
                     }
+                    block.header.time = new_time;
+                    block.transactions = txs.clone();
+                    let merkle = block.merkle_root();
+                    block.header.merkle_root = merkle;
                 }
             }
-            return Ok(true);
-        }
-
-        nonce = nonce.wrapping_add(1);
-        if nonce == 0 {
-            header_time = Utc::now().timestamp() as u32;
-            if header_time <= prev_time {
-                header_time = prev_time.saturating_add(1);
+            if local_attempts > 0 {
+                attempts.fetch_add(local_attempts, Ordering::Relaxed);
             }
-            block.header.time = header_time;
-            block.transactions = txs.clone();
-            let merkle = block.merkle_root();
-            block.header.merkle_root = merkle;
-        }
-
-        if nonce % 1_000_000 == 0 {
-            let elapsed = start.elapsed().as_secs_f64();
-            if json_log_enabled() {
-                let rate = if elapsed > 0.0 {
-                    Some(nonce as f64 / elapsed)
-                } else {
-                    None
-                };
-                println!(
-                    "{}",
-                    json!({
-                        "event": "progress",
-                        "height": height,
-                        "tip_height": height.saturating_sub(1),
-                        "nonce": nonce,
-                        "rate_hs": rate,
-                        "ts": Utc::now().format("%H:%M:%S").to_string()
-                    })
-                );
-            } else {
-                if elapsed > 0.0 {
-                    println!(
-                        "  mining next height {} (tip {}): nonce {} rate {:.2} H/s",
-                        height,
-                        height.saturating_sub(1),
-                        nonce,
-                        nonce as f64 / elapsed
-                    );
-                } else {
-                    println!("[⏱️] next height {} tip {} nonce {}", height, height.saturating_sub(1), nonce);
-                }
-            }
-
-            if template_changed(client, template) {
-                if json_log_enabled() {
-                    println!("{}", json!({"event": "template_updated", "height": height, "ts": Utc::now().format("%H:%M:%S").to_string()}));
-                } else {
-                    println!("[🔄] Template updated; restarting mining");
-                }
-                return Ok(false);
-            }
-        }
+        }));
     }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    if let Some((block, h, nonce)) = result.lock().unwrap().take() {
+        let elapsed = start.elapsed().as_secs_f64();
+        let attempts_total = attempts.load(Ordering::Relaxed);
+        if json_log_enabled() {
+            let rate = if elapsed > 0.0 {
+                Some(attempts_total as f64 / elapsed)
+            } else {
+                None
+            };
+            println!(
+                "{}",
+                json!({
+                    "event": "mined_block",
+                    "height": height,
+                    "hash": hex::encode(h),
+                    "nonce": nonce,
+                    "rate_hs": rate,
+                    "ts": Utc::now().format("%H:%M:%S").to_string()
+                })
+            );
+        } else {
+            println!("[✅] Mined block at height {}", height);
+            println!("   🔗 hash   = {}", hex::encode(h));
+            println!("   🎯 nonce  = {}", nonce);
+            if elapsed > 0.0 {
+                println!("   ⚡ rate   = {:.2} H/s", attempts_total as f64 / elapsed);
+            }
+        }
+
+        chain.connect_block(block.clone())?;
+        write_block_json(height as u64, &block).map_err(|e| e.to_string())?;
+
+        match submit_block_to_node(height as u64, &block) {
+            Ok(_) => {
+                if json_log_enabled() {
+                    println!("{}", json!({"event": "submit_block", "height": height, "status": "accepted"}));
+                } else {
+                    println!("[✅] Block accepted by node at height {}", height);
+                }
+            }
+            Err(e) => {
+                if json_log_enabled() {
+                    eprintln!("{}", json!({"event": "submit_block_failed", "height": height, "error": e}));
+                } else {
+                    eprintln!("[❌] Block rejected at height {}: {}", height, e);
+                }
+            }
+        }
+        return Ok(true);
+    }
+
+    if template_changed_flag.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    Ok(false)
+
 }
 
 
@@ -1613,6 +1704,14 @@ fn main() {
         }
     }
 
+    let threads = miner_thread_count();
+    if json_log_enabled() {
+        println!("{}", json!({"event": "miner_threads", "threads": threads, "ts": Utc::now().format("%H:%M:%S").to_string()}));
+    } else {
+        println!("[🧵] Mining threads: {}", threads);
+    }
+
+
     loop {
         let client = match node_http_client() {
             Ok(c) => c,
@@ -1660,7 +1759,7 @@ fn main() {
             println!("[▶️] Mining next height {} (tip {})", state.height, state.tip_height());
         }
 
-        match mine_once(&mut state, &template, &client) {
+        match mine_once(&mut state, &template, &client, threads) {
             Ok(true) => {
                 if json_log_enabled() {
                     println!(
