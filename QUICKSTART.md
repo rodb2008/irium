@@ -1,5 +1,46 @@
 # Irium Rust Quickstart (Mainnet)
 
+
+## Plain-English Quickstart
+If you are new to this, follow these steps in order. Keep the node running while you mine.
+
+1) Install Rust (skip if already installed):
+   - Visit https://rustup.rs and install, then open a new terminal.
+2) Download and build:
+```
+git clone https://github.com/iriumlabs/irium.git
+cd irium
+source ~/.cargo/env
+cargo build --release
+```
+3) Start the node (leave this running):
+```
+./target/release/iriumd
+```
+4) Create a wallet address (copy it):
+```
+./target/release/irium-wallet init
+./target/release/irium-wallet new-address
+```
+5) Optional but recommended: set a simple RPC token to avoid rate limits:
+```
+export IRIUM_RPC_TOKEN=$(openssl rand -hex 24)
+```
+6) Start mining (use your address):
+```
+export IRIUM_MINER_ADDRESS=<YOUR_ADDRESS>
+./target/release/irium-miner --threads 2
+```
+7) Check your balance:
+```
+./target/release/irium-wallet balance <YOUR_ADDRESS>
+```
+Notes:
+- If the miner starts at height 1, the node is not reachable. Start `iriumd` or set `IRIUM_NODE_RPC=http://<node>:38300`.
+- If you use `IRIUM_RPC_TOKEN`, the node and miner must use the same token value.
+
+If you want the detailed/advanced steps, continue below.
+
 This guide runs a Rust Irium node/miner on mainnet (no testnet, no DNS). Assumes Rust toolchain is installed (`source ~/.cargo/env`).
 
 ## 0) Download and build

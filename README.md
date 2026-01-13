@@ -19,6 +19,44 @@ Irium is a production‑only proof‑of‑work blockchain for the IRM asset. The
 - `state/` – runtime data (peers.json, etc.).
 
 
+## Quick Start (Plain English)
+If you are new to the command line, follow these steps in order. Keep the node running while you mine.
+
+1) Install Rust (skip if already installed):
+   - Visit https://rustup.rs and install, then open a new terminal.
+2) Download and build:
+```
+git clone https://github.com/iriumlabs/irium.git
+cd irium
+source ~/.cargo/env
+cargo build --release
+```
+3) Start the node (leave this running):
+```
+./target/release/iriumd
+```
+4) Create a wallet address (copy it):
+```
+./target/release/irium-wallet init
+./target/release/irium-wallet new-address
+```
+5) Optional but recommended: set a simple RPC token to avoid rate limits:
+```
+export IRIUM_RPC_TOKEN=$(openssl rand -hex 24)
+```
+6) Start mining (use your address):
+```
+export IRIUM_MINER_ADDRESS=<YOUR_ADDRESS>
+./target/release/irium-miner --threads 2
+```
+7) Check your balance:
+```
+./target/release/irium-wallet balance <YOUR_ADDRESS>
+```
+Notes:
+- If the miner starts at height 1, the node is not reachable. Start `iriumd` or set `IRIUM_NODE_RPC=http://<node>:38300`.
+- If you use `IRIUM_RPC_TOKEN`, the node and miner must use the same token value.
+
 ## Get Started (Download + Run Services)
 ```bash
 git clone https://github.com/iriumlabs/irium.git
@@ -54,6 +92,7 @@ export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>
 Notes:
 - If the node requires `IRIUM_RPC_TOKEN`, export the same token for the miner and wallet.
 - Keep the printed private key safe; it controls the funds for that address.
+
 
 ## Build & Test
 ```bash
