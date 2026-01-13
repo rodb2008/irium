@@ -27,10 +27,10 @@ use irium_node_rs::pow::{meets_target, sha256d, Target};
 use irium_node_rs::relay::RelayCommitment;
 use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
 
-fn load_env_file(path: &str) {
+fn load_env_file(path: &str) -> bool {
     let contents = match fs::read_to_string(path) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return false,
     };
     for raw in contents.lines() {
         let line = raw.trim();
@@ -50,6 +50,7 @@ fn load_env_file(path: &str) {
         }
         env::set_var(key, val);
     }
+    true
 }
 
 fn rpc_token() -> Option<String> {
@@ -1681,6 +1682,14 @@ fn run_stratum_miner() -> Result<(), String> {
 }
 
 fn main() {
+    let loaded_env = load_env_file("/etc/irium/miner.env");
+    if loaded_env {
+        if json_log_enabled() {
+            println!("{}", json!({"event": "env_loaded", "path": "/etc/irium/miner.env", "ts": Utc::now().format("%H:%M:%S").to_string()}));
+        } else {
+            println!("[📄] Loaded /etc/irium/miner.env");
+        }
+    }
     load_env_file("/etc/irium/miner.env");
     let locked = load_locked_genesis().expect("load locked genesis");
     let block = block_from_locked(&locked);

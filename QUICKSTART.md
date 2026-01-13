@@ -50,6 +50,13 @@ export IRIUM_NODE_RPC=http://<node-ip>:38300
 
 If you want the detailed/advanced steps, continue below.
 
+
+## FAQ / Common issues
+- Miner stuck at height 1: the node isn’t running or `IRIUM_NODE_RPC` is wrong.
+- `HTTP 401 Unauthorized`: the node has a token set, but the miner/wallet does not. Use the same `IRIUM_RPC_TOKEN` everywhere.
+- `HTTP 429 Too Many Requests`: the node rate‑limit is blocking the miner. Set a token or raise `IRIUM_RATE_LIMIT_PER_MIN` in the node env.
+- Miner ignores `/etc/irium/miner.env`: manual runs now auto‑load it. Shell exports still override the file.
+
 This guide runs a Rust Irium node/miner on mainnet (no testnet, no DNS). Assumes Rust toolchain is installed (`source ~/.cargo/env`).
 
 ## 0) Download and build
