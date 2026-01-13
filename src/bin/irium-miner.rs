@@ -1,5 +1,6 @@
 use reqwest::blocking::Client;
 use reqwest::Certificate;
+use reqwest::StatusCode;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -25,6 +26,46 @@ use irium_node_rs::mempool::MempoolManager;
 use irium_node_rs::pow::{meets_target, sha256d, Target};
 use irium_node_rs::relay::RelayCommitment;
 use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
+
+fn load_env_file(path: &str) {
+    let contents = match fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || env::var_os(key).is_some() {
+            continue;
+        }
+        let mut val = value.trim().to_string();
+        if (val.starts_with('"') && val.ends_with('"')) || (val.starts_with('\'') && val.ends_with('\'')) {
+            val = val[1..val.len() - 1].to_string();
+        }
+        env::set_var(key, val);
+    }
+}
+
+fn rpc_token() -> Option<String> {
+    env::var("IRIUM_RPC_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn rpc_status_error(prefix: &str, status: StatusCode) -> String {
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        format!("{}: HTTP {} (check IRIUM_RPC_TOKEN)", prefix, status)
+    } else {
+        format!("{}: HTTP {}", prefix, status)
+    }
+}
 
 fn json_log_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
@@ -529,7 +570,7 @@ fn submit_block_to_node_with_base(
 ) -> Result<(), String> {
     let url = format!("{}/rpc/submit_block", base.trim_end_matches("/"));
     let mut req = client.post(url).json(payload);
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+    if let Some(token) = rpc_token() {
         req = req.bearer_auth(token);
     }
     let resp = req
@@ -537,7 +578,7 @@ fn submit_block_to_node_with_base(
         .map_err(|e| format!("submit failed: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("submit failed: HTTP {}", resp.status()));
+        return Err(rpc_status_error("submit failed", resp.status()));
     }
     Ok(())
 }
@@ -716,14 +757,14 @@ fn fetch_block_template_with_base(
 ) -> Result<BlockTemplate, String> {
     let url = format!("{}/rpc/getblocktemplate", base.trim_end_matches("/"));
     let mut req = client.get(url).query(&gbt_query_params(longpoll));
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+    if let Some(token) = rpc_token() {
         req = req.bearer_auth(token);
     }
     let resp = req
         .send()
         .map_err(|e| format!("template failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("template failed: HTTP {}", resp.status()));
+        return Err(rpc_status_error("template failed", resp.status()));
     }
     resp.json()
         .map_err(|e| format!("template parse: {e}"))
@@ -740,14 +781,14 @@ fn fetch_block_json_with_base(
 ) -> Result<serde_json::Value, String> {
     let url = format!("{}/rpc/block?height={}", base.trim_end_matches('/') , height);
     let mut req = client.get(url);
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+    if let Some(token) = rpc_token() {
         req = req.bearer_auth(token);
     }
     let resp = req
         .send()
         .map_err(|e| format!("get block {height} failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("get block {height} failed: HTTP {}", resp.status()));
+        return Err(rpc_status_error(&format!("get block {height} failed"), resp.status()));
     }
     resp.json()
         .map_err(|e| format!("block {height} parse: {e}"))
@@ -1640,6 +1681,7 @@ fn run_stratum_miner() -> Result<(), String> {
 }
 
 fn main() {
+    load_env_file("/etc/irium/miner.env");
     let locked = load_locked_genesis().expect("load locked genesis");
     let block = block_from_locked(&locked);
     let pow_limit = Target { bits: 0x1d00_ffff };

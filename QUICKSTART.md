@@ -31,6 +31,7 @@ cargo build --release
 export IRIUM_MINER_ADDRESS=<YOUR_ADDRESS>
 ./target/release/irium-miner --threads 2
 ```
+Tip: If you already set `/etc/irium/miner.env`, the miner will load it automatically (manual runs too).
 7) Check your balance:
 ```
 ./target/release/irium-wallet balance <YOUR_ADDRESS>
