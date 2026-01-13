@@ -112,6 +112,7 @@ source ~/.cargo/env
 - If `IRIUM_RPC_TOKEN` is set to an empty value in env files, miners will still send an empty token and get 401; either remove the line or set a real token.
 - For HTTPS with a local self-signed cert, set `IRIUM_RPC_CA=/etc/irium/tls/irium-ca.crt` instead of `IRIUM_RPC_INSECURE=1`.
 - The miner pulls templates from `/rpc/getblocktemplate` and honors `IRIUM_GBT_MAX_TXS`, `IRIUM_GBT_MIN_FEE`, `IRIUM_GBT_LONGPOLL`, and `IRIUM_GBT_LONGPOLL_SECS`.
+- If you see `HTTP 429 Too Many Requests`, set `IRIUM_RPC_TOKEN` in both `iriumd` and the miner, or raise `IRIUM_RATE_LIMIT_PER_MIN` in the node env.
 - Set `IRIUM_MINER_STRICT_RPC=1` to stop mining if RPC/template fetch fails.
 - Pool mining (Stratum v1, TCP): set `IRIUM_STRATUM_URL`, `IRIUM_STRATUM_USER`, `IRIUM_STRATUM_PASS`.
 Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
