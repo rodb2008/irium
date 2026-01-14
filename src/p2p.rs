@@ -79,6 +79,27 @@ fn getblocks_grace() -> Duration {
     Duration::from_secs(secs.max(2).min(60))
 }
 
+async fn getblocks_request_allowed(
+    requests: &Arc<Mutex<HashMap<IpAddr, (Vec<u8>, u32, Instant)>>>,
+    ip: IpAddr,
+    start_hash: &[u8],
+    count: u32,
+) -> bool {
+    let grace = getblocks_grace();
+    let now = Instant::now();
+    let mut guard = requests.lock().await;
+    if let Some((last_hash, last_count, last_ts)) = guard.get(&ip) {
+        if *last_count == count
+            && last_hash.as_slice() == start_hash
+            && now.duration_since(*last_ts) < grace
+        {
+            return false;
+        }
+    }
+    guard.insert(ip, (start_hash.to_vec(), count, now));
+    true
+}
+
 #[derive(Clone)]
 pub struct P2PNode {
     bind_addr: SocketAddr,
@@ -90,6 +111,7 @@ pub struct P2PNode {
     sync_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     block_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     getblocks_seen: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    getblocks_last: Arc<Mutex<HashMap<IpAddr, (Vec<u8>, u32, Instant)>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     dynamic_bans: Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
@@ -310,6 +332,7 @@ impl P2PNode {
             sync_requests: Arc::new(Mutex::new(HashMap::new())),
             block_requests: Arc::new(Mutex::new(HashMap::new())),
             getblocks_seen: Arc::new(Mutex::new(HashMap::new())),
+            getblocks_last: Arc::new(Mutex::new(HashMap::new())),
             self_ips: Arc::new(Mutex::new(HashSet::new())),
             dynamic_bans: Arc::new(StdMutex::new(HashMap::new())),
             chain,
@@ -342,6 +365,7 @@ impl P2PNode {
         let sync_requests = self.sync_requests.clone();
         let block_requests = self.block_requests.clone();
         let getblocks_seen = self.getblocks_seen.clone();
+        let getblocks_last = self.getblocks_last.clone();
         let self_ips = self.self_ips.clone();
         let dynamic_bans = self.dynamic_bans.clone();
         let node_id = self.node_id.clone();
@@ -397,6 +421,7 @@ impl P2PNode {
                         let sync_peer = sync_requests.clone();
                         let block_peer = block_requests.clone();
                         let getblocks_peer = getblocks_seen.clone();
+                        let getblocks_last_peer = getblocks_last.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_incoming_with_sybil(
                                 socket,
@@ -409,6 +434,7 @@ impl P2PNode {
                                 sync_peer,
                                 block_peer,
                                 getblocks_peer,
+                                getblocks_last_peer,
                                 self_ip_peer,
                                 chain_peer,
                                 mempool_peer,
@@ -811,6 +837,7 @@ impl P2PNode {
         let sync_requests = self.sync_requests.clone();
         let block_requests = self.block_requests.clone();
         let getblocks_seen = self.getblocks_seen.clone();
+        let getblocks_last = self.getblocks_last.clone();
         let self_ips = self.self_ips.clone();
         let peers_vec = self.peers.clone();
         let connected_vec = self.connected.clone();
@@ -1160,6 +1187,15 @@ impl P2PNode {
                                 }
                                 if let Some(ref chain_arc) = chain_for_sync {
                                     if let Ok(payload) = GetBlocksPayload::from_message(&msg) {
+                                        if !getblocks_request_allowed(
+                                            &getblocks_last,
+                                            addr.ip(),
+                                            &payload.start_hash,
+                                            payload.count,
+                                        ).await
+                                        {
+                                            continue;
+                                        }
                                         let (blocks, start_height) = {
                                             let guard = chain_arc.lock().unwrap();
                                             let mut start_idx = 0usize;
@@ -1588,6 +1624,7 @@ async fn handle_incoming_with_sybil(
     sync_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     block_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     getblocks_seen: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    getblocks_last: Arc<Mutex<HashMap<IpAddr, (Vec<u8>, u32, Instant)>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
@@ -2055,6 +2092,15 @@ async fn handle_incoming_with_sybil(
                 }
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = GetBlocksPayload::from_message(&msg) {
+                        if !getblocks_request_allowed(
+                            &getblocks_last,
+                            addr.ip(),
+                            &payload.start_hash,
+                            payload.count,
+                        ).await
+                        {
+                            continue;
+                        }
                         let (blocks, start_height) = {
                             let guard = chain_arc.lock().unwrap();
                             let mut start_idx = 0usize;
