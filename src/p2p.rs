@@ -590,9 +590,7 @@ impl P2PNode {
 
         let mut guard = self.peers.lock().await;
         for socket in guard.iter_mut() {
-            if let Err(e) = socket.lock().await.write_all(&serialized).await {
-                eprintln!("Failed to send block to peer: {}", e);
-            }
+            let _ = socket.lock().await.write_all(&serialized).await;
         }
         Ok(())
     }
