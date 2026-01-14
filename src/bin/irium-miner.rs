@@ -417,12 +417,8 @@ struct SubmitBlockRequest {
 }
 
 
-fn rpc_base_is_localhost() -> bool {
-    let base = node_rpc_base();
-    base.contains("127.0.0.1")
-        || base.contains("localhost")
-        || base.contains("[::1]")
-        || base.contains("::1")
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 fn rpc_client() -> Result<Client, String> {
@@ -433,7 +429,7 @@ fn rpc_client() -> Result<Client, String> {
             .map_err(|e| format!("invalid CA {path}: {e}"))?;
         builder = builder.add_root_certificate(cert);
     }
-    let mut insecure = env::var("IRIUM_RPC_INSECURE")
+    let insecure = env::var("IRIUM_RPC_INSECURE")
         .ok()
         .map(|v| {
             let v = v.to_lowercase();
@@ -447,13 +443,25 @@ fn rpc_client() -> Result<Client, String> {
             v == "1" || v == "true" || v == "yes"
         })
         .unwrap_or(false);
-    if strict {
-        insecure = false;
+    let base = node_rpc_base();
+    let mut allow_insecure = false;
+    if !strict && insecure {
+        let url = reqwest::Url::parse(&base)
+            .map_err(|e| format!("invalid RPC URL {base}: {e}"))?;
+        if url.scheme() != "https" {
+            eprintln!("[warn] IRIUM_RPC_INSECURE=1 has no effect on non-HTTPS RPC URL");
+        } else {
+            let host = url.host_str().ok_or_else(|| "RPC URL missing host".to_string())?;
+            if !is_loopback_host(host) {
+                return Err(format!(
+                    "Refusing to disable TLS verification for non-local RPC host {host}; set IRIUM_RPC_CA instead"
+                ));
+            }
+            eprintln!("[warn] IRIUM_RPC_INSECURE=1: TLS verification disabled for https://{host}");
+            allow_insecure = true;
+        }
     }
-    if !insecure && !strict && rpc_base_is_localhost() {
-        insecure = true;
-    }
-    if insecure {
+    if allow_insecure {
         builder = builder.danger_accept_invalid_certs(true);
     }
     builder.build().map_err(|e| format!("build client: {e}"))

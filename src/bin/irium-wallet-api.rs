@@ -34,7 +34,11 @@ struct SubmitTxRequest {
     tx_hex: String,
 }
 
-fn build_client() -> Result<Client, String> {
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn build_client(node_base: &str) -> Result<Client, String> {
     let mut builder = Client::builder().timeout(Duration::from_secs(10));
     if let Ok(path) = env::var("IRIUM_RPC_CA") {
         let pem = std::fs::read(&path).map_err(|e| format!("read CA {path}: {e}"))?;
@@ -50,7 +54,20 @@ fn build_client() -> Result<Client, String> {
         })
         .unwrap_or(false);
     if insecure {
-        builder = builder.danger_accept_invalid_certs(true);
+        let url = reqwest::Url::parse(node_base)
+            .map_err(|e| format!("invalid RPC URL {node_base}: {e}"))?;
+        if url.scheme() != "https" {
+            eprintln!("[warn] IRIUM_RPC_INSECURE=1 has no effect on non-HTTPS RPC URL");
+        } else {
+            let host = url.host_str().ok_or_else(|| "RPC URL missing host".to_string())?;
+            if !is_loopback_host(host) {
+                return Err(format!(
+                    "Refusing to disable TLS verification for non-local RPC host {host}; set IRIUM_RPC_CA instead"
+                ));
+            }
+            eprintln!("[warn] IRIUM_RPC_INSECURE=1: TLS verification disabled for https://{host}");
+            builder = builder.danger_accept_invalid_certs(true);
+        }
     }
     builder.build().map_err(|e| format!("build client: {e}"))
 }
@@ -182,14 +199,14 @@ async fn submit_tx(
 
 #[tokio::main]
 async fn main() {
-    let client = match build_client() {
+    let node_base = env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string());
+    let client = match build_client(&node_base) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to init HTTP client: {e}");
             std::process::exit(1);
         }
     };
-    let node_base = env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string());
     let api_token = env::var("IRIUM_WALLET_API_TOKEN").ok();
     let rpc_token = env::var("IRIUM_RPC_TOKEN").ok();
     let rate = env::var("IRIUM_WALLET_API_RATE_LIMIT_PER_MIN")
