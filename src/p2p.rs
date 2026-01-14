@@ -549,7 +549,7 @@ impl P2PNode {
             if scanned > 10 {
                 break;
             }
-            if current + added >= MAX_PEERS || added >= max_new {
+            if current + added >= max_peers() || added >= max_new {
                 break;
             }
             // Skip peers we just connected to recently.
