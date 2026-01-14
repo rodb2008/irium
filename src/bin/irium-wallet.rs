@@ -734,6 +734,7 @@ fn main() {
                 }
             };
 
+            let base = rpc_url.trim_end_matches('/');
             let client = match rpc_client(base) {
                 Ok(c) => c,
                 Err(e) => {
@@ -741,7 +742,6 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let base = rpc_url.trim_end_matches('/');
             let payload = match fetch_utxos(&client, base, from_addr) {
                 Ok(v) => v,
                 Err(e) => {
