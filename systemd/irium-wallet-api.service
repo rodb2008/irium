@@ -5,7 +5,7 @@ Wants=network-online.target
 Requires=iriumd.service
 
 [Service]
-User=irium
+User=@IRIUM_USER@
 Environment=IRIUM_RPC_WAIT_HOST=127.0.0.1
 Environment=IRIUM_RPC_WAIT_PORT=38300
 EnvironmentFile=-/etc/irium/wallet-api.env

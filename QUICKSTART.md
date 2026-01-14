@@ -144,6 +144,7 @@ source ~/.cargo/env
 ./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm>
 ./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm> --coin-select largest
 ```
+Wallet RPC defaults to `IRIUM_NODE_RPC` (or legacy `IRIUM_RPC_URL`), falling back to http://127.0.0.1:38300. If your node uses HTTPS, set `IRIUM_NODE_RPC=https://...` or pass `--rpc`.
 
 ## 8) SPV check
 ```
@@ -158,6 +159,7 @@ cd /home/irium/irium
 ./install.sh
 ```
 - Edit `/etc/irium/iriumd.env` and `/etc/irium/miner.env` for your paths and wallet.
+- Services run as the user who runs `./install.sh`. Override with `IRIUM_SERVICE_USER=<user> ./install.sh`.
 - Optional API services: `/etc/irium/explorer.env` and `/etc/irium/wallet-api.env`.
 - Enable the miner after setting `IRIUM_MINER_ADDRESS`:
 ```

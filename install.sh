@@ -3,6 +3,15 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+SERVICE_USER="${IRIUM_SERVICE_USER:-}"
+if [ -z "$SERVICE_USER" ]; then
+  if [ -n "${SUDO_USER:-}" ]; then
+    SERVICE_USER="$SUDO_USER"
+  else
+    SERVICE_USER="$(whoami)"
+  fi
+fi
+
 echo "🚀 Installing Irium (Rust)"
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -21,12 +30,14 @@ if ! command -v systemctl >/dev/null 2>&1; then
 fi
 
 echo "🧩 Installing systemd units..."
+echo "Using systemd service user: $SERVICE_USER (override with IRIUM_SERVICE_USER)"
 sudo mkdir -p /etc/irium
 sudo cp systemd/iriumd.service /etc/systemd/system/iriumd.service
 sudo cp systemd/irium-miner.service /etc/systemd/system/irium-miner.service
 sudo cp systemd/irium-explorer.service /etc/systemd/system/irium-explorer.service
 sudo cp systemd/irium-wallet-api.service /etc/systemd/system/irium-wallet-api.service
 sudo sed -i "s|@IRIUM_HOME@|$ROOT_DIR|g" /etc/systemd/system/iriumd.service /etc/systemd/system/irium-miner.service /etc/systemd/system/irium-explorer.service /etc/systemd/system/irium-wallet-api.service
+sudo sed -i "s|@IRIUM_USER@|$SERVICE_USER|g" /etc/systemd/system/iriumd.service /etc/systemd/system/irium-miner.service /etc/systemd/system/irium-explorer.service /etc/systemd/system/irium-wallet-api.service
 
 if [ ! -f /etc/irium/iriumd.env ]; then
   sudo cp systemd/iriumd.env.example /etc/irium/iriumd.env

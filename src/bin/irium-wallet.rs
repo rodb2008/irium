@@ -196,7 +196,9 @@ fn usage() {
 }
 
 fn default_rpc_url() -> String {
-    env::var("IRIUM_RPC_URL").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string())
+    env::var("IRIUM_NODE_RPC")
+        .or_else(|_| env::var("IRIUM_RPC_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:38300".to_string())
 }
 
 fn color_enabled() -> bool {

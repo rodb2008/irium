@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=irium
+User=@IRIUM_USER@
 EnvironmentFile=-/etc/irium/iriumd.env
 WorkingDirectory=@IRIUM_HOME@
 ExecStart=@IRIUM_HOME@/target/release/iriumd

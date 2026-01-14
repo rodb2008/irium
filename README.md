@@ -152,6 +152,7 @@ sudo systemctl enable --now irium-miner.service
 - Miner env: `/etc/irium/miner.env`
 - Explorer env: `/etc/irium/explorer.env` (service `irium-explorer.service`)
 - Wallet API env: `/etc/irium/wallet-api.env` (service `irium-wallet-api.service`)
+- Services run as the user who runs `./install.sh`. Override with `IRIUM_SERVICE_USER=<user> ./install.sh`.
 
 ## Mining
 The miner binary (`irium-miner`) assembles blocks from the local mempool and searches nonces. Always set a payout address so rewards are spendable:
@@ -192,6 +193,7 @@ source ~/.cargo/env
 ./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm>
 ./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm> --coin-select largest
 ```
+- Wallet RPC defaults to `IRIUM_NODE_RPC` (or legacy `IRIUM_RPC_URL`), falling back to http://127.0.0.1:38300. If your node uses HTTPS, set `IRIUM_NODE_RPC=https://...` or pass `--rpc`.
 Use `irium-wallet address-to-pkh <base58_address>` to convert an address to its 20-byte pubkey hash.
 
 ## SPV Tooling
