@@ -246,7 +246,11 @@ fn estimate_tx_size(inputs: usize, outputs: usize) -> u64 {
     10 + inputs as u64 * 148 + outputs as u64 * 34
 }
 
-fn rpc_client() -> Result<Client, String> {
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn rpc_client(base: &str) -> Result<Client, String> {
     let mut builder = Client::builder().timeout(Duration::from_secs(10));
     let ca_path = env::var("IRIUM_RPC_CA").ok().or_else(|| {
         let fallback = Path::new("/etc/irium/tls/irium-ca.crt");
@@ -270,7 +274,20 @@ fn rpc_client() -> Result<Client, String> {
         })
         .unwrap_or(false);
     if insecure {
-        builder = builder.danger_accept_invalid_certs(true);
+        let url = reqwest::Url::parse(base)
+            .map_err(|e| format!("invalid RPC URL {base}: {e}"))?;
+        if url.scheme() != "https" {
+            eprintln!("[warn] IRIUM_RPC_INSECURE=1 has no effect on non-HTTPS RPC URL");
+        } else {
+            let host = url.host_str().ok_or_else(|| "RPC URL missing host".to_string())?;
+            if !is_loopback_host(host) {
+                return Err(format!(
+                    "Refusing to disable TLS verification for non-local RPC host {host}; set IRIUM_RPC_CA instead"
+                ));
+            }
+            eprintln!("[warn] IRIUM_RPC_INSECURE=1: TLS verification disabled for https://{host}");
+            builder = builder.danger_accept_invalid_certs(true);
+        }
     }
     builder.build().map_err(|e| format!("build client: {e}"))
 }
@@ -475,7 +492,7 @@ fn main() {
                 rpc_url = args[3].clone();
             }
             let base = rpc_url.trim_end_matches('/');
-            let client = match rpc_client() {
+            let client = match rpc_client(base) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Failed to init HTTP client: {}", e);
@@ -518,7 +535,7 @@ fn main() {
                 rpc_url = args[3].clone();
             }
             let base = rpc_url.trim_end_matches('/');
-            let client = match rpc_client() {
+            let client = match rpc_client(base) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Failed to init HTTP client: {}", e);
@@ -568,7 +585,7 @@ fn main() {
                 rpc_url = args[3].clone();
             }
             let base = rpc_url.trim_end_matches('/');
-            let client = match rpc_client() {
+            let client = match rpc_client(base) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Failed to init HTTP client: {}", e);
@@ -615,7 +632,7 @@ fn main() {
                 std::process::exit(1);
             }
             let base = rpc_url.trim_end_matches('/');
-            let client = match rpc_client() {
+            let client = match rpc_client(base) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Failed to init HTTP client: {}", e);
@@ -717,7 +734,7 @@ fn main() {
                 }
             };
 
-            let client = match rpc_client() {
+            let client = match rpc_client(base) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Failed to init HTTP client: {}", e);

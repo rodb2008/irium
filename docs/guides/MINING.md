@@ -64,6 +64,6 @@ Notes:
 - RPC unauthorized: ensure `IRIUM_RPC_TOKEN` matches the node.
 - Empty RPC token: remove `IRIUM_RPC_TOKEN=` or set a real token in `/etc/irium/*.env`.
 - HTTPS mismatch: set `IRIUM_NODE_RPC=https://127.0.0.1:38300` if the node is running TLS.
-- TLS verify errors: set `IRIUM_RPC_CA=/etc/irium/tls/irium-ca.crt` (or your CA) instead of `IRIUM_RPC_INSECURE=1`.
+- TLS verify errors: set `IRIUM_RPC_CA=/etc/irium/tls/irium-ca.crt` (or your CA). `IRIUM_RPC_INSECURE=1` only works for localhost.
 - No templates: confirm node is running and reachable at `IRIUM_NODE_RPC`.
 - Low hashrate: check CPU governor and ensure the miner is not throttled.

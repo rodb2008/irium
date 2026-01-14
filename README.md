@@ -125,7 +125,7 @@ cargo test --quiet
 - `IRIUM_BANNED_LIST` / `IRIUM_BANNED_TRUST`: optional signed banlist path and allowed signer file (default `bootstrap/banned_peers.txt` + `.sig`, `bootstrap/trust/allowed_ban_signers`).
 - `IRIUM_TLS_CERT` / `IRIUM_TLS_KEY`: PEM paths to enable HTTPS for the HTTP API (if unset, HTTP is used).
 - `IRIUM_RPC_CA`: optional PEM CA/cert to trust when calling HTTPS RPC endpoints.
-- `IRIUM_RPC_INSECURE`: set to `1` to skip TLS validation for HTTPS RPC calls (dev-only).
+- `IRIUM_RPC_INSECURE`: set to `1` to skip TLS validation for `https://localhost` or `https://127.0.0.1` only (dev-only). For anything else, use `IRIUM_RPC_CA`.
 - `IRIUM_RPC_TOKEN`: optional bearer token required for `POST /rpc/submit_block` and `POST /rpc/submit_tx`.
 - `IRIUM_RPC_BODY_MAX`: max HTTP RPC body size in bytes (default 32MB).
 - `IRIUM_NODE_PUBLIC_IP` / `IRIUM_PUBLIC_IP`: optional public IP override for seed nodes.
@@ -169,7 +169,7 @@ source ~/.cargo/env
 - If you run only the miner, point it at a reachable node RPC with `IRIUM_NODE_RPC=http://<node>:38300` (and `IRIUM_RPC_TOKEN` if required).
 - If the node is running HTTPS + `IRIUM_RPC_TOKEN`, set `IRIUM_NODE_RPC=https://127.0.0.1:38300` and export the same `IRIUM_RPC_TOKEN` for the miner.
 - If `IRIUM_RPC_TOKEN` is set to an empty value in env files, miners will still send an empty token and get 401; either remove the line or set a real token.
-- For HTTPS with a local self-signed cert, set `IRIUM_RPC_CA=/etc/irium/tls/irium-ca.crt` instead of `IRIUM_RPC_INSECURE=1`.
+- For HTTPS with a local self-signed cert, set `IRIUM_RPC_CA=/etc/irium/tls/irium-ca.crt` instead of `IRIUM_RPC_INSECURE=1` (which only works for localhost).
 - The miner pulls templates from `/rpc/getblocktemplate` and honors `IRIUM_GBT_MAX_TXS`, `IRIUM_GBT_MIN_FEE`, `IRIUM_GBT_LONGPOLL`, and `IRIUM_GBT_LONGPOLL_SECS`.
 - If you see `HTTP 429 Too Many Requests`, set `IRIUM_RPC_TOKEN` in both `iriumd` and the miner, or raise `IRIUM_RATE_LIMIT_PER_MIN` in the node env.
 - Set `IRIUM_MINER_STRICT_RPC=1` to stop mining if RPC/template fetch fails.
