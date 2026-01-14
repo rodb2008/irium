@@ -30,7 +30,7 @@ use serde_json::json;
 
 /// Minimal P2P node skeleton: accepts incoming connections and can
 /// broadcast raw block bytes to all connected peers.
-const MAX_PEERS: usize = 100;
+const DEFAULT_MAX_PEERS: usize = 100;
 const MAX_MSGS_PER_SEC: u32 = 200;
 
 fn sync_cooldown() -> Duration {
@@ -77,6 +77,14 @@ fn getblocks_grace() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(8);
     Duration::from_secs(secs.max(2).min(60))
+}
+
+fn max_peers() -> usize {
+    let val = std::env::var("IRIUM_P2P_MAX_PEERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_PEERS);
+    val.clamp(10, 500)
 }
 
 async fn getblocks_request_allowed(
@@ -403,7 +411,7 @@ impl P2PNode {
                         drop(log_guard);
 
                         let current = peers_arc.lock().await.len();
-                        if current >= MAX_PEERS {
+                        if current >= max_peers() {
                             Self::log_err(format!("Rejecting inbound {}: max peers reached", addr));
                             continue;
                         }
