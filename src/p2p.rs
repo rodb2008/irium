@@ -79,6 +79,29 @@ fn getblocks_grace() -> Duration {
     Duration::from_secs(secs.max(2).min(60))
 }
 
+fn genesis_grace() -> Duration {
+    let secs = std::env::var("IRIUM_P2P_GENESIS_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    Duration::from_secs(secs.max(30).min(3600))
+}
+
+async fn genesis_request_allowed(
+    requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    ip: IpAddr,
+) -> bool {
+    let mut guard = requests.lock().await;
+    let now = Instant::now();
+    if let Some(last) = guard.get(&ip) {
+        if now.duration_since(*last) < genesis_grace() {
+            return false;
+        }
+    }
+    guard.insert(ip, now);
+    true
+}
+
 fn max_peers() -> usize {
     let val = std::env::var("IRIUM_P2P_MAX_PEERS")
         .ok()
@@ -120,6 +143,7 @@ pub struct P2PNode {
     block_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     getblocks_seen: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     getblocks_last: Arc<Mutex<HashMap<IpAddr, (Vec<u8>, u32, Instant)>>>,
+    getblocks_genesis: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     dynamic_bans: Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
@@ -341,6 +365,7 @@ impl P2PNode {
             block_requests: Arc::new(Mutex::new(HashMap::new())),
             getblocks_seen: Arc::new(Mutex::new(HashMap::new())),
             getblocks_last: Arc::new(Mutex::new(HashMap::new())),
+            getblocks_genesis: Arc::new(Mutex::new(HashMap::new())),
             self_ips: Arc::new(Mutex::new(HashSet::new())),
             dynamic_bans: Arc::new(StdMutex::new(HashMap::new())),
             chain,
@@ -374,6 +399,7 @@ impl P2PNode {
         let block_requests = self.block_requests.clone();
         let getblocks_seen = self.getblocks_seen.clone();
         let getblocks_last = self.getblocks_last.clone();
+        let getblocks_genesis = self.getblocks_genesis.clone();
         let self_ips = self.self_ips.clone();
         let dynamic_bans = self.dynamic_bans.clone();
         let node_id = self.node_id.clone();
@@ -430,6 +456,7 @@ impl P2PNode {
                         let block_peer = block_requests.clone();
                         let getblocks_peer = getblocks_seen.clone();
                         let getblocks_last_peer = getblocks_last.clone();
+                        let getblocks_genesis_peer = getblocks_genesis.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_incoming_with_sybil(
                                 socket,
@@ -443,6 +470,7 @@ impl P2PNode {
                                 block_peer,
                                 getblocks_peer,
                                 getblocks_last_peer,
+                                getblocks_genesis_peer,
                                 self_ip_peer,
                                 chain_peer,
                                 mempool_peer,
@@ -846,6 +874,7 @@ impl P2PNode {
         let block_requests = self.block_requests.clone();
         let getblocks_seen = self.getblocks_seen.clone();
         let getblocks_last = self.getblocks_last.clone();
+        let getblocks_genesis = self.getblocks_genesis.clone();
         let self_ips = self.self_ips.clone();
         let peers_vec = self.peers.clone();
         let connected_vec = self.connected.clone();
@@ -871,7 +900,7 @@ impl P2PNode {
                     Ok(msg) => {
                         if P2PNode::verbose_messages() {
                             match msg.msg_type {
-                                MessageType::Ping | MessageType::Pong | MessageType::Handshake | MessageType::Peers | MessageType::GetPeers | MessageType::GetHeaders | MessageType::GetBlocks | MessageType::Headers => {}
+                                MessageType::Ping | MessageType::Pong | MessageType::Handshake | MessageType::Peers | MessageType::GetPeers | MessageType::GetHeaders | MessageType::GetBlocks | MessageType::Headers | MessageType::Block => {}
                                 _ => {
                                     P2PNode::log_event(
                                         "info",
@@ -1200,22 +1229,38 @@ impl P2PNode {
                                             addr.ip(),
                                             &payload.start_hash,
                                             payload.count,
-                                        ).await
-                                        {
+                                        ).await {
+                                            continue;
+                                        }
+                                        let is_zero = payload.start_hash.iter().all(|b| *b == 0);
+                                        let (start_idx, matched_pos) = {
+                                            let guard = chain_arc.lock().unwrap();
+                                            let mut start_idx = 0usize;
+                                            let mut matched_pos = None;
+                                            if payload.start_hash.len() == 32 {
+                                                let mut target = [0u8; 32];
+                                                target.copy_from_slice(&payload.start_hash);
+                                                if let Some(pos) = guard.chain.iter().position(|b| b.header.hash() == target) {
+                                                    start_idx = pos + 1;
+                                                    matched_pos = Some(pos);
+                                                }
+                                            }
+                                            (start_idx, matched_pos)
+                                        };
+                                        if matched_pos.is_none() && !is_zero {
+                                            P2PNode::log_event(
+                                                "warn",
+                                                "sync",
+                                                format!("P2P {}: ignoring getblocks unknown start hash {}", addr, hex::encode(&payload.start_hash)),
+                                            );
+                                            continue;
+                                        }
+                                        let genesis_locator = is_zero || matches!(matched_pos, Some(0));
+                                        if genesis_locator && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await {
                                             continue;
                                         }
                                         let (blocks, start_height) = {
                                             let guard = chain_arc.lock().unwrap();
-                                            let mut start_idx = 0usize;
-                                            if payload.start_hash.len() == 32 {
-                                                let mut target = [0u8; 32];
-                                                target.copy_from_slice(&payload.start_hash);
-                                                if let Some(pos) =
-                                                    guard.chain.iter().position(|b| b.header.hash() == target)
-                                                {
-                                                    start_idx = pos + 1;
-                                                }
-                                            }
                                             let mut blocks = Vec::new();
                                             let mut heights = Vec::new();
                                             let count = payload.count.min(MAX_BLOCKS_PER_REQUEST) as usize;
@@ -1234,13 +1279,7 @@ impl P2PNode {
                                         };
                                         if !blocks.is_empty() {
                                             let end_h = start_height + blocks.len() as u64 - 1;
-                                            P2PNode::log(format!(
-                                                "P2P {}: sending {} blocks [{}-{}]",
-                                                addr,
-                                                blocks.len(),
-                                                start_height,
-                                                end_h
-                                            ));
+                                            P2PNode::log(format!("P2P {}: sending {} blocks [{}-{}]", addr, blocks.len(), start_height, end_h));
                                         }
                                         for block_data in blocks {
                                             let msg = BlockPayload { block_data }.to_message();
@@ -1633,6 +1672,7 @@ async fn handle_incoming_with_sybil(
     block_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     getblocks_seen: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     getblocks_last: Arc<Mutex<HashMap<IpAddr, (Vec<u8>, u32, Instant)>>>,
+    getblocks_genesis: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
@@ -1803,7 +1843,7 @@ async fn handle_incoming_with_sybil(
 
         if P2PNode::verbose_messages() {
             match msg.msg_type {
-                MessageType::Ping | MessageType::Pong | MessageType::Handshake | MessageType::Peers | MessageType::GetPeers | MessageType::GetHeaders | MessageType::GetBlocks | MessageType::Headers => {}
+                MessageType::Ping | MessageType::Pong | MessageType::Handshake | MessageType::Peers | MessageType::GetPeers | MessageType::GetHeaders | MessageType::GetBlocks | MessageType::Headers | MessageType::Block => {}
                 _ => {
                     P2PNode::log_event("info", "net", format!("P2P {}: recv {:?}", addr, msg.msg_type));
                 }
@@ -2105,30 +2145,47 @@ async fn handle_incoming_with_sybil(
                             addr.ip(),
                             &payload.start_hash,
                             payload.count,
-                        ).await
-                        {
+                        ).await {
+                            continue;
+                        }
+                        let is_zero = payload.start_hash.iter().all(|b| *b == 0);
+                        let (start_idx, matched_pos) = {
+                            let guard = chain_arc.lock().unwrap();
+                            let mut start_idx = 0usize;
+                            let mut matched_pos = None;
+                            if payload.start_hash.len() == 32 {
+                                let mut target = [0u8; 32];
+                                target.copy_from_slice(&payload.start_hash);
+                                if let Some(pos) = guard.chain.iter().position(|b| b.header.hash() == target) {
+                                    start_idx = pos + 1;
+                                    matched_pos = Some(pos);
+                                }
+                            }
+                            (start_idx, matched_pos)
+                        };
+                        if matched_pos.is_none() && !is_zero {
+                            P2PNode::log_event(
+                                "warn",
+                                "sync",
+                                format!("P2P {}: ignoring getblocks unknown start hash {}", addr, hex::encode(&payload.start_hash)),
+                            );
+                            continue;
+                        }
+                        let genesis_locator = is_zero || matches!(matched_pos, Some(0));
+                        if genesis_locator && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await {
                             continue;
                         }
                         let (blocks, start_height) = {
                             let guard = chain_arc.lock().unwrap();
-                            let mut start_idx = 0usize;
-                            if payload.start_hash.len() == 32 {
-                                let mut target = [0u8; 32];
-                                target.copy_from_slice(&payload.start_hash);
-                                if let Some(pos) =
-                                    guard.chain.iter().position(|b| b.header.hash() == target)
-                                {
-                                    start_idx = pos + 1;
-                                }
-                            }
                             let mut blocks = Vec::new();
                             let mut heights = Vec::new();
+                            let count = payload.count.min(MAX_BLOCKS_PER_REQUEST) as usize;
                             for (idx, b) in guard
                                 .chain
                                 .iter()
                                 .enumerate()
                                 .skip(start_idx)
-                                .take(payload.count as usize)
+                                .take(count)
                             {
                                 blocks.push(b.serialize());
                                 heights.push(idx as u64);
@@ -2138,13 +2195,7 @@ async fn handle_incoming_with_sybil(
                         };
                         if !blocks.is_empty() {
                             let end_h = start_height + blocks.len() as u64 - 1;
-                            P2PNode::log(format!(
-                                "P2P {}: sending {} blocks [{}-{}]",
-                                addr,
-                                blocks.len(),
-                                start_height,
-                                end_h
-                            ));
+                            P2PNode::log(format!("P2P {}: sending {} blocks [{}-{}]", addr, blocks.len(), start_height, end_h));
                         }
                         for block_data in blocks {
                             let msg = BlockPayload { block_data }.to_message();
