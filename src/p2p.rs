@@ -887,6 +887,7 @@ impl P2PNode {
             let mut window_start = Instant::now();
             let mut last_handshake_height: Option<u64> = None;
             let mut last_handshake_agent: Option<String> = None;
+            let mut last_handshake_tip: Option<[u8; 32]> = None;
             loop {
                 if window_start.elapsed() < Duration::from_secs(1) {
                     msg_count += 1;
@@ -945,6 +946,17 @@ impl P2PNode {
                                     }
                                     let agent_str = payload.agent.clone();
                                     let node_id = payload.node_id.clone();
+                                    let parsed_tip = payload
+                                        .tip_hash
+                                        .as_ref()
+                                        .and_then(|h| hex::decode(h).ok())
+                                        .and_then(|b| if b.len() == 32 {
+                                            let mut arr = [0u8; 32];
+                                            arr.copy_from_slice(&b);
+                                            Some(arr)
+                                        } else {
+                                            None
+                                        });
                                     {
                                         let mut dir_guard = dir.lock().await;
                                         let multiaddr =
@@ -967,6 +979,7 @@ impl P2PNode {
                                     }
                                     last_handshake_height = Some(payload.height);
                                     last_handshake_agent = Some(agent_str.clone());
+                                    last_handshake_tip = parsed_tip;
                                     // If we have a relay address, advertise it back.
                                     if let Some(relay) = relay_addr.clone() {
                                         let relay_msg = RelayAddressPayload {
@@ -1244,7 +1257,13 @@ impl P2PNode {
                                             }
                                         };
                                         let fallback = if request.is_none() && header_count > 0 {
-                                            Some((P2PNode::tip_hash(&chain_for_sync), header_count))
+                                            let local_tip = P2PNode::tip_hash(&chain_for_sync);
+                                            let start = if last_handshake_tip.is_some() && last_handshake_tip != Some(local_tip) {
+                                                [0u8; 32]
+                                            } else {
+                                                local_tip
+                                            };
+                                            Some((start, header_count))
                                         } else {
                                             None
                                         };
@@ -1872,6 +1891,7 @@ async fn handle_incoming_with_sybil(
 
     let mut msg_count: u32 = 0;
     let mut window_start = Instant::now();
+    let mut last_handshake_tip: Option<[u8; 32]> = None;
     // Process messages from the peer.
     loop {
         if window_start.elapsed() < Duration::from_secs(1) {
@@ -1930,6 +1950,19 @@ async fn handle_incoming_with_sybil(
                         );
                         dir.record_height(&multiaddr, payload.height);
                     }
+
+                    let parsed_tip = payload
+                        .tip_hash
+                        .as_ref()
+                        .and_then(|h| hex::decode(h).ok())
+                        .and_then(|b| if b.len() == 32 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&b);
+                            Some(arr)
+                        } else {
+                            None
+                        });
+                    last_handshake_tip = parsed_tip;
 
                     let response = HandshakePayload {
                         version: payload.version,
@@ -2206,7 +2239,13 @@ async fn handle_incoming_with_sybil(
                             }
                         };
                         let fallback = if request.is_none() && header_count > 0 {
-                            Some((P2PNode::tip_hash(&chain), header_count))
+                            let local_tip = P2PNode::tip_hash(&chain);
+                            let start = if last_handshake_tip.is_some() && last_handshake_tip != Some(local_tip) {
+                                [0u8; 32]
+                            } else {
+                                local_tip
+                            };
+                            Some((start, header_count))
                         } else {
                             None
                         };
