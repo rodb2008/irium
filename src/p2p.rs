@@ -1197,7 +1197,8 @@ impl P2PNode {
                                         let header_count = (payload.headers.len() / 80) as u32;
                                         let mut offset = 0usize;
                                         let mut last_header_hash: Option<[u8; 32]> = None;
-                                        let mut unknown_parent = false;
+                                        let mut header_error = false;
+                                        let mut reset_headers = false;
 
                                         while offset + 80 <= payload.headers.len() {
                                             let slice = &payload.headers[offset..offset + 80];
@@ -1214,10 +1215,16 @@ impl P2PNode {
                                             {
                                                 let mut guard = chain_arc.lock().unwrap();
                                                 if let Err(e) = guard.add_header(header.clone()) {
+                                                    header_error = true;
                                                     if e.contains("unknown parent") {
-                                                        unknown_parent = true;
-                                                        guard.headers.clear();
-                                                        guard.header_chain.clear();
+                                                        if let Some(peer_height) = last_handshake_height {
+                                                            let local_height = guard.tip_height();
+                                                            if peer_height > local_height {
+                                                                reset_headers = true;
+                                                                guard.headers.clear();
+                                                                guard.header_chain.clear();
+                                                            }
+                                                        }
                                                     }
                                                     eprintln!("Header from {} rejected: {}", addr, e);
                                                     break;
@@ -1225,14 +1232,16 @@ impl P2PNode {
                                             }
                                         }
 
-                                        if unknown_parent {
-                                            if sync_request_allowed(&sync_requests, addr.ip()).await {
-                                                let get_headers = GetHeadersPayload {
-                                                    start_hash: vec![0u8; 32],
-                                                    count: MAX_HEADERS_PER_REQUEST,
-                                                };
-                                                if let Ok(msg) = get_headers.to_message() {
-                                                    let _ = send_message(&writer, msg, addr).await;
+                                        if header_error {
+                                            if reset_headers {
+                                                if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                                    let get_headers = GetHeadersPayload {
+                                                        start_hash: vec![0u8; 32],
+                                                        count: MAX_HEADERS_PER_REQUEST,
+                                                    };
+                                                    if let Ok(msg) = get_headers.to_message() {
+                                                        let _ = send_message(&writer, msg, addr).await;
+                                                    }
                                                 }
                                             }
                                             continue;
@@ -1936,6 +1945,7 @@ async fn handle_incoming_with_sybil(
     let mut msg_count: u32 = 0;
     let mut window_start = Instant::now();
     let mut last_handshake_tip: Option<[u8; 32]> = None;
+    let mut last_handshake_height: Option<u64> = None;
     // Process messages from the peer.
     loop {
         if window_start.elapsed() < Duration::from_secs(1) {
@@ -2007,6 +2017,7 @@ async fn handle_incoming_with_sybil(
                             None
                         });
                     last_handshake_tip = parsed_tip;
+                    last_handshake_height = Some(payload.height);
 
                     let response = HandshakePayload {
                         version: payload.version,
@@ -2220,7 +2231,8 @@ async fn handle_incoming_with_sybil(
                         let header_count = (payload.headers.len() / 80) as u32;
                         let mut offset = 0usize;
                         let mut last_header_hash: Option<[u8; 32]> = None;
-                        let mut unknown_parent = false;
+                        let mut header_error = false;
+                        let mut reset_headers = false;
 
                         while offset + 80 <= payload.headers.len() {
                             let slice = &payload.headers[offset..offset + 80];
@@ -2237,10 +2249,16 @@ async fn handle_incoming_with_sybil(
                             {
                                 let mut guard = chain_arc.lock().unwrap();
                                 if let Err(e) = guard.add_header(header.clone()) {
+                                    header_error = true;
                                     if e.contains("unknown parent") {
-                                        unknown_parent = true;
-                                        guard.headers.clear();
-                                        guard.header_chain.clear();
+                                        if let Some(peer_height) = last_handshake_height {
+                                            let local_height = guard.tip_height();
+                                            if peer_height > local_height {
+                                                reset_headers = true;
+                                                guard.headers.clear();
+                                                guard.header_chain.clear();
+                                            }
+                                        }
                                     }
                                     eprintln!("Header from {} rejected: {}", addr, e);
                                     break;
@@ -2248,14 +2266,16 @@ async fn handle_incoming_with_sybil(
                             }
                         }
 
-                        if unknown_parent {
-                            if sync_request_allowed(&sync_requests, addr.ip()).await {
-                                let get_headers = GetHeadersPayload {
-                                    start_hash: vec![0u8; 32],
-                                    count: MAX_HEADERS_PER_REQUEST,
-                                };
-                                if let Ok(msg) = get_headers.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
+                        if header_error {
+                            if reset_headers {
+                                if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                    let get_headers = GetHeadersPayload {
+                                        start_hash: vec![0u8; 32],
+                                        count: MAX_HEADERS_PER_REQUEST,
+                                    };
+                                    if let Ok(msg) = get_headers.to_message() {
+                                        let _ = send_message(&writer, msg, addr).await;
+                                    }
                                 }
                             }
                             continue;
