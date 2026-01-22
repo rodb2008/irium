@@ -1015,7 +1015,7 @@ impl P2PNode {
                                             let start_hash = P2PNode::tip_hash(&chain_for_sync);
                                             let get_headers = GetHeadersPayload {
                                                 start_hash: start_hash.to_vec(),
-                                                count: 64,
+                                                count: MAX_HEADERS_PER_REQUEST,
                                             };
                                             let short = {
                                                 let h = hex::encode(start_hash);
@@ -1178,11 +1178,13 @@ impl P2PNode {
                             MessageType::Headers => {
                                 if let Some(ref chain_arc) = chain_for_sync {
                                     if let Ok(payload) = HeadersPayload::from_message(&msg) {
+                                        let header_count = (payload.headers.len() / 80) as u32;
                                         let mut offset = 0usize;
+                                        let mut last_header_hash: Option<[u8; 32]> = None;
+
                                         while offset + 80 <= payload.headers.len() {
                                             let slice = &payload.headers[offset..offset + 80];
-                                            let (header, used) = match crate::block::BlockHeader::deserialize(slice)
-                                            {
+                                            let (header, used) = match crate::block::BlockHeader::deserialize(slice) {
                                                 Ok(v) => v,
                                                 Err(e) => {
                                                     eprintln!("Failed to parse header from {}: {}", addr, e);
@@ -1190,6 +1192,7 @@ impl P2PNode {
                                                 }
                                             };
                                             offset += used;
+                                            last_header_hash = Some(header.hash());
 
                                             {
                                                 let mut guard = chain_arc.lock().unwrap();
@@ -1200,26 +1203,33 @@ impl P2PNode {
                                             }
                                         }
 
-                                        if let Some(ref chain_arc) = chain_for_sync {
-                                            let header_count = (payload.headers.len() / 80) as u32;
-                                            let request = {
-                                                let guard = chain_arc.lock().unwrap();
-                                                if let Some(best) = guard.best_header_if_better() {
-                                                    if let Some(path) =
-                                                        guard.header_path_to_known(best.header.hash())
-                                                    {
-                                                        if let Some(first_hash) = path.first() {
-                                                            let start_hash = guard
-                                                                .headers
-                                                                .get(first_hash)
-                                                                .map(|hw| hw.header.prev_hash)
-                                                                .unwrap_or([0u8; 32]);
-                                                            let count = path.len() as u32;
-                                                            if count > 0 {
-                                                                Some((start_hash, count))
-                                                            } else {
-                                                                None
-                                                            }
+                                        if header_count >= MAX_HEADERS_PER_REQUEST {
+                                            if let Some(last_hash) = last_header_hash {
+                                                if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                                    let get_headers = GetHeadersPayload {
+                                                        start_hash: last_hash.to_vec(),
+                                                        count: MAX_HEADERS_PER_REQUEST,
+                                                    };
+                                                    if let Ok(msg) = get_headers.to_message() {
+                                                        let _ = send_message(&writer, msg, addr).await;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        let request = {
+                                            let guard = chain_arc.lock().unwrap();
+                                            if let Some(best) = guard.best_header_if_better() {
+                                                if let Some(path) = guard.header_path_to_known(best.header.hash()) {
+                                                    if let Some(first_hash) = path.first() {
+                                                        let start_hash = guard
+                                                            .headers
+                                                            .get(first_hash)
+                                                            .map(|hw| hw.header.prev_hash)
+                                                            .unwrap_or([0u8; 32]);
+                                                        let count = path.len() as u32;
+                                                        if count > 0 {
+                                                            Some((start_hash, count))
                                                         } else {
                                                             None
                                                         }
@@ -1229,28 +1239,30 @@ impl P2PNode {
                                                 } else {
                                                     None
                                                 }
-                                            };
-                                            let fallback = if request.is_none() && header_count > 0 {
-                                                Some((P2PNode::tip_hash(&chain_for_sync), header_count))
                                             } else {
                                                 None
+                                            }
+                                        };
+                                        let fallback = if request.is_none() && header_count > 0 {
+                                            Some((P2PNode::tip_hash(&chain_for_sync), header_count))
+                                        } else {
+                                            None
+                                        };
+                                        if let Some((start_hash, count)) = request.or(fallback) {
+                                            let get_blocks = GetBlocksPayload {
+                                                start_hash: start_hash.to_vec(),
+                                                count,
                                             };
-                                            if let Some((start_hash, count)) = request.or(fallback) {
-                                                let get_blocks = GetBlocksPayload {
-                                                    start_hash: start_hash.to_vec(),
-                                                    count,
-                                                };
-                                                if sync_block_request_allowed(&block_requests, addr.ip()).await {
-                                                    if let Ok(msg) = get_blocks.to_message() {
-                                                        let _ = send_message(&writer, msg, addr).await;
-                                                    }
+                                            if sync_block_request_allowed(&block_requests, addr.ip()).await {
+                                                if let Ok(msg) = get_blocks.to_message() {
+                                                    let _ = send_message(&writer, msg, addr).await;
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
-                            MessageType::GetBlocks => {
+            MessageType::GetBlocks => {
                                 {
                                     let mut guard = getblocks_seen.lock().await;
                                     guard.insert(addr.ip(), Instant::now());
@@ -1965,7 +1977,7 @@ async fn handle_incoming_with_sybil(
                             let start_hash = P2PNode::tip_hash(&chain);
                             let get_headers = GetHeadersPayload {
                                 start_hash: start_hash.to_vec(),
-                                count: 64,
+                                count: MAX_HEADERS_PER_REQUEST,
                             };
                             if let Ok(msg) = get_headers.to_message() {
                                 let _ = send_message(&writer, msg, addr).await;
@@ -2128,11 +2140,13 @@ async fn handle_incoming_with_sybil(
             MessageType::Headers => {
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = HeadersPayload::from_message(&msg) {
+                        let header_count = (payload.headers.len() / 80) as u32;
                         let mut offset = 0usize;
+                        let mut last_header_hash: Option<[u8; 32]> = None;
+
                         while offset + 80 <= payload.headers.len() {
                             let slice = &payload.headers[offset..offset + 80];
-                            let (header, used) = match crate::block::BlockHeader::deserialize(slice)
-                            {
+                            let (header, used) = match crate::block::BlockHeader::deserialize(slice) {
                                 Ok(v) => v,
                                 Err(e) => {
                                     eprintln!("Failed to parse header from {}: {}", addr, e);
@@ -2140,6 +2154,7 @@ async fn handle_incoming_with_sybil(
                                 }
                             };
                             offset += used;
+                            last_header_hash = Some(header.hash());
 
                             {
                                 let mut guard = chain_arc.lock().unwrap();
@@ -2150,27 +2165,33 @@ async fn handle_incoming_with_sybil(
                             }
                         }
 
-                        // After processing headers, check if a better-work fork exists and request its blocks.
-                        if let Some(ref chain_arc) = chain {
-                            let header_count = (payload.headers.len() / 80) as u32;
-                            let request = {
-                                let guard = chain_arc.lock().unwrap();
-                                if let Some(best) = guard.best_header_if_better() {
-                                    if let Some(path) =
-                                        guard.header_path_to_known(best.header.hash())
-                                    {
-                                        if let Some(first_hash) = path.first() {
-                                            let start_hash = guard
-                                                .headers
-                                                .get(first_hash)
-                                                .map(|hw| hw.header.prev_hash)
-                                                .unwrap_or([0u8; 32]);
-                                            let count = path.len() as u32;
-                                            if count > 0 {
-                                                Some((start_hash, count))
-                                            } else {
-                                                None
-                                            }
+                        if header_count >= MAX_HEADERS_PER_REQUEST {
+                            if let Some(last_hash) = last_header_hash {
+                                if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                    let get_headers = GetHeadersPayload {
+                                        start_hash: last_hash.to_vec(),
+                                        count: MAX_HEADERS_PER_REQUEST,
+                                    };
+                                    if let Ok(msg) = get_headers.to_message() {
+                                        let _ = send_message(&writer, msg, addr).await;
+                                    }
+                                }
+                            }
+                        }
+
+                        let request = {
+                            let guard = chain_arc.lock().unwrap();
+                            if let Some(best) = guard.best_header_if_better() {
+                                if let Some(path) = guard.header_path_to_known(best.header.hash()) {
+                                    if let Some(first_hash) = path.first() {
+                                        let start_hash = guard
+                                            .headers
+                                            .get(first_hash)
+                                            .map(|hw| hw.header.prev_hash)
+                                            .unwrap_or([0u8; 32]);
+                                        let count = path.len() as u32;
+                                        if count > 0 {
+                                            Some((start_hash, count))
                                         } else {
                                             None
                                         }
@@ -2180,21 +2201,23 @@ async fn handle_incoming_with_sybil(
                                 } else {
                                     None
                                 }
-                            };
-                            let fallback = if request.is_none() && header_count > 0 {
-                                Some((P2PNode::tip_hash(&chain), header_count))
                             } else {
                                 None
+                            }
+                        };
+                        let fallback = if request.is_none() && header_count > 0 {
+                            Some((P2PNode::tip_hash(&chain), header_count))
+                        } else {
+                            None
+                        };
+                        if let Some((start_hash, count)) = request.or(fallback) {
+                            let get_blocks = GetBlocksPayload {
+                                start_hash: start_hash.to_vec(),
+                                count,
                             };
-                            if let Some((start_hash, count)) = request.or(fallback) {
-                                let get_blocks = GetBlocksPayload {
-                                    start_hash: start_hash.to_vec(),
-                                    count,
-                                };
-                                if sync_block_request_allowed(&block_requests, addr.ip()).await {
-                                    if let Ok(msg) = get_blocks.to_message() {
-                                        let _ = send_message(&writer, msg, addr).await;
-                                    }
+                            if sync_block_request_allowed(&block_requests, addr.ip()).await {
+                                if let Ok(msg) = get_blocks.to_message() {
+                                    let _ = send_message(&writer, msg, addr).await;
                                 }
                             }
                         }
