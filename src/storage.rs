@@ -2,7 +2,46 @@ use std::{env, fs, path::PathBuf};
 
 use serde::Serialize;
 
+use sha2::{Digest, Sha256};
+use bs58;
+
 use crate::block::Block;
+
+const IRIUM_P2PKH_VERSION: u8 = 0x39;
+
+fn p2pkh_hash_from_script(script: &[u8]) -> Option<[u8; 20]> {
+    if script.len() != 25 {
+        return None;
+    }
+    if script[0] != 0x76 || script[1] != 0xa9 || script[2] != 0x14 {
+        return None;
+    }
+    if script[23] != 0x88 || script[24] != 0xac {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&script[3..23]);
+    Some(out)
+}
+
+fn base58_p2pkh_from_hash(pkh: &[u8; 20]) -> String {
+    let mut body = Vec::with_capacity(1 + 20);
+    body.push(IRIUM_P2PKH_VERSION);
+    body.extend_from_slice(pkh);
+    let first = Sha256::digest(&body);
+    let second = Sha256::digest(&first);
+    let checksum = &second[0..4];
+    let mut full = body;
+    full.extend_from_slice(checksum);
+    bs58::encode(full).into_string()
+}
+
+fn miner_address_from_block(block: &Block) -> Option<String> {
+    let tx = block.transactions.first()?;
+    let output = tx.outputs.first()?;
+    let pkh = p2pkh_hash_from_script(&output.script_pubkey)?;
+    Some(base58_p2pkh_from_hash(&pkh))
+}
 
 #[derive(Serialize)]
 struct JsonHeader {
@@ -20,6 +59,8 @@ struct JsonBlock {
     height: u64,
     header: JsonHeader,
     tx_hex: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    miner_address: Option<String>,
 }
 
 pub fn blocks_dir() -> PathBuf {
@@ -55,6 +96,7 @@ pub fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
             .iter()
             .map(|tx| hex::encode(tx.serialize()))
             .collect(),
+        miner_address: miner_address_from_block(block),
     };
 
     let json = serde_json::to_string_pretty(&jb)?;

@@ -35,6 +35,8 @@ use irium_node_rs::reputation::ReputationManager;
 use irium_node_rs::tx::{decode_full_tx, Transaction, TxInput, TxOutput};
 use get_if_addrs::get_if_addrs;
 
+const IRIUM_P2PKH_VERSION: u8 = 0x39;
+
 #[derive(Clone)]
 struct AppState {
     chain: Arc<Mutex<ChainState>>,
@@ -463,6 +465,35 @@ fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
     }
     Some(payload.to_vec())
 }
+
+fn base58_p2pkh_from_hash(pkh: &[u8; 20]) -> String {
+    let mut body = Vec::with_capacity(1 + 20);
+    body.push(IRIUM_P2PKH_VERSION);
+    body.extend_from_slice(pkh);
+    let first = Sha256::digest(&body);
+    let second = Sha256::digest(&first);
+    let checksum = &second[0..4];
+    let mut full = body;
+    full.extend_from_slice(checksum);
+    bs58::encode(full).into_string()
+}
+
+fn miner_address_from_tx(tx: &Transaction) -> Option<String> {
+    let output = tx.outputs.first()?;
+    let pkh = p2pkh_hash_from_script(&output.script_pubkey)?;
+    Some(base58_p2pkh_from_hash(&pkh))
+}
+
+fn miner_address_from_tx_hex(tx_hex: &str) -> Option<String> {
+    let raw = hex::decode(tx_hex).ok()?;
+    let tx = decode_full_tx(&raw).ok()?;
+    miner_address_from_tx(&tx)
+}
+
+fn miner_address_from_block(block: &Block) -> Option<String> {
+    block.transactions.first().and_then(miner_address_from_tx)
+}
+
 
 fn p2pkh_hash_from_script(script: &[u8]) -> Option<[u8; 20]> {
     if script.len() != 25 {
@@ -1176,7 +1207,21 @@ async fn get_block(
     let dir = storage::blocks_dir();
     let path = dir.join(format!("block_{}.json", q.height));
     if let Ok(data) = fs::read_to_string(&path) {
-        let v: Value = serde_json::from_str(&data).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut v: Value = serde_json::from_str(&data).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if v.get("miner_address").is_none() {
+            if let Some(tx_hex) = v
+                .get("tx_hex")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+            {
+                if let Some(addr) = miner_address_from_tx_hex(tx_hex) {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("miner_address".to_string(), Value::String(addr));
+                    }
+                }
+            }
+        }
         return Ok(Json(v));
     }
 
@@ -1200,7 +1245,8 @@ async fn get_block(
                 "nonce": header.nonce,
                 "hash": hex::encode(header.hash()),
             },
-            "tx_hex": block.transactions.iter().map(|tx| hex::encode(tx.serialize())).collect::<Vec<_>>()
+            "tx_hex": block.transactions.iter().map(|tx| hex::encode(tx.serialize())).collect::<Vec<_>>(),
+            "miner_address": miner_address_from_block(block)
         })
     };
 
