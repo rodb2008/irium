@@ -1142,6 +1142,7 @@ impl P2PNode {
                                             let guard = chain_arc.lock().unwrap();
 
                                             let mut start_idx = 0usize;
+                                            let mut found = false;
                                             if !payload.start_hash.is_empty() && payload.start_hash.len() == 32 {
                                                 let mut target = [0u8; 32];
                                                 target.copy_from_slice(&payload.start_hash);
@@ -1149,7 +1150,11 @@ impl P2PNode {
                                                     guard.chain.iter().position(|b| b.header.hash() == target)
                                                 {
                                                     start_idx = pos;
+                                                    found = true;
                                                 }
+                                            }
+                                            if !found && guard.chain.len() > 1 {
+                                                start_idx = 1;
                                             }
 
                                             let count = payload.count.min(MAX_HEADERS_PER_REQUEST) as usize;
@@ -2085,6 +2090,7 @@ async fn handle_incoming_with_sybil(
                             let guard = chain_arc.lock().unwrap();
 
                             let mut start_idx = 0usize;
+                            let mut found = false;
                             if !payload.start_hash.is_empty() && payload.start_hash.len() == 32 {
                                 let mut target = [0u8; 32];
                                 target.copy_from_slice(&payload.start_hash);
@@ -2092,7 +2098,11 @@ async fn handle_incoming_with_sybil(
                                     guard.chain.iter().position(|b| b.header.hash() == target)
                                 {
                                     start_idx = pos;
+                                    found = true;
                                 }
+                            }
+                            if !found && guard.chain.len() > 1 {
+                                start_idx = 1;
                             }
 
                             let mut bytes = Vec::new();
