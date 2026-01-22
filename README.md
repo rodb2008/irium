@@ -173,6 +173,7 @@ source ~/.cargo/env
 - The miner pulls templates from `/rpc/getblocktemplate` and honors `IRIUM_GBT_MAX_TXS`, `IRIUM_GBT_MIN_FEE`, `IRIUM_GBT_LONGPOLL`, and `IRIUM_GBT_LONGPOLL_SECS`.
 - If you see `HTTP 429 Too Many Requests`, set `IRIUM_RPC_TOKEN` in both `iriumd` and the miner, or raise `IRIUM_RATE_LIMIT_PER_MIN` in the node env.
 - Set `IRIUM_MINER_STRICT_RPC=1` to stop mining if RPC/template fetch fails.
+- The miner pauses if the node is behind peers (sync guard). Set `IRIUM_MINER_SYNC_GUARD=0` to disable, or `IRIUM_MINER_MAX_BEHIND=<n>` to allow a small lag.
 - Pool mining (Stratum v1, TCP): set `IRIUM_STRATUM_URL`, `IRIUM_STRATUM_USER`, `IRIUM_STRATUM_PASS`.
 Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
 

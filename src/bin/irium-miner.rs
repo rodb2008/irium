@@ -290,6 +290,16 @@ struct BlockTemplate {
     txs: Vec<TemplateTx>,
 }
 
+#[derive(Deserialize)]
+struct PeerInfo {
+    height: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct PeersResponse {
+    peers: Vec<PeerInfo>,
+}
+
 /// Load mempool transactions, accepting either the new structured mempool
 /// file or the legacy hex-only format.
 fn mempool_entries_from_template(
@@ -801,6 +811,72 @@ fn fetch_block_json_with_base(
     }
     resp.json()
         .map_err(|e| format!("block {height} parse: {e}"))
+}
+
+fn miner_sync_guard_enabled() -> bool {
+    env::var("IRIUM_MINER_SYNC_GUARD")
+        .ok()
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(true)
+}
+
+fn miner_max_behind() -> u64 {
+    env::var("IRIUM_MINER_MAX_BEHIND")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn fetch_best_peer_height(client: &Client) -> Result<Option<u64>, String> {
+    with_rpc_base(|base| {
+        let url = format!("{}/peers", base.trim_end_matches('/'));
+        let resp = client
+            .get(url)
+            .send()
+            .map_err(|e| format!("peers failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(rpc_status_error("peers failed", resp.status()));
+        }
+        let data: PeersResponse = resp
+            .json()
+            .map_err(|e| format!("peers parse: {e}"))?;
+        Ok(data.peers.iter().filter_map(|p| p.height).max())
+    })
+}
+
+fn guard_miner_sync(client: &Client, local_tip: u64) -> Result<bool, String> {
+    if !miner_sync_guard_enabled() {
+        return Ok(true);
+    }
+    let max_behind = miner_max_behind();
+    let peer_height = match fetch_best_peer_height(client) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[warn] Miner sync guard skipped (peers): {e}");
+            return Ok(true);
+        }
+    };
+    if let Some(peer_height) = peer_height {
+        if peer_height > local_tip.saturating_add(max_behind) {
+            if json_log_enabled() {
+                println!(
+                    "{}",
+                    json!({"event": "miner_sync_wait", "local_height": local_tip, "peer_height": peer_height, "ts": Utc::now().format("%H:%M:%S").to_string()})
+                );
+            } else {
+                println!(
+                    "[guard] Node behind network (local {} < peer {}); waiting...",
+                    local_tip,
+                    peer_height
+                );
+            }
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn parse_bits(bits_str: &str) -> Result<u32, String> {
@@ -1799,6 +1875,18 @@ fn main() {
         };
 
         reconcile_with_template(&mut state, &params, &template, &client);
+
+        let local_tip = template.height.saturating_sub(1);
+        match guard_miner_sync(&client, local_tip) {
+            Ok(true) => {}
+            Ok(false) => {
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+            Err(e) => {
+                eprintln!("[warn] Miner sync guard error: {e}");
+            }
+        }
 
         if state.height != template.height {
             eprintln!(

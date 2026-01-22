@@ -42,6 +42,8 @@ Template tuning (optional):
 - `IRIUM_GBT_LONGPOLL=1`: enable long-poll template refresh.
 - `IRIUM_GBT_LONGPOLL_SECS`: long-poll timeout (default 25s, max 120s).
 - `IRIUM_MINER_STRICT_RPC=1`: stop mining if RPC/template fetch fails.
+- `IRIUM_MINER_SYNC_GUARD=0`: disable the sync guard that pauses mining when the node is behind peers.
+- `IRIUM_MINER_MAX_BEHIND=<n>`: allow mining while up to <n> blocks behind (default 0).
 
 ## 5) Stratum pool mining (optional)
 Set a Stratum URL to enable pool mode (disables solo template mining):
