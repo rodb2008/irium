@@ -119,6 +119,8 @@ pub struct HandshakePayload {
     pub relay_address: Option<String>,
     #[serde(default)]
     pub node_id: Option<String>,
+    #[serde(default)]
+    pub tip_hash: Option<String>,
 }
 
 impl HandshakePayload {

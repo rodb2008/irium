@@ -787,6 +787,7 @@ impl P2PNode {
             checkpoint_hash: None,
             relay_address: self.relay_address.clone(),
             node_id: Some(hex::encode(&self.node_id)),
+            tip_hash: Some(hex::encode(&P2PNode::tip_hash(&self.chain))),
         };
 
         let msg = payload
@@ -855,6 +856,7 @@ impl P2PNode {
                         checkpoint_hash: None,
                         relay_address: ping_relay.clone(),
                         node_id: Some(hex::encode(&ping_node_id)),
+                        tip_hash: Some(hex::encode(&P2PNode::tip_hash(&ping_chain))),
                     };
                     if let Ok(msg) = payload.to_message() {
                         let _ = send_message(&ping_writer, msg, ping_addr).await;
@@ -988,7 +990,27 @@ impl P2PNode {
                                             0
                                         }
                                     };
-                                    if payload.height > local_height {
+                                    let peer_tip = payload
+                                        .tip_hash
+                                        .as_ref()
+                                        .and_then(|h| hex::decode(h).ok())
+                                        .and_then(|b| if b.len() == 32 {
+                                            let mut arr = [0u8; 32];
+                                            arr.copy_from_slice(&b);
+                                            Some(arr)
+                                        } else {
+                                            None
+                                        });
+                                    let local_at_peer = if let Some(ref chain_arc) = chain_for_sync {
+                                        let guard = chain_arc.lock().unwrap();
+                                        guard.chain.get(payload.height as usize).map(|b| b.header.hash())
+                                    } else {
+                                        None
+                                    };
+                                    let tip_mismatch = peer_tip
+                                        .map(|t| Some(t) != local_at_peer)
+                                        .unwrap_or(false);
+                                    if payload.height > local_height || (payload.height == local_height && tip_mismatch) {
                                         if sync_request_allowed(&sync_requests, addr.ip()).await {
                                             let start_hash = P2PNode::tip_hash(&chain_for_sync);
                                             let get_headers = GetHeadersPayload {
@@ -1016,7 +1038,11 @@ impl P2PNode {
                                         if let Some(ref chain_arc) = chain_for_sync {
                                             let headers_bytes = {
                                                 let guard = chain_arc.lock().unwrap();
-                                                let start = payload.height.saturating_add(1) as usize;
+                                                let start = if tip_mismatch {
+                                                    0
+                                                } else {
+                                                    payload.height.saturating_add(1) as usize
+                                                };
                                                 let mut headers = Vec::new();
                                                 for block in guard.chain.iter().skip(start).take(32) {
                                                     headers.extend_from_slice(&block.header.serialize());
@@ -1028,6 +1054,7 @@ impl P2PNode {
                                                 let _ = send_message(&writer, msg, addr).await;
                                             }
                                         }
+                                        if !tip_mismatch {
                                         let fallback_writer = writer.clone();
                                         let fallback_chain = chain_for_sync.clone();
                                         let fallback_seen = getblocks_seen.clone();
@@ -1080,6 +1107,7 @@ impl P2PNode {
                                                 let _ = send_message(&fallback_writer, msg, fallback_addr).await;
                                             }
                                         });
+                                        }
                                     }
                                 }
                             }
@@ -1787,6 +1815,7 @@ async fn handle_incoming_with_sybil(
                     checkpoint_hash: None,
                     relay_address: ping_relay.clone(),
                     node_id: Some(hex::encode(&ping_node_id)),
+                    tip_hash: Some(hex::encode(&P2PNode::tip_hash(&ping_chain))),
                 };
                 if let Ok(msg) = payload.to_message() {
                     let _ = send_message(&ping_writer, msg, ping_addr).await;
@@ -1818,6 +1847,7 @@ async fn handle_incoming_with_sybil(
         checkpoint_hash: None,
         relay_address: relay_address.clone(),
         node_id: Some(hex::encode(&node_id)),
+        tip_hash: Some(hex::encode(&P2PNode::tip_hash(&chain))),
     };
     if let Ok(msg) = payload.to_message() {
         let _ = send_message(&writer, msg, addr).await;
@@ -1894,6 +1924,7 @@ async fn handle_incoming_with_sybil(
                         checkpoint_hash: None,
                         relay_address: relay_address.clone(),
                         node_id: Some(hex::encode(&node_id)),
+                        tip_hash: Some(hex::encode(&P2PNode::tip_hash(&chain))),
                     };
                     if let Ok(handshake_msg) = response.to_message() {
                         let _ = send_message(&writer, handshake_msg, addr).await;
@@ -1902,7 +1933,28 @@ async fn handle_incoming_with_sybil(
                     if let Ok(msg) = EmptyPayload::to_message(MessageType::GetPeers) {
                         let _ = send_message(&writer, msg, addr).await;
                     }
-                    if payload.height > local_h {
+                    let local_height = local_height(&chain);
+                    let peer_tip = payload
+                        .tip_hash
+                        .as_ref()
+                        .and_then(|h| hex::decode(h).ok())
+                        .and_then(|b| if b.len() == 32 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&b);
+                            Some(arr)
+                        } else {
+                            None
+                        });
+                    let local_at_peer = if let Some(ref chain_arc) = chain {
+                        let guard = chain_arc.lock().unwrap();
+                        guard.chain.get(payload.height as usize).map(|b| b.header.hash())
+                    } else {
+                        None
+                    };
+                    let tip_mismatch = peer_tip
+                        .map(|t| Some(t) != local_at_peer)
+                        .unwrap_or(false);
+                    if payload.height > local_height || (payload.height == local_height && tip_mismatch) {
                         // Request headers first for basic sync.
                         if sync_request_allowed(&sync_requests, addr.ip()).await {
                             let start_hash = P2PNode::tip_hash(&chain);
@@ -1914,13 +1966,17 @@ async fn handle_incoming_with_sybil(
                                 let _ = send_message(&writer, msg, addr).await;
                             }
                         }
-                    } else if payload.height < local_h {
+                    } else if payload.height < local_height {
                         // Peer is behind; send headers and fall back to block push if needed.
                         let behind_height = payload.height;
                         if let Some(ref chain_arc) = chain {
                             let headers_bytes = {
                                 let guard = chain_arc.lock().unwrap();
-                                let start = payload.height.saturating_add(1) as usize;
+                                let start = if tip_mismatch {
+                                    0
+                                } else {
+                                    payload.height.saturating_add(1) as usize
+                                };
                                 let mut headers = Vec::new();
                                 for block in guard.chain.iter().skip(start).take(32) {
                                     headers.extend_from_slice(&block.header.serialize());
@@ -1932,6 +1988,7 @@ async fn handle_incoming_with_sybil(
                                 let _ = send_message(&writer, msg, addr).await;
                             }
                         }
+                        if !tip_mismatch {
                         let fallback_writer = writer.clone();
                         let fallback_chain = chain.clone();
                         let fallback_seen = getblocks_seen.clone();
@@ -1984,6 +2041,7 @@ async fn handle_incoming_with_sybil(
                                 let _ = send_message(&fallback_writer, msg, fallback_addr).await;
                             }
                         });
+                        }
                     }
                 }
             }
