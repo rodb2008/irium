@@ -1025,12 +1025,15 @@ impl P2PNode {
                                         .unwrap_or(false);
                                     if payload.height > local_height || (payload.height == local_height && tip_mismatch) {
                                         if sync_request_allowed(&sync_requests, addr.ip()).await {
-                                            let start_hash = P2PNode::tip_hash(&chain_for_sync);
+                                            let local_tip = P2PNode::tip_hash(&chain_for_sync);
+                                            let start_hash = if tip_mismatch { [0u8; 32] } else { local_tip };
                                             let get_headers = GetHeadersPayload {
                                                 start_hash: start_hash.to_vec(),
                                                 count: MAX_HEADERS_PER_REQUEST,
                                             };
-                                            let short = {
+                                            let short = if start_hash == [0u8; 32] {
+                                                "genesis".to_string()
+                                            } else {
                                                 let h = hex::encode(start_hash);
                                                 h.get(0..12).unwrap_or(&h).to_string()
                                             };
@@ -1194,6 +1197,7 @@ impl P2PNode {
                                         let header_count = (payload.headers.len() / 80) as u32;
                                         let mut offset = 0usize;
                                         let mut last_header_hash: Option<[u8; 32]> = None;
+                                        let mut unknown_parent = false;
 
                                         while offset + 80 <= payload.headers.len() {
                                             let slice = &payload.headers[offset..offset + 80];
@@ -1210,12 +1214,29 @@ impl P2PNode {
                                             {
                                                 let mut guard = chain_arc.lock().unwrap();
                                                 if let Err(e) = guard.add_header(header.clone()) {
+                                                    if e.contains("unknown parent") {
+                                                        unknown_parent = true;
+                                                        guard.headers.clear();
+                                                        guard.header_chain.clear();
+                                                    }
                                                     eprintln!("Header from {} rejected: {}", addr, e);
                                                     break;
                                                 }
                                             }
                                         }
 
+                                        if unknown_parent {
+                                            if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                                let get_headers = GetHeadersPayload {
+                                                    start_hash: vec![0u8; 32],
+                                                    count: MAX_HEADERS_PER_REQUEST,
+                                                };
+                                                if let Ok(msg) = get_headers.to_message() {
+                                                    let _ = send_message(&writer, msg, addr).await;
+                                                }
+                                            }
+                                            continue;
+                                        }
                                         if header_count >= MAX_HEADERS_PER_REQUEST {
                                             if let Some(last_hash) = last_header_hash {
                                                 if sync_request_allowed(&sync_requests, addr.ip()).await {
@@ -1297,7 +1318,7 @@ impl P2PNode {
                                             continue;
                                         }
                                         let is_zero = payload.start_hash.iter().all(|b| *b == 0);
-                                        let (start_idx, matched_pos) = {
+                                        let (mut start_idx, mut matched_pos) = {
                                             let guard = chain_arc.lock().unwrap();
                                             let mut start_idx = 0usize;
                                             let mut matched_pos = None;
@@ -1311,13 +1332,36 @@ impl P2PNode {
                                             }
                                             (start_idx, matched_pos)
                                         };
+                                        let mut force_genesis = false;
                                         if matched_pos.is_none() && !is_zero {
-                                            P2PNode::log_event(
-                                                "warn",
-                                                "sync",
-                                                format!("P2P {}: ignoring getblocks unknown start hash {}", addr, hex::encode(&payload.start_hash)),
-                                            );
-                                            continue;
+                                            if let Some(remote_tip) = last_handshake_tip {
+                                                let local_tip = {
+                                                    let guard = chain_arc.lock().unwrap();
+                                                    guard.tip_hash()
+                                                };
+                                                if remote_tip != local_tip {
+                                                    force_genesis = true;
+                                                    start_idx = 0;
+                                                    matched_pos = Some(0);
+                                                    P2PNode::log_event(
+                                                        "info",
+                                                        "sync",
+                                                        format!(
+                                                            "P2P {}: unknown start hash {}, forcing genesis sync",
+                                                            addr,
+                                                            hex::encode(&payload.start_hash)
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                            if !force_genesis {
+                                                P2PNode::log_event(
+                                                    "warn",
+                                                    "sync",
+                                                    format!("P2P {}: ignoring getblocks unknown start hash {}", addr, hex::encode(&payload.start_hash)),
+                                                );
+                                                continue;
+                                            }
                                         }
                                         let genesis_locator = is_zero || matches!(matched_pos, Some(0));
                                         if genesis_locator && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await {
@@ -2176,6 +2220,7 @@ async fn handle_incoming_with_sybil(
                         let header_count = (payload.headers.len() / 80) as u32;
                         let mut offset = 0usize;
                         let mut last_header_hash: Option<[u8; 32]> = None;
+                        let mut unknown_parent = false;
 
                         while offset + 80 <= payload.headers.len() {
                             let slice = &payload.headers[offset..offset + 80];
@@ -2192,12 +2237,29 @@ async fn handle_incoming_with_sybil(
                             {
                                 let mut guard = chain_arc.lock().unwrap();
                                 if let Err(e) = guard.add_header(header.clone()) {
+                                    if e.contains("unknown parent") {
+                                        unknown_parent = true;
+                                        guard.headers.clear();
+                                        guard.header_chain.clear();
+                                    }
                                     eprintln!("Header from {} rejected: {}", addr, e);
                                     break;
                                 }
                             }
                         }
 
+                        if unknown_parent {
+                            if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                let get_headers = GetHeadersPayload {
+                                    start_hash: vec![0u8; 32],
+                                    count: MAX_HEADERS_PER_REQUEST,
+                                };
+                                if let Ok(msg) = get_headers.to_message() {
+                                    let _ = send_message(&writer, msg, addr).await;
+                                }
+                            }
+                            continue;
+                        }
                         if header_count >= MAX_HEADERS_PER_REQUEST {
                             if let Some(last_hash) = last_header_hash {
                                 if sync_request_allowed(&sync_requests, addr.ip()).await {
@@ -2279,7 +2341,7 @@ async fn handle_incoming_with_sybil(
                             continue;
                         }
                         let is_zero = payload.start_hash.iter().all(|b| *b == 0);
-                        let (start_idx, matched_pos) = {
+                        let (mut start_idx, mut matched_pos) = {
                             let guard = chain_arc.lock().unwrap();
                             let mut start_idx = 0usize;
                             let mut matched_pos = None;
@@ -2293,13 +2355,36 @@ async fn handle_incoming_with_sybil(
                             }
                             (start_idx, matched_pos)
                         };
+                        let mut force_genesis = false;
                         if matched_pos.is_none() && !is_zero {
-                            P2PNode::log_event(
-                                "warn",
-                                "sync",
-                                format!("P2P {}: ignoring getblocks unknown start hash {}", addr, hex::encode(&payload.start_hash)),
-                            );
-                            continue;
+                            if let Some(remote_tip) = last_handshake_tip {
+                                let local_tip = {
+                                    let guard = chain_arc.lock().unwrap();
+                                    guard.tip_hash()
+                                };
+                                if remote_tip != local_tip {
+                                    force_genesis = true;
+                                    start_idx = 0;
+                                    matched_pos = Some(0);
+                                    P2PNode::log_event(
+                                        "info",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: unknown start hash {}, forcing genesis sync",
+                                            addr,
+                                            hex::encode(&payload.start_hash)
+                                        ),
+                                    );
+                                }
+                            }
+                            if !force_genesis {
+                                P2PNode::log_event(
+                                    "warn",
+                                    "sync",
+                                    format!("P2P {}: ignoring getblocks unknown start hash {}", addr, hex::encode(&payload.start_hash)),
+                                );
+                                continue;
+                            }
                         }
                         let genesis_locator = is_zero || matches!(matched_pos, Some(0));
                         if genesis_locator && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await {
