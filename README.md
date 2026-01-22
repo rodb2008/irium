@@ -70,6 +70,7 @@ export IRIUM_NODE_RPC=http://<node-ip>:38300
 - Miner stuck at height 1: the node isn’t running or `IRIUM_NODE_RPC` is wrong.
 - `HTTP 401 Unauthorized`: the node has a token set, but the miner/wallet does not. Use the same `IRIUM_RPC_TOKEN` everywhere.
 - `HTTP 429 Too Many Requests`: the node rate‑limit is blocking the miner. Set a token or raise `IRIUM_RATE_LIMIT_PER_MIN` in the node env.
+- `unknown parent` / `orphan` during sync: normal while headers/blocks catch up; it clears once the node is fully synced.
 - Miner ignores `/etc/irium/miner.env`: manual runs now auto‑load it. Shell exports still override the file.
 
 ## Get Started (Download + Run Services)
