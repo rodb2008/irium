@@ -32,6 +32,7 @@ use serde_json::json;
 /// broadcast raw block bytes to all connected peers.
 const DEFAULT_MAX_PEERS: usize = 100;
 const MAX_MSGS_PER_SEC: u32 = 200;
+const MAX_BULK_MSGS_PER_SEC: u32 = 2000;
 
 fn sync_cooldown() -> Duration {
     let secs = std::env::var("IRIUM_P2P_SYNC_COOLDOWN_SECS")
@@ -888,20 +889,38 @@ impl P2PNode {
             let mut last_handshake_height: Option<u64> = None;
             let mut last_handshake_agent: Option<String> = None;
             let mut last_handshake_tip: Option<[u8; 32]> = None;
+            let mut bulk_count: u32 = 0;
             loop {
-                if window_start.elapsed() < Duration::from_secs(1) {
+                let msg = match read_message_with_timeout(&mut reader, P2PNode::peer_timeout()).await {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        Self::log_err(format!("P2P outbound {}: closing read loop: {}", addr, e));
+                        let mut rep = reputation.lock().await;
+                        rep.record_failure(&addr.to_string());
+                        break;
+                    }
+                };
+                if window_start.elapsed() >= Duration::from_secs(1) {
+                    window_start = Instant::now();
+                    msg_count = 0;
+                    bulk_count = 0;
+                }
+                let is_bulk = matches!(msg.msg_type, MessageType::Block | MessageType::Headers);
+                if is_bulk {
+                    bulk_count += 1;
+                    if bulk_count > MAX_BULK_MSGS_PER_SEC {
+                        Self::log_err(format!("P2P outbound {}: bulk rate limit", addr));
+                        break;
+                    }
+                } else {
                     msg_count += 1;
                     if msg_count > MAX_MSGS_PER_SEC {
                         Self::log_err(format!("P2P outbound {}: rate limit", addr));
                         break;
                     }
-                } else {
-                    window_start = Instant::now();
-                    msg_count = 1;
                 }
-                match read_message_with_timeout(&mut reader, P2PNode::peer_timeout()).await {
-                    Ok(msg) => {
-                        if P2PNode::verbose_messages() {
+                if P2PNode::verbose_messages() {
+
                             match msg.msg_type {
                                 MessageType::Ping | MessageType::Pong | MessageType::Handshake | MessageType::Peers | MessageType::GetPeers | MessageType::GetHeaders | MessageType::GetBlocks | MessageType::Headers | MessageType::Block => {}
                                 _ => {
@@ -1693,14 +1712,6 @@ impl P2PNode {
                             MessageType::Disconnect => break,
                             _ => {}
                         }
-                    }
-                    Err(e) => {
-                        Self::log_err(format!("P2P outbound {}: closing read loop: {}", addr, e));
-                        let mut rep = reputation.lock().await;
-                        rep.record_failure(&addr.to_string());
-                        break;
-                    }
-                }
             }
             {
                 let mut guard = peers_vec.lock().await;
@@ -1958,22 +1969,32 @@ async fn handle_incoming_with_sybil(
     let mut last_handshake_tip: Option<[u8; 32]> = None;
     let mut last_handshake_height: Option<u64> = None;
     // Process messages from the peer.
+    let mut bulk_count: u32 = 0;
     loop {
-        if window_start.elapsed() < Duration::from_secs(1) {
-            msg_count += 1;
-            if msg_count > MAX_MSGS_PER_SEC {
-                return Err("message rate limit exceeded".to_string());
-            }
-        } else {
-            window_start = Instant::now();
-            msg_count = 1;
-        }
         let msg = match read_message_with_timeout(&mut reader, P2PNode::peer_timeout()).await {
             Ok(m) => m,
             Err(e) => return Err(e),
         };
+        if window_start.elapsed() >= Duration::from_secs(1) {
+            window_start = Instant::now();
+            msg_count = 0;
+            bulk_count = 0;
+        }
+        let is_bulk = matches!(msg.msg_type, MessageType::Block | MessageType::Headers);
+        if is_bulk {
+            bulk_count += 1;
+            if bulk_count > MAX_BULK_MSGS_PER_SEC {
+                return Err("bulk message rate limit exceeded".to_string());
+            }
+        } else {
+            msg_count += 1;
+            if msg_count > MAX_MSGS_PER_SEC {
+                return Err("message rate limit exceeded".to_string());
+            }
+        }
 
         if P2PNode::verbose_messages() {
+
             match msg.msg_type {
                 MessageType::Ping | MessageType::Pong | MessageType::Handshake | MessageType::Peers | MessageType::GetPeers | MessageType::GetHeaders | MessageType::GetBlocks | MessageType::Headers | MessageType::Block => {}
                 _ => {
