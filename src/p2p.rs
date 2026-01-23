@@ -1047,6 +1047,17 @@ impl P2PNode {
                                             if let Ok(msg) = get_headers.to_message() {
                                                 let _ = send_message(&writer, msg, addr).await;
                                             }
+                                            if tip_mismatch {
+                                                let get_blocks = GetBlocksPayload {
+                                                    start_hash: vec![0u8; 32],
+                                                    count: MAX_BLOCKS_PER_REQUEST,
+                                                };
+                                                if sync_block_request_allowed(&block_requests, addr.ip()).await {
+                                                    if let Ok(msg) = get_blocks.to_message() {
+                                                        let _ = send_message(&writer, msg, addr).await;
+                                                    }
+                                                }
+                                            }
                                         }
                                     } else if payload.height < local_height {
                                         // Peer is behind; push headers and fall back to block push if needed.
