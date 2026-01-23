@@ -1066,15 +1066,14 @@ impl P2PNode {
                                             if let Ok(msg) = get_headers.to_message() {
                                                 let _ = send_message(&writer, msg, addr).await;
                                             }
-                                            if tip_mismatch {
-                                                let get_blocks = GetBlocksPayload {
-                                                    start_hash: vec![0u8; 32],
-                                                    count: MAX_BLOCKS_PER_REQUEST,
-                                                };
-                                                if sync_block_request_allowed(&block_requests, addr.ip()).await {
-                                                    if let Ok(msg) = get_blocks.to_message() {
-                                                        let _ = send_message(&writer, msg, addr).await;
-                                                    }
+                                            let block_start = if local_height > 0 { local_tip } else { [0u8; 32] };
+                                            let get_blocks = GetBlocksPayload {
+                                                start_hash: block_start.to_vec(),
+                                                count: MAX_BLOCKS_PER_REQUEST,
+                                            };
+                                            if sync_block_request_allowed(&block_requests, addr.ip()).await {
+                                                if let Ok(msg) = get_blocks.to_message() {
+                                                    let _ = send_message(&writer, msg, addr).await;
                                                 }
                                             }
                                         }
