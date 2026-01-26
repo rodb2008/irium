@@ -1046,7 +1046,7 @@ impl P2PNode {
                                     if payload.height > local_height || (payload.height == local_height && tip_mismatch) {
                                         if sync_request_allowed(&sync_requests, addr.ip()).await {
                                             let local_tip = P2PNode::tip_hash(&chain_for_sync);
-                                            let start_hash = if tip_mismatch { [0u8; 32] } else { local_tip };
+                                            let start_hash = if local_height == 0 { [0u8; 32] } else { local_tip };
                                             let get_headers = GetHeadersPayload {
                                                 start_hash: start_hash.to_vec(),
                                                 count: MAX_HEADERS_PER_REQUEST,
