@@ -1039,9 +1039,10 @@ impl P2PNode {
                                     } else {
                                         None
                                     };
-                                    let tip_mismatch = peer_tip
-                                        .map(|t| Some(t) != local_at_peer)
-                                        .unwrap_or(false);
+                                    let tip_mismatch = match peer_tip {
+                                        Some(t) => local_at_peer.map(|h| h != t).unwrap_or(false),
+                                        None => false,
+                                    };
                                     if payload.height > local_height || (payload.height == local_height && tip_mismatch) {
                                         if sync_request_allowed(&sync_requests, addr.ip()).await {
                                             let local_tip = P2PNode::tip_hash(&chain_for_sync);
@@ -2087,9 +2088,10 @@ async fn handle_incoming_with_sybil(
                     } else {
                         None
                     };
-                    let tip_mismatch = peer_tip
-                        .map(|t| Some(t) != local_at_peer)
-                        .unwrap_or(false);
+                    let tip_mismatch = match peer_tip {
+                        Some(t) => local_at_peer.map(|h| h != t).unwrap_or(false),
+                        None => false,
+                    };
                     if payload.height > local_height || (payload.height == local_height && tip_mismatch) {
                         // Request headers first for basic sync.
                         if sync_request_allowed(&sync_requests, addr.ip()).await {
