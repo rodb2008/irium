@@ -103,6 +103,55 @@ async fn genesis_request_allowed(
     true
 }
 
+
+fn handshake_fail_window() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn handshake_fail_threshold() -> u32 {
+    5
+}
+
+fn should_log_handshake_failure(count: u32) -> bool {
+    count == 1 || count % 5 == 0
+}
+
+async fn record_handshake_failure(
+    failures: &Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
+    dynamic_bans: &Arc<StdMutex<HashMap<IpAddr, Instant>>>,
+    ip: IpAddr,
+) -> (u32, bool) {
+    let now = Instant::now();
+    let window = handshake_fail_window();
+    let count = {
+        let mut guard = failures.lock().await;
+        if let Some((prev, first)) = guard.get(&ip).copied() {
+            if now.duration_since(first) <= window {
+                let next = prev.saturating_add(1);
+                guard.insert(ip, (next, first));
+                next
+            } else {
+                guard.insert(ip, (1, now));
+                1
+            }
+        } else {
+            guard.insert(ip, (1, now));
+            1
+        }
+    };
+    let mut banned = false;
+    if count >= handshake_fail_threshold() {
+        {
+            let mut guard = dynamic_bans.lock().unwrap();
+            guard.insert(ip, Instant::now());
+        }
+        let mut guard = failures.lock().await;
+        guard.remove(&ip);
+        banned = true;
+    }
+    (count, banned)
+}
+
 fn max_peers() -> usize {
     let val = std::env::var("IRIUM_P2P_MAX_PEERS")
         .ok()
@@ -145,6 +194,7 @@ pub struct P2PNode {
     getblocks_seen: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     getblocks_last: Arc<Mutex<HashMap<IpAddr, (Vec<u8>, u32, Instant)>>>,
     getblocks_genesis: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    handshake_failures: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     dynamic_bans: Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
@@ -367,6 +417,7 @@ impl P2PNode {
             getblocks_seen: Arc::new(Mutex::new(HashMap::new())),
             getblocks_last: Arc::new(Mutex::new(HashMap::new())),
             getblocks_genesis: Arc::new(Mutex::new(HashMap::new())),
+            handshake_failures: Arc::new(Mutex::new(HashMap::new())),
             self_ips: Arc::new(Mutex::new(HashSet::new())),
             dynamic_bans: Arc::new(StdMutex::new(HashMap::new())),
             chain,
@@ -401,6 +452,7 @@ impl P2PNode {
         let getblocks_seen = self.getblocks_seen.clone();
         let getblocks_last = self.getblocks_last.clone();
         let getblocks_genesis = self.getblocks_genesis.clone();
+        let handshake_failures = self.handshake_failures.clone();
         let self_ips = self.self_ips.clone();
         let dynamic_bans = self.dynamic_bans.clone();
         let node_id = self.node_id.clone();
@@ -458,6 +510,8 @@ impl P2PNode {
                         let getblocks_peer = getblocks_seen.clone();
                         let getblocks_last_peer = getblocks_last.clone();
                         let getblocks_genesis_peer = getblocks_genesis.clone();
+                        let dynamic_bans_for_handshake = dynamic_bans.clone();
+                        let handshake_failures_for_handshake = handshake_failures.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_incoming_with_sybil(
                                 socket,
@@ -481,7 +535,25 @@ impl P2PNode {
                             )
                             .await
                             {
-                                Self::log_err(format!("P2P handshake error from {}: {}", addr, e));
+                                let (count, banned) = record_handshake_failure(
+                                    &handshake_failures_for_handshake,
+                                    &dynamic_bans_for_handshake,
+                                    addr.ip(),
+                                )
+                                .await;
+                                if banned {
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "reputation",
+                                        format!(
+                                            "P2P {}: temp-banning after {} handshake failures",
+                                            addr.ip(),
+                                            count
+                                        ),
+                                    );
+                                } else if should_log_handshake_failure(count) {
+                                    Self::log_err(format!("P2P handshake error from {}: {}", addr, e));
+                                }
                             }
                         });
                     }
@@ -1372,6 +1444,7 @@ impl P2PNode {
                                             (start_idx, matched_pos)
                                         };
                                         let mut force_genesis = false;
+                                        let mut genesis_allowed = false;
                                         if matched_pos.is_none() && !is_zero {
                                             if let Some(remote_tip) = last_handshake_tip {
                                                 let local_tip = {
@@ -1379,6 +1452,10 @@ impl P2PNode {
                                                     guard.tip_hash()
                                                 };
                                                 if remote_tip != local_tip {
+                                                    genesis_allowed = genesis_request_allowed(&getblocks_genesis, addr.ip()).await;
+                                                    if !genesis_allowed {
+                                                        continue;
+                                                    }
                                                     force_genesis = true;
                                                     start_idx = 0;
                                                     matched_pos = Some(0);
@@ -1403,7 +1480,7 @@ impl P2PNode {
                                             }
                                         }
                                         let genesis_locator = is_zero || matches!(matched_pos, Some(0));
-                                        if genesis_locator && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await {
+                                        if genesis_locator && !genesis_allowed && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await {
                                             continue;
                                         }
                                         let (blocks, start_height) = {
@@ -2409,6 +2486,7 @@ async fn handle_incoming_with_sybil(
                             (start_idx, matched_pos)
                         };
                         let mut force_genesis = false;
+                        let mut genesis_allowed = false;
                         if matched_pos.is_none() && !is_zero {
                             if let Some(remote_tip) = last_handshake_tip {
                                 let local_tip = {
@@ -2416,6 +2494,10 @@ async fn handle_incoming_with_sybil(
                                     guard.tip_hash()
                                 };
                                 if remote_tip != local_tip {
+                                    genesis_allowed = genesis_request_allowed(&getblocks_genesis, addr.ip()).await;
+                                    if !genesis_allowed {
+                                        continue;
+                                    }
                                     force_genesis = true;
                                     start_idx = 0;
                                     matched_pos = Some(0);
@@ -2440,7 +2522,7 @@ async fn handle_incoming_with_sybil(
                             }
                         }
                         let genesis_locator = is_zero || matches!(matched_pos, Some(0));
-                        if genesis_locator && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await {
+                        if genesis_locator && !genesis_allowed && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await {
                             continue;
                         }
                         let (blocks, start_height) = {
