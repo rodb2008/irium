@@ -973,6 +973,25 @@ fn reconcile_with_template(state: &mut ChainState, params: &ChainParams, templat
         .map(|b| b.header.hash())
         .unwrap_or([0u8; 32]);
 
+    if local_tip > 0 {
+        if let Ok(v) = fetch_block_json(client, local_tip) {
+            if let Some(remote_hash) = v.get("header").and_then(|h| h.get("hash")).and_then(|v| v.as_str()) {
+                let local_hex = hex::encode(local_hash);
+                if remote_hash != local_hex {
+                    eprintln!(
+                        "[warn] Miner chain mismatch at height {} (local {} != remote {}), resetting to node",
+                        local_tip,
+                        local_hex,
+                        remote_hash
+                    );
+                    prune_blocks_above(0);
+                    *state = ChainState::new(params.clone());
+                    local_tip = state.tip_height();
+                }
+            }
+        }
+    }
+
     if local_tip == remote_tip && local_hash != remote_prev {
         eprintln!(
             "[warn] Miner chain diverged at height {} (local {} != remote {}), resetting to node",
@@ -1020,6 +1039,11 @@ fn reconcile_with_template(state: &mut ChainState, params: &ChainParams, templat
             Ok(v) => {
                 if let Err(e) = connect_block_from_json(state, &v) {
                     eprintln!("[warn] Miner failed to connect block {}: {}", h, e);
+                    if e.contains("does not extend the current tip") {
+                        eprintln!("[warn] Miner chain diverged during sync; resetting to node");
+                        prune_blocks_above(0);
+                        *state = ChainState::new(params.clone());
+                    }
                     break;
                 }
             }
