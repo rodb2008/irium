@@ -185,7 +185,11 @@ impl ChainState {
 
     /// Work for a block based on its target (Bitcoin-style).
     pub fn block_work(block: &Block) -> BigUint {
-        let target = block.header.target().to_target();
+        Self::work_for_target(block.header.target())
+    }
+
+    fn work_for_target(target: Target) -> BigUint {
+        let target = target.to_target();
         if target.is_zero() {
             return BigUint::zero();
         }
@@ -270,8 +274,7 @@ impl ChainState {
             return Err("header does not meet target".to_string());
         }
 
-        let work =
-            parent_work.clone() + BigUint::from(0xffff_ffffu64) / header.target().to_target();
+        let work = parent_work + Self::work_for_target(header.target());
         let height = parent_height + 1;
         self.headers.insert(
             hash,
