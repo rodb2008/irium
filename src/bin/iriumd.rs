@@ -484,12 +484,6 @@ fn miner_address_from_tx(tx: &Transaction) -> Option<String> {
     Some(base58_p2pkh_from_hash(&pkh))
 }
 
-fn miner_address_from_tx_hex(tx_hex: &str) -> Option<String> {
-    let raw = hex::decode(tx_hex).ok()?;
-    let tx = decode_full_tx(&raw).ok()?;
-    miner_address_from_tx(&tx)
-}
-
 fn miner_address_from_block(block: &Block) -> Option<String> {
     block.transactions.first().and_then(miner_address_from_tx)
 }
