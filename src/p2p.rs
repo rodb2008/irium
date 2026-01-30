@@ -1514,8 +1514,6 @@ impl P2PNode {
                                                                     mem_guard.remove(&tx.txid());
                                                                 }
                                                             }
-                                                            guard.headers.clear();
-                                                            guard.header_chain.clear();
                                                             new_height_opt = Some(new_height);
                                                             record_verdict = Some(true);
                                                             if guard.tip_hash() == bhash {
@@ -2544,8 +2542,6 @@ async fn handle_incoming_with_sybil(
                                                 }
                                             }
                                             // Update headers to reflect advanced tip.
-                                            guard.headers.clear();
-                                            guard.header_chain.clear();
                                             new_height_opt = Some(new_height);
                                             record_verdict = Some(true);
                                             if guard.tip_hash() == bhash {
