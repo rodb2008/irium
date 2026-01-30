@@ -1203,29 +1203,6 @@ async fn get_block(
     Query(q): Query<BlockQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
-    // Prefer on-disk JSON if present for compatibility with miner files.
-    let dir = storage::blocks_dir();
-    let path = dir.join(format!("block_{}.json", q.height));
-    if let Ok(data) = fs::read_to_string(&path) {
-        let mut v: Value = serde_json::from_str(&data).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        if v.get("miner_address").is_none() {
-            if let Some(tx_hex) = v
-                .get("tx_hex")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_str())
-            {
-                if let Some(addr) = miner_address_from_tx_hex(tx_hex) {
-                    if let Some(obj) = v.as_object_mut() {
-                        obj.insert("miner_address".to_string(), Value::String(addr));
-                    }
-                }
-            }
-        }
-        return Ok(Json(v));
-    }
-
-    // Fallback: serve directly from in-memory chain state.
     let block_json = {
         let guard = state.chain.lock().unwrap();
         let idx = q.height as usize;

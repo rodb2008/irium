@@ -295,11 +295,35 @@ async fn get_block(
     Query(q): Query<BlockQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     check_rate(&state, &addr)?;
-    let dir = blocks_dir();
-    let path = dir.join(format!("block_{}.json", q.height));
-    let data = fs::read_to_string(&path).map_err(|_| StatusCode::NOT_FOUND)?;
-    let v: Value = serde_json::from_str(&data).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(v))
+    let block_json = {
+        let guard = state.chain.lock().unwrap();
+        let idx = q.height as usize;
+        if idx >= guard.chain.len() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let block = &guard.chain[idx];
+        let header = &block.header;
+        let jb = JsonBlock {
+            height: q.height,
+            header: JsonHeader {
+                version: header.version,
+                prev_hash: hex::encode(header.prev_hash),
+                merkle_root: hex::encode(header.merkle_root),
+                time: header.time,
+                bits: format!("{:08x}", header.bits),
+                nonce: header.nonce,
+                hash: hex::encode(header.hash()),
+            },
+            tx_hex: block
+                .transactions
+                .iter()
+                .map(|tx| hex::encode(tx.serialize()))
+                .collect(),
+        };
+        serde_json::to_value(&jb).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+
+    Ok(Json(block_json))
 }
 
 fn decode_compact_tx(raw: &[u8]) -> Result<Transaction, String> {
