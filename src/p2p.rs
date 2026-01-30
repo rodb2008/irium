@@ -635,30 +635,37 @@ impl P2PNode {
     pub async fn connect_known_peers(&self, max_new: usize) {
         let current = self.peer_count().await;
         let mut added = 0usize;
-        let peers = {
+        let local_height = self.local_height_value();
+        let mut peers = {
             let dir = self.peers_directory.lock().await;
             dir.peers()
         };
+        peers.sort_by_key(|p| std::cmp::Reverse(p.last_height.unwrap_or(0)));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
         let mut scanned = 0usize;
+        let mut attempted_ahead = false;
 
-        for record in peers {
+        for record in peers.iter() {
             scanned += 1;
-            if scanned > 10 {
+            if scanned > 50 {
                 break;
             }
             if current + added >= max_peers() || added >= max_new {
                 break;
             }
+            let record_height = record.last_height.unwrap_or(0);
+            if record_height <= local_height {
+                continue;
+            }
+            attempted_ahead = true;
             // Skip peers we just connected to recently.
             if now > record.last_seen && (now - record.last_seen) < 30.0 {
                 continue;
             }
             if let Some(addr) = Self::parse_multiaddr(&record.multiaddr) {
-                // Skip connecting to ourselves or banned peers.
                 if (addr.ip() == self.bind_addr.ip() && addr.port() == self.bind_addr.port())
                     || self.is_banned(&addr.ip())
                 {
@@ -671,7 +678,45 @@ impl P2PNode {
                     continue;
                 }
                 if self
-                    .connect_and_handshake(addr, self.local_height_value(), &self.agent)
+                    .connect_and_handshake(addr, local_height, &self.agent)
+                    .await
+                    .is_ok()
+                {
+                    added += 1;
+                }
+            }
+        }
+
+        if attempted_ahead {
+            return;
+        }
+
+        scanned = 0;
+        for record in peers {
+            scanned += 1;
+            if scanned > 10 {
+                break;
+            }
+            if current + added >= max_peers() || added >= max_new {
+                break;
+            }
+            if now > record.last_seen && (now - record.last_seen) < 30.0 {
+                continue;
+            }
+            if let Some(addr) = Self::parse_multiaddr(&record.multiaddr) {
+                if (addr.ip() == self.bind_addr.ip() && addr.port() == self.bind_addr.port())
+                    || self.is_banned(&addr.ip())
+                {
+                    continue;
+                }
+                if self.is_self_ip(addr.ip()).await {
+                    continue;
+                }
+                if self.is_ip_connected(addr.ip()).await {
+                    continue;
+                }
+                if self
+                    .connect_and_handshake(addr, local_height, &self.agent)
                     .await
                     .is_ok()
                 {
