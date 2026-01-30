@@ -1326,14 +1326,12 @@ impl P2PNode {
 
                                         if header_error {
                                             if reset_headers {
-                                                if sync_request_allowed(&sync_requests, addr.ip()).await {
-                                                    let get_headers = GetHeadersPayload {
-                                                        start_hash: vec![0u8; 32],
-                                                        count: MAX_HEADERS_PER_REQUEST,
-                                                    };
-                                                    if let Ok(msg) = get_headers.to_message() {
-                                                        let _ = send_message(&writer, msg, addr).await;
-                                                    }
+                                                let get_headers = GetHeadersPayload {
+                                                    start_hash: vec![0u8; 32],
+                                                    count: MAX_HEADERS_PER_REQUEST,
+                                                };
+                                                if let Ok(msg) = get_headers.to_message() {
+                                                    let _ = send_message(&writer, msg, addr).await;
                                                 }
                                             }
                                             continue;
@@ -1378,18 +1376,7 @@ impl P2PNode {
                                                 None
                                             }
                                         };
-                                        let fallback = if request.is_none() && header_count > 0 {
-                                            let local_tip = P2PNode::tip_hash(&chain_for_sync);
-                                            let start = if last_handshake_tip.is_some() && last_handshake_tip != Some(local_tip) {
-                                                [0u8; 32]
-                                            } else {
-                                                local_tip
-                                            };
-                                            Some((start, header_count))
-                                        } else {
-                                            None
-                                        };
-                                        if let Some((start_hash, count)) = request.or(fallback) {
+                                        if let Some((start_hash, count)) = request {
                                             let get_blocks = GetBlocksPayload {
                                                 start_hash: start_hash.to_vec(),
                                                 count,
@@ -2368,14 +2355,12 @@ async fn handle_incoming_with_sybil(
 
                         if header_error {
                             if reset_headers {
-                                if sync_request_allowed(&sync_requests, addr.ip()).await {
-                                    let get_headers = GetHeadersPayload {
-                                        start_hash: vec![0u8; 32],
-                                        count: MAX_HEADERS_PER_REQUEST,
-                                    };
-                                    if let Ok(msg) = get_headers.to_message() {
-                                        let _ = send_message(&writer, msg, addr).await;
-                                    }
+                                let get_headers = GetHeadersPayload {
+                                    start_hash: vec![0u8; 32],
+                                    count: MAX_HEADERS_PER_REQUEST,
+                                };
+                                if let Ok(msg) = get_headers.to_message() {
+                                    let _ = send_message(&writer, msg, addr).await;
                                 }
                             }
                             continue;
@@ -2420,18 +2405,7 @@ async fn handle_incoming_with_sybil(
                                 None
                             }
                         };
-                        let fallback = if request.is_none() && header_count > 0 {
-                            let local_tip = P2PNode::tip_hash(&chain);
-                            let start = if last_handshake_tip.is_some() && last_handshake_tip != Some(local_tip) {
-                                [0u8; 32]
-                            } else {
-                                local_tip
-                            };
-                            Some((start, header_count))
-                        } else {
-                            None
-                        };
-                        if let Some((start_hash, count)) = request.or(fallback) {
+                        if let Some((start_hash, count)) = request {
                             let get_blocks = GetBlocksPayload {
                                 start_hash: start_hash.to_vec(),
                                 count,
