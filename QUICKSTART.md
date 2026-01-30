@@ -19,7 +19,7 @@ cargo build --release
 ```
 4) Start the node (leave this running):
 ```
-./target/release/iriumd
+IRIUM_NODE_CONFIG=configs/node.json ./target/release/iriumd
 ```
 5) Make a wallet address (copy the one that starts with Q):
 ```
@@ -38,6 +38,7 @@ Tip: If you already set `/etc/irium/miner.env`, the miner will load it automatic
 ```
 
 Quick fixes:
+- Node stuck at height 0 / peers=0: start with `IRIUM_NODE_CONFIG=configs/node.json` so seeds load.
 - Miner says height 1? The node is not running. Start `iriumd` first.
 - If you see `HTTP 429`, add this before starting the node AND miner (same value in both terminals):
 ```
@@ -111,7 +112,7 @@ export IRIUM_NODE_CONFIG=/home/irium/irium/configs/node.json
 ## 4) Run the node
 ```
 source ~/.cargo/env
-RUST_LOG=info ./target/release/iriumd
+IRIUM_NODE_CONFIG=configs/node.json RUST_LOG=info ./target/release/iriumd
 ```
 - Seeds: signed `bootstrap/seedlist.txt` + cached `bootstrap/seedlist.runtime` (unless `p2p_seeds` overrides).
 - HTTP API: defaults to 127.0.0.1:38300 (`IRIUM_NODE_HOST`, `IRIUM_NODE_PORT`).

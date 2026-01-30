@@ -93,7 +93,7 @@ cargo build --release
 Run each service in its own terminal:
 ```bash
 # Terminal 1: node
-RUST_LOG=info ./target/release/iriumd
+IRIUM_NODE_CONFIG=configs/node.json RUST_LOG=info ./target/release/iriumd
 ```
 ```bash
 # Terminal 2: create an address (save the privkey) and start mining
@@ -116,6 +116,7 @@ export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>
 ./target/release/irium-spv --help
 ```
 Notes:
+- If the node sits at height 0 with peers=0, set `IRIUM_NODE_CONFIG=configs/node.json` and restart the node.
 - If the node requires `IRIUM_RPC_TOKEN`, export the same token for the miner and wallet.
 - Keep the printed private key safe; it controls the funds for that address.
 
