@@ -38,7 +38,7 @@ fn sync_cooldown() -> Duration {
     let secs = std::env::var("IRIUM_P2P_SYNC_COOLDOWN_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(10);
+        .unwrap_or(2);
     Duration::from_secs(secs.max(1).min(300))
 }
 
