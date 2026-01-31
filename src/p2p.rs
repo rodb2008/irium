@@ -42,14 +42,37 @@ fn sync_cooldown() -> Duration {
     Duration::from_secs(secs.max(1).min(300))
 }
 
-async fn sync_request_allowed(
+fn sync_cooldown_for(local_height: u64, peer_height: u64) -> Duration {
+    let base = sync_cooldown();
+    if peer_height <= local_height {
+        return base;
+    }
+    let gap = peer_height.saturating_sub(local_height);
+    let secs = if gap >= 10_000 {
+        1
+    } else if gap >= 1_000 {
+        2
+    } else if gap >= 100 {
+        3
+    } else if gap >= 10 {
+        5
+    } else {
+        base.as_secs()
+    };
+    Duration::from_secs(secs.max(1).min(300))
+}
+
+async fn sync_request_allowed_for(
     sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
     ip: IpAddr,
+    local_height: u64,
+    peer_height: u64,
 ) -> bool {
+    let cooldown = sync_cooldown_for(local_height, peer_height);
     let mut guard = sync_requests.lock().await;
     let now = Instant::now();
     if let Some(last) = guard.get(&ip) {
-        if now.duration_since(*last) < sync_cooldown() {
+        if now.duration_since(*last) < cooldown {
             return false;
         }
     }
@@ -57,14 +80,17 @@ async fn sync_request_allowed(
     true
 }
 
-async fn sync_block_request_allowed(
+async fn sync_block_request_allowed_for(
     block_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
     ip: IpAddr,
+    local_height: u64,
+    peer_height: u64,
 ) -> bool {
+    let cooldown = sync_cooldown_for(local_height, peer_height);
     let mut guard = block_requests.lock().await;
     let now = Instant::now();
     if let Some(last) = guard.get(&ip) {
-        if now.duration_since(*last) < sync_cooldown() {
+        if now.duration_since(*last) < cooldown {
             return false;
         }
     }
@@ -190,7 +216,7 @@ async fn maybe_request_sync(
         local_tip
     };
 
-    if sync_request_allowed(sync_requests, addr.ip()).await {
+    if sync_request_allowed_for(sync_requests, addr.ip(), local_height, peer_height).await {
         let get_headers = GetHeadersPayload {
             start_hash: start_hash.to_vec(),
             count: MAX_HEADERS_PER_REQUEST,
@@ -200,7 +226,7 @@ async fn maybe_request_sync(
         }
     }
     if peer_height > local_height || tip_mismatch {
-        if sync_block_request_allowed(block_requests, addr.ip()).await {
+        if sync_block_request_allowed_for(block_requests, addr.ip(), local_height, peer_height).await {
             let get_blocks = GetBlocksPayload {
                 start_hash: start_hash.to_vec(),
                 count: MAX_BLOCKS_PER_REQUEST,
@@ -1321,7 +1347,7 @@ impl P2PNode {
                                             let h = hex::encode(start_hash);
                                             h.get(0..12).unwrap_or(&h).to_string()
                                         };
-                                        let _ = sync_request_allowed(&sync_requests, addr.ip()).await;
+                                        let _ = sync_request_allowed_for(&sync_requests, addr.ip(), local_height, payload.height).await;
                                         Self::log(format!(
                                             "P2P {}: peer ahead ({} > {}), requesting headers from tip {}",
                                             addr,
@@ -1528,9 +1554,14 @@ impl P2PNode {
                                             }
                                             continue;
                                         }
+                                        let local_height = {
+                                            let guard = chain_arc.lock().unwrap();
+                                            guard.tip_height()
+                                        };
+                                        let peer_height = last_handshake_height.unwrap_or(local_height);
                                         if header_count >= MAX_HEADERS_PER_REQUEST {
                                             if let Some(last_hash) = last_header_hash {
-                                                if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                                if sync_request_allowed_for(&sync_requests, addr.ip(), local_height, peer_height).await {
                                                     let get_headers = GetHeadersPayload {
                                                         start_hash: last_hash.to_vec(),
                                                         count: MAX_HEADERS_PER_REQUEST,
@@ -1573,7 +1604,7 @@ impl P2PNode {
                                                 start_hash: start_hash.to_vec(),
                                                 count,
                                             };
-                                            if sync_block_request_allowed(&block_requests, addr.ip()).await {
+                                            if sync_block_request_allowed_for(&block_requests, addr.ip(), local_height, peer_height).await {
                                                 if let Ok(msg) = get_blocks.to_message() {
                                                     let _ = send_message(&writer, msg, addr).await;
                                                 }
@@ -2388,7 +2419,7 @@ async fn handle_incoming_with_sybil(
                         start_hash: start_hash.to_vec(),
                         count: MAX_HEADERS_PER_REQUEST,
                     };
-                    let _ = sync_request_allowed(&sync_requests, addr.ip()).await;
+                    let _ = sync_request_allowed_for(&sync_requests, addr.ip(), local_height, payload.height).await;
                     let short = if start_hash == [0u8; 32] {
                         "genesis".to_string()
                     } else {
@@ -2616,9 +2647,14 @@ async fn handle_incoming_with_sybil(
                             }
                             continue;
                         }
+                        let local_height = {
+                            let guard = chain_arc.lock().unwrap();
+                            guard.tip_height()
+                        };
+                        let peer_height = last_handshake_height.unwrap_or(local_height);
                         if header_count >= MAX_HEADERS_PER_REQUEST {
                             if let Some(last_hash) = last_header_hash {
-                                if sync_request_allowed(&sync_requests, addr.ip()).await {
+                                if sync_request_allowed_for(&sync_requests, addr.ip(), local_height, peer_height).await {
                                     let get_headers = GetHeadersPayload {
                                         start_hash: last_hash.to_vec(),
                                         count: MAX_HEADERS_PER_REQUEST,
@@ -2661,7 +2697,7 @@ async fn handle_incoming_with_sybil(
                                 start_hash: start_hash.to_vec(),
                                 count,
                             };
-                            if sync_block_request_allowed(&block_requests, addr.ip()).await {
+                            if sync_block_request_allowed_for(&block_requests, addr.ip(), local_height, peer_height).await {
                                 if let Ok(msg) = get_blocks.to_message() {
                                     let _ = send_message(&writer, msg, addr).await;
                                 }
