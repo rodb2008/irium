@@ -162,7 +162,7 @@ async fn maybe_request_sync(
     addr: SocketAddr,
     chain: &Option<Arc<StdMutex<ChainState>>>,
     sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
-    _block_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    block_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
     peer_state: &Arc<Mutex<PeerSyncState>>,
 ) {
     let (peer_height, peer_tip) = {
@@ -199,6 +199,18 @@ async fn maybe_request_sync(
             let _ = send_message(writer, msg, addr).await;
         }
     }
+    if peer_height > local_height || tip_mismatch {
+        if sync_block_request_allowed(block_requests, addr.ip()).await {
+            let get_blocks = GetBlocksPayload {
+                start_hash: start_hash.to_vec(),
+                count: MAX_BLOCKS_PER_REQUEST,
+            };
+            if let Ok(msg) = get_blocks.to_message() {
+                let _ = send_message(writer, msg, addr).await;
+            }
+        }
+    }
+
 
 }
 
