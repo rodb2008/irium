@@ -104,6 +104,69 @@ async fn genesis_request_allowed(
 }
 
 
+#[derive(Debug, Default)]
+struct PeerSyncState {
+    height: Option<u64>,
+    tip: Option<[u8; 32]>,
+}
+
+async fn maybe_request_sync(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    addr: SocketAddr,
+    chain: &Option<Arc<StdMutex<ChainState>>>,
+    sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    block_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    peer_state: &Arc<Mutex<PeerSyncState>>,
+) {
+    let (peer_height, peer_tip) = {
+        let guard = peer_state.lock().await;
+        (guard.height, guard.tip)
+    };
+    let peer_height = match peer_height {
+        Some(h) => h,
+        None => return,
+    };
+    let local_height = chain
+        .as_ref()
+        .and_then(|c| c.lock().ok().map(|g| g.tip_height()))
+        .unwrap_or(0);
+    let local_tip = P2PNode::tip_hash(chain);
+    let tip_mismatch = peer_tip.map(|t| t != local_tip).unwrap_or(false);
+
+    if peer_height < local_height || (peer_height == local_height && !tip_mismatch) {
+        return;
+    }
+
+    let start_hash = if local_height == 0 || tip_mismatch {
+        [0u8; 32]
+    } else {
+        local_tip
+    };
+
+    if sync_request_allowed(sync_requests, addr.ip()).await {
+        let get_headers = GetHeadersPayload {
+            start_hash: start_hash.to_vec(),
+            count: MAX_HEADERS_PER_REQUEST,
+        };
+        if let Ok(msg) = get_headers.to_message() {
+            let _ = send_message(writer, msg, addr).await;
+        }
+    }
+
+    if peer_height > local_height || tip_mismatch {
+        if sync_block_request_allowed(block_requests, addr.ip()).await {
+            let get_blocks = GetBlocksPayload {
+                start_hash: start_hash.to_vec(),
+                count: MAX_BLOCKS_PER_REQUEST,
+            };
+            if let Ok(msg) = get_blocks.to_message() {
+                let _ = send_message(writer, msg, addr).await;
+            }
+        }
+    }
+}
+
+
 fn handshake_fail_window() -> Duration {
     Duration::from_secs(60)
 }
@@ -937,6 +1000,7 @@ impl P2PNode {
             dir.register_connection(multiaddr, None, self.relay_address.clone(), None);
         }
 
+        let peer_state = Arc::new(Mutex::new(PeerSyncState::default()));
         let ping_writer = writer.clone();
         let ping_addr = addr;
         let ping_chain = self.chain.clone();
@@ -944,6 +1008,9 @@ impl P2PNode {
         let ping_relay = self.relay_address.clone();
         let ping_port = self.bind_addr.port();
         let ping_node_id = self.node_id.clone();
+        let ping_peer_state = peer_state.clone();
+        let ping_sync_requests = self.sync_requests.clone();
+        let ping_block_requests = self.block_requests.clone();
         tokio::spawn(async move {
             let interval = P2PNode::ping_interval();
             let mut last_height = crate::p2p::local_height(&ping_chain);
@@ -982,6 +1049,15 @@ impl P2PNode {
                     last_height = current_height;
                     last_handshake = Instant::now();
                 }
+                maybe_request_sync(
+                    &ping_writer,
+                    ping_addr,
+                    &ping_chain,
+                    &ping_sync_requests,
+                    &ping_block_requests,
+                    &ping_peer_state,
+                )
+                .await;
             }
         });
 
@@ -999,6 +1075,7 @@ impl P2PNode {
         let peers_vec = self.peers.clone();
         let connected_vec = self.connected.clone();
         let writer_for_drop = writer.clone();
+        let peer_state = peer_state.clone();
         let local_node_id = hex::encode(&self.node_id);
         tokio::spawn(async move {
             let mut msg_count: u32 = 0;
@@ -1116,6 +1193,11 @@ impl P2PNode {
                                     last_handshake_height = Some(payload.height);
                                     last_handshake_agent = Some(agent_str.clone());
                                     last_handshake_tip = parsed_tip;
+                                    {
+                                        let mut state = peer_state.lock().await;
+                                        state.height = Some(payload.height);
+                                        state.tip = parsed_tip;
+                                    }
                                     // If we have a relay address, advertise it back.
                                     if let Some(relay) = relay_addr.clone() {
                                         let relay_msg = RelayAddressPayload {
@@ -1130,6 +1212,14 @@ impl P2PNode {
                                     if let Ok(msg) = EmptyPayload::to_message(MessageType::GetPeers)
                                     {
                                         let _ = send_message(&writer, msg, addr).await;
+                                        maybe_request_sync(
+                                            &writer,
+                                            addr,
+                                            &chain_for_sync,
+                                            &sync_requests,
+                                            &block_requests,
+                                            &peer_state,
+                                        ).await;
                                     }
                                     // Basic header-first sync trigger: if peer is ahead, request blocks.
                                     let local_height = {
@@ -1616,6 +1706,14 @@ impl P2PNode {
                                                         new_height.saturating_sub(1),
                                                     );
                                                 }
+                                                    maybe_request_sync(
+                                                        &writer,
+                                                        addr,
+                                                        &chain_for_sync,
+                                                        &sync_requests,
+                                                        &block_requests,
+                                                        &peer_state,
+                                                    ).await;
                                                 if let Some(ok) = record_verdict {
                                                     let mut rep = reputation.lock().await;
                                                     rep.record_block(&addr.to_string(), ok);
@@ -1986,6 +2084,7 @@ async fn handle_incoming_with_sybil(
         guard.push(writer.clone());
     }
 
+    let peer_state = Arc::new(Mutex::new(PeerSyncState::default()));
     let ping_writer = writer.clone();
     let ping_addr = addr;
     let ping_chain = chain.clone();
@@ -1993,6 +2092,9 @@ async fn handle_incoming_with_sybil(
     let ping_relay = relay_address.clone();
     let ping_port = bind_addr.port();
     let ping_node_id = node_id.clone();
+    let ping_peer_state = peer_state.clone();
+    let ping_sync_requests = sync_requests.clone();
+    let ping_block_requests = block_requests.clone();
     tokio::spawn(async move {
         let interval = P2PNode::ping_interval();
         let mut last_height = crate::p2p::local_height(&ping_chain);
@@ -2031,6 +2133,15 @@ async fn handle_incoming_with_sybil(
                 last_height = current_height;
                 last_handshake = Instant::now();
             }
+            maybe_request_sync(
+                &ping_writer,
+                ping_addr,
+                &ping_chain,
+                &ping_sync_requests,
+                &ping_block_requests,
+                &ping_peer_state,
+            )
+            .await;
         }
     });
 
@@ -2146,6 +2257,11 @@ async fn handle_incoming_with_sybil(
                             None
                         });
                     last_handshake_tip = parsed_tip;
+                    {
+                        let mut state = peer_state.lock().await;
+                        state.height = Some(payload.height);
+                        state.tip = parsed_tip;
+                    }
                     last_handshake_height = Some(payload.height);
 
                     let response = HandshakePayload {
@@ -2166,6 +2282,14 @@ async fn handle_incoming_with_sybil(
                     // Ask peer for its view of the network.
                     if let Ok(msg) = EmptyPayload::to_message(MessageType::GetPeers) {
                         let _ = send_message(&writer, msg, addr).await;
+                        maybe_request_sync(
+                            &writer,
+                            addr,
+                            &chain,
+                            &sync_requests,
+                            &block_requests,
+                            &peer_state,
+                        ).await;
                     }
                     let local_height = local_height(&chain);
                     let peer_tip = payload
@@ -2637,6 +2761,14 @@ async fn handle_incoming_with_sybil(
                                     let mut directory = directory.lock().await;
                                     directory.record_height(&multiaddr, new_height.saturating_sub(1));
                                 }
+                                    maybe_request_sync(
+                                        &writer,
+                                        addr,
+                                        &chain,
+                                        &sync_requests,
+                                        &block_requests,
+                                        &peer_state,
+                                    ).await;
                                 if let Some(ok) = record_verdict {
                                     let mut rep = reputation.lock().await;
                                     rep.record_block(&addr.to_string(), ok);
