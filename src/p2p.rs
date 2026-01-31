@@ -103,6 +103,53 @@ async fn genesis_request_allowed(
     true
 }
 
+fn chain_hash_at(chain: &Option<Arc<StdMutex<ChainState>>>, height: u64) -> Option<[u8; 32]> {
+    let chain_arc = chain.as_ref()?;
+    let guard = chain_arc.lock().ok()?;
+    guard.chain.get(height as usize).map(|b| b.header.hash())
+}
+
+fn genesis_checkpoint(chain: &Option<Arc<StdMutex<ChainState>>>) -> (Option<u64>, Option<String>) {
+    match chain_hash_at(chain, 0) {
+        Some(hash) => (Some(0), Some(hex::encode(hash))),
+        None => (None, None),
+    }
+}
+
+fn verify_peer_checkpoint(
+    payload: &HandshakePayload,
+    chain: &Option<Arc<StdMutex<ChainState>>>,
+) -> Result<(), String> {
+    let height = match payload.checkpoint_height {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    let hash_hex = payload
+        .checkpoint_hash
+        .as_ref()
+        .ok_or_else(|| "missing checkpoint hash".to_string())?;
+    let bytes = hex::decode(hash_hex).map_err(|_| "invalid checkpoint hash hex".to_string())?;
+    if bytes.len() != 32 {
+        return Err("invalid checkpoint hash length".to_string());
+    }
+    let local = match chain_hash_at(chain, height) {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    let mut peer = [0u8; 32];
+    peer.copy_from_slice(&bytes[..32]);
+    if local != peer {
+        let local_hex = hex::encode(local);
+        let peer_hex = hex::encode(peer);
+        let local_short = local_hex.get(0..12).unwrap_or(&local_hex);
+        let peer_short = peer_hex.get(0..12).unwrap_or(&peer_hex);
+        return Err(format!(
+            "checkpoint mismatch at height {} (local {} != peer {})",
+            height, local_short, peer_short
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Default)]
 struct PeerSyncState {
@@ -115,7 +162,7 @@ async fn maybe_request_sync(
     addr: SocketAddr,
     chain: &Option<Arc<StdMutex<ChainState>>>,
     sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
-    block_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    _block_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
     peer_state: &Arc<Mutex<PeerSyncState>>,
 ) {
     let (peer_height, peer_tip) = {
@@ -153,17 +200,6 @@ async fn maybe_request_sync(
         }
     }
 
-    if peer_height > local_height || tip_mismatch {
-        if sync_block_request_allowed(block_requests, addr.ip()).await {
-            let get_blocks = GetBlocksPayload {
-                start_hash: start_hash.to_vec(),
-                count: MAX_BLOCKS_PER_REQUEST,
-            };
-            if let Ok(msg) = get_blocks.to_message() {
-                let _ = send_message(writer, msg, addr).await;
-            }
-        }
-    }
 }
 
 
@@ -958,14 +994,15 @@ impl P2PNode {
             .map_err(|e| format!("send sybil proof to {} failed: {}", addr, e))?;
         Self::log(format!("P2P outbound {}: sent sybil proof", addr));
 
+        let (checkpoint_height, checkpoint_hash) = genesis_checkpoint(&self.chain);
         let payload = HandshakePayload {
             version: 1,
             agent: agent.to_string(),
             height: local_height_val,
             timestamp: Utc::now().timestamp(),
             port: self.bind_addr.port(),
-            checkpoint_height: None,
-            checkpoint_hash: None,
+            checkpoint_height,
+            checkpoint_hash,
             relay_address: self.relay_address.clone(),
             node_id: Some(hex::encode(&self.node_id)),
             tip_hash: Some(hex::encode(&P2PNode::tip_hash(&self.chain))),
@@ -1031,14 +1068,15 @@ impl P2PNode {
                 let current_height = crate::p2p::local_height(&ping_chain);
                 let handshake_due = last_handshake.elapsed() >= P2PNode::handshake_interval();
                 if handshake_due || current_height != last_height {
+                    let (checkpoint_height, checkpoint_hash) = genesis_checkpoint(&ping_chain);
                     let payload = HandshakePayload {
                         version: 1,
                         agent: ping_agent.clone(),
                         height: current_height,
                         timestamp: Utc::now().timestamp(),
                         port: ping_port,
-                        checkpoint_height: None,
-                        checkpoint_hash: None,
+                        checkpoint_height,
+                        checkpoint_hash,
                         relay_address: ping_relay.clone(),
                         node_id: Some(hex::encode(&ping_node_id)),
                         tip_hash: Some(hex::encode(&P2PNode::tip_hash(&ping_chain))),
@@ -1156,6 +1194,14 @@ impl P2PNode {
                                             );
                                             break;
                                         }
+                                    }
+                                    if let Err(reason) = verify_peer_checkpoint(&payload, &chain_for_sync) {
+                                        P2PNode::log_event(
+                                            "warn",
+                                            "net",
+                                            format!("P2P {}: incompatible peer: {}", addr, reason),
+                                        );
+                                        break;
                                     }
                                     let agent_str = payload.agent.clone();
                                     let node_id = payload.node_id.clone();
@@ -2115,14 +2161,15 @@ async fn handle_incoming_with_sybil(
             let current_height = crate::p2p::local_height(&ping_chain);
             let handshake_due = last_handshake.elapsed() >= P2PNode::handshake_interval();
             if handshake_due || current_height != last_height {
+                let (checkpoint_height, checkpoint_hash) = genesis_checkpoint(&ping_chain);
                 let payload = HandshakePayload {
                     version: 1,
                     agent: ping_agent.clone(),
                     height: current_height,
                     timestamp: Utc::now().timestamp(),
                     port: ping_port,
-                    checkpoint_height: None,
-                    checkpoint_hash: None,
+                    checkpoint_height,
+                    checkpoint_hash,
                     relay_address: ping_relay.clone(),
                     node_id: Some(hex::encode(&ping_node_id)),
                     tip_hash: Some(hex::encode(&P2PNode::tip_hash(&ping_chain))),
@@ -2156,14 +2203,15 @@ async fn handle_incoming_with_sybil(
 
     // Reply with our handshake so outbound peers learn our agent/height.
     let local_h = local_height(&chain);
+    let (checkpoint_height, checkpoint_hash) = genesis_checkpoint(&chain);
     let payload = HandshakePayload {
         version: 1,
         agent: agent.clone(),
         height: local_h,
         timestamp: Utc::now().timestamp(),
         port: bind_addr.port(),
-        checkpoint_height: None,
-        checkpoint_hash: None,
+        checkpoint_height,
+        checkpoint_hash,
         relay_address: relay_address.clone(),
         node_id: Some(hex::encode(&node_id)),
         tip_hash: Some(hex::encode(&P2PNode::tip_hash(&chain))),
@@ -2228,6 +2276,14 @@ async fn handle_incoming_with_sybil(
                             break;
                         }
                     }
+                    if let Err(reason) = verify_peer_checkpoint(&payload, &chain) {
+                        P2PNode::log_event(
+                            "warn",
+                            "net",
+                            format!("P2P {}: incompatible peer: {}", addr, reason),
+                        );
+                        break;
+                    }
                     let advertised_port = if payload.port > 0 {
                         payload.port
                     } else {
@@ -2264,14 +2320,15 @@ async fn handle_incoming_with_sybil(
                     }
                     last_handshake_height = Some(payload.height);
 
+                    let (checkpoint_height, checkpoint_hash) = genesis_checkpoint(&chain);
                     let response = HandshakePayload {
                         version: payload.version,
                         agent: agent.clone(),
                         height: local_height(&chain),
                         timestamp: Utc::now().timestamp(),
                         port: bind_addr.port(),
-                        checkpoint_height: None,
-                        checkpoint_hash: None,
+                        checkpoint_height,
+                        checkpoint_hash,
                         relay_address: relay_address.clone(),
                         node_id: Some(hex::encode(&node_id)),
                         tip_hash: Some(hex::encode(&P2PNode::tip_hash(&chain))),
