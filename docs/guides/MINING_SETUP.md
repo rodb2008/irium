@@ -60,6 +60,10 @@ The miner was already running. Restart it after updating `IRIUM_MINER_ADDRESS`.
 ```
 Rewards are spendable after 100 block confirmations (coinbase maturity).
 
+**HTTP 429 Too Many Requests**
+
+Your node is rate-limiting RPC calls. Use your own local node, set the same `IRIUM_RPC_TOKEN` on both node and miner, or raise `IRIUM_RATE_LIMIT_PER_MIN` in the node env and restart it.
+
 ### Mining Tips
 
 - Save your private key and address offline.
