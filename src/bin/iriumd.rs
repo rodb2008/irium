@@ -170,6 +170,11 @@ struct BlockQuery {
 }
 
 #[derive(Deserialize)]
+struct BlockHashQuery {
+    hash: String,
+}
+
+#[derive(Deserialize)]
 struct TemplateQuery {
     longpoll: Option<u8>,
     poll_secs: Option<u64>,
@@ -179,6 +184,24 @@ struct TemplateQuery {
 
 #[derive(Deserialize)]
 struct SubmitTxRequest {
+    tx_hex: String,
+}
+
+#[derive(Deserialize)]
+struct TxQuery {
+    txid: String,
+}
+
+#[derive(Serialize)]
+struct TxLookupResponse {
+    txid: String,
+    height: u64,
+    index: usize,
+    block_hash: String,
+    inputs: usize,
+    outputs: usize,
+    output_value: u64,
+    is_coinbase: bool,
     tx_hex: String,
 }
 
@@ -1302,6 +1325,23 @@ async fn get_block_template(
     }))
 }
 
+fn block_json_for(height: u64, block: &Block) -> Value {
+    let header = &block.header;
+    serde_json::json!({
+        "height": height,
+        "header": {
+            "version": header.version,
+            "prev_hash": hex::encode(header.prev_hash),
+            "merkle_root": hex::encode(header.merkle_root),
+            "time": header.time,
+            "bits": format!("{:08x}", header.bits),
+            "nonce": header.nonce,
+            "hash": hex::encode(header.hash()),
+        },
+        "tx_hex": block.transactions.iter().map(|tx| hex::encode(tx.serialize())).collect::<Vec<_>>(),
+        "miner_address": miner_address_from_block(block)
+    })
+}
 async fn get_block(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -1309,31 +1349,78 @@ async fn get_block(
     Query(q): Query<BlockQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
-    let block_json = {
-        let guard = state.chain.lock().unwrap();
-        let idx = q.height as usize;
-        if idx >= guard.chain.len() {
-            return Err(StatusCode::NOT_FOUND);
-        }
-        let block = &guard.chain[idx];
-        let header = &block.header;
-        serde_json::json!({
-            "height": q.height,
-            "header": {
-                "version": header.version,
-                "prev_hash": hex::encode(header.prev_hash),
-                "merkle_root": hex::encode(header.merkle_root),
-                "time": header.time,
-                "bits": format!("{:08x}", header.bits),
-                "nonce": header.nonce,
-                "hash": hex::encode(header.hash()),
-            },
-            "tx_hex": block.transactions.iter().map(|tx| hex::encode(tx.serialize())).collect::<Vec<_>>(),
-            "miner_address": miner_address_from_block(block)
-        })
-    };
+    let guard = state.chain.lock().unwrap();
+    let idx = q.height as usize;
+    if idx >= guard.chain.len() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let block = &guard.chain[idx];
+    Ok(Json(block_json_for(q.height, block)))
+}
 
-    Ok(Json(block_json))
+async fn get_block_by_hash(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<BlockHashQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    let bytes = hex::decode(&q.hash).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if bytes.len() != 32 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut target = [0u8; 32];
+    target.copy_from_slice(&bytes);
+
+    let guard = state.chain.lock().unwrap();
+    let height = match guard.heights.get(&target) {
+        Some(h) => *h,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+    let block = guard
+        .block_store
+        .get(&target)
+        .or_else(|| guard.chain.get(height as usize))
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(block_json_for(height, block)))
+}
+
+async fn get_tx(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TxQuery>,
+) -> Result<Json<TxLookupResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    let bytes = hex::decode(&q.txid).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if bytes.len() != 32 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut target = [0u8; 32];
+    target.copy_from_slice(&bytes);
+
+    let guard = state.chain.lock().unwrap();
+    for (height, block) in guard.chain.iter().enumerate() {
+        for (idx, tx) in block.transactions.iter().enumerate() {
+            if tx.txid() == target {
+                let output_value: u64 = tx.outputs.iter().map(|o| o.value).sum();
+                let is_coinbase = tx.inputs.len() == 1 && tx.inputs[0].prev_txid == [0u8; 32];
+                let response = TxLookupResponse {
+                    txid: hex::encode(target),
+                    height: height as u64,
+                    index: idx,
+                    block_hash: hex::encode(block.header.hash()),
+                    inputs: tx.inputs.len(),
+                    outputs: tx.outputs.len(),
+                    output_value,
+                    is_coinbase,
+                    tx_hex: hex::encode(tx.serialize()),
+                };
+                return Ok(Json(response));
+            }
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
 }
 
 fn decode_compact_tx(raw: &[u8]) -> Result<Transaction, String> {
@@ -1937,6 +2024,8 @@ async fn main() {
         .route("/rpc/utxo", get(get_utxo))
         .route("/rpc/getblocktemplate", get(get_block_template))
         .route("/rpc/block", get(get_block))
+        .route("/rpc/block_by_hash", get(get_block_by_hash))
+        .route("/rpc/tx", get(get_tx))
         .route("/rpc/submit_block", post(submit_block))
         .route("/rpc/submit_tx", post(submit_tx))
         .layer(DefaultBodyLimit::max(rpc_body_limit_bytes()))

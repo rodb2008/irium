@@ -230,6 +230,46 @@ async fn block(
     proxy_json(&state, &format!("/rpc/block?height={}", height)).await
 }
 
+
+async fn blockhash(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(hash): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    proxy_json(&state, &format!("/rpc/block_by_hash?hash={}", hash)).await
+}
+
+async fn tx(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(txid): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    proxy_json(&state, &format!("/rpc/tx?txid={}", txid)).await
+}
+
+async fn address(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(address): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    let balance = proxy_value(&state, &format!("/rpc/balance?address={}", address)).await?;
+    let utxos = proxy_value(&state, &format!("/rpc/utxos?address={}", address)).await?;
+    let history = proxy_value(&state, &format!("/rpc/history?address={}", address)).await?;
+    let payload = json!({
+        "address": address,
+        "balance": balance,
+        "utxos": utxos,
+        "history": history,
+    });
+    Ok(Json(payload))
+}
+
 async fn utxo(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -276,6 +316,9 @@ async fn main() {
         .route("/peers", get(peers))
         .route("/metrics", get(metrics))
         .route("/block/:height", get(block))
+        .route("/blockhash/:hash", get(blockhash))
+        .route("/tx/:txid", get(tx))
+        .route("/address/:address", get(address))
         .route("/utxo", get(utxo))
         .with_state(state)
         .into_make_service_with_connect_info::<SocketAddr>();
