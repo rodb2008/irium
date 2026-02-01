@@ -8,11 +8,12 @@ use std::{env, fs};
 
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Json as AxumJson, Query, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::{header::{AUTHORIZATION, CONTENT_TYPE}, HeaderMap, HeaderValue, Method, StatusCode},
     routing::{get, post},
     Json, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
+use tower_http::cors::{Any, CorsLayer};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -220,6 +221,34 @@ struct NodeConfig {
     /// Optional relay payout address to advertise to peers.
     #[serde(default)]
     relay_address: Option<String>,
+}
+
+fn cors_layer() -> Option<CorsLayer> {
+    let raw = env::var("IRIUM_CORS_ORIGINS").ok()?;
+    let origins = raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    if origins.is_empty() {
+        return None;
+    }
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE]);
+    if origins.iter().any(|o| *o == "*" || *o == "all") {
+        return Some(layer.allow_origin(Any));
+    }
+    let mut values = Vec::new();
+    for origin in origins {
+        if let Ok(value) = HeaderValue::from_str(origin) {
+            values.push(value);
+        }
+    }
+    if values.is_empty() {
+        return None;
+    }
+    Some(layer.allow_origin(values))
 }
 
 fn parse_seed_lines(raw: &str) -> Vec<String> {
@@ -1813,7 +1842,7 @@ async fn main() {
         limiter: limiter.clone(),
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/status", get(status))
         .route("/peers", get(peers))
         .route("/metrics", get(metrics))
@@ -1827,8 +1856,13 @@ async fn main() {
         .route("/rpc/submit_block", post(submit_block))
         .route("/rpc/submit_tx", post(submit_tx))
         .layer(DefaultBodyLimit::max(rpc_body_limit_bytes()))
-        .with_state(app_state)
-        .into_make_service_with_connect_info::<SocketAddr>();
+        .with_state(app_state);
+
+    if let Some(cors) = cors_layer() {
+        app = app.layer(cors);
+    }
+
+    let app = app.into_make_service_with_connect_info::<SocketAddr>();
 
     let host = std::env::var("IRIUM_NODE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port: u16 = std::env::var("IRIUM_NODE_PORT")
