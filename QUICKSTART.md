@@ -55,6 +55,12 @@ export IRIUM_NODE_RPC=http://<node-ip>:38300
 If you want the detailed/advanced steps, continue below.
 
 
+## Network Hashrate (estimate)
+```bash
+curl http://127.0.0.1:38300/rpc/network_hashrate
+curl http://127.0.0.1:38300/rpc/network_hashrate?window=120
+```
+
 ## FAQ / Common issues
 - No peers / stuck at height 0: check outbound TCP 38291, verify seeds in `bootstrap/seedlist.txt`, and restart the node. Some networks block inbound peers.
 - Miner starts at height 0: let the node finish syncing and confirm RPC is reachable with `curl -k https://127.0.0.1:38300/status`.

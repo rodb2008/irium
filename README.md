@@ -130,6 +130,15 @@ cargo test --quiet
 
 ## Run the Rust Node
 
+### Network Hashrate (estimate)
+Use the node RPC to estimate network hashrate from recent blocks:
+```bash
+curl http://127.0.0.1:38300/rpc/network_hashrate
+# optional window (blocks)
+curl http://127.0.0.1:38300/rpc/network_hashrate?window=120
+```
+Response fields: hashrate, difficulty, avg_block_time, window, sample_blocks, tip_height.
+
 ### Important runtime env vars
 - `IRIUM_ANCHOR_MIN_SIGNERS`: minimum valid signatures required for `bootstrap/anchors.json` (default 1).
 - `IRIUM_SYBIL_DIFFICULTY` / `IRIUM_SYBIL_DIFFICULTY_MAX`: base and cap for sybil handshake PoW (default 10/20).
