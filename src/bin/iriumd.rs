@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use hex;
+use num_traits::ToPrimitive;
 
 use bs58;
 use irium_node_rs::anchors::AnchorManager;
@@ -77,6 +78,21 @@ struct UtxoResponse {
     value: u64,
     height: u64,
     is_coinbase: bool,
+}
+
+#[derive(Deserialize)]
+struct NetworkHashrateQuery {
+    window: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct NetworkHashrateResponse {
+    tip_height: u64,
+    difficulty: f64,
+    hashrate: Option<f64>,
+    avg_block_time: Option<f64>,
+    window: usize,
+    sample_blocks: usize,
 }
 
 #[derive(Serialize)]
@@ -783,6 +799,73 @@ fn check_rate(state: &AppState, addr: &SocketAddr) -> Result<(), StatusCode> {
         Err(StatusCode::TOO_MANY_REQUESTS)
     }
 }
+
+fn difficulty_from_target(pow_limit: Target, target: Target) -> f64 {
+    let max_target = pow_limit.to_target();
+    let cur_target = target.to_target();
+    let max_f = max_target.to_f64().unwrap_or(0.0);
+    let cur_f = cur_target.to_f64().unwrap_or(0.0);
+    if cur_f <= 0.0 {
+        0.0
+    } else {
+        max_f / cur_f
+    }
+}
+
+async fn network_hashrate(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Query(q): Query<NetworkHashrateQuery>,
+) -> Result<Json<NetworkHashrateResponse>, StatusCode> {
+    check_rate(&state, &addr)?;
+    let window = q.window.unwrap_or(120).clamp(1, 2016);
+    let (tip_height, difficulty, hashrate, avg_block_time, sample_blocks) = {
+        let guard = state.chain.lock().unwrap();
+        let tip_height = guard.tip_height();
+        let tip_target = guard
+            .chain
+            .last()
+            .map(|b| b.header.target())
+            .unwrap_or_else(|| guard.params.genesis_block.header.target());
+        let difficulty = difficulty_from_target(guard.params.pow_limit, tip_target);
+
+        if guard.chain.len() < 2 {
+            (tip_height, difficulty, None, None, 0usize)
+        } else {
+            let end_index = guard.chain.len() - 1;
+            let start_index = if guard.chain.len() > window {
+                guard.chain.len() - 1 - window
+            } else {
+                0
+            };
+            let blocks = end_index.saturating_sub(start_index);
+            if blocks == 0 {
+                (tip_height, difficulty, None, None, 0usize)
+            } else {
+                let start_time = guard.chain[start_index].header.time as i64;
+                let end_time = guard.chain[end_index].header.time as i64;
+                let elapsed = end_time - start_time;
+                if elapsed <= 0 {
+                    (tip_height, difficulty, None, None, blocks)
+                } else {
+                    let avg_time = (elapsed as f64) / (blocks as f64);
+                    let hashrate = difficulty * 4294967296.0 / avg_time;
+                    (tip_height, difficulty, Some(hashrate), Some(avg_time), blocks)
+                }
+            }
+        }
+    };
+
+    Ok(Json(NetworkHashrateResponse {
+        tip_height,
+        difficulty,
+        hashrate,
+        avg_block_time,
+        window,
+        sample_blocks,
+    }))
+}
+
 
 async fn status(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -1846,6 +1929,7 @@ async fn main() {
         .route("/status", get(status))
         .route("/peers", get(peers))
         .route("/metrics", get(metrics))
+        .route("/rpc/network_hashrate", get(network_hashrate))
         .route("/rpc/balance", get(get_balance))
         .route("/rpc/utxos", get(get_utxos))
         .route("/rpc/history", get(get_history))
