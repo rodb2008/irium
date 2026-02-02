@@ -320,6 +320,27 @@ async fn getblocks_request_allowed(
     true
 }
 
+
+async fn getblocks_range_allowed(
+    requests: &Arc<Mutex<HashMap<IpAddr, (u64, u64, Instant)>>>,
+    ip: IpAddr,
+    start_height: u64,
+    end_height: u64,
+) -> bool {
+    let grace = getblocks_grace();
+    let now = Instant::now();
+    let mut guard = requests.lock().await;
+    if let Some((last_start, last_end, last_ts)) = guard.get(&ip) {
+        if now.duration_since(*last_ts) < grace {
+            if start_height <= *last_end && end_height >= *last_start {
+                return false;
+            }
+        }
+    }
+    guard.insert(ip, (start_height, end_height, now));
+    true
+}
+
 #[derive(Clone)]
 pub struct P2PNode {
     bind_addr: SocketAddr,
@@ -332,6 +353,7 @@ pub struct P2PNode {
     block_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     getblocks_seen: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     getblocks_last: Arc<Mutex<HashMap<IpAddr, (Vec<u8>, u32, Instant)>>>,
+    getblocks_ranges: Arc<Mutex<HashMap<IpAddr, (u64, u64, Instant)>>>,
     getblocks_genesis: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     handshake_failures: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
@@ -555,6 +577,7 @@ impl P2PNode {
             block_requests: Arc::new(Mutex::new(HashMap::new())),
             getblocks_seen: Arc::new(Mutex::new(HashMap::new())),
             getblocks_last: Arc::new(Mutex::new(HashMap::new())),
+            getblocks_ranges: Arc::new(Mutex::new(HashMap::new())),
             getblocks_genesis: Arc::new(Mutex::new(HashMap::new())),
             handshake_failures: Arc::new(Mutex::new(HashMap::new())),
             self_ips: Arc::new(Mutex::new(HashSet::new())),
@@ -590,6 +613,7 @@ impl P2PNode {
         let block_requests = self.block_requests.clone();
         let getblocks_seen = self.getblocks_seen.clone();
         let getblocks_last = self.getblocks_last.clone();
+        let getblocks_ranges = self.getblocks_ranges.clone();
         let getblocks_genesis = self.getblocks_genesis.clone();
         let handshake_failures = self.handshake_failures.clone();
         let self_ips = self.self_ips.clone();
@@ -648,6 +672,7 @@ impl P2PNode {
                         let block_peer = block_requests.clone();
                         let getblocks_peer = getblocks_seen.clone();
                         let getblocks_last_peer = getblocks_last.clone();
+                        let getblocks_ranges_peer = getblocks_ranges.clone();
                         let getblocks_genesis_peer = getblocks_genesis.clone();
                         let dynamic_bans_for_handshake = dynamic_bans.clone();
                         let handshake_failures_for_handshake = handshake_failures.clone();
@@ -664,6 +689,7 @@ impl P2PNode {
                                 block_peer,
                                 getblocks_peer,
                                 getblocks_last_peer,
+                                getblocks_ranges_peer,
                                 getblocks_genesis_peer,
                                 self_ip_peer,
                                 chain_peer,
@@ -1148,6 +1174,7 @@ impl P2PNode {
         let block_requests = self.block_requests.clone();
         let getblocks_seen = self.getblocks_seen.clone();
         let getblocks_last = self.getblocks_last.clone();
+        let getblocks_ranges = self.getblocks_ranges.clone();
         let getblocks_genesis = self.getblocks_genesis.clone();
         let self_ips = self.self_ips.clone();
         let peers_vec = self.peers.clone();
@@ -1703,10 +1730,14 @@ impl P2PNode {
                                             let start_h: u64 = heights.first().copied().unwrap_or(0);
                                             (blocks, start_h)
                                         };
-                                        if !blocks.is_empty() {
-                                            let end_h = start_height + blocks.len() as u64 - 1;
-                                            P2PNode::log(format!("P2P {}: sending {} blocks [{}-{}]", addr, blocks.len(), start_height, end_h));
+                                        if blocks.is_empty() {
+                                            continue;
                                         }
+                                        let end_h = start_height + blocks.len() as u64 - 1;
+                                        if !getblocks_range_allowed(&getblocks_ranges, addr.ip(), start_height, end_h).await {
+                                            continue;
+                                        }
+                                        P2PNode::log(format!("P2P {}: sending {} blocks [{}-{}]", addr, blocks.len(), start_height, end_h));
                                         for block_data in blocks {
                                             let msg = BlockPayload { block_data }.to_message();
                                             let _ = send_message(&writer, msg, addr).await;
@@ -2096,6 +2127,7 @@ async fn handle_incoming_with_sybil(
     block_requests: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     getblocks_seen: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     getblocks_last: Arc<Mutex<HashMap<IpAddr, (Vec<u8>, u32, Instant)>>>,
+    getblocks_ranges: Arc<Mutex<HashMap<IpAddr, (u64, u64, Instant)>>>,
     getblocks_genesis: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
@@ -2791,10 +2823,14 @@ async fn handle_incoming_with_sybil(
                             let start_h: u64 = heights.first().copied().unwrap_or(0);
                             (blocks, start_h)
                         };
-                        if !blocks.is_empty() {
-                            let end_h = start_height + blocks.len() as u64 - 1;
-                            P2PNode::log(format!("P2P {}: sending {} blocks [{}-{}]", addr, blocks.len(), start_height, end_h));
+                        if blocks.is_empty() {
+                            continue;
                         }
+                        let end_h = start_height + blocks.len() as u64 - 1;
+                        if !getblocks_range_allowed(&getblocks_ranges, addr.ip(), start_height, end_h).await {
+                            continue;
+                        }
+                        P2PNode::log(format!("P2P {}: sending {} blocks [{}-{}]", addr, blocks.len(), start_height, end_h));
                         for block_data in blocks {
                             let msg = BlockPayload { block_data }.to_message();
                             let _ = send_message(&writer, msg, addr).await;
