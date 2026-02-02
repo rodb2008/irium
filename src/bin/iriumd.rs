@@ -1738,10 +1738,11 @@ async fn main() {
             let expected = latest.hash.to_lowercase();
             let tip_hash = genesis_hash.to_lowercase();
             if latest.height <= 1 && expected != tip_hash {
-                panic!(
+                eprintln!(
                     "Anchors mismatch: latest anchor hash {} != genesis hash {}",
                     expected, tip_hash
                 );
+                std::process::exit(1);
             }
         }
     }
@@ -1750,10 +1751,11 @@ async fn main() {
     if let Some(ref a) = anchors {
         if let Some(latest) = a.get_latest_anchor() {
             if latest.height <= 1 && latest.hash.to_lowercase() != genesis_hash.to_lowercase() {
-                panic!(
+                eprintln!(
                     "Anchors mismatch: latest anchor hash {} != genesis hash {}",
                     latest.hash, genesis_hash
                 );
+                std::process::exit(1);
             }
         }
     }

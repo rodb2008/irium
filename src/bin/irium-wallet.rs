@@ -790,20 +790,49 @@ fn main() {
                 std::process::exit(1);
             }
 
-            let to_pkh = base58_p2pkh_to_hash(to_addr).unwrap();
+            let to_pkh = match base58_p2pkh_to_hash(to_addr) {
+                Some(v) => v,
+                None => {
+                    eprintln!("Invalid destination address");
+                    std::process::exit(1);
+                }
+            };
             let mut to_arr = [0u8; 20];
             to_arr.copy_from_slice(&to_pkh);
             let to_script = p2pkh_script(&to_arr);
 
-            let from_pkh = base58_p2pkh_to_hash(from_addr).unwrap();
+            let from_pkh = match base58_p2pkh_to_hash(from_addr) {
+                Some(v) => v,
+                None => {
+                    eprintln!("Invalid source address");
+                    std::process::exit(1);
+                }
+            };
             let mut from_arr = [0u8; 20];
             from_arr.copy_from_slice(&from_pkh);
             let change_script = p2pkh_script(&from_arr);
 
-            let priv_bytes = hex::decode(&key.privkey).expect("privkey hex");
-            let signing_key = SigningKey::from_bytes(priv_bytes.as_slice().into())
-                .expect("valid signing key");
-            let pub_bytes = hex::decode(&key.pubkey).expect("pubkey hex");
+            let priv_bytes = match hex::decode(&key.privkey) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Invalid private key hex: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let signing_key = match SigningKey::from_bytes(priv_bytes.as_slice().into()) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Invalid signing key: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let pub_bytes = match hex::decode(&key.pubkey) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Invalid public key hex: {}", e);
+                    std::process::exit(1);
+                }
+            };
 
             let mut inputs: Vec<TxInput> = Vec::new();
             for utxo in &selected {
@@ -846,9 +875,13 @@ fn main() {
                 for (idx, utxo) in selected.iter().enumerate() {
                     let script_pubkey = hex::decode(&utxo.script_pubkey).unwrap_or_else(|_| change_script.clone());
                     let digest = signature_digest(&tx, idx, &script_pubkey);
-                    let sig: Signature = signing_key
-                        .sign_prehash(&digest)
-                        .expect("sign prehash");
+                    let sig: Signature = match signing_key.sign_prehash(&digest) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("Failed to sign prehash: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
                     let sig = sig.normalize_s().unwrap_or(sig);
                     let mut sig_bytes = sig.to_der().as_bytes().to_vec();
                     sig_bytes.push(0x01);

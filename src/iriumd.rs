@@ -675,7 +675,11 @@ async fn main() {
     if let Some(ref a) = anchors {
         if let Some(latest) = a.get_latest_anchor() {
             if latest.height <= 1 && latest.hash.to_lowercase() != genesis_hash.to_lowercase() {
-                panic!("Anchors mismatch: latest anchor hash {} != genesis hash {}", latest.hash, genesis_hash);
+                eprintln!(
+                    "Anchors mismatch: latest anchor hash {} != genesis hash {}",
+                    latest.hash, genesis_hash
+                );
+                std::process::exit(1);
             }
         }
     }

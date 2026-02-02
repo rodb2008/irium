@@ -2575,14 +2575,9 @@ async fn handle_incoming_with_sybil(
                             if !found && guard.chain.len() > 1 {
                                 start_idx = 1;
                             }
-
+                            let count = payload.count.min(MAX_HEADERS_PER_REQUEST) as usize;
                             let mut bytes = Vec::new();
-                            for block in guard
-                                .chain
-                                .iter()
-                                .skip(start_idx)
-                                .take(payload.count as usize)
-                            {
+                            for block in guard.chain.iter().skip(start_idx).take(count) {
                                 bytes.extend_from_slice(&block.header.serialize());
                             }
                             bytes
