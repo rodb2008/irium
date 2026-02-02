@@ -98,6 +98,9 @@ fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
     if body.len() < 21 {
         return None;
     }
+    if body[0] != IRIUM_P2PKH_VERSION {
+        return None;
+    }
     let payload = &body[1..];
     if payload.len() != 20 {
         return None;
@@ -873,7 +876,13 @@ fn main() {
 
             for _ in 0..2 {
                 for (idx, utxo) in selected.iter().enumerate() {
-                    let script_pubkey = hex::decode(&utxo.script_pubkey).unwrap_or_else(|_| change_script.clone());
+                    let script_pubkey = match hex::decode(&utxo.script_pubkey) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("Invalid utxo script_pubkey hex: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
                     let digest = signature_digest(&tx, idx, &script_pubkey);
                     let sig: Signature = match signing_key.sign_prehash(&digest) {
                         Ok(v) => v,
