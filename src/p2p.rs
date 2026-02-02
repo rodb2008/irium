@@ -1469,31 +1469,33 @@ impl P2PNode {
                                         let headers_bytes = {
                                             let guard = chain_arc.lock().unwrap();
 
-                                            let mut start_idx = 0usize;
-                                            let mut found = false;
-                                            if !payload.start_hash.is_empty() && payload.start_hash.len() == 32 {
+                                            let mut start_idx = if guard.chain.len() > 1 { 1 } else { 0 };
+                                            let mut start_hash_non_zero = false;
+                                            let mut start_found = false;
+                                            if payload.start_hash.len() == 32 {
                                                 let mut target = [0u8; 32];
                                                 target.copy_from_slice(&payload.start_hash);
-                                                if let Some(pos) =
-                                                    guard.chain.iter().position(|b| b.header.hash() == target)
-                                                {
-                                                    start_idx = pos;
-                                                    found = true;
+                                                start_hash_non_zero = target.iter().any(|b| *b != 0);
+                                                if start_hash_non_zero {
+                                                    if let Some(pos) =
+                                                        guard.chain.iter().position(|b| b.header.hash() == target)
+                                                    {
+                                                        start_idx = pos.saturating_add(1);
+                                                        start_found = true;
+                                                    }
                                                 }
                                             }
-                                            if !found && guard.chain.len() > 1 {
-                                                start_idx = 1;
-                                            }
-
                                             let count = payload.count.min(MAX_HEADERS_PER_REQUEST) as usize;
                                             let mut bytes = Vec::new();
-                                            for block in guard
-                                                .chain
-                                                .iter()
-                                                .skip(start_idx)
-                                                .take(count)
-                                            {
-                                                bytes.extend_from_slice(&block.header.serialize());
+                                            if !start_hash_non_zero || start_found {
+                                                for block in guard
+                                                    .chain
+                                                    .iter()
+                                                    .skip(start_idx)
+                                                    .take(count)
+                                                {
+                                                    bytes.extend_from_slice(&block.header.serialize());
+                                                }
                                             }
                                             bytes
                                         };
@@ -1511,6 +1513,7 @@ impl P2PNode {
                                         let mut last_header_hash: Option<[u8; 32]> = None;
                                         let mut header_error = false;
                                         let mut reset_headers = false;
+                                        let mut added_any = false;
 
                                         while offset + 80 <= payload.headers.len() {
                                             let slice = &payload.headers[offset..offset + 80];
@@ -1524,8 +1527,17 @@ impl P2PNode {
                                             offset += used;
                                             last_header_hash = Some(header.hash());
 
+                                            let header_hash = header.hash();
                                             {
                                                 let mut guard = chain_arc.lock().unwrap();
+                                                if header.prev_hash == [0u8; 32] {
+                                                    let genesis_hash = guard.params.genesis_block.header.hash();
+                                                    if header_hash == genesis_hash {
+                                                        continue;
+                                                    }
+                                                }
+                                                let already_known = guard.headers.contains_key(&header_hash)
+                                                    || guard.block_store.contains_key(&header_hash);
                                                 if let Err(e) = guard.add_header(header.clone()) {
                                                     header_error = true;
                                                     if e.contains("unknown parent") {
@@ -1540,6 +1552,9 @@ impl P2PNode {
                                                     }
                                                     eprintln!("Header from {} rejected: {}", addr, e);
                                                     break;
+                                                }
+                                                if !already_known {
+                                                    added_any = true;
                                                 }
                                             }
                                         }
@@ -1561,6 +1576,18 @@ impl P2PNode {
                                             guard.tip_height()
                                         };
                                         let peer_height = last_handshake_height.unwrap_or(local_height);
+                                        if !added_any && peer_height > local_height {
+                                            if sync_request_allowed_for(&sync_requests, addr.ip(), local_height, peer_height).await {
+                                                let get_headers = GetHeadersPayload {
+                                                    start_hash: vec![0u8; 32],
+                                                    count: MAX_HEADERS_PER_REQUEST,
+                                                };
+                                                if let Ok(msg) = get_headers.to_message() {
+                                                    let _ = send_message(&writer, msg, addr).await;
+                                                }
+                                            }
+                                            continue;
+                                        }
                                         if header_count >= MAX_HEADERS_PER_REQUEST {
                                             if let Some(last_hash) = last_header_hash {
                                                 if sync_request_allowed_for(&sync_requests, addr.ip(), local_height, peer_height).await {
@@ -2560,25 +2587,33 @@ async fn handle_incoming_with_sybil(
                         let headers_bytes = {
                             let guard = chain_arc.lock().unwrap();
 
-                            let mut start_idx = 0usize;
-                            let mut found = false;
-                            if !payload.start_hash.is_empty() && payload.start_hash.len() == 32 {
+                            let mut start_idx = if guard.chain.len() > 1 { 1 } else { 0 };
+                            let mut start_hash_non_zero = false;
+                            let mut start_found = false;
+                            if payload.start_hash.len() == 32 {
                                 let mut target = [0u8; 32];
                                 target.copy_from_slice(&payload.start_hash);
-                                if let Some(pos) =
-                                    guard.chain.iter().position(|b| b.header.hash() == target)
-                                {
-                                    start_idx = pos;
-                                    found = true;
+                                start_hash_non_zero = target.iter().any(|b| *b != 0);
+                                if start_hash_non_zero {
+                                    if let Some(pos) =
+                                        guard.chain.iter().position(|b| b.header.hash() == target)
+                                    {
+                                        start_idx = pos.saturating_add(1);
+                                        start_found = true;
+                                    }
                                 }
-                            }
-                            if !found && guard.chain.len() > 1 {
-                                start_idx = 1;
                             }
                             let count = payload.count.min(MAX_HEADERS_PER_REQUEST) as usize;
                             let mut bytes = Vec::new();
-                            for block in guard.chain.iter().skip(start_idx).take(count) {
-                                bytes.extend_from_slice(&block.header.serialize());
+                            if !start_hash_non_zero || start_found {
+                                for block in guard
+                                    .chain
+                                    .iter()
+                                    .skip(start_idx)
+                                    .take(count)
+                                {
+                                    bytes.extend_from_slice(&block.header.serialize());
+                                }
                             }
                             bytes
                         };
@@ -2599,6 +2634,7 @@ async fn handle_incoming_with_sybil(
                         let mut last_header_hash: Option<[u8; 32]> = None;
                         let mut header_error = false;
                         let mut reset_headers = false;
+                        let mut added_any = false;
 
                         while offset + 80 <= payload.headers.len() {
                             let slice = &payload.headers[offset..offset + 80];
@@ -2612,8 +2648,17 @@ async fn handle_incoming_with_sybil(
                             offset += used;
                             last_header_hash = Some(header.hash());
 
+                            let header_hash = header.hash();
                             {
                                 let mut guard = chain_arc.lock().unwrap();
+                                if header.prev_hash == [0u8; 32] {
+                                    let genesis_hash = guard.params.genesis_block.header.hash();
+                                    if header_hash == genesis_hash {
+                                        continue;
+                                    }
+                                }
+                                let already_known = guard.headers.contains_key(&header_hash)
+                                    || guard.block_store.contains_key(&header_hash);
                                 if let Err(e) = guard.add_header(header.clone()) {
                                     header_error = true;
                                     if e.contains("unknown parent") {
@@ -2628,6 +2673,9 @@ async fn handle_incoming_with_sybil(
                                     }
                                     eprintln!("Header from {} rejected: {}", addr, e);
                                     break;
+                                }
+                                if !already_known {
+                                    added_any = true;
                                 }
                             }
                         }
@@ -2649,6 +2697,18 @@ async fn handle_incoming_with_sybil(
                             guard.tip_height()
                         };
                         let peer_height = last_handshake_height.unwrap_or(local_height);
+                        if !added_any && peer_height > local_height {
+                            if sync_request_allowed_for(&sync_requests, addr.ip(), local_height, peer_height).await {
+                                let get_headers = GetHeadersPayload {
+                                    start_hash: vec![0u8; 32],
+                                    count: MAX_HEADERS_PER_REQUEST,
+                                };
+                                if let Ok(msg) = get_headers.to_message() {
+                                    let _ = send_message(&writer, msg, addr).await;
+                                }
+                            }
+                            continue;
+                        }
                         if header_count >= MAX_HEADERS_PER_REQUEST {
                             if let Some(last_hash) = last_header_hash {
                                 if sync_request_allowed_for(&sync_requests, addr.ip(), local_height, peer_height).await {
