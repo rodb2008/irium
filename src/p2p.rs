@@ -204,7 +204,9 @@ async fn maybe_request_sync(
         .and_then(|c| c.lock().ok().map(|g| g.tip_height()))
         .unwrap_or(0);
     let local_tip = P2PNode::tip_hash(chain);
-    let tip_mismatch = peer_tip.map(|t| t != local_tip).unwrap_or(false);
+    let tip_mismatch = peer_tip
+        .map(|t| peer_height == local_height && t != local_tip)
+        .unwrap_or(false);
 
     if peer_height < local_height || (peer_height == local_height && !tip_mismatch) {
         return;
