@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
+use std::env;
 
 use crate::anchors::AnchorManager;
 use chrono::Utc;
@@ -20,6 +21,22 @@ use crate::pow::{meets_target, sha256d, Target};
 use crate::tx::{decode_hex, Transaction, TxInput, TxOutput};
 
 const MAX_ORPHAN_BLOCKS: usize = 100;
+
+fn header_cache_window() -> u64 {
+    env::var("IRIUM_HEADER_CACHE_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10_000)
+        .min(200_000)
+}
+
+fn block_store_window() -> u64 {
+    env::var("IRIUM_BLOCK_STORE_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5_000)
+        .min(200_000)
+}
 
 /// Chain parameters for the Irium mainnet.
 #[derive(Debug, Clone)]
@@ -123,6 +140,63 @@ impl ChainState {
             self.orphan_pool.remove(&key);
         }
     }
+
+    fn prune_header_cache(&mut self) {
+        let window = header_cache_window();
+        if window == 0 {
+            return;
+        }
+        let tip = self.tip_height();
+        if tip <= window {
+            return;
+        }
+        let min_height = tip.saturating_sub(window);
+        self.headers.retain(|_, hw| hw.height >= min_height);
+        if !self.header_chain.is_empty() {
+            self.header_chain.retain(|h| self.headers.contains_key(h));
+        }
+    }
+
+    fn prune_block_store(&mut self) {
+        let window = block_store_window();
+        if window == 0 {
+            return;
+        }
+        let tip = self.tip_height();
+        if tip <= window {
+            return;
+        }
+        let min_height = tip.saturating_sub(window);
+        let mut remove = Vec::new();
+        for (hash, _) in self.block_store.iter() {
+            if let Some(h) = self.heights.get(hash) {
+                if *h <= min_height {
+                    if let Some(block) = self.chain.get(*h as usize) {
+                        if block.header.hash() == *hash {
+                            remove.push(*hash);
+                        }
+                    }
+                }
+            }
+        }
+        for hash in remove {
+            self.block_store.remove(&hash);
+        }
+    }
+
+    fn prune_caches(&mut self) {
+        self.prune_header_cache();
+        self.prune_block_store();
+    }
+
+    fn block_by_hash(&self, hash: &[u8; 32]) -> Option<Block> {
+        if let Some(block) = self.block_store.get(hash) {
+            return Some(block.clone());
+        }
+        let height = *self.heights.get(hash)?;
+        self.chain.get(height as usize).cloned()
+    }
+
 
     pub fn target_for_height(&self, height: u64) -> Target {
         if height == 0 {
@@ -228,6 +302,7 @@ impl ChainState {
         self.block_store.insert(hash, block);
         self.heights.insert(hash, expected_height);
         self.cumulative_work.insert(hash, self.total_work.clone());
+        self.prune_caches();
 
         Ok(())
     }
@@ -248,7 +323,7 @@ impl ChainState {
     /// Add a header to the header tree if it extends a known header and compute cumulative work.
     pub fn add_header(&mut self, header: BlockHeader) -> Result<u64, String> {
         let hash = header.hash();
-        if self.headers.contains_key(&hash) || self.block_store.contains_key(&hash) {
+        if self.headers.contains_key(&hash) || self.heights.contains_key(&hash) {
             if let Some(h) = self.heights.get(&hash) {
                 return Ok(*h);
             }
@@ -533,7 +608,7 @@ impl ChainState {
         let mut path = Vec::new();
         let mut current = tip;
         loop {
-            if self.block_store.contains_key(&current) {
+            if self.heights.contains_key(&current) {
                 path.reverse();
                 return Some(path);
             }
@@ -551,14 +626,14 @@ impl ChainState {
         let mut current = tip;
         loop {
             let block = self
-                .block_store
-                .get(&current)
+                .block_by_hash(&current)
                 .ok_or_else(|| "missing block in store".to_string())?;
-            path.push(block.clone());
-            if block.header.prev_hash == [0u8; 32] {
+            let prev_hash = block.header.prev_hash;
+            path.push(block);
+            if prev_hash == [0u8; 32] {
                 break;
             }
-            current = block.header.prev_hash;
+            current = prev_hash;
         }
         path.reverse();
         Ok(path)
@@ -613,12 +688,12 @@ impl ChainState {
     /// Store a block that may trigger a reorg if it has higher cumulative work.
     pub fn process_block(&mut self, block: Block) -> Result<(u64, [u8; 32]), String> {
         let hash = block.header.hash();
-        if self.block_store.contains_key(&hash) {
+        if self.heights.contains_key(&hash) {
             return Err("duplicate block".to_string());
         }
 
         let parent_hash = block.header.prev_hash;
-        if parent_hash != [0u8; 32] && !self.block_store.contains_key(&parent_hash) {
+        if parent_hash != [0u8; 32] && !self.heights.contains_key(&parent_hash) {
             self.orphan_pool.entry(parent_hash).or_default().push(block);
             self.prune_orphan_pool();
             return Err("block stored as orphan (prev hash unknown)".to_string());
@@ -678,6 +753,7 @@ impl ChainState {
                 }
             }
         }
+        self.prune_caches();
 
         Ok((self.height, self.tip_hash()))
     }
