@@ -101,6 +101,14 @@ async fn sync_block_request_allowed_for(
     true
 }
 
+fn headers_fallback_grace() -> Duration {
+    let secs = std::env::var("IRIUM_P2P_HEADERS_FALLBACK_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(15);
+    Duration::from_secs(secs.max(5).min(300))
+}
+
 fn getblocks_grace() -> Duration {
     let secs = std::env::var("IRIUM_P2P_GETBLOCKS_GRACE_SECS")
         .ok()
@@ -188,6 +196,9 @@ struct PeerSyncState {
     supports_uptime: bool,
     last_uptime_challenge: Option<UptimeChallengePayload>,
     last_uptime_sent: Option<Instant>,
+    last_headers_request: Option<Instant>,
+    last_headers_received: Option<Instant>,
+    last_headers_start: Option<[u8; 32]>,
 }
 
 impl Default for PeerSyncState {
@@ -199,6 +210,9 @@ impl Default for PeerSyncState {
             supports_uptime: false,
             last_uptime_challenge: None,
             last_uptime_sent: None,
+            last_headers_request: None,
+            last_headers_received: None,
+            last_headers_start: None,
         }
     }
 }
@@ -246,6 +260,11 @@ async fn maybe_request_sync(
         if let Ok(msg) = get_headers.to_message() {
             let _ = send_message(writer, msg, addr).await;
         }
+        {
+            let mut state = peer_state.lock().await;
+            state.last_headers_request = Some(Instant::now());
+            state.last_headers_start = Some(start_hash);
+        }
     }
     if peer_height > local_height || tip_mismatch {
         if sync_block_request_allowed_for(block_requests, addr.ip(), local_height, peer_height).await {
@@ -260,6 +279,71 @@ async fn maybe_request_sync(
     }
 
 
+}
+
+async fn maybe_request_headers_fallback(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    addr: SocketAddr,
+    chain: &Option<Arc<StdMutex<ChainState>>>,
+    sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    peer_state: &Arc<Mutex<PeerSyncState>>,
+) {
+    let (peer_height, last_request, last_received, last_start) = {
+        let guard = peer_state.lock().await;
+        (
+            guard.height,
+            guard.last_headers_request,
+            guard.last_headers_received,
+            guard.last_headers_start,
+        )
+    };
+    let peer_height = match peer_height {
+        Some(h) => h,
+        None => return,
+    };
+    let local_height = chain
+        .as_ref()
+        .and_then(|c| c.lock().ok().map(|g| g.tip_height()))
+        .unwrap_or(0);
+    if peer_height <= local_height {
+        return;
+    }
+    let last_request = match last_request {
+        Some(ts) => ts,
+        None => return,
+    };
+    let received_after_request = last_received
+        .map(|ts| ts >= last_request)
+        .unwrap_or(false);
+    if received_after_request {
+        return;
+    }
+    if last_request.elapsed() < headers_fallback_grace() {
+        return;
+    }
+    if last_start == Some([0u8; 32]) {
+        return;
+    }
+    if sync_request_allowed_for(sync_requests, addr.ip(), local_height, peer_height).await {
+        let get_headers = GetHeadersPayload {
+            start_hash: vec![0u8; 32],
+            count: MAX_HEADERS_PER_REQUEST,
+        };
+        P2PNode::log_event(
+            "info",
+            "sync",
+            format!(
+                "P2P {}: no headers response, falling back to genesis locator",
+                addr
+            ),
+        );
+        if let Ok(msg) = get_headers.to_message() {
+            let _ = send_message(writer, msg, addr).await;
+        }
+        let mut guard = peer_state.lock().await;
+        guard.last_headers_request = Some(Instant::now());
+        guard.last_headers_start = Some([0u8; 32]);
+    }
 }
 
 async fn request_orphan_headers(
@@ -1335,6 +1419,14 @@ impl P2PNode {
                     &ping_peer_state,
                 )
                 .await;
+                maybe_request_headers_fallback(
+                    &ping_writer,
+                    ping_addr,
+                    &ping_chain,
+                    &ping_sync_requests,
+                    &ping_peer_state,
+                )
+                .await;
             }
         });
 
@@ -1564,6 +1656,11 @@ impl P2PNode {
                                         if let Ok(msg) = get_headers.to_message() {
                                             let _ = send_message(&writer, msg, addr).await;
                                         }
+                                        {
+                                            let mut state = peer_state.lock().await;
+                                            state.last_headers_request = Some(Instant::now());
+                                            state.last_headers_start = Some(start_hash);
+                                        }
                                     } else if payload.height < local_height {
                                         // Peer is behind; push headers and fall back to block push if needed.
                                         let behind_height = payload.height;
@@ -1760,6 +1857,10 @@ impl P2PNode {
                             MessageType::Headers => {
                                 if let Some(ref chain_arc) = chain_for_sync {
                                     if let Ok(payload) = HeadersPayload::from_message(&msg) {
+                                        {
+                                            let mut state = peer_state.lock().await;
+                                            state.last_headers_received = Some(Instant::now());
+                                        }
                                         let header_count = (payload.headers.len() / 80) as u32;
                                         let mut offset = 0usize;
                                         let mut last_header_hash: Option<[u8; 32]> = None;
@@ -2557,6 +2658,14 @@ async fn handle_incoming_with_sybil(
                 &ping_chain,
                 &ping_sync_requests,
                 &ping_block_requests,
+                &ping_peer_state,
+            )
+            .await;
+            maybe_request_headers_fallback(
+                &ping_writer,
+                ping_addr,
+                &ping_chain,
+                &ping_sync_requests,
                 &ping_peer_state,
             )
             .await;
