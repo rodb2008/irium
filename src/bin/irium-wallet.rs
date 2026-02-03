@@ -1,5 +1,6 @@
 use irium_node_rs::constants::COINBASE_MATURITY;
 use irium_node_rs::pow::sha256d;
+use irium_node_rs::qr::{render_ascii, render_svg};
 use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
 use k256::ecdsa::signature::hazmat::PrehashSigner;
 use k256::ecdsa::{Signature, SigningKey};
@@ -191,6 +192,7 @@ fn usage() {
     eprintln!("  irium-wallet new-address");
     eprintln!("  irium-wallet list-addresses");
     eprintln!("  irium-wallet address-to-pkh <base58_addr>");
+    eprintln!("  irium-wallet qr <base58_addr> [--svg] [--out <file>]");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet history <base58_addr> [--rpc <url>]");
@@ -474,6 +476,61 @@ fn main() {
                     eprintln!("Invalid address or checksum");
                     std::process::exit(1);
                 }
+            }
+        }
+        "qr" => {
+            if args.len() < 2 {
+                usage();
+                std::process::exit(1);
+            }
+            let addr = &args[1];
+            if base58_p2pkh_to_hash(addr).is_none() {
+                eprintln!("Invalid address or checksum");
+                std::process::exit(1);
+            }
+            let mut output_path: Option<String> = None;
+            let mut use_svg = false;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--svg" => {
+                        use_svg = true;
+                        i += 1;
+                    }
+                    "--out" => {
+                        if i + 1 >= args.len() {
+                            eprintln!("Missing --out value");
+                            std::process::exit(1);
+                        }
+                        output_path = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    _ => {
+                        usage();
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            let rendered = if use_svg {
+                render_svg(addr, 8, 2).unwrap_or_else(|e| {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                })
+            } else {
+                render_ascii(addr).unwrap_or_else(|e| {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                })
+            };
+
+            if let Some(path) = output_path {
+                if let Err(e) = fs::write(&path, rendered) {
+                    eprintln!("Failed to write {}: {}", path, e);
+                    std::process::exit(1);
+                }
+            } else {
+                print!("{}", rendered);
             }
         }
         "balance" => {

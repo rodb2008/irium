@@ -110,6 +110,7 @@ export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>
 ./target/release/irium-wallet list-unspent <YOUR_IRIUM_ADDRESS>
 ./target/release/irium-wallet history <YOUR_IRIUM_ADDRESS>
 ./target/release/irium-wallet estimate-fee
+./target/release/irium-wallet qr <base58_address> [--svg] [--out <file>]
 ```
 ```bash
 # Optional: SPV tool
@@ -216,6 +217,7 @@ source ~/.cargo/env
 ./target/release/irium-wallet list-unspent <base58_address>
 ./target/release/irium-wallet history <base58_address>
 ./target/release/irium-wallet estimate-fee
+./target/release/irium-wallet qr <base58_address> [--svg] [--out <file>]
 ```
 ```bash
 ./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm>

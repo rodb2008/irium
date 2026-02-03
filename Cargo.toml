@@ -27,3 +27,4 @@ tower-http = { version = "0.5", features = ["cors"] }
 rand_core = "0.6"
 get_if_addrs = "0.5"
 reqwest = { version = "0.11", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+qrcode = "0.14"

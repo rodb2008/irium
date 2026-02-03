@@ -6,11 +6,13 @@ use std::time::Duration;
 use axum_server::tls_rustls::RustlsConfig;
 use axum::{
     extract::{ConnectInfo, Query, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::{header::{AUTHORIZATION, CONTENT_TYPE}, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use irium_node_rs::rate_limiter::RateLimiter;
+use irium_node_rs::qr::{render_ascii, render_svg};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +29,14 @@ struct AppState {
 #[derive(Deserialize)]
 struct BalanceQuery {
     address: String,
+}
+
+#[derive(Deserialize)]
+struct QrQuery {
+    address: String,
+    format: Option<String>,
+    scale: Option<u32>,
+    margin: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -184,6 +194,42 @@ async fn fee_estimate(
     proxy_json(&state, "/rpc/fee_estimate").await
 }
 
+async fn qr(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<QrQuery>,
+) -> Result<Response, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    let address = q.address.trim();
+    if address.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let format = q
+        .format
+        .as_deref()
+        .unwrap_or("svg")
+        .to_lowercase();
+    match format.as_str() {
+        "svg" => {
+            let scale = q.scale.unwrap_or(8);
+            let margin = q.margin.unwrap_or(2);
+            let body = render_svg(address, scale, margin)
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            Ok((
+                [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+                body,
+            )
+                .into_response())
+        }
+        "ascii" => {
+            let body = render_ascii(address).map_err(|_| StatusCode::BAD_REQUEST)?;
+            Ok(([(CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
+        }
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
 async fn submit_tx(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -228,6 +274,7 @@ async fn main() {
         .route("/utxos", get(utxos))
         .route("/history", get(history))
         .route("/fee_estimate", get(fee_estimate))
+        .route("/qr", get(qr))
         .route("/submit_tx", post(submit_tx))
         .with_state(state)
         .into_make_service_with_connect_info::<SocketAddr>();

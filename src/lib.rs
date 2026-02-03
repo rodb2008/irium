@@ -8,6 +8,7 @@ pub mod network;
 pub mod p2p;
 pub mod pow;
 pub mod protocol;
+pub mod qr;
 pub mod rate_limiter;
 pub mod relay;
 pub mod reputation;
