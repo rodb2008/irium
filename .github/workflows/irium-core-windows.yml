@@ -20,8 +20,19 @@ jobs:
       - name: Install NSIS
         run: choco install nsis -y
 
-      - name: Install tauri-cli
-        run: cargo install tauri-cli --version 1.5.12
+      - name: Install tauri-cli (prebuilt)
+        shell: pwsh
+        run: |
+          $ProgressPreference = SilentlyContinue
+          $uri = https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v1.5.12/cargo-tauri-x86_64-pc-windows-msvc.zip
+          $zip = "$env:RUNNER_TEMP\cargo-tauri.zip"
+          Invoke-WebRequest -Uri $uri -OutFile $zip
+          $dest = "$env:RUNNER_TEMP\cargo-tauri"
+          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          Expand-Archive -Path $zip -DestinationPath $dest
+          $bin = "$env:USERPROFILE\.cargo\bin"
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          Move-Item -Force "$dest\cargo-tauri.exe" "$bin\cargo-tauri.exe"
 
       - name: Build NSIS bundle
         run: cargo tauri build --bundles nsis
