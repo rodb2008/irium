@@ -2300,7 +2300,16 @@ async fn handle_incoming_with_sybil(
     loop {
         let msg = match read_message_with_timeout(&mut reader, P2PNode::peer_timeout()).await {
             Ok(m) => m,
-            Err(e) => return Err(e),
+            Err(e) => {
+                P2PNode::log_event(
+                    "warn",
+                    "net",
+                    format!("P2P inbound {}: closing read loop: {}", addr, e),
+                );
+                let mut rep = reputation.lock().await;
+                rep.record_failure(&addr.to_string());
+                break;
+            }
         };
         if window_start.elapsed() >= Duration::from_secs(1) {
             window_start = Instant::now();
@@ -2311,12 +2320,22 @@ async fn handle_incoming_with_sybil(
         if is_bulk {
             bulk_count += 1;
             if bulk_count > MAX_BULK_MSGS_PER_SEC {
-                return Err("bulk message rate limit exceeded".to_string());
+                P2PNode::log_event(
+                    "warn",
+                    "net",
+                    format!("P2P inbound {}: bulk rate limit", addr),
+                );
+                break;
             }
         } else {
             msg_count += 1;
             if msg_count > MAX_MSGS_PER_SEC {
-                return Err("message rate limit exceeded".to_string());
+                P2PNode::log_event(
+                    "warn",
+                    "net",
+                    format!("P2P inbound {}: rate limit", addr),
+                );
+                break;
             }
         }
 
