@@ -155,6 +155,8 @@ Response fields: hashrate, difficulty, avg_block_time, window, sample_blocks, ti
 - `IRIUM_RPC_INSECURE`: set to `1` to skip TLS validation for `https://localhost` or `https://127.0.0.1` only (dev-only). For anything else, use `IRIUM_RPC_CA`.
 - `IRIUM_RPC_TOKEN`: optional bearer token required for `POST /rpc/submit_block` and `POST /rpc/submit_tx`.
 - `IRIUM_RPC_BODY_MAX`: max HTTP RPC body size in bytes (default 32MB).
+- `IRIUM_NODE_WALLET_FILE`: override node-managed wallet file (default `~/.irium/wallet.core.json`).
+- `IRIUM_WALLET_AUTO_LOCK_MIN`: auto-lock minutes for node-managed wallet (default 10, set 0 to disable).
 - `IRIUM_NODE_PUBLIC_IP` / `IRIUM_PUBLIC_IP`: optional public IP override for seed nodes.
 - `IRIUM_PUBLIC_IP_PROBE_TARGET`: optional `host:port` to probe for outbound IP discovery.
 
@@ -225,6 +227,17 @@ source ~/.cargo/env
 ```
 - Wallet RPC defaults to `IRIUM_NODE_RPC` (or legacy `IRIUM_RPC_URL`), falling back to http://127.0.0.1:38300. If your node uses HTTPS, set `IRIUM_NODE_RPC=https://...` or pass `--rpc`.
 Use `irium-wallet address-to-pkh <base58_address>` to convert an address to its 20-byte pubkey hash.
+
+### Wallet RPC (node-managed)
+The node can manage an encrypted wallet for GUI/RPC clients. Default file: `~/.irium/wallet.core.json` (override with `IRIUM_NODE_WALLET_FILE`).
+- `POST /wallet/create` { passphrase }
+- `POST /wallet/unlock` { passphrase }
+- `POST /wallet/lock`
+- `GET /wallet/addresses`
+- `GET /wallet/receive`
+- `POST /wallet/new_address`
+- `POST /wallet/send` { to_address, amount, from_address?, fee_mode?, fee_per_byte?, coin_select? }
+`amount` is an IRM string like `1.25`. `fee_mode` supports `low`, `normal`, `high`.
 
 ## SPV Tooling
 `irium-spv` verifies merkle proofs and NiPoPoW proofs against stored block JSON snapshots:

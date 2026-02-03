@@ -17,3 +17,4 @@ pub mod storage;
 pub mod sybil;
 pub mod tx;
 pub mod wallet;
+pub mod wallet_store;

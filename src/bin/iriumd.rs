@@ -22,19 +22,22 @@ use hex;
 use num_traits::ToPrimitive;
 
 use bs58;
+use k256::ecdsa::signature::hazmat::PrehashSigner;
+use k256::ecdsa::{Signature, SigningKey};
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
 use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, OutPoint};
-use irium_node_rs::constants::block_reward;
+use irium_node_rs::constants::{block_reward, COINBASE_MATURITY};
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::MempoolManager;
 use irium_node_rs::network::SeedlistManager;
 use irium_node_rs::p2p::P2PNode;
-use irium_node_rs::pow::Target;
+use irium_node_rs::pow::{sha256d, Target};
 use irium_node_rs::rate_limiter::RateLimiter;
 use irium_node_rs::storage;
 use irium_node_rs::reputation::ReputationManager;
 use irium_node_rs::tx::{decode_full_tx, Transaction, TxInput, TxOutput};
+use irium_node_rs::wallet_store::{WalletKey, WalletManager};
 use get_if_addrs::get_if_addrs;
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
@@ -44,6 +47,7 @@ struct AppState {
     chain: Arc<Mutex<ChainState>>,
     genesis_hash: String,
     mempool: Arc<Mutex<MempoolManager>>,
+    wallet: Arc<Mutex<WalletManager>>,
     anchors: Option<AnchorManager>,
     p2p: Option<P2PNode>,
     limiter: Arc<Mutex<RateLimiter>>,
@@ -209,6 +213,71 @@ struct TxLookupResponse {
 struct SubmitTxResponse {
     txid: String,
     accepted: bool,
+}
+
+#[derive(Deserialize)]
+struct WalletCreateRequest {
+    passphrase: String,
+}
+
+#[derive(Deserialize)]
+struct WalletUnlockRequest {
+    passphrase: String,
+}
+
+#[derive(Deserialize)]
+struct WalletSendRequest {
+    to_address: String,
+    amount: String,
+    from_address: Option<String>,
+    fee_mode: Option<String>,
+    fee_per_byte: Option<u64>,
+    coin_select: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WalletCreateResponse {
+    address: String,
+    wallet_path: String,
+}
+
+#[derive(Serialize)]
+struct WalletUnlockResponse {
+    addresses: Vec<String>,
+    current_address: String,
+}
+
+#[derive(Serialize)]
+struct WalletAddressesResponse {
+    addresses: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct WalletReceiveResponse {
+    address: String,
+}
+
+#[derive(Serialize)]
+struct WalletLockResponse {
+    locked: bool,
+}
+
+#[derive(Serialize)]
+struct WalletSendResponse {
+    txid: String,
+    accepted: bool,
+    fee: u64,
+    total_input: u64,
+    change: u64,
+}
+
+#[derive(Clone)]
+struct WalletUtxo {
+    outpoint: OutPoint,
+    output: TxOutput,
+    height: u64,
+    is_coinbase: bool,
+    pkh: [u8; 20],
 }
 
 #[derive(Serialize)]
@@ -544,6 +613,62 @@ fn base58_p2pkh_from_hash(pkh: &[u8; 20]) -> String {
     let mut full = body;
     full.extend_from_slice(checksum);
     bs58::encode(full).into_string()
+}
+
+fn parse_irm(s: &str) -> Result<u64, String> {
+    if s.trim().is_empty() {
+        return Err("empty amount".to_string());
+    }
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() > 2 {
+        return Err("invalid amount".to_string());
+    }
+    let whole: u64 = parts[0].parse().map_err(|_| "invalid amount".to_string())?;
+    let frac = if parts.len() == 2 {
+        let frac_str = parts[1];
+        if frac_str.len() > 8 {
+            return Err("too many decimals".to_string());
+        }
+        let mut frac_val: u64 = frac_str.parse().map_err(|_| "invalid amount".to_string())?;
+        for _ in frac_str.len()..8 {
+            frac_val *= 10;
+        }
+        frac_val
+    } else {
+        0
+    };
+    Ok(whole
+        .saturating_mul(100_000_000)
+        .saturating_add(frac))
+}
+
+fn estimate_tx_size(inputs: usize, outputs: usize) -> u64 {
+    10 + inputs as u64 * 148 + outputs as u64 * 34
+}
+
+fn p2pkh_script(pkh: &[u8; 20]) -> Vec<u8> {
+    let mut script = Vec::with_capacity(25);
+    script.push(0x76);
+    script.push(0xa9);
+    script.push(0x14);
+    script.extend_from_slice(pkh);
+    script.push(0x88);
+    script.push(0xac);
+    script
+}
+
+fn signature_digest(tx: &Transaction, input_index: usize, script_pubkey: &[u8]) -> [u8; 32] {
+    let mut tx_copy = tx.clone();
+    for (idx, input) in tx_copy.inputs.iter_mut().enumerate() {
+        if idx == input_index {
+            input.script_sig = script_pubkey.to_vec();
+        } else {
+            input.script_sig.clear();
+        }
+    }
+    let mut data = tx_copy.serialize();
+    data.extend_from_slice(&1u32.to_le_bytes());
+    sha256d(&data)
 }
 
 fn miner_address_from_tx(tx: &Transaction) -> Option<String> {
@@ -1229,6 +1354,390 @@ async fn get_fee_estimate(
     }))
 }
 
+fn sign_wallet_inputs(
+    tx: &mut Transaction,
+    utxos: &[WalletUtxo],
+    key_map: &HashMap<[u8; 20], WalletKey>,
+) -> Result<(), StatusCode> {
+    for (idx, utxo) in utxos.iter().enumerate() {
+        let key = key_map.get(&utxo.pkh).ok_or(StatusCode::BAD_REQUEST)?;
+        let priv_bytes = hex::decode(&key.privkey).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let signing_key = SigningKey::from_bytes(priv_bytes.as_slice().into())
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let pub_bytes = hex::decode(&key.pubkey).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let digest = signature_digest(tx, idx, &utxo.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let mut script = Vec::new();
+        script.push(sig_bytes.len() as u8);
+        script.extend_from_slice(&sig_bytes);
+        script.push(pub_bytes.len() as u8);
+        script.extend_from_slice(&pub_bytes);
+        tx.inputs[idx].script_sig = script;
+    }
+    Ok(())
+}
+
+async fn wallet_create(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<WalletCreateRequest>,
+) -> Result<Json<WalletCreateResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap();
+    if wallet.exists() {
+        return Err(StatusCode::CONFLICT);
+    }
+    let key = wallet
+        .create(&req.passphrase)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    Ok(Json(WalletCreateResponse {
+        address: key.address,
+        wallet_path: wallet.path().display().to_string(),
+    }))
+}
+
+async fn wallet_unlock(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<WalletUnlockRequest>,
+) -> Result<Json<WalletUnlockResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap();
+    wallet
+        .unlock(&req.passphrase)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let addresses = wallet.addresses().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let current = wallet
+        .current_address()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    Ok(Json(WalletUnlockResponse {
+        addresses,
+        current_address: current,
+    }))
+}
+
+async fn wallet_lock(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WalletLockResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap();
+    wallet.lock();
+
+    Ok(Json(WalletLockResponse { locked: true }))
+}
+
+async fn wallet_addresses(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WalletAddressesResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap();
+    let addresses = wallet.addresses().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    Ok(Json(WalletAddressesResponse { addresses }))
+}
+
+async fn wallet_receive(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WalletReceiveResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap();
+    let address = wallet
+        .current_address()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    Ok(Json(WalletReceiveResponse { address }))
+}
+
+async fn wallet_new_address(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WalletReceiveResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap();
+    let key = wallet.new_address().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    Ok(Json(WalletReceiveResponse {
+        address: key.address,
+    }))
+}
+
+async fn wallet_send(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<WalletSendRequest>,
+) -> Result<Json<WalletSendResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let amount = parse_irm(&req.amount).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if amount == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let (keys, change_address) = {
+        let mut wallet = state.wallet.lock().unwrap();
+        let keys = wallet.keys().map_err(|_| StatusCode::BAD_REQUEST)?;
+        let change = if let Some(ref from) = req.from_address {
+            from.clone()
+        } else {
+            wallet
+                .current_address()
+                .map_err(|_| StatusCode::BAD_REQUEST)?
+        };
+        (keys, change)
+    };
+
+    if keys.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    for key in keys {
+        let bytes = hex::decode(&key.pkh).map_err(|_| StatusCode::BAD_REQUEST)?;
+        if bytes.len() != 20 {
+            continue;
+        }
+        let mut arr = [0u8; 20];
+        arr.copy_from_slice(&bytes);
+        key_map.insert(arr, key);
+    }
+
+    if key_map.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut allowed: HashSet<[u8; 20]> = HashSet::new();
+    if let Some(ref from_addr) = req.from_address {
+        let pkh = base58_p2pkh_to_hash(from_addr).ok_or(StatusCode::BAD_REQUEST)?;
+        if pkh.len() != 20 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let mut arr = [0u8; 20];
+        arr.copy_from_slice(&pkh);
+        if !key_map.contains_key(&arr) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        allowed.insert(arr);
+    } else {
+        for key in key_map.keys() {
+            allowed.insert(*key);
+        }
+    }
+
+    let change_vec = base58_p2pkh_to_hash(&change_address).ok_or(StatusCode::BAD_REQUEST)?;
+    if change_vec.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut change_pkh = [0u8; 20];
+    change_pkh.copy_from_slice(&change_vec);
+    if !key_map.contains_key(&change_pkh) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap();
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if allowed.contains(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+
+    if utxos.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let coin_select = req.coin_select.as_deref().unwrap_or("largest");
+    match coin_select {
+        "smallest" => utxos.sort_by_key(|u| u.output.value),
+        _ => utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value)),
+    }
+
+    let mut fee_per_byte = {
+        let mempool = state.mempool.lock().unwrap();
+        mempool.min_fee_per_byte().ceil() as u64
+    };
+    if fee_per_byte == 0 {
+        fee_per_byte = 1;
+    }
+    if let Some(override_fee) = req.fee_per_byte {
+        if override_fee > 0 {
+            fee_per_byte = override_fee;
+        }
+    } else if let Some(mode) = req.fee_mode.as_deref() {
+        match mode.to_lowercase().as_str() {
+            "low" => {}
+            "normal" => fee_per_byte = fee_per_byte.saturating_mul(2),
+            "high" => fee_per_byte = fee_per_byte.saturating_mul(4),
+            _ => {}
+        }
+    }
+    if fee_per_byte == 0 {
+        fee_per_byte = 1;
+    }
+
+    let mut selected: Vec<WalletUtxo> = Vec::new();
+    let mut total = 0u64;
+    let mut fee = 0u64;
+    for utxo in utxos.iter() {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+            continue;
+        }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.output.value);
+        let outputs = if total > amount { 2 } else { 1 };
+        fee = estimate_tx_size(selected.len(), outputs).saturating_mul(fee_per_byte);
+        if total >= amount.saturating_add(fee) {
+            break;
+        }
+    }
+
+    if total < amount.saturating_add(fee) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let to_vec = base58_p2pkh_to_hash(&req.to_address).ok_or(StatusCode::BAD_REQUEST)?;
+    if to_vec.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut to_pkh = [0u8; 20];
+    to_pkh.copy_from_slice(&to_vec);
+    let to_script = p2pkh_script(&to_pkh);
+    let change_script = p2pkh_script(&change_pkh);
+
+    let mut inputs: Vec<TxInput> = Vec::new();
+    for utxo in &selected {
+        inputs.push(TxInput {
+            prev_txid: utxo.outpoint.txid,
+            prev_index: utxo.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        });
+    }
+
+    let mut outputs = vec![TxOutput {
+        value: amount,
+        script_pubkey: to_script,
+    }];
+
+    let mut change = total.saturating_sub(amount).saturating_sub(fee);
+    if change > 0 {
+        outputs.push(TxOutput {
+            value: change,
+            script_pubkey: change_script.clone(),
+        });
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+
+    for _ in 0..2 {
+        sign_wallet_inputs(&mut tx, &selected, &key_map)?;
+        let size = tx.serialize().len() as u64;
+        let needed_fee = size.saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if change >= extra {
+                fee = needed_fee;
+                change = change.saturating_sub(extra);
+                if tx.outputs.len() > 1 {
+                    tx.outputs[1].value = change;
+                } else if change > 0 {
+                    tx.outputs.push(TxOutput {
+                        value: change,
+                        script_pubkey: change_script.clone(),
+                    });
+                }
+                continue;
+            } else {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap();
+        chain.calculate_fees(&tx).map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+
+    let raw = tx.serialize();
+    let txid = tx.txid();
+    let hex_txid = hex::encode(txid);
+
+    let mut mempool = state.mempool.lock().unwrap();
+    if mempool.contains(&txid) {
+        return Ok(Json(WalletSendResponse {
+            txid: hex_txid,
+            accepted: false,
+            fee: fee_checked,
+            total_input: total,
+            change,
+        }));
+    }
+
+    let accepted = match mempool.add_transaction(tx, raw, fee_checked) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("Failed to add tx to mempool: {}", e);
+            false
+        }
+    };
+
+    Ok(Json(WalletSendResponse {
+        txid: hex_txid,
+        accepted,
+        fee: fee_checked,
+        total_input: total,
+        change,
+    }))
+}
+
 async fn get_block_template(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -1711,6 +2220,7 @@ async fn main() {
     let genesis_hash = locked.header.hash.clone();
     let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));
     let limiter = Arc::new(Mutex::new(rate_limiter()));
+    let wallet = Arc::new(Mutex::new(WalletManager::new(WalletManager::default_path())));
 
     // Attempt to load anchors from the repo root if present. On mainnet,
     // the anchors file is shipped and verified out-of-band.
@@ -2009,6 +2519,7 @@ async fn main() {
         chain: shared_state.clone(),
         genesis_hash: genesis_hash.clone(),
         mempool: mempool.clone(),
+        wallet: wallet.clone(),
         anchors,
         p2p,
         limiter: limiter.clone(),
@@ -2030,6 +2541,13 @@ async fn main() {
         .route("/rpc/tx", get(get_tx))
         .route("/rpc/submit_block", post(submit_block))
         .route("/rpc/submit_tx", post(submit_tx))
+        .route("/wallet/create", post(wallet_create))
+        .route("/wallet/unlock", post(wallet_unlock))
+        .route("/wallet/lock", post(wallet_lock))
+        .route("/wallet/addresses", get(wallet_addresses))
+        .route("/wallet/receive", get(wallet_receive))
+        .route("/wallet/new_address", post(wallet_new_address))
+        .route("/wallet/send", post(wallet_send))
         .layer(DefaultBodyLimit::max(rpc_body_limit_bytes()))
         .with_state(app_state);
 
