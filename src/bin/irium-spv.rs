@@ -32,6 +32,11 @@ struct JsonBlock {
 }
 
 #[derive(Deserialize, Serialize)]
+struct GenesisFile {
+    header: JsonHeader,
+}
+
+#[derive(Deserialize, Serialize)]
 struct JsonNipopowProof {
     m: usize,
     k: usize,
@@ -112,8 +117,27 @@ impl JsonNipopowProof {
     }
 }
 
+fn load_genesis_header() -> Result<BlockHeader, String> {
+    let candidates = ["configs/genesis-locked.json", "configs/genesis.json"];
+    for candidate in candidates.iter() {
+        let path = PathBuf::from(candidate);
+        if !path.exists() {
+            continue;
+        }
+        let data = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+        let v: Value = serde_json::from_str(&data)
+            .map_err(|e| format!("failed to parse JSON: {}", e))?;
+        let gf: GenesisFile = serde_json::from_value(v)
+            .map_err(|e| format!("unexpected genesis JSON format: {}", e))?;
+        return json_to_header(&gf.header);
+    }
+    Err("missing genesis file at configs/genesis-locked.json".to_string())
+}
+
 fn load_headers_from_dir(dir: &PathBuf) -> Result<Vec<BlockHeader>, String> {
     let mut entries = Vec::new();
+    let mut has_genesis = false;
     for entry in fs::read_dir(dir).map_err(|e| format!("failed to read {}: {}", dir.display(), e))? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
@@ -123,12 +147,19 @@ fn load_headers_from_dir(dir: &PathBuf) -> Result<Vec<BlockHeader>, String> {
         };
         if let Some(num) = name.strip_prefix("block_").and_then(|n| n.strip_suffix(".json")) {
             if let Ok(h) = num.parse::<u64>() {
+                if h == 0 {
+                    has_genesis = true;
+                }
                 entries.push((h, path));
             }
         }
     }
     entries.sort_by_key(|(h, _)| *h);
     let mut headers = Vec::new();
+    if !has_genesis {
+        let genesis = load_genesis_header()?;
+        headers.push(genesis);
+    }
     for (_h, path) in entries {
         let data = fs::read_to_string(&path)
             .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
@@ -140,6 +171,7 @@ fn load_headers_from_dir(dir: &PathBuf) -> Result<Vec<BlockHeader>, String> {
     }
     Ok(headers)
 }
+
 
 fn load_proof(path: &PathBuf) -> Result<NipopowProof, String> {
     let data = fs::read_to_string(path)
