@@ -241,13 +241,16 @@ impl UptimeProofPayload {
         if msg.payload.len() != 72 {
             return Err("Invalid uptime proof payload length".to_string());
         }
-        let mut nonce = [0u8; 32];
-        nonce.copy_from_slice(&msg.payload[0..32]);
-        let mut ts_bytes = [0u8; 8];
-        ts_bytes.copy_from_slice(&msg.payload[32..40]);
+        let nonce: [u8; 32] = msg.payload[0..32]
+            .try_into()
+            .map_err(|_| "Invalid uptime proof payload length".to_string())?;
+        let ts_bytes: [u8; 8] = msg.payload[32..40]
+            .try_into()
+            .map_err(|_| "Invalid uptime proof payload length".to_string())?;
         let timestamp = u64::from_be_bytes(ts_bytes);
-        let mut hmac = [0u8; 32];
-        hmac.copy_from_slice(&msg.payload[40..72]);
+        let hmac: [u8; 32] = msg.payload[40..72]
+            .try_into()
+            .map_err(|_| "Invalid uptime proof payload length".to_string())?;
         Ok(UptimeProofPayload {
             nonce,
             timestamp,
