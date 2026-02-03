@@ -233,11 +233,28 @@ async fn maybe_request_sync(
         Some(h) => h,
         None => return,
     };
-    let local_height = chain
-        .as_ref()
-        .and_then(|c| c.lock().ok().map(|g| g.tip_height()))
-        .unwrap_or(0);
-    let local_tip = P2PNode::tip_hash(chain);
+    let (local_height, local_tip, peer_tip_on_main) = match chain {
+        Some(c) => {
+            let guard = c.lock().unwrap();
+            let local_height = guard.tip_height();
+            let local_tip = guard.tip_hash();
+            let peer_tip_on_main = peer_tip
+                .map(|tip| {
+                    if let Some(h) = guard.heights.get(&tip) {
+                        guard
+                            .chain
+                            .get(*h as usize)
+                            .map(|b| b.header.hash() == tip)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(true);
+            (local_height, local_tip, peer_tip_on_main)
+        }
+        None => (0, [0u8; 32], true),
+    };
     let tip_mismatch = peer_tip
         .map(|t| peer_height == local_height && t != local_tip)
         .unwrap_or(false);
@@ -246,7 +263,7 @@ async fn maybe_request_sync(
         return;
     }
 
-    let start_hash = if local_height == 0 || tip_mismatch {
+    let start_hash = if local_height == 0 || !peer_tip_on_main || tip_mismatch {
         [0u8; 32]
     } else {
         local_tip
