@@ -136,6 +136,22 @@ impl SeedlistManager {
             .unwrap_or(false)
     }
 
+    fn runtime_seed_min_days() -> i64 {
+        std::env::var("IRIUM_RUNTIME_SEED_DAYS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(7)
+            .clamp(1, 30)
+    }
+
+    fn runtime_seed_max_idle_hours() -> f64 {
+        std::env::var("IRIUM_RUNTIME_SEED_MAX_IDLE_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(24.0)
+            .clamp(1.0, 168.0)
+    }
+
     fn seedlist_sig_principal() -> String {
         std::env::var("IRIUM_SEEDLIST_SIG_PRINCIPAL")
             .ok()
@@ -499,17 +515,20 @@ impl PeerDirectory {
     pub fn refresh_seedlist_with_policy(&self) {
         let now = now_secs();
         let today = now_day();
+        let min_days = SeedlistManager::runtime_seed_min_days();
+        let max_idle = SeedlistManager::runtime_seed_max_idle_hours();
+        let start_day = today.saturating_sub(min_days.saturating_sub(1));
         let mut seeds = Vec::new();
 
         for rec in self.records.values() {
             let idle_hours = (now - rec.last_seen) / 3600.0;
             let mut active_days = 0;
-            for day in (today - 6)..=today {
+            for day in start_day..=today {
                 if rec.seen_days.contains(&day) {
                     active_days += 1;
                 }
             }
-            if active_days >= 7 && idle_hours <= 24.0 {
+            if active_days >= min_days && idle_hours <= max_idle {
                 if let Some(ip) = normalize_seed(&rec.multiaddr) {
                     seeds.push(ip);
                 }
