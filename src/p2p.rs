@@ -1639,15 +1639,33 @@ impl P2PNode {
                                         } else {
                                             None
                                         });
+                                    let peer_tip_on_main = if let (Some(tip), Some(chain_arc)) = (peer_tip, chain_for_sync.as_ref()) {
+                                        let guard = chain_arc.lock().unwrap();
+                                        if let Some(h) = guard.heights.get(&tip) {
+                                            guard
+                                                .chain
+                                                .get(*h as usize)
+                                                .map(|b| b.header.hash() == tip)
+                                                .unwrap_or(false)
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        true
+                                    };
                                     let local_at_peer = if let Some(ref chain_arc) = chain_for_sync {
                                         let guard = chain_arc.lock().unwrap();
                                         guard.chain.get(payload.height as usize).map(|b| b.header.hash())
                                     } else {
                                         None
                                     };
-                                    let tip_mismatch = match peer_tip {
-                                        Some(t) => local_at_peer.map(|h| h != t).unwrap_or(false),
-                                        None => false,
+                                    let tip_mismatch = if !peer_tip_on_main {
+                                        true
+                                    } else {
+                                        match peer_tip {
+                                            Some(t) => local_at_peer.map(|h| h != t).unwrap_or(false),
+                                            None => false,
+                                        }
                                     };
                                     if payload.height > local_height || (payload.height == local_height && tip_mismatch) {
                                         let local_tip = P2PNode::tip_hash(&chain_for_sync);
@@ -2882,15 +2900,33 @@ async fn handle_incoming_with_sybil(
                         } else {
                             None
                         });
+                    let peer_tip_on_main = if let (Some(tip), Some(chain_arc)) = (peer_tip, chain.as_ref()) {
+                        let guard = chain_arc.lock().unwrap();
+                        if let Some(h) = guard.heights.get(&tip) {
+                            guard
+                                .chain
+                                .get(*h as usize)
+                                .map(|b| b.header.hash() == tip)
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    };
                     let local_at_peer = if let Some(ref chain_arc) = chain {
                         let guard = chain_arc.lock().unwrap();
                         guard.chain.get(payload.height as usize).map(|b| b.header.hash())
                     } else {
                         None
                     };
-                    let tip_mismatch = match peer_tip {
-                        Some(t) => local_at_peer.map(|h| h != t).unwrap_or(false),
-                        None => false,
+                    let tip_mismatch = if !peer_tip_on_main {
+                        true
+                    } else {
+                        match peer_tip {
+                            Some(t) => local_at_peer.map(|h| h != t).unwrap_or(false),
+                            None => false,
+                        }
                     };
                     if payload.height > local_height || (payload.height == local_height && tip_mismatch) {
                     let local_tip = P2PNode::tip_hash(&chain);
