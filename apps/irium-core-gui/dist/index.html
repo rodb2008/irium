@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Irium Core</title>
+  <link rel="icon" href="assets/irium-logo.png" />
+  <link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <img src="assets/irium-logo.svg" alt="Irium" />
+        <div>Irium Core</div>
+      </div>
+      <nav class="nav">
+        <button data-page="page-setup">Setup</button>
+        <button data-page="page-dashboard" class="active">Dashboard</button>
+        <button data-page="page-wallet">Wallet</button>
+        <button data-page="page-node">Node</button>
+        <button data-page="page-explorer">Explorer</button>
+        <button data-page="page-settings">Settings</button>
+        <button data-page="page-about">About</button>
+      </nav>
+      <div class="watermark">
+        <img src="assets/irium-logo.svg" alt="Irium" />
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <div class="status-group">
+          <span class="badge">Height: <strong id="stat-height">—</strong></span>
+          <span class="badge">Peers: <strong id="stat-peers">—</strong></span>
+          <span class="badge">Tip: <strong id="stat-tip">—</strong></span>
+          <span class="badge ok" id="stat-node">Running</span>
+        </div>
+        <div class="action-row">
+          <button id="btn-start-node">Start Node</button>
+          <button id="btn-stop-node">Stop Node</button>
+        </div>
+      </div>
+
+      <section id="page-setup" class="page">
+        <div class="card">
+          <h3>Welcome to Irium Core</h3>
+          <p>This app runs a local Irium full node and wallet. Configure your node settings first.</p>
+          <button class="primary" id="btn-open-settings">Open Settings</button>
+        </div>
+      </section>
+
+      <section id="page-dashboard" class="page active">
+        <div class="grid">
+          <div class="card">
+            <div class="label">Chain Height</div>
+            <div class="value" id="stat-height">—</div>
+          </div>
+          <div class="card">
+            <div class="label">Peers</div>
+            <div class="value" id="stat-peers">—</div>
+          </div>
+          <div class="card">
+            <div class="label">Tip Hash</div>
+            <div class="value" id="stat-tip">—</div>
+          </div>
+          <div class="card">
+            <div class="label">Node Status</div>
+            <div class="value" id="stat-node">Running</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-wallet" class="page">
+        <div class="grid">
+          <div class="card">
+            <h3>Wallet</h3>
+            <div class="form">
+              <label class="label">Passphrase</label>
+              <input id="wallet-pass" type="password" placeholder="Enter passphrase" />
+              <div class="action-row">
+                <button class="primary" id="btn-wallet-create">Create Wallet</button>
+                <button id="btn-wallet-unlock">Unlock</button>
+                <button id="btn-wallet-lock">Lock</button>
+              </div>
+            </div>
+            <div class="label" style="margin-top: 16px;">Balance</div>
+            <div class="value" id="wallet-balance">—</div>
+            <div class="label">Unconfirmed</div>
+            <div class="value" id="wallet-unconfirmed">—</div>
+          </div>
+
+          <div class="card">
+            <h3>Receive</h3>
+            <div id="wallet-address" style="word-break: break-all;">—</div>
+            <button id="btn-wallet-new" style="margin-top: 10px;">New Address</button>
+            <div id="wallet-qr" class="qr" style="margin-top: 12px;"></div>
+          </div>
+
+          <div class="card">
+            <h3>Send</h3>
+            <div class="form">
+              <input id="send-to" type="text" placeholder="Recipient address" />
+              <input id="send-amount" type="text" placeholder="Amount (IRM)" />
+              <select id="send-fee">
+                <option value="auto">Auto fee</option>
+                <option value="low">Low</option>
+                <option value="normal">Normal</option>
+                <option value="high">High</option>
+              </select>
+              <button class="primary" id="btn-wallet-send">Send</button>
+              <div id="send-result" class="label"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top: 16px;">
+          <h3>Recent Transactions</h3>
+          <div id="wallet-tx-list" class="list"></div>
+        </div>
+      </section>
+
+      <section id="page-node" class="page">
+        <div class="grid">
+          <div class="card">
+            <h3>Node Control</h3>
+            <div class="action-row">
+              <button class="primary" id="btn-start-node">Start</button>
+              <button id="btn-stop-node">Stop</button>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Logs</h3>
+            <div id="log-output" class="log-output"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-explorer" class="page">
+        <div class="grid">
+          <div class="card">
+            <h3>Latest Blocks</h3>
+            <button id="btn-explorer-refresh">Refresh</button>
+            <div id="explorer-blocks" class="list"></div>
+          </div>
+          <div class="card">
+            <h3>Lookup</h3>
+            <input id="explorer-txid" type="text" placeholder="Txid" />
+            <button id="btn-explorer-tx">Fetch Tx</button>
+            <pre id="explorer-detail" class="log-output"></pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-settings" class="page">
+        <div class="card">
+          <h3>Settings</h3>
+          <div class="form">
+            <label class="label">Node Mode</label>
+            <select id="settings-mode">
+              <option value="managed">Managed</option>
+              <option value="attach">Attach</option>
+            </select>
+            <label class="label">Data directory</label>
+            <input id="settings-datadir" type="text" />
+            <label class="label">RPC endpoint</label>
+            <input id="settings-rpc" type="text" />
+            <label class="label">RPC token</label>
+            <input id="settings-token" type="password" />
+            <button class="primary" id="btn-save-settings">Save</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-about" class="page">
+        <div class="card">
+          <h3>About Irium Core</h3>
+          <img src="assets/irium-logo.svg" alt="Irium" style="width: 96px;" />
+          <p>Reference full-node wallet for the Irium blockchain.</p>
+          <p>Version: <span id="about-version">0.1.0-alpha</span></p>
+          <p>License: MIT</p>
+        </div>
+      </section>
+
+      <div class="status-bar">
+        <div id="status-bar-text">Initializing…</div>
+        <div>Local node only · No external services</div>
+      </div>
+    </main>
+  </div>
+
+  <script src="assets/app.js"></script>
+</body>
+</html>

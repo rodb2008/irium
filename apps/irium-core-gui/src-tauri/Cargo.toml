@@ -1,0 +1,31 @@
+[package]
+name = "irium-core-gui"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.5", features = ["api-all"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+directories = "5"
+base64 = "0.22"
+hex = "0.4"
+sha2 = "0.10"
+ripemd = "0.1"
+bs58 = "0.4"
+rand = "0.8"
+rand_core = "0.6"
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+k256 = { version = "0.13", features = ["ecdsa"] }
+chrono = { version = "0.4", features = ["clock"] }
+irium-node-rs = { path = "../../../", package = "irium-node-rs" }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
