@@ -2382,25 +2382,15 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 name = "irium-core-gui"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
- "base64 0.22.1",
- "bs58",
- "chrono",
  "directories",
  "hex",
  "irium-node-rs",
- "k256",
- "pbkdf2",
  "rand 0.8.5",
- "rand_core 0.6.4",
  "reqwest",
- "ripemd",
  "serde",
  "serde_json",
- "sha2",
  "tauri",
  "tauri-build",
- "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -2408,6 +2398,7 @@ dependencies = [
 name = "irium-node-rs"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "axum",
  "axum-server",
  "bs58",
@@ -2418,6 +2409,7 @@ dependencies = [
  "k256",
  "num-bigint",
  "num-traits",
+ "pbkdf2",
  "qrcode",
  "rand_core 0.6.4",
  "reqwest",

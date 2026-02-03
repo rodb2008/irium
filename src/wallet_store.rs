@@ -223,8 +223,10 @@ fn encrypt_wallet(passphrase: &str, plain: &WalletPlain) -> Result<WalletFile, S
     let key = derive_key(passphrase, &salt);
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     let payload = serde_json::to_vec(plain).map_err(|e| e.to_string())?;
+    #[allow(deprecated)]
+    let nonce_ga = Nonce::from_slice(&nonce);
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), payload.as_ref())
+        .encrypt(&nonce_ga, payload.as_ref())
         .map_err(|e| e.to_string())?;
     Ok(WalletFile {
         version: WALLET_VERSION,
@@ -245,6 +247,7 @@ fn decrypt_wallet(passphrase: &str, file: &WalletFile) -> Result<WalletPlain, St
     let cipher_bytes = hex::decode(&file.crypto.cipher).map_err(|e| e.to_string())?;
     let key = derive_key(passphrase, &salt);
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
+    #[allow(deprecated)]
     let payload = cipher
         .decrypt(Nonce::from_slice(&nonce), cipher_bytes.as_ref())
         .map_err(|_| "invalid passphrase".to_string())?;

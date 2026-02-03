@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Duration;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 pub fn spawn_log_tail(app: AppHandle, path: PathBuf) {
     tauri::async_runtime::spawn(async move {

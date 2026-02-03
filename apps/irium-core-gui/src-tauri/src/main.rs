@@ -10,11 +10,10 @@ use crate::log_tail::spawn_log_tail;
 use crate::node_manager::NodeManager;
 use crate::rpc_client::RpcClient;
 use crate::settings::{load_settings, save_settings as save_settings_file, Settings};
-use crate::wallet::WalletService;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, State};
 
 
 fn format_irm_value(amount: i64) -> String {
@@ -32,7 +31,6 @@ fn format_irm_value(amount: i64) -> String {
 struct AppState {
     settings: Mutex<Settings>,
     node: Mutex<NodeManager>,
-    wallet: Mutex<WalletService>,
     log_tail_started: Mutex<bool>,
 }
 
@@ -46,19 +44,19 @@ fn rpc_client_from(settings: &Settings) -> Result<RpcClient, String> {
 }
 
 #[tauri::command]
-fn get_settings(state: State<AppState>) -> Settings {
+fn get_settings(state: State<'_, AppState>) -> Settings {
     state.settings.lock().unwrap().clone()
 }
 
 #[tauri::command]
-fn save_settings(state: State<AppState>, settings: Settings) -> Result<(), String> {
+fn save_settings(state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
     save_settings_file(&settings)?;
     *state.settings.lock().unwrap() = settings;
     Ok(())
 }
 
 #[tauri::command]
-fn start_node(state: State<AppState>) -> Result<(), String> {
+fn start_node(state: State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.lock().unwrap().clone();
     if settings.mode == "attach" {
         return Ok(());
@@ -68,7 +66,7 @@ fn start_node(state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn stop_node(state: State<AppState>) -> Result<(), String> {
+fn stop_node(state: State<'_, AppState>) -> Result<(), String> {
     let mut node = state.node.lock().unwrap();
     node.stop()
 }
@@ -81,7 +79,7 @@ async fn get_status(state: State<'_, AppState>) -> Result<serde_json::Value, Str
 }
 
 #[tauri::command]
-fn start_log_tail(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+fn start_log_tail(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let mut started = state.log_tail_started.lock().unwrap();
     if *started {
         return Ok(());
@@ -100,41 +98,42 @@ struct WalletReceive {
 }
 
 #[tauri::command]
-fn wallet_create(state: State<AppState>, passphrase: String) -> Result<WalletReceive, String> {
+async fn wallet_create(state: State<'_, AppState>, passphrase: String) -> Result<WalletReceive, String> {
     let settings = state.settings.lock().unwrap().clone();
-    let mut wallet = state.wallet.lock().unwrap();
-    let addr = wallet.create_wallet(PathBuf::from(settings.data_dir).as_path(), &passphrase)?;
+    let client = rpc_client_from(&settings)?;
+    let addr = crate::wallet::create_wallet(&client, &passphrase).await?;
     let qr_svg = irium_node_rs::qr::render_svg(&addr, 6, 2)?;
     Ok(WalletReceive { address: addr, qr_svg })
 }
 
 #[tauri::command]
-fn wallet_unlock(state: State<AppState>, passphrase: String) -> Result<(), String> {
+async fn wallet_unlock(state: State<'_, AppState>, passphrase: String) -> Result<(), String> {
     let settings = state.settings.lock().unwrap().clone();
-    let mut wallet = state.wallet.lock().unwrap();
-    wallet.unlock_wallet(PathBuf::from(settings.data_dir).as_path(), &passphrase)
+    let client = rpc_client_from(&settings)?;
+    crate::wallet::unlock_wallet(&client, &passphrase).await
 }
 
 #[tauri::command]
-fn wallet_lock(state: State<AppState>) {
-    let mut wallet = state.wallet.lock().unwrap();
-    wallet.lock_wallet();
+async fn wallet_lock(state: State<'_, AppState>) -> Result<(), String> {
+    let settings = state.settings.lock().unwrap().clone();
+    let client = rpc_client_from(&settings)?;
+    crate::wallet::lock_wallet(&client).await
 }
 
 #[tauri::command]
-fn wallet_new_address(state: State<AppState>) -> Result<WalletReceive, String> {
+async fn wallet_new_address(state: State<'_, AppState>) -> Result<WalletReceive, String> {
     let settings = state.settings.lock().unwrap().clone();
-    let mut wallet = state.wallet.lock().unwrap();
-    let addr = wallet.new_address(PathBuf::from(settings.data_dir).as_path())?;
+    let client = rpc_client_from(&settings)?;
+    let addr = crate::wallet::new_address(&client).await?;
     let qr_svg = irium_node_rs::qr::render_svg(&addr, 6, 2)?;
     Ok(WalletReceive { address: addr, qr_svg })
 }
 
 #[tauri::command]
-fn wallet_receive(state: State<AppState>) -> Result<WalletReceive, String> {
+async fn wallet_receive(state: State<'_, AppState>) -> Result<WalletReceive, String> {
     let settings = state.settings.lock().unwrap().clone();
-    let mut wallet = state.wallet.lock().unwrap();
-    let addr = wallet.current_address(settings.auto_lock_minutes)?;
+    let client = rpc_client_from(&settings)?;
+    let addr = crate::wallet::receive_address(&client).await?;
     let qr_svg = irium_node_rs::qr::render_svg(&addr, 6, 2)?;
     Ok(WalletReceive { address: addr, qr_svg })
 }
@@ -149,8 +148,7 @@ struct WalletBalance {
 async fn wallet_balance(state: State<'_, AppState>) -> Result<WalletBalance, String> {
     let settings = state.settings.lock().unwrap().clone();
     let client = rpc_client_from(&settings)?;
-    let mut wallet = state.wallet.lock().unwrap();
-    let (confirmed, unconfirmed) = wallet.balance(&client, settings.auto_lock_minutes).await?;
+    let (confirmed, unconfirmed) = crate::wallet::balance(&client).await?;
     Ok(WalletBalance { confirmed, unconfirmed })
 }
 
@@ -165,8 +163,7 @@ struct WalletTx {
 async fn wallet_history(state: State<'_, AppState>, limit: usize) -> Result<Vec<WalletTx>, String> {
     let settings = state.settings.lock().unwrap().clone();
     let client = rpc_client_from(&settings)?;
-    let mut wallet = state.wallet.lock().unwrap();
-    let items = wallet.history(&client, settings.auto_lock_minutes, limit).await?;
+    let items = crate::wallet::history(&client, limit).await?;
     Ok(items
         .into_iter()
         .map(|i| WalletTx {
@@ -191,10 +188,7 @@ async fn wallet_send(
 ) -> Result<WalletSendResponse, String> {
     let settings = state.settings.lock().unwrap().clone();
     let client = rpc_client_from(&settings)?;
-    let mut wallet = state.wallet.lock().unwrap();
-    let txid = wallet
-        .send(&client, settings.auto_lock_minutes, &to, &amount, &fee_mode)
-        .await?;
+    let txid = crate::wallet::send(&client, &to, &amount, &fee_mode).await?;
     Ok(WalletSendResponse { txid })
 }
 
@@ -225,7 +219,6 @@ fn main() {
         .manage(AppState {
             settings: Mutex::new(settings),
             node: Mutex::new(NodeManager::default()),
-            wallet: Mutex::new(WalletService::new()),
             log_tail_started: Mutex::new(false),
         })
         .invoke_handler(tauri::generate_handler![
