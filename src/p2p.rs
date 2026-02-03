@@ -1933,8 +1933,6 @@ impl P2PNode {
                                                             let local_height = guard.tip_height();
                                                             if peer_height > local_height {
                                                                 reset_headers = true;
-                                                                guard.headers.clear();
-                                                                guard.header_chain.clear();
                                                             }
                                                         }
                                                     }
