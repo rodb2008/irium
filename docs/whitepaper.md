@@ -12,7 +12,7 @@
 
 Irium is a purpose-built proof-of-work blockchain designed to maximize network independence and long-term survivability. The protocol eliminates reliance on DNS infrastructure, enforces transparent founder vesting via on-chain timelocks, incentivizes transaction relay quality without inflation, and prioritizes light client usability from genesis. This whitepaper outlines the core design principles, system architecture, monetary policy, and implementation status of the IRM asset and its supporting network.
 
-**Current Implementation:** Production mainnet is LIVE; core innovations are operational, with NiPoPoW proofs still pending.
+**Current Implementation:** Production mainnet is LIVE; core innovations are operational, with NiPoPoW scoring implemented and succinct proofs pending.
 
 ---
 
@@ -35,7 +35,7 @@ Most established proof-of-work networks inherit architectural assumptions from B
 5. **Mobile-first architecture** with NiPoPoW-ready light clients from block 1
 6. **On-chain notarization** layer for off-chain metadata commitments
 
-**Status:** 5/6 implemented; NiPoPoW proofs are pending.
+**Status:** 5/6 implemented; NiPoPoW scoring implemented, succinct proofs pending.
 
 ### 1.2 Technical Specifications
 
@@ -333,7 +333,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 - Merkle proof verification
 - Superblock proofs for ultra-light clients
 
-**Status:** ⚠️ Partial (header chain + merkle proofs implemented; NiPoPoW pending)
+**Status:** ⚠️ Partial (header chain + merkle proofs + NiPoPoW scoring implemented; succinct proofs pending)
 
 **Light Client Benefits:**
 - Download only headers (~80 bytes per block)
@@ -554,7 +554,7 @@ Nodes maintain a dynamic peer list (`bootstrap/seedlist.runtime`):
 - ✅ Sybil-resistant handshake
 - ✅ Relay reward system
 - ✅ Anchor verification
-- ✅ SPV with NiPoPoW
+- ⚠️ SPV + NiPoPoW scoring (succinct proofs pending)
 
 ### 9.2 Network Launch
 
