@@ -167,6 +167,13 @@
             <input id="settings-rpc" type="text" />
             <label class="label">RPC token</label>
             <input id="settings-token" type="password" />
+            <label class="label">Auto-lock (minutes)</label>
+            <input id="settings-auto-lock" type="number" min="0" />
+            <label class="label">Allow insecure TLS (local only)</label>
+            <select id="settings-insecure">
+              <option value="false">No</option>
+              <option value="true">Yes</option>
+            </select>
             <button class="primary" id="btn-save-settings">Save</button>
           </div>
         </div>

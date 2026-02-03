@@ -42,6 +42,8 @@ async function loadSettings() {
   document.getElementById('settings-mode').value = settings.mode;
   document.getElementById('settings-rpc').value = settings.rpc_url;
   document.getElementById('settings-token').value = settings.rpc_token ?? '';
+  document.getElementById('settings-auto-lock').value = settings.auto_lock_minutes ?? 5;
+  document.getElementById('settings-insecure').value = String(settings.rpc_allow_insecure ?? false);
   document.getElementById('settings-datadir').value = settings.data_dir;
 }
 
@@ -51,6 +53,8 @@ async function saveSettings() {
     mode: document.getElementById('settings-mode').value,
     rpc_url: document.getElementById('settings-rpc').value,
     rpc_token: document.getElementById('settings-token').value,
+    auto_lock_minutes: Number(document.getElementById('settings-auto-lock').value || 0),
+    rpc_allow_insecure: document.getElementById('settings-insecure').value === 'true',
     data_dir: document.getElementById('settings-datadir').value,
   };
   await invoke('save_settings', { settings: updated });
