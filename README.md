@@ -220,10 +220,16 @@ source ~/.cargo/env
 Use `irium-wallet address-to-pkh <base58_address>` to convert an address to its 20-byte pubkey hash.
 
 ## SPV Tooling
-`irium-spv` verifies merkle proofs against stored block JSON snapshots:
+`irium-spv` verifies merkle proofs and NiPoPoW proofs against stored block JSON snapshots:
 ```bash
 source ~/.cargo/env
 cargo run --release --bin irium-spv -- verify <height> <txid> <index> <proof_hex_csv>
+```
+```bash
+cargo run --release --bin irium-spv -- nipopow-score [blocks_dir] [m]
+cargo run --release --bin irium-spv -- nipopow-prove [blocks_dir] [m] [k] [out_json]
+cargo run --release --bin irium-spv -- nipopow-verify <proof_json>
+cargo run --release --bin irium-spv -- nipopow-compare-proofs <proof_a> <proof_b> [m]
 ```
 
 ## Bootstrap Artifacts
