@@ -23,8 +23,8 @@ jobs:
       - name: Install tauri-cli (prebuilt)
         shell: pwsh
         run: |
-          $ProgressPreference = SilentlyContinue
-          $uri = https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v1.5.12/cargo-tauri-x86_64-pc-windows-msvc.zip
+          $ProgressPreference = "SilentlyContinue"
+          $uri = "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v1.5.12/cargo-tauri-x86_64-pc-windows-msvc.zip"
           $zip = "$env:RUNNER_TEMP\cargo-tauri.zip"
           Invoke-WebRequest -Uri $uri -OutFile $zip
           $dest = "$env:RUNNER_TEMP\cargo-tauri"
