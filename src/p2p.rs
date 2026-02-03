@@ -1974,7 +1974,7 @@ impl P2PNode {
                                             guard.tip_height()
                                         };
                                         let peer_height = last_handshake_height.unwrap_or(local_height);
-                                        if !added_any && peer_height > local_height {
+                                        if !added_any && peer_height > local_height && header_count < MAX_HEADERS_PER_REQUEST {
                                             if sync_request_allowed_for(&sync_requests, addr.ip(), local_height, peer_height).await {
                                                 let get_headers = GetHeadersPayload {
                                                     start_hash: vec![0u8; 32],
@@ -3252,7 +3252,7 @@ async fn handle_incoming_with_sybil(
                             guard.tip_height()
                         };
                         let peer_height = last_handshake_height.unwrap_or(local_height);
-                        if !added_any && peer_height > local_height {
+                        if !added_any && peer_height > local_height && header_count < MAX_HEADERS_PER_REQUEST {
                             if sync_request_allowed_for(&sync_requests, addr.ip(), local_height, peer_height).await {
                                 let get_headers = GetHeadersPayload {
                                     start_hash: vec![0u8; 32],
