@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SEEDLIST_BASELINE: &str = "bootstrap/seedlist.txt";
@@ -127,6 +129,81 @@ impl SeedlistManager {
         }
     }
 
+    fn allow_unsigned_seedlist() -> bool {
+        std::env::var("IRIUM_SEEDLIST_ALLOW_UNSIGNED")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    fn seedlist_sig_principal() -> String {
+        std::env::var("IRIUM_SEEDLIST_SIG_PRINCIPAL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "bootstrap-signer".to_string())
+    }
+
+    fn seedlist_sig_namespace() -> String {
+        std::env::var("IRIUM_SEEDLIST_SIG_NAMESPACE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "file".to_string())
+    }
+
+    fn seedlist_allowed_signers() -> PathBuf {
+        std::env::var("IRIUM_SEEDLIST_ALLOWED_SIGNERS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| repo_root().join("bootstrap/trust/allowed_signers"))
+    }
+
+    fn seedlist_sig_path(&self) -> PathBuf {
+        PathBuf::from(format!("{}.sig", self.baseline.to_string_lossy()))
+    }
+
+    fn verify_seedlist_signature(&self) -> bool {
+        let seed_data = match fs::read_to_string(&self.baseline) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let sig_path = self.seedlist_sig_path();
+        if !sig_path.exists() {
+            return false;
+        }
+        let allowed = Self::seedlist_allowed_signers();
+        if !allowed.exists() {
+            return false;
+        }
+        let principal = Self::seedlist_sig_principal();
+        let namespace = Self::seedlist_sig_namespace();
+        let mut child = match Command::new("ssh-keygen")
+            .arg("-Y")
+            .arg("verify")
+            .arg("-f")
+            .arg(&allowed)
+            .arg("-I")
+            .arg(&principal)
+            .arg("-n")
+            .arg(&namespace)
+            .arg("-s")
+            .arg(&sig_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return false,
+        };
+        if let Some(stdin) = child.stdin.as_mut() {
+            if stdin.write_all(seed_data.as_bytes()).is_err() {
+                return false;
+            }
+        }
+        match child.wait() {
+            Ok(status) => status.success(),
+            Err(_) => false,
+        }
+    }
     fn load_seed_entries(&self, path: &PathBuf) -> Vec<String> {
         let mut entries = Vec::new();
         let text = match fs::read_to_string(path) {
@@ -177,7 +254,16 @@ impl SeedlistManager {
 
     pub fn merged_seedlist(&self) -> Vec<String> {
         let mut combined = Vec::new();
-        for ip in self.load_seed_entries(&self.baseline) {
+        let baseline_entries = if self.verify_seedlist_signature() {
+            self.load_seed_entries(&self.baseline)
+        } else if Self::allow_unsigned_seedlist() {
+            eprintln!("Seedlist signature invalid or missing; using unsigned baseline seeds due to IRIUM_SEEDLIST_ALLOW_UNSIGNED=1");
+            self.load_seed_entries(&self.baseline)
+        } else {
+            eprintln!("Seedlist signature invalid or missing; skipping baseline seeds");
+            Vec::new()
+        };
+        for ip in baseline_entries {
             if !combined.contains(&ip) {
                 combined.push(ip);
             }

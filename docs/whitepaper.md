@@ -12,7 +12,7 @@
 
 Irium is a purpose-built proof-of-work blockchain designed to maximize network independence and long-term survivability. The protocol eliminates reliance on DNS infrastructure, enforces transparent founder vesting via on-chain timelocks, incentivizes transaction relay quality without inflation, and prioritizes light client usability from genesis. This whitepaper outlines the core design principles, system architecture, monetary policy, and implementation status of the IRM asset and its supporting network.
 
-**Current Implementation:** Production mainnet is LIVE with all 8 core innovations operational.
+**Current Implementation:** Production mainnet is LIVE; core innovations are operational, with NiPoPoW proofs still pending.
 
 ---
 
@@ -35,7 +35,7 @@ Most established proof-of-work networks inherit architectural assumptions from B
 5. **Mobile-first architecture** with NiPoPoW-ready light clients from block 1
 6. **On-chain notarization** layer for off-chain metadata commitments
 
-**Status: All 6 goals achieved and operational.**
+**Status:** 5/6 implemented; NiPoPoW proofs are pending.
 
 ### 1.2 Technical Specifications
 
@@ -197,7 +197,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 - Signed `anchors.json` with checkpoint block headers
 - Bootstrap script: `scripts/irium-zero.sh` (no DNS queries)
 - Distributed via GitHub, IPFS, torrents
-- Signature verification with secp256k1
+- Signature verification via SSH signatures (sshsig), validated with `ssh-keygen -Y verify` and `bootstrap/trust/allowed_signers`
 
 **Status:** ✅ Implemented and operational
 
@@ -217,7 +217,13 @@ Ultra-low fees enable micropayments and frequent transactions.
 - Network 'remembers' reliable peers
 - `seedlist.runtime` updated automatically
 
-**Status:** ✅ Implemented (src/reputation.rs, src/network.rs)
+**Status:** ✅ Implemented (src/reputation.rs, src/network.rs, src/p2p.rs)
+
+**Implementation Notes:**
+- P2P message types: `UptimeChallenge`, `UptimeProof`
+- Capability: `uptime_hmac_v1`
+- HMAC key derived from node ID pair; timestamp window defaults to 5 minutes
+
 
 **Reputation Factors:**
 - Successful connections: +2 points each
@@ -327,7 +333,7 @@ Ultra-low fees enable micropayments and frequent transactions.
 - Merkle proof verification
 - Superblock proofs for ultra-light clients
 
-**Status:** ✅ Implemented (src/spv.rs)
+**Status:** ⚠️ Partial (header chain + merkle proofs implemented; NiPoPoW pending)
 
 **Light Client Benefits:**
 - Download only headers (~80 bytes per block)
@@ -345,7 +351,11 @@ Ultra-low fees enable micropayments and frequent transactions.
 - Notarization layer
 - Immutable timestamp proofs
 
-**Status:** ✅ Structure ready, integrated
+**Status:** ✅ Implemented (coinbase OP_RETURN via IRIUM_COINBASE_METADATA / IRIUM_NOTARY_HASH)
+
+**Runtime Controls:**
+- `IRIUM_COINBASE_METADATA`: arbitrary string (hashed if not 32-byte hex)
+- `IRIUM_NOTARY_HASH`: 32-byte hex hash
 
 **Use Cases:**
 - Document timestamping

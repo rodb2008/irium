@@ -178,6 +178,41 @@ fn script_from_relay_address(addr: &str) -> Result<Vec<u8>, String> {
     Ok(script)
 }
 
+fn op_return_output(data: &[u8]) -> TxOutput {
+    let mut script = Vec::with_capacity(2 + data.len());
+    script.push(0x6a); // OP_RETURN
+    script.push(data.len() as u8);
+    script.extend_from_slice(data);
+    TxOutput {
+        value: 0,
+        script_pubkey: script,
+    }
+}
+
+fn coinbase_metadata_output() -> Option<TxOutput> {
+    let raw = std::env::var("IRIUM_COINBASE_METADATA")
+        .ok()
+        .or_else(|| std::env::var("IRIUM_NOTARY_HASH").ok())?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let hex_hash = if raw.len() == 64 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+        raw.to_lowercase()
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(raw.as_bytes());
+        let digest = hasher.finalize();
+        hex::encode(digest)
+    };
+    let payload = format!("notary:{}", hex_hash);
+    let bytes = payload.as_bytes();
+    if bytes.len() > 75 {
+        return None;
+    }
+    Some(op_return_output(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::script_from_relay_address;
@@ -1235,6 +1270,10 @@ fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client, 
     for rc in relay_commitments {
         let outputs = rc.build_outputs(|addr| script_from_relay_address(addr))?;
         coinbase.outputs.extend(outputs);
+    }
+
+    if let Some(output) = coinbase_metadata_output() {
+        coinbase.outputs.push(output);
     }
 
     txs.push(coinbase);

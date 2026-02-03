@@ -19,14 +19,17 @@ use crate::network::{PeerDirectory, PeerRecord};
 use crate::protocol::{
     BlockPayload, EmptyPayload, GetBlocksPayload, GetDataPayload, GetHeadersPayload,
     HandshakePayload, HeadersPayload, InvPayload, MempoolPayload, Message, MessageType,
-    PeersPayload, PingPayload, RelayAddressPayload, TxPayload, MAX_BLOCKS_PER_REQUEST, MAX_HEADERS_PER_REQUEST, MAX_MESSAGE_SIZE,
+    PeersPayload, PingPayload, RelayAddressPayload, TxPayload, UptimeChallengePayload, UptimeProofPayload,
+    MAX_BLOCKS_PER_REQUEST, MAX_HEADERS_PER_REQUEST, MAX_MESSAGE_SIZE,
 };
 use crate::reputation::ReputationManager;
 use crate::sybil::{SybilChallenge, SybilProof, SybilResistantHandshake};
 use crate::tx::decode_full_tx;
 use rand_core::{OsRng, RngCore};
 use hex;
+use hmac::{Hmac, Mac};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 /// Minimal P2P node skeleton: accepts incoming connections and can
 /// broadcast raw block bytes to all connected peers.
@@ -177,10 +180,27 @@ fn verify_peer_checkpoint(
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PeerSyncState {
     height: Option<u64>,
     tip: Option<[u8; 32]>,
+    node_id: Option<Vec<u8>>,
+    supports_uptime: bool,
+    last_uptime_challenge: Option<UptimeChallengePayload>,
+    last_uptime_sent: Option<Instant>,
+}
+
+impl Default for PeerSyncState {
+    fn default() -> Self {
+        Self {
+            height: None,
+            tip: None,
+            node_id: None,
+            supports_uptime: false,
+            last_uptime_challenge: None,
+            last_uptime_sent: None,
+        }
+    }
 }
 
 async fn maybe_request_sync(
@@ -242,6 +262,139 @@ async fn maybe_request_sync(
 
 }
 
+async fn request_orphan_headers(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    addr: SocketAddr,
+    prev_hash: [u8; 32],
+    chain: &Option<Arc<StdMutex<ChainState>>>,
+    sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    peer_state: &Arc<Mutex<PeerSyncState>>,
+) {
+    let local_height = chain
+        .as_ref()
+        .and_then(|c| c.lock().ok().map(|g| g.tip_height()))
+        .unwrap_or(0);
+    let peer_height = {
+        let guard = peer_state.lock().await;
+        guard.height.unwrap_or(local_height.saturating_add(1))
+    };
+    let start_hash = if prev_hash == [0u8; 32] {
+        [0u8; 32]
+    } else {
+        prev_hash
+    };
+    if sync_request_allowed_for(sync_requests, addr.ip(), local_height, peer_height).await {
+        let short = if start_hash == [0u8; 32] {
+            "genesis".to_string()
+        } else {
+            let h = hex::encode(start_hash);
+            h.get(0..12).unwrap_or(&h).to_string()
+        };
+        P2PNode::log_event(
+            "info",
+            "sync",
+            format!("P2P {}: orphan block, requesting headers from {}", addr, short),
+        );
+        let get_headers = GetHeadersPayload {
+            start_hash: start_hash.to_vec(),
+            count: MAX_HEADERS_PER_REQUEST,
+        };
+        if let Ok(msg) = get_headers.to_message() {
+            let _ = send_message(writer, msg, addr).await;
+        }
+    }
+}
+
+fn uptime_capability() -> &'static str {
+    "uptime_hmac_v1"
+}
+
+fn uptime_enabled() -> bool {
+    std::env::var("IRIUM_UPTIME_PROOFS")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
+fn uptime_interval() -> Duration {
+    let secs = std::env::var("IRIUM_UPTIME_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    Duration::from_secs(secs.clamp(60, 3600))
+}
+
+fn uptime_max_skew() -> u64 {
+    std::env::var("IRIUM_UPTIME_MAX_SKEW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300)
+}
+
+fn uptime_timestamp_valid(timestamp: u64) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let skew = uptime_max_skew();
+    if timestamp > now.saturating_add(skew) {
+        return false;
+    }
+    now.saturating_sub(timestamp) <= skew
+}
+
+fn uptime_key(local_id: &[u8], peer_id: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    if local_id <= peer_id {
+        hasher.update(local_id);
+        hasher.update(peer_id);
+    } else {
+        hasher.update(peer_id);
+        hasher.update(local_id);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn compute_uptime_hmac(key: &[u8; 32], nonce: &[u8; 32], timestamp: u64) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
+    mac.update(nonce);
+    mac.update(&timestamp.to_be_bytes());
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+fn local_capabilities() -> Option<Vec<String>> {
+    let mut caps = Vec::new();
+    if uptime_enabled() {
+        caps.push(uptime_capability().to_string());
+    }
+    if caps.is_empty() {
+        None
+    } else {
+        Some(caps)
+    }
+}
+
+fn peer_supports_uptime(payload: &HandshakePayload) -> bool {
+    payload
+        .capabilities
+        .as_ref()
+        .map(|caps| caps.iter().any(|c| c == uptime_capability()))
+        .unwrap_or(false)
+}
+
+fn parse_node_id_bytes(payload: &HandshakePayload) -> Option<Vec<u8>> {
+    payload
+        .node_id
+        .as_ref()
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| if b.len() == 32 { Some(b) } else { None })
+}
 
 fn handshake_fail_window() -> Duration {
     Duration::from_secs(60)
@@ -515,8 +668,20 @@ impl P2PNode {
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(10)
+            .unwrap_or(8)
     }
+
+    fn sybil_banned_bump(banned_count: u8) -> u8 {
+        let bump = std::env::var("IRIUM_SYBIL_BANNED_BUMP")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(0);
+        if bump == 0 {
+            return 0;
+        }
+        banned_count.min(bump)
+    }
+
 
     fn load_or_create_node_id() -> Vec<u8> {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
@@ -877,7 +1042,8 @@ impl P2PNode {
             let rep = self.reputation.lock().await;
             rep.banned_count() as u8
         };
-        let adj = base.saturating_add(banned.min(5));
+        let bump = Self::sybil_banned_bump(banned);
+        let adj = base.saturating_add(bump);
         adj.min(max)
     }
 
@@ -1046,6 +1212,7 @@ impl P2PNode {
             relay_address: self.relay_address.clone(),
             node_id: Some(hex::encode(&self.node_id)),
             tip_hash: Some(hex::encode(&P2PNode::tip_hash(&self.chain))),
+            capabilities: local_capabilities(),
         };
 
         let msg = payload
@@ -1120,12 +1287,44 @@ impl P2PNode {
                         relay_address: ping_relay.clone(),
                         node_id: Some(hex::encode(&ping_node_id)),
                         tip_hash: Some(hex::encode(&P2PNode::tip_hash(&ping_chain))),
+                        capabilities: local_capabilities(),
                     };
                     if let Ok(msg) = payload.to_message() {
                         let _ = send_message(&ping_writer, msg, ping_addr).await;
                     }
                     last_height = current_height;
                     last_handshake = Instant::now();
+                    if uptime_enabled() {
+                        let challenge = {
+                            let mut state = ping_peer_state.lock().await;
+                            if !state.supports_uptime {
+                                None
+                            } else {
+                                let due = state
+                                    .last_uptime_sent
+                                    .map(|t| t.elapsed() >= uptime_interval())
+                                    .unwrap_or(true);
+                                if !due {
+                                    None
+                                } else {
+                                    let mut nonce = [0u8; 32];
+                                    OsRng.fill_bytes(&mut nonce);
+                                    let timestamp = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let payload = UptimeChallengePayload { nonce, timestamp };
+                                    state.last_uptime_challenge = Some(payload.clone());
+                                    state.last_uptime_sent = Some(Instant::now());
+                                    Some(payload)
+                                }
+                            }
+                        };
+                        if let Some(payload) = challenge {
+                            let msg = payload.to_message();
+                            let _ = send_message(&ping_writer, msg, ping_addr).await;
+                        }
+                    }
                 }
                 maybe_request_sync(
                     &ping_writer,
@@ -1155,6 +1354,7 @@ impl P2PNode {
         let writer_for_drop = writer.clone();
         let peer_state = peer_state.clone();
         let local_node_id = hex::encode(&self.node_id);
+        let local_node_id_bytes = self.node_id.clone();
         tokio::spawn(async move {
             let mut msg_count: u32 = 0;
             let mut window_start = Instant::now();
@@ -1256,6 +1456,8 @@ impl P2PNode {
                                         } else {
                                             None
                                         });
+                                    let node_id_bytes = parse_node_id_bytes(&payload);
+                                    let supports_uptime = peer_supports_uptime(&payload);
                                     {
                                         let mut dir_guard = dir.lock().await;
                                         let multiaddr =
@@ -1283,6 +1485,8 @@ impl P2PNode {
                                         let mut state = peer_state.lock().await;
                                         state.height = Some(payload.height);
                                         state.tip = parsed_tip;
+                                        state.node_id = node_id_bytes.clone();
+                                        state.supports_uptime = supports_uptime;
                                     }
                                     // If we have a relay address, advertise it back.
                                     if let Some(relay) = relay_addr.clone() {
@@ -1443,7 +1647,55 @@ impl P2PNode {
                                 let mut dir_guard = dir.lock().await;
                                 let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
                                 dir_guard.mark_seen(&multiaddr);
-                                                            }
+                            }
+                            MessageType::UptimeChallenge => {
+                                if uptime_enabled() {
+                                    if let Ok(payload) = UptimeChallengePayload::from_message(&msg) {
+                                        if !uptime_timestamp_valid(payload.timestamp) {
+                                            continue;
+                                        }
+                                        let peer_id = {
+                                            let guard = peer_state.lock().await;
+                                            guard.node_id.clone()
+                                        };
+                                        if let Some(peer_id) = peer_id {
+                                            let key = uptime_key(&local_node_id_bytes, &peer_id);
+                                            let hmac = compute_uptime_hmac(&key, &payload.nonce, payload.timestamp);
+                                            let proof = UptimeProofPayload {
+                                                nonce: payload.nonce,
+                                                timestamp: payload.timestamp,
+                                                hmac,
+                                            };
+                                            let _ = send_message(&writer, proof.to_message(), addr).await;
+                                        }
+                                    }
+                                }
+                            }
+                            MessageType::UptimeProof => {
+                                if uptime_enabled() {
+                                    if let Ok(payload) = UptimeProofPayload::from_message(&msg) {
+                                        if !uptime_timestamp_valid(payload.timestamp) {
+                                            continue;
+                                        }
+                                        let (challenge, peer_id) = {
+                                            let guard = peer_state.lock().await;
+                                            (guard.last_uptime_challenge.clone(), guard.node_id.clone())
+                                        };
+                                        if let (Some(challenge), Some(peer_id)) = (challenge, peer_id) {
+                                            if challenge.nonce == payload.nonce && challenge.timestamp == payload.timestamp {
+                                                let key = uptime_key(&local_node_id_bytes, &peer_id);
+                                                let expected = compute_uptime_hmac(&key, &payload.nonce, payload.timestamp);
+                                                if expected == payload.hmac {
+                                                    let mut rep = reputation.lock().await;
+                                                    rep.record_uptime_proof(&addr.to_string());
+                                                    let mut guard = peer_state.lock().await;
+                                                    guard.last_uptime_challenge = None;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             MessageType::GetPeers => {
                                 let peers_payload = {
                                     let dir = dir.lock().await;
@@ -1749,11 +2001,12 @@ impl P2PNode {
                                                 let bhash = block.header.hash();
                                                 let short = hex::encode(bhash);
                                                 let short = short.get(0..12).unwrap_or(&short);
-                                                let (new_height_opt, record_verdict, persist_height) = {
+                                                let (new_height_opt, record_verdict, persist_height, orphan_prev) = {
                                                     let mut guard = chain_arc.lock().unwrap();
                                                     let mut new_height_opt = None;
                                                     let mut record_verdict = None;
                                                     let mut persist_height = None;
+                                                    let mut orphan_prev = None;
                                                     match guard.process_block(block.clone()) {
                                                         Ok((new_height, _tip)) => {
                                                             P2PNode::log(format!(
@@ -1773,6 +2026,9 @@ impl P2PNode {
                                                             }
                                                         }
                                                         Err(e) => {
+                                                            if e.contains("orphan") || e.contains("prev hash unknown") {
+                                                                orphan_prev = Some(block.header.prev_hash);
+                                                            }
                                                             if P2PNode::is_soft_block_reject(&e) {
                                                                 if !P2PNode::is_duplicate_block(&e) {
                                                                     P2PNode::log_event(
@@ -1797,7 +2053,7 @@ impl P2PNode {
                                                             }
                                                         }
                                                     }
-                                                    (new_height_opt, record_verdict, persist_height)
+                                                    (new_height_opt, record_verdict, persist_height, orphan_prev)
                                                 };
                                                 if let Some(height) = persist_height {
                                                     if let Err(e) = storage::write_block_json(height, &block) {
@@ -1810,6 +2066,16 @@ impl P2PNode {
                                                             ),
                                                         );
                                                     }
+                                                }
+                                                if let Some(prev_hash) = orphan_prev {
+                                                    request_orphan_headers(
+                                                        &writer,
+                                                        addr,
+                                                        prev_hash,
+                                                        &chain_for_sync,
+                                                        &sync_requests,
+                                                        &peer_state,
+                                                    ).await;
                                                 }
                                                 if let Some(new_height) = new_height_opt {
                                                     let multiaddr = format!(
@@ -2132,6 +2398,7 @@ async fn handle_incoming_with_sybil(
     node_id: Vec<u8>,
 ) -> Result<(), String> {
     let local_node_id = hex::encode(&node_id);
+    let local_node_id_bytes = node_id.clone();
     // Issue a fresh challenge with adaptive difficulty.
     let base = P2PNode::sybil_difficulty();
     let max = std::env::var("IRIUM_SYBIL_DIFFICULTY_MAX")
@@ -2143,7 +2410,8 @@ async fn handle_incoming_with_sybil(
         let rep = reputation.lock().await;
         rep.banned_count() as u8
     };
-    let difficulty = std::cmp::min(max, base.saturating_add(banned.min(5)));
+    let bump = P2PNode::sybil_banned_bump(banned);
+    let difficulty = std::cmp::min(max, base.saturating_add(bump));
     let handshake = SybilResistantHandshake::new(difficulty);
     let challenge = handshake.create_challenge();
     let challenge_bytes = challenge.to_bytes();
@@ -2244,12 +2512,44 @@ async fn handle_incoming_with_sybil(
                     relay_address: ping_relay.clone(),
                     node_id: Some(hex::encode(&ping_node_id)),
                     tip_hash: Some(hex::encode(&P2PNode::tip_hash(&ping_chain))),
+                    capabilities: local_capabilities(),
                 };
                 if let Ok(msg) = payload.to_message() {
                     let _ = send_message(&ping_writer, msg, ping_addr).await;
                 }
                 last_height = current_height;
                 last_handshake = Instant::now();
+                if uptime_enabled() {
+                    let challenge = {
+                        let mut state = ping_peer_state.lock().await;
+                        if !state.supports_uptime {
+                            None
+                        } else {
+                            let due = state
+                                .last_uptime_sent
+                                .map(|t| t.elapsed() >= uptime_interval())
+                                .unwrap_or(true);
+                            if !due {
+                                None
+                            } else {
+                                let mut nonce = [0u8; 32];
+                                OsRng.fill_bytes(&mut nonce);
+                                let timestamp = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let payload = UptimeChallengePayload { nonce, timestamp };
+                                state.last_uptime_challenge = Some(payload.clone());
+                                state.last_uptime_sent = Some(Instant::now());
+                                Some(payload)
+                            }
+                        }
+                    };
+                    if let Some(payload) = challenge {
+                        let msg = payload.to_message();
+                        let _ = send_message(&ping_writer, msg, ping_addr).await;
+                    }
+                }
             }
             maybe_request_sync(
                 &ping_writer,
@@ -2286,6 +2586,7 @@ async fn handle_incoming_with_sybil(
         relay_address: relay_address.clone(),
         node_id: Some(hex::encode(&node_id)),
         tip_hash: Some(hex::encode(&P2PNode::tip_hash(&chain))),
+        capabilities: local_capabilities(),
     };
     if let Ok(msg) = payload.to_message() {
         let _ = send_message(&writer, msg, addr).await;
@@ -2402,11 +2703,15 @@ async fn handle_incoming_with_sybil(
                         } else {
                             None
                         });
+                    let node_id_bytes = parse_node_id_bytes(&payload);
+                    let supports_uptime = peer_supports_uptime(&payload);
                     last_handshake_tip = parsed_tip;
                     {
                         let mut state = peer_state.lock().await;
                         state.height = Some(payload.height);
                         state.tip = parsed_tip;
+                        state.node_id = node_id_bytes.clone();
+                        state.supports_uptime = supports_uptime;
                     }
                     last_handshake_height = Some(payload.height);
 
@@ -2422,6 +2727,7 @@ async fn handle_incoming_with_sybil(
                         relay_address: relay_address.clone(),
                         node_id: Some(hex::encode(&node_id)),
                         tip_hash: Some(hex::encode(&P2PNode::tip_hash(&chain))),
+                        capabilities: local_capabilities(),
                     };
                     if let Ok(handshake_msg) = response.to_message() {
                         let _ = send_message(&writer, handshake_msg, addr).await;
@@ -2579,6 +2885,54 @@ async fn handle_incoming_with_sybil(
                     let mut dir_guard = directory.lock().await;
                     let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
                     dir_guard.mark_seen(&multiaddr);
+                }
+            }
+            MessageType::UptimeChallenge => {
+                if uptime_enabled() {
+                    if let Ok(payload) = UptimeChallengePayload::from_message(&msg) {
+                        if !uptime_timestamp_valid(payload.timestamp) {
+                            continue;
+                        }
+                        let peer_id = {
+                            let guard = peer_state.lock().await;
+                            guard.node_id.clone()
+                        };
+                        if let Some(peer_id) = peer_id {
+                            let key = uptime_key(&local_node_id_bytes, &peer_id);
+                            let hmac = compute_uptime_hmac(&key, &payload.nonce, payload.timestamp);
+                            let proof = UptimeProofPayload {
+                                nonce: payload.nonce,
+                                timestamp: payload.timestamp,
+                                hmac,
+                            };
+                            let _ = send_message(&writer, proof.to_message(), addr).await;
+                        }
+                    }
+                }
+            }
+            MessageType::UptimeProof => {
+                if uptime_enabled() {
+                    if let Ok(payload) = UptimeProofPayload::from_message(&msg) {
+                        if !uptime_timestamp_valid(payload.timestamp) {
+                            continue;
+                        }
+                        let (challenge, peer_id) = {
+                            let guard = peer_state.lock().await;
+                            (guard.last_uptime_challenge.clone(), guard.node_id.clone())
+                        };
+                        if let (Some(challenge), Some(peer_id)) = (challenge, peer_id) {
+                            if challenge.nonce == payload.nonce && challenge.timestamp == payload.timestamp {
+                                let key = uptime_key(&local_node_id_bytes, &peer_id);
+                                let expected = compute_uptime_hmac(&key, &payload.nonce, payload.timestamp);
+                                if expected == payload.hmac {
+                                    let mut rep = reputation.lock().await;
+                                    rep.record_uptime_proof(&addr.to_string());
+                                    let mut guard = peer_state.lock().await;
+                                    guard.last_uptime_challenge = None;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             MessageType::GetPeers => {
@@ -2889,11 +3243,12 @@ async fn handle_incoming_with_sybil(
                                 let bhash = block.header.hash();
                                 let short = hex::encode(bhash);
                                 let short = short.get(0..12).unwrap_or(&short);
-                                let (new_height_opt, record_verdict, persist_height) = {
+                                let (new_height_opt, record_verdict, persist_height, orphan_prev) = {
                                     let mut guard = chain_arc.lock().unwrap();
                                     let mut new_height_opt = None;
                                     let mut record_verdict = None;
                                     let mut persist_height = None;
+                                    let mut orphan_prev = None;
                                     match guard.process_block(block.clone()) {
                                         Ok((new_height, _tip)) => {
                                             P2PNode::log(format!(
@@ -2914,6 +3269,9 @@ async fn handle_incoming_with_sybil(
                                             }
                                         }
                                         Err(e) => {
+                                            if e.contains("orphan") || e.contains("prev hash unknown") {
+                                                orphan_prev = Some(block.header.prev_hash);
+                                            }
                                             if P2PNode::is_soft_block_reject(&e) {
                                                 if !P2PNode::is_duplicate_block(&e) {
                                                     P2PNode::log_event(
@@ -2938,7 +3296,7 @@ async fn handle_incoming_with_sybil(
                                             }
                                         }
                                     }
-                                    (new_height_opt, record_verdict, persist_height)
+                                    (new_height_opt, record_verdict, persist_height, orphan_prev)
                                 };
                                 if let Some(height) = persist_height {
                                     if let Err(e) = storage::write_block_json(height, &block) {
@@ -2951,6 +3309,16 @@ async fn handle_incoming_with_sybil(
                                             ),
                                         );
                                     }
+                                }
+                                if let Some(prev_hash) = orphan_prev {
+                                    request_orphan_headers(
+                                        &writer,
+                                        addr,
+                                        prev_hash,
+                                        &chain,
+                                        &sync_requests,
+                                        &peer_state,
+                                    ).await;
                                 }
                                 if let Some(new_height) = new_height_opt {
                                     let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());

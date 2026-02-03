@@ -31,6 +31,8 @@ pub enum MessageType {
     RelayAddress = 14,
     Inv = 15,
     GetData = 16,
+    UptimeChallenge = 17,
+    UptimeProof = 18,
     Disconnect = 99,
 }
 
@@ -56,6 +58,8 @@ impl TryFrom<u8> for MessageType {
             14 => RelayAddress,
             15 => Inv,
             16 => GetData,
+            17 => UptimeChallenge,
+            18 => UptimeProof,
             99 => Disconnect,
             other => return Err(format!("Unknown message type: {}", other)),
         };
@@ -121,6 +125,8 @@ pub struct HandshakePayload {
     pub node_id: Option<String>,
     #[serde(default)]
     pub tip_hash: Option<String>,
+    #[serde(default)]
+    pub capabilities: Option<Vec<String>>,
 }
 
 impl HandshakePayload {
@@ -173,6 +179,83 @@ impl PingPayload {
 
 /// Pong message reuses PingPayload format.
 pub type PongPayload = PingPayload;
+
+/// Uptime challenge payload: nonce + timestamp.
+#[derive(Debug, Clone)]
+pub struct UptimeChallengePayload {
+    pub nonce: [u8; 32],
+    pub timestamp: u64,
+}
+
+impl UptimeChallengePayload {
+    pub fn to_message(&self) -> Message {
+        let mut payload = Vec::with_capacity(40);
+        payload.extend_from_slice(&self.nonce);
+        payload.extend_from_slice(&self.timestamp.to_be_bytes());
+        Message {
+            msg_type: MessageType::UptimeChallenge,
+            payload,
+        }
+    }
+
+    pub fn from_message(msg: &Message) -> Result<Self, String> {
+        if msg.msg_type != MessageType::UptimeChallenge {
+            return Err("Not an uptime challenge message".to_string());
+        }
+        if msg.payload.len() != 40 {
+            return Err("Invalid uptime challenge payload length".to_string());
+        }
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&msg.payload[0..32]);
+        let mut ts_bytes = [0u8; 8];
+        ts_bytes.copy_from_slice(&msg.payload[32..40]);
+        let timestamp = u64::from_be_bytes(ts_bytes);
+        Ok(UptimeChallengePayload { nonce, timestamp })
+    }
+}
+
+/// Uptime proof payload: nonce + timestamp + HMAC.
+#[derive(Debug, Clone)]
+pub struct UptimeProofPayload {
+    pub nonce: [u8; 32],
+    pub timestamp: u64,
+    pub hmac: [u8; 32],
+}
+
+impl UptimeProofPayload {
+    pub fn to_message(&self) -> Message {
+        let mut payload = Vec::with_capacity(72);
+        payload.extend_from_slice(&self.nonce);
+        payload.extend_from_slice(&self.timestamp.to_be_bytes());
+        payload.extend_from_slice(&self.hmac);
+        Message {
+            msg_type: MessageType::UptimeProof,
+            payload,
+        }
+    }
+
+    pub fn from_message(msg: &Message) -> Result<Self, String> {
+        if msg.msg_type != MessageType::UptimeProof {
+            return Err("Not an uptime proof message".to_string());
+        }
+        if msg.payload.len() != 72 {
+            return Err("Invalid uptime proof payload length".to_string());
+        }
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&msg.payload[0..32]);
+        let mut ts_bytes = [0u8; 8];
+        ts_bytes.copy_from_slice(&msg.payload[32..40]);
+        let timestamp = u64::from_be_bytes(ts_bytes);
+        let mut hmac = [0u8; 32];
+        hmac.copy_from_slice(&msg.payload[40..72]);
+        Ok(UptimeProofPayload {
+            nonce,
+            timestamp,
+            hmac,
+        })
+    }
+}
+
 
 /// Block message: raw block bytes.
 #[derive(Debug, Clone)]
