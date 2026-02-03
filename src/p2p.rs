@@ -1900,6 +1900,7 @@ impl P2PNode {
                                         let mut offset = 0usize;
                                         let mut last_header_hash: Option<[u8; 32]> = None;
                                         let mut header_error = false;
+                                        let mut unknown_parent = false;
                                         let mut reset_headers = false;
                                         let mut added_any = false;
 
@@ -1929,6 +1930,7 @@ impl P2PNode {
                                                 if let Err(e) = guard.add_header(header.clone()) {
                                                     header_error = true;
                                                     if e.contains("unknown parent") {
+                                                        unknown_parent = true;
                                                         if let Some(peer_height) = last_handshake_height {
                                                             let local_height = guard.tip_height();
                                                             if peer_height > local_height {
@@ -1946,6 +1948,16 @@ impl P2PNode {
                                         }
 
                                         if header_error {
+                                            if unknown_parent && !added_any {
+                                                P2PNode::log_event(
+                                                    "warn",
+                                                    "sync",
+                                                    format!("P2P {}: headers do not connect; ignoring peer height", addr),
+                                                );
+                                                let mut state = peer_state.lock().await;
+                                                state.height = None;
+                                                state.tip = None;
+                                            }
                                             if reset_headers {
                                                 let get_headers = GetHeadersPayload {
                                                     start_hash: vec![0u8; 32],
@@ -3166,6 +3178,7 @@ async fn handle_incoming_with_sybil(
                         let mut offset = 0usize;
                         let mut last_header_hash: Option<[u8; 32]> = None;
                         let mut header_error = false;
+                        let mut unknown_parent = false;
                         let mut reset_headers = false;
                         let mut added_any = false;
 
@@ -3195,12 +3208,11 @@ async fn handle_incoming_with_sybil(
                                 if let Err(e) = guard.add_header(header.clone()) {
                                     header_error = true;
                                     if e.contains("unknown parent") {
+                                        unknown_parent = true;
                                         if let Some(peer_height) = last_handshake_height {
                                             let local_height = guard.tip_height();
                                             if peer_height > local_height {
                                                 reset_headers = true;
-                                                guard.headers.clear();
-                                                guard.header_chain.clear();
                                             }
                                         }
                                     }
@@ -3214,6 +3226,16 @@ async fn handle_incoming_with_sybil(
                         }
 
                         if header_error {
+                            if unknown_parent && !added_any {
+                                P2PNode::log_event(
+                                    "warn",
+                                    "sync",
+                                    format!("P2P {}: headers do not connect; ignoring peer height", addr),
+                                );
+                                let mut state = peer_state.lock().await;
+                                state.height = None;
+                                state.tip = None;
+                            }
                             if reset_headers {
                                 let get_headers = GetHeadersPayload {
                                     start_hash: vec![0u8; 32],
