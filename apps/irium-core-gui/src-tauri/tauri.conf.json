@@ -6,7 +6,7 @@
     "distDir": "../dist"
   },
   "package": {
-    "productName": "Irium Core",
+    "productName": "Irium Core v0.1 Alpha",
     "version": "0.1.0"
   },
   "tauri": {
@@ -22,7 +22,7 @@
     },
     "windows": [
       {
-        "title": "Irium Core",
+        "title": "Irium Core v0.1 Alpha",
         "width": 1200,
         "height": 800,
         "resizable": true
