@@ -117,6 +117,16 @@ fn getblocks_grace() -> Duration {
     Duration::from_secs(secs.max(2).min(60))
 }
 
+fn fallback_blocks_per_burst() -> usize {
+    let default = 32usize;
+    let max = MAX_BLOCKS_PER_REQUEST as usize;
+    let blocks = std::env::var("IRIUM_P2P_FALLBACK_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default);
+    blocks.clamp(1, max)
+}
+
 fn genesis_grace() -> Duration {
     let secs = std::env::var("IRIUM_P2P_GENESIS_GRACE_SECS")
         .ok()
@@ -1743,7 +1753,7 @@ impl P2PNode {
                                                     (Vec::new(), 0)
                                                 } else {
                                                     let mut blocks = Vec::new();
-                                                    for b in guard.chain.iter().skip(start_idx).take(32) {
+                                                    for b in guard.chain.iter().skip(start_idx).take(fallback_blocks_per_burst()) {
                                                         blocks.push(b.serialize());
                                                     }
                                                     (blocks, start_idx as u64)
@@ -3011,7 +3021,7 @@ async fn handle_incoming_with_sybil(
                                     (Vec::new(), 0)
                                 } else {
                                     let mut blocks = Vec::new();
-                                    for b in guard.chain.iter().skip(start_idx).take(32) {
+                                    for b in guard.chain.iter().skip(start_idx).take(fallback_blocks_per_burst()) {
                                         blocks.push(b.serialize());
                                     }
                                     (blocks, start_idx as u64)

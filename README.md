@@ -143,6 +143,9 @@ Response fields: hashrate, difficulty, avg_block_time, window, sample_blocks, ti
 - `IRIUM_ANCHOR_MIN_SIGNERS`: minimum valid signatures required for `bootstrap/anchors.json` (default 1).
 - `IRIUM_SYBIL_DIFFICULTY` / `IRIUM_SYBIL_DIFFICULTY_MAX`: base and cap for sybil handshake PoW (default 10/20).
 - `IRIUM_P2P_MAX_PEERS`: maximum connected peers before rejecting new inbound connections (default 100).
+- `IRIUM_P2P_SYNC_COOLDOWN_SECS`: base cooldown between repeated sync requests (default 2).
+- `IRIUM_P2P_GETBLOCKS_GRACE_SECS`: grace period before pushing blocks when a peer does not request them (default 8).
+- `IRIUM_P2P_FALLBACK_BLOCKS`: number of blocks to push per fallback burst (default 32, max 512).
 - `IRIUM_RUNTIME_SEED_DAYS`: minimum consecutive days before a peer is promoted into the runtime seedlist (default 7).
 - `IRIUM_RUNTIME_SEED_MAX_IDLE_HOURS`: max idle hours for runtime seedlist promotion (default 24).
 - `IRIUM_BANNED_LIST` / `IRIUM_BANNED_TRUST`: optional signed banlist path and allowed signer file (default `bootstrap/banned_peers.txt` + `.sig`, `bootstrap/trust/allowed_ban_signers`).
