@@ -1988,14 +1988,12 @@ impl P2PNode {
                                         }
                                         if header_count >= MAX_HEADERS_PER_REQUEST {
                                             if let Some(last_hash) = last_header_hash {
-                                                if sync_request_allowed_for(&sync_requests, addr.ip(), local_height, peer_height).await {
-                                                    let get_headers = GetHeadersPayload {
-                                                        start_hash: last_hash.to_vec(),
-                                                        count: MAX_HEADERS_PER_REQUEST,
-                                                    };
-                                                    if let Ok(msg) = get_headers.to_message() {
-                                                        let _ = send_message(&writer, msg, addr).await;
-                                                    }
+                                                let get_headers = GetHeadersPayload {
+                                                    start_hash: last_hash.to_vec(),
+                                                    count: MAX_HEADERS_PER_REQUEST,
+                                                };
+                                                if let Ok(msg) = get_headers.to_message() {
+                                                    let _ = send_message(&writer, msg, addr).await;
                                                 }
                                             }
                                         }
@@ -3266,14 +3264,12 @@ async fn handle_incoming_with_sybil(
                         }
                         if header_count >= MAX_HEADERS_PER_REQUEST {
                             if let Some(last_hash) = last_header_hash {
-                                if sync_request_allowed_for(&sync_requests, addr.ip(), local_height, peer_height).await {
-                                    let get_headers = GetHeadersPayload {
-                                        start_hash: last_hash.to_vec(),
-                                        count: MAX_HEADERS_PER_REQUEST,
-                                    };
-                                    if let Ok(msg) = get_headers.to_message() {
-                                        let _ = send_message(&writer, msg, addr).await;
-                                    }
+                                let get_headers = GetHeadersPayload {
+                                    start_hash: last_hash.to_vec(),
+                                    count: MAX_HEADERS_PER_REQUEST,
+                                };
+                                if let Ok(msg) = get_headers.to_message() {
+                                    let _ = send_message(&writer, msg, addr).await;
                                 }
                             }
                         }
