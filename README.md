@@ -229,7 +229,7 @@ source ~/.cargo/env
 Use `irium-wallet address-to-pkh <base58_address>` to convert an address to its 20-byte pubkey hash.
 
 ### Wallet RPC (node-managed)
-The node can manage an encrypted wallet for GUI/RPC clients. Default file: `~/.irium/wallet.core.json` (override with `IRIUM_NODE_WALLET_FILE`).
+The node can manage an encrypted wallet for RPC clients. Default file: `~/.irium/wallet.core.json` (override with `IRIUM_NODE_WALLET_FILE`).
 - `POST /wallet/create` { passphrase }
 - `POST /wallet/unlock` { passphrase }
 - `POST /wallet/lock`
