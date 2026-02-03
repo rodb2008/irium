@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Download Irium Core</title>
+  <style>
+    :root {
+      --bg: #0e1116;
+      --panel: #151a21;
+      --ink: #eef2f6;
+      --muted: #9aa4b2;
+      --accent: #4fd1c5;
+      --accent-2: #ffb86b;
+      --border: #242b36;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Noto Sans", "Fira Sans", Arial, sans-serif;
+      background: radial-gradient(1200px 600px at 20% -10%, #1a2330 0%, var(--bg) 50%), var(--bg);
+      color: var(--ink);
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 48px 24px 64px;
+    }
+    .header {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-bottom: 28px;
+    }
+    .title {
+      font-size: 32px;
+      letter-spacing: 0.3px;
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 15px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+    }
+    .card h3 {
+      margin: 0 0 8px;
+      font-size: 18px;
+    }
+    .card p {
+      margin: 0 0 16px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .btn {
+      display: inline-block;
+      padding: 10px 14px;
+      border-radius: 10px;
+      color: #0b0d10;
+      background: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
+    }
+    .btn.secondary {
+      background: var(--accent-2);
+    }
+    .meta {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .list {
+      margin: 10px 0 0;
+      padding: 0;
+      list-style: none;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .list li { margin: 6px 0; }
+    .box {
+      margin-top: 18px;
+      padding: 14px;
+      background: #0d1219;
+      border: 1px dashed #2c3645;
+      border-radius: 12px;
+      font-family: "Consolas", "SFMono-Regular", Menlo, monospace;
+      font-size: 13px;
+      color: #d0d7de;
+    }
+    .warning {
+      margin-top: 22px;
+      padding: 14px;
+      border-left: 4px solid #f6c453;
+      background: #1c1a12;
+      color: #f8e7c2;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    .release {
+      margin-top: 16px;
+      font-size: 14px;
+      color: var(--muted);
+    }
+    .release a { color: #9bd4ff; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <div class="title">Download Irium Core</div>
+      <div class="subtitle">Alpha release downloads for Windows and Linux.</div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Windows (NSIS Installer)</h3>
+        <p>Recommended for Windows 10/11. Installs Irium Core with an uninstaller.</p>
+        <a class="btn" href="https://github.com/iriumlabs/irium/releases/tag/irium-core-v0.1.0-alpha" target="_blank" rel="noopener">Download for Windows</a>
+      </div>
+
+      <div class="card">
+        <h3>Linux (AppImage)</h3>
+        <p>Portable AppImage build for most modern Linux distributions.</p>
+        <a class="btn secondary" href="https://github.com/iriumlabs/irium/releases/tag/irium-core-v0.1.0-alpha" target="_blank" rel="noopener">Download for Linux</a>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top: 18px;">
+      <h3>Files in this release</h3>
+      <ul class="list">
+        <li>Irium_Core_v0.1_Alpha_0.1.0_x64-setup.exe</li>
+        <li>Irium_Core_v0.1_Alpha_0.1.0_amd64.AppImage</li>
+      </ul>
+      <div class="box">sha256sum -c SHA256SUMS.txt</div>
+      <div class="box">chmod +x Irium_Core_v0.1_Alpha_0.1.0_amd64.AppImage
+./Irium_Core_v0.1_Alpha_0.1.0_amd64.AppImage</div>
+      <div class="release">
+        Release page: <a href="https://github.com/iriumlabs/irium/releases/tag/irium-core-v0.1.0-alpha" target="_blank" rel="noopener">irium-core-v0.1.0-alpha</a>
+      </div>
+    </div>
+
+    <div class="warning">
+      <strong>Alpha warning:</strong> This is an early release. Expect bugs and breaking changes. Keep backups of wallet files and test with small amounts first.
+    </div>
+  </div>
+</body>
+</html>
