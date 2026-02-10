@@ -85,6 +85,14 @@ Irium separates responsibilities into modular subsystems:
 - **irium-spv** - SPV proof verification tool
 - **irium-p2p** - P2P-only diagnostic node
 
+
+## Appendix A: Operator Notes (Implementation)
+
+These items describe operational behavior of the current Rust implementation and do not change consensus.
+
+- RPC: `iriumd` may serve HTTPS on `127.0.0.1:38300` when TLS cert/key are configured. Wallet/miner default to `https://127.0.0.1:38300` and retry once over HTTP if HTTPS fails.
+- Storage separation: blocks default to `~/.irium/blocks` and volatile state to `~/.irium/state`. Resync/clear-cache should delete ONLY the state directory (keep blocks).
+- Peer bootstrap: signed baseline seeds are merged with a runtime seedlist that is refreshed from observed peers.
 ---
 
 
