@@ -16,7 +16,7 @@ Irium is a production‑only proof‑of‑work blockchain for the IRM asset. The
 - `configs/` – genesis/consensus config.
 - `systemd/` – systemd unit templates + env examples.
 - `scripts/` – optional shell helpers (no Python entrypoints).
-- `state/` – runtime data (peers.json, etc.).
+- `state/` – legacy repo-local runtime data (do not commit). Current defaults use `~/.irium/state` for volatile state and `~/.irium/blocks` for blocks.
 
 
 
@@ -63,7 +63,7 @@ export IRIUM_RPC_TOKEN=$(openssl rand -hex 24)
 ```
 - Mining on another machine? Point the miner to a node:
 ```
-export IRIUM_NODE_RPC=http://<node-ip>:38300
+export IRIUM_NODE_RPC=https://<node-ip>:38300
 ```
 - If you see no peers: wait a few minutes, make sure outbound TCP 38291 is allowed, and confirm `bootstrap/seedlist.txt` exists. NAT can show 0 inbound peers even when syncing.
 - Miner starts at height 0: the node is still syncing or the miner cannot reach RPC. Check `curl -k https://127.0.0.1:38300/status` and verify `IRIUM_NODE_RPC`.
@@ -117,6 +117,7 @@ export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>
 ./target/release/irium-spv --help
 ```
 Notes:
+- Resync/clear cache: delete ONLY `~/.irium/state` (keep `~/.irium/blocks` to avoid re-downloading blocks).
 - If the node sits at height 0 with peers=0, set `IRIUM_NODE_CONFIG=configs/node.json` and restart the node.
 - If the node requires `IRIUM_RPC_TOKEN`, export the same token for the miner and wallet.
 - Keep the printed private key safe; it controls the funds for that address.
@@ -134,20 +135,23 @@ cargo test --quiet
 ### Network Hashrate (estimate)
 Use the node RPC to estimate network hashrate from recent blocks:
 ```bash
-curl http://127.0.0.1:38300/rpc/network_hashrate
+curl -k https://127.0.0.1:38300/rpc/network_hashrate
 # optional window (blocks)
-curl http://127.0.0.1:38300/rpc/network_hashrate?window=120
+curl -k https://127.0.0.1:38300/rpc/network_hashrate?window=120
 ```
 Response fields: hashrate, difficulty, avg_block_time, window, sample_blocks, tip_height.
 
 ### Important runtime env vars
+- `IRIUM_BLOCKS_DIR`: override blocks storage directory (default `~/.irium/blocks`).
+- `IRIUM_STATE_DIR`: override volatile state directory (default `~/.irium/state`).
+- `IRIUM_P2P_BANNED_LOG_COOLDOWN_SECS`: rate-limit repeated banned-inbound reject logs per IP (default 30s).
 - `IRIUM_ANCHOR_MIN_SIGNERS`: minimum valid signatures required for `bootstrap/anchors.json` (default 1).
 - `IRIUM_SYBIL_DIFFICULTY` / `IRIUM_SYBIL_DIFFICULTY_MAX`: base and cap for sybil handshake PoW (default 10/20).
 - `IRIUM_P2P_MAX_PEERS`: maximum connected peers before rejecting new inbound connections (default 100).
 - `IRIUM_P2P_SYNC_COOLDOWN_SECS`: base cooldown between repeated sync requests (default 2).
 - `IRIUM_P2P_GETBLOCKS_GRACE_SECS`: grace period before pushing blocks when a peer does not request them (default 8).
 - `IRIUM_P2P_FALLBACK_BLOCKS`: number of blocks to push per fallback burst (default 32, max 512).
-- `IRIUM_RUNTIME_SEED_DAYS`: minimum consecutive days before a peer is promoted into the runtime seedlist (default 7).
+- `IRIUM_RUNTIME_SEED_DAYS`: minimum consecutive days before a peer is promoted into the runtime seedlist (default 2).
 - `IRIUM_RUNTIME_SEED_MAX_IDLE_HOURS`: max idle hours for runtime seedlist promotion (default 24).
 - `IRIUM_BANNED_LIST` / `IRIUM_BANNED_TRUST`: optional signed banlist path and allowed signer file (default `bootstrap/banned_peers.txt` + `.sig`, `bootstrap/trust/allowed_ban_signers`).
 - `IRIUM_TLS_CERT` / `IRIUM_TLS_KEY`: PEM paths to enable HTTPS for the HTTP API (if unset, HTTP is used).
@@ -192,10 +196,10 @@ export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>   # or set IRIUM_MINER_PKH (40-h
 source ~/.cargo/env
 ./target/release/irium-miner
 ```
-- Mined blocks are auto-submitted to `IRIUM_NODE_RPC` (default http://127.0.0.1:38300).
+- Mined blocks are auto-submitted to `IRIUM_NODE_RPC` (default https://127.0.0.1:38300; one-shot fallback to http if https fails).
 - RPC auth tokens are user-defined. Example: `export IRIUM_RPC_TOKEN=$(openssl rand -hex 24)` and set the same value in `/etc/irium/iriumd.env` and `/etc/irium/miner.env`.
 - Control CPU usage with `--threads N` or `IRIUM_MINER_THREADS=N` (default 1).
-- If you run only the miner, point it at a reachable node RPC with `IRIUM_NODE_RPC=http://<node>:38300` (and `IRIUM_RPC_TOKEN` if required).
+- If you run only the miner, point it at a reachable node RPC with `IRIUM_NODE_RPC=https://<node>:38300` (it will retry once over http if https fails) and set `IRIUM_RPC_TOKEN` if required.
 - If the node is running HTTPS + `IRIUM_RPC_TOKEN`, set `IRIUM_NODE_RPC=https://127.0.0.1:38300` and export the same `IRIUM_RPC_TOKEN` for the miner.
 - If `IRIUM_RPC_TOKEN` is set to an empty value in env files, miners will still send an empty token and get 401; either remove the line or set a real token.
 - For HTTPS with a local self-signed cert, set `IRIUM_RPC_CA=/etc/irium/tls/irium-ca.crt` instead of `IRIUM_RPC_INSECURE=1` (which only works for localhost).
@@ -225,7 +229,7 @@ source ~/.cargo/env
 ./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm>
 ./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm> --coin-select largest
 ```
-- Wallet RPC defaults to `IRIUM_NODE_RPC` (or legacy `IRIUM_RPC_URL`), falling back to http://127.0.0.1:38300. If your node uses HTTPS, set `IRIUM_NODE_RPC=https://...` or pass `--rpc`.
+- Wallet RPC defaults to `IRIUM_NODE_RPC` (or legacy `IRIUM_RPC_URL`), otherwise https://127.0.0.1:38300. If HTTPS fails and the URL starts with `https://`, it retries once over `http://`.
 Use `irium-wallet address-to-pkh <base58_address>` to convert an address to its 20-byte pubkey hash.
 
 ### Wallet RPC (node-managed)

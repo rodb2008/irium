@@ -45,7 +45,7 @@ export IRIUM_MINER_ADDRESS=<NEW_ADDRESS>
 
 ### Backup Your Keys
 
-**CRITICAL: Save the printed private key.** The Rust wallet CLI does not store a wallet file for you.
+**CRITICAL: Back up your wallet.** The wallet CLI stores keys in `~/.irium/wallet.json` (override with `IRIUM_WALLET_FILE`) and may also print private key material on creation.
 
 ### Troubleshooting
 

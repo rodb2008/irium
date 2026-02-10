@@ -31,7 +31,7 @@ Save the printed private key. It controls the funds for that address.
 ## 4) Solo mining (recommended)
 ```bash
 export IRIUM_MINER_ADDRESS=<YOUR_IRIUM_ADDRESS>
-export IRIUM_NODE_RPC=http://127.0.0.1:38300
+export IRIUM_NODE_RPC=https://127.0.0.1:38300
 # If the node requires auth, export IRIUM_RPC_TOKEN too.
 ./target/release/irium-miner
 ```
