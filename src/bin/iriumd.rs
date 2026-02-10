@@ -2644,6 +2644,9 @@ async fn main() {
         let genesis_hex = genesis_hash.clone();
         tokio::spawn(async move {
             let seed_mgr = SeedlistManager::new(128);
+            let mut hb_ticks: u64 = 0;
+            let mut last_progress_height: u64 = 0;
+            let mut stalled_ticks: u32 = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let peers = node_clone.peers_snapshot().await;
@@ -2712,6 +2715,54 @@ async fn main() {
                 let next_height = local_height.saturating_add(1);
                 let peer_height = best_peer_height.unwrap_or(0);
                 let chain_height = std::cmp::max(local_height, peer_height);
+
+                hb_ticks = hb_ticks.wrapping_add(1);
+
+                // Periodic sync status line to diagnose stalls quickly.
+                if hb_ticks % 6 == 0 {
+                    let dbg = node_clone.sync_debug_snapshot().await;
+                    let ahead = peer_height.saturating_sub(local_height);
+                    println!(
+                        "[{}] [🔁 sync] status local={} best_peer={} ahead={} peers={} inflight(getheaders)={} inflight(getblocks)={} handshake_failures={}",
+                        Utc::now().format("%H:%M:%S"),
+                        local_height,
+                        peer_height,
+                        ahead,
+                        peer_ips.len(),
+                        dbg.sync_requests,
+                        dbg.getblocks_inflight,
+                        dbg.handshake_failures
+                    );
+                }
+
+                // If we're behind and not making progress for ~60s, clear throttles and try fresh peers.
+                if peer_height >= local_height.saturating_add(3) {
+                    if local_height == last_progress_height {
+                        stalled_ticks = stalled_ticks.saturating_add(1);
+                    } else {
+                        last_progress_height = local_height;
+                        stalled_ticks = 0;
+                    }
+
+                    if stalled_ticks >= 12 {
+                        println!(
+                            "[{}] [🔁 sync] WARN stalled (local={}, best_peer={}); clearing sync throttles and reconnecting",
+                            Utc::now().format("%H:%M:%S"),
+                            local_height,
+                            peer_height
+                        );
+                        node_clone.clear_sync_throttles().await;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            node_clone.connect_known_peers(5),
+                        )
+                        .await;
+                        stalled_ticks = 0;
+                    }
+                } else {
+                    last_progress_height = local_height;
+                    stalled_ticks = 0;
+                }
 
                 let peer_sample = peer_list
                     .iter()

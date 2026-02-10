@@ -250,6 +250,13 @@ impl Default for PeerSyncState {
         }
     }
 }
+#[derive(Debug, Clone)]
+pub struct SyncDebugSnapshot {
+    pub sync_requests: usize,
+    pub block_requests: usize,
+    pub handshake_failures: usize,
+    pub getblocks_inflight: usize,
+}
 
 async fn maybe_request_sync(
     writer: &Arc<Mutex<OwnedWriteHalf>>,
@@ -1039,6 +1046,28 @@ impl P2PNode {
                 }
             })
             .collect()
+    }
+
+    pub async fn sync_debug_snapshot(&self) -> SyncDebugSnapshot {
+        let sync_requests = self.sync_requests.lock().await.len();
+        let block_requests = self.block_requests.lock().await.len();
+        let handshake_failures = self.handshake_failures.lock().await.len();
+        let getblocks_inflight = self.getblocks_last.lock().await.len();
+        SyncDebugSnapshot {
+            sync_requests,
+            block_requests,
+            handshake_failures,
+            getblocks_inflight,
+        }
+    }
+
+    pub async fn clear_sync_throttles(&self) {
+        self.sync_requests.lock().await.clear();
+        self.block_requests.lock().await.clear();
+        self.getblocks_last.lock().await.clear();
+        self.getblocks_genesis.lock().await.clear();
+        // Allow fresh attempts against previously failing peers.
+        self.handshake_failures.lock().await.clear();
     }
 
     /// Request peer lists from all connected peers.
@@ -2139,6 +2168,40 @@ impl P2PNode {
                                     }
                                 }
 
+                                if header_count > 0 {
+                                    let last_short = last_header_hash
+                                        .map(|h| {
+                                            let hex = hex::encode(h);
+                                            hex.get(0..12).unwrap_or(&hex).to_string()
+                                        })
+                                        .unwrap_or_else(|| "-".to_string());
+                                    P2PNode::log_event(
+                                        "info",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: received {} headers (new={}) last={}",
+                                            addr, header_count, added_any, last_short
+                                        ),
+                                    );
+                                }
+
+                                if header_count > 0 {
+                                    let last_short = last_header_hash
+                                        .map(|h| {
+                                            let hex = hex::encode(h);
+                                            hex.get(0..12).unwrap_or(&hex).to_string()
+                                        })
+                                        .unwrap_or_else(|| "-".to_string());
+                                    P2PNode::log_event(
+                                        "info",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: received {} headers (new={}) last={}",
+                                            addr, header_count, added_any, last_short
+                                        ),
+                                    );
+                                }
+
                                 if header_error {
                                     if unknown_parent && !added_any {
                                         P2PNode::log_event(
@@ -2230,6 +2293,36 @@ impl P2PNode {
                                     }
                                 };
                                 if let Some((start_hash, count)) = request {
+                                    let short = if start_hash == [0u8; 32] {
+                                        "genesis".to_string()
+                                    } else {
+                                        let h = hex::encode(start_hash);
+                                        h.get(0..12).unwrap_or(&h).to_string()
+                                    };
+                                    P2PNode::log_event(
+                                        "info",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: requesting {} blocks from {}",
+                                            addr, count, short
+                                        ),
+                                    );
+
+                                    let short = if start_hash == [0u8; 32] {
+                                        "genesis".to_string()
+                                    } else {
+                                        let h = hex::encode(start_hash);
+                                        h.get(0..12).unwrap_or(&h).to_string()
+                                    };
+                                    P2PNode::log_event(
+                                        "info",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: requesting {} blocks from {}",
+                                            addr, count, short
+                                        ),
+                                    );
+
                                     let get_blocks = GetBlocksPayload {
                                         start_hash: start_hash.to_vec(),
                                         count,
