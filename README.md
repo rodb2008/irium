@@ -1,5 +1,7 @@
 # Irium Blockchain (Rust Mainnet)
 
+![Irium Logo](assets/irium-logo.png)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org)
 [![Network: Mainnet Only](https://img.shields.io/badge/network-mainnet--only-red.svg)](#run-the-rust-node)
@@ -11,6 +13,7 @@ Irium is a production‑only proof‑of‑work blockchain for the IRM asset. The
 - Design goal: mainnet‑first, DNS‑free bootstrap, light‑client friendly, optional relay rewards.
 
 ## Layout
+- `assets/` – logos/branding used by docs and API frontends.
 - `src/` – Rust sources (node, P2P, miner, SPV, wallet primitives).
 - `bootstrap/` – signed seedlist, anchors, trust roots.
 - `configs/` – genesis/consensus config.
