@@ -3204,14 +3204,14 @@ async fn handle_incoming_with_sybil(
         .and_then(|v| v.parse::<u8>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(20);
-    let banned = {
-        let rep = reputation.lock().await;
-        rep.banned_count() as u8
-    };
-    let bump = P2PNode::sybil_banned_bump(banned);
     let difficulty = if trusted_seed {
         base
     } else {
+        let banned = {
+            let rep = reputation.lock().await;
+            rep.banned_count() as u8
+        };
+        let bump = P2PNode::sybil_banned_bump(banned);
         std::cmp::min(max, base.saturating_add(bump))
     };
     let handshake = SybilResistantHandshake::new(difficulty);
