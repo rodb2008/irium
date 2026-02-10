@@ -1725,7 +1725,9 @@ impl P2PNode {
         let ping_sync_requests = self.sync_requests.clone();
         let ping_block_requests = self.block_requests.clone();
         tokio::spawn(async move {
-            let interval = P2PNode::ping_interval();
+            let ping_interval = P2PNode::ping_interval();
+            let sync_tick = sync_tick_interval();
+            let mut last_ping = Instant::now();
             let mut last_height = crate::p2p::local_height(&ping_chain);
             let mut last_handshake = Instant::now();
             let mut stalled_heartbeats: u32 = 0;
@@ -1733,17 +1735,20 @@ impl P2PNode {
             let mut recovery_in_progress = false;
             let mut recovery_start_height = last_progress_height;
             loop {
-                tokio::time::sleep(interval).await;
-                let nonce = rand_core::OsRng.next_u64();
-                let ping = PingPayload { nonce };
-                let msg = ping.to_message();
-                if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
-                    P2PNode::log_event(
-                        "warn",
-                        "net",
-                        format!("P2P {}: ping failed: {}", ping_addr, e),
-                    );
-                    break;
+                tokio::time::sleep(sync_tick).await;
+                if last_ping.elapsed() >= ping_interval {
+                    let nonce = rand_core::OsRng.next_u64();
+                    let ping = PingPayload { nonce };
+                    let msg = ping.to_message();
+                    if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
+                        P2PNode::log_event(
+                            "warn",
+                            "net",
+                            format!("P2P {}: ping failed: {}", ping_addr, e),
+                        );
+                        break;
+                    }
+                    last_ping = Instant::now();
                 }
                 let current_height = crate::p2p::local_height(&ping_chain);
                 let handshake_due = last_handshake.elapsed() >= P2PNode::handshake_interval();
@@ -2600,21 +2605,6 @@ impl P2PNode {
                                         ),
                                     );
 
-                                    let short = if start_hash == [0u8; 32] {
-                                        "genesis".to_string()
-                                    } else {
-                                        let h = hex::encode(start_hash);
-                                        h.get(0..12).unwrap_or(&h).to_string()
-                                    };
-                                    P2PNode::log_event(
-                                        "info",
-                                        "sync",
-                                        format!(
-                                            "P2P {}: requesting {} blocks from {}",
-                                            addr, count, short
-                                        ),
-                                    );
-
                                     let get_blocks = GetBlocksPayload {
                                         start_hash: start_hash.to_vec(),
                                         count,
@@ -3105,6 +3095,14 @@ impl P2PNode {
     }
 }
 
+fn sync_tick_interval() -> Duration {
+    let secs = std::env::var("IRIUM_P2P_SYNC_TICK_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5);
+    Duration::from_secs(secs.clamp(1, 30))
+}
+
 /// Read a single protocol message from the given TCP stream.
 async fn read_message<R>(stream: &mut R) -> Result<Message, String>
 where
@@ -3283,21 +3281,26 @@ async fn handle_incoming_with_sybil(
     let ping_sync_requests = sync_requests.clone();
     let ping_block_requests = block_requests.clone();
     tokio::spawn(async move {
-        let interval = P2PNode::ping_interval();
+        let ping_interval = P2PNode::ping_interval();
+        let sync_tick = sync_tick_interval();
+        let mut last_ping = Instant::now();
         let mut last_height = crate::p2p::local_height(&ping_chain);
         let mut last_handshake = Instant::now();
         loop {
-            tokio::time::sleep(interval).await;
-            let nonce = rand_core::OsRng.next_u64();
-            let ping = PingPayload { nonce };
-            let msg = ping.to_message();
-            if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
-                P2PNode::log_event(
-                    "warn",
-                    "net",
-                    format!("P2P {}: ping failed: {}", ping_addr, e),
-                );
-                break;
+            tokio::time::sleep(sync_tick).await;
+            if last_ping.elapsed() >= ping_interval {
+                let nonce = rand_core::OsRng.next_u64();
+                let ping = PingPayload { nonce };
+                let msg = ping.to_message();
+                if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
+                    P2PNode::log_event(
+                        "warn",
+                        "net",
+                        format!("P2P {}: ping failed: {}", ping_addr, e),
+                    );
+                    break;
+                }
+                last_ping = Instant::now();
             }
             let current_height = crate::p2p::local_height(&ping_chain);
             let handshake_due = last_handshake.elapsed() >= P2PNode::handshake_interval();
