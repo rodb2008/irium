@@ -8,22 +8,24 @@ use std::{env, fs};
 
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Json as AxumJson, Query, State},
-    http::{header::{AUTHORIZATION, CONTENT_TYPE}, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode,
+    },
     routing::{get, post},
     Json, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
-use tower_http::cors::{Any, CorsLayer};
 use chrono::Utc;
+use hex;
+use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use hex;
-use num_traits::ToPrimitive;
+use tower_http::cors::{Any, CorsLayer};
 
 use bs58;
-use k256::ecdsa::signature::hazmat::PrehashSigner;
-use k256::ecdsa::{Signature, SigningKey};
+use get_if_addrs::get_if_addrs;
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
 use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, OutPoint};
@@ -34,11 +36,12 @@ use irium_node_rs::network::SeedlistManager;
 use irium_node_rs::p2p::P2PNode;
 use irium_node_rs::pow::{sha256d, Target};
 use irium_node_rs::rate_limiter::RateLimiter;
-use irium_node_rs::storage;
 use irium_node_rs::reputation::ReputationManager;
+use irium_node_rs::storage;
 use irium_node_rs::tx::{decode_full_tx, Transaction, TxInput, TxOutput};
 use irium_node_rs::wallet_store::{WalletKey, WalletManager};
-use get_if_addrs::get_if_addrs;
+use k256::ecdsa::signature::hazmat::PrehashSigner;
+use k256::ecdsa::{Signature, SigningKey};
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
 
@@ -637,9 +640,7 @@ fn parse_irm(s: &str) -> Result<u64, String> {
     } else {
         0
     };
-    Ok(whole
-        .saturating_mul(100_000_000)
-        .saturating_add(frac))
+    Ok(whole.saturating_mul(100_000_000).saturating_add(frac))
 }
 
 fn estimate_tx_size(inputs: usize, outputs: usize) -> u64 {
@@ -680,7 +681,6 @@ fn miner_address_from_tx(tx: &Transaction) -> Option<String> {
 fn miner_address_from_block(block: &Block) -> Option<String> {
     block.transactions.first().and_then(miner_address_from_tx)
 }
-
 
 fn p2pkh_hash_from_script(script: &[u8]) -> Option<[u8; 20]> {
     if script.len() != 25 {
@@ -751,12 +751,7 @@ fn quarantine_blocks_above_dir(dir: &std::path::Path, height: u64) {
     }
 }
 
-
-fn load_persisted_blocks_from(
-    state: &mut ChainState,
-    dir: &std::path::Path,
-    skip_below_tip: bool,
-) {
+fn load_persisted_blocks_from(state: &mut ChainState, dir: &std::path::Path, skip_below_tip: bool) {
     if !dir.exists() {
         return;
     }
@@ -786,6 +781,9 @@ fn load_persisted_blocks_from(
     entries.sort_by_key(|(h, _)| *h);
 
     for (h, path) in entries {
+        if h == 0 {
+            continue;
+        }
         match std::fs::read_to_string(&path) {
             Ok(data) => {
                 let parsed: serde_json::Value = match serde_json::from_str(&data) {
@@ -817,11 +815,20 @@ fn load_persisted_blocks_from(
                     Some(v) => v,
                     None => continue,
                 };
-                let version = header_obj.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                let version = header_obj
+                    .get("version")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as u32;
                 let time = header_obj.get("time").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let bits_str = header_obj.get("bits").and_then(|v| v.as_str()).unwrap_or("1d00ffff");
+                let bits_str = header_obj
+                    .get("bits")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("1d00ffff");
                 let bits = u32::from_str_radix(bits_str, 16).unwrap_or(0x1d00_ffff);
-                let nonce = header_obj.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let nonce = header_obj
+                    .get("nonce")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
 
                 let txs: Vec<Transaction> = match parsed.get("tx_hex").and_then(|v| v.as_array()) {
                     Some(arr) => {
@@ -831,7 +838,11 @@ fn load_persisted_blocks_from(
                                 if let Ok(bytes) = hex::decode(s) {
                                     match decode_compact_tx(&bytes) {
                                         Ok(tx) => out.push(tx),
-                                        Err(e) => eprintln!("[⚠️] Failed to decode tx in {}: {}", path.display(), e),
+                                        Err(e) => eprintln!(
+                                            "[⚠️] Failed to decode tx in {}: {}",
+                                            path.display(),
+                                            e
+                                        ),
                                     }
                                 }
                             }
@@ -876,16 +887,114 @@ fn load_persisted_blocks(state: &mut ChainState) {
     }
 
     if state.height > 1 {
-        println!("[↩️] Resumed node height {} from persisted blocks", state.height);
+        println!(
+            "[↩️] Resumed node height {} from persisted blocks",
+            state.height
+        );
     }
+}
+
+fn dir_is_empty(path: &std::path::Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut rd) => rd.next().is_none(),
+        Err(_) => true,
+    }
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ty.is_file() {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Do not overwrite any existing new-state files.
+            if !to.exists() {
+                let _ = std::fs::copy(&from, &to);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn migrate_legacy_repo_state_dir(state_dir: &std::path::Path) {
+    if !dir_is_empty(state_dir) {
+        return;
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(root) = env::var("IRIUM_REPO_ROOT") {
+        candidates.push(PathBuf::from(root).join("state"));
+    }
+    candidates.push(PathBuf::from("state"));
+
+    for legacy in candidates {
+        if legacy.exists() && legacy.is_dir() {
+            if let Err(e) = copy_dir_recursive(&legacy, state_dir) {
+                eprintln!(
+                    "[warn] Legacy state migration failed from {}: {}",
+                    legacy.display(),
+                    e
+                );
+            } else {
+                println!(
+                    "[i] Migrated legacy state from {} -> {}",
+                    legacy.display(),
+                    state_dir.display()
+                );
+            }
+            break;
+        }
+    }
+}
+
+fn reinit_state_dir(state_dir: &PathBuf, reason: &str) {
+    let ts = Utc::now().timestamp();
+    if state_dir.exists() && !dir_is_empty(state_dir) {
+        let backup = state_dir
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(format!("state.bad.{ts}"));
+        if let Err(e) = fs::rename(state_dir, &backup) {
+            eprintln!(
+                "[warn] Failed to rename state dir {} -> {}: {}",
+                state_dir.display(),
+                backup.display(),
+                e
+            );
+        } else {
+            println!(
+                "[i] State dir reinitialized ({}) -> {}",
+                reason,
+                backup.display()
+            );
+        }
+    }
+    let _ = fs::create_dir_all(state_dir);
 }
 
 fn mempool_file() -> PathBuf {
     if let Ok(path) = env::var("IRIUM_MEMPOOL_FILE") {
         PathBuf::from(path)
     } else {
-        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        PathBuf::from(home).join(".irium/mempool/pending.json")
+        let path = storage::state_dir().join("mempool/pending.json");
+        if !path.exists() {
+            let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
+            let legacy = PathBuf::from(home).join(".irium/mempool/pending.json");
+            if legacy.exists() {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::copy(&legacy, &path);
+            }
+        }
+        path
     }
 }
 
@@ -998,7 +1107,13 @@ async fn network_hashrate(
                 } else {
                     let avg_time = (elapsed as f64) / (blocks as f64);
                     let hashrate = difficulty * 4294967296.0 / avg_time;
-                    (tip_height, difficulty, Some(hashrate), Some(avg_time), blocks)
+                    (
+                        tip_height,
+                        difficulty,
+                        Some(hashrate),
+                        Some(avg_time),
+                        blocks,
+                    )
                 }
             }
         }
@@ -1013,7 +1128,6 @@ async fn network_hashrate(
         sample_blocks,
     }))
 }
-
 
 async fn status(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -1208,7 +1322,6 @@ async fn get_balance(
     }))
 }
 
-
 async fn get_utxos(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -1250,7 +1363,6 @@ async fn get_utxos(
         utxos,
     }))
 }
-
 
 async fn get_history(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -1703,7 +1815,9 @@ async fn wallet_send(
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap();
-        chain.calculate_fees(&tx).map_err(|_| StatusCode::BAD_REQUEST)?
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| StatusCode::BAD_REQUEST)?
     };
 
     let raw = tx.serialize();
@@ -2206,21 +2320,87 @@ async fn submit_tx(
 
 #[tokio::main]
 async fn main() {
+    let (blocks_dir, state_dir) = storage::ensure_runtime_dirs().unwrap_or_else(|e| {
+        eprintln!("Failed to init runtime dirs: {e}");
+        std::process::exit(1);
+    });
+    migrate_legacy_repo_state_dir(&state_dir);
+    println!("Using blocks dir: {}", blocks_dir.display());
+    println!("Using state dir: {}", state_dir.display());
+    println!(
+        "To resync, delete ONLY state dir: {} (keep blocks dir: {})",
+        state_dir.display(),
+        blocks_dir.display()
+    );
     // Initialize chain state with locked genesis.
     let locked = load_locked_genesis().expect("load locked genesis");
-    let block = block_from_locked(&locked);
+    let genesis_hash = locked.header.hash.clone();
+    let genesis_hash_lc = genesis_hash.to_lowercase();
+    let genesis_block = block_from_locked(&locked);
+
+    // Ensure genesis (block 0) exists and matches the locked genesis.
+    // If a persisted genesis is corrupt/mismatched, quarantine it and reset volatile state.
+    let mut load_persisted = true;
+    let block0_path = blocks_dir.join("block_0.json");
+    if block0_path.exists() {
+        let mut bad = false;
+        match fs::read_to_string(&block0_path) {
+            Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+                Ok(v) => {
+                    let file_hash = v
+                        .get("header")
+                        .and_then(|h| h.get("hash"))
+                        .and_then(|h| h.as_str())
+                        .unwrap_or("");
+                    if file_hash.to_lowercase() != genesis_hash_lc {
+                        bad = true;
+                    }
+                }
+                Err(_) => bad = true,
+            },
+            Err(_) => bad = true,
+        }
+        if bad {
+            eprintln!(
+                "[error] Genesis block file (block_0.json) is corrupt or mismatched at {}",
+                block0_path.display()
+            );
+            let ts = Utc::now().timestamp();
+            let quarantine = blocks_dir.join(format!("block_0.bad.{ts}.json"));
+            let _ = fs::rename(&block0_path, &quarantine);
+            eprintln!(
+                "[error] Quarantined bad genesis to {}. Reinitializing state dir and resyncing headers from genesis.",
+                quarantine.display()
+            );
+            reinit_state_dir(&state_dir, "genesis mismatch");
+            load_persisted = false;
+        }
+    }
+    if !block0_path.exists() {
+        if let Err(e) = storage::write_block_json(0, &genesis_block) {
+            eprintln!(
+                "[warn] Failed to write genesis block_0.json to {}: {}",
+                block0_path.display(),
+                e
+            );
+        }
+    }
+
     let pow_limit = Target { bits: 0x1d00_ffff };
     let params = ChainParams {
-        genesis_block: block,
+        genesis_block: genesis_block.clone(),
         pow_limit,
     };
     let mut state = ChainState::new(params);
-    load_persisted_blocks(&mut state);
+    if load_persisted {
+        load_persisted_blocks(&mut state);
+    }
     let shared_state = Arc::new(Mutex::new(state));
-    let genesis_hash = locked.header.hash.clone();
     let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));
     let limiter = Arc::new(Mutex::new(rate_limiter()));
-    let wallet = Arc::new(Mutex::new(WalletManager::new(WalletManager::default_path())));
+    let wallet = Arc::new(Mutex::new(
+        WalletManager::new(WalletManager::default_path()),
+    ));
 
     // Attempt to load anchors from the repo root if present. On mainnet,
     // the anchors file is shipped and verified out-of-band.
@@ -2335,8 +2515,10 @@ async fn main() {
             let node = node;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             let mut no_seed_logged = false;
+
             loop {
-                let (seeds, seed_info) = build_seed_addrs(&config_seeds, &signed_seeds, default_seed_port, &local_ips);
+                let (seeds, seed_info) =
+                    build_seed_addrs(&config_seeds, &signed_seeds, default_seed_port, &local_ips);
                 if seeds.is_empty() {
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(2),
@@ -2358,7 +2540,20 @@ async fn main() {
                     continue;
                 }
                 no_seed_logged = false;
+
+                // Dedup seeds to avoid churn when the seed list contains duplicates.
+                let mut seeds_seen: std::collections::HashSet<std::net::SocketAddr> =
+                    std::collections::HashSet::new();
+                let mut seeds_ip_seen: std::collections::HashSet<std::net::IpAddr> =
+                    std::collections::HashSet::new();
+
                 for addr in &seeds {
+                    if !seeds_seen.insert(*addr) {
+                        continue;
+                    }
+                    if !seeds_ip_seen.insert(addr.ip()) {
+                        continue;
+                    }
                     if node.is_connected(addr).await {
                         continue;
                     }
@@ -2368,6 +2563,11 @@ async fn main() {
                     if node.is_ip_connected(addr.ip()).await {
                         continue;
                     }
+
+                    if !node.outbound_dial_allowed(addr).await {
+                        continue;
+                    }
+
                     let height = {
                         let chain = shared_clone.lock().unwrap();
                         chain.tip_height()
@@ -2382,11 +2582,15 @@ async fn main() {
                         .connect_and_handshake(*addr, height, &agent_clone)
                         .await
                     {
+                        let msg = format!("{}", e);
+                        if msg.contains("dial backoff") || msg.contains("dial in progress") {
+                            continue;
+                        }
                         eprintln!(
                             "[{}] outbound {} failed: {}",
                             Utc::now().format("%H:%M:%S"),
                             addr,
-                            e
+                            msg
                         );
                     }
                 }
@@ -2403,11 +2607,18 @@ async fn main() {
         let genesis_hex = genesis_hash.clone();
         tokio::spawn(async move {
             let seed_mgr = SeedlistManager::new(128);
+            let mut hb_ticks: u64 = 0;
+            let mut last_progress_height: u64 = 0;
+            let mut stalled_ticks: u32 = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let peers = node_clone.peers_snapshot().await;
                 node_clone.refresh_seedlist().await;
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), node_clone.connect_known_peers(3)).await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    node_clone.connect_known_peers(3),
+                )
+                .await;
                 let seeds = seed_mgr.merged_seedlist();
 
                 let mut peer_ips = std::collections::HashSet::new();
@@ -2421,8 +2632,8 @@ async fn main() {
                             peer_list.push(label);
                         }
                     } else if peer_ips.insert(p.multiaddr.clone()) {
-                            let label = p.agent.clone().unwrap_or_else(|| "peer".to_string());
-                            peer_list.push(label);
+                        let label = p.agent.clone().unwrap_or_else(|| "peer".to_string());
+                        peer_list.push(label);
                     }
                 }
                 if peer_list.is_empty() {
@@ -2468,6 +2679,54 @@ async fn main() {
                 let peer_height = best_peer_height.unwrap_or(0);
                 let chain_height = std::cmp::max(local_height, peer_height);
 
+                hb_ticks = hb_ticks.wrapping_add(1);
+
+                // Periodic sync status line to diagnose stalls quickly.
+                if hb_ticks % 6 == 0 {
+                    let dbg = node_clone.sync_debug_snapshot().await;
+                    let ahead = peer_height.saturating_sub(local_height);
+                    println!(
+                        "[{}] [🔁 sync] status local={} best_peer={} ahead={} peers={} inflight(getheaders)={} inflight(getblocks)={} handshake_failures={}",
+                        Utc::now().format("%H:%M:%S"),
+                        local_height,
+                        peer_height,
+                        ahead,
+                        peer_ips.len(),
+                        dbg.sync_requests,
+                        dbg.getblocks_inflight,
+                        dbg.handshake_failures
+                    );
+                }
+
+                // If we're behind and not making progress for ~60s, clear throttles and try fresh peers.
+                if peer_height >= local_height.saturating_add(3) {
+                    if local_height == last_progress_height {
+                        stalled_ticks = stalled_ticks.saturating_add(1);
+                    } else {
+                        last_progress_height = local_height;
+                        stalled_ticks = 0;
+                    }
+
+                    if stalled_ticks >= 12 {
+                        println!(
+                            "[{}] [🔁 sync] WARN stalled (local={}, best_peer={}); clearing sync throttles and reconnecting",
+                            Utc::now().format("%H:%M:%S"),
+                            local_height,
+                            peer_height
+                        );
+                        node_clone.clear_sync_throttles().await;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            node_clone.connect_known_peers(5),
+                        )
+                        .await;
+                        stalled_ticks = 0;
+                    }
+                } else {
+                    last_progress_height = local_height;
+                    stalled_ticks = 0;
+                }
+
                 let peer_sample = peer_list
                     .iter()
                     .take(5)
@@ -2510,7 +2769,6 @@ async fn main() {
                         mempool_size
                     );
                 }
-
             }
         });
     }
@@ -2579,7 +2837,10 @@ async fn main() {
                 json!({"ts": Utc::now().format("%H:%M:%S").to_string(), "level": "info", "event": "http_listen", "host": host, "port": port, "scheme": "https"})
             );
         } else {
-            println!("Irium Rust node HTTPS listening on https://{}:{}", host, port);
+            println!(
+                "Irium Rust node HTTPS listening on https://{}:{}",
+                host, port
+            );
         }
         axum_server::bind_rustls(addr, config)
             .serve(app)

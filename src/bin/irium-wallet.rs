@@ -146,7 +146,8 @@ fn save_wallet(path: &Path, wallet: &WalletFile) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create wallet dir: {e}"))?;
     }
-    let data = serde_json::to_string_pretty(wallet).map_err(|e| format!("serialize wallet: {e}"))?;
+    let data =
+        serde_json::to_string_pretty(wallet).map_err(|e| format!("serialize wallet: {e}"))?;
     fs::write(path, data).map_err(|e| format!("write wallet: {e}"))?;
     #[cfg(unix)]
     {
@@ -200,10 +201,14 @@ fn usage() {
     eprintln!("  irium-wallet send <from_addr> <to_addr> <amount_irm> [--fee <irm>] [--coin-select smallest|largest] [--rpc <url>]");
 }
 
+fn node_rpc_base() -> String {
+    env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string())
+}
+
 fn default_rpc_url() -> String {
     env::var("IRIUM_NODE_RPC")
         .or_else(|_| env::var("IRIUM_RPC_URL"))
-        .unwrap_or_else(|_| "http://127.0.0.1:38300".to_string())
+        .unwrap_or_else(|_| node_rpc_base())
 }
 
 fn color_enabled() -> bool {
@@ -242,9 +247,7 @@ fn parse_irm(s: &str) -> Result<u64, String> {
     } else {
         0
     };
-    Ok(whole
-        .saturating_mul(100_000_000)
-        .saturating_add(frac))
+    Ok(whole.saturating_mul(100_000_000).saturating_add(frac))
 }
 
 fn estimate_tx_size(inputs: usize, outputs: usize) -> u64 {
@@ -253,6 +256,35 @@ fn estimate_tx_size(inputs: usize, outputs: usize) -> u64 {
 
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn https_to_http(base: &str) -> Option<String> {
+    if let Some(rest) = base.strip_prefix("https://") {
+        Some(format!("http://{}", rest))
+    } else {
+        None
+    }
+}
+
+fn send_with_https_fallback<F>(
+    base: &str,
+    f: F,
+) -> Result<reqwest::blocking::Response, reqwest::Error>
+where
+    F: Fn(&str) -> Result<reqwest::blocking::Response, reqwest::Error>,
+{
+    match f(base) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if let Some(http) = https_to_http(base) {
+                eprintln!("HTTPS RPC failed, retrying over HTTP: {}", http);
+                if let Ok(v) = f(&http) {
+                    return Ok(v);
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 fn rpc_client(base: &str) -> Result<Client, String> {
@@ -267,8 +299,8 @@ fn rpc_client(base: &str) -> Result<Client, String> {
     });
     if let Some(path) = ca_path {
         let pem = fs::read(&path).map_err(|e| format!("read CA {path}: {e}"))?;
-        let cert = reqwest::Certificate::from_pem(&pem)
-            .map_err(|e| format!("invalid CA {path}: {e}"))?;
+        let cert =
+            reqwest::Certificate::from_pem(&pem).map_err(|e| format!("invalid CA {path}: {e}"))?;
         builder = builder.add_root_certificate(cert);
     }
     let insecure = env::var("IRIUM_RPC_INSECURE")
@@ -279,12 +311,13 @@ fn rpc_client(base: &str) -> Result<Client, String> {
         })
         .unwrap_or(false);
     if insecure {
-        let url = reqwest::Url::parse(base)
-            .map_err(|e| format!("invalid RPC URL {base}: {e}"))?;
+        let url = reqwest::Url::parse(base).map_err(|e| format!("invalid RPC URL {base}: {e}"))?;
         if url.scheme() != "https" {
             eprintln!("[warn] IRIUM_RPC_INSECURE=1 has no effect on non-HTTPS RPC URL");
         } else {
-            let host = url.host_str().ok_or_else(|| "RPC URL missing host".to_string())?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| "RPC URL missing host".to_string())?;
             if !is_loopback_host(host) {
                 return Err(format!(
                     "Refusing to disable TLS verification for non-local RPC host {host}; set IRIUM_RPC_CA instead"
@@ -333,12 +366,16 @@ fn hex_to_32(s: &str) -> Result<[u8; 32], String> {
 }
 
 fn fetch_balance(client: &Client, base: &str, addr: &str) -> Result<BalanceResponse, String> {
-    let url = format!("{}/rpc/balance?address={}", base, addr);
-    let mut req = client.get(&url);
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().map_err(|e| format!("balance request failed: {e}"))?;
+    let resp = send_with_https_fallback(base, |b| {
+        let url = format!("{}/rpc/balance?address={}", b, addr);
+        let mut req = client.get(&url);
+        if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    })
+    .map_err(|e| format!("balance request failed: {e}"))?;
+
     if !resp.status().is_success() {
         return Err(format!("balance request failed: {}", resp.status()));
     }
@@ -347,12 +384,16 @@ fn fetch_balance(client: &Client, base: &str, addr: &str) -> Result<BalanceRespo
 }
 
 fn fetch_utxos(client: &Client, base: &str, addr: &str) -> Result<UtxosResponse, String> {
-    let url = format!("{}/rpc/utxos?address={}", base, addr);
-    let mut req = client.get(&url);
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().map_err(|e| format!("utxos request failed: {e}"))?;
+    let resp = send_with_https_fallback(base, |b| {
+        let url = format!("{}/rpc/utxos?address={}", b, addr);
+        let mut req = client.get(&url);
+        if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    })
+    .map_err(|e| format!("utxos request failed: {e}"))?;
+
     if !resp.status().is_success() {
         return Err(format!("utxos request failed: {}", resp.status()));
     }
@@ -360,14 +401,17 @@ fn fetch_utxos(client: &Client, base: &str, addr: &str) -> Result<UtxosResponse,
         .map_err(|e| format!("parse utxos response: {e}"))
 }
 
-
 fn fetch_history(client: &Client, base: &str, addr: &str) -> Result<HistoryResponse, String> {
-    let url = format!("{}/rpc/history?address={}", base, addr);
-    let mut req = client.get(&url);
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().map_err(|e| format!("history request failed: {e}"))?;
+    let resp = send_with_https_fallback(base, |b| {
+        let url = format!("{}/rpc/history?address={}", b, addr);
+        let mut req = client.get(&url);
+        if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    })
+    .map_err(|e| format!("history request failed: {e}"))?;
+
     if !resp.status().is_success() {
         return Err(format!("history request failed: {}", resp.status()));
     }
@@ -376,12 +420,16 @@ fn fetch_history(client: &Client, base: &str, addr: &str) -> Result<HistoryRespo
 }
 
 fn fetch_fee_estimate(client: &Client, base: &str) -> Result<FeeEstimateResponse, String> {
-    let url = format!("{}/rpc/fee_estimate", base);
-    let mut req = client.get(&url);
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().map_err(|e| format!("fee estimate failed: {e}"))?;
+    let resp = send_with_https_fallback(base, |b| {
+        let url = format!("{}/rpc/fee_estimate", b);
+        let mut req = client.get(&url);
+        if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    })
+    .map_err(|e| format!("fee estimate failed: {e}"))?;
+
     if !resp.status().is_success() {
         return Err(format!("fee estimate failed: {}", resp.status()));
     }
@@ -394,12 +442,17 @@ fn submit_tx(client: &Client, base: &str, tx: &Transaction) -> Result<(), String
     let req_body = SubmitTxRequest {
         tx_hex: hex::encode(raw),
     };
-    let url = format!("{}/rpc/submit_tx", base);
-    let mut req = client.post(&url).json(&req_body);
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().map_err(|e| format!("submit tx failed: {e}"))?;
+
+    let resp = send_with_https_fallback(base, |b| {
+        let url = format!("{}/rpc/submit_tx", b);
+        let mut req = client.post(&url).json(&req_body);
+        if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    })
+    .map_err(|e| format!("submit tx failed: {e}"))?;
+
     if !resp.status().is_success() {
         return Err(format!("submit tx failed: {}", resp.status()));
     }
@@ -617,11 +670,7 @@ fn main() {
                 let val = format_irm(utxo.value);
                 println!(
                     "{}:{} {} IRM height {} coinbase {}",
-                    utxo.txid,
-                    utxo.index,
-                    val,
-                    utxo.height,
-                    utxo.is_coinbase
+                    utxo.txid, utxo.index, val, utxo.height, utxo.is_coinbase
                 );
             }
         }
@@ -670,12 +719,7 @@ fn main() {
                 };
                 println!(
                     "{} height {} net {} recv {} spent {} coinbase {}",
-                    item.txid,
-                    item.height,
-                    net,
-                    received,
-                    spent,
-                    item.is_coinbase
+                    item.txid, item.height, net, received, spent, item.is_coinbase
                 );
             }
         }
@@ -708,8 +752,7 @@ fn main() {
             };
             println!(
                 "min_fee_per_byte {} mempool_size {}",
-                payload.min_fee_per_byte,
-                payload.mempool_size
+                payload.min_fee_per_byte, payload.mempool_size
             );
         }
         "send" => {
@@ -726,7 +769,8 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            if base58_p2pkh_to_hash(from_addr).is_none() || base58_p2pkh_to_hash(to_addr).is_none() {
+            if base58_p2pkh_to_hash(from_addr).is_none() || base58_p2pkh_to_hash(to_addr).is_none()
+            {
                 eprintln!("Invalid address or checksum");
                 std::process::exit(1);
             }

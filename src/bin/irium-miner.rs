@@ -513,7 +513,7 @@ fn rpc_client() -> Result<Client, String> {
 }
 
 fn node_rpc_base() -> String {
-    env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "http://127.0.0.1:38300".to_string())
+    env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string())
 }
 
 static RPC_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
@@ -570,6 +570,24 @@ fn is_tls_mismatch(err: &str) -> bool {
     lower.contains("invalid http version")
 }
 
+fn should_downgrade_https(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("error trying to connect")
+        || lower.contains("connection refused")
+        || lower.contains("timed out")
+        || lower.contains("tcp connect")
+        || lower.contains("dns")
+        || lower.contains("no such host")
+        || lower.contains("network unreachable")
+        || lower.contains("failed to lookup address")
+        || lower.contains("connection error")
+        || lower.contains("tls")
+        || lower.contains("handshake")
+        || lower.contains("certificate")
+        || lower.contains("wrong version number")
+        || lower.contains("unexpected eof")
+}
+
 fn with_rpc_base<T, F>(f: F) -> Result<T, String>
 where
     F: Fn(&str) -> Result<T, String>,
@@ -578,6 +596,13 @@ where
     match f(&base) {
         Ok(v) => Ok(v),
         Err(e) => {
+            if base.starts_with("https://") && should_downgrade_https(&e) {
+                let http = base.replacen("https://", "http://", 1);
+                eprintln!("HTTPS RPC failed, retrying over HTTP: {}", http);
+                if let Ok(v) = f(&http) {
+                    return Ok(v);
+                }
+            }
             if base.starts_with("http://") && is_tls_mismatch(&e) {
                 let https = base.replacen("http://", "https://", 1);
                 if let Ok(v) = f(&https) {
@@ -590,6 +615,7 @@ where
         }
     }
 }
+
 
 fn submit_block_to_node(height: u64, block: &Block) -> Result<(), String> {
     let header = &block.header;

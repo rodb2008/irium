@@ -72,6 +72,23 @@ pub fn blocks_dir() -> PathBuf {
     }
 }
 
+pub fn state_dir() -> PathBuf {
+    if let Ok(dir) = env::var("IRIUM_STATE_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        PathBuf::from(home).join(".irium/state")
+    }
+}
+
+pub fn ensure_runtime_dirs() -> std::io::Result<(PathBuf, PathBuf)> {
+    let blocks = blocks_dir();
+    fs::create_dir_all(&blocks)?;
+    let state = state_dir();
+    fs::create_dir_all(&state)?;
+    Ok((blocks, state))
+}
+
 pub fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
     let dir = blocks_dir();
     fs::create_dir_all(&dir)?;
