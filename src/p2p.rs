@@ -100,6 +100,17 @@ fn inbound_banned_log_cooldown_secs() -> u64 {
     })
 }
 
+fn trusted_seed_inbound_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_TRUSTED_SEED_INBOUND_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(60))
+            .unwrap_or(10)
+    })
+}
+
 async fn sync_request_allowed_for(
     sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
     ip: IpAddr,
@@ -1063,9 +1074,19 @@ impl P2PNode {
                             }
                         }
                         let mut log_guard = accept_log.lock().await;
+                        let cooldown = if trusted {
+                            Duration::from_secs(trusted_seed_inbound_cooldown_secs())
+                        } else {
+                            Duration::from_millis(500)
+                        };
                         if let Some(last) = log_guard.get(&ip) {
-                            if last.elapsed() < Duration::from_millis(500) {
-                                Self::log_err(format!("Rejecting inbound {}: rate limit", addr));
+                            if last.elapsed() < cooldown {
+                                if !trusted {
+                                    Self::log_err(format!(
+                                        "Rejecting inbound {}: rate limit",
+                                        addr
+                                    ));
+                                }
                                 continue;
                             }
                         }
