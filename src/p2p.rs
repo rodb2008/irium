@@ -65,6 +65,30 @@ fn sync_cooldown_for(local_height: u64, peer_height: u64) -> Duration {
     Duration::from_secs(secs.max(1).min(300))
 }
 
+fn outbound_dial_base_secs() -> u64 {
+    std::env::var("IRIUM_SEED_DIAL_BASE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2)
+        .clamp(1, 30)
+}
+
+fn outbound_dial_max_secs() -> u64 {
+    std::env::var("IRIUM_SEED_DIAL_MAX_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300)
+        .clamp(30, 3600)
+}
+
+fn outbound_dial_banned_secs() -> u64 {
+    std::env::var("IRIUM_SEED_DIAL_BANNED_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(600)
+        .clamp(60, 7200)
+}
+
 async fn sync_request_allowed_for(
     sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
     ip: IpAddr,
@@ -250,7 +274,22 @@ impl Default for PeerSyncState {
         }
     }
 }
-#[derive(Debug, Clone)]
+
+struct OutboundDialGuard {
+    ip: IpAddr,
+    inflight: Arc<StdMutex<HashSet<IpAddr>>>,
+}
+
+impl Drop for OutboundDialGuard {
+    fn drop(&mut self) {
+        let mut guard = match self.inflight.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.remove(&self.ip);
+    }
+}
+
 pub struct SyncDebugSnapshot {
     pub sync_requests: usize,
     pub block_requests: usize,
@@ -634,6 +673,8 @@ pub struct P2PNode {
     getblocks_last: Arc<Mutex<HashMap<IpAddr, (Vec<u8>, u32, Instant)>>>,
     getblocks_genesis: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     handshake_failures: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
+    outbound_dial_inflight: Arc<StdMutex<HashSet<IpAddr>>>,
+    outbound_dial_backoff: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     dynamic_bans: Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
@@ -876,6 +917,8 @@ impl P2PNode {
             getblocks_last: Arc::new(Mutex::new(HashMap::new())),
             getblocks_genesis: Arc::new(Mutex::new(HashMap::new())),
             handshake_failures: Arc::new(Mutex::new(HashMap::new())),
+            outbound_dial_inflight: Arc::new(StdMutex::new(HashSet::new())),
+            outbound_dial_backoff: Arc::new(Mutex::new(HashMap::new())),
             self_ips: Arc::new(Mutex::new(HashSet::new())),
             dynamic_bans: Arc::new(StdMutex::new(HashMap::new())),
             chain,
@@ -1113,6 +1156,81 @@ impl P2PNode {
 
     /// Opportunistically dial peers we have learned about from gossip.
     /// Opportunistically dial peers we have learned about from gossip.
+
+    pub async fn outbound_dial_allowed(&self, addr: &SocketAddr) -> bool {
+        let ip = addr.ip();
+        if self.is_banned(&ip) {
+            return false;
+        }
+        {
+            let guard = match self.outbound_dial_inflight.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if guard.contains(&ip) {
+                return false;
+            }
+        }
+        {
+            let guard = self.outbound_dial_backoff.lock().await;
+            if let Some((_, until)) = guard.get(&ip) {
+                if Instant::now() < *until {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    async fn begin_outbound_dial(&self, ip: IpAddr) -> Result<OutboundDialGuard, String> {
+        if self.is_banned(&ip) {
+            return Err(format!("peer {} is banned (banlist)", ip));
+        }
+        {
+            let guard = self.outbound_dial_backoff.lock().await;
+            if let Some((_, until)) = guard.get(&ip) {
+                if Instant::now() < *until {
+                    return Err("dial backoff".to_string());
+                }
+            }
+        }
+        {
+            let mut guard = match self.outbound_dial_inflight.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if guard.contains(&ip) {
+                return Err("dial in progress".to_string());
+            }
+            guard.insert(ip);
+        }
+        Ok(OutboundDialGuard {
+            ip,
+            inflight: self.outbound_dial_inflight.clone(),
+        })
+    }
+
+    async fn record_outbound_dial_success(&self, ip: IpAddr) {
+        let mut guard = self.outbound_dial_backoff.lock().await;
+        guard.remove(&ip);
+    }
+
+    async fn record_outbound_dial_failure(&self, ip: IpAddr, err: &str) {
+        let base_secs = outbound_dial_base_secs();
+        let max_secs = outbound_dial_max_secs();
+        let banned_secs = outbound_dial_banned_secs();
+        let mut guard = self.outbound_dial_backoff.lock().await;
+        let (fails, _) = guard.get(&ip).copied().unwrap_or((0, Instant::now()));
+        let next = fails.saturating_add(1);
+        let backoff = if err.contains("banned") {
+            Duration::from_secs(banned_secs)
+        } else {
+            let exp = 2u64.saturating_pow(next.min(10));
+            Duration::from_secs((base_secs.saturating_mul(exp)).min(max_secs))
+        };
+        guard.insert(ip, (next, Instant::now() + backoff));
+    }
+
     pub async fn connect_known_peers(&self, max_new: usize) {
         let current = self.peer_count().await;
         let mut added = 0usize;
@@ -1128,6 +1246,7 @@ impl P2PNode {
             .as_secs_f64();
         let mut scanned = 0usize;
         let mut attempted_ahead = false;
+        let mut attempted_ips: HashSet<IpAddr> = HashSet::new();
 
         for record in peers.iter() {
             scanned += 1;
@@ -1147,6 +1266,12 @@ impl P2PNode {
                 continue;
             }
             if let Some(addr) = Self::parse_multiaddr(&record.multiaddr) {
+                if !attempted_ips.insert(addr.ip()) {
+                    continue;
+                }
+                if !self.outbound_dial_allowed(&addr).await {
+                    continue;
+                }
                 if (addr.ip() == self.bind_addr.ip() && addr.port() == self.bind_addr.port())
                     || self.is_banned(&addr.ip())
                 {
@@ -1185,6 +1310,12 @@ impl P2PNode {
                 continue;
             }
             if let Some(addr) = Self::parse_multiaddr(&record.multiaddr) {
+                if !attempted_ips.insert(addr.ip()) {
+                    continue;
+                }
+                if !self.outbound_dial_allowed(&addr).await {
+                    continue;
+                }
                 if (addr.ip() == self.bind_addr.ip() && addr.port() == self.bind_addr.port())
                     || self.is_banned(&addr.ip())
                 {
@@ -1313,12 +1444,19 @@ impl P2PNode {
         if self.is_banned(&addr.ip()) {
             return Err(format!("peer {} is banned (banlist)", addr));
         }
+        let ip = addr.ip();
+        let _dial_guard = self.begin_outbound_dial(ip).await?;
         // Simple jittered delay before connecting to avoid thundering herd.
         let jitter_ms = (rand_core::OsRng.next_u32() % 5000) as u64;
         tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
-        let mut stream = TcpStream::connect(addr)
-            .await
-            .map_err(|e| format!("connect to {} failed: {}", addr, e))?;
+        let mut stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("connect to {} failed: {}", addr, e);
+                self.record_outbound_dial_failure(ip, &msg).await;
+                return Err(msg);
+            }
+        };
 
         // Check reputation before keeping a long-lived connection.
         {
@@ -1340,6 +1478,7 @@ impl P2PNode {
         {
             Ok(m) => m,
             Err(e) => {
+                self.record_outbound_dial_failure(ip, &e).await;
                 let mut rep = self.reputation.lock().await;
                 rep.record_failure(&addr.to_string());
                 return Err(e);
@@ -1371,10 +1510,11 @@ impl P2PNode {
             payload: proof_bytes,
         };
         let proof_ser = proof_msg.serialize();
-        stream
-            .write_all(&proof_ser)
-            .await
-            .map_err(|e| format!("send sybil proof to {} failed: {}", addr, e))?;
+        if let Err(e) = stream.write_all(&proof_ser).await {
+            let msg = format!("send sybil proof to {} failed: {}", addr, e);
+            self.record_outbound_dial_failure(ip, &msg).await;
+            return Err(msg);
+        }
         Self::log(format!("P2P outbound {}: sent sybil proof", addr));
 
         let (checkpoint_height, checkpoint_hash) = genesis_checkpoint(&self.chain);
@@ -1397,10 +1537,11 @@ impl P2PNode {
             .map_err(|e| format!("build handshake message failed: {}", e))?;
         let bytes = msg.serialize();
 
-        stream
-            .write_all(&bytes)
-            .await
-            .map_err(|e| format!("send handshake to {} failed: {}", addr, e))?;
+        if let Err(e) = stream.write_all(&bytes).await {
+            let msg = format!("send handshake to {} failed: {}", addr, e);
+            self.record_outbound_dial_failure(ip, &msg).await;
+            return Err(msg);
+        }
         Self::log(format!("P2P outbound {}: sent handshake", addr));
 
         let (mut reader, writer_half) = stream.into_split();
@@ -1414,6 +1555,8 @@ impl P2PNode {
             let mut guard = self.connected.lock().await;
             guard.insert(addr);
         }
+
+        self.record_outbound_dial_success(ip).await;
 
         {
             let mut dir = self.peers_directory.lock().await;

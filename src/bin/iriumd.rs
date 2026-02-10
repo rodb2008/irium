@@ -2516,27 +2516,6 @@ async fn main() {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             let mut no_seed_logged = false;
 
-            // Outbound seed dialing can spam on transient failures; keep a simple per-addr backoff.
-            let base_secs: u64 = std::env::var("IRIUM_SEED_DIAL_BASE_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2)
-                .clamp(1, 30);
-            let max_secs: u64 = std::env::var("IRIUM_SEED_DIAL_MAX_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300)
-                .clamp(30, 3600);
-            let banned_secs: u64 = std::env::var("IRIUM_SEED_DIAL_BANNED_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(600)
-                .clamp(60, 7200);
-            let mut dial_backoff: std::collections::HashMap<
-                std::net::SocketAddr,
-                (u32, std::time::Instant),
-            > = std::collections::HashMap::new();
-
             loop {
                 let (seeds, seed_info) =
                     build_seed_addrs(&config_seeds, &signed_seeds, default_seed_port, &local_ips);
@@ -2565,9 +2544,14 @@ async fn main() {
                 // Dedup seeds to avoid churn when the seed list contains duplicates.
                 let mut seeds_seen: std::collections::HashSet<std::net::SocketAddr> =
                     std::collections::HashSet::new();
+                let mut seeds_ip_seen: std::collections::HashSet<std::net::IpAddr> =
+                    std::collections::HashSet::new();
 
                 for addr in &seeds {
                     if !seeds_seen.insert(*addr) {
+                        continue;
+                    }
+                    if !seeds_ip_seen.insert(addr.ip()) {
                         continue;
                     }
                     if node.is_connected(addr).await {
@@ -2580,11 +2564,8 @@ async fn main() {
                         continue;
                     }
 
-                    let now = std::time::Instant::now();
-                    if let Some((_, next_ok)) = dial_backoff.get(addr) {
-                        if now < *next_ok {
-                            continue;
-                        }
+                    if !node.outbound_dial_allowed(addr).await {
+                        continue;
                     }
 
                     let height = {
@@ -2597,38 +2578,20 @@ async fn main() {
                         addr,
                         height
                     );
-
-                    match node
+                    if let Err(e) = node
                         .connect_and_handshake(*addr, height, &agent_clone)
                         .await
                     {
-                        Ok(_) => {
-                            dial_backoff.remove(addr);
+                        let msg = format!("{}", e);
+                        if msg.contains("dial backoff") || msg.contains("dial in progress") {
+                            continue;
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "[{}] outbound {} failed: {}",
-                                Utc::now().format("%H:%M:%S"),
-                                addr,
-                                e
-                            );
-
-                            let msg = format!("{}", e);
-                            let (fails, _) = dial_backoff
-                                .get(addr)
-                                .copied()
-                                .unwrap_or((0, std::time::Instant::now()));
-                            let next_fails = fails.saturating_add(1);
-                            let backoff = if msg.contains("banned") {
-                                std::time::Duration::from_secs(banned_secs)
-                            } else {
-                                let exp = 2u64.saturating_pow(next_fails.min(10));
-                                let secs = (base_secs.saturating_mul(exp)).min(max_secs);
-                                std::time::Duration::from_secs(secs)
-                            };
-                            dial_backoff
-                                .insert(*addr, (next_fails, std::time::Instant::now() + backoff));
-                        }
+                        eprintln!(
+                            "[{}] outbound {} failed: {}",
+                            Utc::now().format("%H:%M:%S"),
+                            addr,
+                            msg
+                        );
                     }
                 }
                 interval.tick().await;
