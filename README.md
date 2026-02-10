@@ -1,6 +1,6 @@
 # Irium Blockchain (Rust Mainnet)
 
-![Irium Logo](assets/irium-logo.png)
+<img src="assets/irium-logo.png" alt="Irium Logo" width="160" />
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org)
