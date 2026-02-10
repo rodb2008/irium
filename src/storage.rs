@@ -1,9 +1,13 @@
-use std::{env, fs, path::PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use serde::Serialize;
 
-use sha2::{Digest, Sha256};
 use bs58;
+use sha2::{Digest, Sha256};
 
 use crate::block::Block;
 
@@ -89,6 +93,57 @@ pub fn ensure_runtime_dirs() -> std::io::Result<(PathBuf, PathBuf)> {
     Ok((blocks, state))
 }
 
+fn maybe_quarantine_existing_block(path: &Path, new_hash: &str) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let existing = match fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    let existing_hash = serde_json::from_str::<serde_json::Value>(&existing)
+        .ok()
+        .and_then(|v| {
+            v.get("header")
+                .and_then(|h| h.get("hash"))
+                .and_then(|h| h.as_str())
+                .map(|s| s.to_string())
+        });
+
+    if existing_hash.as_deref() == Some(new_hash) {
+        return Ok(());
+    }
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let backup_dir = dir.join(format!("orphaned_{}", stamp));
+    fs::create_dir_all(&backup_dir)?;
+
+    let name = path.file_name().unwrap_or_default();
+    let mut dest = backup_dir.join(name);
+    if dest.exists() {
+        // Avoid clobbering an existing quarantine file.
+        let mut n = 1u32;
+        loop {
+            let candidate = backup_dir.join(format!("{}.dup{}", name.to_string_lossy(), n));
+            if !candidate.exists() {
+                dest = candidate;
+                break;
+            }
+            n += 1;
+        }
+    }
+
+    // Best-effort quarantine; if rename fails, keep the existing file.
+    let _ = fs::rename(path, dest);
+    Ok(())
+}
+
 pub fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
     let dir = blocks_dir();
     fs::create_dir_all(&dir)?;
@@ -96,6 +151,9 @@ pub fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
 
     let header = &block.header;
     let hash = header.hash();
+
+    let new_hash = hex::encode(hash);
+    let _ = maybe_quarantine_existing_block(&path, &new_hash);
 
     let jb = JsonBlock {
         height,
@@ -106,7 +164,7 @@ pub fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
             time: header.time,
             bits: format!("{:08x}", header.bits),
             nonce: header.nonce,
-            hash: hex::encode(hash),
+            hash: new_hash.clone(),
         },
         tx_hex: block
             .transactions
