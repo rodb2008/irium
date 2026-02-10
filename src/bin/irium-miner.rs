@@ -513,7 +513,7 @@ fn rpc_client() -> Result<Client, String> {
 }
 
 fn node_rpc_base() -> String {
-    env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "http://127.0.0.1:38300".to_string())
+    env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string())
 }
 
 static RPC_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
