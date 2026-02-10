@@ -89,6 +89,17 @@ fn outbound_dial_banned_secs() -> u64 {
         .clamp(60, 7200)
 }
 
+fn inbound_banned_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_BANNED_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(30)
+    })
+}
+
 async fn sync_request_allowed_for(
     sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
     ip: IpAddr,
@@ -673,6 +684,7 @@ pub struct P2PNode {
     getblocks_last: Arc<Mutex<HashMap<IpAddr, (Vec<u8>, u32, Instant)>>>,
     getblocks_genesis: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     handshake_failures: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
+    banned_inbound_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     outbound_dial_inflight: Arc<StdMutex<HashSet<IpAddr>>>,
     outbound_dial_backoff: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
@@ -917,6 +929,7 @@ impl P2PNode {
             getblocks_last: Arc::new(Mutex::new(HashMap::new())),
             getblocks_genesis: Arc::new(Mutex::new(HashMap::new())),
             handshake_failures: Arc::new(Mutex::new(HashMap::new())),
+            banned_inbound_log: Arc::new(Mutex::new(HashMap::new())),
             outbound_dial_inflight: Arc::new(StdMutex::new(HashSet::new())),
             outbound_dial_backoff: Arc::new(Mutex::new(HashMap::new())),
             self_ips: Arc::new(Mutex::new(HashSet::new())),
@@ -954,6 +967,7 @@ impl P2PNode {
         let getblocks_last = self.getblocks_last.clone();
         let getblocks_genesis = self.getblocks_genesis.clone();
         let handshake_failures = self.handshake_failures.clone();
+        let banned_inbound_log = self.banned_inbound_log.clone();
         let self_ips = self.self_ips.clone();
         let dynamic_bans = self.dynamic_bans.clone();
         let node_id = self.node_id.clone();
@@ -966,7 +980,17 @@ impl P2PNode {
                         let ip = addr.ip();
                         let dynamic_bans_check = dynamic_bans.clone();
                         if P2PNode::is_banned_ip(&ip, &banned_ips, &dynamic_bans_check) {
-                            Self::log_err(format!("Rejecting inbound {}: banned", addr));
+                            let cooldown = Duration::from_secs(inbound_banned_log_cooldown_secs());
+                            let mut guard = banned_inbound_log.lock().await;
+                            let should_log = match guard.get(&ip) {
+                                Some(last) => last.elapsed() >= cooldown,
+                                None => true,
+                            };
+                            if should_log {
+                                guard.insert(ip, Instant::now());
+                                drop(guard);
+                                Self::log_err(format!("Rejecting inbound {}: banned", addr));
+                            }
                             continue;
                         }
                         {
