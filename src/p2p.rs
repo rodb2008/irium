@@ -1536,10 +1536,15 @@ fn sybil_challenge_timeout() -> Duration {
 
         // Bind proof-of-work to a persistent node identity derived from disk.
         let peer_pubkey = self.node_id.clone();
-        let handshake = SybilResistantHandshake::new(challenge.difficulty);
-        let proof = handshake
-            .solve_challenge(challenge, peer_pubkey.to_vec())
-            .map_err(|e| format!("failed to solve sybil challenge: {}", e))?;
+        let difficulty = challenge.difficulty;
+        let pubkey = peer_pubkey.to_vec();
+        let proof = tokio::task::spawn_blocking(move || {
+            let handshake = SybilResistantHandshake::new(difficulty);
+            handshake.solve_challenge(challenge, pubkey)
+        })
+        .await
+        .map_err(|e| format!("failed to join sybil solver: {}", e))?
+        .map_err(|e| format!("failed to solve sybil challenge: {}", e))?;
         let proof_bytes = proof.to_bytes();
         let proof_msg = Message {
             msg_type: MessageType::SybilProof,
