@@ -791,17 +791,34 @@ impl P2PNode {
             return 0;
         }
         banned_count.min(bump)
-    }
-
-
-    fn load_or_create_node_id() -> Vec<u8> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        let path = PathBuf::from(home).join(".irium/node_id");
+    }    fn load_or_create_node_id() -> Vec<u8> {
+        let path = storage::state_dir().join("node_id");
+        if !path.exists() {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+            let legacy = PathBuf::from(home).join(".irium/node_id");
+            if legacy.exists() {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::copy(&legacy, &path);
+            }
+        }
         if let Ok(existing) = fs::read_to_string(&path) {
             if let Ok(bytes) = hex::decode(existing.trim()) {
                 if bytes.len() == 32 {
                     return bytes;
                 }
+            }
+        }
+        let mut buf = [0u8; 32];
+        OsRng.fill_bytes(&mut buf);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&path, hex::encode(buf));
+        buf.to_vec()
+    }
+
             }
         }
         let mut buf = [0u8; 32];

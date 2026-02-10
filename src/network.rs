@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::storage;
+
 const DEFAULT_SEEDLIST_BASELINE: &str = "bootstrap/seedlist.txt";
 const DEFAULT_SEEDLIST_EXTRA: &str = "bootstrap/seedlist.extra";
 const DEFAULT_SEEDLIST_RUNTIME: &str = "bootstrap/seedlist.runtime";
@@ -311,8 +313,17 @@ pub struct PeerDirectory {
 
 impl PeerDirectory {
     pub fn new() -> PeerDirectory {
-        let root = repo_root();
-        let db_path = root.join(DEFAULT_PEER_DB);
+        let db_path = storage::state_dir().join("peers.json");
+        if !db_path.exists() {
+            let root = repo_root();
+            let legacy = root.join(DEFAULT_PEER_DB);
+            if legacy.exists() {
+                if let Some(parent) = db_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::copy(&legacy, &db_path);
+            }
+        }
         if let Some(parent) = db_path.parent() {
             let _ = fs::create_dir_all(parent);
         }

@@ -880,14 +880,78 @@ fn load_persisted_blocks(state: &mut ChainState) {
     }
 }
 
+fn dir_is_empty(path: &std::path::Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut rd) => rd.next().is_none(),
+        Err(_) => true,
+    }
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ty.is_file() {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Do not overwrite any existing new-state files.
+            if !to.exists() {
+                let _ = std::fs::copy(&from, &to);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn migrate_legacy_repo_state_dir(state_dir: &std::path::Path) {
+    if !dir_is_empty(state_dir) {
+        return;
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(root) = env::var("IRIUM_REPO_ROOT") {
+        candidates.push(PathBuf::from(root).join("state"));
+    }
+    candidates.push(PathBuf::from("state"));
+
+    for legacy in candidates {
+        if legacy.exists() && legacy.is_dir() {
+            if let Err(e) = copy_dir_recursive(&legacy, state_dir) {
+                eprintln!("[warn] Legacy state migration failed from {}: {}", legacy.display(), e);
+            } else {
+                println!("[i] Migrated legacy state from {} -> {}", legacy.display(), state_dir.display());
+            }
+            break;
+        }
+    }
+}
+
+
 fn mempool_file() -> PathBuf {
     if let Ok(path) = env::var("IRIUM_MEMPOOL_FILE") {
         PathBuf::from(path)
     } else {
-        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        PathBuf::from(home).join(".irium/mempool/pending.json")
+        let path = storage::state_dir().join("mempool/pending.json");
+        if !path.exists() {
+            let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
+            let legacy = PathBuf::from(home).join(".irium/mempool/pending.json");
+            if legacy.exists() {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::copy(&legacy, &path);
+            }
+        }
+        path
     }
 }
+
 
 fn rate_limiter() -> RateLimiter {
     let rpm = env::var("IRIUM_RATE_LIMIT_PER_MIN")
@@ -2206,6 +2270,15 @@ async fn submit_tx(
 
 #[tokio::main]
 async fn main() {
+    let (blocks_dir, state_dir) = storage::ensure_runtime_dirs().unwrap_or_else(|e| {
+        eprintln!("Failed to init runtime dirs: {e}");
+        std::process::exit(1);
+    });
+    migrate_legacy_repo_state_dir(&state_dir);
+    println!("Using blocks dir: {}", blocks_dir.display());
+    println!("Using state dir: {}", state_dir.display());
+    println!("To resync, delete ONLY state dir: {} (keep blocks dir: {})", state_dir.display(), blocks_dir.display());
+
     // Initialize chain state with locked genesis.
     let locked = load_locked_genesis().expect("load locked genesis");
     let block = block_from_locked(&locked);

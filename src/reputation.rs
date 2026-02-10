@@ -4,6 +4,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::storage;
+
 fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -12,9 +14,20 @@ fn now_secs() -> f64 {
 }
 
 fn default_reputation_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-    PathBuf::from(home).join(".irium/peer_reputation.json")
+    let path = storage::state_dir().join("peer_reputation.json");
+    if !path.exists() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let legacy = PathBuf::from(home).join(".irium/peer_reputation.json");
+        if legacy.exists() {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::copy(&legacy, &path);
+        }
+    }
+    path
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerReputation {
