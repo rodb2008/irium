@@ -609,6 +609,7 @@ async fn record_handshake_failure(
     failures: &Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
     dynamic_bans: &Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     ip: IpAddr,
+    trusted_seed: bool,
 ) -> (u32, bool) {
     let now = Instant::now();
     let window = handshake_fail_window();
@@ -629,7 +630,7 @@ async fn record_handshake_failure(
         }
     };
     let mut banned = false;
-    if count >= handshake_fail_threshold() {
+    if !trusted_seed && count >= handshake_fail_threshold() {
         {
             let mut guard = dynamic_bans.lock().unwrap();
             guard.insert(ip, Instant::now());
@@ -694,6 +695,8 @@ pub struct P2PNode {
     agent: String,
     relay_address: Option<String>,
     node_id: Vec<u8>,
+    trusted_seed_ips: Arc<HashSet<IpAddr>>,
+
     banned_ips: Arc<HashSet<IpAddr>>,
 }
 
@@ -798,17 +801,17 @@ impl P2PNode {
         Duration::from_secs(bounded)
     }
 
-fn sybil_challenge_timeout() -> Duration {
-    static DUR: OnceLock<Duration> = OnceLock::new();
-    *DUR.get_or_init(|| {
-        let secs = std::env::var("IRIUM_P2P_SYBIL_CHALLENGE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(15);
-        Duration::from_secs(secs)
-    })
-}
+    fn sybil_challenge_timeout() -> Duration {
+        static DUR: OnceLock<Duration> = OnceLock::new();
+        *DUR.get_or_init(|| {
+            let secs = std::env::var("IRIUM_P2P_SYBIL_CHALLENGE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(15);
+            Duration::from_secs(secs)
+        })
+    }
 
     fn is_soft_block_reject(reason: &str) -> bool {
         let msg = reason.to_lowercase();
@@ -822,6 +825,9 @@ fn sybil_challenge_timeout() -> Duration {
     fn is_banned(&self, ip: &IpAddr) -> bool {
         if self.banned_ips.contains(ip) {
             return true;
+        }
+        if self.trusted_seed_ips.contains(ip) {
+            return false;
         }
         Self::is_banned_ip(ip, &self.banned_ips, &self.dynamic_bans)
     }
@@ -870,6 +876,33 @@ fn sybil_challenge_timeout() -> Duration {
             }
             if let Ok(ip) = line.parse::<IpAddr>() {
                 ips.insert(ip);
+            }
+        }
+        Arc::new(ips)
+    }
+
+    fn load_trusted_seed_ips() -> Arc<HashSet<IpAddr>> {
+        // Trusted seeds are bootstrap endpoints we should not temporarily ban due to transient handshake noise.
+        // Static bans still apply.
+        let mut ips: HashSet<IpAddr> = HashSet::new();
+        for path in ["bootstrap/seedlist.txt", "bootstrap/seedlist.extra"] {
+            let data = match fs::read_to_string(path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            for line in data.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let token = line.split_whitespace().next().unwrap_or("");
+                if let Ok(ip) = token.parse::<IpAddr>() {
+                    ips.insert(ip);
+                    continue;
+                }
+                if let Ok(sa) = token.parse::<SocketAddr>() {
+                    ips.insert(sa.ip());
+                }
             }
         }
         Arc::new(ips)
@@ -951,6 +984,7 @@ fn sybil_challenge_timeout() -> Duration {
             agent,
             relay_address,
             node_id: Self::load_or_create_node_id(),
+            trusted_seed_ips: Self::load_trusted_seed_ips(),
             banned_ips: Self::load_banned_ips(),
         }
     }
@@ -982,6 +1016,7 @@ fn sybil_challenge_timeout() -> Duration {
         let banned_inbound_log = self.banned_inbound_log.clone();
         let self_ips = self.self_ips.clone();
         let dynamic_bans = self.dynamic_bans.clone();
+        let trusted_seed_ips = self.trusted_seed_ips.clone();
         let node_id = self.node_id.clone();
         let banned_ips = self.banned_ips.clone();
 
@@ -990,8 +1025,12 @@ fn sybil_challenge_timeout() -> Duration {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
                         let ip = addr.ip();
+                        let trusted = trusted_seed_ips.contains(&ip);
                         let dynamic_bans_check = dynamic_bans.clone();
-                        if P2PNode::is_banned_ip(&ip, &banned_ips, &dynamic_bans_check) {
+                        if banned_ips.contains(&ip)
+                            || (!trusted
+                                && P2PNode::is_banned_ip(&ip, &banned_ips, &dynamic_bans_check))
+                        {
                             let cooldown = Duration::from_secs(inbound_banned_log_cooldown_secs());
                             let mut guard = banned_inbound_log.lock().await;
                             let should_log = match guard.get(&ip) {
@@ -1076,6 +1115,7 @@ fn sybil_challenge_timeout() -> Duration {
                                     &handshake_failures_for_handshake,
                                     &dynamic_bans_for_handshake,
                                     addr.ip(),
+                                    trusted,
                                 )
                                 .await;
                                 if banned {
@@ -1510,16 +1550,16 @@ fn sybil_challenge_timeout() -> Duration {
         ));
         // Expect a sybil challenge from the remote and respond with a proof
         // before proceeding with the normal handshake.
-        let challenge_msg = match read_message_with_timeout(&mut stream, Self::sybil_challenge_timeout() ).await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                self.record_outbound_dial_failure(ip, &e).await;
-                let mut rep = self.reputation.lock().await;
-                rep.record_failure(&addr.to_string());
-                return Err(e);
-            }
-        };
+        let challenge_msg =
+            match read_message_with_timeout(&mut stream, Self::sybil_challenge_timeout()).await {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_outbound_dial_failure(ip, &e).await;
+                    let mut rep = self.reputation.lock().await;
+                    rep.record_failure(&addr.to_string());
+                    return Err(e);
+                }
+            };
         if challenge_msg.msg_type != MessageType::SybilChallenge {
             let mut rep = self.reputation.lock().await;
             rep.record_failure(&addr.to_string());
