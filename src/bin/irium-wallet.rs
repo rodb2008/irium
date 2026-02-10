@@ -200,6 +200,10 @@ fn usage() {
     eprintln!("  irium-wallet send <from_addr> <to_addr> <amount_irm> [--fee <irm>] [--coin-select smallest|largest] [--rpc <url>]");
 }
 
+fn node_rpc_base() -> String {
+    env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| node_rpc_base())
+}
+
 fn default_rpc_url() -> String {
     env::var("IRIUM_NODE_RPC")
         .or_else(|_| env::var("IRIUM_RPC_URL"))
@@ -254,6 +258,36 @@ fn estimate_tx_size(inputs: usize, outputs: usize) -> u64 {
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
+
+fn https_to_http(base: &str) -> Option<String> {
+    if let Some(rest) = base.strip_prefix("https://") {
+        Some(format!("http://{}", rest))
+    } else {
+        None
+    }
+}
+
+fn send_with_https_fallback<F>(
+    base: &str,
+    f: F,
+) -> Result<reqwest::blocking::Response, reqwest::Error>
+where
+    F: Fn(&str) -> Result<reqwest::blocking::Response, reqwest::Error>,
+{
+    match f(base) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if let Some(http) = https_to_http(base) {
+                eprintln!("HTTPS RPC failed, retrying over HTTP: {}", http);
+                if let Ok(v) = f(&http) {
+                    return Ok(v);
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 
 fn rpc_client(base: &str) -> Result<Client, String> {
     let mut builder = Client::builder().timeout(Duration::from_secs(10));
@@ -333,12 +367,16 @@ fn hex_to_32(s: &str) -> Result<[u8; 32], String> {
 }
 
 fn fetch_balance(client: &Client, base: &str, addr: &str) -> Result<BalanceResponse, String> {
-    let url = format!("{}/rpc/balance?address={}", base, addr);
-    let mut req = client.get(&url);
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().map_err(|e| format!("balance request failed: {e}"))?;
+    let resp = send_with_https_fallback(base, |b| {
+        let url = format!("{}/rpc/balance?address={}", b, addr);
+        let mut req = client.get(&url);
+        if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    })
+    .map_err(|e| format!("balance request failed: {e}"))?;
+
     if !resp.status().is_success() {
         return Err(format!("balance request failed: {}", resp.status()));
     }
@@ -346,13 +384,18 @@ fn fetch_balance(client: &Client, base: &str, addr: &str) -> Result<BalanceRespo
         .map_err(|e| format!("parse balance response: {e}"))
 }
 
+
 fn fetch_utxos(client: &Client, base: &str, addr: &str) -> Result<UtxosResponse, String> {
-    let url = format!("{}/rpc/utxos?address={}", base, addr);
-    let mut req = client.get(&url);
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().map_err(|e| format!("utxos request failed: {e}"))?;
+    let resp = send_with_https_fallback(base, |b| {
+        let url = format!("{}/rpc/utxos?address={}", b, addr);
+        let mut req = client.get(&url);
+        if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    })
+    .map_err(|e| format!("utxos request failed: {e}"))?;
+
     if !resp.status().is_success() {
         return Err(format!("utxos request failed: {}", resp.status()));
     }
@@ -361,13 +404,18 @@ fn fetch_utxos(client: &Client, base: &str, addr: &str) -> Result<UtxosResponse,
 }
 
 
+
 fn fetch_history(client: &Client, base: &str, addr: &str) -> Result<HistoryResponse, String> {
-    let url = format!("{}/rpc/history?address={}", base, addr);
-    let mut req = client.get(&url);
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().map_err(|e| format!("history request failed: {e}"))?;
+    let resp = send_with_https_fallback(base, |b| {
+        let url = format!("{}/rpc/history?address={}", b, addr);
+        let mut req = client.get(&url);
+        if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    })
+    .map_err(|e| format!("history request failed: {e}"))?;
+
     if !resp.status().is_success() {
         return Err(format!("history request failed: {}", resp.status()));
     }
@@ -375,13 +423,18 @@ fn fetch_history(client: &Client, base: &str, addr: &str) -> Result<HistoryRespo
         .map_err(|e| format!("parse history response: {e}"))
 }
 
+
 fn fetch_fee_estimate(client: &Client, base: &str) -> Result<FeeEstimateResponse, String> {
-    let url = format!("{}/rpc/fee_estimate", base);
-    let mut req = client.get(&url);
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().map_err(|e| format!("fee estimate failed: {e}"))?;
+    let resp = send_with_https_fallback(base, |b| {
+        let url = format!("{}/rpc/fee_estimate", b);
+        let mut req = client.get(&url);
+        if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    })
+    .map_err(|e| format!("fee estimate failed: {e}"))?;
+
     if !resp.status().is_success() {
         return Err(format!("fee estimate failed: {}", resp.status()));
     }
@@ -389,22 +442,29 @@ fn fetch_fee_estimate(client: &Client, base: &str) -> Result<FeeEstimateResponse
         .map_err(|e| format!("parse fee estimate response: {e}"))
 }
 
+
 fn submit_tx(client: &Client, base: &str, tx: &Transaction) -> Result<(), String> {
     let raw = tx.serialize();
     let req_body = SubmitTxRequest {
         tx_hex: hex::encode(raw),
     };
-    let url = format!("{}/rpc/submit_tx", base);
-    let mut req = client.post(&url).json(&req_body);
-    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-    let resp = req.send().map_err(|e| format!("submit tx failed: {e}"))?;
+
+    let resp = send_with_https_fallback(base, |b| {
+        let url = format!("{}/rpc/submit_tx", b);
+        let mut req = client.post(&url).json(&req_body);
+        if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    })
+    .map_err(|e| format!("submit tx failed: {e}"))?;
+
     if !resp.status().is_success() {
         return Err(format!("submit tx failed: {}", resp.status()));
     }
     Ok(())
 }
+
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
