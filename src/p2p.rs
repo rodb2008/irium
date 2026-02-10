@@ -829,8 +829,9 @@ impl P2PNode {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|v| *v > 0)
-                .unwrap_or(15);
-            Duration::from_secs(secs)
+                .unwrap_or(30);
+            let bounded = secs.max(5).min(120);
+            Duration::from_secs(bounded)
         })
     }
 
