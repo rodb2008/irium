@@ -2639,13 +2639,13 @@ impl P2PNode {
                                         let (
                                             new_height_opt,
                                             record_verdict,
-                                            persist_height,
+                                            persist_blocks,
                                             orphan_prev,
                                         ) = {
                                             let mut guard = chain_arc.lock().unwrap();
                                             let mut new_height_opt = None;
                                             let mut record_verdict = None;
-                                            let mut persist_height = None;
+                                            let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
                                             let mut orphan_prev = None;
                                             match guard.process_block(block.clone()) {
                                                 Ok((new_height, _tip)) => {
@@ -2665,7 +2665,16 @@ impl P2PNode {
                                                     new_height_opt = Some(new_height);
                                                     record_verdict = Some(true);
                                                     if guard.tip_hash() == bhash {
-                                                        persist_height = Some(guard.tip_height());
+                                                        let tip = guard.tip_height();
+                                                        persist_blocks.push((tip, block.clone()));
+                                                        if tip > 0 {
+                                                            if let Some(prev) =
+                                                                guard.chain.get((tip - 1) as usize)
+                                                            {
+                                                                persist_blocks
+                                                                    .push((tip - 1, prev.clone()));
+                                                            }
+                                                        }
                                                     }
                                                 }
                                                 Err(e) => {
@@ -2701,14 +2710,12 @@ impl P2PNode {
                                             (
                                                 new_height_opt,
                                                 record_verdict,
-                                                persist_height,
+                                                persist_blocks,
                                                 orphan_prev,
                                             )
                                         };
-                                        if let Some(height) = persist_height {
-                                            if let Err(e) =
-                                                storage::write_block_json(height, &block)
-                                            {
+                                        for (height, b) in persist_blocks {
+                                            if let Err(e) = storage::write_block_json(height, &b) {
                                                 P2PNode::log_event(
                                                     "warn",
                                                     "chain",
@@ -4035,11 +4042,11 @@ async fn handle_incoming_with_sybil(
                                 let bhash = block.header.hash();
                                 let short = hex::encode(bhash);
                                 let short = short.get(0..12).unwrap_or(&short);
-                                let (new_height_opt, record_verdict, persist_height, orphan_prev) = {
+                                let (new_height_opt, record_verdict, persist_blocks, orphan_prev) = {
                                     let mut guard = chain_arc.lock().unwrap();
                                     let mut new_height_opt = None;
                                     let mut record_verdict = None;
-                                    let mut persist_height = None;
+                                    let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
                                     let mut orphan_prev = None;
                                     match guard.process_block(block.clone()) {
                                         Ok((new_height, _tip)) => {
@@ -4059,7 +4066,16 @@ async fn handle_incoming_with_sybil(
                                             new_height_opt = Some(new_height);
                                             record_verdict = Some(true);
                                             if guard.tip_hash() == bhash {
-                                                persist_height = Some(guard.tip_height());
+                                                let tip = guard.tip_height();
+                                                persist_blocks.push((tip, block.clone()));
+                                                if tip > 0 {
+                                                    if let Some(prev) =
+                                                        guard.chain.get((tip - 1) as usize)
+                                                    {
+                                                        persist_blocks
+                                                            .push((tip - 1, prev.clone()));
+                                                    }
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -4092,10 +4108,10 @@ async fn handle_incoming_with_sybil(
                                             }
                                         }
                                     }
-                                    (new_height_opt, record_verdict, persist_height, orphan_prev)
+                                    (new_height_opt, record_verdict, persist_blocks, orphan_prev)
                                 };
-                                if let Some(height) = persist_height {
-                                    if let Err(e) = storage::write_block_json(height, &block) {
+                                for (height, b) in persist_blocks {
+                                    if let Err(e) = storage::write_block_json(height, &b) {
                                         P2PNode::log_event(
                                             "warn",
                                             "chain",
