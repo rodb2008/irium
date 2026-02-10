@@ -12,10 +12,11 @@ use ripemd::Ripemd160;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
 const DEFAULT_FEE_PER_BYTE: u64 = 1;
@@ -32,6 +33,116 @@ struct WalletKey {
     pkh: String,
     pubkey: String,
     privkey: String,
+}
+
+#[derive(Deserialize)]
+struct LegacyWalletFile {
+    keys: HashMap<String, String>,
+    #[allow(dead_code)]
+    addresses: Option<Vec<String>>,
+}
+
+fn base58check_decode(s: &str) -> Option<Vec<u8>> {
+    let data = bs58::decode(s).into_vec().ok()?;
+    if data.len() < 5 {
+        return None;
+    }
+    let (body, checksum) = data.split_at(data.len() - 4);
+    let first = Sha256::digest(body);
+    let second = Sha256::digest(&first);
+    if &second[0..4] != checksum {
+        return None;
+    }
+    Some(body.to_vec())
+}
+
+fn wif_to_secret_and_compression(wif: &str) -> Result<([u8; 32], bool), String> {
+    let data = base58check_decode(wif).ok_or_else(|| "invalid WIF".to_string())?;
+
+    // Standard WIF payload: 0x80 || 32-byte secret [|| 0x01 if compressed]
+    if data.len() != 33 && data.len() != 34 {
+        return Err("invalid WIF length".to_string());
+    }
+    if data[0] != 0x80 {
+        return Err("unsupported WIF version".to_string());
+    }
+
+    let compressed = if data.len() == 34 {
+        if data[33] != 0x01 {
+            return Err("invalid WIF compression flag".to_string());
+        }
+        true
+    } else {
+        false
+    };
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&data[1..33]);
+    Ok((out, compressed))
+}
+
+fn maybe_migrate_legacy_wallet(path: &Path, data: &str) -> Result<Option<WalletFile>, String> {
+    let legacy: LegacyWalletFile = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+
+    if legacy.keys.is_empty() {
+        return Ok(Some(WalletFile {
+            version: 1,
+            keys: Vec::new(),
+        }));
+    }
+
+    let mut entries: Vec<(String, String)> = legacy.keys.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut keys = Vec::with_capacity(entries.len());
+    for (address, wif) in entries {
+        let (priv_bytes, compressed) = wif_to_secret_and_compression(&wif)
+            .map_err(|e| format!("legacy key for {address}: {e}"))?;
+
+        let secret = SecretKey::from_slice(&priv_bytes)
+            .map_err(|e| format!("legacy key for {address}: invalid secret key: {e}"))?;
+        let public = secret.public_key();
+        let pubkey = public.to_encoded_point(compressed);
+        let pkh = hash160(pubkey.as_bytes());
+        let derived = base58_p2pkh_from_hash(&pkh);
+        if derived != address {
+            return Err(format!(
+                "legacy key address mismatch: file has {address}, derived {derived}"
+            ));
+        }
+
+        keys.push(WalletKey {
+            address,
+            pkh: hex::encode(pkh),
+            pubkey: hex::encode(pubkey.as_bytes()),
+            privkey: hex::encode(priv_bytes),
+        });
+    }
+
+    let wallet = WalletFile { version: 1, keys };
+
+    // Backup the legacy file before rewriting it.
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = if let Some(name) = path.file_name() {
+        path.with_file_name(format!("{}.legacy.bak.{}", name.to_string_lossy(), ts))
+    } else {
+        PathBuf::from(format!("{}.legacy.bak.{}", path.display(), ts))
+    };
+
+    fs::copy(path, &backup).map_err(|e| format!("backup legacy wallet: {e}"))?;
+    eprintln!(
+        "[warn] Migrated legacy wallet format to v1; backup saved at: {}",
+        backup.display()
+    );
+    save_wallet(path, &wallet)?;
+
+    Ok(Some(wallet))
 }
 
 #[derive(Deserialize)]
@@ -139,7 +250,15 @@ fn wallet_path() -> PathBuf {
 
 fn load_wallet(path: &Path) -> Result<WalletFile, String> {
     let data = fs::read_to_string(path).map_err(|e| format!("read wallet: {e}"))?;
-    serde_json::from_str(&data).map_err(|e| format!("parse wallet: {e}"))
+    match serde_json::from_str::<WalletFile>(&data) {
+        Ok(w) => Ok(w),
+        Err(e) => {
+            if let Some(w) = maybe_migrate_legacy_wallet(path, &data)? {
+                return Ok(w);
+            }
+            Err(format!("parse wallet: {e}"))
+        }
+    }
 }
 
 fn save_wallet(path: &Path, wallet: &WalletFile) -> Result<(), String> {
