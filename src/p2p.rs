@@ -798,6 +798,18 @@ impl P2PNode {
         Duration::from_secs(bounded)
     }
 
+fn sybil_challenge_timeout() -> Duration {
+    static DUR: OnceLock<Duration> = OnceLock::new();
+    *DUR.get_or_init(|| {
+        let secs = std::env::var("IRIUM_P2P_SYBIL_CHALLENGE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(15);
+        Duration::from_secs(secs)
+    })
+}
+
     fn is_soft_block_reject(reason: &str) -> bool {
         let msg = reason.to_lowercase();
         msg.contains("duplicate block") || msg.contains("orphan") || msg.contains("unknown parent")
@@ -1498,7 +1510,7 @@ impl P2PNode {
         ));
         // Expect a sybil challenge from the remote and respond with a proof
         // before proceeding with the normal handshake.
-        let challenge_msg = match read_message_with_timeout(&mut stream, Self::peer_timeout()).await
+        let challenge_msg = match read_message_with_timeout(&mut stream, Self::sybil_challenge_timeout() ).await
         {
             Ok(m) => m,
             Err(e) => {
