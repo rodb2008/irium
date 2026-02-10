@@ -543,6 +543,10 @@ impl PeerDirectory {
 
         seeds.sort();
         seeds.dedup();
+        if seeds.is_empty() {
+            // Avoid wiping bootstrap/seedlist.runtime during cold start; keep last known runtime seeds.
+            return;
+        }
         self.seed_manager.write_runtime_entries(seeds);
     }
 
