@@ -101,6 +101,14 @@ async fn sync_block_request_allowed_for(
     true
 }
 
+fn headers_request_cooldown() -> Duration {
+    let secs = std::env::var("IRIUM_P2P_HEADERS_REQUEST_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    Duration::from_secs(secs.max(5).min(300))
+}
+
 fn headers_fallback_grace() -> Duration {
     let secs = std::env::var("IRIUM_P2P_HEADERS_FALLBACK_SECS")
         .ok()
@@ -1761,7 +1769,7 @@ impl P2PNode {
                                         None
                                     }
                                 });
-                            let peer_tip_on_main = if let (Some(tip), Some(chain_arc)) =
+                            let _peer_tip_on_main = if let (Some(tip), Some(chain_arc)) =
                                 (peer_tip, chain_for_sync.as_ref())
                             {
                                 let guard = chain_arc.lock().unwrap();
@@ -1786,19 +1794,21 @@ impl P2PNode {
                             } else {
                                 None
                             };
-                            let tip_mismatch = if !peer_tip_on_main {
-                                true
-                            } else {
+                            let tip_mismatch = if payload.height == local_height {
                                 match peer_tip {
                                     Some(t) => local_at_peer.map(|h| h != t).unwrap_or(false),
                                     None => false,
                                 }
+                            } else {
+                                false
                             };
                             if payload.height > local_height
                                 || (payload.height == local_height && tip_mismatch)
                             {
                                 let local_tip = P2PNode::tip_hash(&chain_for_sync);
-                                let start_hash = if local_height == 0 || tip_mismatch {
+                                let start_hash = if local_height == 0
+                                    || (payload.height == local_height && tip_mismatch)
+                                {
                                     [0u8; 32]
                                 } else {
                                     local_tip
@@ -1813,24 +1823,41 @@ impl P2PNode {
                                     let h = hex::encode(start_hash);
                                     h.get(0..12).unwrap_or(&h).to_string()
                                 };
-                                let _ = sync_request_allowed_for(
+
+                                let mut allowed = sync_request_allowed_for(
                                     &sync_requests,
                                     addr.ip(),
                                     local_height,
                                     payload.height,
                                 )
                                 .await;
-                                Self::log(format!(
-                                    "P2P {}: peer ahead ({} > {}), requesting headers from tip {}",
-                                    addr, payload.height, local_height, short
-                                ));
-                                if let Ok(msg) = get_headers.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
+                                if allowed {
+                                    let (last_req, last_start) = {
+                                        let guard = peer_state.lock().await;
+                                        (guard.last_headers_request, guard.last_headers_start)
+                                    };
+                                    if let Some(ts) = last_req {
+                                        if ts.elapsed() < headers_request_cooldown()
+                                            && last_start == Some(start_hash)
+                                        {
+                                            allowed = false;
+                                        }
+                                    }
                                 }
-                                {
-                                    let mut state = peer_state.lock().await;
-                                    state.last_headers_request = Some(Instant::now());
-                                    state.last_headers_start = Some(start_hash);
+
+                                if allowed {
+                                    Self::log(format!(
+                                        "P2P {}: peer ahead ({} > {}), requesting headers from tip {}",
+                                        addr, payload.height, local_height, short
+                                    ));
+                                    if let Ok(msg) = get_headers.to_message() {
+                                        let _ = send_message(&writer, msg, addr).await;
+                                    }
+                                    {
+                                        let mut state = peer_state.lock().await;
+                                        state.last_headers_request = Some(Instant::now());
+                                        state.last_headers_start = Some(start_hash);
+                                    }
                                 }
                             } else if payload.height < local_height {
                                 // Peer is behind; push headers and fall back to block push if needed.
@@ -2954,7 +2981,6 @@ async fn handle_incoming_with_sybil(
         let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
         let node_id = hex::encode(&proof.peer_pubkey);
         dir.register_connection(multiaddr.clone(), None, None, Some(node_id));
-        dir.record_height(&multiaddr, local_height(&chain));
     }
 
     // Reply with our handshake so outbound peers learn our agent/height.
@@ -3153,7 +3179,7 @@ async fn handle_incoming_with_sybil(
                                 None
                             }
                         });
-                    let peer_tip_on_main =
+                    let _peer_tip_on_main =
                         if let (Some(tip), Some(chain_arc)) = (peer_tip, chain.as_ref()) {
                             let guard = chain_arc.lock().unwrap();
                             if let Some(h) = guard.heights.get(&tip) {
@@ -3177,19 +3203,21 @@ async fn handle_incoming_with_sybil(
                     } else {
                         None
                     };
-                    let tip_mismatch = if !peer_tip_on_main {
-                        true
-                    } else {
+                    let tip_mismatch = if payload.height == local_height {
                         match peer_tip {
                             Some(t) => local_at_peer.map(|h| h != t).unwrap_or(false),
                             None => false,
                         }
+                    } else {
+                        false
                     };
                     if payload.height > local_height
                         || (payload.height == local_height && tip_mismatch)
                     {
                         let local_tip = P2PNode::tip_hash(&chain);
-                        let start_hash = if local_height == 0 || tip_mismatch {
+                        let start_hash = if local_height == 0
+                            || (payload.height == local_height && tip_mismatch)
+                        {
                             [0u8; 32]
                         } else {
                             local_tip
@@ -3198,29 +3226,51 @@ async fn handle_incoming_with_sybil(
                             start_hash: start_hash.to_vec(),
                             count: MAX_HEADERS_PER_REQUEST,
                         };
-                        let _ = sync_request_allowed_for(
-                            &sync_requests,
-                            addr.ip(),
-                            local_height,
-                            payload.height,
-                        )
-                        .await;
                         let short = if start_hash == [0u8; 32] {
                             "genesis".to_string()
                         } else {
                             let h = hex::encode(start_hash);
                             h.get(0..12).unwrap_or(&h).to_string()
                         };
-                        P2PNode::log_event(
-                            "info",
-                            "sync",
-                            format!(
-                                "P2P {}: peer ahead ({} > {}), requesting headers from tip {}",
-                                addr, payload.height, local_height, short
-                            ),
-                        );
-                        if let Ok(msg) = get_headers.to_message() {
-                            let _ = send_message(&writer, msg, addr).await;
+
+                        let mut allowed = sync_request_allowed_for(
+                            &sync_requests,
+                            addr.ip(),
+                            local_height,
+                            payload.height,
+                        )
+                        .await;
+                        if allowed {
+                            let (last_req, last_start) = {
+                                let guard = peer_state.lock().await;
+                                (guard.last_headers_request, guard.last_headers_start)
+                            };
+                            if let Some(ts) = last_req {
+                                if ts.elapsed() < headers_request_cooldown()
+                                    && last_start == Some(start_hash)
+                                {
+                                    allowed = false;
+                                }
+                            }
+                        }
+
+                        if allowed {
+                            P2PNode::log_event(
+                                "info",
+                                "sync",
+                                format!(
+                                    "P2P {}: peer ahead ({} > {}), requesting headers from tip {}",
+                                    addr, payload.height, local_height, short
+                                ),
+                            );
+                            if let Ok(msg) = get_headers.to_message() {
+                                let _ = send_message(&writer, msg, addr).await;
+                            }
+                            {
+                                let mut state = peer_state.lock().await;
+                                state.last_headers_request = Some(Instant::now());
+                                state.last_headers_start = Some(start_hash);
+                            }
                         }
                     } else if payload.height < local_height {
                         // Peer is behind; send headers and fall back to block push if needed.
