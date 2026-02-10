@@ -146,7 +146,8 @@ fn save_wallet(path: &Path, wallet: &WalletFile) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create wallet dir: {e}"))?;
     }
-    let data = serde_json::to_string_pretty(wallet).map_err(|e| format!("serialize wallet: {e}"))?;
+    let data =
+        serde_json::to_string_pretty(wallet).map_err(|e| format!("serialize wallet: {e}"))?;
     fs::write(path, data).map_err(|e| format!("write wallet: {e}"))?;
     #[cfg(unix)]
     {
@@ -201,13 +202,13 @@ fn usage() {
 }
 
 fn node_rpc_base() -> String {
-    env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| node_rpc_base())
+    env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string())
 }
 
 fn default_rpc_url() -> String {
     env::var("IRIUM_NODE_RPC")
         .or_else(|_| env::var("IRIUM_RPC_URL"))
-        .unwrap_or_else(|_| "https://127.0.0.1:38300".to_string())
+        .unwrap_or_else(|_| node_rpc_base())
 }
 
 fn color_enabled() -> bool {
@@ -246,9 +247,7 @@ fn parse_irm(s: &str) -> Result<u64, String> {
     } else {
         0
     };
-    Ok(whole
-        .saturating_mul(100_000_000)
-        .saturating_add(frac))
+    Ok(whole.saturating_mul(100_000_000).saturating_add(frac))
 }
 
 fn estimate_tx_size(inputs: usize, outputs: usize) -> u64 {
@@ -288,7 +287,6 @@ where
     }
 }
 
-
 fn rpc_client(base: &str) -> Result<Client, String> {
     let mut builder = Client::builder().timeout(Duration::from_secs(10));
     let ca_path = env::var("IRIUM_RPC_CA").ok().or_else(|| {
@@ -301,8 +299,8 @@ fn rpc_client(base: &str) -> Result<Client, String> {
     });
     if let Some(path) = ca_path {
         let pem = fs::read(&path).map_err(|e| format!("read CA {path}: {e}"))?;
-        let cert = reqwest::Certificate::from_pem(&pem)
-            .map_err(|e| format!("invalid CA {path}: {e}"))?;
+        let cert =
+            reqwest::Certificate::from_pem(&pem).map_err(|e| format!("invalid CA {path}: {e}"))?;
         builder = builder.add_root_certificate(cert);
     }
     let insecure = env::var("IRIUM_RPC_INSECURE")
@@ -313,12 +311,13 @@ fn rpc_client(base: &str) -> Result<Client, String> {
         })
         .unwrap_or(false);
     if insecure {
-        let url = reqwest::Url::parse(base)
-            .map_err(|e| format!("invalid RPC URL {base}: {e}"))?;
+        let url = reqwest::Url::parse(base).map_err(|e| format!("invalid RPC URL {base}: {e}"))?;
         if url.scheme() != "https" {
             eprintln!("[warn] IRIUM_RPC_INSECURE=1 has no effect on non-HTTPS RPC URL");
         } else {
-            let host = url.host_str().ok_or_else(|| "RPC URL missing host".to_string())?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| "RPC URL missing host".to_string())?;
             if !is_loopback_host(host) {
                 return Err(format!(
                     "Refusing to disable TLS verification for non-local RPC host {host}; set IRIUM_RPC_CA instead"
@@ -384,7 +383,6 @@ fn fetch_balance(client: &Client, base: &str, addr: &str) -> Result<BalanceRespo
         .map_err(|e| format!("parse balance response: {e}"))
 }
 
-
 fn fetch_utxos(client: &Client, base: &str, addr: &str) -> Result<UtxosResponse, String> {
     let resp = send_with_https_fallback(base, |b| {
         let url = format!("{}/rpc/utxos?address={}", b, addr);
@@ -402,8 +400,6 @@ fn fetch_utxos(client: &Client, base: &str, addr: &str) -> Result<UtxosResponse,
     resp.json::<UtxosResponse>()
         .map_err(|e| format!("parse utxos response: {e}"))
 }
-
-
 
 fn fetch_history(client: &Client, base: &str, addr: &str) -> Result<HistoryResponse, String> {
     let resp = send_with_https_fallback(base, |b| {
@@ -423,7 +419,6 @@ fn fetch_history(client: &Client, base: &str, addr: &str) -> Result<HistoryRespo
         .map_err(|e| format!("parse history response: {e}"))
 }
 
-
 fn fetch_fee_estimate(client: &Client, base: &str) -> Result<FeeEstimateResponse, String> {
     let resp = send_with_https_fallback(base, |b| {
         let url = format!("{}/rpc/fee_estimate", b);
@@ -441,7 +436,6 @@ fn fetch_fee_estimate(client: &Client, base: &str) -> Result<FeeEstimateResponse
     resp.json::<FeeEstimateResponse>()
         .map_err(|e| format!("parse fee estimate response: {e}"))
 }
-
 
 fn submit_tx(client: &Client, base: &str, tx: &Transaction) -> Result<(), String> {
     let raw = tx.serialize();
@@ -464,7 +458,6 @@ fn submit_tx(client: &Client, base: &str, tx: &Transaction) -> Result<(), String
     }
     Ok(())
 }
-
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -677,11 +670,7 @@ fn main() {
                 let val = format_irm(utxo.value);
                 println!(
                     "{}:{} {} IRM height {} coinbase {}",
-                    utxo.txid,
-                    utxo.index,
-                    val,
-                    utxo.height,
-                    utxo.is_coinbase
+                    utxo.txid, utxo.index, val, utxo.height, utxo.is_coinbase
                 );
             }
         }
@@ -730,12 +719,7 @@ fn main() {
                 };
                 println!(
                     "{} height {} net {} recv {} spent {} coinbase {}",
-                    item.txid,
-                    item.height,
-                    net,
-                    received,
-                    spent,
-                    item.is_coinbase
+                    item.txid, item.height, net, received, spent, item.is_coinbase
                 );
             }
         }
@@ -768,8 +752,7 @@ fn main() {
             };
             println!(
                 "min_fee_per_byte {} mempool_size {}",
-                payload.min_fee_per_byte,
-                payload.mempool_size
+                payload.min_fee_per_byte, payload.mempool_size
             );
         }
         "send" => {
@@ -786,7 +769,8 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            if base58_p2pkh_to_hash(from_addr).is_none() || base58_p2pkh_to_hash(to_addr).is_none() {
+            if base58_p2pkh_to_hash(from_addr).is_none() || base58_p2pkh_to_hash(to_addr).is_none()
+            {
                 eprintln!("Invalid address or checksum");
                 std::process::exit(1);
             }
