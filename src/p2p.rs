@@ -267,7 +267,7 @@ async fn maybe_request_sync(
         Some(h) => h,
         None => return,
     };
-    let (local_height, local_tip, peer_tip_on_main) = match chain {
+    let (local_height, local_tip, _peer_tip_on_main) = match chain {
         Some(c) => {
             let guard = c.lock().unwrap();
             let local_height = guard.tip_height();
@@ -297,7 +297,7 @@ async fn maybe_request_sync(
         return;
     }
 
-    let start_hash = if local_height == 0 || !peer_tip_on_main || tip_mismatch {
+    let start_hash = if local_height == 0 || tip_mismatch {
         [0u8; 32]
     } else {
         local_tip
@@ -2166,10 +2166,7 @@ impl P2PNode {
                                     guard.tip_height()
                                 };
                                 let peer_height = last_handshake_height.unwrap_or(local_height);
-                                if !added_any
-                                    && peer_height > local_height
-                                    && header_count < MAX_HEADERS_PER_REQUEST
-                                {
+                                if header_count == 0 && peer_height > local_height {
                                     if sync_request_allowed_for(
                                         &sync_requests,
                                         addr.ip(),
@@ -2212,7 +2209,11 @@ impl P2PNode {
                                                     .get(first_hash)
                                                     .map(|hw| hw.header.prev_hash)
                                                     .unwrap_or([0u8; 32]);
-                                                let count = path.len() as u32;
+                                                let count = std::cmp::min(
+                                                    path.len(),
+                                                    MAX_BLOCKS_PER_REQUEST as usize,
+                                                )
+                                                    as u32;
                                                 if count > 0 {
                                                     Some((start_hash, count))
                                                 } else {
@@ -3570,10 +3571,7 @@ async fn handle_incoming_with_sybil(
                             guard.tip_height()
                         };
                         let peer_height = last_handshake_height.unwrap_or(local_height);
-                        if !added_any
-                            && peer_height > local_height
-                            && header_count < MAX_HEADERS_PER_REQUEST
-                        {
+                        if header_count == 0 && peer_height > local_height {
                             if sync_request_allowed_for(
                                 &sync_requests,
                                 addr.ip(),
@@ -3614,7 +3612,11 @@ async fn handle_incoming_with_sybil(
                                             .get(first_hash)
                                             .map(|hw| hw.header.prev_hash)
                                             .unwrap_or([0u8; 32]);
-                                        let count = path.len() as u32;
+                                        let count = std::cmp::min(
+                                            path.len(),
+                                            MAX_BLOCKS_PER_REQUEST as usize,
+                                        )
+                                            as u32;
                                         if count > 0 {
                                             Some((start_hash, count))
                                         } else {
