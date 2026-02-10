@@ -1108,6 +1108,7 @@ impl P2PNode {
                                 agent_peer,
                                 relay_peer,
                                 node_id_peer,
+                                trusted,
                             )
                             .await
                             {
@@ -3125,6 +3126,7 @@ async fn handle_incoming_with_sybil(
     agent: String,
     relay_address: Option<String>,
     node_id: Vec<u8>,
+    trusted_seed: bool,
 ) -> Result<(), String> {
     let local_node_id = hex::encode(&node_id);
     let local_node_id_bytes = node_id.clone();
@@ -3140,7 +3142,7 @@ async fn handle_incoming_with_sybil(
         rep.banned_count() as u8
     };
     let bump = P2PNode::sybil_banned_bump(banned);
-    let difficulty = std::cmp::min(max, base.saturating_add(bump));
+    let difficulty = if trusted_seed { base } else { std::cmp::min(max, base.saturating_add(bump)) };
     let handshake = SybilResistantHandshake::new(difficulty);
     let challenge = handshake.create_challenge();
     let challenge_bytes = challenge.to_bytes();
