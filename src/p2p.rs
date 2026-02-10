@@ -1026,6 +1026,13 @@ impl P2PNode {
                     Ok((socket, addr)) => {
                         let ip = addr.ip();
                         let trusted = trusted_seed_ips.contains(&ip);
+                        if trusted {
+                            let guard = connected.lock().await;
+                            if guard.iter().any(|a| a.ip() == ip) {
+                                // Avoid seed<->seed connection storms (same IP, many ephemeral ports).
+                                continue;
+                            }
+                        }
                         let dynamic_bans_check = dynamic_bans.clone();
                         if banned_ips.contains(&ip)
                             || (!trusted
@@ -3142,7 +3149,11 @@ async fn handle_incoming_with_sybil(
         rep.banned_count() as u8
     };
     let bump = P2PNode::sybil_banned_bump(banned);
-    let difficulty = if trusted_seed { base } else { std::cmp::min(max, base.saturating_add(bump)) };
+    let difficulty = if trusted_seed {
+        base
+    } else {
+        std::cmp::min(max, base.saturating_add(bump))
+    };
     let handshake = SybilResistantHandshake::new(difficulty);
     let challenge = handshake.create_challenge();
     let challenge_bytes = challenge.to_bytes();
