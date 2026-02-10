@@ -111,6 +111,16 @@ fn trusted_seed_inbound_cooldown_secs() -> u64 {
     })
 }
 
+fn trusted_seed_should_dial(local_ip: IpAddr, remote_ip: IpAddr) -> bool {
+    // Deterministic tie-break for official trusted seeds to prevent bidirectional dial storms.
+    // Rule: the lower IP dials, the higher IP accepts.
+    match (local_ip, remote_ip) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => u32::from(a) < u32::from(b),
+        // Fall back to a stable textual order for non-IPv4 (shouldn't happen for mainnet seeds).
+        (a, b) => a.to_string() < b.to_string(),
+    }
+}
+
 async fn sync_request_allowed_for(
     sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
     ip: IpAddr,
@@ -1038,9 +1048,17 @@ impl P2PNode {
                         let ip = addr.ip();
                         let trusted = trusted_seed_ips.contains(&ip);
                         if trusted {
+                            if let Ok(local_addr) = socket.local_addr() {
+                                let local_ip = local_addr.ip();
+                                if trusted_seed_should_dial(local_ip, ip) {
+                                    // Deterministic tie-break: lower IP dials, higher IP accepts.
+                                    // Prevents bidirectional trusted-seed connection storms.
+                                    continue;
+                                }
+                            }
                             let guard = connected.lock().await;
                             if guard.iter().any(|a| a.ip() == ip) {
-                                // Avoid seed<->seed connection storms (same IP, many ephemeral ports).
+                                // Avoid multiple concurrent connections from the same trusted seed IP.
                                 continue;
                             }
                         }
@@ -1324,6 +1342,11 @@ impl P2PNode {
         let base_secs = outbound_dial_base_secs();
         let max_secs = outbound_dial_max_secs();
         let banned_secs = outbound_dial_banned_secs();
+        if err.contains("trusted seed: prefer inbound") {
+            let mut guard = self.outbound_dial_backoff.lock().await;
+            guard.insert(ip, (1, Instant::now() + Duration::from_secs(banned_secs)));
+            return;
+        }
         let mut guard = self.outbound_dial_backoff.lock().await;
         let (fails, _) = guard.get(&ip).copied().unwrap_or((0, Instant::now()));
         let next = fails.saturating_add(1);
@@ -1562,6 +1585,21 @@ impl P2PNode {
                 return Err(msg);
             }
         };
+
+        let trusted_seed = self.trusted_seed_ips.contains(&ip);
+        if trusted_seed {
+            if let Ok(local_addr) = stream.local_addr() {
+                let local_ip = local_addr.ip();
+                if !trusted_seed_should_dial(local_ip, ip) {
+                    // We are the higher IP: prefer inbound-only for this trusted seed.
+                    // This avoids seed<->seed double connections where both sides dial and then drop.
+                    let _ = stream.shutdown().await;
+                    self.record_outbound_dial_failure(ip, "trusted seed: prefer inbound")
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
 
         // Check reputation before keeping a long-lived connection.
         {
