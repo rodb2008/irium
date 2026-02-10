@@ -22,7 +22,6 @@ fn now_secs() -> f64 {
         .as_secs_f64()
 }
 
-
 fn now_day() -> i64 {
     (now_secs() / 86_400.0).floor() as i64
 }
@@ -142,7 +141,7 @@ impl SeedlistManager {
         std::env::var("IRIUM_RUNTIME_SEED_DAYS")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(7)
+            .unwrap_or(2)
             .clamp(1, 30)
     }
 
@@ -359,11 +358,7 @@ impl PeerDirectory {
                 let seen_days = obj
                     .get("seen_days")
                     .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_i64())
-                            .collect::<Vec<i64>>()
-                    })
+                    .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<i64>>())
                     .unwrap_or_default();
                 let first_seen = obj
                     .get("first_seen")
