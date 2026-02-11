@@ -25,7 +25,13 @@ async fn main() {
     // Build minimal chain + mempool context so peer handshakes can advertise height
     // and accept transaction inventory.
     let locked = load_locked_genesis().expect("load locked genesis");
-    let block = block_from_locked(&locked);
+    let block = match block_from_locked(&locked) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to build genesis block from locked config: {e}");
+            return;
+        }
+    };
     let pow_limit = Target { bits: 0x1d00_ffff };
     let params = ChainParams {
         genesis_block: block,
@@ -50,7 +56,7 @@ async fn main() {
     println!(
         "[{}] 🔗 chain initialized at height {}",
         Utc::now().format("%H:%M:%S"),
-        chain.lock().unwrap().tip_height()
+        chain.lock().unwrap_or_else(|e| e.into_inner()).tip_height()
     );
 
     let node = P2PNode::new(
@@ -78,7 +84,10 @@ async fn main() {
         let node_clone = node.clone();
         tokio::spawn(async move {
             for addr in seeds {
-                let h = chain_clone.lock().unwrap().tip_height();
+                let h = chain_clone
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .tip_height();
                 if let Err(e) = node_clone
                     .connect_and_handshake(addr, h, &agent_clone)
                     .await
@@ -94,7 +103,7 @@ async fn main() {
     tokio::spawn(async move {
         loop {
             let peers = node_clone.peers_snapshot().await;
-            let height = chain.lock().unwrap().tip_height();
+            let height = chain.lock().unwrap_or_else(|e| e.into_inner()).tip_height();
             let seeds = irium_node_rs::network::SeedlistManager::new(128).merged_seedlist();
             println!(
                 "[{}] 🔁 height={} peers={} seeds={} [{}]",

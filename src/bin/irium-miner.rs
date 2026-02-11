@@ -4,18 +4,21 @@ use reqwest::StatusCode;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, fs, sync::OnceLock};
 
 use bs58;
 use chrono::Utc;
+use num_bigint::BigUint;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use num_bigint::BigUint;
 
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
@@ -45,7 +48,9 @@ fn load_env_file(path: &str) -> bool {
             continue;
         }
         let mut val = value.trim().to_string();
-        if (val.starts_with('"') && val.ends_with('"')) || (val.starts_with('\'') && val.ends_with('\'')) {
+        if (val.starts_with('"') && val.ends_with('"'))
+            || (val.starts_with('\'') && val.ends_with('\''))
+        {
             val = val[1..val.len() - 1].to_string();
         }
         env::set_var(key, val);
@@ -260,10 +265,6 @@ fn miner_address_info() -> Option<(String, Vec<u8>)> {
     None
 }
 
-
-
-
-
 fn miner_pubkey_hash() -> Option<Vec<u8>> {
     miner_address_info().map(|(_, pkh)| pkh)
 }
@@ -357,7 +358,11 @@ fn mempool_entries_from_template(
         }
         let fee = tx.fee.unwrap_or(0);
         let size = raw.len();
-        let fee_per_byte = if size > 0 { fee as f64 / size as f64 } else { 0.0 };
+        let fee_per_byte = if size > 0 {
+            fee as f64 / size as f64
+        } else {
+            0.0
+        };
         out.push(irium_node_rs::mempool::MempoolEntry {
             tx: tx_obj,
             raw,
@@ -461,7 +466,6 @@ struct SubmitBlockRequest {
     tx_hex: Vec<String>,
 }
 
-
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
@@ -470,8 +474,7 @@ fn rpc_client() -> Result<Client, String> {
     let mut builder = Client::builder().timeout(Duration::from_secs(5));
     if let Ok(path) = env::var("IRIUM_RPC_CA") {
         let pem = fs::read(&path).map_err(|e| format!("read CA {path}: {e}"))?;
-        let cert = Certificate::from_pem(&pem)
-            .map_err(|e| format!("invalid CA {path}: {e}"))?;
+        let cert = Certificate::from_pem(&pem).map_err(|e| format!("invalid CA {path}: {e}"))?;
         builder = builder.add_root_certificate(cert);
     }
     let insecure = env::var("IRIUM_RPC_INSECURE")
@@ -491,12 +494,13 @@ fn rpc_client() -> Result<Client, String> {
     let base = node_rpc_base();
     let mut allow_insecure = false;
     if !strict && insecure {
-        let url = reqwest::Url::parse(&base)
-            .map_err(|e| format!("invalid RPC URL {base}: {e}"))?;
+        let url = reqwest::Url::parse(&base).map_err(|e| format!("invalid RPC URL {base}: {e}"))?;
         if url.scheme() != "https" {
             eprintln!("[warn] IRIUM_RPC_INSECURE=1 has no effect on non-HTTPS RPC URL");
         } else {
-            let host = url.host_str().ok_or_else(|| "RPC URL missing host".to_string())?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| "RPC URL missing host".to_string())?;
             if !is_loopback_host(host) {
                 return Err(format!(
                     "Refusing to disable TLS verification for non-local RPC host {host}; set IRIUM_RPC_CA instead"
@@ -562,7 +566,11 @@ fn miner_thread_count() -> usize {
         }
     }
     let n = threads.unwrap_or(1);
-    if n == 0 { 1 } else { n }
+    if n == 0 {
+        1
+    } else {
+        n
+    }
 }
 
 fn is_tls_mismatch(err: &str) -> bool {
@@ -616,7 +624,6 @@ where
     }
 }
 
-
 fn submit_block_to_node(height: u64, block: &Block) -> Result<(), String> {
     let header = &block.header;
     let hash = header.hash();
@@ -653,9 +660,7 @@ fn submit_block_to_node_with_base(
     if let Some(token) = rpc_token() {
         req = req.bearer_auth(token);
     }
-    let resp = req
-        .send()
-        .map_err(|e| format!("submit failed: {e}"))?;
+    let resp = req.send().map_err(|e| format!("submit failed: {e}"))?;
 
     if !resp.status().is_success() {
         return Err(rpc_status_error("submit failed", resp.status()));
@@ -717,11 +722,20 @@ fn load_persisted_blocks(state: &mut ChainState) {
                     Some(v) => v,
                     None => continue,
                 };
-                let version = header_obj.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                let version = header_obj
+                    .get("version")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as u32;
                 let time = header_obj.get("time").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
-                let bits_str = header_obj.get("bits").and_then(|v| v.as_str()).unwrap_or("1d00ffff");
+                let bits_str = header_obj
+                    .get("bits")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("1d00ffff");
                 let bits = u32::from_str_radix(bits_str, 16).unwrap_or(0x1d00_ffff);
-                let nonce = header_obj.get("nonce").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+                let nonce = header_obj
+                    .get("nonce")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as u32;
 
                 let txs = match parsed.get("tx_hex").and_then(|v| v.as_array()) {
                     Some(arr) => {
@@ -772,11 +786,13 @@ fn load_persisted_blocks(state: &mut ChainState) {
                 json!({"event": "resume_height", "height": state.tip_height(), "ts": Utc::now().format("%H:%M:%S").to_string()})
             );
         } else {
-            println!("[↩️] Resumed chain height {} from persisted blocks", state.height);
+            println!(
+                "[↩️] Resumed chain height {} from persisted blocks",
+                state.height
+            );
         }
     }
 }
-
 
 fn node_http_client() -> Result<Client, String> {
     rpc_client()
@@ -840,14 +856,11 @@ fn fetch_block_template_with_base(
     if let Some(token) = rpc_token() {
         req = req.bearer_auth(token);
     }
-    let resp = req
-        .send()
-        .map_err(|e| format!("template failed: {e}"))?;
+    let resp = req.send().map_err(|e| format!("template failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(rpc_status_error("template failed", resp.status()));
     }
-    resp.json()
-        .map_err(|e| format!("template parse: {e}"))
+    resp.json().map_err(|e| format!("template parse: {e}"))
 }
 
 fn fetch_block_json(client: &Client, height: u64) -> Result<serde_json::Value, String> {
@@ -859,7 +872,7 @@ fn fetch_block_json_with_base(
     base: &str,
     height: u64,
 ) -> Result<serde_json::Value, String> {
-    let url = format!("{}/rpc/block?height={}", base.trim_end_matches('/') , height);
+    let url = format!("{}/rpc/block?height={}", base.trim_end_matches('/'), height);
     let mut req = client.get(url);
     if let Some(token) = rpc_token() {
         req = req.bearer_auth(token);
@@ -868,7 +881,10 @@ fn fetch_block_json_with_base(
         .send()
         .map_err(|e| format!("get block {height} failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(rpc_status_error(&format!("get block {height} failed"), resp.status()));
+        return Err(rpc_status_error(
+            &format!("get block {height} failed"),
+            resp.status(),
+        ));
     }
     resp.json()
         .map_err(|e| format!("block {height} parse: {e}"))
@@ -901,9 +917,7 @@ fn fetch_best_peer_height(client: &Client) -> Result<Option<u64>, String> {
         if !resp.status().is_success() {
             return Err(rpc_status_error("peers failed", resp.status()));
         }
-        let data: PeersResponse = resp
-            .json()
-            .map_err(|e| format!("peers parse: {e}"))?;
+        let data: PeersResponse = resp.json().map_err(|e| format!("peers parse: {e}"))?;
         Ok(data.peers.iter().filter_map(|p| p.height).max())
     })
 }
@@ -930,8 +944,7 @@ fn guard_miner_sync(client: &Client, local_tip: u64) -> Result<bool, String> {
             } else {
                 println!(
                     "[guard] Node behind network (local {} < peer {}); waiting...",
-                    local_tip,
-                    peer_height
+                    local_tip, peer_height
                 );
             }
             return Ok(false);
@@ -966,10 +979,7 @@ fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Res
         .get("version")
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as u32;
-    let time = header_obj
-        .get("time")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0) as u32;
+    let time = header_obj.get("time").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
     let bits_str = header_obj
         .get("bits")
         .and_then(|v| v.as_str())
@@ -1011,7 +1021,12 @@ fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Res
     state.connect_block(block).map(|_| ())
 }
 
-fn reconcile_with_template(state: &mut ChainState, params: &ChainParams, template: &BlockTemplate, client: &Client) {
+fn reconcile_with_template(
+    state: &mut ChainState,
+    params: &ChainParams,
+    template: &BlockTemplate,
+    client: &Client,
+) {
     let remote_tip = template.height.saturating_sub(1);
     let prev_bytes = match hex::decode(&template.prev_hash) {
         Ok(v) => v,
@@ -1021,7 +1036,10 @@ fn reconcile_with_template(state: &mut ChainState, params: &ChainParams, templat
         }
     };
     if prev_bytes.len() != 32 {
-        eprintln!("[warn] Miner template prev_hash length {} != 32", prev_bytes.len());
+        eprintln!(
+            "[warn] Miner template prev_hash length {} != 32",
+            prev_bytes.len()
+        );
         return;
     }
     let mut remote_prev = [0u8; 32];
@@ -1036,7 +1054,11 @@ fn reconcile_with_template(state: &mut ChainState, params: &ChainParams, templat
 
     if local_tip > 0 {
         if let Ok(v) = fetch_block_json(client, local_tip) {
-            if let Some(remote_hash) = v.get("header").and_then(|h| h.get("hash")).and_then(|v| v.as_str()) {
+            if let Some(remote_hash) = v
+                .get("header")
+                .and_then(|h| h.get("hash"))
+                .and_then(|v| v.as_str())
+            {
                 let local_hex = hex::encode(local_hash);
                 if remote_hash != local_hex {
                     eprintln!(
@@ -1073,8 +1095,7 @@ fn reconcile_with_template(state: &mut ChainState, params: &ChainParams, templat
         if !allow_ahead {
             eprintln!(
                 "[warn] Miner ahead of node (local {} > remote {}), resetting to node",
-                local_tip,
-                remote_tip
+                local_tip, remote_tip
             );
             prune_blocks_above(remote_tip);
             *state = ChainState::new(params.clone());
@@ -1091,8 +1112,7 @@ fn reconcile_with_template(state: &mut ChainState, params: &ChainParams, templat
     let target = remote_tip;
     println!(
         "[sync] Miner downloading blocks {}..{} from node",
-        start,
-        target
+        start, target
     );
 
     for h in start..=target {
@@ -1122,7 +1142,10 @@ fn reconcile_with_template(state: &mut ChainState, params: &ChainParams, templat
             target
         );
     } else {
-        println!("[ok] Miner caught up to node at height {}", state.tip_height());
+        println!(
+            "[ok] Miner caught up to node at height {}",
+            state.tip_height()
+        );
     }
 }
 
@@ -1163,7 +1186,12 @@ fn template_changed(client: &Client, height: u64, prev_hash: &str) -> bool {
     }
 }
 
-fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client, threads: usize) -> Result<bool, String> {
+fn mine_once(
+    chain: &mut ChainState,
+    template: &BlockTemplate,
+    client: &Client,
+    threads: usize,
+) -> Result<bool, String> {
     let height = template.height; // next block height
     if chain.height != height {
         return Err(format!(
@@ -1172,13 +1200,10 @@ fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client, 
         ));
     }
 
-    let prev_bytes = hex::decode(&template.prev_hash)
-        .map_err(|e| format!("template prev_hash decode: {e}"))?;
+    let prev_bytes =
+        hex::decode(&template.prev_hash).map_err(|e| format!("template prev_hash decode: {e}"))?;
     if prev_bytes.len() != 32 {
-        return Err(format!(
-            "template prev_hash len {} != 32",
-            prev_bytes.len()
-        ));
+        return Err(format!("template prev_hash len {} != 32", prev_bytes.len()));
     }
     let mut prev_hash = [0u8; 32];
     prev_hash.copy_from_slice(&prev_bytes);
@@ -1361,7 +1386,7 @@ fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client, 
                 let h = block.header.hash();
                 if meets_target(&h, target) {
                     if !found.swap(true, Ordering::SeqCst) {
-                        let mut guard = result.lock().unwrap();
+                        let mut guard = result.lock().unwrap_or_else(|e| e.into_inner());
                         *guard = Some((block.clone(), h, nonce));
                     }
                     stop.store(true, Ordering::Relaxed);
@@ -1445,7 +1470,7 @@ fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client, 
         let _ = handle.join();
     }
 
-    if let Some((block, h, nonce)) = result.lock().unwrap().take() {
+    if let Some((block, h, nonce)) = result.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let elapsed = start.elapsed().as_secs_f64();
         let attempts_total = attempts.load(Ordering::Relaxed);
         if json_log_enabled() {
@@ -1480,14 +1505,20 @@ fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client, 
         match submit_block_to_node(height as u64, &block) {
             Ok(_) => {
                 if json_log_enabled() {
-                    println!("{}", json!({"event": "submit_block", "height": height, "status": "accepted"}));
+                    println!(
+                        "{}",
+                        json!({"event": "submit_block", "height": height, "status": "accepted"})
+                    );
                 } else {
                     println!("[✅] Block accepted by node at height {}", height);
                 }
             }
             Err(e) => {
                 if json_log_enabled() {
-                    eprintln!("{}", json!({"event": "submit_block_failed", "height": height, "error": e}));
+                    eprintln!(
+                        "{}",
+                        json!({"event": "submit_block_failed", "height": height, "error": e})
+                    );
                 } else {
                     eprintln!("[❌] Block rejected at height {}: {}", height, e);
                 }
@@ -1500,9 +1531,7 @@ fn mine_once(chain: &mut ChainState, template: &BlockTemplate, client: &Client, 
         return Ok(false);
     }
     Ok(false)
-
 }
-
 
 #[derive(Clone)]
 struct StratumJob {
@@ -1548,9 +1577,12 @@ fn stratum_normalize_url(url: &str) -> String {
 }
 
 fn stratum_send(writer: &Mutex<TcpStream>, value: &serde_json::Value) -> Result<(), String> {
-    let mut stream = writer.lock().unwrap();
-    let line = format!("{}
-", value.to_string());
+    let mut stream = writer.lock().unwrap_or_else(|e| e.into_inner());
+    let line = format!(
+        "{}
+",
+        value.to_string()
+    );
     stream
         .write_all(line.as_bytes())
         .map_err(|e| format!("stratum send: {e}"))
@@ -1596,12 +1628,10 @@ fn merkle_root_from_stratum(
         "{}{}{}{}",
         job.coinbase1, extranonce1, extranonce2, job.coinbase2
     );
-    let coinbase = hex::decode(&coinbase_hex)
-        .map_err(|e| format!("coinbase decode: {e}"))?;
+    let coinbase = hex::decode(&coinbase_hex).map_err(|e| format!("coinbase decode: {e}"))?;
     let mut merkle = sha256d(&coinbase);
     for branch in &job.merkle_branch {
-        let branch_bytes = hex::decode(branch)
-            .map_err(|e| format!("merkle branch decode: {e}"))?;
+        let branch_bytes = hex::decode(branch).map_err(|e| format!("merkle branch decode: {e}"))?;
         let mut data = Vec::with_capacity(64);
         data.extend_from_slice(&merkle);
         data.extend_from_slice(&branch_bytes);
@@ -1633,20 +1663,23 @@ fn stratum_reader(
         match (method, params) {
             (Some("mining.set_difficulty"), Some(p)) => {
                 if let Some(diff) = p.get(0).and_then(|v| v.as_f64()) {
-                    let mut guard = state.lock().unwrap();
+                    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
                     guard.difficulty = diff;
                     guard.target = None;
                 }
             }
             (Some("mining.set_target"), Some(p)) => {
                 if let Some(t) = p.get(0).and_then(|v| v.as_str()) {
-                    let mut guard = state.lock().unwrap();
+                    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
                     guard.target = stratum_target_from_hex(t);
                 }
             }
             (Some("mining.set_extranonce"), Some(p)) => {
-                if let (Some(en1), Some(size)) = (p.get(0).and_then(|v| v.as_str()), p.get(1).and_then(|v| v.as_u64())) {
-                    let mut guard = state.lock().unwrap();
+                if let (Some(en1), Some(size)) = (
+                    p.get(0).and_then(|v| v.as_str()),
+                    p.get(1).and_then(|v| v.as_u64()),
+                ) {
+                    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
                     guard.extranonce1 = en1.to_string();
                     guard.extranonce2_size = size as usize;
                 }
@@ -1671,7 +1704,7 @@ fn stratum_reader(
                         ntime: p[7].as_str().unwrap_or("").to_string(),
                         _clean_jobs: p[8].as_bool().unwrap_or(false),
                     };
-                    let mut guard = state.lock().unwrap();
+                    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
                     guard.job = Some(job);
                     job_version.fetch_add(1, Ordering::SeqCst);
                 }
@@ -1692,8 +1725,7 @@ fn mine_stratum_job(
     job_version: u64,
     job_version_ref: &AtomicU64,
 ) -> Result<bool, String> {
-    let prev_bytes = hex::decode(&job.prev_hash)
-        .map_err(|e| format!("prev_hash decode: {e}"))?;
+    let prev_bytes = hex::decode(&job.prev_hash).map_err(|e| format!("prev_hash decode: {e}"))?;
     if prev_bytes.len() != 32 {
         return Err(format!("prev_hash len {} != 32", prev_bytes.len()));
     }
@@ -1733,7 +1765,10 @@ fn mine_stratum_job(
             });
             let _ = stratum_send(writer, &submit);
             if hash_value <= network_target {
-                println!("[🏁] Stratum share meets network target at height? hash={}", hex::encode(hash));
+                println!(
+                    "[🏁] Stratum share meets network target at height? hash={}",
+                    hex::encode(hash)
+                );
             }
         }
         nonce = nonce.wrapping_add(1);
@@ -1759,11 +1794,16 @@ fn run_stratum_miner() -> Result<(), String> {
         None => return Err("IRIUM_STRATUM_URL not set".to_string()),
     };
     let addr = stratum_normalize_url(&url);
-    let stream = TcpStream::connect(&addr)
-        .map_err(|e| format!("stratum connect: {e}"))?;
+    let stream = TcpStream::connect(&addr).map_err(|e| format!("stratum connect: {e}"))?;
     let _ = stream.set_nodelay(true);
     let writer = Arc::new(Mutex::new(stream));
-    let mut reader = BufReader::new(writer.lock().unwrap().try_clone().map_err(|e| e.to_string())?);
+    let mut reader = BufReader::new(
+        writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_clone()
+            .map_err(|e| e.to_string())?,
+    );
 
     let subscribe = json!({"id": 1, "method": "mining.subscribe", "params": ["irium-miner/0.1"]});
     stratum_send(&writer, &subscribe)?;
@@ -1779,7 +1819,8 @@ fn run_stratum_miner() -> Result<(), String> {
 
     let user = stratum_user();
     let pass = stratum_pass();
-    let auth = json!({"id": 2, "method": "mining.authorize", "params": [user.clone(), pass.clone()]});
+    let auth =
+        json!({"id": 2, "method": "mining.authorize", "params": [user.clone(), pass.clone()]});
     stratum_send(&writer, &auth)?;
 
     let state = Arc::new(Mutex::new(StratumState {
@@ -1803,13 +1844,18 @@ fn run_stratum_miner() -> Result<(), String> {
 
     loop {
         let (job, extranonce1, extranonce2_size, share_target) = {
-            let guard = state.lock().unwrap();
+            let guard = state.lock().unwrap_or_else(|e| e.into_inner());
             let job = guard.job.clone();
             let share_target = guard
                 .target
                 .clone()
                 .unwrap_or_else(|| stratum_target_from_difficulty(guard.difficulty));
-            (job, guard.extranonce1.clone(), guard.extranonce2_size, share_target)
+            (
+                job,
+                guard.extranonce1.clone(),
+                guard.extranonce2_size,
+                share_target,
+            )
         };
 
         let job = match job {
@@ -1858,14 +1904,23 @@ fn main() {
     let loaded_env = load_env_file("/etc/irium/miner.env");
     if loaded_env {
         if json_log_enabled() {
-            println!("{}", json!({"event": "env_loaded", "path": "/etc/irium/miner.env", "ts": Utc::now().format("%H:%M:%S").to_string()}));
+            println!(
+                "{}",
+                json!({"event": "env_loaded", "path": "/etc/irium/miner.env", "ts": Utc::now().format("%H:%M:%S").to_string()})
+            );
         } else {
             println!("[📄] Loaded /etc/irium/miner.env");
         }
     }
     load_env_file("/etc/irium/miner.env");
     let locked = load_locked_genesis().expect("load locked genesis");
-    let block = block_from_locked(&locked);
+    let block = match block_from_locked(&locked) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to build genesis block from locked config: {e}");
+            std::process::exit(1);
+        }
+    };
     let pow_limit = Target { bits: 0x1d00_ffff };
     let params = ChainParams {
         genesis_block: block,
@@ -1880,7 +1935,11 @@ fn main() {
             json!({"event": "miner_start", "height": state.height, "tip_height": state.tip_height(), "ts": Utc::now().format("%H:%M:%S").to_string()})
         );
     } else {
-        println!("[⛏️] Irium Rust miner starting at tip {} (next {})", state.tip_height(), state.height);
+        println!(
+            "[⛏️] Irium Rust miner starting at tip {} (next {})",
+            state.tip_height(),
+            state.height
+        );
     }
 
     // Optionally report anchors digest if anchors.json is available.
@@ -1930,11 +1989,13 @@ fn main() {
 
     let threads = miner_thread_count();
     if json_log_enabled() {
-        println!("{}", json!({"event": "miner_threads", "threads": threads, "ts": Utc::now().format("%H:%M:%S").to_string()}));
+        println!(
+            "{}",
+            json!({"event": "miner_threads", "threads": threads, "ts": Utc::now().format("%H:%M:%S").to_string()})
+        );
     } else {
         println!("[🧵] Mining threads: {}", threads);
     }
-
 
     loop {
         let client = match node_http_client() {
@@ -1992,7 +2053,11 @@ fn main() {
                 json!({"event": "mining_start", "height": state.height, "tip_height": state.tip_height(), "ts": Utc::now().format("%H:%M:%S").to_string()})
             );
         } else {
-            println!("[▶️] Mining next height {} (tip {})", state.height, state.tip_height());
+            println!(
+                "[▶️] Mining next height {} (tip {})",
+                state.height,
+                state.tip_height()
+            );
         }
 
         match mine_once(&mut state, &template, &client, threads) {
@@ -2016,7 +2081,11 @@ fn main() {
                         json!({"event": "mining_failed", "error": e.to_string(), "height": state.height, "tip_height": state.tip_height(), "ts": Utc::now().format("%H:%M:%S").to_string()})
                     );
                 } else {
-                    eprintln!("[⚠️] Mining failed at next height {} (tip {}): {e}", state.height, state.tip_height());
+                    eprintln!(
+                        "[⚠️] Mining failed at next height {} (tip {}): {e}",
+                        state.height,
+                        state.tip_height()
+                    );
                 }
                 if strict_rpc_enabled() {
                     std::process::exit(1);

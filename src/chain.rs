@@ -197,7 +197,6 @@ impl ChainState {
         self.chain.get(height as usize).cloned()
     }
 
-
     pub fn target_for_height(&self, height: u64) -> Target {
         if height == 0 {
             return self.params.genesis_block.header.target();
@@ -933,18 +932,33 @@ fn verify_transaction_signature(
     vk.verify(&digest, &signature).is_ok()
 }
 
-pub fn block_from_locked(gen: &LockedGenesis) -> Block {
+pub fn block_from_locked(gen: &LockedGenesis) -> Result<Block, String> {
     // Decode header fields
     let header = &gen.header;
-    let prev_hash = hex::decode(&header.prev_hash).expect("prev_hash hex");
-    let merkle_root = hex::decode(&header.merkle_root).expect("merkle_root hex");
+    let prev_hash = hex::decode(&header.prev_hash)
+        .map_err(|e| format!("invalid locked genesis prev_hash hex: {e}"))?;
+    let merkle_root = hex::decode(&header.merkle_root)
+        .map_err(|e| format!("invalid locked genesis merkle_root hex: {e}"))?;
+    if prev_hash.len() != 32 {
+        return Err(format!(
+            "invalid locked genesis prev_hash length: expected 32 bytes, got {}",
+            prev_hash.len()
+        ));
+    }
+    if merkle_root.len() != 32 {
+        return Err(format!(
+            "invalid locked genesis merkle_root length: expected 32 bytes, got {}",
+            merkle_root.len()
+        ));
+    }
     let mut prev = [0u8; 32];
     prev.copy_from_slice(&prev_hash);
     let mut merkle = [0u8; 32];
     merkle.copy_from_slice(&merkle_root);
 
-    let bits = u32::from_str_radix(&header.bits.trim_start_matches("0x"), 16)
-        .unwrap_or_else(|_| u32::from_str_radix(header.bits.as_str(), 16).unwrap());
+    let bits = u32::from_str_radix(header.bits.trim_start_matches("0x"), 16)
+        .or_else(|_| u32::from_str_radix(header.bits.as_str(), 16))
+        .map_err(|e| format!("invalid locked genesis bits field '{}': {e}", header.bits))?;
 
     let block_header = BlockHeader {
         version: header.version,
@@ -957,15 +971,16 @@ pub fn block_from_locked(gen: &LockedGenesis) -> Block {
 
     let mut txs: Vec<Transaction> = Vec::new();
     for tx_hex in &gen.transactions {
-        let raw = decode_hex(tx_hex).expect("valid tx hex");
+        let raw = decode_hex(tx_hex)
+            .map_err(|e| format!("invalid locked genesis tx hex '{}': {e}", tx_hex))?;
         let tx = decode_compact_tx(&raw);
         txs.push(tx);
     }
 
-    Block {
+    Ok(Block {
         header: block_header,
         transactions: txs,
-    }
+    })
 }
 
 /// Decode the compact transaction format used in `genesis-locked.json`.

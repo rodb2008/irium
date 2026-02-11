@@ -42,7 +42,6 @@ impl BlockHeader {
 
     /// Deserialize a header from the 80-byte compact encoding.
     #[allow(dead_code)]
-    #[allow(dead_code)]
     pub fn deserialize(raw: &[u8]) -> Result<(Self, usize), String> {
         if raw.len() < 80 {
             return Err("header too short".to_string());

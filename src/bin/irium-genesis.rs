@@ -165,10 +165,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             genesis_value["nonce"] = json!(nonce);
             genesis_value["hash"] = json!(hash_hex.clone());
             genesis_value["merkle_root"] = json!(merkle_hex.clone());
-            fs::write(
-                &genesis_path,
-                serde_json::to_string_pretty(&genesis_value)?,
-            )?;
+            fs::write(&genesis_path, serde_json::to_string_pretty(&genesis_value)?)?;
 
             let anchor_time = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
             let mut anchor_map = BTreeMap::new();
@@ -221,10 +218,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             fs::write(
                 &anchors_path,
                 serde_json::to_string_pretty(&serde_json::Value::Object(
-                    full_map
-                        .into_iter()
-                        .map(|(k, v)| (k, v))
-                        .collect(),
+                    full_map.into_iter().map(|(k, v)| (k, v)).collect(),
                 ))?,
             )?;
 

@@ -34,7 +34,11 @@ pub enum GenesisError {
 pub fn repo_root() -> PathBuf {
     // Prefer the manifest dir if it already contains configs/.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if manifest_dir.join("configs").join("genesis-locked.json").exists() {
+    if manifest_dir
+        .join("configs")
+        .join("genesis-locked.json")
+        .exists()
+    {
         return manifest_dir;
     }
     manifest_dir

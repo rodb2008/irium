@@ -100,6 +100,27 @@ fn inbound_banned_log_cooldown_secs() -> u64 {
     })
 }
 
+fn trusted_seed_inbound_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_TRUSTED_SEED_INBOUND_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(60))
+            .unwrap_or(10)
+    })
+}
+
+fn trusted_seed_should_dial(local_ip: IpAddr, remote_ip: IpAddr) -> bool {
+    // Deterministic tie-break for official trusted seeds to prevent bidirectional dial storms.
+    // Rule: the lower IP dials, the higher IP accepts.
+    match (local_ip, remote_ip) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => u32::from(a) < u32::from(b),
+        // Fall back to a stable textual order for non-IPv4 (shouldn't happen for mainnet seeds).
+        (a, b) => a.to_string() < b.to_string(),
+    }
+}
+
 async fn sync_request_allowed_for(
     sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
     ip: IpAddr,
@@ -326,7 +347,7 @@ async fn maybe_request_sync(
     };
     let (local_height, local_tip, _peer_tip_on_main) = match chain {
         Some(c) => {
-            let guard = c.lock().unwrap();
+            let guard = c.lock().unwrap_or_else(|e| e.into_inner());
             let local_height = guard.tip_height();
             let local_tip = guard.tip_hash();
             let peer_tip_on_main = peer_tip
@@ -609,6 +630,7 @@ async fn record_handshake_failure(
     failures: &Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
     dynamic_bans: &Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     ip: IpAddr,
+    trusted_seed: bool,
 ) -> (u32, bool) {
     let now = Instant::now();
     let window = handshake_fail_window();
@@ -629,9 +651,9 @@ async fn record_handshake_failure(
         }
     };
     let mut banned = false;
-    if count >= handshake_fail_threshold() {
+    if !trusted_seed && count >= handshake_fail_threshold() {
         {
-            let mut guard = dynamic_bans.lock().unwrap();
+            let mut guard = dynamic_bans.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(ip, Instant::now());
         }
         let mut guard = failures.lock().await;
@@ -694,6 +716,8 @@ pub struct P2PNode {
     agent: String,
     relay_address: Option<String>,
     node_id: Vec<u8>,
+    trusted_seed_ips: Arc<HashSet<IpAddr>>,
+
     banned_ips: Arc<HashSet<IpAddr>>,
 }
 
@@ -798,6 +822,19 @@ impl P2PNode {
         Duration::from_secs(bounded)
     }
 
+    fn sybil_challenge_timeout() -> Duration {
+        static DUR: OnceLock<Duration> = OnceLock::new();
+        *DUR.get_or_init(|| {
+            let secs = std::env::var("IRIUM_P2P_SYBIL_CHALLENGE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(30);
+            let bounded = secs.max(5).min(120);
+            Duration::from_secs(bounded)
+        })
+    }
+
     fn is_soft_block_reject(reason: &str) -> bool {
         let msg = reason.to_lowercase();
         msg.contains("duplicate block") || msg.contains("orphan") || msg.contains("unknown parent")
@@ -811,6 +848,9 @@ impl P2PNode {
         if self.banned_ips.contains(ip) {
             return true;
         }
+        if self.trusted_seed_ips.contains(ip) {
+            return false;
+        }
         Self::is_banned_ip(ip, &self.banned_ips, &self.dynamic_bans)
     }
 
@@ -822,7 +862,7 @@ impl P2PNode {
         if static_bans.contains(ip) {
             return true;
         }
-        let mut guard = dynamic_bans.lock().unwrap();
+        let mut guard = dynamic_bans.lock().unwrap_or_else(|e| e.into_inner());
         let expire = Duration::from_secs(600);
         if let Some(ts) = guard.get(ip) {
             if ts.elapsed() < expire {
@@ -835,7 +875,7 @@ impl P2PNode {
 
     fn tip_hash(chain: &Option<Arc<StdMutex<ChainState>>>) -> [u8; 32] {
         if let Some(ref c) = chain {
-            let guard = c.lock().unwrap();
+            let guard = c.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(last) = guard.chain.last() {
                 return last.header.hash();
             }
@@ -858,6 +898,33 @@ impl P2PNode {
             }
             if let Ok(ip) = line.parse::<IpAddr>() {
                 ips.insert(ip);
+            }
+        }
+        Arc::new(ips)
+    }
+
+    fn load_trusted_seed_ips() -> Arc<HashSet<IpAddr>> {
+        // Trusted seeds are bootstrap endpoints we should not temporarily ban due to transient handshake noise.
+        // Static bans still apply.
+        let mut ips: HashSet<IpAddr> = HashSet::new();
+        for path in ["bootstrap/seedlist.txt", "bootstrap/seedlist.extra"] {
+            let data = match fs::read_to_string(path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            for line in data.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let token = line.split_whitespace().next().unwrap_or("");
+                if let Ok(ip) = token.parse::<IpAddr>() {
+                    ips.insert(ip);
+                    continue;
+                }
+                if let Ok(sa) = token.parse::<SocketAddr>() {
+                    ips.insert(sa.ip());
+                }
             }
         }
         Arc::new(ips)
@@ -939,6 +1006,7 @@ impl P2PNode {
             agent,
             relay_address,
             node_id: Self::load_or_create_node_id(),
+            trusted_seed_ips: Self::load_trusted_seed_ips(),
             banned_ips: Self::load_banned_ips(),
         }
     }
@@ -970,6 +1038,7 @@ impl P2PNode {
         let banned_inbound_log = self.banned_inbound_log.clone();
         let self_ips = self.self_ips.clone();
         let dynamic_bans = self.dynamic_bans.clone();
+        let trusted_seed_ips = self.trusted_seed_ips.clone();
         let node_id = self.node_id.clone();
         let banned_ips = self.banned_ips.clone();
 
@@ -978,8 +1047,27 @@ impl P2PNode {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
                         let ip = addr.ip();
+                        let trusted = trusted_seed_ips.contains(&ip);
+                        if trusted {
+                            if let Ok(local_addr) = socket.local_addr() {
+                                let local_ip = local_addr.ip();
+                                if trusted_seed_should_dial(local_ip, ip) {
+                                    // Deterministic tie-break: lower IP dials, higher IP accepts.
+                                    // Prevents bidirectional trusted-seed connection storms.
+                                    continue;
+                                }
+                            }
+                            let guard = connected.lock().await;
+                            if guard.iter().any(|a| a.ip() == ip) {
+                                // Avoid multiple concurrent connections from the same trusted seed IP.
+                                continue;
+                            }
+                        }
                         let dynamic_bans_check = dynamic_bans.clone();
-                        if P2PNode::is_banned_ip(&ip, &banned_ips, &dynamic_bans_check) {
+                        if banned_ips.contains(&ip)
+                            || (!trusted
+                                && P2PNode::is_banned_ip(&ip, &banned_ips, &dynamic_bans_check))
+                        {
                             let cooldown = Duration::from_secs(inbound_banned_log_cooldown_secs());
                             let mut guard = banned_inbound_log.lock().await;
                             let should_log = match guard.get(&ip) {
@@ -1005,9 +1093,19 @@ impl P2PNode {
                             }
                         }
                         let mut log_guard = accept_log.lock().await;
+                        let cooldown = if trusted {
+                            Duration::from_secs(trusted_seed_inbound_cooldown_secs())
+                        } else {
+                            Duration::from_millis(500)
+                        };
                         if let Some(last) = log_guard.get(&ip) {
-                            if last.elapsed() < Duration::from_millis(500) {
-                                Self::log_err(format!("Rejecting inbound {}: rate limit", addr));
+                            if last.elapsed() < cooldown {
+                                if !trusted {
+                                    Self::log_err(format!(
+                                        "Rejecting inbound {}: rate limit",
+                                        addr
+                                    ));
+                                }
                                 continue;
                             }
                         }
@@ -1057,6 +1155,7 @@ impl P2PNode {
                                 agent_peer,
                                 relay_peer,
                                 node_id_peer,
+                                trusted,
                             )
                             .await
                             {
@@ -1064,6 +1163,7 @@ impl P2PNode {
                                     &handshake_failures_for_handshake,
                                     &dynamic_bans_for_handshake,
                                     addr.ip(),
+                                    trusted,
                                 )
                                 .await;
                                 if banned {
@@ -1243,6 +1343,11 @@ impl P2PNode {
         let base_secs = outbound_dial_base_secs();
         let max_secs = outbound_dial_max_secs();
         let banned_secs = outbound_dial_banned_secs();
+        if err.contains("trusted seed: prefer inbound") {
+            let mut guard = self.outbound_dial_backoff.lock().await;
+            guard.insert(ip, (1, Instant::now() + Duration::from_secs(banned_secs)));
+            return;
+        }
         let mut guard = self.outbound_dial_backoff.lock().await;
         let (fails, _) = guard.get(&ip).copied().unwrap_or((0, Instant::now()));
         let next = fails.saturating_add(1);
@@ -1482,6 +1587,21 @@ impl P2PNode {
             }
         };
 
+        let trusted_seed = self.trusted_seed_ips.contains(&ip);
+        if trusted_seed {
+            if let Ok(local_addr) = stream.local_addr() {
+                let local_ip = local_addr.ip();
+                if !trusted_seed_should_dial(local_ip, ip) {
+                    // We are the higher IP: prefer inbound-only for this trusted seed.
+                    // This avoids seed<->seed double connections where both sides dial and then drop.
+                    let _ = stream.shutdown().await;
+                    self.record_outbound_dial_failure(ip, "trusted seed: prefer inbound")
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
+
         // Check reputation before keeping a long-lived connection.
         {
             let peer_id = addr.to_string();
@@ -1498,16 +1618,16 @@ impl P2PNode {
         ));
         // Expect a sybil challenge from the remote and respond with a proof
         // before proceeding with the normal handshake.
-        let challenge_msg = match read_message_with_timeout(&mut stream, Self::peer_timeout()).await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                self.record_outbound_dial_failure(ip, &e).await;
-                let mut rep = self.reputation.lock().await;
-                rep.record_failure(&addr.to_string());
-                return Err(e);
-            }
-        };
+        let challenge_msg =
+            match read_message_with_timeout(&mut stream, Self::sybil_challenge_timeout()).await {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_outbound_dial_failure(ip, &e).await;
+                    let mut rep = self.reputation.lock().await;
+                    rep.record_failure(&addr.to_string());
+                    return Err(e);
+                }
+            };
         if challenge_msg.msg_type != MessageType::SybilChallenge {
             let mut rep = self.reputation.lock().await;
             rep.record_failure(&addr.to_string());
@@ -1524,10 +1644,15 @@ impl P2PNode {
 
         // Bind proof-of-work to a persistent node identity derived from disk.
         let peer_pubkey = self.node_id.clone();
-        let handshake = SybilResistantHandshake::new(challenge.difficulty);
-        let proof = handshake
-            .solve_challenge(challenge, peer_pubkey.to_vec())
-            .map_err(|e| format!("failed to solve sybil challenge: {}", e))?;
+        let difficulty = challenge.difficulty;
+        let pubkey = peer_pubkey.to_vec();
+        let proof = tokio::task::spawn_blocking(move || {
+            let handshake = SybilResistantHandshake::new(difficulty);
+            handshake.solve_challenge(challenge, pubkey)
+        })
+        .await
+        .map_err(|e| format!("failed to join sybil solver: {}", e))?
+        .map_err(|e| format!("failed to solve sybil challenge: {}", e))?;
         let proof_bytes = proof.to_bytes();
         let proof_msg = Message {
             msg_type: MessageType::SybilProof,
@@ -1600,7 +1725,9 @@ impl P2PNode {
         let ping_sync_requests = self.sync_requests.clone();
         let ping_block_requests = self.block_requests.clone();
         tokio::spawn(async move {
-            let interval = P2PNode::ping_interval();
+            let ping_interval = P2PNode::ping_interval();
+            let sync_tick = sync_tick_interval();
+            let mut last_ping = Instant::now();
             let mut last_height = crate::p2p::local_height(&ping_chain);
             let mut last_handshake = Instant::now();
             let mut stalled_heartbeats: u32 = 0;
@@ -1608,17 +1735,20 @@ impl P2PNode {
             let mut recovery_in_progress = false;
             let mut recovery_start_height = last_progress_height;
             loop {
-                tokio::time::sleep(interval).await;
-                let nonce = rand_core::OsRng.next_u64();
-                let ping = PingPayload { nonce };
-                let msg = ping.to_message();
-                if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
-                    P2PNode::log_event(
-                        "warn",
-                        "net",
-                        format!("P2P {}: ping failed: {}", ping_addr, e),
-                    );
-                    break;
+                tokio::time::sleep(sync_tick).await;
+                if last_ping.elapsed() >= ping_interval {
+                    let nonce = rand_core::OsRng.next_u64();
+                    let ping = PingPayload { nonce };
+                    let msg = ping.to_message();
+                    if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
+                        P2PNode::log_event(
+                            "warn",
+                            "net",
+                            format!("P2P {}: ping failed: {}", ping_addr, e),
+                        );
+                        break;
+                    }
+                    last_ping = Instant::now();
                 }
                 let current_height = crate::p2p::local_height(&ping_chain);
                 let handshake_due = last_handshake.elapsed() >= P2PNode::handshake_interval();
@@ -1947,7 +2077,7 @@ impl P2PNode {
                             // Basic header-first sync trigger: if peer is ahead, request blocks.
                             let local_height = {
                                 if let Some(ref c) = chain_for_sync {
-                                    c.lock().unwrap().tip_height()
+                                    c.lock().unwrap_or_else(|e| e.into_inner()).tip_height()
                                 } else {
                                     0
                                 }
@@ -1968,7 +2098,7 @@ impl P2PNode {
                             let _peer_tip_on_main = if let (Some(tip), Some(chain_arc)) =
                                 (peer_tip, chain_for_sync.as_ref())
                             {
-                                let guard = chain_arc.lock().unwrap();
+                                let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some(h) = guard.heights.get(&tip) {
                                     guard
                                         .chain
@@ -1982,7 +2112,7 @@ impl P2PNode {
                                 true
                             };
                             let local_at_peer = if let Some(ref chain_arc) = chain_for_sync {
-                                let guard = chain_arc.lock().unwrap();
+                                let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                 guard
                                     .chain
                                     .get(payload.height as usize)
@@ -2060,7 +2190,8 @@ impl P2PNode {
                                 let behind_height = payload.height;
                                 if let Some(ref chain_arc) = chain_for_sync {
                                     let headers_bytes = {
-                                        let guard = chain_arc.lock().unwrap();
+                                        let guard =
+                                            chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                         let start = if tip_mismatch {
                                             0
                                         } else {
@@ -2098,28 +2229,30 @@ impl P2PNode {
                                             }
                                             guard.insert(fallback_addr.ip(), now);
                                         }
-                                        let (blocks, start_height) =
-                                            if let Some(ref chain_arc) = fallback_chain {
-                                                let guard = chain_arc.lock().unwrap();
-                                                let start_idx =
-                                                    behind_height.saturating_add(1) as usize;
-                                                if start_idx >= guard.chain.len() {
-                                                    (Vec::new(), 0)
-                                                } else {
-                                                    let mut blocks = Vec::new();
-                                                    for b in guard
-                                                        .chain
-                                                        .iter()
-                                                        .skip(start_idx)
-                                                        .take(fallback_blocks_per_burst())
-                                                    {
-                                                        blocks.push(b.serialize());
-                                                    }
-                                                    (blocks, start_idx as u64)
-                                                }
-                                            } else {
+                                        let (blocks, start_height) = if let Some(ref chain_arc) =
+                                            fallback_chain
+                                        {
+                                            let guard =
+                                                chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                            let start_idx =
+                                                behind_height.saturating_add(1) as usize;
+                                            if start_idx >= guard.chain.len() {
                                                 (Vec::new(), 0)
-                                            };
+                                            } else {
+                                                let mut blocks = Vec::new();
+                                                for b in guard
+                                                    .chain
+                                                    .iter()
+                                                    .skip(start_idx)
+                                                    .take(fallback_blocks_per_burst())
+                                                {
+                                                    blocks.push(b.serialize());
+                                                }
+                                                (blocks, start_idx as u64)
+                                            }
+                                        } else {
+                                            (Vec::new(), 0)
+                                        };
                                         if blocks.is_empty() {
                                             return;
                                         }
@@ -2232,7 +2365,7 @@ impl P2PNode {
                         if let Some(ref chain_arc) = chain_for_sync {
                             if let Ok(payload) = GetHeadersPayload::from_message(&msg) {
                                 let headers_bytes = {
-                                    let guard = chain_arc.lock().unwrap();
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
 
                                     let mut start_idx = if guard.chain.len() > 1 { 1 } else { 0 };
                                     let mut start_hash_non_zero = false;
@@ -2304,7 +2437,8 @@ impl P2PNode {
 
                                     let header_hash = header.hash();
                                     {
-                                        let mut guard = chain_arc.lock().unwrap();
+                                        let mut guard =
+                                            chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                         if header.prev_hash == [0u8; 32] {
                                             let genesis_hash =
                                                 guard.params.genesis_block.header.hash();
@@ -2392,7 +2526,7 @@ impl P2PNode {
                                     continue;
                                 }
                                 let local_height = {
-                                    let guard = chain_arc.lock().unwrap();
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.tip_height()
                                 };
                                 let peer_height = last_handshake_height.unwrap_or(local_height);
@@ -2428,7 +2562,7 @@ impl P2PNode {
                                 }
 
                                 let request = {
-                                    let guard = chain_arc.lock().unwrap();
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     if let Some(best) = guard.best_header_if_better() {
                                         if let Some(path) =
                                             guard.header_path_to_known(best.header.hash())
@@ -2460,21 +2594,6 @@ impl P2PNode {
                                     }
                                 };
                                 if let Some((start_hash, count)) = request {
-                                    let short = if start_hash == [0u8; 32] {
-                                        "genesis".to_string()
-                                    } else {
-                                        let h = hex::encode(start_hash);
-                                        h.get(0..12).unwrap_or(&h).to_string()
-                                    };
-                                    P2PNode::log_event(
-                                        "info",
-                                        "sync",
-                                        format!(
-                                            "P2P {}: requesting {} blocks from {}",
-                                            addr, count, short
-                                        ),
-                                    );
-
                                     let short = if start_hash == [0u8; 32] {
                                         "genesis".to_string()
                                     } else {
@@ -2529,7 +2648,7 @@ impl P2PNode {
                                 }
                                 let is_zero = payload.start_hash.iter().all(|b| *b == 0);
                                 let (mut start_idx, mut matched_pos) = {
-                                    let guard = chain_arc.lock().unwrap();
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     let mut start_idx = 0usize;
                                     let mut matched_pos = None;
                                     if payload.start_hash.len() == 32 {
@@ -2551,7 +2670,8 @@ impl P2PNode {
                                 if matched_pos.is_none() && !is_zero {
                                     if let Some(remote_tip) = last_handshake_tip {
                                         let local_tip = {
-                                            let guard = chain_arc.lock().unwrap();
+                                            let guard =
+                                                chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                             guard.tip_hash()
                                         };
                                         if remote_tip != local_tip {
@@ -2598,7 +2718,7 @@ impl P2PNode {
                                     continue;
                                 }
                                 let (blocks, start_height) = {
-                                    let guard = chain_arc.lock().unwrap();
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     let mut blocks = Vec::new();
                                     let mut heights = Vec::new();
                                     let count = payload.count.min(MAX_BLOCKS_PER_REQUEST) as usize;
@@ -2642,7 +2762,8 @@ impl P2PNode {
                                             persist_blocks,
                                             orphan_prev,
                                         ) = {
-                                            let mut guard = chain_arc.lock().unwrap();
+                                            let mut guard =
+                                                chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                             let mut new_height_opt = None;
                                             let mut record_verdict = None;
                                             let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
@@ -2656,7 +2777,9 @@ impl P2PNode {
                                                         short
                                                     ));
                                                     if let Some(ref mem) = mempool_for_sync {
-                                                        let mut mem_guard = mem.lock().unwrap();
+                                                        let mut mem_guard = mem
+                                                            .lock()
+                                                            .unwrap_or_else(|e| e.into_inner());
                                                         for tx in block.transactions.iter().skip(1)
                                                         {
                                                             mem_guard.remove(&tx.txid());
@@ -2781,7 +2904,9 @@ impl P2PNode {
                                     {
                                         let inv_bytes = {
                                             let fee = {
-                                                let guard = chain_arc.lock().unwrap();
+                                                let guard = chain_arc
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
                                                 match guard.calculate_fees(&tx) {
                                                     Ok(f) => f,
                                                     Err(e) => {
@@ -2797,7 +2922,8 @@ impl P2PNode {
                                                 let dir = dir.lock().await;
                                                 dir.relay_address_for_peer(&addr)
                                             };
-                                            let mut mem_guard = mem.lock().unwrap();
+                                            let mut mem_guard =
+                                                mem.lock().unwrap_or_else(|e| e.into_inner());
                                             let peer_addr = addr.to_string();
                                             let txid = tx.txid();
                                             let txid_hex = hex::encode(txid);
@@ -2874,7 +3000,7 @@ impl P2PNode {
                             if let Ok(inv) = InvPayload::from_message(&msg) {
                                 let mut needed = Vec::new();
                                 {
-                                    let guard = mem.lock().unwrap();
+                                    let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                                     for txid_hex in inv.txids {
                                         if let Ok(bytes) = hex::decode(&txid_hex) {
                                             if bytes.len() == 32 {
@@ -2901,7 +3027,7 @@ impl P2PNode {
                             if let Ok(gd) = GetDataPayload::from_message(&msg) {
                                 let mut responses: Vec<Message> = Vec::new();
                                 {
-                                    let guard = mem.lock().unwrap();
+                                    let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                                     for txid_hex in gd.txids {
                                         if let Ok(bytes) = hex::decode(&txid_hex) {
                                             if bytes.len() != 32 {
@@ -2925,7 +3051,7 @@ impl P2PNode {
                     MessageType::Mempool => {
                         if let Some(ref mem) = mempool_for_sync {
                             let tx_hashes: Vec<String> = {
-                                let guard = mem.lock().unwrap();
+                                let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                                 guard.txids_hex()
                             };
                             let payload = MempoolPayload { tx_hashes };
@@ -2944,7 +3070,8 @@ impl P2PNode {
                                         if bytes.len() == 32 {
                                             let mut txid = [0u8; 32];
                                             txid.copy_from_slice(&bytes);
-                                            let mut guard = mem.lock().unwrap();
+                                            let mut guard =
+                                                mem.lock().unwrap_or_else(|e| e.into_inner());
                                             guard.record_relay_address(&txid, relay.address);
                                         }
                                     }
@@ -2978,6 +3105,14 @@ impl P2PNode {
 
         Ok(())
     }
+}
+
+fn sync_tick_interval() -> Duration {
+    let secs = std::env::var("IRIUM_P2P_SYNC_TICK_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5);
+    Duration::from_secs(secs.clamp(1, 30))
 }
 
 /// Read a single protocol message from the given TCP stream.
@@ -3068,6 +3203,7 @@ async fn handle_incoming_with_sybil(
     agent: String,
     relay_address: Option<String>,
     node_id: Vec<u8>,
+    trusted_seed: bool,
 ) -> Result<(), String> {
     let local_node_id = hex::encode(&node_id);
     let local_node_id_bytes = node_id.clone();
@@ -3078,12 +3214,16 @@ async fn handle_incoming_with_sybil(
         .and_then(|v| v.parse::<u8>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(20);
-    let banned = {
-        let rep = reputation.lock().await;
-        rep.banned_count() as u8
+    let difficulty = if trusted_seed {
+        base
+    } else {
+        let banned = {
+            let rep = reputation.lock().await;
+            rep.banned_count() as u8
+        };
+        let bump = P2PNode::sybil_banned_bump(banned);
+        std::cmp::min(max, base.saturating_add(bump))
     };
-    let bump = P2PNode::sybil_banned_bump(banned);
-    let difficulty = std::cmp::min(max, base.saturating_add(bump));
     let handshake = SybilResistantHandshake::new(difficulty);
     let challenge = handshake.create_challenge();
     let challenge_bytes = challenge.to_bytes();
@@ -3153,21 +3293,26 @@ async fn handle_incoming_with_sybil(
     let ping_sync_requests = sync_requests.clone();
     let ping_block_requests = block_requests.clone();
     tokio::spawn(async move {
-        let interval = P2PNode::ping_interval();
+        let ping_interval = P2PNode::ping_interval();
+        let sync_tick = sync_tick_interval();
+        let mut last_ping = Instant::now();
         let mut last_height = crate::p2p::local_height(&ping_chain);
         let mut last_handshake = Instant::now();
         loop {
-            tokio::time::sleep(interval).await;
-            let nonce = rand_core::OsRng.next_u64();
-            let ping = PingPayload { nonce };
-            let msg = ping.to_message();
-            if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
-                P2PNode::log_event(
-                    "warn",
-                    "net",
-                    format!("P2P {}: ping failed: {}", ping_addr, e),
-                );
-                break;
+            tokio::time::sleep(sync_tick).await;
+            if last_ping.elapsed() >= ping_interval {
+                let nonce = rand_core::OsRng.next_u64();
+                let ping = PingPayload { nonce };
+                let msg = ping.to_message();
+                if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
+                    P2PNode::log_event(
+                        "warn",
+                        "net",
+                        format!("P2P {}: ping failed: {}", ping_addr, e),
+                    );
+                    break;
+                }
+                last_ping = Instant::now();
             }
             let current_height = crate::p2p::local_height(&ping_chain);
             let handshake_due = last_handshake.elapsed() >= P2PNode::handshake_interval();
@@ -3449,7 +3594,7 @@ async fn handle_incoming_with_sybil(
                         });
                     let _peer_tip_on_main =
                         if let (Some(tip), Some(chain_arc)) = (peer_tip, chain.as_ref()) {
-                            let guard = chain_arc.lock().unwrap();
+                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(h) = guard.heights.get(&tip) {
                                 guard
                                     .chain
@@ -3463,7 +3608,7 @@ async fn handle_incoming_with_sybil(
                             true
                         };
                     let local_at_peer = if let Some(ref chain_arc) = chain {
-                        let guard = chain_arc.lock().unwrap();
+                        let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                         guard
                             .chain
                             .get(payload.height as usize)
@@ -3545,7 +3690,7 @@ async fn handle_incoming_with_sybil(
                         let behind_height = payload.height;
                         if let Some(ref chain_arc) = chain {
                             let headers_bytes = {
-                                let guard = chain_arc.lock().unwrap();
+                                let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                 let start = if tip_mismatch {
                                     0
                                 } else {
@@ -3583,27 +3728,28 @@ async fn handle_incoming_with_sybil(
                                     }
                                     guard.insert(fallback_addr.ip(), now);
                                 }
-                                let (blocks, start_height) =
-                                    if let Some(ref chain_arc) = fallback_chain {
-                                        let guard = chain_arc.lock().unwrap();
-                                        let start_idx = behind_height.saturating_add(1) as usize;
-                                        if start_idx >= guard.chain.len() {
-                                            (Vec::new(), 0)
-                                        } else {
-                                            let mut blocks = Vec::new();
-                                            for b in guard
-                                                .chain
-                                                .iter()
-                                                .skip(start_idx)
-                                                .take(fallback_blocks_per_burst())
-                                            {
-                                                blocks.push(b.serialize());
-                                            }
-                                            (blocks, start_idx as u64)
-                                        }
-                                    } else {
+                                let (blocks, start_height) = if let Some(ref chain_arc) =
+                                    fallback_chain
+                                {
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                    let start_idx = behind_height.saturating_add(1) as usize;
+                                    if start_idx >= guard.chain.len() {
                                         (Vec::new(), 0)
-                                    };
+                                    } else {
+                                        let mut blocks = Vec::new();
+                                        for b in guard
+                                            .chain
+                                            .iter()
+                                            .skip(start_idx)
+                                            .take(fallback_blocks_per_burst())
+                                        {
+                                            blocks.push(b.serialize());
+                                        }
+                                        (blocks, start_idx as u64)
+                                    }
+                                } else {
+                                    (Vec::new(), 0)
+                                };
                                 if blocks.is_empty() {
                                     return;
                                 }
@@ -3717,7 +3863,7 @@ async fn handle_incoming_with_sybil(
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = GetHeadersPayload::from_message(&msg) {
                         let headers_bytes = {
-                            let guard = chain_arc.lock().unwrap();
+                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
 
                             let mut start_idx = if guard.chain.len() > 1 { 1 } else { 0 };
                             let mut start_hash_non_zero = false;
@@ -3779,7 +3925,7 @@ async fn handle_incoming_with_sybil(
 
                             let header_hash = header.hash();
                             {
-                                let mut guard = chain_arc.lock().unwrap();
+                                let mut guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                 if header.prev_hash == [0u8; 32] {
                                     let genesis_hash = guard.params.genesis_block.header.hash();
                                     if header_hash == genesis_hash {
@@ -3834,7 +3980,7 @@ async fn handle_incoming_with_sybil(
                             continue;
                         }
                         let local_height = {
-                            let guard = chain_arc.lock().unwrap();
+                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                             guard.tip_height()
                         };
                         let peer_height = last_handshake_height.unwrap_or(local_height);
@@ -3870,7 +4016,7 @@ async fn handle_incoming_with_sybil(
                         }
 
                         let request = {
-                            let guard = chain_arc.lock().unwrap();
+                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(best) = guard.best_header_if_better() {
                                 if let Some(path) = guard.header_path_to_known(best.header.hash()) {
                                     if let Some(first_hash) = path.first() {
@@ -3939,7 +4085,7 @@ async fn handle_incoming_with_sybil(
                         }
                         let is_zero = payload.start_hash.iter().all(|b| *b == 0);
                         let (mut start_idx, mut matched_pos) = {
-                            let guard = chain_arc.lock().unwrap();
+                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                             let mut start_idx = 0usize;
                             let mut matched_pos = None;
                             if payload.start_hash.len() == 32 {
@@ -3959,7 +4105,7 @@ async fn handle_incoming_with_sybil(
                         if matched_pos.is_none() && !is_zero {
                             if let Some(remote_tip) = last_handshake_tip {
                                 let local_tip = {
-                                    let guard = chain_arc.lock().unwrap();
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.tip_hash()
                                 };
                                 if remote_tip != local_tip {
@@ -4004,7 +4150,7 @@ async fn handle_incoming_with_sybil(
                             continue;
                         }
                         let (blocks, start_height) = {
-                            let guard = chain_arc.lock().unwrap();
+                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                             let mut blocks = Vec::new();
                             let mut heights = Vec::new();
                             let count = payload.count.min(MAX_BLOCKS_PER_REQUEST) as usize;
@@ -4043,7 +4189,8 @@ async fn handle_incoming_with_sybil(
                                 let short = hex::encode(bhash);
                                 let short = short.get(0..12).unwrap_or(&short);
                                 let (new_height_opt, record_verdict, persist_blocks, orphan_prev) = {
-                                    let mut guard = chain_arc.lock().unwrap();
+                                    let mut guard =
+                                        chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     let mut new_height_opt = None;
                                     let mut record_verdict = None;
                                     let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
@@ -4057,7 +4204,8 @@ async fn handle_incoming_with_sybil(
                                                 short
                                             ));
                                             if let Some(ref mem) = mempool {
-                                                let mut mem_guard = mem.lock().unwrap();
+                                                let mut mem_guard =
+                                                    mem.lock().unwrap_or_else(|e| e.into_inner());
                                                 for tx in block.transactions.iter().skip(1) {
                                                     mem_guard.remove(&tx.txid());
                                                 }
@@ -4170,7 +4318,8 @@ async fn handle_incoming_with_sybil(
                             if let (Some(ref chain_arc), Some(ref mem)) = (&chain, &mempool) {
                                 let inv_bytes = {
                                     let fee = {
-                                        let guard = chain_arc.lock().unwrap();
+                                        let guard =
+                                            chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                         match guard.calculate_fees(&tx) {
                                             Ok(f) => f,
                                             Err(e) => {
@@ -4183,7 +4332,8 @@ async fn handle_incoming_with_sybil(
                                         let dir = directory.lock().await;
                                         dir.relay_address_for_peer(&addr)
                                     };
-                                    let mut mem_guard = mem.lock().unwrap();
+                                    let mut mem_guard =
+                                        mem.lock().unwrap_or_else(|e| e.into_inner());
                                     let peer_addr = addr.to_string();
                                     match mem_guard.add_transaction(
                                         tx.clone(),
@@ -4228,7 +4378,7 @@ async fn handle_incoming_with_sybil(
                     if let Ok(inv) = InvPayload::from_message(&msg) {
                         let mut needed = Vec::new();
                         {
-                            let guard = mem.lock().unwrap();
+                            let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                             for txid_hex in inv.txids {
                                 if let Ok(bytes) = hex::decode(&txid_hex) {
                                     if bytes.len() == 32 {
@@ -4255,7 +4405,7 @@ async fn handle_incoming_with_sybil(
                     if let Ok(gd) = GetDataPayload::from_message(&msg) {
                         let mut responses: Vec<Message> = Vec::new();
                         {
-                            let guard = mem.lock().unwrap();
+                            let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                             for txid_hex in gd.txids {
                                 if let Ok(bytes) = hex::decode(&txid_hex) {
                                     if bytes.len() != 32 {
@@ -4278,7 +4428,7 @@ async fn handle_incoming_with_sybil(
             MessageType::Mempool => {
                 if let Some(ref mem) = mempool {
                     let tx_hashes: Vec<String> = {
-                        let guard = mem.lock().unwrap();
+                        let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                         guard.txids_hex()
                     };
                     let payload = MempoolPayload { tx_hashes };
@@ -4297,7 +4447,7 @@ async fn handle_incoming_with_sybil(
                                 if bytes.len() == 32 {
                                     let mut txid = [0u8; 32];
                                     txid.copy_from_slice(&bytes);
-                                    let mut guard = mem.lock().unwrap();
+                                    let mut guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.record_relay_address(&txid, relay.address);
                                 }
                             }

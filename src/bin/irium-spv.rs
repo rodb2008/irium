@@ -9,8 +9,8 @@ use irium_node_rs::block::BlockHeader;
 use irium_node_rs::pow::Target;
 use irium_node_rs::spv::{
     header_level, nipopow_best_level, nipopow_compare_counts, nipopow_compare_proofs,
-    nipopow_counts, nipopow_proof_counts, nipopow_prove, nipopow_verify,
-    verify_header_chain, verify_merkle_proof, HeaderChain, NipopowProof,
+    nipopow_counts, nipopow_proof_counts, nipopow_prove, nipopow_verify, verify_header_chain,
+    verify_merkle_proof, HeaderChain, NipopowProof,
 };
 
 const DEFAULT_M: usize = 15;
@@ -126,8 +126,8 @@ fn load_genesis_header() -> Result<BlockHeader, String> {
         }
         let data = fs::read_to_string(&path)
             .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-        let v: Value = serde_json::from_str(&data)
-            .map_err(|e| format!("failed to parse JSON: {}", e))?;
+        let v: Value =
+            serde_json::from_str(&data).map_err(|e| format!("failed to parse JSON: {}", e))?;
         let gf: GenesisFile = serde_json::from_value(v)
             .map_err(|e| format!("unexpected genesis JSON format: {}", e))?;
         return json_to_header(&gf.header);
@@ -138,14 +138,19 @@ fn load_genesis_header() -> Result<BlockHeader, String> {
 fn load_headers_from_dir(dir: &PathBuf) -> Result<Vec<BlockHeader>, String> {
     let mut entries = Vec::new();
     let mut has_genesis = false;
-    for entry in fs::read_dir(dir).map_err(|e| format!("failed to read {}: {}", dir.display(), e))? {
+    for entry in
+        fs::read_dir(dir).map_err(|e| format!("failed to read {}: {}", dir.display(), e))?
+    {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n,
             None => continue,
         };
-        if let Some(num) = name.strip_prefix("block_").and_then(|n| n.strip_suffix(".json")) {
+        if let Some(num) = name
+            .strip_prefix("block_")
+            .and_then(|n| n.strip_suffix(".json"))
+        {
             if let Ok(h) = num.parse::<u64>() {
                 if h == 0 {
                     has_genesis = true;
@@ -163,15 +168,14 @@ fn load_headers_from_dir(dir: &PathBuf) -> Result<Vec<BlockHeader>, String> {
     for (_h, path) in entries {
         let data = fs::read_to_string(&path)
             .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-        let v: Value = serde_json::from_str(&data)
-            .map_err(|e| format!("failed to parse JSON: {}", e))?;
+        let v: Value =
+            serde_json::from_str(&data).map_err(|e| format!("failed to parse JSON: {}", e))?;
         let jb: JsonBlock = serde_json::from_value(v)
             .map_err(|e| format!("unexpected block JSON format: {}", e))?;
         headers.push(json_to_header(&jb.header)?);
     }
     Ok(headers)
 }
-
 
 fn load_proof(path: &PathBuf) -> Result<NipopowProof, String> {
     let data = fs::read_to_string(path)
@@ -301,7 +305,9 @@ fn main() -> Result<(), String> {
         }
         "nipopow-compare" => {
             if args.len() < 4 {
-                return Err("nipopow-compare requires <blocks_dir_a> <blocks_dir_b> [m]".to_string());
+                return Err(
+                    "nipopow-compare requires <blocks_dir_a> <blocks_dir_b> [m]".to_string()
+                );
             }
             let dir_a = PathBuf::from(&args[2]);
             let dir_b = PathBuf::from(&args[3]);
@@ -408,4 +414,3 @@ fn main() -> Result<(), String> {
         _ => Err(format!("unknown command: {}", cmd)),
     }
 }
-

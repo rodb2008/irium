@@ -40,13 +40,12 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-
 fn build_client(node_base: &str) -> Result<Client, String> {
     let mut builder = Client::builder().timeout(Duration::from_secs(10));
     if let Ok(path) = env::var("IRIUM_RPC_CA") {
         let pem = std::fs::read(&path).map_err(|e| format!("read CA {path}: {e}"))?;
-        let cert = reqwest::Certificate::from_pem(&pem)
-            .map_err(|e| format!("invalid CA {path}: {e}"))?;
+        let cert =
+            reqwest::Certificate::from_pem(&pem).map_err(|e| format!("invalid CA {path}: {e}"))?;
         builder = builder.add_root_certificate(cert);
     }
     let insecure = env::var("IRIUM_RPC_INSECURE")
@@ -62,7 +61,9 @@ fn build_client(node_base: &str) -> Result<Client, String> {
         if url.scheme() != "https" {
             eprintln!("[warn] IRIUM_RPC_INSECURE=1 has no effect on non-HTTPS RPC URL");
         } else {
-            let host = url.host_str().ok_or_else(|| "RPC URL missing host".to_string())?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| "RPC URL missing host".to_string())?;
             if !is_loopback_host(host) {
                 return Err(format!(
                     "Refusing to disable TLS verification for non-local RPC host {host}; set IRIUM_RPC_CA instead"
@@ -89,7 +90,7 @@ fn check_rate(state: &AppState, addr: &SocketAddr, headers: &HeaderMap) -> Resul
     if api_authorized(headers, &state.api_token) {
         return Ok(());
     }
-    let mut limiter = state.limiter.lock().unwrap();
+    let mut limiter = state.limiter.lock().unwrap_or_else(|e| e.into_inner());
     if limiter.is_allowed(&addr.ip().to_string()) {
         Ok(())
     } else {
@@ -102,7 +103,11 @@ fn map_status(status: reqwest::StatusCode) -> StatusCode {
 }
 
 fn node_url(base: &str, path: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
 }
 
 async fn proxy_json(state: &AppState, path: &str) -> Result<Json<Value>, StatusCode> {
@@ -117,10 +122,12 @@ async fn proxy_json(state: &AppState, path: &str) -> Result<Json<Value>, StatusC
     if !resp.status().is_success() {
         return Err(map_status(resp.status()));
     }
-    let payload = resp.json::<Value>().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let payload = resp
+        .json::<Value>()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
     Ok(Json(payload))
 }
-
 
 async fn proxy_value(state: &AppState, path: &str) -> Result<Value, StatusCode> {
     let Json(payload) = proxy_json(state, path).await?;
@@ -168,7 +175,6 @@ async fn metrics(
     check_rate(&state, &addr, &headers)?;
     proxy_text(&state, "/metrics").await
 }
-
 
 async fn stats(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -230,7 +236,6 @@ async fn block(
     proxy_json(&state, &format!("/rpc/block?height={}", height)).await
 }
 
-
 async fn blockhash(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -286,7 +291,8 @@ async fn utxo(
 
 #[tokio::main]
 async fn main() {
-    let node_base = env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string());
+    let node_base =
+        env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string());
     let client = match build_client(&node_base) {
         Ok(c) => c,
         Err(e) => {

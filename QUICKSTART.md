@@ -2,6 +2,15 @@
 
 
 
+## Latest Mainnet Update (Feb 2026)
+- Wallet/miner RPC default is now `https://127.0.0.1:38300` with one-shot HTTPS -> HTTP fallback.
+- Sync/storage split is active by default:
+  - `~/.irium/blocks` keeps downloaded blocks
+  - `~/.irium/state` stores volatile sync/cache data
+- Safe resync procedure: delete ONLY `~/.irium/state`, keep `~/.irium/blocks`.
+- Sync reliability improvements include stall recovery + reduced repeated seed/dial noise.
+- CPU mining is built-in; Stratum client mode is supported; native GPU/OpenCL/CUDA miner is not bundled.
+
 ## Super Simple Start (No Tech)
 Follow these steps in order. Keep the node running while you mine.
 
