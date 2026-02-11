@@ -2678,8 +2678,17 @@ async fn main() {
             let mut stalled_ticks: u32 = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let peers = node_clone.peers_snapshot().await;
-                node_clone.refresh_seedlist().await;
+                let peers = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    node_clone.peers_snapshot(),
+                )
+                .await
+                .unwrap_or_default();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    node_clone.refresh_seedlist(),
+                )
+                .await;
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     node_clone.connect_known_peers(3),

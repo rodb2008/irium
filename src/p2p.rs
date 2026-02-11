@@ -181,6 +181,14 @@ fn getblocks_grace() -> Duration {
     Duration::from_secs(secs.max(2).min(60))
 }
 
+fn no_getblocks_fallback_cooldown() -> Duration {
+    let secs = std::env::var("IRIUM_P2P_NO_GETBLOCKS_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(20);
+    Duration::from_secs(secs.max(5).min(300))
+}
+
 fn sync_stall_heartbeats() -> u32 {
     std::env::var("IRIUM_SYNC_STALL_HEARTBEATS")
         .ok()
@@ -2217,7 +2225,7 @@ impl P2PNode {
                                     let fallback_seen = getblocks_seen.clone();
                                     let fallback_addr = addr;
                                     tokio::spawn(async move {
-                                        let grace = getblocks_grace();
+                                        let grace = no_getblocks_fallback_cooldown();
                                         tokio::time::sleep(grace).await;
                                         let now = Instant::now();
                                         {
@@ -3716,7 +3724,7 @@ async fn handle_incoming_with_sybil(
                             let fallback_seen = getblocks_seen.clone();
                             let fallback_addr = addr;
                             tokio::spawn(async move {
-                                let grace = getblocks_grace();
+                                let grace = no_getblocks_fallback_cooldown();
                                 tokio::time::sleep(grace).await;
                                 let now = Instant::now();
                                 {
