@@ -3,7 +3,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use std::{env, fs};
 
 use axum::{
@@ -54,6 +57,9 @@ struct AppState {
     anchors: Option<AnchorManager>,
     p2p: Option<P2PNode>,
     limiter: Arc<Mutex<RateLimiter>>,
+    status_height_cache: Arc<AtomicU64>,
+    status_peer_count_cache: Arc<AtomicUsize>,
+    status_sybil_cache: Arc<AtomicU8>,
 }
 
 #[derive(Serialize)]
@@ -1134,22 +1140,50 @@ async fn status(
     State(state): State<AppState>,
 ) -> Result<Json<StatusResponse>, StatusCode> {
     check_rate(&state, &addr)?;
+
+    // Keep /status responsive under heavy sync/P2P load by using short timeouts
+    // and cached values instead of waiting indefinitely.
     let (peer_count, node_id, sybil_diff) = match state.p2p {
-        Some(ref p2p) => (
-            p2p.peer_count().await,
-            Some(p2p.node_id_hex()),
-            Some(p2p.current_sybil_difficulty().await),
-        ),
+        Some(ref p2p) => {
+            let peer_count =
+                match tokio::time::timeout(Duration::from_millis(250), p2p.peer_count()).await {
+                    Ok(v) => {
+                        state.status_peer_count_cache.store(v, Ordering::Relaxed);
+                        v
+                    }
+                    Err(_) => state.status_peer_count_cache.load(Ordering::Relaxed),
+                };
+            let sybil = match tokio::time::timeout(
+                Duration::from_millis(250),
+                p2p.current_sybil_difficulty(),
+            )
+            .await
+            {
+                Ok(v) => {
+                    state.status_sybil_cache.store(v, Ordering::Relaxed);
+                    Some(v)
+                }
+                Err(_) => Some(state.status_sybil_cache.load(Ordering::Relaxed)),
+            };
+            (peer_count, Some(p2p.node_id_hex()), sybil)
+        }
         None => (0, None, None),
     };
-    let (height, anchors_digest) = {
-        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let anchors_digest = state
-            .anchors
-            .as_ref()
-            .map(|a| a.payload_digest().to_string());
-        (guard.tip_height(), anchors_digest)
+
+    let anchors_digest = state
+        .anchors
+        .as_ref()
+        .map(|a| a.payload_digest().to_string());
+
+    let height = match state.chain.try_lock() {
+        Ok(guard) => {
+            let h = guard.tip_height();
+            state.status_height_cache.store(h, Ordering::Relaxed);
+            h
+        }
+        Err(_) => state.status_height_cache.load(Ordering::Relaxed),
     };
+
     Ok(Json(StatusResponse {
         height,
         genesis_hash: state.genesis_hash.clone(),
@@ -2621,12 +2655,22 @@ async fn main() {
         });
     }
 
+    let status_height_cache = Arc::new(AtomicU64::new({
+        let g = shared_state.lock().unwrap_or_else(|e| e.into_inner());
+        g.tip_height()
+    }));
+    let status_peer_count_cache = Arc::new(AtomicUsize::new(0));
+    let status_sybil_cache = Arc::new(AtomicU8::new(0));
+
     // Periodic heartbeat logging to surface peers and seedlist.
     if let Some(ref node) = p2p {
         let node_clone = node.clone();
         let chain_clone = shared_state.clone();
         let mempool_clone = mempool.clone();
         let genesis_hex = genesis_hash.clone();
+        let status_height = status_height_cache.clone();
+        let status_peer_count = status_peer_count_cache.clone();
+        let status_sybil = status_sybil_cache.clone();
         tokio::spawn(async move {
             let seed_mgr = SeedlistManager::new(128);
             let mut hb_ticks: u64 = 0;
@@ -2697,6 +2741,13 @@ async fn main() {
                     };
                     (g.tip_height(), tip, mem_sz)
                 };
+                status_height.store(local_height, Ordering::Relaxed);
+                status_peer_count.store(peer_ips.len(), Ordering::Relaxed);
+                status_sybil.store(
+                    node_clone.current_sybil_difficulty().await,
+                    Ordering::Relaxed,
+                );
+
                 let next_height = local_height.saturating_add(1);
                 let peer_height = best_peer_height.unwrap_or(0);
                 let chain_height = std::cmp::max(local_height, peer_height);
@@ -2803,6 +2854,9 @@ async fn main() {
         anchors,
         p2p,
         limiter: limiter.clone(),
+        status_height_cache,
+        status_peer_count_cache,
+        status_sybil_cache,
     };
 
     let mut app = Router::new()
