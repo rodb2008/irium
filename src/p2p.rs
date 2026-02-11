@@ -653,7 +653,7 @@ fn handshake_fail_threshold() -> u32 {
 }
 
 fn should_log_handshake_failure(count: u32) -> bool {
-    count == 1 || count % 5 == 0
+    count % handshake_fail_threshold() == 0
 }
 
 async fn record_handshake_failure(
