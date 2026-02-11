@@ -122,6 +122,16 @@ fn send_blocks_log_cooldown_secs() -> u64 {
     })
 }
 
+fn incoming_conn_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_INCOMING_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(30)
+    })
+}
 fn no_getblocks_log_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -847,6 +857,26 @@ impl P2PNode {
                     }
                 }
                 map.insert(key, now);
+            }
+        }
+        if category == "p2p" && msg_ref.starts_with("Incoming P2P connection from ") {
+            static INCOMING_LOG_GUARD: OnceLock<StdMutex<HashMap<IpAddr, Instant>>> =
+                OnceLock::new();
+            if let Some(addr_str) = msg_ref.strip_prefix("Incoming P2P connection from ") {
+                if let Ok(sock) = addr_str.trim().parse::<SocketAddr>() {
+                    let guard = INCOMING_LOG_GUARD.get_or_init(|| StdMutex::new(HashMap::new()));
+                    let mut map = guard.lock().unwrap_or_else(|e| e.into_inner());
+                    let now = Instant::now();
+                    let ip = sock.ip();
+                    if let Some(last) = map.get(&ip) {
+                        if now.duration_since(*last)
+                            < Duration::from_secs(incoming_conn_log_cooldown_secs())
+                        {
+                            return;
+                        }
+                    }
+                    map.insert(ip, now);
+                }
             }
         }
         if Self::json_log_enabled() {
