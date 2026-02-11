@@ -96,7 +96,7 @@ fn inbound_banned_log_cooldown_secs() -> u64 {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|v| v.max(1).min(3600))
-            .unwrap_or(30)
+            .unwrap_or(120)
     })
 }
 
@@ -129,7 +129,7 @@ fn incoming_conn_log_cooldown_secs() -> u64 {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|v| v.max(1).min(3600))
-            .unwrap_or(30)
+            .unwrap_or(120)
     })
 }
 fn no_getblocks_log_cooldown_secs() -> u64 {
@@ -215,7 +215,7 @@ fn headers_request_cooldown() -> Duration {
     let secs = std::env::var("IRIUM_P2P_HEADERS_REQUEST_COOLDOWN_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30);
+        .unwrap_or(120);
     Duration::from_secs(secs.max(5).min(300))
 }
 
@@ -962,7 +962,7 @@ impl P2PNode {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|v| *v > 0)
-                .unwrap_or(30);
+                .unwrap_or(120);
             let bounded = secs.max(5).min(120);
             Duration::from_secs(bounded)
         })
