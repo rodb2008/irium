@@ -283,11 +283,7 @@ pub fn nipopow_proof_counts(proof: &NipopowProof) -> Vec<usize> {
     nipopow_counts(&levels)
 }
 
-pub fn nipopow_compare_proofs(
-    a: &NipopowProof,
-    b: &NipopowProof,
-    m: usize,
-) -> std::cmp::Ordering {
+pub fn nipopow_compare_proofs(a: &NipopowProof, b: &NipopowProof, m: usize) -> std::cmp::Ordering {
     let counts_a = nipopow_proof_counts(a);
     let counts_b = nipopow_proof_counts(b);
     nipopow_compare_counts(&counts_a, &counts_b, m)

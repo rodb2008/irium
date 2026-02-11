@@ -1049,7 +1049,7 @@ fn check_rate_with_auth(
 }
 
 fn check_rate(state: &AppState, addr: &SocketAddr) -> Result<(), StatusCode> {
-    let mut limiter = state.limiter.lock().unwrap();
+    let mut limiter = state.limiter.lock().unwrap_or_else(|e| e.into_inner());
     if limiter.is_allowed(&addr.ip().to_string()) {
         Ok(())
     } else {
@@ -1077,7 +1077,7 @@ async fn network_hashrate(
     check_rate(&state, &addr)?;
     let window = q.window.unwrap_or(120).clamp(1, 2016);
     let (tip_height, difficulty, hashrate, avg_block_time, sample_blocks) = {
-        let guard = state.chain.lock().unwrap();
+        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let tip_height = guard.tip_height();
         let tip_target = guard
             .chain
@@ -1143,7 +1143,7 @@ async fn status(
         None => (0, None, None),
     };
     let (height, anchors_digest) = {
-        let guard = state.chain.lock().unwrap();
+        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let anchors_digest = state
             .anchors
             .as_ref()
@@ -1190,7 +1190,7 @@ async fn metrics(
 ) -> Result<String, StatusCode> {
     check_rate(&state, &addr)?;
     let (height, anchor_loaded, tip_hash, anchor_digest) = {
-        let g = state.chain.lock().unwrap();
+        let g = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let tip_hash = g
             .chain
             .last()
@@ -1213,7 +1213,11 @@ async fn metrics(
         None => (0usize, String::new(), 0u8),
     };
     let seeds = SeedlistManager::new(128).merged_seedlist();
-    let mempool_sz = state.mempool.lock().unwrap().len();
+    let mempool_sz = state
+        .mempool
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
     Ok(format!(
         "irium_height {}
 irium_peers {}
@@ -1254,7 +1258,7 @@ async fn get_utxo(
     let mut txid = [0u8; 32];
     txid.copy_from_slice(&bytes);
 
-    let guard = state.chain.lock().unwrap();
+    let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
     let key = OutPoint {
         txid,
         index: q.index,
@@ -1285,7 +1289,7 @@ async fn get_balance(
     pkh_arr.copy_from_slice(&pkh);
 
     let (balance, utxo_count, mined_balance, mined_blocks, height) = {
-        let guard = state.chain.lock().unwrap();
+        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut balance = 0u64;
         let mut utxo_count = 0usize;
         let mut mined_balance = 0u64;
@@ -1337,7 +1341,7 @@ async fn get_utxos(
     pkh_arr.copy_from_slice(&pkh);
 
     let (utxos, height) = {
-        let guard = state.chain.lock().unwrap();
+        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut items = Vec::new();
         for (outpoint, utxo) in guard.utxos.iter() {
             if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
@@ -1379,7 +1383,7 @@ async fn get_history(
     pkh_arr.copy_from_slice(&pkh);
 
     let (height, txs) = {
-        let guard = state.chain.lock().unwrap();
+        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut owned: HashMap<OutPoint, u64> = HashMap::new();
         let mut map: HashMap<[u8; 32], HistoryItem> = HashMap::new();
 
@@ -1457,7 +1461,7 @@ async fn get_fee_estimate(
 ) -> Result<Json<FeeEstimateResponse>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
     let (min_fee_per_byte, mempool_size) = {
-        let mempool = state.mempool.lock().unwrap();
+        let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         (mempool.min_fee_per_byte(), mempool.len())
     };
     Ok(Json(FeeEstimateResponse {
@@ -1504,7 +1508,7 @@ async fn wallet_create(
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
 
-    let mut wallet = state.wallet.lock().unwrap();
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
     if wallet.exists() {
         return Err(StatusCode::CONFLICT);
     }
@@ -1527,7 +1531,7 @@ async fn wallet_unlock(
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
 
-    let mut wallet = state.wallet.lock().unwrap();
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
     wallet
         .unlock(&req.passphrase)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -1550,7 +1554,7 @@ async fn wallet_lock(
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
 
-    let mut wallet = state.wallet.lock().unwrap();
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
     wallet.lock();
 
     Ok(Json(WalletLockResponse { locked: true }))
@@ -1564,7 +1568,7 @@ async fn wallet_addresses(
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
 
-    let mut wallet = state.wallet.lock().unwrap();
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
     let addresses = wallet.addresses().map_err(|_| StatusCode::BAD_REQUEST)?;
 
     Ok(Json(WalletAddressesResponse { addresses }))
@@ -1578,7 +1582,7 @@ async fn wallet_receive(
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
 
-    let mut wallet = state.wallet.lock().unwrap();
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
     let address = wallet
         .current_address()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -1594,7 +1598,7 @@ async fn wallet_new_address(
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
 
-    let mut wallet = state.wallet.lock().unwrap();
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
     let key = wallet.new_address().map_err(|_| StatusCode::BAD_REQUEST)?;
 
     Ok(Json(WalletReceiveResponse {
@@ -1617,7 +1621,7 @@ async fn wallet_send(
     }
 
     let (keys, change_address) = {
-        let mut wallet = state.wallet.lock().unwrap();
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
         let keys = wallet.keys().map_err(|_| StatusCode::BAD_REQUEST)?;
         let change = if let Some(ref from) = req.from_address {
             from.clone()
@@ -1677,7 +1681,7 @@ async fn wallet_send(
     }
 
     let (mut utxos, tip_height) = {
-        let chain = state.chain.lock().unwrap();
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut collected = Vec::new();
         for (outpoint, utxo) in chain.utxos.iter() {
             if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
@@ -1706,7 +1710,7 @@ async fn wallet_send(
     }
 
     let mut fee_per_byte = {
-        let mempool = state.mempool.lock().unwrap();
+        let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         mempool.min_fee_per_byte().ceil() as u64
     };
     if fee_per_byte == 0 {
@@ -1814,7 +1818,7 @@ async fn wallet_send(
     }
 
     let fee_checked = {
-        let chain = state.chain.lock().unwrap();
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain
             .calculate_fees(&tx)
             .map_err(|_| StatusCode::BAD_REQUEST)?
@@ -1824,7 +1828,7 @@ async fn wallet_send(
     let txid = tx.txid();
     let hex_txid = hex::encode(txid);
 
-    let mut mempool = state.mempool.lock().unwrap();
+    let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
     if mempool.contains(&txid) {
         return Ok(Json(WalletSendResponse {
             txid: hex_txid,
@@ -1868,27 +1872,35 @@ async fn get_block_template(
 
     if longpoll {
         let last_tip = {
-            let guard = state.chain.lock().unwrap();
+            let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
             guard
                 .chain
                 .last()
                 .map(|b| hex::encode(b.header.hash()))
                 .unwrap_or_else(|| state.genesis_hash.clone())
         };
-        let last_mempool = state.mempool.lock().unwrap().len();
+        let last_mempool = state
+            .mempool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
 
         let start = std::time::Instant::now();
         while start.elapsed().as_secs() < poll_secs {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let current_tip = {
-                let guard = state.chain.lock().unwrap();
+                let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
                 guard
                     .chain
                     .last()
                     .map(|b| hex::encode(b.header.hash()))
                     .unwrap_or_else(|| state.genesis_hash.clone())
             };
-            let current_mempool = state.mempool.lock().unwrap().len();
+            let current_mempool = state
+                .mempool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
             if current_tip != last_tip || current_mempool != last_mempool {
                 break;
             }
@@ -1896,7 +1908,7 @@ async fn get_block_template(
     }
 
     let (height, prev_hash, bits, target, time) = {
-        let guard = state.chain.lock().unwrap();
+        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let tip = guard.chain.last();
         let prev_hash = tip
             .map(|b| hex::encode(b.header.hash()))
@@ -1910,7 +1922,11 @@ async fn get_block_template(
         (height, prev_hash, bits, target_hex(bits), time)
     };
 
-    let mut mempool_entries = state.mempool.lock().unwrap().ordered_entries();
+    let mut mempool_entries = state
+        .mempool
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .ordered_entries();
     if let Some(min_fee) = min_fee {
         mempool_entries.retain(|e| e.fee_per_byte >= min_fee);
     }
@@ -1972,7 +1988,7 @@ async fn get_block(
     Query(q): Query<BlockQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
-    let guard = state.chain.lock().unwrap();
+    let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
     let idx = q.height as usize;
     if idx >= guard.chain.len() {
         return Err(StatusCode::NOT_FOUND);
@@ -1995,7 +2011,7 @@ async fn get_block_by_hash(
     let mut target = [0u8; 32];
     target.copy_from_slice(&bytes);
 
-    let guard = state.chain.lock().unwrap();
+    let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
     let height = match guard.heights.get(&target) {
         Some(h) => *h,
         None => return Err(StatusCode::NOT_FOUND),
@@ -2022,7 +2038,7 @@ async fn get_tx(
     let mut target = [0u8; 32];
     target.copy_from_slice(&bytes);
 
-    let guard = state.chain.lock().unwrap();
+    let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
     for (height, block) in guard.chain.iter().enumerate() {
         for (idx, tx) in block.transactions.iter().enumerate() {
             if tx.txid() == target {
@@ -2206,7 +2222,7 @@ async fn submit_block(
 
     // Apply to chain state under lock, enforcing consensus rules.
     let (new_height, new_tip_hash) = {
-        let mut chain = state.chain.lock().unwrap();
+        let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
 
         // Height must match the next expected block height.
         if req.height != chain.height {
@@ -2236,7 +2252,7 @@ async fn submit_block(
 
     // Remove any included transactions from the HTTP mempool.
     {
-        let mut mempool = state.mempool.lock().unwrap();
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         for tx in block.transactions.iter().skip(1) {
             let txid = tx.txid();
             mempool.remove(&txid);
@@ -2287,14 +2303,14 @@ async fn submit_tx(
 
     // Delegate validation to ChainState and compute fees.
     let fee = {
-        let chain = state.chain.lock().unwrap();
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         match chain.calculate_fees(&tx) {
             Ok(f) => f,
             Err(_) => return Err(StatusCode::BAD_REQUEST),
         }
     };
 
-    let mut mempool = state.mempool.lock().unwrap();
+    let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
     let hex_txid = hex::encode(txid);
     if mempool.contains(&txid) {
         return Ok(Json(SubmitTxResponse {
@@ -2336,7 +2352,13 @@ async fn main() {
     let locked = load_locked_genesis().expect("load locked genesis");
     let genesis_hash = locked.header.hash.clone();
     let genesis_hash_lc = genesis_hash.to_lowercase();
-    let genesis_block = block_from_locked(&locked);
+    let genesis_block = match block_from_locked(&locked) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to build genesis block from locked config: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Ensure genesis (block 0) exists and matches the locked genesis.
     // If a persisted genesis is corrupt/mismatched, quarantine it and reset volatile state.
@@ -2412,7 +2434,7 @@ async fn main() {
         }
     };
     if let Some(a) = anchors.clone() {
-        let mut guard = shared_state.lock().unwrap();
+        let mut guard = shared_state.lock().unwrap_or_else(|e| e.into_inner());
         guard.set_anchors(a);
     }
 
@@ -2569,7 +2591,7 @@ async fn main() {
                     }
 
                     let height = {
-                        let chain = shared_clone.lock().unwrap();
+                        let chain = shared_clone.lock().unwrap_or_else(|e| e.into_inner());
                         chain.tip_height()
                     };
                     println!(

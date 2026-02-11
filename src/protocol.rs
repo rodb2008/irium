@@ -259,7 +259,6 @@ impl UptimeProofPayload {
     }
 }
 
-
 /// Block message: raw block bytes.
 #[derive(Debug, Clone)]
 pub struct BlockPayload {

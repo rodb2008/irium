@@ -347,7 +347,7 @@ async fn maybe_request_sync(
     };
     let (local_height, local_tip, _peer_tip_on_main) = match chain {
         Some(c) => {
-            let guard = c.lock().unwrap();
+            let guard = c.lock().unwrap_or_else(|e| e.into_inner());
             let local_height = guard.tip_height();
             let local_tip = guard.tip_hash();
             let peer_tip_on_main = peer_tip
@@ -653,7 +653,7 @@ async fn record_handshake_failure(
     let mut banned = false;
     if !trusted_seed && count >= handshake_fail_threshold() {
         {
-            let mut guard = dynamic_bans.lock().unwrap();
+            let mut guard = dynamic_bans.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(ip, Instant::now());
         }
         let mut guard = failures.lock().await;
@@ -862,7 +862,7 @@ impl P2PNode {
         if static_bans.contains(ip) {
             return true;
         }
-        let mut guard = dynamic_bans.lock().unwrap();
+        let mut guard = dynamic_bans.lock().unwrap_or_else(|e| e.into_inner());
         let expire = Duration::from_secs(600);
         if let Some(ts) = guard.get(ip) {
             if ts.elapsed() < expire {
@@ -875,7 +875,7 @@ impl P2PNode {
 
     fn tip_hash(chain: &Option<Arc<StdMutex<ChainState>>>) -> [u8; 32] {
         if let Some(ref c) = chain {
-            let guard = c.lock().unwrap();
+            let guard = c.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(last) = guard.chain.last() {
                 return last.header.hash();
             }
@@ -2077,7 +2077,7 @@ impl P2PNode {
                             // Basic header-first sync trigger: if peer is ahead, request blocks.
                             let local_height = {
                                 if let Some(ref c) = chain_for_sync {
-                                    c.lock().unwrap().tip_height()
+                                    c.lock().unwrap_or_else(|e| e.into_inner()).tip_height()
                                 } else {
                                     0
                                 }
@@ -2098,7 +2098,7 @@ impl P2PNode {
                             let _peer_tip_on_main = if let (Some(tip), Some(chain_arc)) =
                                 (peer_tip, chain_for_sync.as_ref())
                             {
-                                let guard = chain_arc.lock().unwrap();
+                                let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some(h) = guard.heights.get(&tip) {
                                     guard
                                         .chain
@@ -2112,7 +2112,7 @@ impl P2PNode {
                                 true
                             };
                             let local_at_peer = if let Some(ref chain_arc) = chain_for_sync {
-                                let guard = chain_arc.lock().unwrap();
+                                let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                 guard
                                     .chain
                                     .get(payload.height as usize)
@@ -2190,7 +2190,8 @@ impl P2PNode {
                                 let behind_height = payload.height;
                                 if let Some(ref chain_arc) = chain_for_sync {
                                     let headers_bytes = {
-                                        let guard = chain_arc.lock().unwrap();
+                                        let guard =
+                                            chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                         let start = if tip_mismatch {
                                             0
                                         } else {
@@ -2228,28 +2229,30 @@ impl P2PNode {
                                             }
                                             guard.insert(fallback_addr.ip(), now);
                                         }
-                                        let (blocks, start_height) =
-                                            if let Some(ref chain_arc) = fallback_chain {
-                                                let guard = chain_arc.lock().unwrap();
-                                                let start_idx =
-                                                    behind_height.saturating_add(1) as usize;
-                                                if start_idx >= guard.chain.len() {
-                                                    (Vec::new(), 0)
-                                                } else {
-                                                    let mut blocks = Vec::new();
-                                                    for b in guard
-                                                        .chain
-                                                        .iter()
-                                                        .skip(start_idx)
-                                                        .take(fallback_blocks_per_burst())
-                                                    {
-                                                        blocks.push(b.serialize());
-                                                    }
-                                                    (blocks, start_idx as u64)
-                                                }
-                                            } else {
+                                        let (blocks, start_height) = if let Some(ref chain_arc) =
+                                            fallback_chain
+                                        {
+                                            let guard =
+                                                chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                            let start_idx =
+                                                behind_height.saturating_add(1) as usize;
+                                            if start_idx >= guard.chain.len() {
                                                 (Vec::new(), 0)
-                                            };
+                                            } else {
+                                                let mut blocks = Vec::new();
+                                                for b in guard
+                                                    .chain
+                                                    .iter()
+                                                    .skip(start_idx)
+                                                    .take(fallback_blocks_per_burst())
+                                                {
+                                                    blocks.push(b.serialize());
+                                                }
+                                                (blocks, start_idx as u64)
+                                            }
+                                        } else {
+                                            (Vec::new(), 0)
+                                        };
                                         if blocks.is_empty() {
                                             return;
                                         }
@@ -2362,7 +2365,7 @@ impl P2PNode {
                         if let Some(ref chain_arc) = chain_for_sync {
                             if let Ok(payload) = GetHeadersPayload::from_message(&msg) {
                                 let headers_bytes = {
-                                    let guard = chain_arc.lock().unwrap();
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
 
                                     let mut start_idx = if guard.chain.len() > 1 { 1 } else { 0 };
                                     let mut start_hash_non_zero = false;
@@ -2434,7 +2437,8 @@ impl P2PNode {
 
                                     let header_hash = header.hash();
                                     {
-                                        let mut guard = chain_arc.lock().unwrap();
+                                        let mut guard =
+                                            chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                         if header.prev_hash == [0u8; 32] {
                                             let genesis_hash =
                                                 guard.params.genesis_block.header.hash();
@@ -2522,7 +2526,7 @@ impl P2PNode {
                                     continue;
                                 }
                                 let local_height = {
-                                    let guard = chain_arc.lock().unwrap();
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.tip_height()
                                 };
                                 let peer_height = last_handshake_height.unwrap_or(local_height);
@@ -2558,7 +2562,7 @@ impl P2PNode {
                                 }
 
                                 let request = {
-                                    let guard = chain_arc.lock().unwrap();
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     if let Some(best) = guard.best_header_if_better() {
                                         if let Some(path) =
                                             guard.header_path_to_known(best.header.hash())
@@ -2644,7 +2648,7 @@ impl P2PNode {
                                 }
                                 let is_zero = payload.start_hash.iter().all(|b| *b == 0);
                                 let (mut start_idx, mut matched_pos) = {
-                                    let guard = chain_arc.lock().unwrap();
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     let mut start_idx = 0usize;
                                     let mut matched_pos = None;
                                     if payload.start_hash.len() == 32 {
@@ -2666,7 +2670,8 @@ impl P2PNode {
                                 if matched_pos.is_none() && !is_zero {
                                     if let Some(remote_tip) = last_handshake_tip {
                                         let local_tip = {
-                                            let guard = chain_arc.lock().unwrap();
+                                            let guard =
+                                                chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                             guard.tip_hash()
                                         };
                                         if remote_tip != local_tip {
@@ -2713,7 +2718,7 @@ impl P2PNode {
                                     continue;
                                 }
                                 let (blocks, start_height) = {
-                                    let guard = chain_arc.lock().unwrap();
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     let mut blocks = Vec::new();
                                     let mut heights = Vec::new();
                                     let count = payload.count.min(MAX_BLOCKS_PER_REQUEST) as usize;
@@ -2757,7 +2762,8 @@ impl P2PNode {
                                             persist_blocks,
                                             orphan_prev,
                                         ) = {
-                                            let mut guard = chain_arc.lock().unwrap();
+                                            let mut guard =
+                                                chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                             let mut new_height_opt = None;
                                             let mut record_verdict = None;
                                             let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
@@ -2771,7 +2777,9 @@ impl P2PNode {
                                                         short
                                                     ));
                                                     if let Some(ref mem) = mempool_for_sync {
-                                                        let mut mem_guard = mem.lock().unwrap();
+                                                        let mut mem_guard = mem
+                                                            .lock()
+                                                            .unwrap_or_else(|e| e.into_inner());
                                                         for tx in block.transactions.iter().skip(1)
                                                         {
                                                             mem_guard.remove(&tx.txid());
@@ -2896,7 +2904,9 @@ impl P2PNode {
                                     {
                                         let inv_bytes = {
                                             let fee = {
-                                                let guard = chain_arc.lock().unwrap();
+                                                let guard = chain_arc
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
                                                 match guard.calculate_fees(&tx) {
                                                     Ok(f) => f,
                                                     Err(e) => {
@@ -2912,7 +2922,8 @@ impl P2PNode {
                                                 let dir = dir.lock().await;
                                                 dir.relay_address_for_peer(&addr)
                                             };
-                                            let mut mem_guard = mem.lock().unwrap();
+                                            let mut mem_guard =
+                                                mem.lock().unwrap_or_else(|e| e.into_inner());
                                             let peer_addr = addr.to_string();
                                             let txid = tx.txid();
                                             let txid_hex = hex::encode(txid);
@@ -2989,7 +3000,7 @@ impl P2PNode {
                             if let Ok(inv) = InvPayload::from_message(&msg) {
                                 let mut needed = Vec::new();
                                 {
-                                    let guard = mem.lock().unwrap();
+                                    let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                                     for txid_hex in inv.txids {
                                         if let Ok(bytes) = hex::decode(&txid_hex) {
                                             if bytes.len() == 32 {
@@ -3016,7 +3027,7 @@ impl P2PNode {
                             if let Ok(gd) = GetDataPayload::from_message(&msg) {
                                 let mut responses: Vec<Message> = Vec::new();
                                 {
-                                    let guard = mem.lock().unwrap();
+                                    let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                                     for txid_hex in gd.txids {
                                         if let Ok(bytes) = hex::decode(&txid_hex) {
                                             if bytes.len() != 32 {
@@ -3040,7 +3051,7 @@ impl P2PNode {
                     MessageType::Mempool => {
                         if let Some(ref mem) = mempool_for_sync {
                             let tx_hashes: Vec<String> = {
-                                let guard = mem.lock().unwrap();
+                                let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                                 guard.txids_hex()
                             };
                             let payload = MempoolPayload { tx_hashes };
@@ -3059,7 +3070,8 @@ impl P2PNode {
                                         if bytes.len() == 32 {
                                             let mut txid = [0u8; 32];
                                             txid.copy_from_slice(&bytes);
-                                            let mut guard = mem.lock().unwrap();
+                                            let mut guard =
+                                                mem.lock().unwrap_or_else(|e| e.into_inner());
                                             guard.record_relay_address(&txid, relay.address);
                                         }
                                     }
@@ -3582,7 +3594,7 @@ async fn handle_incoming_with_sybil(
                         });
                     let _peer_tip_on_main =
                         if let (Some(tip), Some(chain_arc)) = (peer_tip, chain.as_ref()) {
-                            let guard = chain_arc.lock().unwrap();
+                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(h) = guard.heights.get(&tip) {
                                 guard
                                     .chain
@@ -3596,7 +3608,7 @@ async fn handle_incoming_with_sybil(
                             true
                         };
                     let local_at_peer = if let Some(ref chain_arc) = chain {
-                        let guard = chain_arc.lock().unwrap();
+                        let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                         guard
                             .chain
                             .get(payload.height as usize)
@@ -3678,7 +3690,7 @@ async fn handle_incoming_with_sybil(
                         let behind_height = payload.height;
                         if let Some(ref chain_arc) = chain {
                             let headers_bytes = {
-                                let guard = chain_arc.lock().unwrap();
+                                let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                 let start = if tip_mismatch {
                                     0
                                 } else {
@@ -3716,27 +3728,28 @@ async fn handle_incoming_with_sybil(
                                     }
                                     guard.insert(fallback_addr.ip(), now);
                                 }
-                                let (blocks, start_height) =
-                                    if let Some(ref chain_arc) = fallback_chain {
-                                        let guard = chain_arc.lock().unwrap();
-                                        let start_idx = behind_height.saturating_add(1) as usize;
-                                        if start_idx >= guard.chain.len() {
-                                            (Vec::new(), 0)
-                                        } else {
-                                            let mut blocks = Vec::new();
-                                            for b in guard
-                                                .chain
-                                                .iter()
-                                                .skip(start_idx)
-                                                .take(fallback_blocks_per_burst())
-                                            {
-                                                blocks.push(b.serialize());
-                                            }
-                                            (blocks, start_idx as u64)
-                                        }
-                                    } else {
+                                let (blocks, start_height) = if let Some(ref chain_arc) =
+                                    fallback_chain
+                                {
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                    let start_idx = behind_height.saturating_add(1) as usize;
+                                    if start_idx >= guard.chain.len() {
                                         (Vec::new(), 0)
-                                    };
+                                    } else {
+                                        let mut blocks = Vec::new();
+                                        for b in guard
+                                            .chain
+                                            .iter()
+                                            .skip(start_idx)
+                                            .take(fallback_blocks_per_burst())
+                                        {
+                                            blocks.push(b.serialize());
+                                        }
+                                        (blocks, start_idx as u64)
+                                    }
+                                } else {
+                                    (Vec::new(), 0)
+                                };
                                 if blocks.is_empty() {
                                     return;
                                 }
@@ -3850,7 +3863,7 @@ async fn handle_incoming_with_sybil(
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = GetHeadersPayload::from_message(&msg) {
                         let headers_bytes = {
-                            let guard = chain_arc.lock().unwrap();
+                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
 
                             let mut start_idx = if guard.chain.len() > 1 { 1 } else { 0 };
                             let mut start_hash_non_zero = false;
@@ -3912,7 +3925,7 @@ async fn handle_incoming_with_sybil(
 
                             let header_hash = header.hash();
                             {
-                                let mut guard = chain_arc.lock().unwrap();
+                                let mut guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                 if header.prev_hash == [0u8; 32] {
                                     let genesis_hash = guard.params.genesis_block.header.hash();
                                     if header_hash == genesis_hash {
@@ -3967,7 +3980,7 @@ async fn handle_incoming_with_sybil(
                             continue;
                         }
                         let local_height = {
-                            let guard = chain_arc.lock().unwrap();
+                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                             guard.tip_height()
                         };
                         let peer_height = last_handshake_height.unwrap_or(local_height);
@@ -4003,7 +4016,7 @@ async fn handle_incoming_with_sybil(
                         }
 
                         let request = {
-                            let guard = chain_arc.lock().unwrap();
+                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(best) = guard.best_header_if_better() {
                                 if let Some(path) = guard.header_path_to_known(best.header.hash()) {
                                     if let Some(first_hash) = path.first() {
@@ -4072,7 +4085,7 @@ async fn handle_incoming_with_sybil(
                         }
                         let is_zero = payload.start_hash.iter().all(|b| *b == 0);
                         let (mut start_idx, mut matched_pos) = {
-                            let guard = chain_arc.lock().unwrap();
+                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                             let mut start_idx = 0usize;
                             let mut matched_pos = None;
                             if payload.start_hash.len() == 32 {
@@ -4092,7 +4105,7 @@ async fn handle_incoming_with_sybil(
                         if matched_pos.is_none() && !is_zero {
                             if let Some(remote_tip) = last_handshake_tip {
                                 let local_tip = {
-                                    let guard = chain_arc.lock().unwrap();
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.tip_hash()
                                 };
                                 if remote_tip != local_tip {
@@ -4137,7 +4150,7 @@ async fn handle_incoming_with_sybil(
                             continue;
                         }
                         let (blocks, start_height) = {
-                            let guard = chain_arc.lock().unwrap();
+                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                             let mut blocks = Vec::new();
                             let mut heights = Vec::new();
                             let count = payload.count.min(MAX_BLOCKS_PER_REQUEST) as usize;
@@ -4176,7 +4189,8 @@ async fn handle_incoming_with_sybil(
                                 let short = hex::encode(bhash);
                                 let short = short.get(0..12).unwrap_or(&short);
                                 let (new_height_opt, record_verdict, persist_blocks, orphan_prev) = {
-                                    let mut guard = chain_arc.lock().unwrap();
+                                    let mut guard =
+                                        chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     let mut new_height_opt = None;
                                     let mut record_verdict = None;
                                     let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
@@ -4190,7 +4204,8 @@ async fn handle_incoming_with_sybil(
                                                 short
                                             ));
                                             if let Some(ref mem) = mempool {
-                                                let mut mem_guard = mem.lock().unwrap();
+                                                let mut mem_guard =
+                                                    mem.lock().unwrap_or_else(|e| e.into_inner());
                                                 for tx in block.transactions.iter().skip(1) {
                                                     mem_guard.remove(&tx.txid());
                                                 }
@@ -4303,7 +4318,8 @@ async fn handle_incoming_with_sybil(
                             if let (Some(ref chain_arc), Some(ref mem)) = (&chain, &mempool) {
                                 let inv_bytes = {
                                     let fee = {
-                                        let guard = chain_arc.lock().unwrap();
+                                        let guard =
+                                            chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                         match guard.calculate_fees(&tx) {
                                             Ok(f) => f,
                                             Err(e) => {
@@ -4316,7 +4332,8 @@ async fn handle_incoming_with_sybil(
                                         let dir = directory.lock().await;
                                         dir.relay_address_for_peer(&addr)
                                     };
-                                    let mut mem_guard = mem.lock().unwrap();
+                                    let mut mem_guard =
+                                        mem.lock().unwrap_or_else(|e| e.into_inner());
                                     let peer_addr = addr.to_string();
                                     match mem_guard.add_transaction(
                                         tx.clone(),
@@ -4361,7 +4378,7 @@ async fn handle_incoming_with_sybil(
                     if let Ok(inv) = InvPayload::from_message(&msg) {
                         let mut needed = Vec::new();
                         {
-                            let guard = mem.lock().unwrap();
+                            let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                             for txid_hex in inv.txids {
                                 if let Ok(bytes) = hex::decode(&txid_hex) {
                                     if bytes.len() == 32 {
@@ -4388,7 +4405,7 @@ async fn handle_incoming_with_sybil(
                     if let Ok(gd) = GetDataPayload::from_message(&msg) {
                         let mut responses: Vec<Message> = Vec::new();
                         {
-                            let guard = mem.lock().unwrap();
+                            let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                             for txid_hex in gd.txids {
                                 if let Ok(bytes) = hex::decode(&txid_hex) {
                                     if bytes.len() != 32 {
@@ -4411,7 +4428,7 @@ async fn handle_incoming_with_sybil(
             MessageType::Mempool => {
                 if let Some(ref mem) = mempool {
                     let tx_hashes: Vec<String> = {
-                        let guard = mem.lock().unwrap();
+                        let guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                         guard.txids_hex()
                     };
                     let payload = MempoolPayload { tx_hashes };
@@ -4430,7 +4447,7 @@ async fn handle_incoming_with_sybil(
                                 if bytes.len() == 32 {
                                     let mut txid = [0u8; 32];
                                     txid.copy_from_slice(&bytes);
-                                    let mut guard = mem.lock().unwrap();
+                                    let mut guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.record_relay_address(&txid, relay.address);
                                 }
                             }

@@ -19,7 +19,13 @@ fn main() {
         }
     };
 
-    let block = block_from_locked(&locked);
+    let block = match block_from_locked(&locked) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to build genesis block from locked config: {e}");
+            std::process::exit(1);
+        }
+    };
     let pow_limit = Target { bits: 0x1d00_ffff }; // same as Python default
     let params = ChainParams {
         genesis_block: block,

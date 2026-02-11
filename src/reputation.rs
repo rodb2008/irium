@@ -28,7 +28,6 @@ fn default_reputation_path() -> PathBuf {
     path
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerReputation {
     pub peer_id: String,
