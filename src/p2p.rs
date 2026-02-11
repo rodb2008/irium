@@ -122,6 +122,28 @@ fn send_blocks_log_cooldown_secs() -> u64 {
     })
 }
 
+fn no_getblocks_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_NO_GETBLOCKS_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(60)
+    })
+}
+
+fn unknown_start_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_UNKNOWN_START_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(120)
+    })
+}
+
 fn trusted_seed_inbound_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -794,13 +816,46 @@ impl P2PNode {
             "mempool" => "🧺",
             _ => "",
         };
+        let msg_ref = msg.as_ref();
+        if category == "sync" {
+            let cooldown_secs = if msg_ref.contains("no getblocks after headers") {
+                Some(no_getblocks_log_cooldown_secs())
+            } else if msg_ref.contains("unknown start hash") {
+                Some(unknown_start_log_cooldown_secs())
+            } else {
+                None
+            };
+            if let Some(cooldown_secs) = cooldown_secs {
+                static SYNC_LOG_GUARD: OnceLock<StdMutex<HashMap<String, Instant>>> =
+                    OnceLock::new();
+                let key = if let Some(start) = msg_ref.find("P2P ") {
+                    let rest = &msg_ref[start + 4..];
+                    if let Some(colon) = rest.find(':') {
+                        format!("{}:{}", &msg_ref[..start], &rest[..colon])
+                    } else {
+                        msg_ref.to_string()
+                    }
+                } else {
+                    msg_ref.to_string()
+                };
+                let guard = SYNC_LOG_GUARD.get_or_init(|| StdMutex::new(HashMap::new()));
+                let mut map = guard.lock().unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                if let Some(last) = map.get(&key) {
+                    if now.duration_since(*last) < Duration::from_secs(cooldown_secs) {
+                        return;
+                    }
+                }
+                map.insert(key, now);
+            }
+        }
         if Self::json_log_enabled() {
             let payload = json!({
                 "ts": Self::ts(),
                 "level": level,
                 "cat": category,
                 "icon": icon,
-                "msg": msg.as_ref(),
+                "msg": msg_ref,
             });
             if level == "error" {
                 eprintln!("{}", payload);
@@ -813,7 +868,7 @@ impl P2PNode {
             } else {
                 format!("{} {}", icon, category)
             };
-            let line = format!("[{}] [{}] {}", Self::ts(), tag, msg.as_ref());
+            let line = format!("[{}] [{}] {}", Self::ts(), tag, msg_ref);
             if level == "error" {
                 eprintln!("{}", line);
             } else {
