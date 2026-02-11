@@ -23,6 +23,16 @@ Irium is a production‑only proof‑of‑work blockchain for the IRM asset. The
 
 
 
+## Latest Mainnet Update (Feb 2026)
+- RPC defaults now use `https://127.0.0.1:38300` for wallet/miner, with one-shot HTTPS -> HTTP fallback when HTTPS fails.
+- Node storage is split for safer resync:
+  - blocks: `~/.irium/blocks` (persistent)
+  - state: `~/.irium/state` (volatile)
+- Genesis safety/recovery improved: block 0 is enforced and bad genesis files are quarantined safely.
+- Sync reliability improved: better stall recovery, peer/seed dedupe, reduced sync spam, and faster catch-up polling.
+- Resync rule: delete ONLY `~/.irium/state` (never delete `~/.irium/blocks` unless intentionally starting fully from scratch).
+- Mining support in this repo is CPU miner + Stratum client mode. Native CUDA/OpenCL miner is not included by default.
+
 ## Super Simple Start (No Tech)
 Follow these steps in order. Keep the node running while you mine.
 
