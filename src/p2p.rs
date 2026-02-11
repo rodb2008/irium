@@ -100,6 +100,28 @@ fn inbound_banned_log_cooldown_secs() -> u64 {
     })
 }
 
+fn handshake_error_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_HANDSHAKE_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(20)
+    })
+}
+
+fn send_blocks_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_SEND_BLOCKS_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(15)
+    })
+}
+
 fn trusted_seed_inbound_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -671,6 +693,22 @@ async fn record_handshake_failure(
     (count, banned)
 }
 
+async fn ip_log_allowed(
+    logs: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    ip: IpAddr,
+    cooldown: Duration,
+) -> bool {
+    let mut guard = logs.lock().await;
+    let now = Instant::now();
+    if let Some(last) = guard.get(&ip) {
+        if now.duration_since(*last) < cooldown {
+            return false;
+        }
+    }
+    guard.insert(ip, now);
+    true
+}
+
 fn max_peers() -> usize {
     let val = std::env::var("IRIUM_P2P_MAX_PEERS")
         .ok()
@@ -714,7 +752,9 @@ pub struct P2PNode {
     getblocks_last: Arc<Mutex<HashMap<IpAddr, (Vec<u8>, u32, Instant)>>>,
     getblocks_genesis: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     handshake_failures: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
+    handshake_error_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     banned_inbound_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    send_blocks_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     outbound_dial_inflight: Arc<StdMutex<HashSet<IpAddr>>>,
     outbound_dial_backoff: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
@@ -1004,7 +1044,9 @@ impl P2PNode {
             getblocks_last: Arc::new(Mutex::new(HashMap::new())),
             getblocks_genesis: Arc::new(Mutex::new(HashMap::new())),
             handshake_failures: Arc::new(Mutex::new(HashMap::new())),
+            handshake_error_log: Arc::new(Mutex::new(HashMap::new())),
             banned_inbound_log: Arc::new(Mutex::new(HashMap::new())),
+            send_blocks_log: Arc::new(Mutex::new(HashMap::new())),
             outbound_dial_inflight: Arc::new(StdMutex::new(HashSet::new())),
             outbound_dial_backoff: Arc::new(Mutex::new(HashMap::new())),
             self_ips: Arc::new(Mutex::new(HashSet::new())),
@@ -1043,7 +1085,9 @@ impl P2PNode {
         let getblocks_last = self.getblocks_last.clone();
         let getblocks_genesis = self.getblocks_genesis.clone();
         let handshake_failures = self.handshake_failures.clone();
+        let handshake_error_log = self.handshake_error_log.clone();
         let banned_inbound_log = self.banned_inbound_log.clone();
+        let send_blocks_log = self.send_blocks_log.clone();
         let self_ips = self.self_ips.clone();
         let dynamic_bans = self.dynamic_bans.clone();
         let trusted_seed_ips = self.trusted_seed_ips.clone();
@@ -1143,6 +1187,8 @@ impl P2PNode {
                         let getblocks_genesis_peer = getblocks_genesis.clone();
                         let dynamic_bans_for_handshake = dynamic_bans.clone();
                         let handshake_failures_for_handshake = handshake_failures.clone();
+                        let handshake_error_log_for_handshake = handshake_error_log.clone();
+                        let send_blocks_log_peer = send_blocks_log.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_incoming_with_sybil(
                                 socket,
@@ -1157,6 +1203,7 @@ impl P2PNode {
                                 getblocks_peer,
                                 getblocks_last_peer,
                                 getblocks_genesis_peer,
+                                send_blocks_log_peer,
                                 self_ip_peer,
                                 chain_peer,
                                 mempool_peer,
@@ -1184,7 +1231,14 @@ impl P2PNode {
                                             count
                                         ),
                                     );
-                                } else if should_log_handshake_failure(count) {
+                                } else if should_log_handshake_failure(count)
+                                    && ip_log_allowed(
+                                        &handshake_error_log_for_handshake,
+                                        addr.ip(),
+                                        Duration::from_secs(handshake_error_log_cooldown_secs()),
+                                    )
+                                    .await
+                                {
                                     Self::log_err(format!(
                                         "P2P handshake error from {}: {}",
                                         addr, e
@@ -1909,6 +1963,7 @@ impl P2PNode {
         let getblocks_seen = self.getblocks_seen.clone();
         let getblocks_last = self.getblocks_last.clone();
         let getblocks_genesis = self.getblocks_genesis.clone();
+        let send_blocks_log = self.send_blocks_log.clone();
         let self_ips = self.self_ips.clone();
         let peers_vec = self.peers.clone();
         let connected_vec = self.connected.clone();
@@ -2741,13 +2796,21 @@ impl P2PNode {
                                 };
                                 if !blocks.is_empty() {
                                     let end_h = start_height + blocks.len() as u64 - 1;
-                                    P2PNode::log(format!(
-                                        "P2P {}: sending {} blocks [{}-{}]",
-                                        addr,
-                                        blocks.len(),
-                                        start_height,
-                                        end_h
-                                    ));
+                                    if ip_log_allowed(
+                                        &send_blocks_log,
+                                        addr.ip(),
+                                        Duration::from_secs(send_blocks_log_cooldown_secs()),
+                                    )
+                                    .await
+                                    {
+                                        P2PNode::log(format!(
+                                            "P2P {}: sending {} blocks [{}-{}]",
+                                            addr,
+                                            blocks.len(),
+                                            start_height,
+                                            end_h
+                                        ));
+                                    }
                                 }
                                 for block_data in blocks {
                                     let msg = BlockPayload { block_data }.to_message();
@@ -3205,6 +3268,7 @@ async fn handle_incoming_with_sybil(
     getblocks_seen: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     getblocks_last: Arc<Mutex<HashMap<IpAddr, (Vec<u8>, u32, Instant)>>>,
     getblocks_genesis: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    send_blocks_log: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     self_ips: Arc<Mutex<HashSet<IpAddr>>>,
     chain: Option<Arc<StdMutex<ChainState>>>,
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
@@ -4173,13 +4237,21 @@ async fn handle_incoming_with_sybil(
                         };
                         if !blocks.is_empty() {
                             let end_h = start_height + blocks.len() as u64 - 1;
-                            P2PNode::log(format!(
-                                "P2P {}: sending {} blocks [{}-{}]",
-                                addr,
-                                blocks.len(),
-                                start_height,
-                                end_h
-                            ));
+                            if ip_log_allowed(
+                                &send_blocks_log,
+                                addr.ip(),
+                                Duration::from_secs(send_blocks_log_cooldown_secs()),
+                            )
+                            .await
+                            {
+                                P2PNode::log(format!(
+                                    "P2P {}: sending {} blocks [{}-{}]",
+                                    addr,
+                                    blocks.len(),
+                                    start_height,
+                                    end_h
+                                ));
+                            }
                         }
                         for block_data in blocks {
                             let msg = BlockPayload { block_data }.to_message();
