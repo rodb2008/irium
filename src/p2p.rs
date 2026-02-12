@@ -132,6 +132,17 @@ fn incoming_conn_log_cooldown_secs() -> u64 {
             .unwrap_or(120)
     })
 }
+
+fn incoming_conn_log_enabled() -> bool {
+    static VAL: OnceLock<bool> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_LOG_INCOMING")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    })
+}
+
 fn no_getblocks_log_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -1259,7 +1270,9 @@ impl P2PNode {
                             Self::log_err(format!("Rejecting inbound {}: max peers reached", addr));
                             continue;
                         }
-                        Self::log(format!("Incoming P2P connection from {}", addr));
+                        if incoming_conn_log_enabled() {
+                            Self::log(format!("Incoming P2P connection from {}", addr));
+                        }
                         let peers_inner = peers_arc.clone();
                         let connected_inner = connected.clone();
                         let dir = dir_arc.clone();
