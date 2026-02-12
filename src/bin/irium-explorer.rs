@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
@@ -15,6 +16,7 @@ use irium_node_rs::rate_limiter::RateLimiter;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 struct AppState {
@@ -23,6 +25,23 @@ struct AppState {
     limiter: Arc<Mutex<RateLimiter>>,
     api_token: Option<String>,
     rpc_token: Option<String>,
+    miners_cache: Arc<RwLock<MinersCache>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MinersCache {
+    active_miners: Option<u64>,
+    window_blocks: u64,
+    as_of_height: u64,
+    updated_at_unix: u64,
+    last_error: Option<String>,
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
 }
 
 #[derive(Deserialize)]
@@ -42,6 +61,7 @@ struct MiningQuery {
     window: Option<usize>,
     series: Option<usize>,
 }
+
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
@@ -139,6 +159,7 @@ async fn proxy_value(state: &AppState, path: &str) -> Result<Value, StatusCode> 
     let Json(payload) = proxy_json(state, path).await?;
     Ok(payload)
 }
+
 async fn proxy_text(state: &AppState, path: &str) -> Result<Response, StatusCode> {
     let url = node_url(&state.node_base, path);
     let mut req = state.client.get(url);
@@ -153,6 +174,68 @@ async fn proxy_text(state: &AppState, path: &str) -> Result<Response, StatusCode
     }
     let body = resp.text().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
     Ok(body.into_response())
+}
+
+async fn refresh_active_miners_once(
+    state: &AppState,
+    window_blocks: u64,
+) -> Result<MinersCache, String> {
+    let status = proxy_value(state, "/status")
+        .await
+        .map_err(|e| format!("status: {e}"))?;
+    let height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let window_blocks = window_blocks.max(1);
+    let start = height.saturating_sub(window_blocks.saturating_sub(1));
+
+    let mut miners = HashSet::new();
+    let mut ok_blocks = 0u64;
+
+    for h in start..=height {
+        let path = format!("/rpc/block?height={}", h);
+        match proxy_value(state, &path).await {
+            Ok(block) => {
+                ok_blocks += 1;
+                let addr = block
+                    .get("miner_address")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .unwrap_or("");
+                if !addr.is_empty() && addr != "N/A" {
+                    miners.insert(addr.to_string());
+                }
+            }
+            Err(_) => {
+                // Keep going; this is best-effort.
+                continue;
+            }
+        }
+    }
+
+    Ok(MinersCache {
+        active_miners: Some(miners.len() as u64),
+        window_blocks: ok_blocks.max(1),
+        as_of_height: height,
+        updated_at_unix: now_unix(),
+        last_error: None,
+    })
+}
+
+async fn miners_refresher_task(state: AppState, window_blocks: u64, interval: Duration) {
+    loop {
+        match refresh_active_miners_once(&state, window_blocks).await {
+            Ok(cache) => {
+                let mut w = state.miners_cache.write().await;
+                *w = cache;
+            }
+            Err(e) => {
+                let mut w = state.miners_cache.write().await;
+                w.updated_at_unix = now_unix();
+                w.last_error = Some(e);
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 async fn status(
@@ -188,20 +271,38 @@ async fn stats(
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
     check_rate(&state, &addr, &headers)?;
+
     let status = proxy_value(&state, "/status").await?;
     let height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+    let peer_count = status.get("peer_count").and_then(|v| v.as_u64());
+
+    // Supply calculation is deterministic; keep existing behavior.
     let mut total = 0u64;
     for h in 1..=height {
         total = total.saturating_add(block_reward(h));
     }
+
+    let miners = state.miners_cache.read().await.clone();
+
     let payload = json!({
         "height": height,
         "total_blocks": height,
         "total": height,
         "supply_irm": (total as f64) / 100_000_000.0,
         "genesis_hash": status.get("genesis_hash"),
-        "peer_count": status.get("peer_count"),
+
+        // Live peers
+        "peer_count": peer_count,
+        "peers_connected": peer_count,
+
+        // Approx miners: unique miner addresses observed in a rolling recent window.
+        "active_miners": miners.active_miners,
+        "active_miners_window_blocks": miners.window_blocks,
+        "active_miners_as_of_height": miners.as_of_height,
+        "active_miners_updated_at": miners.updated_at_unix,
+        "active_miners_last_error": miners.last_error,
     });
+
     Ok(Json(payload))
 }
 
@@ -233,6 +334,7 @@ async fn blocks(
     });
     Ok(Json(payload))
 }
+
 async fn block(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -316,6 +418,7 @@ async fn mining(
     }
     proxy_json(&state, &path).await
 }
+
 #[tokio::main]
 async fn main() {
     let node_base =
@@ -334,13 +437,33 @@ async fn main() {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(120);
 
+    let miners_window_blocks = env::var("IRIUM_EXPLORER_MINERS_WINDOW_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(144);
+    let miners_refresh_secs = env::var("IRIUM_EXPLORER_MINERS_REFRESH_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
+
     let state = AppState {
         client,
         node_base: node_base.trim_end_matches('/').to_string(),
         limiter: Arc::new(Mutex::new(RateLimiter::new(rate))),
         api_token,
         rpc_token,
+        miners_cache: Arc::new(RwLock::new(MinersCache {
+            window_blocks: miners_window_blocks,
+            ..Default::default()
+        })),
     };
+
+    // Background refresh for "active miners" estimate.
+    tokio::spawn(miners_refresher_task(
+        state.clone(),
+        miners_window_blocks,
+        Duration::from_secs(miners_refresh_secs.max(10)),
+    ));
 
     let app = Router::new()
         .route("/stats", get(stats))
