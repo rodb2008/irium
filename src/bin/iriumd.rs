@@ -2674,6 +2674,7 @@ async fn main() {
         tokio::spawn(async move {
             let seed_mgr = SeedlistManager::new(128);
             let mut hb_ticks: u64 = 0;
+            let mut maintenance_ticks: u64 = 0;
             let mut last_progress_height: u64 = 0;
             let mut stalled_ticks: u32 = 0;
             loop {
@@ -2684,16 +2685,19 @@ async fn main() {
                 )
                 .await
                 .unwrap_or_default();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    node_clone.refresh_seedlist(),
-                )
-                .await;
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    node_clone.connect_known_peers(3),
-                )
-                .await;
+                maintenance_ticks = maintenance_ticks.wrapping_add(1);
+                if maintenance_ticks % 6 == 0 {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        node_clone.refresh_seedlist(),
+                    )
+                    .await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        node_clone.connect_known_peers(3),
+                    )
+                    .await;
+                }
                 let seeds = seed_mgr.merged_seedlist();
 
                 let mut peer_ips = std::collections::HashSet::new();
