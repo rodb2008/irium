@@ -330,14 +330,30 @@ fn chain_hash_at(chain: &Option<Arc<StdMutex<ChainState>>>, height: u64) -> Opti
     let guard = chain_arc.lock().ok()?;
     guard.chain.get(height as usize).map(|b| b.header.hash())
 }
+fn best_checkpoint(chain: &Option<Arc<StdMutex<ChainState>>>) -> (Option<u64>, Option<String>) {
+    let chain_arc = match chain.as_ref() {
+        Some(c) => c,
+        None => return (None, None),
+    };
+    let guard = match chain_arc.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
 
-fn genesis_checkpoint(chain: &Option<Arc<StdMutex<ChainState>>>) -> (Option<u64>, Option<String>) {
-    match chain_hash_at(chain, 0) {
-        Some(hash) => (Some(0), Some(hex::encode(hash))),
+    // Prefer the most recent signed anchor at or below our tip height.
+    if let Some(ref anchors) = guard.anchors {
+        let tip_h = guard.tip_height();
+        if let Some(anchor) = anchors.anchors().iter().rev().find(|a| a.height <= tip_h) {
+            return (Some(anchor.height), Some(anchor.hash.to_lowercase()));
+        }
+    }
+
+    // Fallback to genesis.
+    match guard.chain.get(0) {
+        Some(b) => (Some(0), Some(hex::encode(b.header.hash()))),
         None => (None, None),
     }
 }
-
 fn verify_peer_checkpoint(
     payload: &HandshakePayload,
     chain: &Option<Arc<StdMutex<ChainState>>>,
@@ -346,6 +362,13 @@ fn verify_peer_checkpoint(
         Some(h) => h,
         None => return Ok(()),
     };
+    if height > payload.height {
+        return Err(format!(
+            "invalid checkpoint (height {} > advertised height {})",
+            height, payload.height
+        ));
+    }
+
     let hash_hex = payload
         .checkpoint_hash
         .as_ref()
@@ -354,12 +377,63 @@ fn verify_peer_checkpoint(
     if bytes.len() != 32 {
         return Err("invalid checkpoint hash length".to_string());
     }
-    let local = match chain_hash_at(chain, height) {
-        Some(h) => h,
-        None => return Ok(()),
-    };
     let mut peer = [0u8; 32];
     peer.copy_from_slice(&bytes[..32]);
+
+    let chain_arc = match chain.as_ref() {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    let guard = match chain_arc.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    let local = match guard.chain.get(height as usize) {
+        Some(b) => b.header.hash(),
+        None => return Ok(()),
+    };
+
+    // If an anchor exists at this exact height, use it to disambiguate
+    // "peer is forked" vs "we are forked".
+    let anchor = guard
+        .anchors
+        .as_ref()
+        .and_then(|a| a.get_anchor_at_height(height))
+        .and_then(|a| hex::decode(a.hash.trim()).ok())
+        .and_then(|b| {
+            if b.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                Some(arr)
+            } else {
+                None
+            }
+        });
+
+    if let Some(anchor_hash) = anchor {
+        if peer == anchor_hash && local != anchor_hash {
+            let local_hex = hex::encode(local);
+            let anchor_hex = hex::encode(anchor_hash);
+            return Err(format!(
+                "LOCAL_FORK: checkpoint mismatch at height {} (local {} != anchor {})",
+                height,
+                local_hex.get(0..12).unwrap_or(&local_hex),
+                anchor_hex.get(0..12).unwrap_or(&anchor_hex)
+            ));
+        }
+        if local == anchor_hash && peer != anchor_hash {
+            let peer_hex = hex::encode(peer);
+            let anchor_hex = hex::encode(anchor_hash);
+            return Err(format!(
+                "peer on fork/split chain: checkpoint mismatch at height {} (peer {} != anchor {})",
+                height,
+                peer_hex.get(0..12).unwrap_or(&peer_hex),
+                anchor_hex.get(0..12).unwrap_or(&anchor_hex)
+            ));
+        }
+    }
+
     if local != peer {
         let local_hex = hex::encode(local);
         let peer_hex = hex::encode(peer);
@@ -370,6 +444,7 @@ fn verify_peer_checkpoint(
             height, local_short, peer_short
         ));
     }
+
     Ok(())
 }
 
@@ -1008,7 +1083,7 @@ impl P2PNode {
             if level == "error" {
                 eprintln!("{}", payload);
             } else {
-                println!("{}", payload);
+                eprintln!("{}", payload);
             }
         } else {
             let tag = if icon.is_empty() {
@@ -1020,7 +1095,7 @@ impl P2PNode {
             if level == "error" {
                 eprintln!("{}", line);
             } else {
-                println!("{}", line);
+                eprintln!("{}", line);
             }
         }
     }
@@ -1927,7 +2002,7 @@ impl P2PNode {
         }
         Self::log(format!("P2P outbound {}: sent sybil proof", addr));
 
-        let (checkpoint_height, checkpoint_hash) = genesis_checkpoint(&self.chain);
+        let (checkpoint_height, checkpoint_hash) = best_checkpoint(&self.chain);
         let payload = HandshakePayload {
             version: 1,
             agent: agent.to_string(),
@@ -2014,7 +2089,7 @@ impl P2PNode {
                 let current_height = crate::p2p::local_height(&ping_chain);
                 let handshake_due = last_handshake.elapsed() >= P2PNode::handshake_interval();
                 if handshake_due || current_height != last_height {
-                    let (checkpoint_height, checkpoint_hash) = genesis_checkpoint(&ping_chain);
+                    let (checkpoint_height, checkpoint_hash) = best_checkpoint(&ping_chain);
                     let payload = HandshakePayload {
                         version: 1,
                         agent: ping_agent.clone(),
@@ -2262,12 +2337,37 @@ impl P2PNode {
                                 }
                             }
                             if let Err(reason) = verify_peer_checkpoint(&payload, &chain_for_sync) {
-                                P2PNode::log_event(
-                                    "warn",
-                                    "net",
-                                    format!("P2P {}: incompatible peer: {}", addr, reason),
-                                );
-                                break;
+                                if let Some(rest) = reason.strip_prefix("LOCAL_FORK:") {
+                                    P2PNode::log_event(
+                                        "error",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: LOCAL node appears on a fork/split chain ({}). Attempting recovery...",
+                                            addr,
+                                            rest.trim()
+                                        ),
+                                    );
+                                    // State-only recovery: clear sync throttles and request headers from genesis.
+                                    sync_requests.lock().await.clear();
+                                    block_requests.lock().await.clear();
+                                    let get_headers = GetHeadersPayload {
+                                        start_hash: vec![0u8; 32],
+                                        count: MAX_HEADERS_PER_REQUEST,
+                                    };
+                                    if let Ok(msg) = get_headers.to_message() {
+                                        let _ = send_message(&writer, msg, addr).await;
+                                    }
+                                } else {
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "net",
+                                        format!(
+                                            "P2P {}: peer on fork/split or incompatible chain: {}",
+                                            addr, reason
+                                        ),
+                                    );
+                                    break;
+                                }
                             }
                             let agent_str = payload.agent.clone();
                             let node_id = payload.node_id.clone();
@@ -3544,7 +3644,7 @@ async fn handle_incoming_with_sybil(
             let current_height = crate::p2p::local_height(&ping_chain);
             let handshake_due = last_handshake.elapsed() >= P2PNode::handshake_interval();
             if handshake_due || current_height != last_height {
-                let (checkpoint_height, checkpoint_hash) = genesis_checkpoint(&ping_chain);
+                let (checkpoint_height, checkpoint_hash) = best_checkpoint(&ping_chain);
                 let payload = HandshakePayload {
                     version: 1,
                     agent: ping_agent.clone(),
@@ -3625,7 +3725,7 @@ async fn handle_incoming_with_sybil(
 
     // Reply with our handshake so outbound peers learn our agent/height.
     let local_h = local_height(&chain);
-    let (checkpoint_height, checkpoint_hash) = genesis_checkpoint(&chain);
+    let (checkpoint_height, checkpoint_hash) = best_checkpoint(&chain);
     let payload = HandshakePayload {
         version: 1,
         agent: agent.clone(),
@@ -3728,12 +3828,37 @@ async fn handle_incoming_with_sybil(
                         }
                     }
                     if let Err(reason) = verify_peer_checkpoint(&payload, &chain) {
-                        P2PNode::log_event(
-                            "warn",
-                            "net",
-                            format!("P2P {}: incompatible peer: {}", addr, reason),
-                        );
-                        break;
+                        if let Some(rest) = reason.strip_prefix("LOCAL_FORK:") {
+                            P2PNode::log_event(
+                                "error",
+                                "sync",
+                                format!(
+                                    "P2P {}: LOCAL node appears on a fork/split chain ({}). Attempting recovery...",
+                                    addr,
+                                    rest.trim()
+                                ),
+                            );
+                            // State-only recovery: clear sync throttles and request headers from genesis.
+                            sync_requests.lock().await.clear();
+                            block_requests.lock().await.clear();
+                            let get_headers = GetHeadersPayload {
+                                start_hash: vec![0u8; 32],
+                                count: MAX_HEADERS_PER_REQUEST,
+                            };
+                            if let Ok(msg) = get_headers.to_message() {
+                                let _ = send_message(&writer, msg, addr).await;
+                            }
+                        } else {
+                            P2PNode::log_event(
+                                "warn",
+                                "net",
+                                format!(
+                                    "P2P {}: peer on fork/split or incompatible chain: {}",
+                                    addr, reason
+                                ),
+                            );
+                            break;
+                        }
                     }
                     let advertised_port = if payload.port > 0 {
                         payload.port
@@ -3777,7 +3902,7 @@ async fn handle_incoming_with_sybil(
                     }
                     last_handshake_height = Some(payload.height);
 
-                    let (checkpoint_height, checkpoint_hash) = genesis_checkpoint(&chain);
+                    let (checkpoint_height, checkpoint_hash) = best_checkpoint(&chain);
                     let response = HandshakePayload {
                         version: payload.version,
                         agent: agent.clone(),

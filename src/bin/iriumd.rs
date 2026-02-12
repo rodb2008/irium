@@ -2836,7 +2836,7 @@ async fn main() {
                 if hb_ticks % 6 == 0 {
                     let dbg = node_clone.sync_debug_snapshot().await;
                     let ahead = peer_height.saturating_sub(local_height);
-                    println!(
+                    eprintln!(
                         "[{}] [🔁 sync] status local={} best_peer={} ahead={} peers={} inflight(getheaders)={} inflight(getblocks)={} handshake_failures={}",
                         Utc::now().format("%H:%M:%S"),
                         local_height,
@@ -2859,7 +2859,7 @@ async fn main() {
                     }
 
                     if stalled_ticks >= 12 {
-                        println!(
+                        eprintln!(
                             "[{}] [🔁 sync] WARN stalled (local={}, best_peer={}); clearing sync throttles and reconnecting",
                             Utc::now().format("%H:%M:%S"),
                             local_height,
@@ -2887,7 +2887,7 @@ async fn main() {
                 let seed_count = seed_list.len();
 
                 if json_log_enabled() {
-                    println!(
+                    eprintln!(
                         "{}",
                         json!({
                             "ts": Utc::now().format("%H:%M:%S").to_string(),
@@ -2908,7 +2908,7 @@ async fn main() {
                     );
                 } else {
                     let short_tip = tip_hash.chars().take(12).collect::<String>();
-                    println!(
+                    eprintln!(
                         "[{}] ❤️ heartbeat Irium chain height={} 🏠 local height={} 🧱 next height={} ⛏ tip={} 👥 peers={} 🌱 seedlist={} 🧺 mempool={}",
                         Utc::now().format("%H:%M:%S"),
                         chain_height,
