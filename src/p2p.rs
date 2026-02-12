@@ -1639,12 +1639,24 @@ impl P2PNode {
                 }
             }
         }
+        {
+            let guard = self.connected.lock().await;
+            if guard.iter().any(|a| a.ip() == ip) {
+                return false;
+            }
+        }
         true
     }
 
     async fn begin_outbound_dial(&self, ip: IpAddr) -> Result<OutboundDialGuard, String> {
         if self.is_banned(&ip) {
             return Err(format!("peer {} is banned (banlist)", ip));
+        }
+        {
+            let guard = self.connected.lock().await;
+            if guard.iter().any(|a| a.ip() == ip) {
+                return Err("already connected".to_string());
+            }
         }
         {
             let guard = self.outbound_dial_backoff.lock().await;
