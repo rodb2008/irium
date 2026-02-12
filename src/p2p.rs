@@ -2396,6 +2396,7 @@ impl P2PNode {
                                     node_id.clone(),
                                 );
                                 dir_guard.record_height(&multiaddr, payload.height);
+                                dir_guard.mark_dialable(&multiaddr);
                             }
                             let should_log = last_handshake_height != Some(payload.height)
                                 || last_handshake_agent.as_deref() != Some(agent_str.as_str());

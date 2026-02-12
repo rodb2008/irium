@@ -66,6 +66,8 @@ pub struct PeerRecord {
     pub relay_address: Option<String>,
     pub last_height: Option<u64>,
     pub node_id: Option<String>,
+    #[serde(default)]
+    pub dialable: bool,
 }
 
 impl PeerRecord {
@@ -81,6 +83,7 @@ impl PeerRecord {
             relay_address: None,
             last_height: None,
             node_id: None,
+            dialable: false,
         }
     }
 
@@ -377,6 +380,10 @@ impl PeerDirectory {
                     .get("node_id")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let dialable = obj
+                    .get("dialable")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 self.records.insert(
                     addr.clone(),
                     PeerRecord {
@@ -388,6 +395,7 @@ impl PeerDirectory {
                         relay_address,
                         last_height,
                         node_id,
+                        dialable,
                     },
                 );
             }
@@ -489,12 +497,23 @@ impl PeerDirectory {
                 relay_address: None,
                 last_height: None,
                 node_id: None,
+                dialable: false,
             },
         );
         self.flush();
     }
 
     /// Mark a peer as seen without changing its metadata.
+    pub fn mark_dialable(&mut self, multiaddr: &str) {
+        if let Some(rec) = self.records.get_mut(multiaddr) {
+            if !rec.dialable {
+                rec.dialable = true;
+                rec.touch();
+                self.flush();
+            }
+        }
+    }
+
     pub fn mark_seen(&mut self, multiaddr: &str) {
         if let Some(rec) = self.records.get_mut(multiaddr) {
             let before = rec.seen_days.len();
@@ -543,10 +562,6 @@ impl PeerDirectory {
 
         seeds.sort();
         seeds.dedup();
-        if seeds.is_empty() {
-            // Avoid wiping bootstrap/seedlist.runtime during cold start; keep last known runtime seeds.
-            return;
-        }
         self.seed_manager.write_runtime_entries(seeds);
     }
 
