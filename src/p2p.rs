@@ -165,6 +165,17 @@ fn unknown_start_log_cooldown_secs() -> u64 {
     })
 }
 
+fn headers_new_false_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_HEADERS_NEW_FALSE_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(30)
+    })
+}
+
 fn inbound_accept_cooldown_ms() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -854,6 +865,8 @@ impl P2PNode {
                 Some(no_getblocks_log_cooldown_secs())
             } else if msg_ref.contains("unknown start hash") {
                 Some(unknown_start_log_cooldown_secs())
+            } else if msg_ref.contains("headers (new=false)") {
+                Some(headers_new_false_log_cooldown_secs())
             } else {
                 None
             };
@@ -2635,23 +2648,6 @@ impl P2PNode {
                                             added_any = true;
                                         }
                                     }
-                                }
-
-                                if header_count > 0 {
-                                    let last_short = last_header_hash
-                                        .map(|h| {
-                                            let hex = hex::encode(h);
-                                            hex.get(0..12).unwrap_or(&hex).to_string()
-                                        })
-                                        .unwrap_or_else(|| "-".to_string());
-                                    P2PNode::log_event(
-                                        "info",
-                                        "sync",
-                                        format!(
-                                            "P2P {}: received {} headers (new={}) last={}",
-                                            addr, header_count, added_any, last_short
-                                        ),
-                                    );
                                 }
 
                                 if header_count > 0 {

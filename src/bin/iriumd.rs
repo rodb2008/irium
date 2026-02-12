@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::sync::{
     atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
@@ -589,6 +589,35 @@ fn json_log_enabled() -> bool {
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false)
     })
+}
+
+fn dial_seed_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_DIAL_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.min(3600))
+            .unwrap_or(30)
+    })
+}
+
+fn dial_seed_log_allowed(ip: IpAddr) -> bool {
+    let cooldown = dial_seed_log_cooldown_secs();
+    if cooldown == 0 {
+        return true;
+    }
+    static GUARD: OnceLock<Mutex<HashMap<IpAddr, Instant>>> = OnceLock::new();
+    let guard = GUARD.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = guard.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if let Some(last) = map.get(&ip) {
+        if now.duration_since(*last) < Duration::from_secs(cooldown) {
+            return false;
+        }
+    }
+    map.insert(ip, now);
+    true
 }
 
 fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
@@ -2628,12 +2657,14 @@ async fn main() {
                         let chain = shared_clone.lock().unwrap_or_else(|e| e.into_inner());
                         chain.tip_height()
                     };
-                    println!(
-                        "[{}] dialing seed {} (h={})",
-                        Utc::now().format("%H:%M:%S"),
-                        addr,
-                        height
-                    );
+                    if dial_seed_log_allowed(addr.ip()) {
+                        println!(
+                            "[{}] dialing seed {} (h={})",
+                            Utc::now().format("%H:%M:%S"),
+                            addr,
+                            height
+                        );
+                    }
                     if let Err(e) = node
                         .connect_and_handshake(*addr, height, &agent_clone)
                         .await
@@ -2642,12 +2673,14 @@ async fn main() {
                         if msg.contains("dial backoff") || msg.contains("dial in progress") {
                             continue;
                         }
-                        eprintln!(
-                            "[{}] outbound {} failed: {}",
-                            Utc::now().format("%H:%M:%S"),
-                            addr,
-                            msg
-                        );
+                        if dial_seed_log_allowed(addr.ip()) {
+                            eprintln!(
+                                "[{}] outbound {} failed: {}",
+                                Utc::now().format("%H:%M:%S"),
+                                addr,
+                                msg
+                            );
+                        }
                     }
                 }
                 interval.tick().await;
