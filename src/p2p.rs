@@ -165,6 +165,17 @@ fn unknown_start_log_cooldown_secs() -> u64 {
     })
 }
 
+fn headers_new_false_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_HEADERS_NEW_FALSE_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(30)
+    })
+}
+
 fn inbound_accept_cooldown_ms() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -839,6 +850,8 @@ impl P2PNode {
     }
 
     fn log_event(level: &str, category: &str, msg: impl AsRef<str>) {
+        use std::borrow::Cow;
+
         let icon = match category {
             "net" => "📡",
             "p2p" => "🔌",
@@ -849,65 +862,138 @@ impl P2PNode {
             _ => "",
         };
         let msg_ref = msg.as_ref();
-        if category == "sync" {
-            let cooldown_secs = if msg_ref.contains("no getblocks after headers") {
-                Some(no_getblocks_log_cooldown_secs())
-            } else if msg_ref.contains("unknown start hash") {
-                Some(unknown_start_log_cooldown_secs())
-            } else {
-                None
+
+        // Rate-limit selected spammy log lines by IP (ignoring port) and keep a suppressed counter.
+        // This keeps logs readable and makes `journalctl -f` responsive under heavy P2P churn.
+        static RL: OnceLock<StdMutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();
+        let rl = RL.get_or_init(|| StdMutex::new(HashMap::new()));
+
+        let mut suffix: Option<String> = None;
+
+        let extract_sock = |s: &str| s.trim().parse::<SocketAddr>().ok();
+        let extract_ip_from_p2p_line = |line: &str| -> Option<IpAddr> {
+            if let Some(rest) = line.strip_prefix("P2P ") {
+                if let Some(end) = rest.find(": ") {
+                    return extract_sock(&rest[..end]).map(|s| s.ip());
+                }
+            }
+            None
+        };
+        let extract_ip_from_prefix =
+            |line: &str, prefix: &str, suffix_marker: &str| -> Option<IpAddr> {
+                let rest = line.strip_prefix(prefix)?;
+                let end = rest.find(suffix_marker)?;
+                extract_sock(&rest[..end]).map(|s| s.ip())
             };
-            if let Some(cooldown_secs) = cooldown_secs {
-                static SYNC_LOG_GUARD: OnceLock<StdMutex<HashMap<String, Instant>>> =
-                    OnceLock::new();
-                let key = if let Some(start) = msg_ref.find("P2P ") {
-                    let rest = &msg_ref[start + 4..];
-                    if let Some(colon) = rest.find(':') {
-                        format!("{}:{}", &msg_ref[..start], &rest[..colon])
-                    } else {
-                        msg_ref.to_string()
-                    }
-                } else {
-                    msg_ref.to_string()
-                };
-                let guard = SYNC_LOG_GUARD.get_or_init(|| StdMutex::new(HashMap::new()));
-                let mut map = guard.lock().unwrap_or_else(|e| e.into_inner());
-                let now = Instant::now();
-                if let Some(last) = map.get(&key) {
-                    if now.duration_since(*last) < Duration::from_secs(cooldown_secs) {
-                        return;
-                    }
-                }
-                map.insert(key, now);
-            }
-        }
-        if category == "p2p" && msg_ref.starts_with("Incoming P2P connection from ") {
-            static INCOMING_LOG_GUARD: OnceLock<StdMutex<HashMap<IpAddr, Instant>>> =
-                OnceLock::new();
-            if let Some(addr_str) = msg_ref.strip_prefix("Incoming P2P connection from ") {
-                if let Ok(sock) = addr_str.trim().parse::<SocketAddr>() {
-                    let guard = INCOMING_LOG_GUARD.get_or_init(|| StdMutex::new(HashMap::new()));
-                    let mut map = guard.lock().unwrap_or_else(|e| e.into_inner());
-                    let now = Instant::now();
-                    let ip = sock.ip();
-                    if let Some(last) = map.get(&ip) {
-                        if now.duration_since(*last)
-                            < Duration::from_secs(incoming_conn_log_cooldown_secs())
-                        {
-                            return;
-                        }
-                    }
-                    map.insert(ip, now);
+
+        let mut rl_spec: Option<(String, u64)> = None;
+
+        if category == "sync" {
+            let (kind, cooldown) = if msg_ref.contains("no getblocks after headers") {
+                ("no_getblocks", no_getblocks_log_cooldown_secs())
+            } else if msg_ref.contains("unknown start hash") {
+                ("unknown_start", unknown_start_log_cooldown_secs())
+            } else if msg_ref.contains("headers (new=false)") {
+                ("headers_new_false", headers_new_false_log_cooldown_secs())
+            } else {
+                ("", 0)
+            };
+            if cooldown > 0 {
+                if let Some(ip) = extract_ip_from_p2p_line(msg_ref) {
+                    rl_spec = Some((format!("sync:{}:{}", kind, ip), cooldown));
                 }
             }
+        } else if category == "p2p" {
+            if msg_ref.starts_with("Incoming P2P connection from ") {
+                if let Some(rest) = msg_ref.strip_prefix("Incoming P2P connection from ") {
+                    if let Some(sock) = extract_sock(rest) {
+                        rl_spec = Some((
+                            format!("p2p:incoming:{}", sock.ip()),
+                            incoming_conn_log_cooldown_secs(),
+                        ));
+                    }
+                }
+            } else if msg_ref.starts_with("Rejecting inbound ") {
+                if msg_ref.contains(": banned") {
+                    if let Some(ip) =
+                        extract_ip_from_prefix(msg_ref, "Rejecting inbound ", ": banned")
+                    {
+                        rl_spec = Some((
+                            format!("p2p:reject_banned:{}", ip),
+                            inbound_banned_log_cooldown_secs(),
+                        ));
+                    }
+                } else if msg_ref.contains(": rate limit") {
+                    if let Some(ip) =
+                        extract_ip_from_prefix(msg_ref, "Rejecting inbound ", ": rate limit")
+                    {
+                        rl_spec = Some((
+                            format!("p2p:reject_ratelimit:{}", ip),
+                            inbound_banned_log_cooldown_secs(),
+                        ));
+                    }
+                }
+            } else if msg_ref.contains("sending 512 blocks [0-511]") {
+                if let Some(ip) = extract_ip_from_p2p_line(msg_ref) {
+                    rl_spec = Some((
+                        format!("p2p:send_genesis_512:{}", ip),
+                        send_blocks_log_cooldown_secs(),
+                    ));
+                }
+            } else if msg_ref.contains("P2P handshake error from ") {
+                if let Some(ip) = extract_ip_from_prefix(msg_ref, "P2P handshake error from ", ": ")
+                {
+                    rl_spec = Some((
+                        format!("p2p:handshake_err:{}", ip),
+                        handshake_error_log_cooldown_secs(),
+                    ));
+                }
+            } else if msg_ref.contains("early eof") {
+                if let Some(ip) = extract_ip_from_p2p_line(msg_ref).or_else(|| {
+                    extract_ip_from_prefix(msg_ref, "early eof during sybil proof from ", ":")
+                }) {
+                    rl_spec = Some((
+                        format!("p2p:early_eof:{}", ip),
+                        handshake_error_log_cooldown_secs(),
+                    ));
+                }
+            }
         }
+
+        if let Some((key, cooldown_secs)) = rl_spec {
+            let now = Instant::now();
+            let mut map = rl.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = map.entry(key).or_insert_with(|| {
+                (
+                    Instant::now() - Duration::from_secs(cooldown_secs.saturating_add(1)),
+                    0,
+                )
+            });
+            if now.duration_since(entry.0) < Duration::from_secs(cooldown_secs) {
+                entry.1 = entry.1.saturating_add(1);
+                return;
+            }
+            let suppressed = entry.1;
+            entry.0 = now;
+            entry.1 = 0;
+            if suppressed > 0 {
+                suffix = Some(format!(" (suppressed {} repeats)", suppressed));
+            }
+        }
+
+        let msg_out: Cow<'_, str> = if let Some(suf) = suffix {
+            Cow::Owned(format!("{}{}", msg_ref, suf))
+        } else {
+            Cow::Borrowed(msg_ref)
+        };
+
         if Self::json_log_enabled() {
             let payload = json!({
                 "ts": Self::ts(),
                 "level": level,
                 "cat": category,
                 "icon": icon,
-                "msg": msg_ref,
+                "msg": msg_out,
             });
             if level == "error" {
                 eprintln!("{}", payload);
@@ -920,7 +1006,7 @@ impl P2PNode {
             } else {
                 format!("{} {}", icon, category)
             };
-            let line = format!("[{}] [{}] {}", Self::ts(), tag, msg_ref);
+            let line = format!("[{}] [{}] {}", Self::ts(), tag, msg_out);
             if level == "error" {
                 eprintln!("{}", line);
             } else {
@@ -2654,23 +2740,6 @@ impl P2PNode {
                                     );
                                 }
 
-                                if header_count > 0 {
-                                    let last_short = last_header_hash
-                                        .map(|h| {
-                                            let hex = hex::encode(h);
-                                            hex.get(0..12).unwrap_or(&hex).to_string()
-                                        })
-                                        .unwrap_or_else(|| "-".to_string());
-                                    P2PNode::log_event(
-                                        "info",
-                                        "sync",
-                                        format!(
-                                            "P2P {}: received {} headers (new={}) last={}",
-                                            addr, header_count, added_any, last_short
-                                        ),
-                                    );
-                                }
-
                                 if header_error {
                                     if unknown_parent && !added_any {
                                         P2PNode::log_event(
@@ -2833,56 +2902,23 @@ impl P2PNode {
                                     }
                                     (start_idx, matched_pos)
                                 };
-                                let mut force_genesis = false;
-                                let mut genesis_allowed = false;
-                                if matched_pos.is_none() && !is_zero {
-                                    if let Some(remote_tip) = last_handshake_tip {
-                                        let local_tip = {
-                                            let guard =
-                                                chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                            guard.tip_hash()
-                                        };
-                                        if remote_tip != local_tip {
-                                            genesis_allowed = genesis_request_allowed(
-                                                &getblocks_genesis,
-                                                addr.ip(),
-                                            )
-                                            .await;
-                                            if !genesis_allowed {
-                                                continue;
-                                            }
-                                            force_genesis = true;
-                                            start_idx = 0;
-                                            matched_pos = Some(0);
-                                            P2PNode::log_event(
-                                                        "info",
-                                                        "sync",
-                                                        format!(
-                                                            "P2P {}: unknown start hash {}, forcing genesis sync",
-                                                            addr,
-                                                            hex::encode(&payload.start_hash)
-                                                        ),
-                                                    );
-                                        }
-                                    }
-                                    if !force_genesis {
-                                        P2PNode::log_event(
-                                            "warn",
-                                            "sync",
-                                            format!(
-                                                "P2P {}: ignoring getblocks unknown start hash {}",
-                                                addr,
-                                                hex::encode(&payload.start_hash)
-                                            ),
-                                        );
-                                        continue;
-                                    }
-                                }
                                 let genesis_locator = is_zero || matches!(matched_pos, Some(0));
                                 if genesis_locator
-                                    && !genesis_allowed
                                     && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await
                                 {
+                                    continue;
+                                }
+                                if matched_pos.is_none() && !is_zero {
+                                    // Unknown locator: do not spam-send genesis blocks; it wastes bandwidth and CPU.
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: ignoring getblocks unknown start hash {}",
+                                            addr,
+                                            hex::encode(&payload.start_hash)
+                                        ),
+                                    );
                                     continue;
                                 }
                                 let (blocks, start_height) = {
@@ -4283,53 +4319,23 @@ async fn handle_incoming_with_sybil(
                             }
                             (start_idx, matched_pos)
                         };
-                        let mut force_genesis = false;
-                        let mut genesis_allowed = false;
-                        if matched_pos.is_none() && !is_zero {
-                            if let Some(remote_tip) = last_handshake_tip {
-                                let local_tip = {
-                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                    guard.tip_hash()
-                                };
-                                if remote_tip != local_tip {
-                                    genesis_allowed =
-                                        genesis_request_allowed(&getblocks_genesis, addr.ip())
-                                            .await;
-                                    if !genesis_allowed {
-                                        continue;
-                                    }
-                                    force_genesis = true;
-                                    start_idx = 0;
-                                    matched_pos = Some(0);
-                                    P2PNode::log_event(
-                                        "info",
-                                        "sync",
-                                        format!(
-                                            "P2P {}: unknown start hash {}, forcing genesis sync",
-                                            addr,
-                                            hex::encode(&payload.start_hash)
-                                        ),
-                                    );
-                                }
-                            }
-                            if !force_genesis {
-                                P2PNode::log_event(
-                                    "warn",
-                                    "sync",
-                                    format!(
-                                        "P2P {}: ignoring getblocks unknown start hash {}",
-                                        addr,
-                                        hex::encode(&payload.start_hash)
-                                    ),
-                                );
-                                continue;
-                            }
-                        }
                         let genesis_locator = is_zero || matches!(matched_pos, Some(0));
                         if genesis_locator
-                            && !genesis_allowed
                             && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await
                         {
+                            continue;
+                        }
+                        if matched_pos.is_none() && !is_zero {
+                            // Unknown locator: do not spam-send genesis blocks; it wastes bandwidth and CPU.
+                            P2PNode::log_event(
+                                "warn",
+                                "sync",
+                                format!(
+                                    "P2P {}: ignoring getblocks unknown start hash {}",
+                                    addr,
+                                    hex::encode(&payload.start_hash)
+                                ),
+                            );
                             continue;
                         }
                         let (blocks, start_height) = {
