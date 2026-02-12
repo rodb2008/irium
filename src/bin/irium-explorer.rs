@@ -36,6 +36,11 @@ struct BlocksQuery {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct MiningQuery {
+    window: Option<usize>,
+    series: Option<usize>,
+}
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
@@ -289,6 +294,26 @@ async fn utxo(
     .await
 }
 
+async fn mining(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MiningQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    let mut path = String::from("/rpc/mining_metrics");
+    let mut first = true;
+    if let Some(w) = q.window {
+        path.push_str(if first { "?window=" } else { "&window=" });
+        path.push_str(&w.to_string());
+        first = false;
+    }
+    if let Some(n) = q.series {
+        path.push_str(if first { "?series=" } else { "&series=" });
+        path.push_str(&n.to_string());
+    }
+    proxy_json(&state, &path).await
+}
 #[tokio::main]
 async fn main() {
     let node_base =
@@ -326,6 +351,7 @@ async fn main() {
         .route("/tx/:txid", get(tx))
         .route("/address/:address", get(address))
         .route("/utxo", get(utxo))
+        .route("/mining", get(mining))
         .with_state(state)
         .into_make_service_with_connect_info::<SocketAddr>();
 
