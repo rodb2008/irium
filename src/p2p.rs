@@ -96,7 +96,7 @@ fn inbound_banned_log_cooldown_secs() -> u64 {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|v| v.max(1).min(3600))
-            .unwrap_or(30)
+            .unwrap_or(120)
     })
 }
 
@@ -119,6 +119,60 @@ fn send_blocks_log_cooldown_secs() -> u64 {
             .and_then(|v| v.parse::<u64>().ok())
             .map(|v| v.max(1).min(3600))
             .unwrap_or(15)
+    })
+}
+
+fn incoming_conn_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_INCOMING_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(120)
+    })
+}
+
+fn incoming_conn_log_enabled() -> bool {
+    static VAL: OnceLock<bool> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_LOG_INCOMING")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    })
+}
+
+fn no_getblocks_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_NO_GETBLOCKS_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(60)
+    })
+}
+
+fn unknown_start_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_UNKNOWN_START_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(120)
+    })
+}
+
+fn inbound_accept_cooldown_ms() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_INBOUND_ACCEPT_COOLDOWN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(100).min(60000))
+            .unwrap_or(5000)
     })
 }
 
@@ -183,7 +237,7 @@ fn headers_request_cooldown() -> Duration {
     let secs = std::env::var("IRIUM_P2P_HEADERS_REQUEST_COOLDOWN_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30);
+        .unwrap_or(120);
     Duration::from_secs(secs.max(5).min(300))
 }
 
@@ -794,13 +848,66 @@ impl P2PNode {
             "mempool" => "🧺",
             _ => "",
         };
+        let msg_ref = msg.as_ref();
+        if category == "sync" {
+            let cooldown_secs = if msg_ref.contains("no getblocks after headers") {
+                Some(no_getblocks_log_cooldown_secs())
+            } else if msg_ref.contains("unknown start hash") {
+                Some(unknown_start_log_cooldown_secs())
+            } else {
+                None
+            };
+            if let Some(cooldown_secs) = cooldown_secs {
+                static SYNC_LOG_GUARD: OnceLock<StdMutex<HashMap<String, Instant>>> =
+                    OnceLock::new();
+                let key = if let Some(start) = msg_ref.find("P2P ") {
+                    let rest = &msg_ref[start + 4..];
+                    if let Some(colon) = rest.find(':') {
+                        format!("{}:{}", &msg_ref[..start], &rest[..colon])
+                    } else {
+                        msg_ref.to_string()
+                    }
+                } else {
+                    msg_ref.to_string()
+                };
+                let guard = SYNC_LOG_GUARD.get_or_init(|| StdMutex::new(HashMap::new()));
+                let mut map = guard.lock().unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                if let Some(last) = map.get(&key) {
+                    if now.duration_since(*last) < Duration::from_secs(cooldown_secs) {
+                        return;
+                    }
+                }
+                map.insert(key, now);
+            }
+        }
+        if category == "p2p" && msg_ref.starts_with("Incoming P2P connection from ") {
+            static INCOMING_LOG_GUARD: OnceLock<StdMutex<HashMap<IpAddr, Instant>>> =
+                OnceLock::new();
+            if let Some(addr_str) = msg_ref.strip_prefix("Incoming P2P connection from ") {
+                if let Ok(sock) = addr_str.trim().parse::<SocketAddr>() {
+                    let guard = INCOMING_LOG_GUARD.get_or_init(|| StdMutex::new(HashMap::new()));
+                    let mut map = guard.lock().unwrap_or_else(|e| e.into_inner());
+                    let now = Instant::now();
+                    let ip = sock.ip();
+                    if let Some(last) = map.get(&ip) {
+                        if now.duration_since(*last)
+                            < Duration::from_secs(incoming_conn_log_cooldown_secs())
+                        {
+                            return;
+                        }
+                    }
+                    map.insert(ip, now);
+                }
+            }
+        }
         if Self::json_log_enabled() {
             let payload = json!({
                 "ts": Self::ts(),
                 "level": level,
                 "cat": category,
                 "icon": icon,
-                "msg": msg.as_ref(),
+                "msg": msg_ref,
             });
             if level == "error" {
                 eprintln!("{}", payload);
@@ -813,7 +920,7 @@ impl P2PNode {
             } else {
                 format!("{} {}", icon, category)
             };
-            let line = format!("[{}] [{}] {}", Self::ts(), tag, msg.as_ref());
+            let line = format!("[{}] [{}] {}", Self::ts(), tag, msg_ref);
             if level == "error" {
                 eprintln!("{}", line);
             } else {
@@ -877,7 +984,7 @@ impl P2PNode {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|v| *v > 0)
-                .unwrap_or(30);
+                .unwrap_or(120);
             let bounded = secs.max(5).min(120);
             Duration::from_secs(bounded)
         })
@@ -1148,16 +1255,10 @@ impl P2PNode {
                         let cooldown = if trusted {
                             Duration::from_secs(trusted_seed_inbound_cooldown_secs())
                         } else {
-                            Duration::from_millis(500)
+                            Duration::from_millis(inbound_accept_cooldown_ms())
                         };
                         if let Some(last) = log_guard.get(&ip) {
                             if last.elapsed() < cooldown {
-                                if !trusted {
-                                    Self::log_err(format!(
-                                        "Rejecting inbound {}: rate limit",
-                                        addr
-                                    ));
-                                }
                                 continue;
                             }
                         }
@@ -1169,7 +1270,9 @@ impl P2PNode {
                             Self::log_err(format!("Rejecting inbound {}: max peers reached", addr));
                             continue;
                         }
-                        Self::log(format!("Incoming P2P connection from {}", addr));
+                        if incoming_conn_log_enabled() {
+                            Self::log(format!("Incoming P2P connection from {}", addr));
+                        }
                         let peers_inner = peers_arc.clone();
                         let connected_inner = connected.clone();
                         let dir = dir_arc.clone();
@@ -2019,7 +2122,9 @@ impl P2PNode {
                         | MessageType::GetHeaders
                         | MessageType::GetBlocks
                         | MessageType::Headers
-                        | MessageType::Block => {}
+                        | MessageType::Block
+                        | MessageType::UptimeChallenge
+                        | MessageType::UptimeProof => {}
                         _ => {
                             P2PNode::log_event(
                                 "info",
@@ -3165,6 +3270,10 @@ impl P2PNode {
                 }
             }
             {
+                let mut w = writer_for_drop.lock().await;
+                let _ = w.shutdown().await;
+            }
+            {
                 let mut guard = peers_vec.lock().await;
                 guard.retain(|p| !Arc::ptr_eq(p, &writer_for_drop));
             }
@@ -3542,7 +3651,9 @@ async fn handle_incoming_with_sybil(
                 | MessageType::GetHeaders
                 | MessageType::GetBlocks
                 | MessageType::Headers
-                | MessageType::Block => {}
+                | MessageType::Block
+                | MessageType::UptimeChallenge
+                | MessageType::UptimeProof => {}
                 _ => {
                     P2PNode::log_event(
                         "info",
@@ -4545,6 +4656,10 @@ async fn handle_incoming_with_sybil(
                 // Unhandled message types can be ignored for now.
             }
         }
+    }
+    {
+        let mut w = writer.lock().await;
+        let _ = w.shutdown().await;
     }
     {
         let mut guard = peers.lock().await;
