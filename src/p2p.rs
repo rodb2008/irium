@@ -2902,56 +2902,23 @@ impl P2PNode {
                                     }
                                     (start_idx, matched_pos)
                                 };
-                                let mut force_genesis = false;
-                                let mut genesis_allowed = false;
-                                if matched_pos.is_none() && !is_zero {
-                                    if let Some(remote_tip) = last_handshake_tip {
-                                        let local_tip = {
-                                            let guard =
-                                                chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                            guard.tip_hash()
-                                        };
-                                        if remote_tip != local_tip {
-                                            genesis_allowed = genesis_request_allowed(
-                                                &getblocks_genesis,
-                                                addr.ip(),
-                                            )
-                                            .await;
-                                            if !genesis_allowed {
-                                                continue;
-                                            }
-                                            force_genesis = true;
-                                            start_idx = 0;
-                                            matched_pos = Some(0);
-                                            P2PNode::log_event(
-                                                        "info",
-                                                        "sync",
-                                                        format!(
-                                                            "P2P {}: unknown start hash {}, forcing genesis sync",
-                                                            addr,
-                                                            hex::encode(&payload.start_hash)
-                                                        ),
-                                                    );
-                                        }
-                                    }
-                                    if !force_genesis {
-                                        P2PNode::log_event(
-                                            "warn",
-                                            "sync",
-                                            format!(
-                                                "P2P {}: ignoring getblocks unknown start hash {}",
-                                                addr,
-                                                hex::encode(&payload.start_hash)
-                                            ),
-                                        );
-                                        continue;
-                                    }
-                                }
                                 let genesis_locator = is_zero || matches!(matched_pos, Some(0));
                                 if genesis_locator
-                                    && !genesis_allowed
                                     && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await
                                 {
+                                    continue;
+                                }
+                                if matched_pos.is_none() && !is_zero {
+                                    // Unknown locator: do not spam-send genesis blocks; it wastes bandwidth and CPU.
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: ignoring getblocks unknown start hash {}",
+                                            addr,
+                                            hex::encode(&payload.start_hash)
+                                        ),
+                                    );
                                     continue;
                                 }
                                 let (blocks, start_height) = {
@@ -4352,53 +4319,23 @@ async fn handle_incoming_with_sybil(
                             }
                             (start_idx, matched_pos)
                         };
-                        let mut force_genesis = false;
-                        let mut genesis_allowed = false;
-                        if matched_pos.is_none() && !is_zero {
-                            if let Some(remote_tip) = last_handshake_tip {
-                                let local_tip = {
-                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                    guard.tip_hash()
-                                };
-                                if remote_tip != local_tip {
-                                    genesis_allowed =
-                                        genesis_request_allowed(&getblocks_genesis, addr.ip())
-                                            .await;
-                                    if !genesis_allowed {
-                                        continue;
-                                    }
-                                    force_genesis = true;
-                                    start_idx = 0;
-                                    matched_pos = Some(0);
-                                    P2PNode::log_event(
-                                        "info",
-                                        "sync",
-                                        format!(
-                                            "P2P {}: unknown start hash {}, forcing genesis sync",
-                                            addr,
-                                            hex::encode(&payload.start_hash)
-                                        ),
-                                    );
-                                }
-                            }
-                            if !force_genesis {
-                                P2PNode::log_event(
-                                    "warn",
-                                    "sync",
-                                    format!(
-                                        "P2P {}: ignoring getblocks unknown start hash {}",
-                                        addr,
-                                        hex::encode(&payload.start_hash)
-                                    ),
-                                );
-                                continue;
-                            }
-                        }
                         let genesis_locator = is_zero || matches!(matched_pos, Some(0));
                         if genesis_locator
-                            && !genesis_allowed
                             && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await
                         {
+                            continue;
+                        }
+                        if matched_pos.is_none() && !is_zero {
+                            // Unknown locator: do not spam-send genesis blocks; it wastes bandwidth and CPU.
+                            P2PNode::log_event(
+                                "warn",
+                                "sync",
+                                format!(
+                                    "P2P {}: ignoring getblocks unknown start hash {}",
+                                    addr,
+                                    hex::encode(&payload.start_hash)
+                                ),
+                            );
                             continue;
                         }
                         let (blocks, start_height) = {
