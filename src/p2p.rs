@@ -3250,6 +3250,10 @@ impl P2PNode {
                 }
             }
             {
+                let mut w = writer_for_drop.lock().await;
+                let _ = w.shutdown().await;
+            }
+            {
                 let mut guard = peers_vec.lock().await;
                 guard.retain(|p| !Arc::ptr_eq(p, &writer_for_drop));
             }
@@ -4630,6 +4634,10 @@ async fn handle_incoming_with_sybil(
                 // Unhandled message types can be ignored for now.
             }
         }
+    }
+    {
+        let mut w = writer.lock().await;
+        let _ = w.shutdown().await;
     }
     {
         let mut guard = peers.lock().await;
