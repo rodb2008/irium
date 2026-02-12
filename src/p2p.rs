@@ -325,11 +325,6 @@ async fn genesis_request_allowed(
     true
 }
 
-fn chain_hash_at(chain: &Option<Arc<StdMutex<ChainState>>>, height: u64) -> Option<[u8; 32]> {
-    let chain_arc = chain.as_ref()?;
-    let guard = chain_arc.lock().ok()?;
-    guard.chain.get(height as usize).map(|b| b.header.hash())
-}
 fn best_checkpoint(chain: &Option<Arc<StdMutex<ChainState>>>) -> (Option<u64>, Option<String>) {
     let chain_arc = match chain.as_ref() {
         Some(c) => c,
@@ -2262,7 +2257,6 @@ impl P2PNode {
             let mut window_start = Instant::now();
             let mut last_handshake_height: Option<u64> = None;
             let mut last_handshake_agent: Option<String> = None;
-            let mut last_handshake_tip: Option<[u8; 32]> = None;
             let mut bulk_count: u32 = 0;
             loop {
                 let msg = match read_message_with_timeout(&mut reader, P2PNode::peer_timeout())
@@ -2420,7 +2414,6 @@ impl P2PNode {
                             }
                             last_handshake_height = Some(payload.height);
                             last_handshake_agent = Some(agent_str.clone());
-                            last_handshake_tip = parsed_tip;
                             {
                                 let mut state = peer_state.lock().await;
                                 state.height = Some(payload.height);
@@ -3007,7 +3000,7 @@ impl P2PNode {
                                     continue;
                                 }
                                 let is_zero = payload.start_hash.iter().all(|b| *b == 0);
-                                let (mut start_idx, mut matched_pos) = {
+                                let (start_idx, matched_pos) = {
                                     let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     let mut start_idx = 0usize;
                                     let mut matched_pos = None;
@@ -3758,7 +3751,6 @@ async fn handle_incoming_with_sybil(
 
     let mut msg_count: u32 = 0;
     let mut window_start = Instant::now();
-    let mut last_handshake_tip: Option<[u8; 32]> = None;
     let mut last_handshake_height: Option<u64> = None;
     // Process messages from the peer.
     let mut bulk_count: u32 = 0;
@@ -3905,7 +3897,6 @@ async fn handle_incoming_with_sybil(
                         });
                     let node_id_bytes = parse_node_id_bytes(&payload);
                     let supports_uptime = peer_supports_uptime(&payload);
-                    last_handshake_tip = parsed_tip;
                     {
                         let mut state = peer_state.lock().await;
                         state.height = Some(payload.height);
@@ -4451,7 +4442,7 @@ async fn handle_incoming_with_sybil(
                             continue;
                         }
                         let is_zero = payload.start_hash.iter().all(|b| *b == 0);
-                        let (mut start_idx, mut matched_pos) = {
+                        let (start_idx, matched_pos) = {
                             let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                             let mut start_idx = 0usize;
                             let mut matched_pos = None;

@@ -108,6 +108,39 @@ struct NetworkHashrateResponse {
     sample_blocks: usize,
 }
 
+#[derive(Deserialize)]
+struct MiningMetricsQuery {
+    window: Option<usize>,
+    series: Option<usize>,
+}
+
+#[derive(Serialize, Clone)]
+struct MiningMetricsPoint {
+    height: u64,
+    time: u64,
+    difficulty: f64,
+}
+
+#[derive(Serialize)]
+struct MiningMetricsResponse {
+    tip_height: u64,
+    tip_time: u64,
+
+    difficulty: f64,
+    hashrate: Option<f64>,
+    avg_block_time: Option<f64>,
+
+    window: usize,
+    sample_blocks: usize,
+
+    difficulty_1h: Option<f64>,
+    difficulty_24h: Option<f64>,
+    difficulty_change_1h_pct: Option<f64>,
+    difficulty_change_24h_pct: Option<f64>,
+
+    series: Vec<MiningMetricsPoint>,
+}
+
 #[derive(Serialize)]
 struct BalanceResponse {
     address: String,
@@ -1185,6 +1218,148 @@ async fn network_hashrate(
         avg_block_time,
         window,
         sample_blocks,
+    }))
+}
+
+async fn mining_metrics(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Query(q): Query<MiningMetricsQuery>,
+) -> Result<Json<MiningMetricsResponse>, StatusCode> {
+    check_rate(&state, &addr)?;
+    let window = q.window.unwrap_or(120).clamp(1, 2016);
+    let series_len = q.series.unwrap_or(240).clamp(1, 2016);
+
+    let (
+        tip_height,
+        tip_time,
+        difficulty,
+        hashrate,
+        avg_block_time,
+        sample_blocks,
+        diff_1h,
+        diff_24h,
+        diff_1h_pct,
+        diff_24h_pct,
+        series,
+    ) = {
+        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip_height = guard.tip_height();
+        let tip_time = guard
+            .chain
+            .last()
+            .map(|b| b.header.time)
+            .unwrap_or(guard.params.genesis_block.header.time);
+
+        let tip_target = guard
+            .chain
+            .last()
+            .map(|b| b.header.target())
+            .unwrap_or_else(|| guard.params.genesis_block.header.target());
+        let difficulty = difficulty_from_target(guard.params.pow_limit, tip_target);
+
+        let (hashrate, avg_block_time, sample_blocks) = if guard.chain.len() < 2 {
+            (None, None, 0usize)
+        } else {
+            let end_index = guard.chain.len() - 1;
+            let start_index = if guard.chain.len() > window {
+                guard.chain.len() - 1 - window
+            } else {
+                0
+            };
+            let blocks = end_index.saturating_sub(start_index);
+            if blocks == 0 {
+                (None, None, 0usize)
+            } else {
+                let start_time = guard.chain[start_index].header.time as i64;
+                let end_time = guard.chain[end_index].header.time as i64;
+                let elapsed = end_time - start_time;
+                if elapsed <= 0 {
+                    (None, None, blocks)
+                } else {
+                    let avg_time = (elapsed as f64) / (blocks as f64);
+                    let hashrate = difficulty * 4294967296.0 / avg_time;
+                    (Some(hashrate), Some(avg_time), blocks)
+                }
+            }
+        };
+
+        let diff_at_age = |age_secs: u64| -> Option<f64> {
+            for b in guard.chain.iter().rev() {
+                if (tip_time as u64).saturating_sub(b.header.time as u64) >= age_secs {
+                    let d = difficulty_from_target(guard.params.pow_limit, b.header.target());
+                    return Some(d);
+                }
+            }
+            None
+        };
+
+        let diff_1h = diff_at_age(3600);
+        let diff_24h = diff_at_age(86400);
+        let diff_1h_pct = diff_1h.and_then(|d| {
+            if d > 0.0 {
+                Some((difficulty - d) / d * 100.0)
+            } else {
+                None
+            }
+        });
+        let diff_24h_pct = diff_24h.and_then(|d| {
+            if d > 0.0 {
+                Some((difficulty - d) / d * 100.0)
+            } else {
+                None
+            }
+        });
+
+        let mut series = Vec::new();
+        if !guard.chain.is_empty() {
+            let end_index = guard.chain.len() - 1;
+            let start_index = if guard.chain.len() > series_len {
+                guard.chain.len() - series_len
+            } else {
+                0
+            };
+            let count = end_index + 1 - start_index;
+            let step = std::cmp::max(1, count / 120);
+            for i in (start_index..=end_index).step_by(step) {
+                let b = &guard.chain[i];
+                let d = difficulty_from_target(guard.params.pow_limit, b.header.target());
+                series.push(MiningMetricsPoint {
+                    height: i as u64,
+                    time: b.header.time as u64,
+                    difficulty: d,
+                });
+            }
+        }
+
+        (
+            tip_height,
+            tip_time,
+            difficulty,
+            hashrate,
+            avg_block_time,
+            sample_blocks,
+            diff_1h,
+            diff_24h,
+            diff_1h_pct,
+            diff_24h_pct,
+            series,
+        )
+    };
+
+    Ok(Json(MiningMetricsResponse {
+        tip_height,
+        tip_time: tip_time as u64,
+        difficulty,
+        hashrate,
+        avg_block_time,
+        window,
+        sample_blocks,
+        difficulty_1h: diff_1h,
+        difficulty_24h: diff_24h,
+        difficulty_change_1h_pct: diff_1h_pct,
+        difficulty_change_24h_pct: diff_24h_pct,
+        series,
     }))
 }
 
@@ -2942,6 +3117,7 @@ async fn main() {
         .route("/peers", get(peers))
         .route("/metrics", get(metrics))
         .route("/rpc/network_hashrate", get(network_hashrate))
+        .route("/rpc/mining_metrics", get(mining_metrics))
         .route("/rpc/balance", get(get_balance))
         .route("/rpc/utxos", get(get_utxos))
         .route("/rpc/history", get(get_history))
