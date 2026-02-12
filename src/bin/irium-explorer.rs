@@ -34,6 +34,7 @@ struct UtxoQuery {
 #[derive(Deserialize)]
 struct BlocksQuery {
     limit: Option<usize>,
+    start: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -214,8 +215,9 @@ async fn blocks(
     let status = proxy_value(&state, "/status").await?;
     let height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
     let limit = q.limit.unwrap_or(50).min(200);
+    let start = q.start.unwrap_or(height).min(height);
     let mut blocks = Vec::new();
-    let mut h = height as i64;
+    let mut h = start as i64;
     while h >= 0 && blocks.len() < limit {
         let path = format!("/rpc/block?height={}", h);
         if let Ok(block) = proxy_value(&state, &path).await {
