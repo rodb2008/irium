@@ -547,13 +547,19 @@ impl PeerDirectory {
 
         for rec in self.records.values() {
             let idle_hours = (now - rec.last_seen) / 3600.0;
+            if !rec.dialable {
+                continue;
+            }
             let mut active_days = 0;
             for day in start_day..=today {
                 if rec.seen_days.contains(&day) {
                     active_days += 1;
                 }
             }
-            if active_days >= min_days && idle_hours <= max_idle {
+            // For runtime seeds we only publish peers we have successfully dialed (dialable=true).
+            // Once dialable, we do not require multi-day stability before publishing; this keeps
+            // the runtime seedlist fresh and avoids churn on dead/NAT-only addresses.
+            if active_days >= 1 && idle_hours <= max_idle {
                 if let Some(ip) = normalize_seed(&rec.multiaddr) {
                     seeds.push(ip);
                 }
@@ -562,6 +568,10 @@ impl PeerDirectory {
 
         seeds.sort();
         seeds.dedup();
+        if seeds.is_empty() {
+            // Keep the previous runtime seedlist until we have at least one dialable peer.
+            return;
+        }
         self.seed_manager.write_runtime_entries(seeds);
     }
 
