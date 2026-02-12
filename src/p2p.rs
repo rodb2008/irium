@@ -154,6 +154,17 @@ fn unknown_start_log_cooldown_secs() -> u64 {
     })
 }
 
+fn inbound_accept_cooldown_ms() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_INBOUND_ACCEPT_COOLDOWN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(100).min(60000))
+            .unwrap_or(5000)
+    })
+}
+
 fn trusted_seed_inbound_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -1233,16 +1244,10 @@ impl P2PNode {
                         let cooldown = if trusted {
                             Duration::from_secs(trusted_seed_inbound_cooldown_secs())
                         } else {
-                            Duration::from_millis(500)
+                            Duration::from_millis(inbound_accept_cooldown_ms())
                         };
                         if let Some(last) = log_guard.get(&ip) {
                             if last.elapsed() < cooldown {
-                                if !trusted {
-                                    Self::log_err(format!(
-                                        "Rejecting inbound {}: rate limit",
-                                        addr
-                                    ));
-                                }
                                 continue;
                             }
                         }
