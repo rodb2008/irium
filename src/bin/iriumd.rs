@@ -591,6 +591,16 @@ fn json_log_enabled() -> bool {
     })
 }
 
+fn dial_log_rate_limit_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("IRIUM_P2P_DIAL_LOG_RATE_LIMIT")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 fn dial_seed_log_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -603,6 +613,10 @@ fn dial_seed_log_cooldown_secs() -> u64 {
 }
 
 fn dial_seed_log_allowed(kind: u8, ip: IpAddr) -> Option<u64> {
+    if !dial_log_rate_limit_enabled() {
+        return Some(0);
+    }
+
     let cooldown = dial_seed_log_cooldown_secs();
     if cooldown == 0 {
         return Some(0);
