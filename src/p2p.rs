@@ -933,6 +933,13 @@ impl P2PNode {
                         ));
                     }
                 }
+            } else if msg_ref.contains("sending 512 blocks [0-511]") {
+                if let Some(ip) = extract_ip_from_p2p_line(msg_ref) {
+                    rl_spec = Some((
+                        format!("p2p:send_genesis_512:{}", ip),
+                        send_blocks_log_cooldown_secs(),
+                    ));
+                }
             } else if msg_ref.contains("P2P handshake error from ") {
                 if let Some(ip) = extract_ip_from_prefix(msg_ref, "P2P handshake error from ", ": ")
                 {
