@@ -602,22 +602,32 @@ fn dial_seed_log_cooldown_secs() -> u64 {
     })
 }
 
-fn dial_seed_log_allowed(ip: IpAddr) -> bool {
+fn dial_seed_log_allowed(kind: u8, ip: IpAddr) -> Option<u64> {
     let cooldown = dial_seed_log_cooldown_secs();
     if cooldown == 0 {
-        return true;
+        return Some(0);
     }
-    static GUARD: OnceLock<Mutex<HashMap<IpAddr, Instant>>> = OnceLock::new();
+
+    // kind: 0 = dialing seed, 1 = outbound failed
+    static GUARD: OnceLock<Mutex<HashMap<(u8, IpAddr), (Instant, u64)>>> = OnceLock::new();
     let guard = GUARD.get_or_init(|| Mutex::new(HashMap::new()));
+
     let mut map = guard.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    if let Some(last) = map.get(&ip) {
-        if now.duration_since(*last) < Duration::from_secs(cooldown) {
-            return false;
-        }
+    let entry = map.entry((kind, ip)).or_insert((
+        Instant::now() - Duration::from_secs(cooldown.saturating_add(1)),
+        0,
+    ));
+
+    if now.duration_since(entry.0) < Duration::from_secs(cooldown) {
+        entry.1 = entry.1.saturating_add(1);
+        return None;
     }
-    map.insert(ip, now);
-    true
+
+    let suppressed = entry.1;
+    entry.0 = now;
+    entry.1 = 0;
+    Some(suppressed)
 }
 
 fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
@@ -2657,13 +2667,17 @@ async fn main() {
                         let chain = shared_clone.lock().unwrap_or_else(|e| e.into_inner());
                         chain.tip_height()
                     };
-                    if dial_seed_log_allowed(addr.ip()) {
-                        println!(
+                    if let Some(suppressed) = dial_seed_log_allowed(0, addr.ip()) {
+                        let mut line = format!(
                             "[{}] dialing seed {} (h={})",
                             Utc::now().format("%H:%M:%S"),
                             addr,
                             height
                         );
+                        if suppressed > 0 {
+                            line.push_str(&format!(" (suppressed {} repeats)", suppressed));
+                        }
+                        println!("{}", line);
                     }
                     if let Err(e) = node
                         .connect_and_handshake(*addr, height, &agent_clone)
@@ -2673,13 +2687,17 @@ async fn main() {
                         if msg.contains("dial backoff") || msg.contains("dial in progress") {
                             continue;
                         }
-                        if dial_seed_log_allowed(addr.ip()) {
-                            eprintln!(
+                        if let Some(suppressed) = dial_seed_log_allowed(1, addr.ip()) {
+                            let mut line = format!(
                                 "[{}] outbound {} failed: {}",
                                 Utc::now().format("%H:%M:%S"),
                                 addr,
                                 msg
                             );
+                            if suppressed > 0 {
+                                line.push_str(&format!(" (suppressed {} repeats)", suppressed));
+                            }
+                            eprintln!("{}", line);
                         }
                     }
                 }
