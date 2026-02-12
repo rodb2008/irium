@@ -2109,7 +2109,9 @@ impl P2PNode {
                         | MessageType::GetHeaders
                         | MessageType::GetBlocks
                         | MessageType::Headers
-                        | MessageType::Block => {}
+                        | MessageType::Block
+                        | MessageType::UptimeChallenge
+                        | MessageType::UptimeProof => {}
                         _ => {
                             P2PNode::log_event(
                                 "info",
@@ -3636,7 +3638,9 @@ async fn handle_incoming_with_sybil(
                 | MessageType::GetHeaders
                 | MessageType::GetBlocks
                 | MessageType::Headers
-                | MessageType::Block => {}
+                | MessageType::Block
+                | MessageType::UptimeChallenge
+                | MessageType::UptimeProof => {}
                 _ => {
                     P2PNode::log_event(
                         "info",
