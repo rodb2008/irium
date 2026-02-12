@@ -849,6 +849,16 @@ impl P2PNode {
         })
     }
 
+    fn log_rate_limit_enabled() -> bool {
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        *FLAG.get_or_init(|| {
+            std::env::var("IRIUM_P2P_LOG_RATE_LIMIT")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
+    }
+
     fn log_event(level: &str, category: &str, msg: impl AsRef<str>) {
         use std::borrow::Cow;
 
@@ -862,11 +872,6 @@ impl P2PNode {
             _ => "",
         };
         let msg_ref = msg.as_ref();
-
-        // Rate-limit selected spammy log lines by IP (ignoring port) and keep a suppressed counter.
-        // This keeps logs readable and makes `journalctl -f` responsive under heavy P2P churn.
-        static RL: OnceLock<StdMutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();
-        let rl = RL.get_or_init(|| StdMutex::new(HashMap::new()));
 
         let mut suffix: Option<String> = None;
 
@@ -888,7 +893,7 @@ impl P2PNode {
 
         let mut rl_spec: Option<(String, u64)> = None;
 
-        if category == "sync" {
+        if Self::log_rate_limit_enabled() && category == "sync" {
             let (kind, cooldown) = if msg_ref.contains("no getblocks after headers") {
                 ("no_getblocks", no_getblocks_log_cooldown_secs())
             } else if msg_ref.contains("unknown start hash") {
@@ -903,7 +908,7 @@ impl P2PNode {
                     rl_spec = Some((format!("sync:{}:{}", kind, ip), cooldown));
                 }
             }
-        } else if category == "p2p" {
+        } else if Self::log_rate_limit_enabled() && category == "p2p" {
             if msg_ref.starts_with("Incoming P2P connection from ") {
                 if let Some(rest) = msg_ref.strip_prefix("Incoming P2P connection from ") {
                     if let Some(sock) = extract_sock(rest) {
@@ -960,24 +965,29 @@ impl P2PNode {
             }
         }
 
-        if let Some((key, cooldown_secs)) = rl_spec {
-            let now = Instant::now();
-            let mut map = rl.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = map.entry(key).or_insert_with(|| {
-                (
-                    Instant::now() - Duration::from_secs(cooldown_secs.saturating_add(1)),
-                    0,
-                )
-            });
-            if now.duration_since(entry.0) < Duration::from_secs(cooldown_secs) {
-                entry.1 = entry.1.saturating_add(1);
-                return;
-            }
-            let suppressed = entry.1;
-            entry.0 = now;
-            entry.1 = 0;
-            if suppressed > 0 {
-                suffix = Some(format!(" (suppressed {} repeats)", suppressed));
+        if Self::log_rate_limit_enabled() {
+            static RL: OnceLock<StdMutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();
+            let rl = RL.get_or_init(|| StdMutex::new(HashMap::new()));
+
+            if let Some((key, cooldown_secs)) = rl_spec {
+                let now = Instant::now();
+                let mut map = rl.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = map.entry(key).or_insert_with(|| {
+                    (
+                        Instant::now() - Duration::from_secs(cooldown_secs.saturating_add(1)),
+                        0,
+                    )
+                });
+                if now.duration_since(entry.0) < Duration::from_secs(cooldown_secs) {
+                    entry.1 = entry.1.saturating_add(1);
+                    return;
+                }
+                let suppressed = entry.1;
+                entry.0 = now;
+                entry.1 = 0;
+                if suppressed > 0 {
+                    suffix = Some(format!(" (suppressed {} repeats)", suppressed));
+                }
             }
         }
 
