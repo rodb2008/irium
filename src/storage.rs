@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     env, fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use serde::Serialize;
@@ -84,22 +84,84 @@ struct JsonBlock {
     miner_address: Option<String>,
 }
 
-pub fn blocks_dir() -> PathBuf {
-    if let Ok(dir) = env::var("IRIUM_BLOCKS_DIR") {
-        PathBuf::from(dir)
-    } else {
-        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        PathBuf::from(home).join(".irium/blocks")
+#[cfg(unix)]
+fn os_home_dir() -> PathBuf {
+    // Prefer OS account database over $HOME to avoid env-tainted paths.
+    unsafe {
+        let uid = libc::geteuid();
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let mut buf = vec![0u8; 16 * 1024];
+        let rc = libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buf.as_mut_ptr() as *mut _,
+            buf.len(),
+            &mut result,
+        );
+        if rc == 0 && !result.is_null() && !pwd.pw_dir.is_null() {
+            if let Ok(dir) = std::ffi::CStr::from_ptr(pwd.pw_dir).to_str() {
+                return PathBuf::from(dir);
+            }
+        }
     }
+    PathBuf::from("/")
+}
+
+#[cfg(not(unix))]
+fn os_home_dir() -> PathBuf {
+    env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn normalize_under(base: &Path, input: &Path) -> Option<PathBuf> {
+    let mut out = if input.is_absolute() {
+        PathBuf::new()
+    } else {
+        base.to_path_buf()
+    };
+
+    let base_depth = base.components().count();
+    for comp in input.components() {
+        match comp {
+            Component::Prefix(_) => return None,
+            Component::RootDir => out.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out.components().count() <= base_depth {
+                    return None;
+                }
+                out.pop();
+            }
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    Some(out)
+}
+
+fn configured_dir(var: &str, default_rel: &Path) -> PathBuf {
+    let home = os_home_dir();
+
+    if let Some(raw) = env::var_os(var) {
+        let candidate = PathBuf::from(raw);
+        if let Some(normalized) = normalize_under(&home, &candidate) {
+            if normalized.starts_with(&home) {
+                return normalized;
+            }
+        }
+    }
+
+    home.join(default_rel)
+}
+
+pub fn blocks_dir() -> PathBuf {
+    configured_dir("IRIUM_BLOCKS_DIR", Path::new(".irium/blocks"))
 }
 
 pub fn state_dir() -> PathBuf {
-    if let Ok(dir) = env::var("IRIUM_STATE_DIR") {
-        PathBuf::from(dir)
-    } else {
-        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        PathBuf::from(home).join(".irium/state")
-    }
+    configured_dir("IRIUM_STATE_DIR", Path::new(".irium/state"))
 }
 
 pub fn ensure_runtime_dirs() -> std::io::Result<(PathBuf, PathBuf)> {

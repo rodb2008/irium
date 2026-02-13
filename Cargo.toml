@@ -15,7 +15,7 @@ bs58 = "0.4"
 num-bigint = "0.4"
 num-traits = "0.2"
 chrono = { version = "0.4", features = ["clock"] }
-
+libc = "0.2"
 k256 = { version = "0.13", features = ["ecdsa"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["macros"] }
