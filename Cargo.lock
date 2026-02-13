@@ -1026,6 +1026,7 @@ dependencies = [
  "hex",
  "hmac",
  "k256",
+ "libc",
  "num-bigint",
  "num-traits",
  "pbkdf2",
