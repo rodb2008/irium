@@ -13,6 +13,23 @@ use crate::block::Block;
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
 
+fn sanitize_filename_component(name: &std::ffi::OsStr) -> String {
+    // This file name ultimately comes from `Path::file_name()`, but we still sanitize
+    // to defend against path traversal if future callers ever pass tainted input.
+    let s = name.to_string_lossy();
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let ok = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-');
+        out.push(if ok { ch } else { '_' });
+    }
+    let trimmed = out.trim_matches('.');
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        out
+    }
+}
+
 fn p2pkh_hash_from_script(script: &[u8]) -> Option<[u8; 20]> {
     if script.len() != 25 {
         return None;
@@ -125,12 +142,13 @@ fn maybe_quarantine_existing_block(path: &Path, new_hash: &str) -> std::io::Resu
     fs::create_dir_all(&backup_dir)?;
 
     let name = path.file_name().unwrap_or_default();
-    let mut dest = backup_dir.join(name);
+    let safe_name = sanitize_filename_component(name);
+    let mut dest = backup_dir.join(&safe_name);
     if dest.exists() {
         // Avoid clobbering an existing quarantine file.
         let mut n = 1u32;
         loop {
-            let candidate = backup_dir.join(format!("{}.dup{}", name.to_string_lossy(), n));
+            let candidate = backup_dir.join(format!("{safe_name}.dup{n}"));
             if !candidate.exists() {
                 dest = candidate;
                 break;
