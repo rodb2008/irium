@@ -4904,143 +4904,108 @@ async fn handle_incoming_with_sybil(
                 }
             }
 
+
             MessageType::Block => {
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = BlockPayload::from_message(&msg) {
-                        match Block::deserialize(&payload.block_data) {
-                            Ok((block, _)) => {
-                                let bhash = block.header.hash();
-                                let short = hex::encode(bhash);
-                                let short = short.get(0..12).unwrap_or(&short);
-                                let chain_arc2 = chain_arc.clone();
-                                let mempool2 = mempool.clone();
-                                let addr2 = addr;
-                                let short2 = short.to_string();
-                                let bhash2 = bhash;
-                                let block2 = block.clone();
+                        let addr2 = addr;
+                        let chain_arc2 = chain_arc.clone();
+                        let mempool2 = mempool.clone();
+                        let directory2 = directory.clone();
+                        let reputation2 = reputation.clone();
 
-                                let (new_height_opt, record_verdict, persist_blocks, orphan_prev) =
-                                    match spawn_blocking_limited(move || {
-                                        let mut guard =
-                                            chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
-                                        let mut new_height_opt = None;
-                                        let mut record_verdict = None;
-                                        let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
-                                        let mut orphan_prev = None;
-                                        match guard.process_block(block2.clone()) {
-                                            Ok((new_height, _tip)) => {
-                                                P2PNode::log(format!(
-                                                    "P2P {}: accepted block height {} hash {}",
-                                                    addr2,
-                                                    new_height.saturating_sub(1),
-                                                    short2
-                                                ));
-                                                if let Some(ref mem) = mempool2 {
-                                                    let mut mem_guard =
-                                                        mem.lock().unwrap_or_else(|e| e.into_inner());
-                                                    for tx in block2.transactions.iter().skip(1) {
-                                                        mem_guard.remove(&tx.txid());
-                                                    }
-                                                }
-                                                new_height_opt = Some(new_height);
-                                                record_verdict = Some(true);
-                                                if guard.tip_hash() == bhash2 {
-                                                    let tip = guard.tip_height();
-                                                    persist_blocks.push((tip, block2.clone()));
-                                                    if tip > 0 {
-                                                        if let Some(prev) =
-                                                            guard.chain.get((tip - 1) as usize)
-                                                        {
-                                                            persist_blocks.push((tip - 1, prev.clone()));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                if e.contains("orphan") || e.contains("prev hash unknown") {
-                                                    orphan_prev = Some(block2.header.prev_hash);
-                                                }
-                                                if P2PNode::is_soft_block_reject(&e) {
-                                                    if !P2PNode::is_duplicate_block(&e) {
-                                                        P2PNode::log_event(
-                                                            "info",
-                                                            "chain",
-                                                            format!(
-                                                                "P2P {}: ignored block {} ({})",
-                                                                addr2, short2, e
-                                                            ),
-                                                        );
-                                                    }
-                                                } else {
-                                                    P2PNode::log_event(
-                                                        "warn",
-                                                        "chain",
-                                                        format!(
-                                                            "P2P {}: rejected block {}: {}",
-                                                            addr2, short2, e
-                                                        ),
-                                                    );
-                                                    record_verdict = Some(false);
-                                                }
+                        let permit = match inbound_bulk_queue().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                P2PNode::log_event(
+                                    "warn",
+                                    "sync",
+                                    format!("P2P {}: inbound block dropped (busy)", addr),
+                                );
+                                continue;
+                            }
+                        };
+
+                        tokio::spawn(async move {
+                            let _permit = permit;
+
+                            let block = match Block::deserialize(&payload.block_data) {
+                                Ok((b, _)) => b,
+                                Err(e) => {
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "net",
+                                        format!("P2P {}: failed to decode block payload: {}", addr2, e),
+                                    );
+                                    let mut rep = reputation2.lock().await;
+                                    rep.record_decode_error(&addr2.to_string());
+                                    return;
+                                }
+                            };
+
+                            let bhash = block.header.hash();
+                            let short = hex::encode(bhash);
+                            let short = short.get(0..12).unwrap_or(&short).to_string();
+
+                            let (new_height_opt, verdict, persist_blocks) =
+                                match spawn_blocking_limited(move || {
+                                    let mut guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
+                                    let mut new_height_opt = None;
+                                    let mut verdict = None;
+                                    let mut persist_blocks = Vec::new();
+
+                                    match guard.process_block(block.clone()) {
+                                        Ok((new_height, _)) => {
+                                            new_height_opt = Some(new_height);
+                                            verdict = Some(true);
+                                            if guard.tip_hash() == bhash {
+                                                let tip = guard.tip_height();
+                                                persist_blocks.push((tip, block.clone()));
                                             }
                                         }
-                                        (new_height_opt, record_verdict, persist_blocks, orphan_prev)
-                                    })
-                                    .await
-                                    {
-                                        Ok(v) => v,
-                                        Err(_) => (None, None, Vec::new(), None),
-                                    };
-                                for (height, b) in persist_blocks {
-                                    if let Err(e) = storage::write_block_json(height, &b) {
-                                        P2PNode::log_event(
-                                            "warn",
-                                            "chain",
-                                            format!(
-                                                "P2P {}: failed to persist block {}: {}",
-                                                addr, short, e
-                                            ),
-                                        );
+                                        Err(e) => {
+                                            if P2PNode::is_soft_block_reject(&e) {
+                                                // ignore
+                                            } else {
+                                                verdict = Some(false);
+                                                P2PNode::log_event(
+                                                    "warn",
+                                                    "chain",
+                                                    format!("P2P {}: rejected block {}: {}", addr2, short, e),
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    (new_height_opt, verdict, persist_blocks)
+                                })
+                                .await
+                                {
+                                    Ok(v) => v,
+                                    Err(_) => return,
+                                };
+
+                            for (height, b) in persist_blocks {
+                                let _ = storage::write_block_json(height, &b);
+                                if let Some(ref mem) = mempool2 {
+                                    let mut mem_guard = mem.lock().unwrap_or_else(|e| e.into_inner());
+                                    for tx in b.transactions.iter().skip(1) {
+                                        mem_guard.remove(&tx.txid());
                                     }
                                 }
-                                if let Some(prev_hash) = orphan_prev {
-                                    request_orphan_headers(
-                                        &writer,
-                                        addr,
-                                        prev_hash,
-                                        &chain,
-                                        &sync_requests,
-                                        &peer_state,
-                                    )
-                                    .await;
-                                }
-                                if let Some(new_height) = new_height_opt {
-                                    let multiaddr =
-                                        format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
-                                    let mut directory = directory.lock().await;
-                                    directory
-                                        .record_height(&multiaddr, new_height.saturating_sub(1));
-                                }
-                                maybe_request_sync(
-                                    &writer,
-                                    addr,
-                                    &chain,
-                                    &sync_requests,
-                                    &block_requests,
-                                    &peer_state,
-                                )
-                                .await;
-                                if let Some(ok) = record_verdict {
-                                    let mut rep = reputation.lock().await;
-                                    rep.record_block(&addr.to_string(), ok);
-                                }
                             }
-                            Err(e) => {
-                                eprintln!("Failed to decode block payload from {}: {}", addr, e);
-                                let mut rep = reputation.lock().await;
-                                rep.record_decode_error(&addr.to_string());
+
+                            if let Some(new_height) = new_height_opt {
+                                let multiaddr = format!("/ip4/{}/tcp/{}", addr2.ip(), addr2.port());
+                                let mut dir = directory2.lock().await;
+                                dir.record_height(&multiaddr, new_height.saturating_sub(1));
                             }
-                        }
+
+                            if let Some(ok) = verdict {
+                                let mut rep = reputation2.lock().await;
+                                rep.record_block(&addr2.to_string(), ok);
+                            }
+                        });
                     }
                 }
             }
