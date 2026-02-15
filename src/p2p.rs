@@ -1572,11 +1572,9 @@ impl P2PNode {
     pub async fn request_peers(&self) -> Result<(), String> {
         let msg = EmptyPayload::to_message(MessageType::GetPeers)?;
         let bytes = msg.serialize();
-        let mut guard = self.peers.lock().await;
-        for socket in guard.iter_mut() {
-            if let Err(e) = socket.lock().await.write_all(&bytes).await {
-                return Err(format!("failed to send getpeers: {}", e));
-            }
+        let ok = broadcast_raw(&self.peers, &bytes).await;
+        if ok == 0 {
+            return Err("failed to send getpeers: no peers accepted the message".to_string());
         }
         Ok(())
     }
@@ -1852,10 +1850,7 @@ impl P2PNode {
         .to_message();
         let serialized = msg.serialize();
 
-        let mut guard = self.peers.lock().await;
-        for socket in guard.iter_mut() {
-            let _ = socket.lock().await.write_all(&serialized).await;
-        }
+        let _ = broadcast_raw(&self.peers, &serialized).await;
         Ok(())
     }
 
@@ -1867,12 +1862,7 @@ impl P2PNode {
         .to_message();
         let serialized = msg.serialize();
 
-        let mut guard = self.peers.lock().await;
-        for socket in guard.iter_mut() {
-            if let Err(e) = socket.lock().await.write_all(&serialized).await {
-                eprintln!("Failed to send tx to peer: {}", e);
-            }
-        }
+        let _ = broadcast_raw(&self.peers, &serialized).await;
         Ok(())
     }
 
@@ -1883,12 +1873,7 @@ impl P2PNode {
         }
         let msg = InvPayload { txids }.to_message()?;
         let serialized = msg.serialize();
-        let mut guard = self.peers.lock().await;
-        for socket in guard.iter_mut() {
-            if let Err(e) = socket.lock().await.write_all(&serialized).await {
-                eprintln!("Failed to send inv to peer: {}", e);
-            }
-        }
+        let _ = broadcast_raw(&self.peers, &serialized).await;
         Ok(())
     }
 
@@ -3557,6 +3542,37 @@ async fn send_message(
         Ok(Err(e)) => Err(format!("failed to send to {}: {}", peer, e)),
         Err(_) => Err(format!("failed to send to {}: write timeout", peer)),
     }
+}
+
+async fn broadcast_raw(peers: &Arc<Mutex<Vec<Arc<Mutex<OwnedWriteHalf>>>>>, bytes: &[u8]) -> usize {
+    // Never hold the peers lock while awaiting I/O.
+    let peers_snapshot = {
+        let guard = peers.lock().await;
+        guard.clone()
+    };
+    let mut dead: Vec<Arc<Mutex<OwnedWriteHalf>>> = Vec::new();
+    let mut ok: usize = 0;
+    for socket in peers_snapshot.iter() {
+        let write_fut = async {
+            let mut w = socket.lock().await;
+            w.write_all(bytes).await
+        };
+        match tokio::time::timeout(peer_write_timeout(), write_fut).await {
+            Ok(Ok(())) => ok += 1,
+            Ok(Err(_)) | Err(_) => {
+                {
+                    let mut w = socket.lock().await;
+                    let _ = w.shutdown().await;
+                }
+                dead.push(socket.clone());
+            }
+        }
+    }
+    if !dead.is_empty() {
+        let mut guard = peers.lock().await;
+        guard.retain(|p| !dead.iter().any(|d| Arc::ptr_eq(p, d)));
+    }
+    ok
 }
 
 fn local_height(chain: &Option<Arc<StdMutex<ChainState>>>) -> u64 {
