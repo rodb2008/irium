@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::block::Block;
 use crate::chain::ChainState;
@@ -36,6 +36,34 @@ use sha2::{Digest, Sha256};
 const DEFAULT_MAX_PEERS: usize = 100;
 const MAX_MSGS_PER_SEC: u32 = 200;
 const MAX_BULK_MSGS_PER_SEC: u32 = 2000;
+
+fn p2p_blocking_concurrency() -> usize {
+    std::env::var("IRIUM_P2P_BLOCKING_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 32)
+}
+
+fn p2p_blocking_sem() -> Arc<Semaphore> {
+    static VAL: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    VAL.get_or_init(|| Arc::new(Semaphore::new(p2p_blocking_concurrency())))
+        .clone()
+}
+
+async fn spawn_blocking_limited<T, F>(f: F) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let sem = p2p_blocking_sem();
+    let permit = sem.acquire_owned().await.expect("blocking semaphore closed");
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+}
 
 fn sync_cooldown() -> Duration {
     let secs = std::env::var("IRIUM_P2P_SYNC_COOLDOWN_SECS")
@@ -2822,62 +2850,68 @@ impl P2PNode {
                                     state.last_headers_received = Some(Instant::now());
                                 }
                                 let header_count = (payload.headers.len() / 80) as u32;
-                                let mut offset = 0usize;
-                                let mut last_header_hash: Option<[u8; 32]> = None;
-                                let mut header_error = false;
-                                let mut unknown_parent = false;
-                                let mut reset_headers = false;
-                                let mut added_any = false;
+                                let header_bytes = payload.headers.clone();
+                                let chain_arc2 = chain_arc.clone();
+                                let peer_height_hint = last_handshake_height;
 
-                                while offset + 80 <= payload.headers.len() {
-                                    let slice = &payload.headers[offset..offset + 80];
-                                    let (header, used) =
-                                        match crate::block::BlockHeader::deserialize(slice) {
-                                            Ok(v) => v,
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "Failed to parse header from {}: {}",
-                                                    addr, e
-                                                );
-                                                break;
-                                            }
-                                        };
-                                    offset += used;
-                                    last_header_hash = Some(header.hash());
+                                let (last_header_hash, header_error, unknown_parent, reset_headers, added_any) =
+                                    match spawn_blocking_limited(move || {
+                                        let mut offset = 0usize;
+                                        let mut last_header_hash: Option<[u8; 32]> = None;
+                                        let mut header_error = false;
+                                        let mut unknown_parent = false;
+                                        let mut reset_headers = false;
+                                        let mut added_any = false;
 
-                                    let header_hash = header.hash();
-                                    {
-                                        let mut guard =
-                                            chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                        if header.prev_hash == [0u8; 32] {
-                                            let genesis_hash =
-                                                guard.params.genesis_block.header.hash();
-                                            if header_hash == genesis_hash {
-                                                continue;
-                                            }
-                                        }
-                                        let already_known =
-                                            guard.headers.contains_key(&header_hash)
-                                                || guard.block_store.contains_key(&header_hash);
-                                        if let Err(e) = guard.add_header(header.clone()) {
-                                            header_error = true;
-                                            if e.contains("unknown parent") {
-                                                unknown_parent = true;
-                                                if let Some(peer_height) = last_handshake_height {
-                                                    let local_height = guard.tip_height();
-                                                    if peer_height > local_height {
-                                                        reset_headers = true;
-                                                    }
+                                        let mut guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
+
+                                        while offset + 80 <= header_bytes.len() {
+                                            let slice = &header_bytes[offset..offset + 80];
+                                            let (header, used) = match crate::block::BlockHeader::deserialize(slice) {
+                                                Ok(v) => v,
+                                                Err(_) => {
+                                                    header_error = true;
+                                                    break;
+                                                }
+                                            };
+                                            offset += used;
+                                            last_header_hash = Some(header.hash());
+
+                                            let header_hash = header.hash();
+                                            if header.prev_hash == [0u8; 32] {
+                                                let genesis_hash = guard.params.genesis_block.header.hash();
+                                                if header_hash == genesis_hash {
+                                                    continue;
                                                 }
                                             }
-                                            eprintln!("Header from {} rejected: {}", addr, e);
-                                            break;
+
+                                            let already_known = guard.headers.contains_key(&header_hash)
+                                                || guard.block_store.contains_key(&header_hash);
+                                            if let Err(e) = guard.add_header(header.clone()) {
+                                                header_error = true;
+                                                if e.contains("unknown parent") {
+                                                    unknown_parent = true;
+                                                    if let Some(peer_height) = peer_height_hint {
+                                                        let local_height = guard.tip_height();
+                                                        if peer_height > local_height {
+                                                            reset_headers = true;
+                                                        }
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                            if !already_known {
+                                                added_any = true;
+                                            }
                                         }
-                                        if !already_known {
-                                            added_any = true;
-                                        }
-                                    }
-                                }
+
+                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any)
+                                    })
+                                    .await
+                                    {
+                                        Ok(v) => v,
+                                        Err(_) => (None, true, false, false, false),
+                                    };
 
                                 if header_count > 0 {
                                     let last_short = last_header_hash
@@ -4439,56 +4473,68 @@ async fn handle_incoming_with_sybil(
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = HeadersPayload::from_message(&msg) {
                         let header_count = (payload.headers.len() / 80) as u32;
-                        let mut offset = 0usize;
-                        let mut last_header_hash: Option<[u8; 32]> = None;
-                        let mut header_error = false;
-                        let mut unknown_parent = false;
-                        let mut reset_headers = false;
-                        let mut added_any = false;
+                        let header_bytes = payload.headers.clone();
+                        let chain_arc2 = chain_arc.clone();
+                        let peer_height_hint = last_handshake_height;
 
-                        while offset + 80 <= payload.headers.len() {
-                            let slice = &payload.headers[offset..offset + 80];
-                            let (header, used) = match crate::block::BlockHeader::deserialize(slice)
-                            {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    eprintln!("Failed to parse header from {}: {}", addr, e);
-                                    break;
-                                }
-                            };
-                            offset += used;
-                            last_header_hash = Some(header.hash());
+                        let (last_header_hash, header_error, unknown_parent, reset_headers, added_any) =
+                            match spawn_blocking_limited(move || {
+                                let mut offset = 0usize;
+                                let mut last_header_hash: Option<[u8; 32]> = None;
+                                let mut header_error = false;
+                                let mut unknown_parent = false;
+                                let mut reset_headers = false;
+                                let mut added_any = false;
 
-                            let header_hash = header.hash();
-                            {
-                                let mut guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                if header.prev_hash == [0u8; 32] {
-                                    let genesis_hash = guard.params.genesis_block.header.hash();
-                                    if header_hash == genesis_hash {
-                                        continue;
-                                    }
-                                }
-                                let already_known = guard.headers.contains_key(&header_hash)
-                                    || guard.block_store.contains_key(&header_hash);
-                                if let Err(e) = guard.add_header(header.clone()) {
-                                    header_error = true;
-                                    if e.contains("unknown parent") {
-                                        unknown_parent = true;
-                                        if let Some(peer_height) = last_handshake_height {
-                                            let local_height = guard.tip_height();
-                                            if peer_height > local_height {
-                                                reset_headers = true;
-                                            }
+                                let mut guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
+
+                                while offset + 80 <= header_bytes.len() {
+                                    let slice = &header_bytes[offset..offset + 80];
+                                    let (header, used) = match crate::block::BlockHeader::deserialize(slice) {
+                                        Ok(v) => v,
+                                        Err(_) => {
+                                            header_error = true;
+                                            break;
+                                        }
+                                    };
+                                    offset += used;
+                                    last_header_hash = Some(header.hash());
+
+                                    let header_hash = header.hash();
+                                    if header.prev_hash == [0u8; 32] {
+                                        let genesis_hash = guard.params.genesis_block.header.hash();
+                                        if header_hash == genesis_hash {
+                                            continue;
                                         }
                                     }
-                                    eprintln!("Header from {} rejected: {}", addr, e);
-                                    break;
+
+                                    let already_known = guard.headers.contains_key(&header_hash)
+                                        || guard.block_store.contains_key(&header_hash);
+                                    if let Err(e) = guard.add_header(header.clone()) {
+                                        header_error = true;
+                                        if e.contains("unknown parent") {
+                                            unknown_parent = true;
+                                            if let Some(peer_height) = peer_height_hint {
+                                                let local_height = guard.tip_height();
+                                                if peer_height > local_height {
+                                                    reset_headers = true;
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    if !already_known {
+                                        added_any = true;
+                                    }
                                 }
-                                if !already_known {
-                                    added_any = true;
-                                }
-                            }
-                        }
+
+                                (last_header_hash, header_error, unknown_parent, reset_headers, added_any)
+                            })
+                            .await
+                            {
+                                Ok(v) => v,
+                                Err(_) => (None, true, false, false, false),
+                            };
 
                         if header_error {
                             if unknown_parent && !added_any {
