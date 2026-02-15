@@ -2079,25 +2079,15 @@ impl P2PNode {
                     let nonce = rand_core::OsRng.next_u64();
                     let ping = PingPayload { nonce };
                     let msg = ping.to_message();
-                    if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
-                        P2PNode::log_event(
-                            "warn",
-                            "net",
-                            format!("P2P {}: ping failed: {}", ping_addr, e),
-                        );
-                        // Proactively drop the peer from global sets so sockets do not accumulate in CLOSE-WAIT.
-                        {
-                            let mut w = ping_writer.lock().await;
-                            let _ = w.shutdown().await;
-                        }
-                        {
-                            let mut guard = ping_peers_vec.lock().await;
-                            guard.retain(|p| !Arc::ptr_eq(p, &ping_writer));
-                        }
-                        {
-                            let mut guard = ping_connected_vec.lock().await;
-                            guard.remove(&ping_addr);
-                        }
+                    if !send_message_or_disconnect(
+                        &ping_writer,
+                        msg,
+                        ping_addr,
+                        &ping_peers_vec,
+                        &ping_connected_vec,
+                    )
+                    .await
+                    {
                         if let Some(tx) = shutdown_tx_to_reader.take() {
                             let _ = tx.send(());
                         }
@@ -2123,7 +2113,17 @@ impl P2PNode {
                         capabilities: local_capabilities(),
                     };
                     if let Ok(msg) = payload.to_message() {
-                        let _ = send_message(&ping_writer, msg, ping_addr).await;
+                        if !send_message_or_disconnect(
+                            &ping_writer,
+                            msg,
+                            ping_addr,
+                            &ping_peers_vec,
+                            &ping_connected_vec,
+                        )
+                        .await
+                        {
+                            break;
+                        }
                     }
                     last_height = current_height;
                     last_handshake = Instant::now();
@@ -2155,7 +2155,17 @@ impl P2PNode {
                         };
                         if let Some(payload) = challenge {
                             let msg = payload.to_message();
-                            let _ = send_message(&ping_writer, msg, ping_addr).await;
+                            if !send_message_or_disconnect(
+                                &ping_writer,
+                                msg,
+                                ping_addr,
+                                &ping_peers_vec,
+                                &ping_connected_vec,
+                            )
+                            .await
+                            {
+                                break;
+                            }
                         }
                     }
                 }
@@ -2216,7 +2226,17 @@ impl P2PNode {
                                 count: MAX_HEADERS_PER_REQUEST,
                             };
                             if let Ok(msg) = get_headers.to_message() {
-                                let _ = send_message(&ping_writer, msg, ping_addr).await;
+                                if !send_message_or_disconnect(
+                                    &ping_writer,
+                                    msg,
+                                    ping_addr,
+                                    &ping_peers_vec,
+                                    &ping_connected_vec,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
                             }
                             {
                                 let mut state = ping_peer_state.lock().await;
@@ -3568,6 +3588,38 @@ async fn send_message(
     }
 }
 
+async fn send_message_or_disconnect(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    msg: Message,
+    peer: SocketAddr,
+    peers: &Arc<Mutex<Vec<Arc<Mutex<OwnedWriteHalf>>>>>,
+    connected: &Arc<Mutex<HashSet<SocketAddr>>>,
+) -> bool {
+    match send_message(writer, msg, peer).await {
+        Ok(()) => true,
+        Err(e) => {
+            P2PNode::log_event(
+                "warn",
+                "p2p",
+                format!("P2P {}: send failed, dropping peer: {}", peer, e),
+            );
+            {
+                let mut w = writer.lock().await;
+                let _ = w.shutdown().await;
+            }
+            {
+                let mut guard = peers.lock().await;
+                guard.retain(|p| !Arc::ptr_eq(p, writer));
+            }
+            {
+                let mut guard = connected.lock().await;
+                guard.remove(&peer);
+            }
+            false
+        }
+    }
+}
+
 async fn broadcast_raw(peers: &Arc<Mutex<Vec<Arc<Mutex<OwnedWriteHalf>>>>>, bytes: &[u8]) -> usize {
     // Never hold the peers lock while awaiting I/O.
     let peers_snapshot = {
@@ -3740,25 +3792,15 @@ async fn handle_incoming_with_sybil(
                 let nonce = rand_core::OsRng.next_u64();
                 let ping = PingPayload { nonce };
                 let msg = ping.to_message();
-                if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
-                    P2PNode::log_event(
-                        "warn",
-                        "net",
-                        format!("P2P {}: ping failed: {}", ping_addr, e),
-                    );
-                    // Proactively drop the peer from global sets so sockets do not accumulate in CLOSE-WAIT.
-                    {
-                        let mut w = ping_writer.lock().await;
-                        let _ = w.shutdown().await;
-                    }
-                    {
-                        let mut guard = ping_peers_vec.lock().await;
-                        guard.retain(|p| !Arc::ptr_eq(p, &ping_writer));
-                    }
-                    {
-                        let mut guard = ping_connected_vec.lock().await;
-                        guard.remove(&ping_addr);
-                    }
+                if !send_message_or_disconnect(
+                    &ping_writer,
+                    msg,
+                    ping_addr,
+                    &ping_peers_vec,
+                    &ping_connected_vec,
+                )
+                .await
+                {
                     if let Some(tx) = shutdown_tx_to_reader.take() {
                         let _ = tx.send(());
                     }
@@ -3816,7 +3858,17 @@ async fn handle_incoming_with_sybil(
                     };
                     if let Some(payload) = challenge {
                         let msg = payload.to_message();
-                        let _ = send_message(&ping_writer, msg, ping_addr).await;
+                        if !send_message_or_disconnect(
+                            &ping_writer,
+                            msg,
+                            ping_addr,
+                            &ping_peers_vec,
+                            &ping_connected_vec,
+                        )
+                        .await
+                        {
+                            break;
+                        }
                     }
                 }
             }
