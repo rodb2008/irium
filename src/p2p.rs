@@ -2633,7 +2633,8 @@ impl P2PNode {
                                         if blocks.is_empty() {
                                             return;
                                         }
-                                        let Some(fallback_writer) = fallback_writer.upgrade() else {
+                                        let Some(fallback_writer) = fallback_writer.upgrade()
+                                        else {
                                             return;
                                         };
                                         let end_h = start_height + blocks.len() as u64 - 1;
@@ -3319,10 +3320,40 @@ impl P2PNode {
                                         };
 
                                         if let Some(inv_bytes) = inv_bytes {
-                                            let mut peers_guard = peers_vec.lock().await;
-                                            for socket in peers_guard.iter_mut() {
-                                                let _ =
-                                                    socket.lock().await.write_all(&inv_bytes).await;
+                                            // Never hold the peers lock while awaiting I/O.
+                                            let peers_snapshot = {
+                                                let guard = peers_vec.lock().await;
+                                                guard.clone()
+                                            };
+                                            let mut dead: Vec<Arc<Mutex<OwnedWriteHalf>>> =
+                                                Vec::new();
+                                            for socket in peers_snapshot.iter() {
+                                                let write_fut = async {
+                                                    let mut w = socket.lock().await;
+                                                    w.write_all(&inv_bytes).await
+                                                };
+                                                match tokio::time::timeout(
+                                                    Duration::from_secs(2),
+                                                    write_fut,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(Ok(())) => {}
+                                                    Ok(Err(_)) | Err(_) => {
+                                                        // Drop noisy/stuck peers from the broadcast set.
+                                                        {
+                                                            let mut w = socket.lock().await;
+                                                            let _ = w.shutdown().await;
+                                                        }
+                                                        dead.push(socket.clone());
+                                                    }
+                                                }
+                                            }
+                                            if !dead.is_empty() {
+                                                let mut guard = peers_vec.lock().await;
+                                                guard.retain(|p| {
+                                                    !dead.iter().any(|d| Arc::ptr_eq(p, d))
+                                                });
                                             }
                                         }
                                     }
@@ -4716,9 +4747,36 @@ async fn handle_incoming_with_sybil(
                                 };
 
                                 if let Some(inv_bytes) = inv_bytes {
-                                    let mut peers_guard = peers.lock().await;
-                                    for socket in peers_guard.iter_mut() {
-                                        let _ = socket.lock().await.write_all(&inv_bytes).await;
+                                    // Never hold the peers lock while awaiting I/O.
+                                    let peers_snapshot = {
+                                        let guard = peers.lock().await;
+                                        guard.clone()
+                                    };
+                                    let mut dead: Vec<Arc<Mutex<OwnedWriteHalf>>> = Vec::new();
+                                    for socket in peers_snapshot.iter() {
+                                        let write_fut = async {
+                                            let mut w = socket.lock().await;
+                                            w.write_all(&inv_bytes).await
+                                        };
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(2),
+                                            write_fut,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(_)) | Err(_) => {
+                                                {
+                                                    let mut w = socket.lock().await;
+                                                    let _ = w.shutdown().await;
+                                                }
+                                                dead.push(socket.clone());
+                                            }
+                                        }
+                                    }
+                                    if !dead.is_empty() {
+                                        let mut guard = peers.lock().await;
+                                        guard.retain(|p| !dead.iter().any(|d| Arc::ptr_eq(p, d)));
                                     }
                                 }
                             }
