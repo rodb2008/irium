@@ -3158,87 +3158,88 @@ impl P2PNode {
                                         let bhash = block.header.hash();
                                         let short = hex::encode(bhash);
                                         let short = short.get(0..12).unwrap_or(&short);
-                                        let (
-                                            new_height_opt,
-                                            record_verdict,
-                                            persist_blocks,
-                                            orphan_prev,
-                                        ) = {
-                                            let mut guard =
-                                                chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                            let mut new_height_opt = None;
-                                            let mut record_verdict = None;
-                                            let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
-                                            let mut orphan_prev = None;
-                                            match guard.process_block(block.clone()) {
-                                                Ok((new_height, _tip)) => {
-                                                    P2PNode::log(format!(
-                                                        "P2P {}: accepted block height {} hash {}",
-                                                        addr,
-                                                        new_height.saturating_sub(1),
-                                                        short
-                                                    ));
-                                                    if let Some(ref mem) = mempool_for_sync {
-                                                        let mut mem_guard = mem
-                                                            .lock()
-                                                            .unwrap_or_else(|e| e.into_inner());
-                                                        for tx in block.transactions.iter().skip(1)
-                                                        {
-                                                            mem_guard.remove(&tx.txid());
+                                        let chain_arc2 = chain_arc.clone();
+                                        let mempool2 = mempool_for_sync.clone();
+                                        let addr2 = addr;
+                                        let short2 = short.to_string();
+                                        let bhash2 = bhash;
+                                        let block2 = block.clone();
+
+                                        let (new_height_opt, record_verdict, persist_blocks, orphan_prev) =
+                                            match spawn_blocking_limited(move || {
+                                                let mut guard =
+                                                    chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
+                                                let mut new_height_opt = None;
+                                                let mut record_verdict = None;
+                                                let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
+                                                let mut orphan_prev = None;
+                                                match guard.process_block(block2.clone()) {
+                                                    Ok((new_height, _tip)) => {
+                                                        P2PNode::log(format!(
+                                                            "P2P {}: accepted block height {} hash {}",
+                                                            addr2,
+                                                            new_height.saturating_sub(1),
+                                                            short2
+                                                        ));
+                                                        if let Some(ref mem) = mempool2 {
+                                                            let mut mem_guard = mem
+                                                                .lock()
+                                                                .unwrap_or_else(|e| e.into_inner());
+                                                            for tx in block2.transactions.iter().skip(1) {
+                                                                mem_guard.remove(&tx.txid());
+                                                            }
                                                         }
-                                                    }
-                                                    new_height_opt = Some(new_height);
-                                                    record_verdict = Some(true);
-                                                    if guard.tip_hash() == bhash {
-                                                        let tip = guard.tip_height();
-                                                        persist_blocks.push((tip, block.clone()));
-                                                        if tip > 0 {
-                                                            if let Some(prev) =
-                                                                guard.chain.get((tip - 1) as usize)
-                                                            {
-                                                                persist_blocks
-                                                                    .push((tip - 1, prev.clone()));
+                                                        new_height_opt = Some(new_height);
+                                                        record_verdict = Some(true);
+                                                        if guard.tip_hash() == bhash2 {
+                                                            let tip = guard.tip_height();
+                                                            persist_blocks.push((tip, block2.clone()));
+                                                            if tip > 0 {
+                                                                if let Some(prev) =
+                                                                    guard.chain.get((tip - 1) as usize)
+                                                                {
+                                                                    persist_blocks.push((tip - 1, prev.clone()));
+                                                                }
                                                             }
                                                         }
                                                     }
-                                                }
-                                                Err(e) => {
-                                                    if e.contains("orphan")
-                                                        || e.contains("prev hash unknown")
-                                                    {
-                                                        orphan_prev = Some(block.header.prev_hash);
-                                                    }
-                                                    if P2PNode::is_soft_block_reject(&e) {
-                                                        if !P2PNode::is_duplicate_block(&e) {
+                                                    Err(e) => {
+                                                        if e.contains("orphan")
+                                                            || e.contains("prev hash unknown")
+                                                        {
+                                                            orphan_prev = Some(block2.header.prev_hash);
+                                                        }
+                                                        if P2PNode::is_soft_block_reject(&e) {
+                                                            if !P2PNode::is_duplicate_block(&e) {
+                                                                P2PNode::log_event(
+                                                                    "info",
+                                                                    "chain",
+                                                                    format!(
+                                                                        "P2P {}: ignored block {} ({})",
+                                                                        addr2, short2, e
+                                                                    ),
+                                                                );
+                                                            }
+                                                        } else {
                                                             P2PNode::log_event(
-                                                                "info",
+                                                                "warn",
                                                                 "chain",
                                                                 format!(
-                                                                    "P2P {}: ignored block {} ({})",
-                                                                    addr, short, e
+                                                                    "P2P {}: rejected block {}: {}",
+                                                                    addr2, short2, e
                                                                 ),
                                                             );
+                                                            record_verdict = Some(false);
                                                         }
-                                                    } else {
-                                                        P2PNode::log_event(
-                                                            "warn",
-                                                            "chain",
-                                                            format!(
-                                                                "P2P {}: rejected block {}: {}",
-                                                                addr, short, e
-                                                            ),
-                                                        );
-                                                        record_verdict = Some(false);
                                                     }
                                                 }
-                                            }
-                                            (
-                                                new_height_opt,
-                                                record_verdict,
-                                                persist_blocks,
-                                                orphan_prev,
-                                            )
-                                        };
+                                                (new_height_opt, record_verdict, persist_blocks, orphan_prev)
+                                            })
+                                            .await
+                                            {
+                                                Ok(v) => v,
+                                                Err(_) => (None, None, Vec::new(), None),
+                                            };
                                         for (height, b) in persist_blocks {
                                             if let Err(e) = storage::write_block_json(height, &b) {
                                                 P2PNode::log_event(
@@ -4748,76 +4749,85 @@ async fn handle_incoming_with_sybil(
                                 let bhash = block.header.hash();
                                 let short = hex::encode(bhash);
                                 let short = short.get(0..12).unwrap_or(&short);
-                                let (new_height_opt, record_verdict, persist_blocks, orphan_prev) = {
-                                    let mut guard =
-                                        chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                    let mut new_height_opt = None;
-                                    let mut record_verdict = None;
-                                    let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
-                                    let mut orphan_prev = None;
-                                    match guard.process_block(block.clone()) {
-                                        Ok((new_height, _tip)) => {
-                                            P2PNode::log(format!(
-                                                "P2P {}: accepted block height {} hash {}",
-                                                addr,
-                                                new_height.saturating_sub(1),
-                                                short
-                                            ));
-                                            if let Some(ref mem) = mempool {
-                                                let mut mem_guard =
-                                                    mem.lock().unwrap_or_else(|e| e.into_inner());
-                                                for tx in block.transactions.iter().skip(1) {
-                                                    mem_guard.remove(&tx.txid());
+                                let chain_arc2 = chain_arc.clone();
+                                let mempool2 = mempool.clone();
+                                let addr2 = addr;
+                                let short2 = short.to_string();
+                                let bhash2 = bhash;
+                                let block2 = block.clone();
+
+                                let (new_height_opt, record_verdict, persist_blocks, orphan_prev) =
+                                    match spawn_blocking_limited(move || {
+                                        let mut guard =
+                                            chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
+                                        let mut new_height_opt = None;
+                                        let mut record_verdict = None;
+                                        let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
+                                        let mut orphan_prev = None;
+                                        match guard.process_block(block2.clone()) {
+                                            Ok((new_height, _tip)) => {
+                                                P2PNode::log(format!(
+                                                    "P2P {}: accepted block height {} hash {}",
+                                                    addr2,
+                                                    new_height.saturating_sub(1),
+                                                    short2
+                                                ));
+                                                if let Some(ref mem) = mempool2 {
+                                                    let mut mem_guard =
+                                                        mem.lock().unwrap_or_else(|e| e.into_inner());
+                                                    for tx in block2.transactions.iter().skip(1) {
+                                                        mem_guard.remove(&tx.txid());
+                                                    }
                                                 }
-                                            }
-                                            // Update headers to reflect advanced tip.
-                                            new_height_opt = Some(new_height);
-                                            record_verdict = Some(true);
-                                            if guard.tip_hash() == bhash {
-                                                let tip = guard.tip_height();
-                                                persist_blocks.push((tip, block.clone()));
-                                                if tip > 0 {
-                                                    if let Some(prev) =
-                                                        guard.chain.get((tip - 1) as usize)
-                                                    {
-                                                        persist_blocks
-                                                            .push((tip - 1, prev.clone()));
+                                                new_height_opt = Some(new_height);
+                                                record_verdict = Some(true);
+                                                if guard.tip_hash() == bhash2 {
+                                                    let tip = guard.tip_height();
+                                                    persist_blocks.push((tip, block2.clone()));
+                                                    if tip > 0 {
+                                                        if let Some(prev) =
+                                                            guard.chain.get((tip - 1) as usize)
+                                                        {
+                                                            persist_blocks.push((tip - 1, prev.clone()));
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
-                                        Err(e) => {
-                                            if e.contains("orphan")
-                                                || e.contains("prev hash unknown")
-                                            {
-                                                orphan_prev = Some(block.header.prev_hash);
-                                            }
-                                            if P2PNode::is_soft_block_reject(&e) {
-                                                if !P2PNode::is_duplicate_block(&e) {
+                                            Err(e) => {
+                                                if e.contains("orphan") || e.contains("prev hash unknown") {
+                                                    orphan_prev = Some(block2.header.prev_hash);
+                                                }
+                                                if P2PNode::is_soft_block_reject(&e) {
+                                                    if !P2PNode::is_duplicate_block(&e) {
+                                                        P2PNode::log_event(
+                                                            "info",
+                                                            "chain",
+                                                            format!(
+                                                                "P2P {}: ignored block {} ({})",
+                                                                addr2, short2, e
+                                                            ),
+                                                        );
+                                                    }
+                                                } else {
                                                     P2PNode::log_event(
-                                                        "info",
+                                                        "warn",
                                                         "chain",
                                                         format!(
-                                                            "P2P {}: ignored block {} ({})",
-                                                            addr, short, e
+                                                            "P2P {}: rejected block {}: {}",
+                                                            addr2, short2, e
                                                         ),
                                                     );
+                                                    record_verdict = Some(false);
                                                 }
-                                            } else {
-                                                P2PNode::log_event(
-                                                    "warn",
-                                                    "chain",
-                                                    format!(
-                                                        "P2P {}: rejected block {}: {}",
-                                                        addr, short, e
-                                                    ),
-                                                );
-                                                record_verdict = Some(false);
                                             }
                                         }
-                                    }
-                                    (new_height_opt, record_verdict, persist_blocks, orphan_prev)
-                                };
+                                        (new_height_opt, record_verdict, persist_blocks, orphan_prev)
+                                    })
+                                    .await
+                                    {
+                                        Ok(v) => v,
+                                        Err(_) => (None, None, Vec::new(), None),
+                                    };
                                 for (height, b) in persist_blocks {
                                     if let Err(e) = storage::write_block_json(height, &b) {
                                         P2PNode::log_event(
