@@ -2429,7 +2429,7 @@ impl P2PNode {
                                         count: MAX_HEADERS_PER_REQUEST,
                                     };
                                     if let Ok(msg) = get_headers.to_message() {
-                                        let _ = send_message(&writer, msg, addr).await;
+                                        send_message_detached(&writer, msg, addr);
                                     }
                                 } else {
                                     P2PNode::log_event(
@@ -2496,12 +2496,12 @@ impl P2PNode {
                                     address: relay,
                                 };
                                 if let Ok(msg) = relay_msg.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
+                                    send_message_detached(&writer, msg, addr);
                                 }
                             }
                             // Ask for peers to grow the mesh.
                             if let Ok(msg) = EmptyPayload::to_message(MessageType::GetPeers) {
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                                 maybe_request_sync(
                                     &writer,
                                     addr,
@@ -2615,7 +2615,7 @@ impl P2PNode {
                                         addr, payload.height, local_height, short
                                     ));
                                     if let Ok(msg) = get_headers.to_message() {
-                                        let _ = send_message(&writer, msg, addr).await;
+                                        send_message_detached(&writer, msg, addr);
                                     }
                                     {
                                         let mut state = peer_state.lock().await;
@@ -2646,7 +2646,7 @@ impl P2PNode {
                                             headers: headers_bytes,
                                         }
                                         .to_message();
-                                        let _ = send_message(&writer, msg, addr).await;
+                                        send_message_detached(&writer, msg, addr);
                                     }
                                 }
                                 if !tip_mismatch {
@@ -2792,7 +2792,7 @@ impl P2PNode {
                             }
                         };
                         if let Ok(resp) = peers_payload.to_message() {
-                            let _ = send_message(&writer, resp, addr).await;
+                            send_message_detached(&writer, resp, addr);
                         }
                     }
                     MessageType::Peers => {
@@ -2842,7 +2842,7 @@ impl P2PNode {
                                     headers: headers_bytes,
                                 }
                                 .to_message();
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                             }
                         }
                     }
@@ -2951,7 +2951,7 @@ impl P2PNode {
                                             count: MAX_HEADERS_PER_REQUEST,
                                         };
                                         if let Ok(msg) = get_headers.to_message() {
-                                            let _ = send_message(&writer, msg, addr).await;
+                                            send_message_detached(&writer, msg, addr);
                                         }
                                     }
                                     continue;
@@ -2975,7 +2975,7 @@ impl P2PNode {
                                             count: MAX_HEADERS_PER_REQUEST,
                                         };
                                         if let Ok(msg) = get_headers.to_message() {
-                                            let _ = send_message(&writer, msg, addr).await;
+                                            send_message_detached(&writer, msg, addr);
                                         }
                                     }
                                     continue;
@@ -2987,7 +2987,7 @@ impl P2PNode {
                                             count: MAX_HEADERS_PER_REQUEST,
                                         };
                                         if let Ok(msg) = get_headers.to_message() {
-                                            let _ = send_message(&writer, msg, addr).await;
+                                            send_message_detached(&writer, msg, addr);
                                         }
                                     }
                                 }
@@ -3053,7 +3053,7 @@ impl P2PNode {
                                     .await
                                     {
                                         if let Ok(msg) = get_blocks.to_message() {
-                                            let _ = send_message(&writer, msg, addr).await;
+                                            send_message_detached(&writer, msg, addr);
                                         }
                                     }
                                 }
@@ -3486,7 +3486,7 @@ impl P2PNode {
                                 if !needed.is_empty() {
                                     let gd = GetDataPayload { txids: needed };
                                     if let Ok(msg) = gd.to_message() {
-                                        let _ = send_message(&writer, msg, addr).await;
+                                        send_message_detached(&writer, msg, addr);
                                     }
                                 }
                             }
@@ -3513,7 +3513,7 @@ impl P2PNode {
                                     }
                                 }
                                 for msg in responses {
-                                    let _ = send_message(&writer, msg, addr).await;
+                                    send_message_detached(&writer, msg, addr);
                                 }
                             }
                         }
@@ -3526,10 +3526,10 @@ impl P2PNode {
                             };
                             let payload = MempoolPayload { tx_hashes };
                             if let Ok(msg) = payload.to_message() {
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                             }
                         } else if let Ok(msg) = EmptyPayload::to_message(MessageType::Mempool) {
-                            let _ = send_message(&writer, msg, addr).await;
+                            send_message_detached(&writer, msg, addr);
                         }
                     }
                     MessageType::RelayAddress => {
@@ -3658,6 +3658,17 @@ async fn send_message(
         Ok(Err(e)) => Err(format!("failed to send to {}: {}", peer, e)),
         Err(_) => Err(format!("failed to send to {}: write timeout", peer)),
     }
+}
+
+
+fn send_message_detached(writer: &Arc<Mutex<OwnedWriteHalf>>, msg: Message, peer: SocketAddr) {
+    let writer_weak = Arc::downgrade(writer);
+    tokio::spawn(async move {
+        let Some(writer) = writer_weak.upgrade() else {
+            return;
+        };
+        let _ = send_message(&writer, msg, peer).await;
+    });
 }
 
 async fn send_message_or_disconnect(
@@ -3993,7 +4004,7 @@ async fn handle_incoming_with_sybil(
         capabilities: local_capabilities(),
     };
     if let Ok(msg) = payload.to_message() {
-        let _ = send_message(&writer, msg, addr).await;
+        send_message_detached(&writer, msg, addr);
     }
 
     let mut msg_count: u32 = 0;
@@ -4102,7 +4113,7 @@ async fn handle_incoming_with_sybil(
                                 count: MAX_HEADERS_PER_REQUEST,
                             };
                             if let Ok(msg) = get_headers.to_message() {
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                             }
                         } else {
                             P2PNode::log_event(
@@ -4176,7 +4187,7 @@ async fn handle_incoming_with_sybil(
                     }
                     // Ask peer for its view of the network.
                     if let Ok(msg) = EmptyPayload::to_message(MessageType::GetPeers) {
-                        let _ = send_message(&writer, msg, addr).await;
+                        send_message_detached(&writer, msg, addr);
                         maybe_request_sync(
                             &writer,
                             addr,
@@ -4286,7 +4297,7 @@ async fn handle_incoming_with_sybil(
                                 ),
                             );
                             if let Ok(msg) = get_headers.to_message() {
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                             }
                             {
                                 let mut state = peer_state.lock().await;
@@ -4316,7 +4327,7 @@ async fn handle_incoming_with_sybil(
                                     headers: headers_bytes,
                                 }
                                 .to_message();
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                             }
                         }
                         if !tip_mismatch {
@@ -4460,7 +4471,7 @@ async fn handle_incoming_with_sybil(
                     }
                 };
                 if let Ok(resp) = peers_payload.to_message() {
-                    let _ = send_message(&writer, resp, addr).await;
+                    send_message_detached(&writer, resp, addr);
                 }
             }
             MessageType::Peers => {
@@ -4507,7 +4518,7 @@ async fn handle_incoming_with_sybil(
                             headers: headers_bytes,
                         }
                         .to_message();
-                        let _ = send_message(&writer, msg, addr).await;
+                        send_message_detached(&writer, msg, addr);
                     }
                 }
             }
@@ -4598,7 +4609,7 @@ async fn handle_incoming_with_sybil(
                                     count: MAX_HEADERS_PER_REQUEST,
                                 };
                                 if let Ok(msg) = get_headers.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
+                                    send_message_detached(&writer, msg, addr);
                                 }
                             }
                             continue;
@@ -4622,7 +4633,7 @@ async fn handle_incoming_with_sybil(
                                     count: MAX_HEADERS_PER_REQUEST,
                                 };
                                 if let Ok(msg) = get_headers.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
+                                    send_message_detached(&writer, msg, addr);
                                 }
                             }
                             continue;
@@ -4634,7 +4645,7 @@ async fn handle_incoming_with_sybil(
                                     count: MAX_HEADERS_PER_REQUEST,
                                 };
                                 if let Ok(msg) = get_headers.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
+                                    send_message_detached(&writer, msg, addr);
                                 }
                             }
                         }
@@ -4683,7 +4694,7 @@ async fn handle_incoming_with_sybil(
                             .await
                             {
                                 if let Ok(msg) = get_blocks.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
+                                    send_message_detached(&writer, msg, addr);
                                 }
                             }
                         }
@@ -5067,7 +5078,7 @@ async fn handle_incoming_with_sybil(
                         if !needed.is_empty() {
                             let gd = GetDataPayload { txids: needed };
                             if let Ok(msg) = gd.to_message() {
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                             }
                         }
                     }
@@ -5093,7 +5104,7 @@ async fn handle_incoming_with_sybil(
                             }
                         }
                         for msg in responses {
-                            let _ = send_message(&writer, msg, addr).await;
+                            send_message_detached(&writer, msg, addr);
                         }
                     }
                 }
@@ -5106,10 +5117,10 @@ async fn handle_incoming_with_sybil(
                     };
                     let payload = MempoolPayload { tx_hashes };
                     if let Ok(msg) = payload.to_message() {
-                        let _ = send_message(&writer, msg, addr).await;
+                        send_message_detached(&writer, msg, addr);
                     }
                 } else if let Ok(msg) = EmptyPayload::to_message(MessageType::Mempool) {
-                    let _ = send_message(&writer, msg, addr).await;
+                    send_message_detached(&writer, msg, addr);
                 }
             }
             MessageType::RelayAddress => {
