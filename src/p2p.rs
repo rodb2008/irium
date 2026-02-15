@@ -2589,7 +2589,7 @@ impl P2PNode {
                                     }
                                 }
                                 if !tip_mismatch {
-                                    let fallback_writer = writer.clone();
+                                    let fallback_writer = Arc::downgrade(&writer);
                                     let fallback_chain = chain_for_sync.clone();
                                     let fallback_seen = getblocks_seen.clone();
                                     let fallback_addr = addr;
@@ -2633,6 +2633,9 @@ impl P2PNode {
                                         if blocks.is_empty() {
                                             return;
                                         }
+                                        let Some(fallback_writer) = fallback_writer.upgrade() else {
+                                            return;
+                                        };
                                         let end_h = start_height + blocks.len() as u64 - 1;
                                         P2PNode::log_event(
                                                 "info",
@@ -4083,7 +4086,7 @@ async fn handle_incoming_with_sybil(
                             }
                         }
                         if !tip_mismatch {
-                            let fallback_writer = writer.clone();
+                            let fallback_writer = Arc::downgrade(&writer);
                             let fallback_chain = chain.clone();
                             let fallback_seen = getblocks_seen.clone();
                             let fallback_addr = addr;
@@ -4125,6 +4128,9 @@ async fn handle_incoming_with_sybil(
                                 if blocks.is_empty() {
                                     return;
                                 }
+                                let Some(fallback_writer) = fallback_writer.upgrade() else {
+                                    return;
+                                };
                                 let end_h = start_height + blocks.len() as u64 - 1;
                                 P2PNode::log_event(
                                     "info",
