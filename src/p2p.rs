@@ -3534,18 +3534,29 @@ where
     }
 }
 
+fn peer_write_timeout() -> Duration {
+    let ms = std::env::var("IRIUM_P2P_WRITE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2000);
+    Duration::from_millis(ms.clamp(200, 10_000))
+}
+
 async fn send_message(
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     msg: Message,
     peer: SocketAddr,
 ) -> Result<(), String> {
     let bytes = msg.serialize();
-    writer
-        .lock()
-        .await
-        .write_all(&bytes)
-        .await
-        .map_err(|e| format!("failed to send to {}: {}", peer, e))
+    let write_fut = async {
+        let mut w = writer.lock().await;
+        w.write_all(&bytes).await
+    };
+    match tokio::time::timeout(peer_write_timeout(), write_fut).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("failed to send to {}: {}", peer, e)),
+        Err(_) => Err(format!("failed to send to {}: write timeout", peer)),
+    }
 }
 
 fn local_height(chain: &Option<Arc<StdMutex<ChainState>>>) -> u64 {
