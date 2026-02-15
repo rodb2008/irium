@@ -2055,6 +2055,8 @@ impl P2PNode {
         let ping_peer_state = peer_state.clone();
         let ping_sync_requests = self.sync_requests.clone();
         let ping_block_requests = self.block_requests.clone();
+        let ping_peers_vec = self.peers.clone();
+        let ping_connected_vec = self.connected.clone();
         tokio::spawn(async move {
             let mut shutdown_tx_to_reader = Some(shutdown_tx_to_reader);
             let ping_interval = P2PNode::ping_interval();
@@ -2083,6 +2085,19 @@ impl P2PNode {
                             "net",
                             format!("P2P {}: ping failed: {}", ping_addr, e),
                         );
+                        // Proactively drop the peer from global sets so sockets do not accumulate in CLOSE-WAIT.
+                        {
+                            let mut w = ping_writer.lock().await;
+                            let _ = w.shutdown().await;
+                        }
+                        {
+                            let mut guard = ping_peers_vec.lock().await;
+                            guard.retain(|p| !Arc::ptr_eq(p, &ping_writer));
+                        }
+                        {
+                            let mut guard = ping_connected_vec.lock().await;
+                            guard.remove(&ping_addr);
+                        }
                         if let Some(tx) = shutdown_tx_to_reader.take() {
                             let _ = tx.send(());
                         }
@@ -3705,6 +3720,8 @@ async fn handle_incoming_with_sybil(
     let ping_peer_state = peer_state.clone();
     let ping_sync_requests = sync_requests.clone();
     let ping_block_requests = block_requests.clone();
+    let ping_peers_vec = peers.clone();
+    let ping_connected_vec = connected.clone();
     tokio::spawn(async move {
         let mut shutdown_tx_to_reader = Some(shutdown_tx_to_reader);
         let ping_interval = P2PNode::ping_interval();
@@ -3729,6 +3746,19 @@ async fn handle_incoming_with_sybil(
                         "net",
                         format!("P2P {}: ping failed: {}", ping_addr, e),
                     );
+                    // Proactively drop the peer from global sets so sockets do not accumulate in CLOSE-WAIT.
+                    {
+                        let mut w = ping_writer.lock().await;
+                        let _ = w.shutdown().await;
+                    }
+                    {
+                        let mut guard = ping_peers_vec.lock().await;
+                        guard.retain(|p| !Arc::ptr_eq(p, &ping_writer));
+                    }
+                    {
+                        let mut guard = ping_connected_vec.lock().await;
+                        guard.remove(&ping_addr);
+                    }
                     if let Some(tx) = shutdown_tx_to_reader.take() {
                         let _ = tx.send(());
                     }
