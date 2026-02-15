@@ -215,6 +215,23 @@ fn inbound_accept_cooldown_ms() -> u64 {
     })
 }
 
+fn inbound_bulk_queue_capacity() -> usize {
+    static VAL: OnceLock<usize> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_INBOUND_BULK_QUEUE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1).min(256))
+            .unwrap_or(16)
+    })
+}
+
+fn inbound_bulk_queue() -> Arc<tokio::sync::Semaphore> {
+    static SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(inbound_bulk_queue_capacity())))
+        .clone()
+}
+
 fn trusted_seed_inbound_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -4522,151 +4539,209 @@ async fn handle_incoming_with_sybil(
                     }
                 }
             }
+
             MessageType::Headers => {
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = HeadersPayload::from_message(&msg) {
                         let header_count = (payload.headers.len() / 80) as u32;
-                        let header_bytes = payload.headers.clone();
-                        let chain_arc2 = chain_arc.clone();
+                        let header_bytes = payload.headers;
+                        let chain_arc_for_headers = chain_arc.clone();
+                        let chain_arc_for_tip = chain_arc.clone();
                         let peer_height_hint = last_handshake_height;
+                        let addr2 = addr;
+                        let peer_state2 = peer_state.clone();
+                        let sync_requests2 = sync_requests.clone();
+                        let block_requests2 = block_requests.clone();
+                        let writer_weak = Arc::downgrade(&writer);
 
-                        let (last_header_hash, header_error, unknown_parent, reset_headers, added_any) =
-                            match spawn_blocking_limited(move || {
-                                let mut offset = 0usize;
-                                let mut last_header_hash: Option<[u8; 32]> = None;
-                                let mut header_error = false;
-                                let mut unknown_parent = false;
-                                let mut reset_headers = false;
-                                let mut added_any = false;
+                        {
+                            let mut state = peer_state.lock().await;
+                            state.last_headers_received = Some(Instant::now());
+                        }
 
-                                let mut guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
-
-                                while offset + 80 <= header_bytes.len() {
-                                    let slice = &header_bytes[offset..offset + 80];
-                                    let (header, used) = match crate::block::BlockHeader::deserialize(slice) {
-                                        Ok(v) => v,
-                                        Err(_) => {
-                                            header_error = true;
-                                            break;
-                                        }
-                                    };
-                                    offset += used;
-                                    last_header_hash = Some(header.hash());
-
-                                    let header_hash = header.hash();
-                                    if header.prev_hash == [0u8; 32] {
-                                        let genesis_hash = guard.params.genesis_block.header.hash();
-                                        if header_hash == genesis_hash {
-                                            continue;
-                                        }
-                                    }
-
-                                    let already_known = guard.headers.contains_key(&header_hash)
-                                        || guard.block_store.contains_key(&header_hash);
-                                    if let Err(e) = guard.add_header(header.clone()) {
-                                        header_error = true;
-                                        if e.contains("unknown parent") {
-                                            unknown_parent = true;
-                                            if let Some(peer_height) = peer_height_hint {
-                                                let local_height = guard.tip_height();
-                                                if peer_height > local_height {
-                                                    reset_headers = true;
-                                                }
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    if !already_known {
-                                        added_any = true;
-                                    }
-                                }
-
-                                (last_header_hash, header_error, unknown_parent, reset_headers, added_any)
-                            })
-                            .await
-                            {
-                                Ok(v) => v,
-                                Err(_) => (None, true, false, false, false),
-                            };
-
-                        if header_error {
-                            if unknown_parent && !added_any {
+                        let permit = match inbound_bulk_queue().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
                                 P2PNode::log_event(
                                     "warn",
                                     "sync",
+                                    format!("P2P {}: inbound headers dropped (busy)", addr),
+                                );
+                                continue;
+                            }
+                        };
+
+                        tokio::spawn(async move {
+                            let _permit = permit;
+
+                            let (last_header_hash, header_error, unknown_parent, reset_headers, added_any) =
+                                match spawn_blocking_limited(move || {
+                                    let mut offset = 0usize;
+                                    let mut last_header_hash: Option<[u8; 32]> = None;
+                                    let mut header_error = false;
+                                    let mut unknown_parent = false;
+                                    let mut reset_headers = false;
+                                    let mut added_any = false;
+
+                                    let mut guard =
+                                        chain_arc_for_headers.lock().unwrap_or_else(|e| e.into_inner());
+
+                                    while offset + 80 <= header_bytes.len() {
+                                        let slice = &header_bytes[offset..offset + 80];
+                                        let (header, used) =
+                                            match crate::block::BlockHeader::deserialize(slice) {
+                                                Ok(v) => v,
+                                                Err(_) => {
+                                                    header_error = true;
+                                                    break;
+                                                }
+                                            };
+                                        offset += used;
+                                        last_header_hash = Some(header.hash());
+
+                                        let header_hash = header.hash();
+                                        if header.prev_hash == [0u8; 32] {
+                                            let genesis_hash =
+                                                guard.params.genesis_block.header.hash();
+                                            if header_hash == genesis_hash {
+                                                continue;
+                                            }
+                                        }
+
+                                        let already_known = guard.headers.contains_key(&header_hash)
+                                            || guard.block_store.contains_key(&header_hash);
+                                        if let Err(e) = guard.add_header(header.clone()) {
+                                            header_error = true;
+                                            if e.contains("unknown parent") {
+                                                unknown_parent = true;
+                                                if let Some(peer_height) = peer_height_hint {
+                                                    let local_height = guard.tip_height();
+                                                    if peer_height > local_height {
+                                                        reset_headers = true;
+                                                    }
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        if !already_known {
+                                            added_any = true;
+                                        }
+                                    }
+
+                                    (last_header_hash, header_error, unknown_parent, reset_headers, added_any)
+                                })
+                                .await
+                                {
+                                    Ok(v) => v,
+                                    Err(_) => (None, true, false, false, false),
+                                };
+
+                            if header_count > 0 {
+                                let last_short = last_header_hash
+                                    .map(|h| {
+                                        let hex = hex::encode(h);
+                                        hex.get(0..12).unwrap_or(&hex).to_string()
+                                    })
+                                    .unwrap_or_else(|| "-".to_string());
+                                P2PNode::log_event(
+                                    "info",
+                                    "sync",
                                     format!(
-                                        "P2P {}: headers do not connect; ignoring peer height",
-                                        addr
+                                        "P2P {}: received {} headers (new={}) last={}",
+                                        addr2, header_count, added_any, last_short
                                     ),
                                 );
-                                let mut state = peer_state.lock().await;
-                                state.height = None;
-                                state.tip = None;
                             }
-                            if reset_headers {
-                                let get_headers = GetHeadersPayload {
-                                    start_hash: vec![0u8; 32],
-                                    count: MAX_HEADERS_PER_REQUEST,
-                                };
-                                if let Ok(msg) = get_headers.to_message() {
-                                    send_message_detached(&writer, msg, addr);
-                                }
-                            }
-                            continue;
-                        }
-                        let local_height = {
-                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.tip_height()
-                        };
-                        let peer_height = last_handshake_height.unwrap_or(local_height);
-                        if header_count == 0 && peer_height > local_height {
-                            if sync_request_allowed_for(
-                                &sync_requests,
-                                addr.ip(),
-                                local_height,
-                                peer_height,
-                            )
-                            .await
-                            {
-                                let get_headers = GetHeadersPayload {
-                                    start_hash: vec![0u8; 32],
-                                    count: MAX_HEADERS_PER_REQUEST,
-                                };
-                                if let Ok(msg) = get_headers.to_message() {
-                                    send_message_detached(&writer, msg, addr);
-                                }
-                            }
-                            continue;
-                        }
-                        if header_count >= MAX_HEADERS_PER_REQUEST {
-                            if let Some(last_hash) = last_header_hash {
-                                let get_headers = GetHeadersPayload {
-                                    start_hash: last_hash.to_vec(),
-                                    count: MAX_HEADERS_PER_REQUEST,
-                                };
-                                if let Ok(msg) = get_headers.to_message() {
-                                    send_message_detached(&writer, msg, addr);
-                                }
-                            }
-                        }
 
-                        let request = {
-                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(best) = guard.best_header_if_better() {
-                                if let Some(path) = guard.header_path_to_known(best.header.hash()) {
-                                    if let Some(first_hash) = path.first() {
-                                        let start_hash = guard
-                                            .headers
-                                            .get(first_hash)
-                                            .map(|hw| hw.header.prev_hash)
-                                            .unwrap_or([0u8; 32]);
-                                        let count = std::cmp::min(
-                                            path.len(),
-                                            MAX_BLOCKS_PER_REQUEST as usize,
-                                        )
-                                            as u32;
-                                        if count > 0 {
-                                            Some((start_hash, count))
+                            if header_error {
+                                if unknown_parent && !added_any {
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: headers do not connect; ignoring peer height",
+                                            addr2
+                                        ),
+                                    );
+                                    let mut state = peer_state2.lock().await;
+                                    state.height = None;
+                                    state.tip = None;
+                                }
+                                if reset_headers {
+                                    let get_headers = GetHeadersPayload {
+                                        start_hash: vec![0u8; 32],
+                                        count: MAX_HEADERS_PER_REQUEST,
+                                    };
+                                    if let Ok(msg) = get_headers.to_message() {
+                                        if let Some(writer) = writer_weak.upgrade() {
+                                            send_message_detached(&writer, msg, addr2);
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+
+                            let local_height = {
+                                let guard = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
+                                guard.tip_height()
+                            };
+                            let peer_height = last_handshake_height.unwrap_or(local_height);
+
+                            if header_count == 0 && peer_height > local_height {
+                                if sync_request_allowed_for(
+                                    &sync_requests2,
+                                    addr2.ip(),
+                                    local_height,
+                                    peer_height,
+                                )
+                                .await
+                                {
+                                    let get_headers = GetHeadersPayload {
+                                        start_hash: vec![0u8; 32],
+                                        count: MAX_HEADERS_PER_REQUEST,
+                                    };
+                                    if let Ok(msg) = get_headers.to_message() {
+                                        if let Some(writer) = writer_weak.upgrade() {
+                                            send_message_detached(&writer, msg, addr2);
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+
+                            if header_count >= MAX_HEADERS_PER_REQUEST {
+                                if let Some(last_hash) = last_header_hash {
+                                    let get_headers = GetHeadersPayload {
+                                        start_hash: last_hash.to_vec(),
+                                        count: MAX_HEADERS_PER_REQUEST,
+                                    };
+                                    if let Ok(msg) = get_headers.to_message() {
+                                        if let Some(writer) = writer_weak.upgrade() {
+                                            send_message_detached(&writer, msg, addr2);
+                                        }
+                                    }
+                                }
+                            }
+
+                            let request = {
+                                let guard = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(best) = guard.best_header_if_better() {
+                                    if let Some(path) = guard.header_path_to_known(best.header.hash()) {
+                                        if let Some(first_hash) = path.first() {
+                                            let start_hash = guard
+                                                .headers
+                                                .get(first_hash)
+                                                .map(|hw| hw.header.prev_hash)
+                                                .unwrap_or([0u8; 32]);
+                                            let count = std::cmp::min(
+                                                path.len(),
+                                                MAX_BLOCKS_PER_REQUEST as usize,
+                                            ) as u32;
+                                            if count > 0 {
+                                                Some((start_hash, count))
+                                            } else {
+                                                None
+                                            }
                                         } else {
                                             None
                                         }
@@ -4676,28 +4751,29 @@ async fn handle_incoming_with_sybil(
                                 } else {
                                     None
                                 }
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some((start_hash, count)) = request {
-                            let get_blocks = GetBlocksPayload {
-                                start_hash: start_hash.to_vec(),
-                                count,
                             };
-                            if sync_block_request_allowed_for(
-                                &block_requests,
-                                addr.ip(),
-                                local_height,
-                                peer_height,
-                            )
-                            .await
-                            {
-                                if let Ok(msg) = get_blocks.to_message() {
-                                    send_message_detached(&writer, msg, addr);
+
+                            if let Some((start_hash, count)) = request {
+                                let get_blocks = GetBlocksPayload {
+                                    start_hash: start_hash.to_vec(),
+                                    count,
+                                };
+                                if sync_block_request_allowed_for(
+                                    &block_requests2,
+                                    addr2.ip(),
+                                    local_height,
+                                    peer_height,
+                                )
+                                .await
+                                {
+                                    if let Ok(msg) = get_blocks.to_message() {
+                                        if let Some(writer) = writer_weak.upgrade() {
+                                            send_message_detached(&writer, msg, addr2);
+                                        }
+                                    }
                                 }
                             }
-                        }
+                        });
                     }
                 }
             }
