@@ -2057,6 +2057,7 @@ impl P2PNode {
         }
 
         let peer_state = Arc::new(Mutex::new(PeerSyncState::default()));
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let ping_writer = writer.clone();
         let ping_addr = addr;
         let ping_chain = self.chain.clone();
@@ -2078,7 +2079,12 @@ impl P2PNode {
             let mut recovery_in_progress = false;
             let mut recovery_start_height = last_progress_height;
             loop {
-                tokio::time::sleep(sync_tick).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(sync_tick) => {}
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
+                }
                 if last_ping.elapsed() >= ping_interval {
                     let nonce = rand_core::OsRng.next_u64();
                     let ping = PingPayload { nonce };
@@ -2252,6 +2258,7 @@ impl P2PNode {
         let peer_state = peer_state.clone();
         let local_node_id = hex::encode(&self.node_id);
         let local_node_id_bytes = self.node_id.clone();
+        let shutdown_tx_for_reader = shutdown_tx;
         tokio::spawn(async move {
             let mut msg_count: u32 = 0;
             let mut window_start = Instant::now();
@@ -3421,6 +3428,7 @@ impl P2PNode {
                     _ => {}
                 }
             }
+            let _ = shutdown_tx_for_reader.send(());
             {
                 let mut w = writer_for_drop.lock().await;
                 let _ = w.shutdown().await;
@@ -3615,6 +3623,7 @@ async fn handle_incoming_with_sybil(
     }
 
     let peer_state = Arc::new(Mutex::new(PeerSyncState::default()));
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let ping_writer = writer.clone();
     let ping_addr = addr;
     let ping_chain = chain.clone();
@@ -3632,7 +3641,12 @@ async fn handle_incoming_with_sybil(
         let mut last_height = crate::p2p::local_height(&ping_chain);
         let mut last_handshake = Instant::now();
         loop {
-            tokio::time::sleep(sync_tick).await;
+            tokio::select! {
+                _ = tokio::time::sleep(sync_tick) => {}
+                _ = &mut shutdown_rx => {
+                    break;
+                }
+            }
             if last_ping.elapsed() >= ping_interval {
                 let nonce = rand_core::OsRng.next_u64();
                 let ping = PingPayload { nonce };
@@ -4802,6 +4816,7 @@ async fn handle_incoming_with_sybil(
             }
         }
     }
+    let _ = shutdown_tx.send(());
     {
         let mut w = writer.lock().await;
         let _ = w.shutdown().await;
