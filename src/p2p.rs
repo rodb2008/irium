@@ -2073,7 +2073,7 @@ impl P2PNode {
         let (shutdown_tx_to_ping, mut shutdown_rx_to_ping) = tokio::sync::oneshot::channel::<()>();
         let (shutdown_tx_to_reader, mut shutdown_rx_to_reader) =
             tokio::sync::oneshot::channel::<()>();
-        let ping_writer = writer.clone();
+        let ping_writer_weak = Arc::downgrade(&writer);
         let ping_addr = addr;
         let ping_chain = self.chain.clone();
         let ping_agent = agent.to_string();
@@ -2103,6 +2103,10 @@ impl P2PNode {
                         break;
                     }
                 }
+                let ping_writer = match ping_writer_weak.upgrade() {
+                    Some(w) => w,
+                    None => break,
+                };
                 if last_ping.elapsed() >= ping_interval {
                     let nonce = rand_core::OsRng.next_u64();
                     let ping = PingPayload { nonce };
@@ -3797,7 +3801,7 @@ async fn handle_incoming_with_sybil(
     let peer_state = Arc::new(Mutex::new(PeerSyncState::default()));
     let (shutdown_tx_to_ping, mut shutdown_rx_to_ping) = tokio::sync::oneshot::channel::<()>();
     let (shutdown_tx_to_reader, mut shutdown_rx_to_reader) = tokio::sync::oneshot::channel::<()>();
-    let ping_writer = writer.clone();
+    let ping_writer_weak = Arc::downgrade(&writer);
     let ping_addr = addr;
     let ping_chain = chain.clone();
     let ping_agent = agent.clone();
@@ -3823,6 +3827,10 @@ async fn handle_incoming_with_sybil(
                     break;
                 }
             }
+            let ping_writer = match ping_writer_weak.upgrade() {
+                Some(w) => w,
+                None => break,
+            };
             if last_ping.elapsed() >= ping_interval {
                 let nonce = rand_core::OsRng.next_u64();
                 let ping = PingPayload { nonce };
