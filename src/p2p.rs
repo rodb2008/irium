@@ -3147,9 +3147,18 @@ impl P2PNode {
                                         ));
                                     }
                                 }
-                                for block_data in blocks {
-                                    let msg = BlockPayload { block_data }.to_message();
-                                    let _ = send_message(&writer, msg, addr).await;
+                                if !blocks.is_empty() {
+                                    let writer_weak = Arc::downgrade(&writer);
+                                    let addr2 = addr;
+                                    tokio::spawn(async move {
+                                        for block_data in blocks {
+                                            let Some(writer) = writer_weak.upgrade() else {
+                                                break;
+                                            };
+                                            let msg = BlockPayload { block_data }.to_message();
+                                            let _ = send_message(&writer, msg, addr2).await;
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -4742,9 +4751,18 @@ async fn handle_incoming_with_sybil(
                                 ));
                             }
                         }
-                        for block_data in blocks {
-                            let msg = BlockPayload { block_data }.to_message();
-                            let _ = send_message(&writer, msg, addr).await;
+                        if !blocks.is_empty() {
+                            let writer_weak = Arc::downgrade(&writer);
+                            let addr2 = addr;
+                            tokio::spawn(async move {
+                                for block_data in blocks {
+                                    let Some(writer) = writer_weak.upgrade() else {
+                                        break;
+                                    };
+                                    let msg = BlockPayload { block_data }.to_message();
+                                    let _ = send_message(&writer, msg, addr2).await;
+                                }
+                            });
                         }
                     }
                 }
