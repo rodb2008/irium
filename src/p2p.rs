@@ -4499,47 +4499,61 @@ async fn handle_incoming_with_sybil(
                     }
                 }
             }
+
             MessageType::GetHeaders => {
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = GetHeadersPayload::from_message(&msg) {
-                        let headers_bytes = {
-                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                        let chain_arc2 = chain_arc.clone();
+                        let writer_weak = Arc::downgrade(&writer);
+                        let addr2 = addr;
 
-                            let mut start_idx = if guard.chain.len() > 1 { 1 } else { 0 };
-                            let mut start_hash_non_zero = false;
-                            let mut start_found = false;
-                            if payload.start_hash.len() == 32 {
-                                let mut target = [0u8; 32];
-                                target.copy_from_slice(&payload.start_hash);
-                                start_hash_non_zero = target.iter().any(|b| *b != 0);
-                                if start_hash_non_zero {
-                                    if let Some(pos) =
-                                        guard.chain.iter().position(|b| b.header.hash() == target)
-                                    {
-                                        start_idx = pos.saturating_add(1);
-                                        start_found = true;
+                        tokio::spawn(async move {
+                            let start_hash = payload.start_hash;
+                            let count = payload.count;
+
+                            let headers_bytes = match spawn_blocking_limited(move || {
+                                let guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
+
+                                let mut start_idx = if guard.chain.len() > 1 { 1 } else { 0 };
+                                let mut start_hash_non_zero = false;
+                                let mut start_found = false;
+                                if start_hash.len() == 32 {
+                                    let mut target = [0u8; 32];
+                                    target.copy_from_slice(&start_hash);
+                                    start_hash_non_zero = target.iter().any(|b| *b != 0);
+                                    if start_hash_non_zero {
+                                        if let Some(pos) = guard
+                                            .chain
+                                            .iter()
+                                            .position(|b| b.header.hash() == target)
+                                        {
+                                            start_idx = pos.saturating_add(1);
+                                            start_found = true;
+                                        }
                                     }
                                 }
-                            }
-                            let count = payload.count.min(MAX_HEADERS_PER_REQUEST) as usize;
-                            let mut bytes = Vec::new();
-                            if !start_hash_non_zero || start_found {
-                                for block in guard.chain.iter().skip(start_idx).take(count) {
-                                    bytes.extend_from_slice(&block.header.serialize());
+                                let count = count.min(MAX_HEADERS_PER_REQUEST) as usize;
+                                let mut bytes = Vec::new();
+                                if !start_hash_non_zero || start_found {
+                                    for block in guard.chain.iter().skip(start_idx).take(count) {
+                                        bytes.extend_from_slice(&block.header.serialize());
+                                    }
                                 }
-                            }
-                            bytes
-                        };
+                                bytes
+                            })
+                            .await {
+                                Ok(v) => v,
+                                Err(_) => return,
+                            };
 
-                        let msg = HeadersPayload {
-                            headers: headers_bytes,
-                        }
-                        .to_message();
-                        send_message_detached(&writer, msg, addr);
+                            let msg = HeadersPayload { headers: headers_bytes }.to_message();
+                            if let Some(writer) = writer_weak.upgrade() {
+                                send_message_detached(&writer, msg, addr2);
+                            }
+                        });
                     }
                 }
             }
-
             MessageType::Headers => {
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = HeadersPayload::from_message(&msg) {
