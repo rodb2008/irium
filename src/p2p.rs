@@ -232,6 +232,24 @@ fn inbound_bulk_queue() -> Arc<tokio::sync::Semaphore> {
         .clone()
 }
 
+
+fn inbound_handshake_concurrency() -> usize {
+    static VAL: OnceLock<usize> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_INBOUND_HANDSHAKE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1).min(1024))
+            .unwrap_or(32)
+    })
+}
+
+fn inbound_handshake_sem() -> Arc<tokio::sync::Semaphore> {
+    static SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(inbound_handshake_concurrency())))
+        .clone()
+}
+
 fn trusted_seed_inbound_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -3785,6 +3803,20 @@ async fn handle_incoming_with_sybil(
 ) -> Result<(), String> {
     let local_node_id = hex::encode(&node_id);
     let local_node_id_bytes = node_id.clone();
+    let _handshake_permit = if trusted_seed {
+        inbound_handshake_sem()
+            .acquire_owned()
+            .await
+            .map_err(|_| "inbound handshake semaphore closed".to_string())?
+    } else {
+        match inbound_handshake_sem().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let _ = socket.shutdown().await;
+                return Err("inbound handshake overloaded".to_string());
+            }
+        }
+    };
     // Issue a fresh challenge with adaptive difficulty.
     let base = P2PNode::sybil_difficulty();
     let max = std::env::var("IRIUM_SYBIL_DIFFICULTY_MAX")
@@ -3835,7 +3867,11 @@ async fn handle_incoming_with_sybil(
     }
     let proof = SybilProof::from_bytes(&proof_msg.payload)
         .ok_or_else(|| "invalid sybil proof payload".to_string())?;
-    if !handshake.verify_proof(&proof) {
+    let peer_pubkey = proof.peer_pubkey.clone();
+    let proof_ok = tokio::task::spawn_blocking(move || handshake.verify_proof(&proof))
+        .await
+        .map_err(|e| format!("failed to join sybil verifier: {}", e))?;
+    if !proof_ok {
         {
             let mut rep = reputation.lock().await;
             rep.record_failure(&addr.to_string());
@@ -4000,7 +4036,7 @@ async fn handle_incoming_with_sybil(
     {
         let mut dir = directory.lock().await;
         let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
-        let node_id = hex::encode(&proof.peer_pubkey);
+        let node_id = hex::encode(&peer_pubkey);
         dir.register_connection(multiaddr.clone(), None, None, Some(node_id));
     }
 
