@@ -2042,7 +2042,9 @@ impl P2PNode {
         }
 
         let peer_state = Arc::new(Mutex::new(PeerSyncState::default()));
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (shutdown_tx_to_ping, mut shutdown_rx_to_ping) = tokio::sync::oneshot::channel::<()>();
+        let (shutdown_tx_to_reader, mut shutdown_rx_to_reader) =
+            tokio::sync::oneshot::channel::<()>();
         let ping_writer = writer.clone();
         let ping_addr = addr;
         let ping_chain = self.chain.clone();
@@ -2054,6 +2056,7 @@ impl P2PNode {
         let ping_sync_requests = self.sync_requests.clone();
         let ping_block_requests = self.block_requests.clone();
         tokio::spawn(async move {
+            let mut shutdown_tx_to_reader = Some(shutdown_tx_to_reader);
             let ping_interval = P2PNode::ping_interval();
             let sync_tick = sync_tick_interval();
             let mut last_ping = Instant::now();
@@ -2066,7 +2069,7 @@ impl P2PNode {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(sync_tick) => {}
-                    _ = &mut shutdown_rx => {
+                    _ = &mut shutdown_rx_to_ping => {
                         break;
                     }
                 }
@@ -2080,6 +2083,9 @@ impl P2PNode {
                             "net",
                             format!("P2P {}: ping failed: {}", ping_addr, e),
                         );
+                        if let Some(tx) = shutdown_tx_to_reader.take() {
+                            let _ = tx.send(());
+                        }
                         break;
                     }
                     last_ping = Instant::now();
@@ -2243,7 +2249,6 @@ impl P2PNode {
         let peer_state = peer_state.clone();
         let local_node_id = hex::encode(&self.node_id);
         let local_node_id_bytes = self.node_id.clone();
-        let shutdown_tx_for_reader = shutdown_tx;
         tokio::spawn(async move {
             let mut msg_count: u32 = 0;
             let mut window_start = Instant::now();
@@ -2251,9 +2256,13 @@ impl P2PNode {
             let mut last_handshake_agent: Option<String> = None;
             let mut bulk_count: u32 = 0;
             loop {
-                let msg = match read_message_with_timeout(&mut reader, P2PNode::peer_timeout())
-                    .await
-                {
+                let msg = tokio::select! {
+                    _ = &mut shutdown_rx_to_reader => {
+                        break;
+                    }
+                    res = read_message_with_timeout(&mut reader, P2PNode::peer_timeout()) => res,
+                };
+                let msg = match msg {
                     Ok(msg) => msg,
                     Err(e) => {
                         Self::log_err(format!("P2P outbound {}: closing read loop: {}", addr, e));
@@ -3447,7 +3456,7 @@ impl P2PNode {
                     _ => {}
                 }
             }
-            let _ = shutdown_tx_for_reader.send(());
+            let _ = shutdown_tx_to_ping.send(());
             {
                 let mut w = writer_for_drop.lock().await;
                 let _ = w.shutdown().await;
@@ -3684,7 +3693,8 @@ async fn handle_incoming_with_sybil(
     }
 
     let peer_state = Arc::new(Mutex::new(PeerSyncState::default()));
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx_to_ping, mut shutdown_rx_to_ping) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx_to_reader, mut shutdown_rx_to_reader) = tokio::sync::oneshot::channel::<()>();
     let ping_writer = writer.clone();
     let ping_addr = addr;
     let ping_chain = chain.clone();
@@ -3696,6 +3706,7 @@ async fn handle_incoming_with_sybil(
     let ping_sync_requests = sync_requests.clone();
     let ping_block_requests = block_requests.clone();
     tokio::spawn(async move {
+        let mut shutdown_tx_to_reader = Some(shutdown_tx_to_reader);
         let ping_interval = P2PNode::ping_interval();
         let sync_tick = sync_tick_interval();
         let mut last_ping = Instant::now();
@@ -3704,7 +3715,7 @@ async fn handle_incoming_with_sybil(
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(sync_tick) => {}
-                _ = &mut shutdown_rx => {
+                _ = &mut shutdown_rx_to_ping => {
                     break;
                 }
             }
@@ -3718,6 +3729,9 @@ async fn handle_incoming_with_sybil(
                         "net",
                         format!("P2P {}: ping failed: {}", ping_addr, e),
                     );
+                    if let Some(tx) = shutdown_tx_to_reader.take() {
+                        let _ = tx.send(());
+                    }
                     break;
                 }
                 last_ping = Instant::now();
@@ -3830,7 +3844,11 @@ async fn handle_incoming_with_sybil(
     // Process messages from the peer.
     let mut bulk_count: u32 = 0;
     loop {
-        let msg = match read_message_with_timeout(&mut reader, P2PNode::peer_timeout()).await {
+        let msg = tokio::select! {
+            _ = &mut shutdown_rx_to_reader => { break; }
+            res = read_message_with_timeout(&mut reader, P2PNode::peer_timeout()) => res,
+        };
+        let msg = match msg {
             Ok(m) => m,
             Err(e) => {
                 P2PNode::log_event(
@@ -4907,7 +4925,7 @@ async fn handle_incoming_with_sybil(
             }
         }
     }
-    let _ = shutdown_tx.send(());
+    let _ = shutdown_tx_to_ping.send(());
     {
         let mut w = writer.lock().await;
         let _ = w.shutdown().await;
