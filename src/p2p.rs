@@ -315,6 +315,14 @@ fn headers_request_cooldown() -> Duration {
     Duration::from_secs(secs.max(5).min(300))
 }
 
+fn headers_response_window() -> Duration {
+    let secs = std::env::var("IRIUM_P2P_HEADERS_RESPONSE_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    Duration::from_secs(secs.clamp(5, 120))
+}
+
 fn headers_fallback_grace() -> Duration {
     let secs = std::env::var("IRIUM_P2P_HEADERS_FALLBACK_SECS")
         .ok()
@@ -517,6 +525,12 @@ struct PeerSyncState {
     last_headers_request: Option<Instant>,
     last_headers_received: Option<Instant>,
     last_headers_start: Option<[u8; 32]>,
+
+    // Anti-flood: only accept Headers when we recently requested them, and process one batch at a time.
+    headers_inflight: bool,
+    headers_processing: bool,
+    unsolicited_headers: u32,
+    last_unsolicited_log: Option<Instant>,
 }
 
 impl Default for PeerSyncState {
@@ -531,6 +545,10 @@ impl Default for PeerSyncState {
             last_headers_request: None,
             last_headers_received: None,
             last_headers_start: None,
+            headers_inflight: false,
+            headers_processing: false,
+            unsolicited_headers: 0,
+            last_unsolicited_log: None,
         }
     }
 }
@@ -621,6 +639,7 @@ async fn maybe_request_sync(
             let mut state = peer_state.lock().await;
             state.last_headers_request = Some(Instant::now());
             state.last_headers_start = Some(start_hash);
+            state.headers_inflight = true;
         }
     }
     if peer_height > local_height || tip_mismatch {
@@ -698,6 +717,7 @@ async fn maybe_request_headers_fallback(
         let mut guard = peer_state.lock().await;
         guard.last_headers_request = Some(Instant::now());
         guard.last_headers_start = Some([0u8; 32]);
+        guard.headers_inflight = true;
     }
 }
 
@@ -748,6 +768,7 @@ async fn request_orphan_headers(
         let mut guard = peer_state.lock().await;
         guard.last_headers_request = Some(Instant::now());
         guard.last_headers_start = Some(start_hash);
+        guard.headers_inflight = true;
     }
 }
 
@@ -2309,6 +2330,7 @@ impl P2PNode {
                                 let mut state = ping_peer_state.lock().await;
                                 state.last_headers_request = Some(Instant::now());
                                 state.last_headers_start = Some([0u8; 32]);
+                                state.headers_inflight = true;
                             }
                             stalled_heartbeats = 0;
                             recovery_in_progress = true;
@@ -2656,6 +2678,7 @@ impl P2PNode {
                                         let mut state = peer_state.lock().await;
                                         state.last_headers_request = Some(Instant::now());
                                         state.last_headers_start = Some(start_hash);
+                                        state.headers_inflight = true;
                                     }
                                 }
                             } else if payload.height < local_height {
@@ -2886,7 +2909,35 @@ impl P2PNode {
                             if let Ok(payload) = HeadersPayload::from_message(&msg) {
                                 {
                                     let mut state = peer_state.lock().await;
-                                    state.last_headers_received = Some(Instant::now());
+                                    let now = Instant::now();
+                                    let inflight_recent = state.headers_inflight
+                                        && state
+                                            .last_headers_request
+                                            .map(|ts| now.duration_since(ts) <= headers_response_window())
+                                            .unwrap_or(false);
+                                    if !inflight_recent {
+                                        state.unsolicited_headers = state.unsolicited_headers.saturating_add(1);
+                                        let should_log = state
+                                            .last_unsolicited_log
+                                            .map(|t| now.duration_since(t) > Duration::from_secs(30))
+                                            .unwrap_or(true);
+                                        if should_log {
+                                            state.last_unsolicited_log = Some(now);
+                                            P2PNode::log_event(
+                                                "warn",
+                                                "sync",
+                                                format!("P2P {}: unsolicited headers ignored", addr),
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    if state.headers_processing {
+                                        // Prevent concurrent header batch processing for the same peer.
+                                        state.unsolicited_headers = state.unsolicited_headers.saturating_add(1);
+                                        continue;
+                                    }
+                                    state.headers_processing = true;
+                                    state.headers_inflight = false;
                                 }
                                 let header_count = (payload.headers.len() / 80) as u32;
                                 let header_bytes = payload.headers.clone();
@@ -2988,6 +3039,17 @@ impl P2PNode {
                                         if let Ok(msg) = get_headers.to_message() {
                                             send_message_detached(&writer, msg, addr);
                                         }
+                                        {
+                                            let mut state = peer_state.lock().await;
+                                            state.last_headers_request = Some(Instant::now());
+                                            state.last_headers_start = Some([0u8; 32]);
+                                            state.headers_inflight = true;
+                                        }
+                                    }
+                                    {
+                                        let mut state = peer_state.lock().await;
+                                        state.last_headers_received = Some(Instant::now());
+                                        state.headers_processing = false;
                                     }
                                     continue;
                                 }
@@ -3012,10 +3074,18 @@ impl P2PNode {
                                         if let Ok(msg) = get_headers.to_message() {
                                             send_message_detached(&writer, msg, addr);
                                         }
+                                        let mut state = peer_state.lock().await;
+                                        state.last_headers_request = Some(Instant::now());
+                                        state.last_headers_start = Some([0u8; 32]);
+                                        state.headers_inflight = true;
+                                    }
+                                    {
+                                        let mut state = peer_state.lock().await;
+                                        state.headers_processing = false;
                                     }
                                     continue;
                                 }
-                                if header_count >= MAX_HEADERS_PER_REQUEST {
+                                if header_count >= MAX_HEADERS_PER_REQUEST && peer_height > local_height {
                                     if let Some(last_hash) = last_header_hash {
                                         let get_headers = GetHeadersPayload {
                                             start_hash: last_hash.to_vec(),
@@ -3023,6 +3093,12 @@ impl P2PNode {
                                         };
                                         if let Ok(msg) = get_headers.to_message() {
                                             send_message_detached(&writer, msg, addr);
+                                        }
+                                        {
+                                            let mut state = peer_state.lock().await;
+                                            state.last_headers_request = Some(Instant::now());
+                                            state.last_headers_start = Some(last_hash);
+                                            state.headers_inflight = true;
                                         }
                                     }
                                 }
@@ -3092,6 +3168,12 @@ impl P2PNode {
                                         }
                                     }
                                 }
+                                {
+                                    let mut state = peer_state.lock().await;
+                                    state.last_headers_received = Some(Instant::now());
+                                    state.headers_processing = false;
+                                }
+
                             }
                         }
                     }
@@ -4356,6 +4438,7 @@ async fn handle_incoming_with_sybil(
                                 let mut state = peer_state.lock().await;
                                 state.last_headers_request = Some(Instant::now());
                                 state.last_headers_start = Some(start_hash);
+                                state.headers_inflight = true;
                             }
                         }
                     } else if payload.height < local_height {
@@ -4606,7 +4689,34 @@ async fn handle_incoming_with_sybil(
 
                         {
                             let mut state = peer_state.lock().await;
-                            state.last_headers_received = Some(Instant::now());
+                            let now = Instant::now();
+                            let inflight_recent = state.headers_inflight
+                                && state
+                                    .last_headers_request
+                                    .map(|ts| now.duration_since(ts) <= headers_response_window())
+                                    .unwrap_or(false);
+                            if !inflight_recent {
+                                state.unsolicited_headers = state.unsolicited_headers.saturating_add(1);
+                                let should_log = state
+                                    .last_unsolicited_log
+                                    .map(|t| now.duration_since(t) > Duration::from_secs(30))
+                                    .unwrap_or(true);
+                                if should_log {
+                                    state.last_unsolicited_log = Some(now);
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "sync",
+                                        format!("P2P {}: unsolicited headers ignored", addr),
+                                    );
+                                }
+                                continue;
+                            }
+                            if state.headers_processing {
+                                state.unsolicited_headers = state.unsolicited_headers.saturating_add(1);
+                                continue;
+                            }
+                            state.headers_processing = true;
+                            state.headers_inflight = false;
                         }
 
                         let permit = match inbound_bulk_queue().try_acquire_owned() {
@@ -4727,6 +4837,17 @@ async fn handle_incoming_with_sybil(
                                             send_message_detached(&writer, msg, addr2);
                                         }
                                     }
+                                    {
+                                        let mut state = peer_state2.lock().await;
+                                        state.last_headers_request = Some(Instant::now());
+                                        state.last_headers_start = Some([0u8; 32]);
+                                        state.headers_inflight = true;
+                                    }
+                                }
+                                {
+                                    let mut state = peer_state2.lock().await;
+                                    state.last_headers_received = Some(Instant::now());
+                                    state.headers_processing = false;
                                 }
                                 return;
                             }
@@ -4755,11 +4876,19 @@ async fn handle_incoming_with_sybil(
                                             send_message_detached(&writer, msg, addr2);
                                         }
                                     }
+                                    let mut state = peer_state2.lock().await;
+                                    state.last_headers_request = Some(Instant::now());
+                                    state.last_headers_start = Some([0u8; 32]);
+                                    state.headers_inflight = true;
+                                }
+                                {
+                                    let mut state = peer_state2.lock().await;
+                                    state.headers_processing = false;
                                 }
                                 return;
                             }
 
-                            if header_count >= MAX_HEADERS_PER_REQUEST {
+                            if header_count >= MAX_HEADERS_PER_REQUEST && peer_height > local_height {
                                 if let Some(last_hash) = last_header_hash {
                                     let get_headers = GetHeadersPayload {
                                         start_hash: last_hash.to_vec(),
@@ -4769,6 +4898,12 @@ async fn handle_incoming_with_sybil(
                                         if let Some(writer) = writer_weak.upgrade() {
                                             send_message_detached(&writer, msg, addr2);
                                         }
+                                    }
+                                    {
+                                        let mut state = peer_state2.lock().await;
+                                        state.last_headers_request = Some(Instant::now());
+                                        state.last_headers_start = Some(last_hash);
+                                        state.headers_inflight = true;
                                     }
                                 }
                             }
@@ -4822,6 +4957,12 @@ async fn handle_incoming_with_sybil(
                                         }
                                     }
                                 }
+                            {
+                                let mut state = peer_state2.lock().await;
+                                state.last_headers_received = Some(Instant::now());
+                                state.headers_processing = false;
+                            }
+
                             }
                         });
                     }
