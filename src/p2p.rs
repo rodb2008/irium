@@ -221,9 +221,36 @@ fn inbound_bulk_queue_capacity() -> usize {
         std::env::var("IRIUM_P2P_INBOUND_BULK_QUEUE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .map(|v| v.max(1).min(256))
-            .unwrap_or(16)
+            .map(|v| v.max(1).min(512))
+            .unwrap_or(64)
     })
+}
+
+fn inbound_block_busy_wait_ms() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_INBOUND_BLOCK_BUSY_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(10).min(5000))
+            .unwrap_or(300)
+    })
+}
+
+fn inbound_block_busy_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_INBOUND_BLOCK_BUSY_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(30)
+    })
+}
+
+fn inbound_block_busy_log() -> Arc<Mutex<HashMap<IpAddr, Instant>>> {
+    static LOGS: OnceLock<Arc<Mutex<HashMap<IpAddr, Instant>>>> = OnceLock::new();
+    LOGS.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))).clone()
 }
 
 fn inbound_bulk_queue() -> Arc<tokio::sync::Semaphore> {
@@ -5105,14 +5132,27 @@ async fn handle_incoming_with_sybil(
                         let directory2 = directory.clone();
                         let reputation2 = reputation.clone();
 
-                        let permit = match inbound_bulk_queue().try_acquire_owned() {
-                            Ok(p) => p,
-                            Err(_) => {
-                                P2PNode::log_event(
-                                    "warn",
-                                    "sync",
-                                    format!("P2P {}: inbound block dropped (busy)", addr),
-                                );
+                        let permit = match tokio::time::timeout(
+                            Duration::from_millis(inbound_block_busy_wait_ms()),
+                            inbound_bulk_queue().acquire_owned(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(p)) => p,
+                            _ => {
+                                if ip_log_allowed(
+                                    &inbound_block_busy_log(),
+                                    addr.ip(),
+                                    Duration::from_secs(inbound_block_busy_log_cooldown_secs()),
+                                )
+                                .await
+                                {
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "sync",
+                                        format!("P2P {}: inbound block dropped (busy)", addr),
+                                    );
+                                }
                                 continue;
                             }
                         };
