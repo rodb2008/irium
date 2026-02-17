@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::block::Block;
 use crate::chain::ChainState;
@@ -36,6 +36,34 @@ use sha2::{Digest, Sha256};
 const DEFAULT_MAX_PEERS: usize = 100;
 const MAX_MSGS_PER_SEC: u32 = 200;
 const MAX_BULK_MSGS_PER_SEC: u32 = 2000;
+
+fn p2p_blocking_concurrency() -> usize {
+    std::env::var("IRIUM_P2P_BLOCKING_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 32)
+}
+
+fn p2p_blocking_sem() -> Arc<Semaphore> {
+    static VAL: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    VAL.get_or_init(|| Arc::new(Semaphore::new(p2p_blocking_concurrency())))
+        .clone()
+}
+
+async fn spawn_blocking_limited<T, F>(f: F) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let sem = p2p_blocking_sem();
+    let permit = sem.acquire_owned().await.expect("blocking semaphore closed");
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+}
 
 fn sync_cooldown() -> Duration {
     let secs = std::env::var("IRIUM_P2P_SYNC_COOLDOWN_SECS")
@@ -187,6 +215,41 @@ fn inbound_accept_cooldown_ms() -> u64 {
     })
 }
 
+fn inbound_bulk_queue_capacity() -> usize {
+    static VAL: OnceLock<usize> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_INBOUND_BULK_QUEUE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1).min(256))
+            .unwrap_or(16)
+    })
+}
+
+fn inbound_bulk_queue() -> Arc<tokio::sync::Semaphore> {
+    static SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(inbound_bulk_queue_capacity())))
+        .clone()
+}
+
+
+fn inbound_handshake_concurrency() -> usize {
+    static VAL: OnceLock<usize> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_INBOUND_HANDSHAKE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1).min(1024))
+            .unwrap_or(32)
+    })
+}
+
+fn inbound_handshake_sem() -> Arc<tokio::sync::Semaphore> {
+    static SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(inbound_handshake_concurrency())))
+        .clone()
+}
+
 fn trusted_seed_inbound_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -250,6 +313,14 @@ fn headers_request_cooldown() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(120);
     Duration::from_secs(secs.max(5).min(300))
+}
+
+fn headers_response_window() -> Duration {
+    let secs = std::env::var("IRIUM_P2P_HEADERS_RESPONSE_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    Duration::from_secs(secs.clamp(5, 120))
 }
 
 fn headers_fallback_grace() -> Duration {
@@ -454,6 +525,12 @@ struct PeerSyncState {
     last_headers_request: Option<Instant>,
     last_headers_received: Option<Instant>,
     last_headers_start: Option<[u8; 32]>,
+
+    // Anti-flood: only accept Headers when we recently requested them, and process one batch at a time.
+    headers_inflight: bool,
+    headers_processing: bool,
+    unsolicited_headers: u32,
+    last_unsolicited_log: Option<Instant>,
 }
 
 impl Default for PeerSyncState {
@@ -468,6 +545,10 @@ impl Default for PeerSyncState {
             last_headers_request: None,
             last_headers_received: None,
             last_headers_start: None,
+            headers_inflight: false,
+            headers_processing: false,
+            unsolicited_headers: 0,
+            last_unsolicited_log: None,
         }
     }
 }
@@ -558,6 +639,7 @@ async fn maybe_request_sync(
             let mut state = peer_state.lock().await;
             state.last_headers_request = Some(Instant::now());
             state.last_headers_start = Some(start_hash);
+            state.headers_inflight = true;
         }
     }
     if peer_height > local_height || tip_mismatch {
@@ -635,6 +717,7 @@ async fn maybe_request_headers_fallback(
         let mut guard = peer_state.lock().await;
         guard.last_headers_request = Some(Instant::now());
         guard.last_headers_start = Some([0u8; 32]);
+        guard.headers_inflight = true;
     }
 }
 
@@ -685,6 +768,7 @@ async fn request_orphan_headers(
         let mut guard = peer_state.lock().await;
         guard.last_headers_request = Some(Instant::now());
         guard.last_headers_start = Some(start_hash);
+        guard.headers_inflight = true;
     }
 }
 
@@ -1572,11 +1656,9 @@ impl P2PNode {
     pub async fn request_peers(&self) -> Result<(), String> {
         let msg = EmptyPayload::to_message(MessageType::GetPeers)?;
         let bytes = msg.serialize();
-        let mut guard = self.peers.lock().await;
-        for socket in guard.iter_mut() {
-            if let Err(e) = socket.lock().await.write_all(&bytes).await {
-                return Err(format!("failed to send getpeers: {}", e));
-            }
+        let ok = broadcast_raw(&self.peers, &bytes).await;
+        if ok == 0 {
+            return Err("failed to send getpeers: no peers accepted the message".to_string());
         }
         Ok(())
     }
@@ -1852,10 +1934,7 @@ impl P2PNode {
         .to_message();
         let serialized = msg.serialize();
 
-        let mut guard = self.peers.lock().await;
-        for socket in guard.iter_mut() {
-            let _ = socket.lock().await.write_all(&serialized).await;
-        }
+        let _ = broadcast_raw(&self.peers, &serialized).await;
         Ok(())
     }
 
@@ -1867,12 +1946,7 @@ impl P2PNode {
         .to_message();
         let serialized = msg.serialize();
 
-        let mut guard = self.peers.lock().await;
-        for socket in guard.iter_mut() {
-            if let Err(e) = socket.lock().await.write_all(&serialized).await {
-                eprintln!("Failed to send tx to peer: {}", e);
-            }
-        }
+        let _ = broadcast_raw(&self.peers, &serialized).await;
         Ok(())
     }
 
@@ -1883,12 +1957,7 @@ impl P2PNode {
         }
         let msg = InvPayload { txids }.to_message()?;
         let serialized = msg.serialize();
-        let mut guard = self.peers.lock().await;
-        for socket in guard.iter_mut() {
-            if let Err(e) = socket.lock().await.write_all(&serialized).await {
-                eprintln!("Failed to send inv to peer: {}", e);
-            }
-        }
+        let _ = broadcast_raw(&self.peers, &serialized).await;
         Ok(())
     }
 
@@ -2057,7 +2126,10 @@ impl P2PNode {
         }
 
         let peer_state = Arc::new(Mutex::new(PeerSyncState::default()));
-        let ping_writer = writer.clone();
+        let (shutdown_tx_to_ping, mut shutdown_rx_to_ping) = tokio::sync::oneshot::channel::<()>();
+        let (shutdown_tx_to_reader, mut shutdown_rx_to_reader) =
+            tokio::sync::oneshot::channel::<()>();
+        let ping_writer_weak = Arc::downgrade(&writer);
         let ping_addr = addr;
         let ping_chain = self.chain.clone();
         let ping_agent = agent.to_string();
@@ -2067,7 +2139,10 @@ impl P2PNode {
         let ping_peer_state = peer_state.clone();
         let ping_sync_requests = self.sync_requests.clone();
         let ping_block_requests = self.block_requests.clone();
+        let ping_peers_vec = self.peers.clone();
+        let ping_connected_vec = self.connected.clone();
         tokio::spawn(async move {
+            let mut shutdown_tx_to_reader = Some(shutdown_tx_to_reader);
             let ping_interval = P2PNode::ping_interval();
             let sync_tick = sync_tick_interval();
             let mut last_ping = Instant::now();
@@ -2078,17 +2153,32 @@ impl P2PNode {
             let mut recovery_in_progress = false;
             let mut recovery_start_height = last_progress_height;
             loop {
-                tokio::time::sleep(sync_tick).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(sync_tick) => {}
+                    _ = &mut shutdown_rx_to_ping => {
+                        break;
+                    }
+                }
+                let ping_writer = match ping_writer_weak.upgrade() {
+                    Some(w) => w,
+                    None => break,
+                };
                 if last_ping.elapsed() >= ping_interval {
                     let nonce = rand_core::OsRng.next_u64();
                     let ping = PingPayload { nonce };
                     let msg = ping.to_message();
-                    if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
-                        P2PNode::log_event(
-                            "warn",
-                            "net",
-                            format!("P2P {}: ping failed: {}", ping_addr, e),
-                        );
+                    if !send_message_or_disconnect(
+                        &ping_writer,
+                        msg,
+                        ping_addr,
+                        &ping_peers_vec,
+                        &ping_connected_vec,
+                    )
+                    .await
+                    {
+                        if let Some(tx) = shutdown_tx_to_reader.take() {
+                            let _ = tx.send(());
+                        }
                         break;
                     }
                     last_ping = Instant::now();
@@ -2111,7 +2201,17 @@ impl P2PNode {
                         capabilities: local_capabilities(),
                     };
                     if let Ok(msg) = payload.to_message() {
-                        let _ = send_message(&ping_writer, msg, ping_addr).await;
+                        if !send_message_or_disconnect(
+                            &ping_writer,
+                            msg,
+                            ping_addr,
+                            &ping_peers_vec,
+                            &ping_connected_vec,
+                        )
+                        .await
+                        {
+                            break;
+                        }
                     }
                     last_height = current_height;
                     last_handshake = Instant::now();
@@ -2143,7 +2243,17 @@ impl P2PNode {
                         };
                         if let Some(payload) = challenge {
                             let msg = payload.to_message();
-                            let _ = send_message(&ping_writer, msg, ping_addr).await;
+                            if !send_message_or_disconnect(
+                                &ping_writer,
+                                msg,
+                                ping_addr,
+                                &ping_peers_vec,
+                                &ping_connected_vec,
+                            )
+                            .await
+                            {
+                                break;
+                            }
                         }
                     }
                 }
@@ -2204,12 +2314,23 @@ impl P2PNode {
                                 count: MAX_HEADERS_PER_REQUEST,
                             };
                             if let Ok(msg) = get_headers.to_message() {
-                                let _ = send_message(&ping_writer, msg, ping_addr).await;
+                                if !send_message_or_disconnect(
+                                    &ping_writer,
+                                    msg,
+                                    ping_addr,
+                                    &ping_peers_vec,
+                                    &ping_connected_vec,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
                             }
                             {
                                 let mut state = ping_peer_state.lock().await;
                                 state.last_headers_request = Some(Instant::now());
                                 state.last_headers_start = Some([0u8; 32]);
+                                state.headers_inflight = true;
                             }
                             stalled_heartbeats = 0;
                             recovery_in_progress = true;
@@ -2259,9 +2380,13 @@ impl P2PNode {
             let mut last_handshake_agent: Option<String> = None;
             let mut bulk_count: u32 = 0;
             loop {
-                let msg = match read_message_with_timeout(&mut reader, P2PNode::peer_timeout())
-                    .await
-                {
+                let msg = tokio::select! {
+                    _ = &mut shutdown_rx_to_reader => {
+                        break;
+                    }
+                    res = read_message_with_timeout(&mut reader, P2PNode::peer_timeout()) => res,
+                };
+                let msg = match msg {
                     Ok(msg) => msg,
                     Err(e) => {
                         Self::log_err(format!("P2P outbound {}: closing read loop: {}", addr, e));
@@ -2361,7 +2486,7 @@ impl P2PNode {
                                         count: MAX_HEADERS_PER_REQUEST,
                                     };
                                     if let Ok(msg) = get_headers.to_message() {
-                                        let _ = send_message(&writer, msg, addr).await;
+                                        send_message_detached(&writer, msg, addr);
                                     }
                                 } else {
                                     P2PNode::log_event(
@@ -2428,12 +2553,12 @@ impl P2PNode {
                                     address: relay,
                                 };
                                 if let Ok(msg) = relay_msg.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
+                                    send_message_detached(&writer, msg, addr);
                                 }
                             }
                             // Ask for peers to grow the mesh.
                             if let Ok(msg) = EmptyPayload::to_message(MessageType::GetPeers) {
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                                 maybe_request_sync(
                                     &writer,
                                     addr,
@@ -2547,12 +2672,13 @@ impl P2PNode {
                                         addr, payload.height, local_height, short
                                     ));
                                     if let Ok(msg) = get_headers.to_message() {
-                                        let _ = send_message(&writer, msg, addr).await;
+                                        send_message_detached(&writer, msg, addr);
                                     }
                                     {
                                         let mut state = peer_state.lock().await;
                                         state.last_headers_request = Some(Instant::now());
                                         state.last_headers_start = Some(start_hash);
+                                        state.headers_inflight = true;
                                     }
                                 }
                             } else if payload.height < local_height {
@@ -2578,11 +2704,11 @@ impl P2PNode {
                                             headers: headers_bytes,
                                         }
                                         .to_message();
-                                        let _ = send_message(&writer, msg, addr).await;
+                                        send_message_detached(&writer, msg, addr);
                                     }
                                 }
                                 if !tip_mismatch {
-                                    let fallback_writer = writer.clone();
+                                    let fallback_writer = Arc::downgrade(&writer);
                                     let fallback_chain = chain_for_sync.clone();
                                     let fallback_seen = getblocks_seen.clone();
                                     let fallback_addr = addr;
@@ -2626,6 +2752,10 @@ impl P2PNode {
                                         if blocks.is_empty() {
                                             return;
                                         }
+                                        let Some(fallback_writer) = fallback_writer.upgrade()
+                                        else {
+                                            return;
+                                        };
                                         let end_h = start_height + blocks.len() as u64 - 1;
                                         P2PNode::log_event(
                                                 "info",
@@ -2720,7 +2850,7 @@ impl P2PNode {
                             }
                         };
                         if let Ok(resp) = peers_payload.to_message() {
-                            let _ = send_message(&writer, resp, addr).await;
+                            send_message_detached(&writer, resp, addr);
                         }
                     }
                     MessageType::Peers => {
@@ -2770,7 +2900,7 @@ impl P2PNode {
                                     headers: headers_bytes,
                                 }
                                 .to_message();
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                             }
                         }
                     }
@@ -2779,65 +2909,99 @@ impl P2PNode {
                             if let Ok(payload) = HeadersPayload::from_message(&msg) {
                                 {
                                     let mut state = peer_state.lock().await;
-                                    state.last_headers_received = Some(Instant::now());
+                                    let now = Instant::now();
+                                    let inflight_recent = state.headers_inflight
+                                        && state
+                                            .last_headers_request
+                                            .map(|ts| now.duration_since(ts) <= headers_response_window())
+                                            .unwrap_or(false);
+                                    if !inflight_recent {
+                                        state.unsolicited_headers = state.unsolicited_headers.saturating_add(1);
+                                        let should_log = state
+                                            .last_unsolicited_log
+                                            .map(|t| now.duration_since(t) > Duration::from_secs(30))
+                                            .unwrap_or(true);
+                                        if should_log {
+                                            state.last_unsolicited_log = Some(now);
+                                            P2PNode::log_event(
+                                                "warn",
+                                                "sync",
+                                                format!("P2P {}: unsolicited headers ignored", addr),
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    if state.headers_processing {
+                                        // Prevent concurrent header batch processing for the same peer.
+                                        state.unsolicited_headers = state.unsolicited_headers.saturating_add(1);
+                                        continue;
+                                    }
+                                    state.headers_processing = true;
+                                    state.headers_inflight = false;
                                 }
                                 let header_count = (payload.headers.len() / 80) as u32;
-                                let mut offset = 0usize;
-                                let mut last_header_hash: Option<[u8; 32]> = None;
-                                let mut header_error = false;
-                                let mut unknown_parent = false;
-                                let mut reset_headers = false;
-                                let mut added_any = false;
+                                let header_bytes = payload.headers.clone();
+                                let chain_arc2 = chain_arc.clone();
+                                let peer_height_hint = last_handshake_height;
 
-                                while offset + 80 <= payload.headers.len() {
-                                    let slice = &payload.headers[offset..offset + 80];
-                                    let (header, used) =
-                                        match crate::block::BlockHeader::deserialize(slice) {
-                                            Ok(v) => v,
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "Failed to parse header from {}: {}",
-                                                    addr, e
-                                                );
-                                                break;
-                                            }
-                                        };
-                                    offset += used;
-                                    last_header_hash = Some(header.hash());
+                                let (last_header_hash, header_error, unknown_parent, reset_headers, added_any) =
+                                    match spawn_blocking_limited(move || {
+                                        let mut offset = 0usize;
+                                        let mut last_header_hash: Option<[u8; 32]> = None;
+                                        let mut header_error = false;
+                                        let mut unknown_parent = false;
+                                        let mut reset_headers = false;
+                                        let mut added_any = false;
 
-                                    let header_hash = header.hash();
-                                    {
-                                        let mut guard =
-                                            chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                        if header.prev_hash == [0u8; 32] {
-                                            let genesis_hash =
-                                                guard.params.genesis_block.header.hash();
-                                            if header_hash == genesis_hash {
-                                                continue;
-                                            }
-                                        }
-                                        let already_known =
-                                            guard.headers.contains_key(&header_hash)
-                                                || guard.block_store.contains_key(&header_hash);
-                                        if let Err(e) = guard.add_header(header.clone()) {
-                                            header_error = true;
-                                            if e.contains("unknown parent") {
-                                                unknown_parent = true;
-                                                if let Some(peer_height) = last_handshake_height {
-                                                    let local_height = guard.tip_height();
-                                                    if peer_height > local_height {
-                                                        reset_headers = true;
-                                                    }
+                                        let mut guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
+
+                                        while offset + 80 <= header_bytes.len() {
+                                            let slice = &header_bytes[offset..offset + 80];
+                                            let (header, used) = match crate::block::BlockHeader::deserialize(slice) {
+                                                Ok(v) => v,
+                                                Err(_) => {
+                                                    header_error = true;
+                                                    break;
+                                                }
+                                            };
+                                            offset += used;
+                                            last_header_hash = Some(header.hash());
+
+                                            let header_hash = header.hash();
+                                            if header.prev_hash == [0u8; 32] {
+                                                let genesis_hash = guard.params.genesis_block.header.hash();
+                                                if header_hash == genesis_hash {
+                                                    continue;
                                                 }
                                             }
-                                            eprintln!("Header from {} rejected: {}", addr, e);
-                                            break;
+
+                                            let already_known = guard.headers.contains_key(&header_hash)
+                                                || guard.block_store.contains_key(&header_hash);
+                                            if let Err(e) = guard.add_header(header.clone()) {
+                                                header_error = true;
+                                                if e.contains("unknown parent") {
+                                                    unknown_parent = true;
+                                                    if let Some(peer_height) = peer_height_hint {
+                                                        let local_height = guard.tip_height();
+                                                        if peer_height > local_height {
+                                                            reset_headers = true;
+                                                        }
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                            if !already_known {
+                                                added_any = true;
+                                            }
                                         }
-                                        if !already_known {
-                                            added_any = true;
-                                        }
-                                    }
-                                }
+
+                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any)
+                                    })
+                                    .await
+                                    {
+                                        Ok(v) => v,
+                                        Err(_) => (None, true, false, false, false),
+                                    };
 
                                 if header_count > 0 {
                                     let last_short = last_header_hash
@@ -2873,8 +3037,19 @@ impl P2PNode {
                                             count: MAX_HEADERS_PER_REQUEST,
                                         };
                                         if let Ok(msg) = get_headers.to_message() {
-                                            let _ = send_message(&writer, msg, addr).await;
+                                            send_message_detached(&writer, msg, addr);
                                         }
+                                        {
+                                            let mut state = peer_state.lock().await;
+                                            state.last_headers_request = Some(Instant::now());
+                                            state.last_headers_start = Some([0u8; 32]);
+                                            state.headers_inflight = true;
+                                        }
+                                    }
+                                    {
+                                        let mut state = peer_state.lock().await;
+                                        state.last_headers_received = Some(Instant::now());
+                                        state.headers_processing = false;
                                     }
                                     continue;
                                 }
@@ -2897,19 +3072,33 @@ impl P2PNode {
                                             count: MAX_HEADERS_PER_REQUEST,
                                         };
                                         if let Ok(msg) = get_headers.to_message() {
-                                            let _ = send_message(&writer, msg, addr).await;
+                                            send_message_detached(&writer, msg, addr);
                                         }
+                                        let mut state = peer_state.lock().await;
+                                        state.last_headers_request = Some(Instant::now());
+                                        state.last_headers_start = Some([0u8; 32]);
+                                        state.headers_inflight = true;
+                                    }
+                                    {
+                                        let mut state = peer_state.lock().await;
+                                        state.headers_processing = false;
                                     }
                                     continue;
                                 }
-                                if header_count >= MAX_HEADERS_PER_REQUEST {
+                                if header_count >= MAX_HEADERS_PER_REQUEST && peer_height > local_height {
                                     if let Some(last_hash) = last_header_hash {
                                         let get_headers = GetHeadersPayload {
                                             start_hash: last_hash.to_vec(),
                                             count: MAX_HEADERS_PER_REQUEST,
                                         };
                                         if let Ok(msg) = get_headers.to_message() {
-                                            let _ = send_message(&writer, msg, addr).await;
+                                            send_message_detached(&writer, msg, addr);
+                                        }
+                                        {
+                                            let mut state = peer_state.lock().await;
+                                            state.last_headers_request = Some(Instant::now());
+                                            state.last_headers_start = Some(last_hash);
+                                            state.headers_inflight = true;
                                         }
                                     }
                                 }
@@ -2975,38 +3164,62 @@ impl P2PNode {
                                     .await
                                     {
                                         if let Ok(msg) = get_blocks.to_message() {
-                                            let _ = send_message(&writer, msg, addr).await;
+                                            send_message_detached(&writer, msg, addr);
                                         }
                                     }
                                 }
+                                {
+                                    let mut state = peer_state.lock().await;
+                                    state.last_headers_received = Some(Instant::now());
+                                    state.headers_processing = false;
+                                }
+
                             }
                         }
                     }
                     MessageType::GetBlocks => {
-                        {
-                            let mut guard = getblocks_seen.lock().await;
-                            guard.insert(addr.ip(), Instant::now());
-                        }
-                        if let Some(ref chain_arc) = chain_for_sync {
-                            if let Ok(payload) = GetBlocksPayload::from_message(&msg) {
+                        if let Ok(payload) = GetBlocksPayload::from_message(&msg) {
+                            let writer_weak = Arc::downgrade(&writer);
+                            let chain_for_task = chain_for_sync.clone();
+                            let addr2 = addr;
+                            let getblocks_seen2 = getblocks_seen.clone();
+                            let getblocks_last2 = getblocks_last.clone();
+                            let getblocks_genesis2 = getblocks_genesis.clone();
+                            let send_blocks_log2 = send_blocks_log.clone();
+
+                            tokio::spawn(async move {
+                                {
+                                    let mut guard = getblocks_seen2.lock().await;
+                                    guard.insert(addr2.ip(), Instant::now());
+                                }
+
+                                let Some(chain_arc) = chain_for_task else {
+                                    return;
+                                };
+
                                 if !getblocks_request_allowed(
-                                    &getblocks_last,
-                                    addr.ip(),
+                                    &getblocks_last2,
+                                    addr2.ip(),
                                     &payload.start_hash,
                                     payload.count,
                                 )
                                 .await
                                 {
-                                    continue;
+                                    return;
                                 }
+
                                 let is_zero = payload.start_hash.iter().all(|b| *b == 0);
-                                let (start_idx, matched_pos) = {
+                                let start_hash = payload.start_hash.clone();
+                                let want = payload.count;
+
+                                let (matched_pos, blocks, start_height) = match spawn_blocking_limited(move || {
                                     let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+
                                     let mut start_idx = 0usize;
                                     let mut matched_pos = None;
-                                    if payload.start_hash.len() == 32 {
+                                    if start_hash.len() == 32 {
                                         let mut target = [0u8; 32];
-                                        target.copy_from_slice(&payload.start_hash);
+                                        target.copy_from_slice(&start_hash);
                                         if let Some(pos) = guard
                                             .chain
                                             .iter()
@@ -3016,66 +3229,81 @@ impl P2PNode {
                                             matched_pos = Some(pos);
                                         }
                                     }
-                                    (start_idx, matched_pos)
-                                };
-                                let genesis_locator = is_zero || matches!(matched_pos, Some(0));
-                                if genesis_locator
-                                    && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await
-                                {
-                                    continue;
-                                }
-                                if matched_pos.is_none() && !is_zero {
-                                    // Unknown locator: do not spam-send genesis blocks; it wastes bandwidth and CPU.
-                                    P2PNode::log_event(
-                                        "warn",
-                                        "sync",
-                                        format!(
-                                            "P2P {}: ignoring getblocks unknown start hash {}",
-                                            addr,
-                                            hex::encode(&payload.start_hash)
-                                        ),
-                                    );
-                                    continue;
-                                }
-                                let (blocks, start_height) = {
-                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+
+                                    if matched_pos.is_none() && !is_zero {
+                                        return (matched_pos, Vec::new(), 0u64);
+                                    }
+
                                     let mut blocks = Vec::new();
                                     let mut heights = Vec::new();
-                                    let count = payload.count.min(MAX_BLOCKS_PER_REQUEST) as usize;
-                                    for (idx, b) in
-                                        guard.chain.iter().enumerate().skip(start_idx).take(count)
+                                    let count = want.min(MAX_BLOCKS_PER_REQUEST) as usize;
+                                    for (idx, b) in guard
+                                        .chain
+                                        .iter()
+                                        .enumerate()
+                                        .skip(start_idx)
+                                        .take(count)
                                     {
                                         blocks.push(b.serialize());
                                         heights.push(idx as u64);
                                     }
                                     let start_h: u64 = heights.first().copied().unwrap_or(0);
-                                    (blocks, start_h)
+                                    (matched_pos, blocks, start_h)
+                                }).await {
+                                    Ok(v) => v,
+                                    Err(_) => return,
                                 };
+
+                                let genesis_locator = is_zero || matches!(matched_pos, Some(0));
+                                if genesis_locator
+                                    && !genesis_request_allowed(&getblocks_genesis2, addr2.ip()).await
+                                {
+                                    return;
+                                }
+
+                                if matched_pos.is_none() && !is_zero {
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: ignoring getblocks unknown start hash {}",
+                                            addr2,
+                                            hex::encode(&payload.start_hash)
+                                        ),
+                                    );
+                                    return;
+                                }
+
                                 if !blocks.is_empty() {
                                     let end_h = start_height + blocks.len() as u64 - 1;
                                     if ip_log_allowed(
-                                        &send_blocks_log,
-                                        addr.ip(),
+                                        &send_blocks_log2,
+                                        addr2.ip(),
                                         Duration::from_secs(send_blocks_log_cooldown_secs()),
                                     )
                                     .await
                                     {
                                         P2PNode::log(format!(
                                             "P2P {}: sending {} blocks [{}-{}]",
-                                            addr,
+                                            addr2,
                                             blocks.len(),
                                             start_height,
                                             end_h
                                         ));
                                     }
                                 }
+
                                 for block_data in blocks {
+                                    let Some(writer) = writer_weak.upgrade() else {
+                                        break;
+                                    };
                                     let msg = BlockPayload { block_data }.to_message();
-                                    let _ = send_message(&writer, msg, addr).await;
+                                    let _ = send_message(&writer, msg, addr2).await;
                                 }
-                            }
+                            });
                         }
                     }
+
                     MessageType::Block => {
                         if let Some(ref chain_arc) = chain_for_sync {
                             if let Ok(payload) = BlockPayload::from_message(&msg) {
@@ -3084,87 +3312,88 @@ impl P2PNode {
                                         let bhash = block.header.hash();
                                         let short = hex::encode(bhash);
                                         let short = short.get(0..12).unwrap_or(&short);
-                                        let (
-                                            new_height_opt,
-                                            record_verdict,
-                                            persist_blocks,
-                                            orphan_prev,
-                                        ) = {
-                                            let mut guard =
-                                                chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                            let mut new_height_opt = None;
-                                            let mut record_verdict = None;
-                                            let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
-                                            let mut orphan_prev = None;
-                                            match guard.process_block(block.clone()) {
-                                                Ok((new_height, _tip)) => {
-                                                    P2PNode::log(format!(
-                                                        "P2P {}: accepted block height {} hash {}",
-                                                        addr,
-                                                        new_height.saturating_sub(1),
-                                                        short
-                                                    ));
-                                                    if let Some(ref mem) = mempool_for_sync {
-                                                        let mut mem_guard = mem
-                                                            .lock()
-                                                            .unwrap_or_else(|e| e.into_inner());
-                                                        for tx in block.transactions.iter().skip(1)
-                                                        {
-                                                            mem_guard.remove(&tx.txid());
+                                        let chain_arc2 = chain_arc.clone();
+                                        let mempool2 = mempool_for_sync.clone();
+                                        let addr2 = addr;
+                                        let short2 = short.to_string();
+                                        let bhash2 = bhash;
+                                        let block2 = block.clone();
+
+                                        let (new_height_opt, record_verdict, persist_blocks, orphan_prev) =
+                                            match spawn_blocking_limited(move || {
+                                                let mut guard =
+                                                    chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
+                                                let mut new_height_opt = None;
+                                                let mut record_verdict = None;
+                                                let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
+                                                let mut orphan_prev = None;
+                                                match guard.process_block(block2.clone()) {
+                                                    Ok((new_height, _tip)) => {
+                                                        P2PNode::log(format!(
+                                                            "P2P {}: accepted block height {} hash {}",
+                                                            addr2,
+                                                            new_height.saturating_sub(1),
+                                                            short2
+                                                        ));
+                                                        if let Some(ref mem) = mempool2 {
+                                                            let mut mem_guard = mem
+                                                                .lock()
+                                                                .unwrap_or_else(|e| e.into_inner());
+                                                            for tx in block2.transactions.iter().skip(1) {
+                                                                mem_guard.remove(&tx.txid());
+                                                            }
                                                         }
-                                                    }
-                                                    new_height_opt = Some(new_height);
-                                                    record_verdict = Some(true);
-                                                    if guard.tip_hash() == bhash {
-                                                        let tip = guard.tip_height();
-                                                        persist_blocks.push((tip, block.clone()));
-                                                        if tip > 0 {
-                                                            if let Some(prev) =
-                                                                guard.chain.get((tip - 1) as usize)
-                                                            {
-                                                                persist_blocks
-                                                                    .push((tip - 1, prev.clone()));
+                                                        new_height_opt = Some(new_height);
+                                                        record_verdict = Some(true);
+                                                        if guard.tip_hash() == bhash2 {
+                                                            let tip = guard.tip_height();
+                                                            persist_blocks.push((tip, block2.clone()));
+                                                            if tip > 0 {
+                                                                if let Some(prev) =
+                                                                    guard.chain.get((tip - 1) as usize)
+                                                                {
+                                                                    persist_blocks.push((tip - 1, prev.clone()));
+                                                                }
                                                             }
                                                         }
                                                     }
-                                                }
-                                                Err(e) => {
-                                                    if e.contains("orphan")
-                                                        || e.contains("prev hash unknown")
-                                                    {
-                                                        orphan_prev = Some(block.header.prev_hash);
-                                                    }
-                                                    if P2PNode::is_soft_block_reject(&e) {
-                                                        if !P2PNode::is_duplicate_block(&e) {
+                                                    Err(e) => {
+                                                        if e.contains("orphan")
+                                                            || e.contains("prev hash unknown")
+                                                        {
+                                                            orphan_prev = Some(block2.header.prev_hash);
+                                                        }
+                                                        if P2PNode::is_soft_block_reject(&e) {
+                                                            if !P2PNode::is_duplicate_block(&e) {
+                                                                P2PNode::log_event(
+                                                                    "info",
+                                                                    "chain",
+                                                                    format!(
+                                                                        "P2P {}: ignored block {} ({})",
+                                                                        addr2, short2, e
+                                                                    ),
+                                                                );
+                                                            }
+                                                        } else {
                                                             P2PNode::log_event(
-                                                                "info",
+                                                                "warn",
                                                                 "chain",
                                                                 format!(
-                                                                    "P2P {}: ignored block {} ({})",
-                                                                    addr, short, e
+                                                                    "P2P {}: rejected block {}: {}",
+                                                                    addr2, short2, e
                                                                 ),
                                                             );
+                                                            record_verdict = Some(false);
                                                         }
-                                                    } else {
-                                                        P2PNode::log_event(
-                                                            "warn",
-                                                            "chain",
-                                                            format!(
-                                                                "P2P {}: rejected block {}: {}",
-                                                                addr, short, e
-                                                            ),
-                                                        );
-                                                        record_verdict = Some(false);
                                                     }
                                                 }
-                                            }
-                                            (
-                                                new_height_opt,
-                                                record_verdict,
-                                                persist_blocks,
-                                                orphan_prev,
-                                            )
-                                        };
+                                                (new_height_opt, record_verdict, persist_blocks, orphan_prev)
+                                            })
+                                            .await
+                                            {
+                                                Ok(v) => v,
+                                                Err(_) => (None, None, Vec::new(), None),
+                                            };
                                         for (height, b) in persist_blocks {
                                             if let Err(e) = storage::write_block_json(height, &b) {
                                                 P2PNode::log_event(
@@ -3309,10 +3538,40 @@ impl P2PNode {
                                         };
 
                                         if let Some(inv_bytes) = inv_bytes {
-                                            let mut peers_guard = peers_vec.lock().await;
-                                            for socket in peers_guard.iter_mut() {
-                                                let _ =
-                                                    socket.lock().await.write_all(&inv_bytes).await;
+                                            // Never hold the peers lock while awaiting I/O.
+                                            let peers_snapshot = {
+                                                let guard = peers_vec.lock().await;
+                                                guard.clone()
+                                            };
+                                            let mut dead: Vec<Arc<Mutex<OwnedWriteHalf>>> =
+                                                Vec::new();
+                                            for socket in peers_snapshot.iter() {
+                                                let write_fut = async {
+                                                    let mut w = socket.lock().await;
+                                                    w.write_all(&inv_bytes).await
+                                                };
+                                                match tokio::time::timeout(
+                                                    Duration::from_secs(2),
+                                                    write_fut,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(Ok(())) => {}
+                                                    Ok(Err(_)) | Err(_) => {
+                                                        // Drop noisy/stuck peers from the broadcast set.
+                                                        {
+                                                            let mut w = socket.lock().await;
+                                                            let _ = w.shutdown().await;
+                                                        }
+                                                        dead.push(socket.clone());
+                                                    }
+                                                }
+                                            }
+                                            if !dead.is_empty() {
+                                                let mut guard = peers_vec.lock().await;
+                                                guard.retain(|p| {
+                                                    !dead.iter().any(|d| Arc::ptr_eq(p, d))
+                                                });
                                             }
                                         }
                                     }
@@ -3344,7 +3603,7 @@ impl P2PNode {
                                 if !needed.is_empty() {
                                     let gd = GetDataPayload { txids: needed };
                                     if let Ok(msg) = gd.to_message() {
-                                        let _ = send_message(&writer, msg, addr).await;
+                                        send_message_detached(&writer, msg, addr);
                                     }
                                 }
                             }
@@ -3371,7 +3630,7 @@ impl P2PNode {
                                     }
                                 }
                                 for msg in responses {
-                                    let _ = send_message(&writer, msg, addr).await;
+                                    send_message_detached(&writer, msg, addr);
                                 }
                             }
                         }
@@ -3384,10 +3643,10 @@ impl P2PNode {
                             };
                             let payload = MempoolPayload { tx_hashes };
                             if let Ok(msg) = payload.to_message() {
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                             }
                         } else if let Ok(msg) = EmptyPayload::to_message(MessageType::Mempool) {
-                            let _ = send_message(&writer, msg, addr).await;
+                            send_message_detached(&writer, msg, addr);
                         }
                     }
                     MessageType::RelayAddress => {
@@ -3421,6 +3680,7 @@ impl P2PNode {
                     _ => {}
                 }
             }
+            let _ = shutdown_tx_to_ping.send(());
             {
                 let mut w = writer_for_drop.lock().await;
                 let _ = w.shutdown().await;
@@ -3492,18 +3752,103 @@ where
     }
 }
 
+fn peer_write_timeout() -> Duration {
+    let ms = std::env::var("IRIUM_P2P_WRITE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2000);
+    Duration::from_millis(ms.clamp(200, 10_000))
+}
+
 async fn send_message(
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     msg: Message,
     peer: SocketAddr,
 ) -> Result<(), String> {
     let bytes = msg.serialize();
-    writer
-        .lock()
-        .await
-        .write_all(&bytes)
-        .await
-        .map_err(|e| format!("failed to send to {}: {}", peer, e))
+    let write_fut = async {
+        let mut w = writer.lock().await;
+        w.write_all(&bytes).await
+    };
+    match tokio::time::timeout(peer_write_timeout(), write_fut).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("failed to send to {}: {}", peer, e)),
+        Err(_) => Err(format!("failed to send to {}: write timeout", peer)),
+    }
+}
+
+
+fn send_message_detached(writer: &Arc<Mutex<OwnedWriteHalf>>, msg: Message, peer: SocketAddr) {
+    let writer_weak = Arc::downgrade(writer);
+    tokio::spawn(async move {
+        let Some(writer) = writer_weak.upgrade() else {
+            return;
+        };
+        let _ = send_message(&writer, msg, peer).await;
+    });
+}
+
+async fn send_message_or_disconnect(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    msg: Message,
+    peer: SocketAddr,
+    peers: &Arc<Mutex<Vec<Arc<Mutex<OwnedWriteHalf>>>>>,
+    connected: &Arc<Mutex<HashSet<SocketAddr>>>,
+) -> bool {
+    match send_message(writer, msg, peer).await {
+        Ok(()) => true,
+        Err(e) => {
+            P2PNode::log_event(
+                "warn",
+                "p2p",
+                format!("P2P {}: send failed, dropping peer: {}", peer, e),
+            );
+            {
+                let mut w = writer.lock().await;
+                let _ = w.shutdown().await;
+            }
+            {
+                let mut guard = peers.lock().await;
+                guard.retain(|p| !Arc::ptr_eq(p, writer));
+            }
+            {
+                let mut guard = connected.lock().await;
+                guard.remove(&peer);
+            }
+            false
+        }
+    }
+}
+
+async fn broadcast_raw(peers: &Arc<Mutex<Vec<Arc<Mutex<OwnedWriteHalf>>>>>, bytes: &[u8]) -> usize {
+    // Never hold the peers lock while awaiting I/O.
+    let peers_snapshot = {
+        let guard = peers.lock().await;
+        guard.clone()
+    };
+    let mut dead: Vec<Arc<Mutex<OwnedWriteHalf>>> = Vec::new();
+    let mut ok: usize = 0;
+    for socket in peers_snapshot.iter() {
+        let write_fut = async {
+            let mut w = socket.lock().await;
+            w.write_all(bytes).await
+        };
+        match tokio::time::timeout(peer_write_timeout(), write_fut).await {
+            Ok(Ok(())) => ok += 1,
+            Ok(Err(_)) | Err(_) => {
+                {
+                    let mut w = socket.lock().await;
+                    let _ = w.shutdown().await;
+                }
+                dead.push(socket.clone());
+            }
+        }
+    }
+    if !dead.is_empty() {
+        let mut guard = peers.lock().await;
+        guard.retain(|p| !dead.iter().any(|d| Arc::ptr_eq(p, d)));
+    }
+    ok
 }
 
 fn local_height(chain: &Option<Arc<StdMutex<ChainState>>>) -> u64 {
@@ -3540,6 +3885,20 @@ async fn handle_incoming_with_sybil(
 ) -> Result<(), String> {
     let local_node_id = hex::encode(&node_id);
     let local_node_id_bytes = node_id.clone();
+    let _handshake_permit = if trusted_seed {
+        inbound_handshake_sem()
+            .acquire_owned()
+            .await
+            .map_err(|_| "inbound handshake semaphore closed".to_string())?
+    } else {
+        match inbound_handshake_sem().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let _ = socket.shutdown().await;
+                return Err("inbound handshake overloaded".to_string());
+            }
+        }
+    };
     // Issue a fresh challenge with adaptive difficulty.
     let base = P2PNode::sybil_difficulty();
     let max = std::env::var("IRIUM_SYBIL_DIFFICULTY_MAX")
@@ -3590,7 +3949,11 @@ async fn handle_incoming_with_sybil(
     }
     let proof = SybilProof::from_bytes(&proof_msg.payload)
         .ok_or_else(|| "invalid sybil proof payload".to_string())?;
-    if !handshake.verify_proof(&proof) {
+    let peer_pubkey = proof.peer_pubkey.clone();
+    let proof_ok = tokio::task::spawn_blocking(move || handshake.verify_proof(&proof))
+        .await
+        .map_err(|e| format!("failed to join sybil verifier: {}", e))?;
+    if !proof_ok {
         {
             let mut rep = reputation.lock().await;
             rep.record_failure(&addr.to_string());
@@ -3615,7 +3978,9 @@ async fn handle_incoming_with_sybil(
     }
 
     let peer_state = Arc::new(Mutex::new(PeerSyncState::default()));
-    let ping_writer = writer.clone();
+    let (shutdown_tx_to_ping, mut shutdown_rx_to_ping) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx_to_reader, mut shutdown_rx_to_reader) = tokio::sync::oneshot::channel::<()>();
+    let ping_writer_weak = Arc::downgrade(&writer);
     let ping_addr = addr;
     let ping_chain = chain.clone();
     let ping_agent = agent.clone();
@@ -3625,24 +3990,42 @@ async fn handle_incoming_with_sybil(
     let ping_peer_state = peer_state.clone();
     let ping_sync_requests = sync_requests.clone();
     let ping_block_requests = block_requests.clone();
+    let ping_peers_vec = peers.clone();
+    let ping_connected_vec = connected.clone();
     tokio::spawn(async move {
+        let mut shutdown_tx_to_reader = Some(shutdown_tx_to_reader);
         let ping_interval = P2PNode::ping_interval();
         let sync_tick = sync_tick_interval();
         let mut last_ping = Instant::now();
         let mut last_height = crate::p2p::local_height(&ping_chain);
         let mut last_handshake = Instant::now();
         loop {
-            tokio::time::sleep(sync_tick).await;
+            tokio::select! {
+                _ = tokio::time::sleep(sync_tick) => {}
+                _ = &mut shutdown_rx_to_ping => {
+                    break;
+                }
+            }
+            let ping_writer = match ping_writer_weak.upgrade() {
+                Some(w) => w,
+                None => break,
+            };
             if last_ping.elapsed() >= ping_interval {
                 let nonce = rand_core::OsRng.next_u64();
                 let ping = PingPayload { nonce };
                 let msg = ping.to_message();
-                if let Err(e) = send_message(&ping_writer, msg, ping_addr).await {
-                    P2PNode::log_event(
-                        "warn",
-                        "net",
-                        format!("P2P {}: ping failed: {}", ping_addr, e),
-                    );
+                if !send_message_or_disconnect(
+                    &ping_writer,
+                    msg,
+                    ping_addr,
+                    &ping_peers_vec,
+                    &ping_connected_vec,
+                )
+                .await
+                {
+                    if let Some(tx) = shutdown_tx_to_reader.take() {
+                        let _ = tx.send(());
+                    }
                     break;
                 }
                 last_ping = Instant::now();
@@ -3697,7 +4080,17 @@ async fn handle_incoming_with_sybil(
                     };
                     if let Some(payload) = challenge {
                         let msg = payload.to_message();
-                        let _ = send_message(&ping_writer, msg, ping_addr).await;
+                        if !send_message_or_disconnect(
+                            &ping_writer,
+                            msg,
+                            ping_addr,
+                            &ping_peers_vec,
+                            &ping_connected_vec,
+                        )
+                        .await
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -3725,7 +4118,7 @@ async fn handle_incoming_with_sybil(
     {
         let mut dir = directory.lock().await;
         let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
-        let node_id = hex::encode(&proof.peer_pubkey);
+        let node_id = hex::encode(&peer_pubkey);
         dir.register_connection(multiaddr.clone(), None, None, Some(node_id));
     }
 
@@ -3746,7 +4139,7 @@ async fn handle_incoming_with_sybil(
         capabilities: local_capabilities(),
     };
     if let Ok(msg) = payload.to_message() {
-        let _ = send_message(&writer, msg, addr).await;
+        send_message_detached(&writer, msg, addr);
     }
 
     let mut msg_count: u32 = 0;
@@ -3755,7 +4148,11 @@ async fn handle_incoming_with_sybil(
     // Process messages from the peer.
     let mut bulk_count: u32 = 0;
     loop {
-        let msg = match read_message_with_timeout(&mut reader, P2PNode::peer_timeout()).await {
+        let msg = tokio::select! {
+            _ = &mut shutdown_rx_to_reader => { break; }
+            res = read_message_with_timeout(&mut reader, P2PNode::peer_timeout()) => res,
+        };
+        let msg = match msg {
             Ok(m) => m,
             Err(e) => {
                 P2PNode::log_event(
@@ -3851,7 +4248,7 @@ async fn handle_incoming_with_sybil(
                                 count: MAX_HEADERS_PER_REQUEST,
                             };
                             if let Ok(msg) = get_headers.to_message() {
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                             }
                         } else {
                             P2PNode::log_event(
@@ -3925,7 +4322,7 @@ async fn handle_incoming_with_sybil(
                     }
                     // Ask peer for its view of the network.
                     if let Ok(msg) = EmptyPayload::to_message(MessageType::GetPeers) {
-                        let _ = send_message(&writer, msg, addr).await;
+                        send_message_detached(&writer, msg, addr);
                         maybe_request_sync(
                             &writer,
                             addr,
@@ -4035,12 +4432,13 @@ async fn handle_incoming_with_sybil(
                                 ),
                             );
                             if let Ok(msg) = get_headers.to_message() {
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                             }
                             {
                                 let mut state = peer_state.lock().await;
                                 state.last_headers_request = Some(Instant::now());
                                 state.last_headers_start = Some(start_hash);
+                                state.headers_inflight = true;
                             }
                         }
                     } else if payload.height < local_height {
@@ -4065,11 +4463,11 @@ async fn handle_incoming_with_sybil(
                                     headers: headers_bytes,
                                 }
                                 .to_message();
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                             }
                         }
                         if !tip_mismatch {
-                            let fallback_writer = writer.clone();
+                            let fallback_writer = Arc::downgrade(&writer);
                             let fallback_chain = chain.clone();
                             let fallback_seen = getblocks_seen.clone();
                             let fallback_addr = addr;
@@ -4111,6 +4509,9 @@ async fn handle_incoming_with_sybil(
                                 if blocks.is_empty() {
                                     return;
                                 }
+                                let Some(fallback_writer) = fallback_writer.upgrade() else {
+                                    return;
+                                };
                                 let end_h = start_height + blocks.len() as u64 - 1;
                                 P2PNode::log_event(
                                     "info",
@@ -4206,7 +4607,7 @@ async fn handle_incoming_with_sybil(
                     }
                 };
                 if let Ok(resp) = peers_payload.to_message() {
-                    let _ = send_message(&writer, resp, addr).await;
+                    send_message_detached(&writer, resp, addr);
                 }
             }
             MessageType::Peers => {
@@ -4217,43 +4618,58 @@ async fn handle_incoming_with_sybil(
                     }
                 }
             }
+
             MessageType::GetHeaders => {
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = GetHeadersPayload::from_message(&msg) {
-                        let headers_bytes = {
-                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                        let chain_arc2 = chain_arc.clone();
+                        let writer_weak = Arc::downgrade(&writer);
+                        let addr2 = addr;
 
-                            let mut start_idx = if guard.chain.len() > 1 { 1 } else { 0 };
-                            let mut start_hash_non_zero = false;
-                            let mut start_found = false;
-                            if payload.start_hash.len() == 32 {
-                                let mut target = [0u8; 32];
-                                target.copy_from_slice(&payload.start_hash);
-                                start_hash_non_zero = target.iter().any(|b| *b != 0);
-                                if start_hash_non_zero {
-                                    if let Some(pos) =
-                                        guard.chain.iter().position(|b| b.header.hash() == target)
-                                    {
-                                        start_idx = pos.saturating_add(1);
-                                        start_found = true;
+                        tokio::spawn(async move {
+                            let start_hash = payload.start_hash;
+                            let count = payload.count;
+
+                            let headers_bytes = match spawn_blocking_limited(move || {
+                                let guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
+
+                                let mut start_idx = if guard.chain.len() > 1 { 1 } else { 0 };
+                                let mut start_hash_non_zero = false;
+                                let mut start_found = false;
+                                if start_hash.len() == 32 {
+                                    let mut target = [0u8; 32];
+                                    target.copy_from_slice(&start_hash);
+                                    start_hash_non_zero = target.iter().any(|b| *b != 0);
+                                    if start_hash_non_zero {
+                                        if let Some(pos) = guard
+                                            .chain
+                                            .iter()
+                                            .position(|b| b.header.hash() == target)
+                                        {
+                                            start_idx = pos.saturating_add(1);
+                                            start_found = true;
+                                        }
                                     }
                                 }
-                            }
-                            let count = payload.count.min(MAX_HEADERS_PER_REQUEST) as usize;
-                            let mut bytes = Vec::new();
-                            if !start_hash_non_zero || start_found {
-                                for block in guard.chain.iter().skip(start_idx).take(count) {
-                                    bytes.extend_from_slice(&block.header.serialize());
+                                let count = count.min(MAX_HEADERS_PER_REQUEST) as usize;
+                                let mut bytes = Vec::new();
+                                if !start_hash_non_zero || start_found {
+                                    for block in guard.chain.iter().skip(start_idx).take(count) {
+                                        bytes.extend_from_slice(&block.header.serialize());
+                                    }
                                 }
-                            }
-                            bytes
-                        };
+                                bytes
+                            })
+                            .await {
+                                Ok(v) => v,
+                                Err(_) => return,
+                            };
 
-                        let msg = HeadersPayload {
-                            headers: headers_bytes,
-                        }
-                        .to_message();
-                        let _ = send_message(&writer, msg, addr).await;
+                            let msg = HeadersPayload { headers: headers_bytes }.to_message();
+                            if let Some(writer) = writer_weak.upgrade() {
+                                send_message_detached(&writer, msg, addr2);
+                            }
+                        });
                     }
                 }
             }
@@ -4261,135 +4677,256 @@ async fn handle_incoming_with_sybil(
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = HeadersPayload::from_message(&msg) {
                         let header_count = (payload.headers.len() / 80) as u32;
-                        let mut offset = 0usize;
-                        let mut last_header_hash: Option<[u8; 32]> = None;
-                        let mut header_error = false;
-                        let mut unknown_parent = false;
-                        let mut reset_headers = false;
-                        let mut added_any = false;
+                        let header_bytes = payload.headers;
+                        let chain_arc_for_headers = chain_arc.clone();
+                        let chain_arc_for_tip = chain_arc.clone();
+                        let peer_height_hint = last_handshake_height;
+                        let addr2 = addr;
+                        let peer_state2 = peer_state.clone();
+                        let sync_requests2 = sync_requests.clone();
+                        let block_requests2 = block_requests.clone();
+                        let writer_weak = Arc::downgrade(&writer);
 
-                        while offset + 80 <= payload.headers.len() {
-                            let slice = &payload.headers[offset..offset + 80];
-                            let (header, used) = match crate::block::BlockHeader::deserialize(slice)
-                            {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    eprintln!("Failed to parse header from {}: {}", addr, e);
-                                    break;
+                        {
+                            let mut state = peer_state.lock().await;
+                            let now = Instant::now();
+                            let inflight_recent = state.headers_inflight
+                                && state
+                                    .last_headers_request
+                                    .map(|ts| now.duration_since(ts) <= headers_response_window())
+                                    .unwrap_or(false);
+                            if !inflight_recent {
+                                state.unsolicited_headers = state.unsolicited_headers.saturating_add(1);
+                                let should_log = state
+                                    .last_unsolicited_log
+                                    .map(|t| now.duration_since(t) > Duration::from_secs(30))
+                                    .unwrap_or(true);
+                                if should_log {
+                                    state.last_unsolicited_log = Some(now);
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "sync",
+                                        format!("P2P {}: unsolicited headers ignored", addr),
+                                    );
                                 }
-                            };
-                            offset += used;
-                            last_header_hash = Some(header.hash());
-
-                            let header_hash = header.hash();
-                            {
-                                let mut guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                if header.prev_hash == [0u8; 32] {
-                                    let genesis_hash = guard.params.genesis_block.header.hash();
-                                    if header_hash == genesis_hash {
-                                        continue;
-                                    }
-                                }
-                                let already_known = guard.headers.contains_key(&header_hash)
-                                    || guard.block_store.contains_key(&header_hash);
-                                if let Err(e) = guard.add_header(header.clone()) {
-                                    header_error = true;
-                                    if e.contains("unknown parent") {
-                                        unknown_parent = true;
-                                        if let Some(peer_height) = last_handshake_height {
-                                            let local_height = guard.tip_height();
-                                            if peer_height > local_height {
-                                                reset_headers = true;
-                                            }
-                                        }
-                                    }
-                                    eprintln!("Header from {} rejected: {}", addr, e);
-                                    break;
-                                }
-                                if !already_known {
-                                    added_any = true;
-                                }
+                                continue;
                             }
+                            if state.headers_processing {
+                                state.unsolicited_headers = state.unsolicited_headers.saturating_add(1);
+                                continue;
+                            }
+                            state.headers_processing = true;
+                            state.headers_inflight = false;
                         }
 
-                        if header_error {
-                            if unknown_parent && !added_any {
+                        let permit = match inbound_bulk_queue().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
                                 P2PNode::log_event(
                                     "warn",
                                     "sync",
+                                    format!("P2P {}: inbound headers dropped (busy)", addr),
+                                );
+                                continue;
+                            }
+                        };
+
+                        tokio::spawn(async move {
+                            let _permit = permit;
+
+                            let (last_header_hash, header_error, unknown_parent, reset_headers, added_any) =
+                                match spawn_blocking_limited(move || {
+                                    let mut offset = 0usize;
+                                    let mut last_header_hash: Option<[u8; 32]> = None;
+                                    let mut header_error = false;
+                                    let mut unknown_parent = false;
+                                    let mut reset_headers = false;
+                                    let mut added_any = false;
+
+                                    let mut guard =
+                                        chain_arc_for_headers.lock().unwrap_or_else(|e| e.into_inner());
+
+                                    while offset + 80 <= header_bytes.len() {
+                                        let slice = &header_bytes[offset..offset + 80];
+                                        let (header, used) =
+                                            match crate::block::BlockHeader::deserialize(slice) {
+                                                Ok(v) => v,
+                                                Err(_) => {
+                                                    header_error = true;
+                                                    break;
+                                                }
+                                            };
+                                        offset += used;
+                                        last_header_hash = Some(header.hash());
+
+                                        let header_hash = header.hash();
+                                        if header.prev_hash == [0u8; 32] {
+                                            let genesis_hash =
+                                                guard.params.genesis_block.header.hash();
+                                            if header_hash == genesis_hash {
+                                                continue;
+                                            }
+                                        }
+
+                                        let already_known = guard.headers.contains_key(&header_hash)
+                                            || guard.block_store.contains_key(&header_hash);
+                                        if let Err(e) = guard.add_header(header.clone()) {
+                                            header_error = true;
+                                            if e.contains("unknown parent") {
+                                                unknown_parent = true;
+                                                if let Some(peer_height) = peer_height_hint {
+                                                    let local_height = guard.tip_height();
+                                                    if peer_height > local_height {
+                                                        reset_headers = true;
+                                                    }
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        if !already_known {
+                                            added_any = true;
+                                        }
+                                    }
+
+                                    (last_header_hash, header_error, unknown_parent, reset_headers, added_any)
+                                })
+                                .await
+                                {
+                                    Ok(v) => v,
+                                    Err(_) => (None, true, false, false, false),
+                                };
+
+                            if header_count > 0 {
+                                let last_short = last_header_hash
+                                    .map(|h| {
+                                        let hex = hex::encode(h);
+                                        hex.get(0..12).unwrap_or(&hex).to_string()
+                                    })
+                                    .unwrap_or_else(|| "-".to_string());
+                                P2PNode::log_event(
+                                    "info",
+                                    "sync",
                                     format!(
-                                        "P2P {}: headers do not connect; ignoring peer height",
-                                        addr
+                                        "P2P {}: received {} headers (new={}) last={}",
+                                        addr2, header_count, added_any, last_short
                                     ),
                                 );
-                                let mut state = peer_state.lock().await;
-                                state.height = None;
-                                state.tip = None;
                             }
-                            if reset_headers {
-                                let get_headers = GetHeadersPayload {
-                                    start_hash: vec![0u8; 32],
-                                    count: MAX_HEADERS_PER_REQUEST,
-                                };
-                                if let Ok(msg) = get_headers.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
-                                }
-                            }
-                            continue;
-                        }
-                        let local_height = {
-                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.tip_height()
-                        };
-                        let peer_height = last_handshake_height.unwrap_or(local_height);
-                        if header_count == 0 && peer_height > local_height {
-                            if sync_request_allowed_for(
-                                &sync_requests,
-                                addr.ip(),
-                                local_height,
-                                peer_height,
-                            )
-                            .await
-                            {
-                                let get_headers = GetHeadersPayload {
-                                    start_hash: vec![0u8; 32],
-                                    count: MAX_HEADERS_PER_REQUEST,
-                                };
-                                if let Ok(msg) = get_headers.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
-                                }
-                            }
-                            continue;
-                        }
-                        if header_count >= MAX_HEADERS_PER_REQUEST {
-                            if let Some(last_hash) = last_header_hash {
-                                let get_headers = GetHeadersPayload {
-                                    start_hash: last_hash.to_vec(),
-                                    count: MAX_HEADERS_PER_REQUEST,
-                                };
-                                if let Ok(msg) = get_headers.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
-                                }
-                            }
-                        }
 
-                        let request = {
-                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(best) = guard.best_header_if_better() {
-                                if let Some(path) = guard.header_path_to_known(best.header.hash()) {
-                                    if let Some(first_hash) = path.first() {
-                                        let start_hash = guard
-                                            .headers
-                                            .get(first_hash)
-                                            .map(|hw| hw.header.prev_hash)
-                                            .unwrap_or([0u8; 32]);
-                                        let count = std::cmp::min(
-                                            path.len(),
-                                            MAX_BLOCKS_PER_REQUEST as usize,
-                                        )
-                                            as u32;
-                                        if count > 0 {
-                                            Some((start_hash, count))
+                            if header_error {
+                                if unknown_parent && !added_any {
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: headers do not connect; ignoring peer height",
+                                            addr2
+                                        ),
+                                    );
+                                    let mut state = peer_state2.lock().await;
+                                    state.height = None;
+                                    state.tip = None;
+                                }
+                                if reset_headers {
+                                    let get_headers = GetHeadersPayload {
+                                        start_hash: vec![0u8; 32],
+                                        count: MAX_HEADERS_PER_REQUEST,
+                                    };
+                                    if let Ok(msg) = get_headers.to_message() {
+                                        if let Some(writer) = writer_weak.upgrade() {
+                                            send_message_detached(&writer, msg, addr2);
+                                        }
+                                    }
+                                    {
+                                        let mut state = peer_state2.lock().await;
+                                        state.last_headers_request = Some(Instant::now());
+                                        state.last_headers_start = Some([0u8; 32]);
+                                        state.headers_inflight = true;
+                                    }
+                                }
+                                {
+                                    let mut state = peer_state2.lock().await;
+                                    state.last_headers_received = Some(Instant::now());
+                                    state.headers_processing = false;
+                                }
+                                return;
+                            }
+
+                            let local_height = {
+                                let guard = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
+                                guard.tip_height()
+                            };
+                            let peer_height = last_handshake_height.unwrap_or(local_height);
+
+                            if header_count == 0 && peer_height > local_height {
+                                if sync_request_allowed_for(
+                                    &sync_requests2,
+                                    addr2.ip(),
+                                    local_height,
+                                    peer_height,
+                                )
+                                .await
+                                {
+                                    let get_headers = GetHeadersPayload {
+                                        start_hash: vec![0u8; 32],
+                                        count: MAX_HEADERS_PER_REQUEST,
+                                    };
+                                    if let Ok(msg) = get_headers.to_message() {
+                                        if let Some(writer) = writer_weak.upgrade() {
+                                            send_message_detached(&writer, msg, addr2);
+                                        }
+                                    }
+                                    let mut state = peer_state2.lock().await;
+                                    state.last_headers_request = Some(Instant::now());
+                                    state.last_headers_start = Some([0u8; 32]);
+                                    state.headers_inflight = true;
+                                }
+                                {
+                                    let mut state = peer_state2.lock().await;
+                                    state.headers_processing = false;
+                                }
+                                return;
+                            }
+
+                            if header_count >= MAX_HEADERS_PER_REQUEST && peer_height > local_height {
+                                if let Some(last_hash) = last_header_hash {
+                                    let get_headers = GetHeadersPayload {
+                                        start_hash: last_hash.to_vec(),
+                                        count: MAX_HEADERS_PER_REQUEST,
+                                    };
+                                    if let Ok(msg) = get_headers.to_message() {
+                                        if let Some(writer) = writer_weak.upgrade() {
+                                            send_message_detached(&writer, msg, addr2);
+                                        }
+                                    }
+                                    {
+                                        let mut state = peer_state2.lock().await;
+                                        state.last_headers_request = Some(Instant::now());
+                                        state.last_headers_start = Some(last_hash);
+                                        state.headers_inflight = true;
+                                    }
+                                }
+                            }
+
+                            let request = {
+                                let guard = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(best) = guard.best_header_if_better() {
+                                    if let Some(path) = guard.header_path_to_known(best.header.hash()) {
+                                        if let Some(first_hash) = path.first() {
+                                            let start_hash = guard
+                                                .headers
+                                                .get(first_hash)
+                                                .map(|hw| hw.header.prev_hash)
+                                                .unwrap_or([0u8; 32]);
+                                            let count = std::cmp::min(
+                                                path.len(),
+                                                MAX_BLOCKS_PER_REQUEST as usize,
+                                            ) as u32;
+                                            if count > 0 {
+                                                Some((start_hash, count))
+                                            } else {
+                                                None
+                                            }
                                         } else {
                                             None
                                         }
@@ -4399,251 +4936,267 @@ async fn handle_incoming_with_sybil(
                                 } else {
                                     None
                                 }
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some((start_hash, count)) = request {
-                            let get_blocks = GetBlocksPayload {
-                                start_hash: start_hash.to_vec(),
-                                count,
                             };
-                            if sync_block_request_allowed_for(
-                                &block_requests,
-                                addr.ip(),
-                                local_height,
-                                peer_height,
-                            )
-                            .await
-                            {
-                                if let Ok(msg) = get_blocks.to_message() {
-                                    let _ = send_message(&writer, msg, addr).await;
+
+                            if let Some((start_hash, count)) = request {
+                                let get_blocks = GetBlocksPayload {
+                                    start_hash: start_hash.to_vec(),
+                                    count,
+                                };
+                                if sync_block_request_allowed_for(
+                                    &block_requests2,
+                                    addr2.ip(),
+                                    local_height,
+                                    peer_height,
+                                )
+                                .await
+                                {
+                                    if let Ok(msg) = get_blocks.to_message() {
+                                        if let Some(writer) = writer_weak.upgrade() {
+                                            send_message_detached(&writer, msg, addr2);
+                                        }
+                                    }
                                 }
+                            {
+                                let mut state = peer_state2.lock().await;
+                                state.last_headers_received = Some(Instant::now());
+                                state.headers_processing = false;
                             }
-                        }
+
+                            }
+                        });
                     }
                 }
             }
             MessageType::GetBlocks => {
-                {
-                    let mut guard = getblocks_seen.lock().await;
-                    guard.insert(addr.ip(), Instant::now());
-                }
-                if let Some(ref chain_arc) = chain {
-                    if let Ok(payload) = GetBlocksPayload::from_message(&msg) {
+                if let Ok(payload) = GetBlocksPayload::from_message(&msg) {
+                    let writer_weak = Arc::downgrade(&writer);
+                    let chain_for_task = chain.clone();
+                    let addr2 = addr;
+                    let getblocks_seen2 = getblocks_seen.clone();
+                    let getblocks_last2 = getblocks_last.clone();
+                    let getblocks_genesis2 = getblocks_genesis.clone();
+                    let send_blocks_log2 = send_blocks_log.clone();
+
+                    tokio::spawn(async move {
+                        {
+                            let mut guard = getblocks_seen2.lock().await;
+                            guard.insert(addr2.ip(), Instant::now());
+                        }
+
+                        let Some(chain_arc) = chain_for_task else {
+                            return;
+                        };
+
                         if !getblocks_request_allowed(
-                            &getblocks_last,
-                            addr.ip(),
+                            &getblocks_last2,
+                            addr2.ip(),
                             &payload.start_hash,
                             payload.count,
                         )
                         .await
                         {
-                            continue;
+                            return;
                         }
+
                         let is_zero = payload.start_hash.iter().all(|b| *b == 0);
-                        let (start_idx, matched_pos) = {
+                        let start_hash = payload.start_hash.clone();
+                        let want = payload.count;
+
+                        let (matched_pos, blocks, start_height) = match spawn_blocking_limited(move || {
                             let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+
                             let mut start_idx = 0usize;
                             let mut matched_pos = None;
-                            if payload.start_hash.len() == 32 {
+                            if start_hash.len() == 32 {
                                 let mut target = [0u8; 32];
-                                target.copy_from_slice(&payload.start_hash);
-                                if let Some(pos) =
-                                    guard.chain.iter().position(|b| b.header.hash() == target)
+                                target.copy_from_slice(&start_hash);
+                                if let Some(pos) = guard
+                                    .chain
+                                    .iter()
+                                    .position(|b| b.header.hash() == target)
                                 {
                                     start_idx = pos + 1;
                                     matched_pos = Some(pos);
                                 }
                             }
-                            (start_idx, matched_pos)
-                        };
-                        let genesis_locator = is_zero || matches!(matched_pos, Some(0));
-                        if genesis_locator
-                            && !genesis_request_allowed(&getblocks_genesis, addr.ip()).await
-                        {
-                            continue;
-                        }
-                        if matched_pos.is_none() && !is_zero {
-                            // Unknown locator: do not spam-send genesis blocks; it wastes bandwidth and CPU.
-                            P2PNode::log_event(
-                                "warn",
-                                "sync",
-                                format!(
-                                    "P2P {}: ignoring getblocks unknown start hash {}",
-                                    addr,
-                                    hex::encode(&payload.start_hash)
-                                ),
-                            );
-                            continue;
-                        }
-                        let (blocks, start_height) = {
-                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+
+                            if matched_pos.is_none() && !is_zero {
+                                return (matched_pos, Vec::new(), 0u64);
+                            }
+
                             let mut blocks = Vec::new();
                             let mut heights = Vec::new();
-                            let count = payload.count.min(MAX_BLOCKS_PER_REQUEST) as usize;
-                            for (idx, b) in
-                                guard.chain.iter().enumerate().skip(start_idx).take(count)
+                            let count = want.min(MAX_BLOCKS_PER_REQUEST) as usize;
+                            for (idx, b) in guard
+                                .chain
+                                .iter()
+                                .enumerate()
+                                .skip(start_idx)
+                                .take(count)
                             {
                                 blocks.push(b.serialize());
                                 heights.push(idx as u64);
                             }
                             let start_h: u64 = heights.first().copied().unwrap_or(0);
-                            (blocks, start_h)
+                            (matched_pos, blocks, start_h)
+                        }).await {
+                            Ok(v) => v,
+                            Err(_) => return,
                         };
+
+                        let genesis_locator = is_zero || matches!(matched_pos, Some(0));
+                        if genesis_locator
+                            && !genesis_request_allowed(&getblocks_genesis2, addr2.ip()).await
+                        {
+                            return;
+                        }
+
+                        if matched_pos.is_none() && !is_zero {
+                            P2PNode::log_event(
+                                "warn",
+                                "sync",
+                                format!(
+                                    "P2P {}: ignoring getblocks unknown start hash {}",
+                                    addr2,
+                                    hex::encode(&payload.start_hash)
+                                ),
+                            );
+                            return;
+                        }
+
                         if !blocks.is_empty() {
                             let end_h = start_height + blocks.len() as u64 - 1;
                             if ip_log_allowed(
-                                &send_blocks_log,
-                                addr.ip(),
+                                &send_blocks_log2,
+                                addr2.ip(),
                                 Duration::from_secs(send_blocks_log_cooldown_secs()),
                             )
                             .await
                             {
                                 P2PNode::log(format!(
                                     "P2P {}: sending {} blocks [{}-{}]",
-                                    addr,
+                                    addr2,
                                     blocks.len(),
                                     start_height,
                                     end_h
                                 ));
                             }
                         }
+
                         for block_data in blocks {
+                            let Some(writer) = writer_weak.upgrade() else {
+                                break;
+                            };
                             let msg = BlockPayload { block_data }.to_message();
-                            let _ = send_message(&writer, msg, addr).await;
+                            let _ = send_message(&writer, msg, addr2).await;
                         }
-                    }
+                    });
                 }
             }
+
+
             MessageType::Block => {
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = BlockPayload::from_message(&msg) {
-                        match Block::deserialize(&payload.block_data) {
-                            Ok((block, _)) => {
-                                let bhash = block.header.hash();
-                                let short = hex::encode(bhash);
-                                let short = short.get(0..12).unwrap_or(&short);
-                                let (new_height_opt, record_verdict, persist_blocks, orphan_prev) = {
-                                    let mut guard =
-                                        chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                        let addr2 = addr;
+                        let chain_arc2 = chain_arc.clone();
+                        let mempool2 = mempool.clone();
+                        let directory2 = directory.clone();
+                        let reputation2 = reputation.clone();
+
+                        let permit = match inbound_bulk_queue().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                P2PNode::log_event(
+                                    "warn",
+                                    "sync",
+                                    format!("P2P {}: inbound block dropped (busy)", addr),
+                                );
+                                continue;
+                            }
+                        };
+
+                        tokio::spawn(async move {
+                            let _permit = permit;
+
+                            let block = match Block::deserialize(&payload.block_data) {
+                                Ok((b, _)) => b,
+                                Err(e) => {
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "net",
+                                        format!("P2P {}: failed to decode block payload: {}", addr2, e),
+                                    );
+                                    let mut rep = reputation2.lock().await;
+                                    rep.record_decode_error(&addr2.to_string());
+                                    return;
+                                }
+                            };
+
+                            let bhash = block.header.hash();
+                            let short = hex::encode(bhash);
+                            let short = short.get(0..12).unwrap_or(&short).to_string();
+
+                            let (new_height_opt, verdict, persist_blocks) =
+                                match spawn_blocking_limited(move || {
+                                    let mut guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
                                     let mut new_height_opt = None;
-                                    let mut record_verdict = None;
-                                    let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
-                                    let mut orphan_prev = None;
+                                    let mut verdict = None;
+                                    let mut persist_blocks = Vec::new();
+
                                     match guard.process_block(block.clone()) {
-                                        Ok((new_height, _tip)) => {
-                                            P2PNode::log(format!(
-                                                "P2P {}: accepted block height {} hash {}",
-                                                addr,
-                                                new_height.saturating_sub(1),
-                                                short
-                                            ));
-                                            if let Some(ref mem) = mempool {
-                                                let mut mem_guard =
-                                                    mem.lock().unwrap_or_else(|e| e.into_inner());
-                                                for tx in block.transactions.iter().skip(1) {
-                                                    mem_guard.remove(&tx.txid());
-                                                }
-                                            }
-                                            // Update headers to reflect advanced tip.
+                                        Ok((new_height, _)) => {
                                             new_height_opt = Some(new_height);
-                                            record_verdict = Some(true);
+                                            verdict = Some(true);
                                             if guard.tip_hash() == bhash {
                                                 let tip = guard.tip_height();
                                                 persist_blocks.push((tip, block.clone()));
-                                                if tip > 0 {
-                                                    if let Some(prev) =
-                                                        guard.chain.get((tip - 1) as usize)
-                                                    {
-                                                        persist_blocks
-                                                            .push((tip - 1, prev.clone()));
-                                                    }
-                                                }
                                             }
                                         }
                                         Err(e) => {
-                                            if e.contains("orphan")
-                                                || e.contains("prev hash unknown")
-                                            {
-                                                orphan_prev = Some(block.header.prev_hash);
-                                            }
                                             if P2PNode::is_soft_block_reject(&e) {
-                                                if !P2PNode::is_duplicate_block(&e) {
-                                                    P2PNode::log_event(
-                                                        "info",
-                                                        "chain",
-                                                        format!(
-                                                            "P2P {}: ignored block {} ({})",
-                                                            addr, short, e
-                                                        ),
-                                                    );
-                                                }
+                                                // ignore
                                             } else {
+                                                verdict = Some(false);
                                                 P2PNode::log_event(
                                                     "warn",
                                                     "chain",
-                                                    format!(
-                                                        "P2P {}: rejected block {}: {}",
-                                                        addr, short, e
-                                                    ),
+                                                    format!("P2P {}: rejected block {}: {}", addr2, short, e),
                                                 );
-                                                record_verdict = Some(false);
                                             }
                                         }
                                     }
-                                    (new_height_opt, record_verdict, persist_blocks, orphan_prev)
+
+                                    (new_height_opt, verdict, persist_blocks)
+                                })
+                                .await
+                                {
+                                    Ok(v) => v,
+                                    Err(_) => return,
                                 };
-                                for (height, b) in persist_blocks {
-                                    if let Err(e) = storage::write_block_json(height, &b) {
-                                        P2PNode::log_event(
-                                            "warn",
-                                            "chain",
-                                            format!(
-                                                "P2P {}: failed to persist block {}: {}",
-                                                addr, short, e
-                                            ),
-                                        );
+
+                            for (height, b) in persist_blocks {
+                                let _ = storage::write_block_json(height, &b);
+                                if let Some(ref mem) = mempool2 {
+                                    let mut mem_guard = mem.lock().unwrap_or_else(|e| e.into_inner());
+                                    for tx in b.transactions.iter().skip(1) {
+                                        mem_guard.remove(&tx.txid());
                                     }
                                 }
-                                if let Some(prev_hash) = orphan_prev {
-                                    request_orphan_headers(
-                                        &writer,
-                                        addr,
-                                        prev_hash,
-                                        &chain,
-                                        &sync_requests,
-                                        &peer_state,
-                                    )
-                                    .await;
-                                }
-                                if let Some(new_height) = new_height_opt {
-                                    let multiaddr =
-                                        format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
-                                    let mut directory = directory.lock().await;
-                                    directory
-                                        .record_height(&multiaddr, new_height.saturating_sub(1));
-                                }
-                                maybe_request_sync(
-                                    &writer,
-                                    addr,
-                                    &chain,
-                                    &sync_requests,
-                                    &block_requests,
-                                    &peer_state,
-                                )
-                                .await;
-                                if let Some(ok) = record_verdict {
-                                    let mut rep = reputation.lock().await;
-                                    rep.record_block(&addr.to_string(), ok);
-                                }
                             }
-                            Err(e) => {
-                                eprintln!("Failed to decode block payload from {}: {}", addr, e);
-                                let mut rep = reputation.lock().await;
-                                rep.record_decode_error(&addr.to_string());
+
+                            if let Some(new_height) = new_height_opt {
+                                let multiaddr = format!("/ip4/{}/tcp/{}", addr2.ip(), addr2.port());
+                                let mut dir = directory2.lock().await;
+                                dir.record_height(&multiaddr, new_height.saturating_sub(1));
                             }
-                        }
+
+                            if let Some(ok) = verdict {
+                                let mut rep = reputation2.lock().await;
+                                rep.record_block(&addr2.to_string(), ok);
+                            }
+                        });
                     }
                 }
             }
@@ -4696,9 +5249,36 @@ async fn handle_incoming_with_sybil(
                                 };
 
                                 if let Some(inv_bytes) = inv_bytes {
-                                    let mut peers_guard = peers.lock().await;
-                                    for socket in peers_guard.iter_mut() {
-                                        let _ = socket.lock().await.write_all(&inv_bytes).await;
+                                    // Never hold the peers lock while awaiting I/O.
+                                    let peers_snapshot = {
+                                        let guard = peers.lock().await;
+                                        guard.clone()
+                                    };
+                                    let mut dead: Vec<Arc<Mutex<OwnedWriteHalf>>> = Vec::new();
+                                    for socket in peers_snapshot.iter() {
+                                        let write_fut = async {
+                                            let mut w = socket.lock().await;
+                                            w.write_all(&inv_bytes).await
+                                        };
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(2),
+                                            write_fut,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(_)) | Err(_) => {
+                                                {
+                                                    let mut w = socket.lock().await;
+                                                    let _ = w.shutdown().await;
+                                                }
+                                                dead.push(socket.clone());
+                                            }
+                                        }
+                                    }
+                                    if !dead.is_empty() {
+                                        let mut guard = peers.lock().await;
+                                        guard.retain(|p| !dead.iter().any(|d| Arc::ptr_eq(p, d)));
                                     }
                                 }
                             }
@@ -4730,7 +5310,7 @@ async fn handle_incoming_with_sybil(
                         if !needed.is_empty() {
                             let gd = GetDataPayload { txids: needed };
                             if let Ok(msg) = gd.to_message() {
-                                let _ = send_message(&writer, msg, addr).await;
+                                send_message_detached(&writer, msg, addr);
                             }
                         }
                     }
@@ -4756,7 +5336,7 @@ async fn handle_incoming_with_sybil(
                             }
                         }
                         for msg in responses {
-                            let _ = send_message(&writer, msg, addr).await;
+                            send_message_detached(&writer, msg, addr);
                         }
                     }
                 }
@@ -4769,10 +5349,10 @@ async fn handle_incoming_with_sybil(
                     };
                     let payload = MempoolPayload { tx_hashes };
                     if let Ok(msg) = payload.to_message() {
-                        let _ = send_message(&writer, msg, addr).await;
+                        send_message_detached(&writer, msg, addr);
                     }
                 } else if let Ok(msg) = EmptyPayload::to_message(MessageType::Mempool) {
-                    let _ = send_message(&writer, msg, addr).await;
+                    send_message_detached(&writer, msg, addr);
                 }
             }
             MessageType::RelayAddress => {
@@ -4802,6 +5382,7 @@ async fn handle_incoming_with_sybil(
             }
         }
     }
+    let _ = shutdown_tx_to_ping.send(());
     {
         let mut w = writer.lock().await;
         let _ = w.shutdown().await;

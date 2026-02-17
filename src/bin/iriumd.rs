@@ -2596,7 +2596,7 @@ async fn submit_tx(
     }))
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
     let (blocks_dir, state_dir) = storage::ensure_runtime_dirs().unwrap_or_else(|e| {
         eprintln!("Failed to init runtime dirs: {e}");

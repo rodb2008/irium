@@ -1,2 +1,3 @@
-161.97.71.195
-89.85.40.184
+# Bootstrap banned peers
+# Keep empty unless there is an active, confirmed abuse case.
+
