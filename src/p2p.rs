@@ -222,7 +222,7 @@ fn inbound_bulk_queue_capacity() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .map(|v| v.max(1).min(512))
-            .unwrap_or(64)
+            .unwrap_or(256)
     })
 }
 
@@ -230,6 +230,17 @@ fn inbound_block_busy_wait_ms() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
         std::env::var("IRIUM_P2P_INBOUND_BLOCK_BUSY_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(10).min(5000))
+            .unwrap_or(5000)
+    })
+}
+
+fn inbound_headers_busy_wait_ms() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_INBOUND_HEADERS_BUSY_WAIT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|v| v.max(10).min(5000))
@@ -249,6 +260,22 @@ fn inbound_block_busy_log_cooldown_secs() -> u64 {
 }
 
 fn inbound_block_busy_log() -> Arc<Mutex<HashMap<IpAddr, Instant>>> {
+    static LOGS: OnceLock<Arc<Mutex<HashMap<IpAddr, Instant>>>> = OnceLock::new();
+    LOGS.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))).clone()
+}
+
+fn inbound_headers_busy_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_INBOUND_HEADERS_BUSY_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(30)
+    })
+}
+
+fn inbound_headers_busy_log() -> Arc<Mutex<HashMap<IpAddr, Instant>>> {
     static LOGS: OnceLock<Arc<Mutex<HashMap<IpAddr, Instant>>>> = OnceLock::new();
     LOGS.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))).clone()
 }
@@ -4746,20 +4773,36 @@ async fn handle_incoming_with_sybil(
                             state.headers_inflight = false;
                         }
 
-                        let permit = match inbound_bulk_queue().try_acquire_owned() {
-                            Ok(p) => p,
+                        let permit = match tokio::time::timeout(
+                            Duration::from_millis(inbound_headers_busy_wait_ms()),
+                            inbound_bulk_queue().acquire_owned(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(p)) => p,
                             Err(_) => {
-                                P2PNode::log_event(
-                                    "warn",
-                                    "sync",
-                                    format!("P2P {}: inbound headers dropped (busy)", addr),
-                                );
+                                if ip_log_allowed(
+                                    &inbound_headers_busy_log(),
+                                    addr.ip(),
+                                    Duration::from_secs(inbound_headers_busy_log_cooldown_secs()),
+                                )
+                                .await
+                                {
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "sync",
+                                        format!("P2P {}: inbound headers dropped (busy)", addr),
+                                    );
+                                }
+                                continue;
+                            }
+                            Ok(Err(_)) => {
                                 continue;
                             }
                         };
 
                         tokio::spawn(async move {
-                            let _permit = permit;
+                            let permit_guard = permit;
 
                             let (last_header_hash, header_error, unknown_parent, reset_headers, added_any) =
                                 match spawn_blocking_limited(move || {
@@ -4822,6 +4865,7 @@ async fn handle_incoming_with_sybil(
                                     Ok(v) => v,
                                     Err(_) => (None, true, false, false, false),
                                 };
+                            drop(permit_guard);
 
                             if header_count > 0 {
                                 let last_short = last_header_hash
@@ -5153,12 +5197,18 @@ async fn handle_incoming_with_sybil(
                                         format!("P2P {}: inbound block dropped (busy)", addr),
                                     );
                                 }
+                                let mut rep_guard = reputation.lock().await;
+                                rep_guard.record_block(&addr.to_string(), false);
+                                {
+                                    let mut w = writer.lock().await;
+                                    let _ = w.shutdown().await;
+                                }
                                 continue;
                             }
                         };
 
                         tokio::spawn(async move {
-                            let _permit = permit;
+                            let permit_guard = permit;
 
                             let block = match Block::deserialize(&payload.block_data) {
                                 Ok((b, _)) => b,
@@ -5215,6 +5265,7 @@ async fn handle_incoming_with_sybil(
                                     Ok(v) => v,
                                     Err(_) => return,
                                 };
+                            drop(permit_guard);
 
                             for (height, b) in persist_blocks {
                                 let _ = storage::write_block_json(height, &b);
