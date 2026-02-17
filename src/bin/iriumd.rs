@@ -2917,6 +2917,8 @@ async fn main() {
             let mut maintenance_ticks: u64 = 0;
             let mut last_progress_height: u64 = 0;
             let mut stalled_ticks: u32 = 0;
+            let mut last_tip_hash: String = genesis_hex.clone();
+            let mut last_mempool_size: usize = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let peers = tokio::time::timeout(
@@ -2927,16 +2929,19 @@ async fn main() {
                 .unwrap_or_default();
                 maintenance_ticks = maintenance_ticks.wrapping_add(1);
                 if maintenance_ticks % 6 == 0 {
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        node_clone.refresh_seedlist(),
-                    )
-                    .await;
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        node_clone.connect_known_peers(3),
-                    )
-                    .await;
+                    let maintenance_node = node_clone.clone();
+                    tokio::spawn(async move {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            maintenance_node.refresh_seedlist(),
+                        )
+                        .await;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            maintenance_node.connect_known_peers(3),
+                        )
+                        .await;
+                    });
                 }
                 let seeds = seed_mgr.merged_seedlist();
 
@@ -2978,28 +2983,40 @@ async fn main() {
                     seed_list.push("-".to_string());
                 }
 
-                let (local_height, tip_hash, mempool_size) = {
-                    let g = match chain_clone.lock() {
-                        Ok(g) => g,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    let tip = g
-                        .chain
-                        .last()
-                        .map(|b| hex::encode(b.header.hash()))
-                        .unwrap_or_else(|| genesis_hex.clone());
-                    let mem_sz = match mempool_clone.lock() {
-                        Ok(g) => g.len(),
-                        Err(poisoned) => poisoned.into_inner().len(),
-                    };
-                    (g.tip_height(), tip, mem_sz)
+                let (local_height, tip_hash) = match chain_clone.try_lock() {
+                    Ok(g) => {
+                        let tip = g
+                            .chain
+                            .last()
+                            .map(|b| hex::encode(b.header.hash()))
+                            .unwrap_or_else(|| genesis_hex.clone());
+                        (g.tip_height(), tip)
+                    }
+                    Err(_) => (
+                        status_height.load(Ordering::Relaxed),
+                        last_tip_hash.clone(),
+                    ),
                 };
+                last_tip_hash = tip_hash.clone();
+
+                let mempool_size = match mempool_clone.try_lock() {
+                    Ok(g) => g.len(),
+                    Err(_) => last_mempool_size,
+                };
+                last_mempool_size = mempool_size;
+
                 status_height.store(local_height, Ordering::Relaxed);
                 status_peer_count.store(peer_ips.len(), Ordering::Relaxed);
-                status_sybil.store(
-                    node_clone.current_sybil_difficulty().await,
-                    Ordering::Relaxed,
-                );
+                let sybil_now = match tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    node_clone.current_sybil_difficulty(),
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(_) => status_sybil.load(Ordering::Relaxed),
+                };
+                status_sybil.store(sybil_now, Ordering::Relaxed);
 
                 let next_height = local_height.saturating_add(1);
                 let peer_height = best_peer_height.unwrap_or(0);
@@ -3040,12 +3057,15 @@ async fn main() {
                             local_height,
                             peer_height
                         );
-                        node_clone.clear_sync_throttles().await;
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
-                            node_clone.connect_known_peers(5),
-                        )
-                        .await;
+                        let stalled_node = node_clone.clone();
+                        tokio::spawn(async move {
+                            stalled_node.clear_sync_throttles().await;
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                stalled_node.connect_known_peers(5),
+                            )
+                            .await;
+                        });
                         stalled_ticks = 0;
                     }
                 } else {

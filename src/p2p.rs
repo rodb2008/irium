@@ -3810,8 +3810,8 @@ fn peer_write_timeout() -> Duration {
     let ms = std::env::var("IRIUM_P2P_WRITE_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(2000);
-    Duration::from_millis(ms.clamp(200, 10_000))
+        .unwrap_or(8000);
+    Duration::from_millis(ms.clamp(500, 30_000))
 }
 
 async fn send_message(
