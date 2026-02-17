@@ -1294,6 +1294,14 @@ impl P2PNode {
         })
     }
 
+    fn outbound_connect_timeout() -> Duration {
+        let secs = std::env::var("IRIUM_P2P_CONNECT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(8);
+        Duration::from_secs(secs.clamp(2, 30))
+    }
+
     fn is_soft_block_reject(reason: &str) -> bool {
         let msg = reason.to_lowercase();
         msg.contains("duplicate block") || msg.contains("orphan") || msg.contains("unknown parent")
@@ -2044,10 +2052,24 @@ impl P2PNode {
         // Simple jittered delay before connecting to avoid thundering herd.
         let jitter_ms = (rand_core::OsRng.next_u32() % 5000) as u64;
         tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
-        let mut stream = match TcpStream::connect(addr).await {
-            Ok(s) => s,
-            Err(e) => {
+        let mut stream = match tokio::time::timeout(
+            Self::outbound_connect_timeout(),
+            TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 let msg = format!("connect to {} failed: {}", addr, e);
+                self.record_outbound_dial_failure(ip, &msg).await;
+                return Err(msg);
+            }
+            Err(_) => {
+                let msg = format!(
+                    "connect to {} failed: connect timeout after {}s",
+                    addr,
+                    Self::outbound_connect_timeout().as_secs()
+                );
                 self.record_outbound_dial_failure(ip, &msg).await;
                 return Err(msg);
             }
