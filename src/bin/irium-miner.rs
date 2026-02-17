@@ -578,36 +578,49 @@ fn is_tls_mismatch(err: &str) -> bool {
     lower.contains("invalid http version")
 }
 
-fn should_downgrade_https(err: &str) -> bool {
+fn is_https_scheme_mismatch(err: &str) -> bool {
     let lower = err.to_lowercase();
-    lower.contains("error trying to connect")
-        || lower.contains("connection refused")
-        || lower.contains("timed out")
-        || lower.contains("tcp connect")
-        || lower.contains("dns")
-        || lower.contains("no such host")
-        || lower.contains("network unreachable")
-        || lower.contains("failed to lookup address")
-        || lower.contains("connection error")
-        || lower.contains("tls")
-        || lower.contains("handshake")
-        || lower.contains("certificate")
-        || lower.contains("wrong version number")
-        || lower.contains("unexpected eof")
+    lower.contains("wrong version number")
+        || lower.contains("first record does not look like a tls handshake")
+        || lower.contains("received http/0.9 when not allowed")
+        || lower.contains("invalid http version")
+        || lower.contains("tls handshake")
+        || lower.contains("unexpected eof while reading")
 }
 
 fn with_rpc_base<T, F>(f: F) -> Result<T, String>
 where
     F: Fn(&str) -> Result<T, String>,
 {
+    fn should_log_https_fallback() -> bool {
+        static LAST_LOG: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+        let lock = LAST_LOG.get_or_init(|| Mutex::new(None));
+        if let Ok(mut guard) = lock.lock() {
+            let now = Instant::now();
+            let allow = guard
+                .as_ref()
+                .map(|t| now.duration_since(*t) >= Duration::from_secs(60))
+                .unwrap_or(true);
+            if allow {
+                *guard = Some(now);
+            }
+            allow
+        } else {
+            true
+        }
+    }
+
     let base = node_rpc_base();
     match f(&base) {
         Ok(v) => Ok(v),
         Err(e) => {
-            if base.starts_with("https://") && should_downgrade_https(&e) {
+            if base.starts_with("https://") && is_https_scheme_mismatch(&e) {
                 let http = base.replacen("https://", "http://", 1);
-                eprintln!("HTTPS RPC failed, retrying over HTTP: {}", http);
                 if let Ok(v) = f(&http) {
+                    env::set_var("IRIUM_NODE_RPC", &http);
+                    if should_log_https_fallback() {
+                        eprintln!("[warn] RPC scheme mismatch; switching to {http}");
+                    }
                     return Ok(v);
                 }
             }
