@@ -73,6 +73,7 @@ curl -k https://127.0.0.1:38300/rpc/network_hashrate?window=120
 ## FAQ / Common issues
 - No peers / stuck at height 0: check outbound TCP 38291, verify seeds in `bootstrap/seedlist.txt`, and restart the node. Some networks block inbound peers.
 - Miner starts at height 0: let the node finish syncing and confirm RPC is reachable with `curl -k https://127.0.0.1:38300/status`.
+- `[warn] Miner could not fetch block template ... InvalidContentType`: miner/node protocol mismatch. If node serves HTTP, set `IRIUM_NODE_RPC=http://127.0.0.1:38300`; if node serves HTTPS, keep `https://`. Verify with both `curl -s http://127.0.0.1:38300/status` and `curl -sk https://127.0.0.1:38300/status`, then restart miner.
 - Miner stuck at height 1: the node isn’t running or `IRIUM_NODE_RPC` is wrong.
 - `HTTP 401 Unauthorized`: the node has a token set, but the miner/wallet does not. Use the same `IRIUM_RPC_TOKEN` everywhere.
 - `HTTP 429 Too Many Requests`: the node rate‑limit is blocking the miner. Set a token or raise `IRIUM_RATE_LIMIT_PER_MIN` in the node env.
