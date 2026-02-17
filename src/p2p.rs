@@ -4773,32 +4773,9 @@ async fn handle_incoming_with_sybil(
                             state.headers_inflight = false;
                         }
 
-                        let permit = match tokio::time::timeout(
-                            Duration::from_millis(inbound_headers_busy_wait_ms()),
-                            inbound_bulk_queue().acquire_owned(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(p)) => p,
-                            Err(_) => {
-                                if ip_log_allowed(
-                                    &inbound_headers_busy_log(),
-                                    addr.ip(),
-                                    Duration::from_secs(inbound_headers_busy_log_cooldown_secs()),
-                                )
-                                .await
-                                {
-                                    P2PNode::log_event(
-                                        "warn",
-                                        "sync",
-                                        format!("P2P {}: inbound headers dropped (busy)", addr),
-                                    );
-                                }
-                                continue;
-                            }
-                            Ok(Err(_)) => {
-                                continue;
-                            }
+                        let permit = match inbound_bulk_queue().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => continue,
                         };
 
                         tokio::spawn(async move {
@@ -5176,35 +5153,9 @@ async fn handle_incoming_with_sybil(
                         let directory2 = directory.clone();
                         let reputation2 = reputation.clone();
 
-                        let permit = match tokio::time::timeout(
-                            Duration::from_millis(inbound_block_busy_wait_ms()),
-                            inbound_bulk_queue().acquire_owned(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(p)) => p,
-                            _ => {
-                                if ip_log_allowed(
-                                    &inbound_block_busy_log(),
-                                    addr.ip(),
-                                    Duration::from_secs(inbound_block_busy_log_cooldown_secs()),
-                                )
-                                .await
-                                {
-                                    P2PNode::log_event(
-                                        "warn",
-                                        "sync",
-                                        format!("P2P {}: inbound block dropped (busy)", addr),
-                                    );
-                                }
-                                let mut rep_guard = reputation.lock().await;
-                                rep_guard.record_block(&addr.to_string(), false);
-                                {
-                                    let mut w = writer.lock().await;
-                                    let _ = w.shutdown().await;
-                                }
-                                continue;
-                            }
+                        let permit = match inbound_bulk_queue().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => continue,
                         };
 
                         tokio::spawn(async move {
