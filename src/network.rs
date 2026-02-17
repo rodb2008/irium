@@ -572,6 +572,21 @@ impl PeerDirectory {
             // Keep the previous runtime seedlist until we have at least one dialable peer.
             return;
         }
+
+        // Do not aggressively collapse runtime seeds after short churn windows.
+        // Keep a minimum warm set by carrying forward previous runtime entries.
+        let min_runtime = 8usize;
+        if seeds.len() < min_runtime {
+            for prev in self.seed_manager.load_runtime_entries() {
+                if !seeds.contains(&prev) {
+                    seeds.push(prev);
+                }
+                if seeds.len() >= min_runtime {
+                    break;
+                }
+            }
+        }
+
         self.seed_manager.write_runtime_entries(seeds);
     }
 
