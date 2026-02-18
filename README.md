@@ -227,6 +227,15 @@ source ~/.cargo/env
 - Pool mining (Stratum v1, TCP): set `IRIUM_STRATUM_URL`, `IRIUM_STRATUM_USER`, `IRIUM_STRATUM_PASS`.
 Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinbase outputs.
 
+
+## Mining (Stratum Pool)
+Public SOLO Stratum pool:
+- Pool URL: `stratum+tcp://pool.iriumlabs.org:3333`
+- Username: `IRM_ADDRESS.worker1`
+- Password: `x`
+- Mode: SOLO (full block reward pays to the IRM address in the username)
+
+See `docs/POOL_STRATUM.md` for full miner quickstart, troubleshooting, and operator runbook.
 ## Wallet
 The wallet CLI stores keys in `~/.irium/wallet.json` (override with `IRIUM_WALLET_FILE`).
 ```bash
