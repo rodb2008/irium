@@ -64,6 +64,25 @@ export IRIUM_NODE_RPC=https://<node-ip>:38300
 If you want the detailed/advanced steps, continue below.
 
 
+
+## Public Stratum Pool (SOLO)
+If you prefer pool mode, use the public Irium Stratum endpoint:
+
+- Pool URL: `stratum+tcp://pool.iriumlabs.org:3333`
+- Username: `IRM_ADDRESS.worker1`
+- Password: `x`
+- Mode: SOLO (if your worker finds a valid block, reward pays to the IRM address in the username)
+
+Quick example:
+```bash
+export IRIUM_STRATUM_URL=stratum+tcp://pool.iriumlabs.org:3333
+export IRIUM_STRATUM_USER=IRM_ADDRESS.worker1
+export IRIUM_STRATUM_PASS=x
+./target/release/irium-miner --threads 2
+```
+
+For troubleshooting and operator notes, see `docs/POOL_STRATUM.md`.
+
 ## Network Hashrate (estimate)
 ```bash
 curl -k https://127.0.0.1:38300/rpc/network_hashrate
