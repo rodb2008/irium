@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -11,12 +11,13 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use irium_node_rs::constants::block_reward;
+use irium_node_rs::constants::{block_reward, COINBASE_MATURITY};
 use irium_node_rs::rate_limiter::RateLimiter;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
+use tokio::time::Instant;
 
 #[derive(Clone)]
 struct AppState {
@@ -60,6 +61,12 @@ struct BlocksQuery {
 struct MiningQuery {
     window: Option<usize>,
     series: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct PoolQuery {
+    limit: Option<usize>,
+    window: Option<u64>,
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -134,6 +141,54 @@ fn node_url(base: &str, path: &str) -> String {
         base.trim_end_matches('/'),
         path.trim_start_matches('/')
     )
+}
+
+fn value_f64(v: Option<&Value>) -> Option<f64> {
+    match v {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn reward_irm_for_height(height: u64) -> f64 {
+    (block_reward(height) as f64) / 100_000_000.0
+}
+
+#[derive(Debug, Clone)]
+struct MinedBlockEntry {
+    miner: String,
+    time: u64,
+    hash: String,
+}
+
+async fn load_block_entry(state: &AppState, height: u64) -> Option<MinedBlockEntry> {
+    let path = format!("/rpc/block?height={}", height);
+    let block = proxy_value(state, &path).await.ok()?;
+
+    let miner = block
+        .get("miner_address")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("N/A")
+        .to_string();
+    let time = block
+        .get("header")
+        .and_then(|hh| hh.get("time"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let hash = block
+        .get("header")
+        .and_then(|hh| hh.get("hash"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Some(MinedBlockEntry {
+        miner,
+        time,
+        hash,
+    })
 }
 
 async fn proxy_json(state: &AppState, path: &str) -> Result<Json<Value>, StatusCode> {
@@ -419,6 +474,303 @@ async fn mining(
     proxy_json(&state, &path).await
 }
 
+
+async fn pool_stats(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<PoolQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+
+    let status = proxy_value(&state, "/status").await?;
+    let mining = proxy_value(&state, "/rpc/mining_metrics").await?;
+    let miners = state.miners_cache.read().await.clone();
+
+    let sample_window = q.window.unwrap_or(miners.window_blocks.max(1));
+
+    let payload = json!({
+        "backend_connected": true,
+        "source": "explorer-chain-derived",
+        "payout_model": "solo",
+        "workers_online": miners.active_miners,
+        "active_miners_window_blocks": miners.window_blocks,
+        "active_miners_as_of_height": miners.as_of_height,
+        "active_miners_updated_at": miners.updated_at_unix,
+        "accepted_shares": Value::Null,
+        "rejected_shares": Value::Null,
+        "stale_shares": Value::Null,
+        "round_luck": Value::Null,
+        "round_effort": Value::Null,
+        "pool_hashrate": mining.get("hashrate"),
+        "difficulty": mining.get("difficulty"),
+        "network_height": status.get("height"),
+        "sample_window_blocks": sample_window,
+    });
+
+    Ok(Json(payload))
+}
+
+async fn pool_payouts(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<PoolQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+
+    let status = proxy_value(&state, "/status").await?;
+    let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+    let limit = q.limit.unwrap_or(100).min(500);
+
+    let mut payouts = Vec::new();
+    let mut h = chain_height as i64;
+    while h >= 0 && payouts.len() < limit {
+        let height = h as u64;
+        if let Some(entry) = load_block_entry(&state, height).await {
+            let confirmations = chain_height.saturating_sub(height).saturating_add(1);
+            let mature = confirmations >= COINBASE_MATURITY;
+            let maturity_remaining = COINBASE_MATURITY.saturating_sub(confirmations);
+
+            payouts.push(json!({
+                "height": height,
+                "address": entry.miner,
+                "reward_irm": reward_irm_for_height(height),
+                "time": entry.time,
+                "hash": entry.hash,
+                "status": "on_chain",
+                "confirmations": confirmations,
+                "coinbase_maturity": COINBASE_MATURITY,
+                "mature": mature,
+                "maturity_remaining": maturity_remaining
+            }));
+        }
+        h -= 1;
+    }
+
+    Ok(Json(json!({
+        "height": chain_height,
+        "count": payouts.len(),
+        "coinbase_maturity": COINBASE_MATURITY,
+        "payouts": payouts
+    })))
+}
+
+async fn pool_workers(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<PoolQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+
+    let status = proxy_value(&state, "/status").await?;
+    let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let window = q.window.unwrap_or(288).clamp(32, 5000);
+    let limit = q.limit.unwrap_or(50).min(500);
+    let start = chain_height.saturating_sub(window.saturating_sub(1));
+
+    let mining = proxy_value(&state, "/rpc/mining_metrics").await.ok();
+    let network_hashrate = value_f64(mining.as_ref().and_then(|m| m.get("hashrate")));
+
+    let mut by_addr: HashMap<String, u64> = HashMap::new();
+    let mut scanned_blocks = 0u64;
+    for h in (start..=chain_height).rev() {
+        let Some(entry) = load_block_entry(&state, h).await else {
+            continue;
+        };
+        scanned_blocks = scanned_blocks.saturating_add(1);
+        if entry.miner.is_empty() || entry.miner == "N/A" {
+            continue;
+        }
+        *by_addr.entry(entry.miner).or_insert(0) += 1;
+    }
+
+    let total_found: u64 = by_addr.values().copied().sum();
+    let mut rows: Vec<(String, u64)> = by_addr.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let workers: Vec<Value> = rows
+        .into_iter()
+        .take(limit)
+        .map(|(address, blocks_found)| {
+            let share = if total_found > 0 {
+                (blocks_found as f64) / (total_found as f64)
+            } else {
+                0.0
+            };
+            let est_hashrate = network_hashrate.map(|h| h * share);
+            json!({
+                "address": address,
+                "blocks_found": blocks_found,
+                "share_pct": share * 100.0,
+                "estimated_hashrate_hs": est_hashrate,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "height": chain_height,
+        "window_scanned": window,
+        "scanned_blocks": scanned_blocks,
+        "workers_online": workers.len(),
+        "total_found_blocks": total_found,
+        "network_hashrate_hs": network_hashrate,
+        "workers": workers
+    })))
+}
+
+async fn pool_health(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+
+    let mut issues: Vec<String> = Vec::new();
+    let mut backend_connected = true;
+
+    let t_status = Instant::now();
+    let status = match proxy_value(&state, "/status").await {
+        Ok(v) => v,
+        Err(e) => {
+            backend_connected = false;
+            issues.push(format!("status fetch failed: {e}"));
+            Value::Null
+        }
+    };
+    let status_latency_ms = t_status.elapsed().as_millis() as u64;
+
+    let t_mining = Instant::now();
+    let mining = match proxy_value(&state, "/rpc/mining_metrics").await {
+        Ok(v) => v,
+        Err(e) => {
+            backend_connected = false;
+            issues.push(format!("mining_metrics fetch failed: {e}"));
+            Value::Null
+        }
+    };
+    let mining_latency_ms = t_mining.elapsed().as_millis() as u64;
+
+    let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+    let peers = status
+        .get("peer_count")
+        .and_then(|v| v.as_u64())
+        .or_else(|| status.get("peers_connected").and_then(|v| v.as_u64()));
+
+    let tip_time = if chain_height > 0 {
+        load_block_entry(&state, chain_height).await.map(|b| b.time)
+    } else {
+        None
+    };
+    let freshness_secs = tip_time.map(|t| now_unix().saturating_sub(t));
+    let healthy = backend_connected && freshness_secs.map(|s| s < 1800).unwrap_or(false);
+
+    Ok(Json(json!({
+        "healthy": healthy,
+        "backend_connected": backend_connected,
+        "height": chain_height,
+        "peers_connected": peers,
+        "difficulty": mining.get("difficulty"),
+        "network_hashrate_hs": mining.get("hashrate"),
+        "tip_time": tip_time,
+        "freshness_secs": freshness_secs,
+        "latency_ms": {
+            "status": status_latency_ms,
+            "mining": mining_latency_ms,
+            "total": status_latency_ms.saturating_add(mining_latency_ms)
+        },
+        "issues": issues,
+        "updated_at": now_unix()
+    })))
+}
+
+async fn pool_account(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(address): Path<String>,
+    Query(q): Query<PoolQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+
+    let status = proxy_value(&state, "/status").await?;
+    let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let window = q.window.unwrap_or(4000).clamp(100, 20000);
+    let limit = q.limit.unwrap_or(200).min(1000);
+
+    let mining = proxy_value(&state, "/rpc/mining_metrics").await.ok();
+    let network_hashrate_hs = value_f64(mining.as_ref().and_then(|m| m.get("hashrate")));
+
+    let start = chain_height.saturating_sub(window.saturating_sub(1));
+    let mut found = Vec::new();
+    let mut total = 0.0f64;
+    let mut mature_total = 0.0f64;
+
+    for h in (start..=chain_height).rev() {
+        if found.len() >= limit {
+            break;
+        }
+        let Some(entry) = load_block_entry(&state, h).await else {
+            continue;
+        };
+        if entry.miner != address {
+            continue;
+        }
+
+        let reward = reward_irm_for_height(h);
+        total += reward;
+
+        let confirmations = chain_height.saturating_sub(h).saturating_add(1);
+        let mature = confirmations >= COINBASE_MATURITY;
+        if mature {
+            mature_total += reward;
+        }
+
+        found.push(json!({
+            "height": h,
+            "time": entry.time,
+            "hash": entry.hash,
+            "reward_irm": reward,
+            "status": "on_chain",
+            "confirmations": confirmations,
+            "coinbase_maturity": COINBASE_MATURITY,
+            "mature": mature,
+            "maturity_remaining": COINBASE_MATURITY.saturating_sub(confirmations)
+        }));
+    }
+
+    let pending_total = (total - mature_total).max(0.0);
+    let found_count = found.len() as u64;
+    let share_window = if window > 0 {
+        (found_count as f64) / (window as f64)
+    } else {
+        0.0
+    };
+    let estimated_hashrate_hs = network_hashrate_hs.map(|h| h * share_window);
+
+    let last = found.first().cloned();
+
+    Ok(Json(json!({
+        "address": address,
+        "window_scanned": window,
+        "blocks_found": found_count,
+        "total_rewards_irm": total,
+        "pending_balance_irm": pending_total,
+        "paid_total_irm": mature_total,
+        "payout_model": "solo",
+        "coinbase_maturity": COINBASE_MATURITY,
+        "estimated_hashrate_hs": estimated_hashrate_hs,
+        "network_hashrate_hs": network_hashrate_hs,
+        "window_share_pct": share_window * 100.0,
+        "last_found": last,
+        "records": found
+    })))
+}
+
+
 #[tokio::main]
 async fn main() {
     let node_base =
@@ -477,6 +829,11 @@ async fn main() {
         .route("/address/:address", get(address))
         .route("/utxo", get(utxo))
         .route("/mining", get(mining))
+        .route("/pool/stats", get(pool_stats))
+        .route("/pool/payouts", get(pool_payouts))
+        .route("/pool/workers", get(pool_workers))
+        .route("/pool/health", get(pool_health))
+        .route("/pool/account/:address", get(pool_account))
         .with_state(state)
         .into_make_service_with_connect_info::<SocketAddr>();
 
