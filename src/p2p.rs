@@ -365,8 +365,28 @@ fn headers_request_cooldown() -> Duration {
     let secs = std::env::var("IRIUM_P2P_HEADERS_REQUEST_COOLDOWN_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(120);
-    Duration::from_secs(secs.max(5).min(300))
+        .unwrap_or(30);
+    Duration::from_secs(secs.max(2).min(120))
+}
+
+fn headers_request_cooldown_for(local_height: u64, peer_height: u64) -> Duration {
+    let base = headers_request_cooldown();
+    if peer_height <= local_height {
+        return base;
+    }
+    let gap = peer_height.saturating_sub(local_height);
+    let fast_secs = if gap >= 10_000 {
+        2
+    } else if gap >= 2_000 {
+        3
+    } else if gap >= 500 {
+        4
+    } else if gap >= 100 {
+        6
+    } else {
+        base.as_secs()
+    };
+    Duration::from_secs(fast_secs.max(1).min(base.as_secs().max(1)))
 }
 
 fn headers_response_window() -> Duration {
@@ -2761,12 +2781,24 @@ impl P2PNode {
                                 )
                                 .await;
                                 if allowed {
+                                    let now = Instant::now();
                                     let (last_req, last_start) = {
-                                        let guard = peer_state.lock().await;
+                                        let mut guard = peer_state.lock().await;
+                                        let stale_inflight = guard
+                                            .headers_inflight
+                                            && guard
+                                                .last_headers_request
+                                                .map(|ts| now.duration_since(ts) > headers_response_window())
+                                                .unwrap_or(false);
+                                        if stale_inflight {
+                                            guard.headers_inflight = false;
+                                            guard.headers_processing = false;
+                                        }
                                         (guard.last_headers_request, guard.last_headers_start)
                                     };
                                     if let Some(ts) = last_req {
-                                        if ts.elapsed() < headers_request_cooldown()
+                                        if now.duration_since(ts)
+                                            < headers_request_cooldown_for(local_height, payload.height)
                                             && last_start == Some(start_hash)
                                         {
                                             allowed = false;
@@ -4579,12 +4611,24 @@ async fn handle_incoming_with_sybil(
                         )
                         .await;
                         if allowed {
+                            let now = Instant::now();
                             let (last_req, last_start) = {
-                                let guard = peer_state.lock().await;
+                                let mut guard = peer_state.lock().await;
+                                let stale_inflight = guard
+                                    .headers_inflight
+                                    && guard
+                                        .last_headers_request
+                                        .map(|ts| now.duration_since(ts) > headers_response_window())
+                                        .unwrap_or(false);
+                                if stale_inflight {
+                                    guard.headers_inflight = false;
+                                    guard.headers_processing = false;
+                                }
                                 (guard.last_headers_request, guard.last_headers_start)
                             };
                             if let Some(ts) = last_req {
-                                if ts.elapsed() < headers_request_cooldown()
+                                if now.duration_since(ts)
+                                    < headers_request_cooldown_for(local_height, payload.height)
                                     && last_start == Some(start_hash)
                                 {
                                     allowed = false;
