@@ -2927,6 +2927,12 @@ async fn main() {
                 )
                 .await
                 .unwrap_or_default();
+                let current_peer_count = tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    node_clone.peer_count(),
+                )
+                .await
+                .unwrap_or_else(|_| peers.len());
                 maintenance_ticks = maintenance_ticks.wrapping_add(1);
                 if maintenance_ticks % 6 == 0 {
                     let maintenance_node = node_clone.clone();
@@ -3006,7 +3012,7 @@ async fn main() {
                 last_mempool_size = mempool_size;
 
                 status_height.store(local_height, Ordering::Relaxed);
-                status_peer_count.store(peer_ips.len(), Ordering::Relaxed);
+                status_peer_count.store(current_peer_count, Ordering::Relaxed);
                 let sybil_now = match tokio::time::timeout(
                     std::time::Duration::from_millis(250),
                     node_clone.current_sybil_difficulty(),
@@ -3036,7 +3042,7 @@ async fn main() {
                         local_height,
                         peer_height,
                         ahead,
-                        peer_ips.len(),
+                        current_peer_count,
                         dbg.sync_requests,
                         dbg.getblocks_inflight,
                         dbg.handshake_failures
@@ -3095,7 +3101,7 @@ async fn main() {
                             "chain_height": chain_height,
                             "peer_height": peer_height,
                             "next_height": next_height,
-                            "peers": peer_ips.len(),
+                            "peers": current_peer_count,
                             "peer_sample": peer_sample,
                             "seed_count": seed_count,
                             "agent": std::env::var("IRIUM_NODE_AGENT").unwrap_or_else(|_| "Irium-Node".to_string()),
@@ -3112,7 +3118,7 @@ async fn main() {
                         local_height,
                         next_height,
                         short_tip,
-                        peer_ips.len(),
+                        current_peer_count,
                         seed_count,
                         mempool_size
                     );
