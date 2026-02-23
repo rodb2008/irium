@@ -2994,11 +2994,10 @@ impl P2PNode {
                                 {
                                     let mut state = peer_state.lock().await;
                                     let now = Instant::now();
-                                    let inflight_recent = state.headers_inflight
-                                        && state
-                                            .last_headers_request
-                                            .map(|ts| now.duration_since(ts) <= headers_response_window())
-                                            .unwrap_or(false);
+                                    let inflight_recent = state
+                                        .last_headers_request
+                                        .map(|ts| now.duration_since(ts) <= headers_response_window())
+                                        .unwrap_or(false);
                                     if !inflight_recent {
                                         state.unsolicited_headers = state.unsolicited_headers.saturating_add(1);
                                         let should_log = state
@@ -4824,11 +4823,10 @@ async fn handle_incoming_with_sybil(
                         {
                             let mut state = peer_state.lock().await;
                             let now = Instant::now();
-                            let inflight_recent = state.headers_inflight
-                                && state
-                                    .last_headers_request
-                                    .map(|ts| now.duration_since(ts) <= headers_response_window())
-                                    .unwrap_or(false);
+                            let inflight_recent = state
+                                        .last_headers_request
+                                        .map(|ts| now.duration_since(ts) <= headers_response_window())
+                                        .unwrap_or(false);
                             if !inflight_recent {
                                 state.unsolicited_headers = state.unsolicited_headers.saturating_add(1);
                                 let should_log = state
