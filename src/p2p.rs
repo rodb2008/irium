@@ -158,14 +158,25 @@ fn persist_tx() -> mpsc::Sender<PersistTask> {
 
 async fn enqueue_persist_block(height: u64, hash: [u8; 32], block: Block) {
     let tx = persist_tx();
-    let _ = tx
+    if let Err(e) = tx
         .send(PersistTask {
             height,
             hash,
             block,
             enqueued_at: Instant::now(),
         })
-        .await;
+        .await
+    {
+        let short = {
+            let hx = hex::encode(hash);
+            hx.get(0..12).unwrap_or(&hx).to_string()
+        };
+        P2PNode::log_event(
+            "warn",
+            "chain",
+            format!("persist enqueue failed for block {} at {}: {}", short, height, e),
+        );
+    }
 }
 
 fn stateless_block_precheck(block: &Block) -> Result<(), String> {

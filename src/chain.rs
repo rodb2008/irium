@@ -1173,3 +1173,160 @@ pub fn decode_compact_tx(raw: &[u8]) -> Transaction {
         locktime,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn coinbase_tx(value: u64, tag: &[u8]) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0u8; 32],
+                prev_index: 0xffff_ffff,
+                script_sig: tag.to_vec(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value,
+                script_pubkey: vec![0x51],
+            }],
+            locktime: 0,
+        }
+    }
+
+    fn mine_block(mut block: Block) -> Block {
+        let target = block.header.target();
+        for nonce in 0..u32::MAX {
+            block.header.nonce = nonce;
+            let h = block.header.hash();
+            if meets_target(&h, target) {
+                return block;
+            }
+        }
+        panic!("failed to mine test block");
+    }
+
+    fn make_block(prev: &Block, _height: u64, bits: u32, reward: u64, tag: &[u8]) -> Block {
+        let tx = coinbase_tx(reward, tag);
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: prev.header.hash(),
+                merkle_root: [0u8; 32],
+                time: prev.header.time.saturating_add(1),
+                bits,
+                nonce: 0,
+            },
+            transactions: vec![tx],
+        };
+        block.header.merkle_root = block.merkle_root();
+        mine_block(block)
+    }
+
+    fn make_genesis(bits: u32) -> Block {
+        let now = Utc::now().timestamp() as u32;
+        let tx = coinbase_tx(50, b"genesis");
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: [0u8; 32],
+                merkle_root: [0u8; 32],
+                time: now,
+                bits,
+                nonce: 0,
+            },
+            transactions: vec![tx],
+        };
+        block.header.merkle_root = block.merkle_root();
+        mine_block(block)
+    }
+
+    fn utxo_maps_equal(a: &HashMap<OutPoint, UtxoEntry>, b: &HashMap<OutPoint, UtxoEntry>) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        for (k, va) in a {
+            let Some(vb) = b.get(k) else { return false; };
+            if va.height != vb.height || va.is_coinbase != vb.is_coinbase || va.output != vb.output {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn incremental_reorg_two_nodes_keeps_utxo_consistent() {
+        let bits = 0x207f_ffffu32;
+        let genesis = make_genesis(bits);
+        let params = ChainParams {
+            genesis_block: genesis.clone(),
+            pow_limit: Target { bits },
+        };
+
+        let mut node_a = ChainState::new(params.clone());
+        let mut _node_b = ChainState::new(params);
+
+        let a1 = make_block(&genesis, 1, bits, block_reward(1), b"a1");
+        node_a.process_block(a1.clone()).expect("a1");
+
+        let b1 = make_block(&genesis, 1, bits, block_reward(1), b"b1");
+        let b2 = make_block(&b1, 2, bits, block_reward(2), b"b2");
+
+        node_a.process_block(b1.clone()).expect("store competing b1");
+        node_a.process_block(b2.clone()).expect("reorg to b2");
+
+        assert_eq!(node_a.tip_hash(), b2.header.hash());
+        assert_eq!(node_a.tip_height(), 2);
+
+        let a1_op = OutPoint {
+            txid: a1.transactions[0].txid(),
+            index: 0,
+        };
+        assert!(!node_a.utxos.contains_key(&a1_op));
+
+        let b1_op = OutPoint {
+            txid: b1.transactions[0].txid(),
+            index: 0,
+        };
+        let b2_op = OutPoint {
+            txid: b2.transactions[0].txid(),
+            index: 0,
+        };
+        assert!(node_a.utxos.contains_key(&b1_op));
+        assert!(node_a.utxos.contains_key(&b2_op));
+
+        let expected_issued = node_a
+            .chain
+            .iter()
+            .map(|b| b.transactions[0].outputs.iter().map(|o| o.value).sum::<u64>())
+            .sum::<u64>();
+        assert_eq!(node_a.issued, expected_issued);
+    }
+
+    #[test]
+    fn invalid_block_apply_is_all_or_nothing() {
+        let bits = 0x207f_ffffu32;
+        let genesis = make_genesis(bits);
+        let params = ChainParams {
+            genesis_block: genesis.clone(),
+            pow_limit: Target { bits },
+        };
+        let mut chain = ChainState::new(params);
+
+        let before_utxos = chain.utxos.clone();
+        let before_issued = chain.issued;
+        let before_height = chain.height;
+
+        let mut invalid = make_block(&genesis, 1, bits, block_reward(1), b"bad");
+        invalid.transactions[0].outputs[0].value = block_reward(1).saturating_add(1);
+        invalid.header.merkle_root = invalid.merkle_root();
+        let invalid = mine_block(invalid);
+
+        let res = chain.connect_block(invalid);
+        assert!(res.is_err());
+        assert_eq!(chain.issued, before_issued);
+        assert_eq!(chain.height, before_height);
+        assert!(utxo_maps_equal(&chain.utxos, &before_utxos));
+    }
+}
