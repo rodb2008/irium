@@ -3529,7 +3529,7 @@ impl P2PNode {
                                                     unknown_parent = true;
                                                     if let Some(peer_height) = peer_height_hint {
                                                         let local_height = guard.tip_height();
-                                                        if peer_height > local_height && local_height < 64 {
+                                                        if peer_height > local_height {
                                                             reset_headers = true;
                                                         }
                                                     }
@@ -5417,7 +5417,7 @@ async fn handle_incoming_with_sybil(
                                                 unknown_parent = true;
                                                 if let Some(peer_height) = peer_height_hint {
                                                     let local_height = guard.tip_height();
-                                                    if peer_height > local_height && local_height < 64 {
+                                                    if peer_height > local_height {
                                                         reset_headers = true;
                                                     }
                                                 }
