@@ -3273,7 +3273,7 @@ impl P2PNode {
                                             send_message_detached(&writer, msg, addr);
                                         }
                                     }
-                                                                } else if added_any {
+                                } else if peer_height > local_height {
                                     let tip_hash = {
                                         let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                         guard.tip_hash()
@@ -3290,6 +3290,18 @@ impl P2PNode {
                                     )
                                     .await
                                     {
+                                        let short = {
+                                            let h = hex::encode(tip_hash);
+                                            h.get(0..12).unwrap_or(&h).to_string()
+                                        };
+                                        P2PNode::log_event(
+                                            "info",
+                                            "sync",
+                                            format!(
+                                                "P2P {}: fallback requesting {} blocks from tip {}",
+                                                addr, MAX_BLOCKS_PER_REQUEST, short
+                                            ),
+                                        );
                                         if let Ok(msg) = get_blocks.to_message() {
                                             send_message_detached(&writer, msg, addr);
                                         }
@@ -5106,7 +5118,8 @@ async fn handle_incoming_with_sybil(
                                             send_message_detached(&writer, msg, addr2);
                                         }
                                     }
-                                                            } else if added_any {
+                                }
+                            } else if peer_height > local_height {
                                 let tip_hash = {
                                     let guard = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.tip_hash()
@@ -5123,6 +5136,18 @@ async fn handle_incoming_with_sybil(
                                 )
                                 .await
                                 {
+                                    let short = {
+                                        let h = hex::encode(tip_hash);
+                                        h.get(0..12).unwrap_or(&h).to_string()
+                                    };
+                                    P2PNode::log_event(
+                                        "info",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: fallback requesting {} blocks from tip {}",
+                                            addr2, MAX_BLOCKS_PER_REQUEST, short
+                                        ),
+                                    );
                                     if let Ok(msg) = get_blocks.to_message() {
                                         if let Some(writer) = writer_weak.upgrade() {
                                             send_message_detached(&writer, msg, addr2);
@@ -5130,12 +5155,11 @@ async fn handle_incoming_with_sybil(
                                     }
                                 }
                             }
+
                             {
                                 let mut state = peer_state2.lock().await;
                                 state.last_headers_received = Some(Instant::now());
                                 state.headers_processing = false;
-                            }
-
                             }
                         });
                     }
