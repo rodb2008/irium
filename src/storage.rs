@@ -1,11 +1,12 @@
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc::{sync_channel, SyncSender},
-    OnceLock,
+    Mutex, OnceLock,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{
+    collections::BTreeSet,
     env, fs,
     path::{Component, Path, PathBuf},
 };
@@ -37,6 +38,10 @@ static PERSISTED_CONTIGUOUS_HEIGHT: AtomicU64 = AtomicU64::new(0);
 static PERSISTED_MAX_HEIGHT_ON_DISK: AtomicU64 = AtomicU64::new(0);
 static PERSISTED_WINDOW_TIP: AtomicU64 = AtomicU64::new(0);
 static MISSING_PERSISTED_IN_WINDOW: AtomicU64 = AtomicU64::new(0);
+static GAP_HEALER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static GAP_HEALER_LAST_PROGRESS_TS: AtomicU64 = AtomicU64::new(0);
+static GAP_HEALER_LAST_FILLED_HEIGHT: AtomicU64 = AtomicU64::new(0);
+static GAP_HEALER_PENDING: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
 static QUARANTINE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn persist_async_enabled() -> bool {
@@ -149,6 +154,75 @@ pub fn missing_persisted_in_window() -> u64 {
 
 pub fn set_missing_persisted_in_window(missing: u64) {
     MISSING_PERSISTED_IN_WINDOW.store(missing, Ordering::Relaxed);
+}
+
+fn gap_healer_pending_set() -> &'static Mutex<BTreeSet<u64>> {
+    GAP_HEALER_PENDING.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn gap_healer_touch_progress(height: u64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    GAP_HEALER_LAST_PROGRESS_TS.store(now, Ordering::Relaxed);
+    GAP_HEALER_LAST_FILLED_HEIGHT.store(height, Ordering::Relaxed);
+}
+
+pub fn gap_healer_active() -> bool {
+    GAP_HEALER_ACTIVE.load(Ordering::Relaxed)
+}
+
+pub fn set_gap_healer_active(active: bool) {
+    GAP_HEALER_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+pub fn gap_healer_last_progress_ts() -> u64 {
+    GAP_HEALER_LAST_PROGRESS_TS.load(Ordering::Relaxed)
+}
+
+pub fn gap_healer_last_filled_height() -> Option<u64> {
+    let h = GAP_HEALER_LAST_FILLED_HEIGHT.load(Ordering::Relaxed);
+    if h == 0 {
+        None
+    } else {
+        Some(h)
+    }
+}
+
+pub fn gap_healer_pending_count() -> u64 {
+    gap_healer_pending_set()
+        .lock()
+        .map(|g| g.len() as u64)
+        .unwrap_or(0)
+}
+
+pub fn set_gap_healer_missing_heights(heights: &[u64]) {
+    if let Ok(mut g) = gap_healer_pending_set().lock() {
+        g.clear();
+        for h in heights {
+            g.insert(*h);
+        }
+        MISSING_PERSISTED_IN_WINDOW.store(g.len() as u64, Ordering::Relaxed);
+    }
+}
+
+pub fn gap_healer_batch(limit: usize) -> Vec<u64> {
+    if let Ok(g) = gap_healer_pending_set().lock() {
+        return g.iter().copied().take(limit).collect();
+    }
+    Vec::new()
+}
+
+pub fn gap_healer_mark_filled(height: u64) -> bool {
+    if let Ok(mut g) = gap_healer_pending_set().lock() {
+        if g.remove(&height) {
+            MISSING_PERSISTED_IN_WINDOW.store(g.len() as u64, Ordering::Relaxed);
+            gap_healer_touch_progress(height);
+            return true;
+        }
+    }
+    false
 }
 
 pub fn quarantine_count() -> u64 {
