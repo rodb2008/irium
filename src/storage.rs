@@ -1,4 +1,10 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    mpsc::{sync_channel, SyncSender},
+    OnceLock,
+};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{
     env, fs,
     path::{Component, Path, PathBuf},
@@ -12,6 +18,123 @@ use sha2::{Digest, Sha256};
 use crate::block::Block;
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
+
+#[derive(Clone)]
+struct PersistJob {
+    height: u64,
+    block: Block,
+}
+
+struct PersistWriter {
+    sender: Option<SyncSender<PersistJob>>,
+    async_mode: bool,
+}
+
+static PERSIST_WRITER: OnceLock<PersistWriter> = OnceLock::new();
+static PERSIST_QUEUE_LEN: AtomicUsize = AtomicUsize::new(0);
+static PERSISTED_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+fn persist_async_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env::var("IRIUM_PERSIST_ASYNC")
+            .ok()
+            .map(|v| {
+                let v = v.to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off")
+            })
+            .unwrap_or(true)
+    })
+}
+
+fn persist_queue_capacity() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        env::var("IRIUM_PERSIST_QUEUE_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(64, 65536))
+            .unwrap_or(4096)
+    })
+}
+
+pub fn persisted_height() -> u64 {
+    PERSISTED_HEIGHT.load(Ordering::Relaxed)
+}
+
+pub fn set_persisted_height(height: u64) {
+    let mut current = PERSISTED_HEIGHT.load(Ordering::Relaxed);
+    while height > current {
+        match PERSISTED_HEIGHT.compare_exchange_weak(
+            current,
+            height,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(v) => current = v,
+        }
+    }
+}
+
+pub fn persist_queue_len() -> usize {
+    PERSIST_QUEUE_LEN.load(Ordering::Relaxed)
+}
+
+pub fn init_persist_writer() {
+    let _ = PERSIST_WRITER.get_or_init(|| {
+        if !persist_async_enabled() {
+            return PersistWriter {
+                sender: None,
+                async_mode: false,
+            };
+        }
+
+        let (tx, rx) = sync_channel::<PersistJob>(persist_queue_capacity());
+        thread::spawn(move || {
+            let mut last_checkpoint = Instant::now();
+            loop {
+                let job = match rx.recv() {
+                    Ok(j) => j,
+                    Err(_) => break,
+                };
+                if let Err(e) = write_block_json_sync(job.height, &job.block) {
+                    eprintln!(
+                        "[warn] persist writer failed for block {}: {}",
+                        job.height, e
+                    );
+                }
+                set_persisted_height(job.height);
+                PERSIST_QUEUE_LEN.fetch_sub(1, Ordering::Relaxed);
+
+                if last_checkpoint.elapsed() >= Duration::from_secs(5) {
+                    eprintln!(
+                        "[i] persist checkpoint: persisted_height={} queue_len={}",
+                        persisted_height(),
+                        persist_queue_len()
+                    );
+                    last_checkpoint = Instant::now();
+                }
+            }
+        });
+
+        PersistWriter {
+            sender: Some(tx),
+            async_mode: true,
+        }
+    });
+}
+
+pub fn drain_persist_queue(timeout: Duration) -> bool {
+    let start = Instant::now();
+    while persist_queue_len() > 0 {
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
 
 fn sanitize_filename_component(name: &std::ffi::OsStr) -> String {
     // This file name ultimately comes from `Path::file_name()`, but we still sanitize
@@ -224,7 +347,7 @@ fn maybe_quarantine_existing_block(path: &Path, new_hash: &str) -> std::io::Resu
     Ok(())
 }
 
-pub fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
+fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
     let dir = blocks_dir();
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("block_{}.json", height));
@@ -255,5 +378,27 @@ pub fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
     };
 
     let json = serde_json::to_string_pretty(&jb)?;
-    fs::write(path, json)
+    fs::write(path, json)?;
+    set_persisted_height(height);
+    Ok(())
+}
+
+pub fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
+    init_persist_writer();
+    if let Some(writer) = PERSIST_WRITER.get() {
+        if writer.async_mode {
+            if let Some(ref tx) = writer.sender {
+                PERSIST_QUEUE_LEN.fetch_add(1, Ordering::Relaxed);
+                if let Err(err) = tx.send(PersistJob {
+                    height,
+                    block: block.clone(),
+                }) {
+                    PERSIST_QUEUE_LEN.fetch_sub(1, Ordering::Relaxed);
+                    return write_block_json_sync(err.0.height, &err.0.block);
+                }
+                return Ok(());
+            }
+        }
+    }
+    write_block_json_sync(height, block)
 }

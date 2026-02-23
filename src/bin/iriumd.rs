@@ -60,6 +60,8 @@ struct AppState {
     status_height_cache: Arc<AtomicU64>,
     status_peer_count_cache: Arc<AtomicUsize>,
     status_sybil_cache: Arc<AtomicU8>,
+    status_persisted_height_cache: Arc<AtomicU64>,
+    status_persist_queue_cache: Arc<AtomicUsize>,
 }
 
 #[derive(Serialize)]
@@ -84,6 +86,8 @@ struct StatusResponse {
     anchor_loaded: bool,
     node_id: Option<String>,
     sybil_difficulty: Option<u8>,
+    persisted_height: u64,
+    persist_queue_len: usize,
 }
 
 #[derive(Serialize)]
@@ -970,12 +974,82 @@ fn load_persisted_blocks_from(state: &mut ChainState, dir: &std::path::Path, ski
     }
 }
 
+fn highest_persisted_height_in_dir(dir: &std::path::Path) -> u64 {
+    let mut highest = 0u64;
+    let Ok(read_dir) = dir.read_dir() else {
+        return highest;
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stripped) = name.strip_prefix("block_") else {
+            continue;
+        };
+        let Some(num_part) = stripped.strip_suffix(".json") else {
+            continue;
+        };
+        let Ok(h) = num_part.parse::<u64>() else {
+            continue;
+        };
+        highest = highest.max(h);
+    }
+    highest
+}
+
 fn load_persisted_blocks(state: &mut ChainState) {
     let node_dir = storage::blocks_dir();
-    load_persisted_blocks_from(state, &node_dir, false);
     let miner_dir = miner_blocks_dir();
+
+    let mut highest_persisted = highest_persisted_height_in_dir(&node_dir);
+    if !same_dir(&node_dir, &miner_dir) {
+        highest_persisted = highest_persisted.max(highest_persisted_height_in_dir(&miner_dir));
+    }
+
+    load_persisted_blocks_from(state, &node_dir, false);
     if !same_dir(&node_dir, &miner_dir) {
         load_persisted_blocks_from(state, &miner_dir, true);
+    }
+
+    let tip_height = state.tip_height();
+    let tip_hash = hex::encode(state.tip_hash());
+    storage::set_persisted_height(tip_height);
+    let queue_len = storage::persist_queue_len();
+
+    println!(
+        "[i] Startup source-of-truth: disk blocks are authoritative only up to last contiguous persisted height; node will continue from tip={} hash={} and resync missing continuity from network.",
+        tip_height, tip_hash
+    );
+
+    if highest_persisted > tip_height {
+        let gap = highest_persisted - tip_height;
+        let writer_may_be_behind = queue_len as u64 >= gap;
+        if writer_may_be_behind {
+            println!(
+                "[i] Persisted block gap detected: tip_height={} tip_hash={} highest_persisted_height={} persist_queue_len={}. writer may be behind; will backfill.",
+                tip_height,
+                tip_hash,
+                highest_persisted,
+                queue_len
+            );
+        } else {
+            eprintln!(
+                "[warn] Persisted block gap detected: tip_height={} tip_hash={} highest_persisted_height={} persist_queue_len={}. gap may break restart continuity; will resync from network.",
+                tip_height,
+                tip_hash,
+                highest_persisted,
+                queue_len
+            );
+        }
+    } else {
+        println!(
+            "[i] Persist continuity OK: tip_height={} tip_hash={} highest_persisted_height={} persist_queue_len={}.",
+            tip_height,
+            tip_hash,
+            highest_persisted,
+            queue_len
+        );
     }
 
     if state.height > 1 {
@@ -1412,6 +1486,15 @@ async fn status(
         Err(_) => state.status_height_cache.load(Ordering::Relaxed),
     };
 
+    let persisted_height = storage::persisted_height();
+    state
+        .status_persisted_height_cache
+        .store(persisted_height, Ordering::Relaxed);
+    let persist_queue_len = storage::persist_queue_len();
+    state
+        .status_persist_queue_cache
+        .store(persist_queue_len, Ordering::Relaxed);
+
     Ok(Json(StatusResponse {
         height,
         genesis_hash: state.genesis_hash.clone(),
@@ -1420,6 +1503,8 @@ async fn status(
         anchor_loaded: state.anchors.is_some(),
         node_id,
         sybil_difficulty: sybil_diff,
+        persisted_height,
+        persist_queue_len,
     }))
 }
 
@@ -2610,6 +2695,7 @@ async fn main() {
         state_dir.display(),
         blocks_dir.display()
     );
+    storage::init_persist_writer();
     // Initialize chain state with locked genesis.
     let locked = load_locked_genesis().expect("load locked genesis");
     let genesis_hash = locked.header.hash.clone();
@@ -2901,6 +2987,8 @@ async fn main() {
     }));
     let status_peer_count_cache = Arc::new(AtomicUsize::new(0));
     let status_sybil_cache = Arc::new(AtomicU8::new(0));
+    let status_persisted_height_cache = Arc::new(AtomicU64::new(storage::persisted_height()));
+    let status_persist_queue_cache = Arc::new(AtomicUsize::new(storage::persist_queue_len()));
 
     // Periodic heartbeat logging to surface peers and seedlist.
     if let Some(ref node) = p2p {
@@ -3165,7 +3253,34 @@ async fn main() {
         status_height_cache,
         status_peer_count_cache,
         status_sybil_cache,
+        status_persisted_height_cache,
+        status_persist_queue_cache,
     };
+
+    let persist_drain_secs = std::env::var("IRIUM_PERSIST_DRAIN_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5)
+        .clamp(0, 60);
+    if persist_drain_secs > 0 {
+        #[cfg(unix)]
+        {
+            tokio::spawn(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let _ = sigterm.recv().await;
+                let ok = storage::drain_persist_queue(Duration::from_secs(persist_drain_secs));
+                if ok {
+                    eprintln!("[i] persist queue drained on shutdown");
+                } else {
+                    eprintln!("[warn] persist queue drain timeout on shutdown");
+                }
+            });
+        }
+    }
 
     let mut app = Router::new()
         .route("/status", get(status))
