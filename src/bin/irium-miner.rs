@@ -121,6 +121,34 @@ fn prune_blocks_above(height: u64) {
     }
 }
 
+fn quarantine_single_block_file(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !path.exists() {
+        return None;
+    }
+    let dir = path.parent()?;
+    let name = path.file_name()?.to_str()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let backup_dir = dir.join(format!("orphaned_{}", stamp));
+    let _ = fs::create_dir_all(&backup_dir);
+    let mut dest = backup_dir.join(name);
+    if dest.exists() {
+        let mut n = 1u32;
+        loop {
+            let candidate = backup_dir.join(format!("{}.dup{}", name, n));
+            if !candidate.exists() {
+                dest = candidate;
+                break;
+            }
+            n += 1;
+        }
+    }
+    fs::rename(path, &dest).ok()?;
+    Some(dest)
+}
+
 fn mempool_file() -> PathBuf {
     if let Ok(path) = env::var("IRIUM_MEMPOOL_FILE") {
         PathBuf::from(path)
@@ -704,6 +732,23 @@ fn load_persisted_blocks(state: &mut ChainState) {
     entries.sort_by_key(|(h, _)| *h);
 
     for (h, path) in entries {
+        if h == 0 {
+            continue;
+        }
+
+        let expected_next = state.tip_height().saturating_add(1);
+        if h < expected_next {
+            continue;
+        }
+        if h > expected_next {
+            println!(
+                "[i] Persisted block gap at height {} (found {}), stopping replay at {}",
+                expected_next,
+                h,
+                state.tip_height()
+            );
+            break;
+        }
         match std::fs::read_to_string(&path) {
             Ok(data) => {
                 let parsed: serde_json::Value = match serde_json::from_str(&data) {
@@ -782,9 +827,13 @@ fn load_persisted_blocks(state: &mut ChainState) {
 
                 if let Err(e) = state.connect_block(block) {
                     eprintln!("[⚠️] Failed to connect persisted block {}: {}", h, e);
-                    let tip = state.tip_height();
-                    prune_blocks_above(tip);
-                    println!("[🧹] Pruned persisted blocks above height {}", tip);
+                    if let Some(dest) = quarantine_single_block_file(&path) {
+                        println!(
+                            "[🧹] Quarantined invalid persisted block {} -> {}",
+                            path.display(),
+                            dest.display()
+                        );
+                    }
                     break;
                 }
             }
