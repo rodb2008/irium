@@ -3155,6 +3155,7 @@ impl P2PNode {
                                         .unwrap_or(last_handshake_height.unwrap_or(local_height))
                                         .max(last_handshake_height.unwrap_or(local_height))
                                         .max(local_height)
+                                        .max(local_height.saturating_add(header_count as u64))
                                 };
                                 {
                                     let mut state = peer_state.lock().await;
@@ -3273,7 +3274,7 @@ impl P2PNode {
                                             send_message_detached(&writer, msg, addr);
                                         }
                                     }
-                                } else if peer_height > local_height {
+                                } else if peer_height > local_height || header_count > 0 {
                                     let tip_hash = {
                                         let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                         guard.tip_hash()
@@ -5010,7 +5011,8 @@ async fn handle_incoming_with_sybil(
                                     .unwrap_or(last_handshake_height.unwrap_or(local_height))
                                     .max(last_handshake_height.unwrap_or(local_height))
                                     .max(local_height)
-                            };
+                                        .max(local_height.saturating_add(header_count as u64))
+                                };
                             {
                                 let mut state = peer_state2.lock().await;
                                 state.height = Some(peer_height);
@@ -5119,7 +5121,7 @@ async fn handle_incoming_with_sybil(
                                         }
                                     }
                                 }
-                            } else if peer_height > local_height {
+                            } else if peer_height > local_height || header_count > 0 {
                                 let tip_hash = {
                                     let guard = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.tip_hash()
