@@ -585,6 +585,7 @@ struct PeerSyncState {
     headers_processing: bool,
     unsolicited_headers: u32,
     last_unsolicited_log: Option<Instant>,
+    last_bad_headers: Option<Instant>,
 }
 
 impl Default for PeerSyncState {
@@ -603,6 +604,7 @@ impl Default for PeerSyncState {
             headers_processing: false,
             unsolicited_headers: 0,
             last_unsolicited_log: None,
+            last_bad_headers: None,
         }
     }
 }
@@ -2602,7 +2604,6 @@ impl P2PNode {
                                     payload.relay_address.clone(),
                                     node_id.clone(),
                                 );
-                                dir_guard.record_height(&multiaddr, payload.height);
                                 dir_guard.mark_dialable(&multiaddr);
                             }
                             let should_log = last_handshake_height != Some(payload.height)
@@ -2617,7 +2618,6 @@ impl P2PNode {
                             last_handshake_agent = Some(agent_str.clone());
                             {
                                 let mut state = peer_state.lock().await;
-                                state.height = Some(payload.height);
                                 state.tip = parsed_tip;
                                 state.node_id = node_id_bytes.clone();
                                 state.supports_uptime = supports_uptime;
@@ -2699,8 +2699,16 @@ impl P2PNode {
                             } else {
                                 false
                             };
-                            if payload.height > local_height
-                                || (payload.height == local_height && tip_mismatch)
+                            let bad_recent = {
+                                let state = peer_state.lock().await;
+                                state
+                                    .last_bad_headers
+                                    .map(|ts| ts.elapsed() < Duration::from_secs(120))
+                                    .unwrap_or(false)
+                            };
+                            if !bad_recent
+                                && (payload.height > local_height
+                                    || (payload.height == local_height && tip_mismatch))
                             {
                                 let local_tip = P2PNode::tip_hash(&chain_for_sync);
                                 let start_hash = if local_height == 0
@@ -3059,9 +3067,9 @@ impl P2PNode {
                                                     unknown_parent = true;
                                                     if let Some(peer_height) = peer_height_hint {
                                                         let local_height = guard.tip_height();
-                                                        if peer_height > local_height {
-                                                            reset_headers = true;
-                                                        }
+                                                        if peer_height > local_height && local_height < 64 {
+                                                        reset_headers = true;
+                                                    }
                                                     }
                                                 }
                                                 break;
@@ -3103,11 +3111,18 @@ impl P2PNode {
                                                     "sync",
                                                     format!("P2P {}: headers do not connect; ignoring peer height", addr),
                                                 );
+                                        let multiaddr =
+                                            format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
+                                        {
+                                            let mut directory = dir.lock().await;
+                                            directory.clear_height(&multiaddr);
+                                        }
                                         let mut state = peer_state.lock().await;
                                         state.height = None;
                                         state.tip = None;
+                                        state.last_bad_headers = Some(Instant::now());
                                     }
-                                    if reset_headers {
+                                    if reset_headers && added_any {
                                         let get_headers = GetHeadersPayload {
                                             start_hash: vec![0u8; 32],
                                             count: MAX_HEADERS_PER_REQUEST,
@@ -3133,6 +3148,15 @@ impl P2PNode {
                                     let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.tip_height()
                                 };
+                                let validated_peer_height = local_height;
+                                {
+                                    let mut state = peer_state.lock().await;
+                                    state.height = Some(validated_peer_height);
+                                    state.last_bad_headers = None;
+                                }
+                                let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
+                                let mut directory = dir.lock().await;
+                                directory.record_height(&multiaddr, validated_peer_height);
                                 let peer_height = last_handshake_height.unwrap_or(local_height);
                                 if header_count == 0 && peer_height > local_height {
                                     if sync_request_allowed_for(
@@ -4352,7 +4376,6 @@ async fn handle_incoming_with_sybil(
                             payload.relay_address.clone(),
                             payload.node_id.clone(),
                         );
-                        dir.record_height(&multiaddr, payload.height);
                     }
 
                     let parsed_tip = payload
@@ -4372,7 +4395,6 @@ async fn handle_incoming_with_sybil(
                     let supports_uptime = peer_supports_uptime(&payload);
                     {
                         let mut state = peer_state.lock().await;
-                        state.height = Some(payload.height);
                         state.tip = parsed_tip;
                         state.node_id = node_id_bytes.clone();
                         state.supports_uptime = supports_uptime;
@@ -4455,8 +4477,16 @@ async fn handle_incoming_with_sybil(
                     } else {
                         false
                     };
-                    if payload.height > local_height
-                        || (payload.height == local_height && tip_mismatch)
+                    let bad_recent = {
+                        let state = peer_state.lock().await;
+                        state
+                            .last_bad_headers
+                            .map(|ts| ts.elapsed() < Duration::from_secs(120))
+                            .unwrap_or(false)
+                    };
+                    if !bad_recent
+                        && (payload.height > local_height
+                            || (payload.height == local_height && tip_mismatch))
                     {
                         let local_tip = P2PNode::tip_hash(&chain);
                         let start_hash = if local_height == 0
@@ -4762,6 +4792,7 @@ async fn handle_incoming_with_sybil(
                         let sync_requests2 = sync_requests.clone();
                         let block_requests2 = block_requests.clone();
                         let writer_weak = Arc::downgrade(&writer);
+                        let directory2 = directory.clone();
 
                         {
                             let mut state = peer_state.lock().await;
@@ -4845,7 +4876,7 @@ async fn handle_incoming_with_sybil(
                                                 unknown_parent = true;
                                                 if let Some(peer_height) = peer_height_hint {
                                                     let local_height = guard.tip_height();
-                                                    if peer_height > local_height {
+                                                    if peer_height > local_height && local_height < 64 {
                                                         reset_headers = true;
                                                     }
                                                 }
@@ -4893,11 +4924,18 @@ async fn handle_incoming_with_sybil(
                                             addr2
                                         ),
                                     );
+                                    let multiaddr =
+                                        format!("/ip4/{}/tcp/{}", addr2.ip(), addr2.port());
+                                    {
+                                        let mut dir = directory2.lock().await;
+                                        dir.clear_height(&multiaddr);
+                                    }
                                     let mut state = peer_state2.lock().await;
                                     state.height = None;
                                     state.tip = None;
+                                    state.last_bad_headers = Some(Instant::now());
                                 }
-                                if reset_headers {
+                                if reset_headers && added_any {
                                     let get_headers = GetHeadersPayload {
                                         start_hash: vec![0u8; 32],
                                         count: MAX_HEADERS_PER_REQUEST,
@@ -4926,6 +4964,15 @@ async fn handle_incoming_with_sybil(
                                 let guard = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
                                 guard.tip_height()
                             };
+                            let validated_peer_height = local_height;
+                            {
+                                let mut state = peer_state2.lock().await;
+                                state.height = Some(validated_peer_height);
+                                state.last_bad_headers = None;
+                            }
+                            let multiaddr = format!("/ip4/{}/tcp/{}", addr2.ip(), addr2.port());
+                            let mut dir = directory2.lock().await;
+                            dir.record_height(&multiaddr, validated_peer_height);
                             let peer_height = last_handshake_height.unwrap_or(local_height);
 
                             if header_count == 0 && peer_height > local_height {

@@ -597,4 +597,12 @@ impl PeerDirectory {
             self.flush();
         }
     }
+
+    pub fn clear_height(&mut self, multiaddr: &str) {
+        if let Some(rec) = self.records.get_mut(multiaddr) {
+            rec.last_height = None;
+            rec.touch();
+            self.flush();
+        }
+    }
 }

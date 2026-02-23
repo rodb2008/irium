@@ -3020,7 +3020,9 @@ async fn main() {
 
                 let next_height = local_height.saturating_add(1);
                 let peer_height = best_peer_height.unwrap_or(0);
-                let chain_height = std::cmp::max(local_height, peer_height);
+                // Report validated local chain height in heartbeat to avoid misleading
+                // peer-advertised heights during fork/header-spam conditions.
+                let chain_height = local_height;
 
                 hb_ticks = hb_ticks.wrapping_add(1);
 
