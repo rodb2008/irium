@@ -1716,6 +1716,30 @@ impl P2PNode {
         self.handshake_failures.lock().await.clear();
     }
 
+    /// Proactively request headers and blocks from all connected peers at the current tip.
+    pub async fn force_sync_burst_from_tip(
+        &self,
+        start_hash: [u8; 32],
+    ) -> Result<(usize, usize), String> {
+        let headers = GetHeadersPayload {
+            start_hash: start_hash.to_vec(),
+            count: MAX_HEADERS_PER_REQUEST,
+        }
+        .to_message()?;
+        let blocks = GetBlocksPayload {
+            start_hash: start_hash.to_vec(),
+            count: MAX_BLOCKS_PER_REQUEST,
+        }
+        .to_message()?;
+
+        let headers_ok = broadcast_raw(&self.peers, &headers.serialize()).await;
+        let blocks_ok = broadcast_raw(&self.peers, &blocks.serialize()).await;
+        if headers_ok == 0 && blocks_ok == 0 {
+            return Err("sync burst had no writable peers".to_string());
+        }
+        Ok((headers_ok, blocks_ok))
+    }
+
     /// Request peer lists from all connected peers.
     pub async fn request_peers(&self) -> Result<(), String> {
         let msg = EmptyPayload::to_message(MessageType::GetPeers)?;
