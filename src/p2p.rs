@@ -9,12 +9,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use crate::block::Block;
 use crate::chain::ChainState;
 use crate::mempool::MempoolManager;
 use crate::network::{PeerDirectory, PeerRecord};
+use crate::pow::meets_target;
 use crate::protocol::{
     BlockPayload, EmptyPayload, GetBlocksPayload, GetDataPayload, GetHeadersPayload,
     HandshakePayload, HeadersPayload, InvPayload, MempoolPayload, Message, MessageType,
@@ -63,6 +64,122 @@ where
         f()
     })
     .await
+}
+
+
+#[derive(Clone)]
+struct PersistTask {
+    height: u64,
+    hash: [u8; 32],
+    block: Block,
+    enqueued_at: Instant,
+}
+
+#[derive(Default)]
+struct SyncPerf {
+    blocks: u64,
+    decode_ms: u128,
+    precheck_ms: u128,
+    connect_ms: u128,
+    persist_ms: u128,
+    start: Option<Instant>,
+}
+
+fn sync_perf_state() -> &'static StdMutex<SyncPerf> {
+    static VAL: OnceLock<StdMutex<SyncPerf>> = OnceLock::new();
+    VAL.get_or_init(|| StdMutex::new(SyncPerf::default()))
+}
+
+fn sync_perf_record(decode: u128, precheck: u128, connect: u128, persist: u128) {
+    let m = sync_perf_state();
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    if g.start.is_none() {
+        g.start = Some(Instant::now());
+    }
+    g.blocks = g.blocks.saturating_add(1);
+    g.decode_ms = g.decode_ms.saturating_add(decode);
+    g.precheck_ms = g.precheck_ms.saturating_add(precheck);
+    g.connect_ms = g.connect_ms.saturating_add(connect);
+    g.persist_ms = g.persist_ms.saturating_add(persist);
+    if g.blocks % 100 == 0 {
+        let elapsed = g.start.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let bps = if elapsed > 0.0 { g.blocks as f64 / elapsed } else { 0.0 };
+        P2PNode::log_event(
+            "info",
+            "sync",
+            format!(
+                "sync perf: blocks={} bps={:.2} decode_ms={} precheck_ms={} connect_ms={} persist_ms={}",
+                g.blocks, bps, g.decode_ms, g.precheck_ms, g.connect_ms, g.persist_ms
+            ),
+        );
+    }
+}
+
+fn persist_queue_capacity() -> usize {
+    std::env::var("IRIUM_PERSIST_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2048)
+        .clamp(64, 16384)
+}
+
+fn persist_tx() -> mpsc::Sender<PersistTask> {
+    static TX: OnceLock<mpsc::Sender<PersistTask>> = OnceLock::new();
+    if let Some(tx) = TX.get() {
+        return tx.clone();
+    }
+    let (tx, mut rx) = mpsc::channel::<PersistTask>(persist_queue_capacity());
+    let _ = TX.set(tx.clone());
+    tokio::spawn(async move {
+        while let Some(task) = rx.recv().await {
+            let started = Instant::now();
+            let h = task.height;
+            let bh = task.hash;
+            let b = task.block;
+            let write_res = spawn_blocking_limited(move || storage::write_block_json(h, &b)).await;
+            let persist_ms = started.elapsed().as_millis();
+            if let Ok(Err(e)) = write_res {
+                let short = {
+                    let hx = hex::encode(bh);
+                    hx.get(0..12).unwrap_or(&hx).to_string()
+                };
+                P2PNode::log_event(
+                    "warn",
+                    "chain",
+                    format!("persist failed for block {} at {}: {}", short, h, e),
+                );
+            }
+            let queue_wait_ms = task.enqueued_at.elapsed().as_millis();
+            sync_perf_record(0, 0, 0, persist_ms.saturating_add(queue_wait_ms));
+        }
+    });
+    tx
+}
+
+async fn enqueue_persist_block(height: u64, hash: [u8; 32], block: Block) {
+    let tx = persist_tx();
+    let _ = tx
+        .send(PersistTask {
+            height,
+            hash,
+            block,
+            enqueued_at: Instant::now(),
+        })
+        .await;
+}
+
+fn stateless_block_precheck(block: &Block) -> Result<(), String> {
+    let hash = block.header.hash();
+    if !meets_target(&hash, block.header.target()) {
+        return Err("pow precheck failed".to_string());
+    }
+    if block.header.prev_hash != [0u8; 32] {
+        let merkle = block.merkle_root();
+        if block.header.merkle_root != merkle {
+            return Err("merkle precheck failed".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn sync_cooldown() -> Duration {
@@ -3917,8 +4034,20 @@ impl P2PNode {
                     MessageType::Block => {
                         if let Some(ref chain_arc) = chain_for_sync {
                             if let Ok(payload) = BlockPayload::from_message(&msg) {
+                                let decode_started = Instant::now();
                                 match Block::deserialize(&payload.block_data) {
                                     Ok((block, _)) => {
+                                        let decode_ms = decode_started.elapsed().as_millis();
+                                        let precheck_started = Instant::now();
+                                        if let Err(e) = stateless_block_precheck(&block) {
+                                            P2PNode::log_event(
+                                                "warn",
+                                                "chain",
+                                                format!("P2P {}: stateless precheck failed: {}", addr, e),
+                                            );
+                                            continue;
+                                        }
+                                        let precheck_ms = precheck_started.elapsed().as_millis();
                                         let bhash = block.header.hash();
                                         let short = hex::encode(bhash);
                                         let short = short.get(0..12).unwrap_or(&short);
@@ -3951,6 +4080,7 @@ impl P2PNode {
                                             ),
                                         );
 
+                                        let connect_started = Instant::now();
                                         let (new_height_opt, record_verdict, persist_blocks, orphan_prev) =
                                             match spawn_blocking_limited(move || {
                                                 let mut guard =
@@ -4026,18 +4156,12 @@ impl P2PNode {
                                                 Ok(v) => v,
                                                 Err(_) => (None, None, Vec::new(), None),
                                             };
+                                        let connect_ms = connect_started.elapsed().as_millis();
                                         for (height, b) in persist_blocks {
-                                            if let Err(e) = storage::write_block_json(height, &b) {
-                                                P2PNode::log_event(
-                                                    "warn",
-                                                    "chain",
-                                                    format!(
-                                                        "P2P {}: failed to persist block {}: {}",
-                                                        addr, short, e
-                                                    ),
-                                                );
-                                            }
+                                            let h = b.header.hash();
+                                            enqueue_persist_block(height, h, b).await;
                                         }
+                                        sync_perf_record(decode_ms, precheck_ms, connect_ms, 0);
                                         if let Some(prev_hash) = orphan_prev {
                                             request_orphan_headers(
                                                 &writer,
@@ -5820,6 +5944,7 @@ async fn handle_incoming_with_sybil(
             MessageType::Block => {
                 if let Some(ref chain_arc) = chain {
                     if let Ok(payload) = BlockPayload::from_message(&msg) {
+                        let decode_started = Instant::now();
                         let addr2 = addr;
                         let chain_arc2 = chain_arc.clone();
                         let mempool2 = mempool.clone();
@@ -5848,10 +5973,23 @@ async fn handle_incoming_with_sybil(
                                 }
                             };
 
+                            let decode_ms = decode_started.elapsed().as_millis();
+                            let precheck_started = Instant::now();
+                            if let Err(e) = stateless_block_precheck(&block) {
+                                P2PNode::log_event(
+                                    "warn",
+                                    "chain",
+                                    format!("P2P {}: stateless precheck failed: {}", addr2, e),
+                                );
+                                return;
+                            }
+                            let precheck_ms = precheck_started.elapsed().as_millis();
+
                             let bhash = block.header.hash();
                             let short = hex::encode(bhash);
                             let short = short.get(0..12).unwrap_or(&short).to_string();
 
+                            let connect_started = Instant::now();
                             let (new_height_opt, verdict, persist_blocks) =
                                 match spawn_blocking_limited(move || {
                                     let mut guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
@@ -5890,9 +6028,11 @@ async fn handle_incoming_with_sybil(
                                     Err(_) => return,
                                 };
                             drop(permit_guard);
+                            let connect_ms = connect_started.elapsed().as_millis();
 
                             for (height, b) in persist_blocks {
-                                let _ = storage::write_block_json(height, &b);
+                                let h = b.header.hash();
+                                enqueue_persist_block(height, h, b.clone()).await;
                                 if let Some(ref mem) = mempool2 {
                                     let mut mem_guard = mem.lock().unwrap_or_else(|e| e.into_inner());
                                     for tx in b.transactions.iter().skip(1) {
@@ -5900,6 +6040,7 @@ async fn handle_incoming_with_sybil(
                                     }
                                 }
                             }
+                            sync_perf_record(decode_ms, precheck_ms, connect_ms, 0);
 
                             if let Some(new_height) = new_height_opt {
                                 peer_mark_block_progress(addr2.ip()).await;
