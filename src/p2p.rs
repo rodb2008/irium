@@ -3148,18 +3148,22 @@ impl P2PNode {
                                     let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.tip_height()
                                 };
-                                let validated_peer_height = last_handshake_height
-                                    .unwrap_or(local_height)
-                                    .max(local_height);
+                                let peer_height = {
+                                    let state = peer_state.lock().await;
+                                    state
+                                        .height
+                                        .unwrap_or(last_handshake_height.unwrap_or(local_height))
+                                        .max(last_handshake_height.unwrap_or(local_height))
+                                        .max(local_height)
+                                };
                                 {
                                     let mut state = peer_state.lock().await;
-                                    state.height = Some(validated_peer_height);
+                                    state.height = Some(peer_height);
                                     state.last_bad_headers = None;
                                 }
                                 let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
                                 let mut directory = dir.lock().await;
-                                directory.record_height(&multiaddr, validated_peer_height);
-                                let peer_height = last_handshake_height.unwrap_or(local_height);
+                                directory.record_height(&multiaddr, peer_height);
                                 if header_count == 0 && peer_height > local_height {
                                     if sync_request_allowed_for(
                                         &sync_requests,
@@ -3256,6 +3260,27 @@ impl P2PNode {
                                     let get_blocks = GetBlocksPayload {
                                         start_hash: start_hash.to_vec(),
                                         count,
+                                    };
+                                    if sync_block_request_allowed_for(
+                                        &block_requests,
+                                        addr.ip(),
+                                        local_height,
+                                        peer_height,
+                                    )
+                                    .await
+                                    {
+                                        if let Ok(msg) = get_blocks.to_message() {
+                                            send_message_detached(&writer, msg, addr);
+                                        }
+                                    }
+                                                                } else if added_any {
+                                    let tip_hash = {
+                                        let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                        guard.tip_hash()
+                                    };
+                                    let get_blocks = GetBlocksPayload {
+                                        start_hash: tip_hash.to_vec(),
+                                        count: MAX_BLOCKS_PER_REQUEST,
                                     };
                                     if sync_block_request_allowed_for(
                                         &block_requests,
@@ -4966,18 +4991,22 @@ async fn handle_incoming_with_sybil(
                                 let guard = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
                                 guard.tip_height()
                             };
-                            let validated_peer_height = last_handshake_height
-                                    .unwrap_or(local_height)
-                                    .max(local_height);
+                            let peer_height = {
+                                let state = peer_state2.lock().await;
+                                state
+                                    .height
+                                    .unwrap_or(last_handshake_height.unwrap_or(local_height))
+                                    .max(last_handshake_height.unwrap_or(local_height))
+                                    .max(local_height)
+                            };
                             {
                                 let mut state = peer_state2.lock().await;
-                                state.height = Some(validated_peer_height);
+                                state.height = Some(peer_height);
                                 state.last_bad_headers = None;
                             }
                             let multiaddr = format!("/ip4/{}/tcp/{}", addr2.ip(), addr2.port());
                             let mut dir = directory2.lock().await;
-                            dir.record_height(&multiaddr, validated_peer_height);
-                            let peer_height = last_handshake_height.unwrap_or(local_height);
+                            dir.record_height(&multiaddr, peer_height);
 
                             if header_count == 0 && peer_height > local_height {
                                 if sync_request_allowed_for(
@@ -5077,7 +5106,30 @@ async fn handle_incoming_with_sybil(
                                             send_message_detached(&writer, msg, addr2);
                                         }
                                     }
+                                                            } else if added_any {
+                                let tip_hash = {
+                                    let guard = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
+                                    guard.tip_hash()
+                                };
+                                let get_blocks = GetBlocksPayload {
+                                    start_hash: tip_hash.to_vec(),
+                                    count: MAX_BLOCKS_PER_REQUEST,
+                                };
+                                if sync_block_request_allowed_for(
+                                    &block_requests2,
+                                    addr2.ip(),
+                                    local_height,
+                                    peer_height,
+                                )
+                                .await
+                                {
+                                    if let Ok(msg) = get_blocks.to_message() {
+                                        if let Some(writer) = writer_weak.upgrade() {
+                                            send_message_detached(&writer, msg, addr2);
+                                        }
+                                    }
                                 }
+                            }
                             {
                                 let mut state = peer_state2.lock().await;
                                 state.last_headers_received = Some(Instant::now());
