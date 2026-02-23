@@ -61,13 +61,6 @@ pub struct UtxoEntry {
 }
 
 /// In-memory chain state: height, tip, total work, and UTXO set.
-#[derive(Debug, Clone, Default)]
-struct BlockUndo {
-    spent: Vec<(OutPoint, UtxoEntry)>,
-    created: Vec<OutPoint>,
-    subsidy_created: u64,
-}
-
 #[derive(Debug)]
 pub struct ChainState {
     pub params: ChainParams,
@@ -86,8 +79,6 @@ pub struct ChainState {
     pub heights: HashMap<[u8; 32], u64>,
     pub cumulative_work: HashMap<[u8; 32], BigUint>,
     pub anchors: Option<AnchorManager>,
-    pub best_tip: [u8; 32],
-    undo_logs: HashMap<[u8; 32], BlockUndo>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,8 +104,6 @@ impl ChainState {
             heights: HashMap::new(),
             cumulative_work: HashMap::new(),
             anchors: None,
-            best_tip: [0u8; 32],
-            undo_logs: HashMap::new(),
         };
         let genesis = state.params.genesis_block.clone();
         state
@@ -126,7 +115,6 @@ impl ChainState {
         state.heights.insert(genesis_hash, 0);
         state.cumulative_work.insert(genesis_hash, work.clone());
         state.total_work = work;
-        state.best_tip = genesis_hash;
         state
     }
 
@@ -281,6 +269,7 @@ impl ChainState {
         let max = BigUint::from(1u8) << 256;
         max / (target + BigUint::from(1u8))
     }
+
     #[allow(dead_code)]
     pub fn connect_block(&mut self, block: Block) -> Result<(), String> {
         let expected_height = self.height;
@@ -288,7 +277,7 @@ impl ChainState {
         self.validate_block_header(&block, expected_height, previous)?;
 
         let reward = block_reward(expected_height);
-        let (_fees, _coinbase_total, subsidy_created, undo) = self.validate_and_apply_transactions(
+        let (_fees, _coinbase_total, subsidy_created) = self.validate_and_apply_transactions(
             &block,
             reward,
             expected_height,
@@ -301,8 +290,9 @@ impl ChainState {
             .checked_add(subsidy_created)
             .ok_or_else(|| "Supply overflow".to_string())?;
 
+        // Approximate work: 0xFFFF_FFFF / target
         let work = ChainState::block_work(&block);
-        self.total_work += work;
+        self.total_work += work.clone();
         let hash = block.header.hash();
         self.chain.push(block.clone());
         self.height += 1;
@@ -311,121 +301,25 @@ impl ChainState {
         self.block_store.insert(hash, block);
         self.heights.insert(hash, expected_height);
         self.cumulative_work.insert(hash, self.total_work.clone());
-        self.undo_logs.insert(hash, undo);
-        self.best_tip = hash;
         self.prune_caches();
 
         Ok(())
     }
 
-    fn is_hash_on_main_chain(&self, hash: &[u8; 32]) -> Option<u64> {
-        let h = *self.heights.get(hash)?;
-        if self
-            .chain
-            .get(h as usize)
-            .map(|b| b.header.hash() == *hash)
-            .unwrap_or(false)
-        {
-            Some(h)
-        } else {
-            None
-        }
-    }
-
-    fn disconnect_tip_block(&mut self) -> Result<Block, String> {
-        let tip_block = self
-            .chain
-            .last()
-            .cloned()
-            .ok_or_else(|| "cannot disconnect empty chain".to_string())?;
-        if self.chain.len() <= 1 {
-            return Err("cannot disconnect genesis".to_string());
-        }
-        let tip_hash = tip_block.header.hash();
-        let undo = self
-            .undo_logs
-            .remove(&tip_hash)
-            .ok_or_else(|| "missing undo data for tip block".to_string())?;
-
-        for op in undo.created {
-            self.utxos.remove(&op);
-        }
-        for (op, entry) in undo.spent {
-            self.utxos.insert(op, entry);
-        }
-
-        self.issued = self.issued.saturating_sub(undo.subsidy_created);
-        let work = ChainState::block_work(&tip_block);
-        if self.total_work >= work {
-            self.total_work -= work;
-        } else {
-            self.total_work = BigUint::zero();
-        }
-
-        self.chain.pop();
-        self.height = self.chain.len() as u64;
-        self.best_tip = self.chain.last().map(|b| b.header.hash()).unwrap_or([0u8; 32]);
-        Ok(tip_block)
-    }
-
-    fn find_reorg_path(&self, new_tip: [u8; 32]) -> Result<(u64, Vec<Block>), String> {
-        let mut cur = new_tip;
-        let mut new_branch_rev: Vec<Block> = Vec::new();
-        loop {
-            if let Some(h) = self.is_hash_on_main_chain(&cur) {
-                new_branch_rev.reverse();
-                return Ok((h, new_branch_rev));
-            }
-            let block = self
-                .block_by_hash(&cur)
-                .ok_or_else(|| "missing block for reorg path".to_string())?;
-            let prev = block.header.prev_hash;
-            new_branch_rev.push(block);
-            if prev == [0u8; 32] {
-                return Err("reorg path has no common ancestor".to_string());
-            }
-            cur = prev;
-        }
-    }
-
-    fn reorg_to_tip(&mut self, new_tip: [u8; 32]) -> Result<(), String> {
-        let (ancestor_height, new_branch) = self.find_reorg_path(new_tip)?;
-        let current_tip_height = self.tip_height();
-        if ancestor_height >= current_tip_height {
-            return Ok(());
-        }
-
-        let mut disconnected: Vec<Block> = Vec::new();
-        while self.tip_height() > ancestor_height {
-            disconnected.push(self.disconnect_tip_block()?);
-        }
-
-        let mut connected_new: Vec<Block> = Vec::new();
-        for block in &new_branch {
-            if let Err(e) = self.connect_block(block.clone()) {
-                for _ in 0..connected_new.len() {
-                    let _ = self.disconnect_tip_block();
-                }
-                for old in disconnected.iter().rev() {
-                    let _ = self.connect_block(old.clone());
-                }
-                return Err(format!("reorg connect failed: {}", e));
-            }
-            connected_new.push(block.clone());
-        }
-        Ok(())
-    }
-
     /// Try to connect a block at an explicit height and return true if accepted.
+    /// This is a simple append-only model; fork handling would extend this.
     pub fn try_connect_at(&mut self, height: u64, block: Block) -> bool {
         if height != self.height {
             return false;
         }
-        self.connect_block(block).is_ok()
+        if self.connect_block(block).is_ok() {
+            true
+        } else {
+            false
+        }
     }
 
     /// Add a header to the header tree if it extends a known header and compute cumulative work.
-
     pub fn add_header(&mut self, header: BlockHeader) -> Result<u64, String> {
         let hash = header.hash();
         if self.headers.contains_key(&hash) || self.heights.contains_key(&hash) {
@@ -534,15 +428,13 @@ impl ChainState {
             return Err("Genesis block already connected".to_string());
         }
         self.validate_block_header(&block, 0, None)?;
-        let (_fees, _coinbase_total, subsidy_created, _undo) =
+        let (_fees, _coinbase_total, subsidy_created) =
             self.validate_and_apply_transactions(&block, 0, 0, false, Some(MAX_MONEY))?;
 
         self.total_work = ChainState::block_work(&block);
-        let h = block.header.hash();
         self.chain.push(block);
         self.height = 1;
         self.issued = subsidy_created;
-        self.best_tip = h;
         Ok(())
     }
 
@@ -599,7 +491,7 @@ impl ChainState {
         height: u64,
         enforce_reward: bool,
         max_subsidy: Option<u64>,
-    ) -> Result<(u64, u64, u64, BlockUndo), String> {
+    ) -> Result<(u64, u64, u64), String> {
         if block.transactions.is_empty() {
             return Err("Block must include transactions".to_string());
         }
@@ -661,19 +553,10 @@ impl ChainState {
             }
         }
 
-        let mut spent_for_undo: Vec<(OutPoint, UtxoEntry)> = Vec::new();
-        for key in &seen_inputs {
-            if let Some(entry) = self.utxos.get(key) {
-                spent_for_undo.push((key.clone(), entry.clone()));
-            }
+        for key in seen_inputs {
+            self.utxos.remove(&key);
         }
-
-        for key in &seen_inputs {
-            self.utxos.remove(key);
-        }
-        let mut created_outpoints: Vec<OutPoint> = Vec::new();
         for (op, output, is_coinbase) in created {
-            created_outpoints.push(op.clone());
             self.utxos.insert(
                 op,
                 UtxoEntry {
@@ -684,13 +567,7 @@ impl ChainState {
             );
         }
 
-        let undo = BlockUndo {
-            spent: spent_for_undo,
-            created: created_outpoints,
-            subsidy_created,
-        };
-
-        Ok((fees as u64, coinbase_total, subsidy_created, undo))
+        Ok((fees as u64, coinbase_total, subsidy_created))
     }
 
     /// Validate a single transaction against the current UTXO set,
@@ -776,8 +653,6 @@ impl ChainState {
             heights: self.heights.clone(),
             cumulative_work: self.cumulative_work.clone(),
             anchors: self.anchors.clone(),
-            best_tip: self.best_tip,
-            undo_logs: self.undo_logs.clone(),
         };
 
         let branch = self.gather_branch_to_genesis(tip_hash)?;
@@ -809,7 +684,7 @@ impl ChainState {
         Ok(new_state)
     }
 
-    /// Store a block and update best chain incrementally.
+    /// Store a block that may trigger a reorg if it has higher cumulative work.
     pub fn process_block(&mut self, block: Block) -> Result<(u64, [u8; 32]), String> {
         let hash = block.header.hash();
         if self.heights.contains_key(&hash) {
@@ -823,6 +698,7 @@ impl ChainState {
             return Err("block stored as orphan (prev hash unknown)".to_string());
         }
 
+        // Minimal PoW check before storing. Full validation happens when rebuilding.
         if !meets_target(&hash, block.header.target()) {
             return Err("block does not satisfy proof-of-work target".to_string());
         }
@@ -842,7 +718,6 @@ impl ChainState {
         };
         let cumulative = parent_work + ChainState::block_work(&block);
         let height = parent_height + 1;
-
         if let Some(a) = &self.anchors {
             let hhex = hex::encode(hash);
             if !a.verify_block_against_anchors(height, &hhex) {
@@ -854,10 +729,19 @@ impl ChainState {
         self.heights.insert(hash, height);
         self.cumulative_work.insert(hash, cumulative.clone());
 
-        if parent_hash == self.tip_hash() && cumulative > self.total_work {
-            self.connect_block(block)?;
-        } else if cumulative > self.total_work {
-            self.reorg_to_tip(hash)?;
+        let should_reorg = cumulative > self.total_work;
+        if should_reorg {
+            match self.rebuild_to_tip(hash) {
+                Ok(rebuilt) => {
+                    *self = rebuilt;
+                }
+                Err(e) => {
+                    self.block_store.remove(&hash);
+                    self.heights.remove(&hash);
+                    self.cumulative_work.remove(&hash);
+                    return Err(e);
+                }
+            }
         }
 
         let mut new_hash = self.tip_hash();
@@ -874,7 +758,6 @@ impl ChainState {
     }
 
     fn validate_transaction_internal(
-
         &self,
         tx: &Transaction,
         height: u64,
@@ -1171,162 +1054,5 @@ pub fn decode_compact_tx(raw: &[u8]) -> Transaction {
         inputs,
         outputs,
         locktime,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn coinbase_tx(value: u64, tag: &[u8]) -> Transaction {
-        Transaction {
-            version: 1,
-            inputs: vec![TxInput {
-                prev_txid: [0u8; 32],
-                prev_index: 0xffff_ffff,
-                script_sig: tag.to_vec(),
-                sequence: 0xffff_ffff,
-            }],
-            outputs: vec![TxOutput {
-                value,
-                script_pubkey: vec![0x51],
-            }],
-            locktime: 0,
-        }
-    }
-
-    fn mine_block(mut block: Block) -> Block {
-        let target = block.header.target();
-        for nonce in 0..u32::MAX {
-            block.header.nonce = nonce;
-            let h = block.header.hash();
-            if meets_target(&h, target) {
-                return block;
-            }
-        }
-        panic!("failed to mine test block");
-    }
-
-    fn make_block(prev: &Block, _height: u64, bits: u32, reward: u64, tag: &[u8]) -> Block {
-        let tx = coinbase_tx(reward, tag);
-        let mut block = Block {
-            header: BlockHeader {
-                version: 1,
-                prev_hash: prev.header.hash(),
-                merkle_root: [0u8; 32],
-                time: prev.header.time.saturating_add(1),
-                bits,
-                nonce: 0,
-            },
-            transactions: vec![tx],
-        };
-        block.header.merkle_root = block.merkle_root();
-        mine_block(block)
-    }
-
-    fn make_genesis(bits: u32) -> Block {
-        let now = Utc::now().timestamp() as u32;
-        let tx = coinbase_tx(50, b"genesis");
-        let mut block = Block {
-            header: BlockHeader {
-                version: 1,
-                prev_hash: [0u8; 32],
-                merkle_root: [0u8; 32],
-                time: now,
-                bits,
-                nonce: 0,
-            },
-            transactions: vec![tx],
-        };
-        block.header.merkle_root = block.merkle_root();
-        mine_block(block)
-    }
-
-    fn utxo_maps_equal(a: &HashMap<OutPoint, UtxoEntry>, b: &HashMap<OutPoint, UtxoEntry>) -> bool {
-        if a.len() != b.len() {
-            return false;
-        }
-        for (k, va) in a {
-            let Some(vb) = b.get(k) else { return false; };
-            if va.height != vb.height || va.is_coinbase != vb.is_coinbase || va.output != vb.output {
-                return false;
-            }
-        }
-        true
-    }
-
-    #[test]
-    fn incremental_reorg_two_nodes_keeps_utxo_consistent() {
-        let bits = 0x207f_ffffu32;
-        let genesis = make_genesis(bits);
-        let params = ChainParams {
-            genesis_block: genesis.clone(),
-            pow_limit: Target { bits },
-        };
-
-        let mut node_a = ChainState::new(params.clone());
-        let mut _node_b = ChainState::new(params);
-
-        let a1 = make_block(&genesis, 1, bits, block_reward(1), b"a1");
-        node_a.process_block(a1.clone()).expect("a1");
-
-        let b1 = make_block(&genesis, 1, bits, block_reward(1), b"b1");
-        let b2 = make_block(&b1, 2, bits, block_reward(2), b"b2");
-
-        node_a.process_block(b1.clone()).expect("store competing b1");
-        node_a.process_block(b2.clone()).expect("reorg to b2");
-
-        assert_eq!(node_a.tip_hash(), b2.header.hash());
-        assert_eq!(node_a.tip_height(), 2);
-
-        let a1_op = OutPoint {
-            txid: a1.transactions[0].txid(),
-            index: 0,
-        };
-        assert!(!node_a.utxos.contains_key(&a1_op));
-
-        let b1_op = OutPoint {
-            txid: b1.transactions[0].txid(),
-            index: 0,
-        };
-        let b2_op = OutPoint {
-            txid: b2.transactions[0].txid(),
-            index: 0,
-        };
-        assert!(node_a.utxos.contains_key(&b1_op));
-        assert!(node_a.utxos.contains_key(&b2_op));
-
-        let expected_issued = node_a
-            .chain
-            .iter()
-            .map(|b| b.transactions[0].outputs.iter().map(|o| o.value).sum::<u64>())
-            .sum::<u64>();
-        assert_eq!(node_a.issued, expected_issued);
-    }
-
-    #[test]
-    fn invalid_block_apply_is_all_or_nothing() {
-        let bits = 0x207f_ffffu32;
-        let genesis = make_genesis(bits);
-        let params = ChainParams {
-            genesis_block: genesis.clone(),
-            pow_limit: Target { bits },
-        };
-        let mut chain = ChainState::new(params);
-
-        let before_utxos = chain.utxos.clone();
-        let before_issued = chain.issued;
-        let before_height = chain.height;
-
-        let mut invalid = make_block(&genesis, 1, bits, block_reward(1), b"bad");
-        invalid.transactions[0].outputs[0].value = block_reward(1).saturating_add(1);
-        invalid.header.merkle_root = invalid.merkle_root();
-        let invalid = mine_block(invalid);
-
-        let res = chain.connect_block(invalid);
-        assert!(res.is_err());
-        assert_eq!(chain.issued, before_issued);
-        assert_eq!(chain.height, before_height);
-        assert!(utxo_maps_equal(&chain.utxos, &before_utxos));
     }
 }

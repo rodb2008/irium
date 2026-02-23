@@ -808,32 +808,39 @@ fn same_dir(a: &PathBuf, b: &PathBuf) -> bool {
     }
 }
 
-fn quarantine_single_block_file(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    if !path.exists() {
-        return None;
+fn quarantine_blocks_above_dir(dir: &std::path::Path, height: u64) {
+    if !dir.exists() {
+        return;
     }
-    let dir = path.parent()?;
-    let name = path.file_name()?.to_str()?;
+    let read_dir = match dir.read_dir() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let backup_dir = dir.join(format!("orphaned_{}", stamp));
     let _ = fs::create_dir_all(&backup_dir);
-    let mut dest = backup_dir.join(name);
-    if dest.exists() {
-        let mut n = 1u32;
-        loop {
-            let candidate = backup_dir.join(format!("{}.dup{}", name, n));
-            if !candidate.exists() {
-                dest = candidate;
-                break;
-            }
-            n += 1;
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stripped) = name.strip_prefix("block_") else {
+            continue;
+        };
+        let Some(num_part) = stripped.strip_suffix(".json") else {
+            continue;
+        };
+        let Ok(h) = num_part.parse::<u64>() else {
+            continue;
+        };
+        if h > height {
+            let dest = backup_dir.join(name);
+            let _ = fs::rename(&path, &dest);
         }
     }
-    fs::rename(path, &dest).ok()?;
-    Some(dest)
 }
 
 fn load_persisted_blocks_from(state: &mut ChainState, dir: &std::path::Path, skip_below_tip: bool) {
@@ -868,20 +875,6 @@ fn load_persisted_blocks_from(state: &mut ChainState, dir: &std::path::Path, ski
     for (h, path) in entries {
         if h == 0 {
             continue;
-        }
-
-        let expected_next = state.tip_height().saturating_add(1);
-        if h < expected_next {
-            continue;
-        }
-        if h > expected_next {
-            println!(
-                "[i] Persisted block gap at height {} (found {}), stopping replay at {}",
-                expected_next,
-                h,
-                state.tip_height()
-            );
-            break;
         }
         match std::fs::read_to_string(&path) {
             Ok(data) => {
@@ -966,13 +959,9 @@ fn load_persisted_blocks_from(state: &mut ChainState, dir: &std::path::Path, ski
 
                 if let Err(e) = state.connect_block(block) {
                     eprintln!("[⚠️] Failed to connect persisted block {}: {}", h, e);
-                    if let Some(dest) = quarantine_single_block_file(&path) {
-                        println!(
-                            "[🧹] Quarantined invalid persisted block {} -> {}",
-                            path.display(),
-                            dest.display()
-                        );
-                    }
+                    let tip = state.tip_height();
+                    quarantine_blocks_above_dir(dir, tip);
+                    println!("[🧹] Quarantined persisted blocks above height {}", tip);
                     break;
                 }
             }
