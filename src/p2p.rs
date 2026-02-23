@@ -1718,7 +1718,7 @@ impl P2PNode {
         let sync_requests = self.sync_requests.lock().await.len();
         let block_requests = self.block_requests.lock().await.len();
         let handshake_failures = self.handshake_failures.lock().await.len();
-        let getblocks_inflight = self.getblocks_last.lock().await.len();
+        let getblocks_inflight = block_requests;
         SyncDebugSnapshot {
             sync_requests,
             block_requests,
@@ -1735,6 +1735,24 @@ impl P2PNode {
         // Allow fresh attempts against previously failing peers.
         self.handshake_failures.lock().await.clear();
     }
+
+    pub async fn clear_transient_headers(&self) {
+        let Some(chain_arc) = self.chain.as_ref() else {
+            return;
+        };
+        let mut guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+        let dropped = guard.headers.len();
+        if dropped > 0 {
+            guard.headers.clear();
+            guard.header_chain.clear();
+            P2PNode::log_event(
+                "warn",
+                "sync",
+                format!("Cleared {} transient headers after sync stall", dropped),
+            );
+        }
+    }
+
 
     /// Proactively request headers and blocks from all connected peers at the current tip.
     pub async fn force_sync_burst_from_tip(
