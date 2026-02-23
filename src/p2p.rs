@@ -332,6 +332,73 @@ fn headers_new_false_log_cooldown_secs() -> u64 {
     })
 }
 
+fn orphan_recovery_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_ORPHAN_RECOVERY_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(60))
+            .unwrap_or(5)
+    })
+}
+
+fn orphan_storm_window_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_ORPHAN_STORM_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(5).min(300))
+            .unwrap_or(20)
+    })
+}
+
+fn orphan_storm_threshold() -> u32 {
+    static VAL: OnceLock<u32> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_ORPHAN_STORM_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|v| v.max(4).min(200))
+            .unwrap_or(16)
+    })
+}
+
+async fn orphan_recovery_allowed(ip: IpAddr) -> bool {
+    static MAP: OnceLock<Arc<Mutex<HashMap<IpAddr, Instant>>>> = OnceLock::new();
+    let map = MAP
+        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone();
+    let mut g = map.lock().await;
+    let now = Instant::now();
+    let cool = Duration::from_secs(orphan_recovery_cooldown_secs());
+    if let Some(last) = g.get(&ip) {
+        if now.duration_since(*last) < cool {
+            return false;
+        }
+    }
+    g.insert(ip, now);
+    true
+}
+
+async fn orphan_storm_hit(ip: IpAddr) -> bool {
+    static MAP: OnceLock<Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>> = OnceLock::new();
+    let map = MAP
+        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone();
+    let mut g = map.lock().await;
+    let now = Instant::now();
+    let window = Duration::from_secs(orphan_storm_window_secs());
+    let thr = orphan_storm_threshold();
+    let e = g.entry(ip).or_insert((0, now));
+    if now.duration_since(e.1) > window {
+        *e = (0, now);
+    }
+    e.0 = e.0.saturating_add(1);
+    e.0 >= thr
+}
+
 fn inbound_accept_cooldown_ms() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -3793,7 +3860,7 @@ impl P2PNode {
                                         let block2 = block.clone();
 
                                         let connect_started = Instant::now();
-                                        let (new_height_opt, record_verdict, persist_blocks, orphan_prev) =
+                                        let (new_height_opt, mut record_verdict, persist_blocks, mut orphan_prev, orphan_unknown) =
                                             match spawn_blocking_limited(move || {
                                                 let mut guard =
                                                     chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
@@ -3801,6 +3868,7 @@ impl P2PNode {
                                                 let mut record_verdict = None;
                                                 let mut persist_blocks: Vec<(u64, Block)> = Vec::new();
                                                 let mut orphan_prev = None;
+                                                let mut orphan_unknown = false;
                                                 match guard.process_block(block2.clone()) {
                                                     Ok((new_height, _tip)) => {
                                                         P2PNode::log(format!(
@@ -3837,6 +3905,9 @@ impl P2PNode {
                                                         {
                                                             orphan_prev = Some(block2.header.prev_hash);
                                                         }
+                                                        if e.contains("prev hash unknown") {
+                                                            orphan_unknown = true;
+                                                        }
                                                         if P2PNode::is_soft_block_reject(&e) {
                                                             if !P2PNode::is_duplicate_block(&e) {
                                                                 P2PNode::log_event(
@@ -3861,29 +3932,40 @@ impl P2PNode {
                                                         }
                                                     }
                                                 }
-                                                (new_height_opt, record_verdict, persist_blocks, orphan_prev)
+                                                (new_height_opt, record_verdict, persist_blocks, orphan_prev, orphan_unknown)
                                             })
                                             .await
                                             {
                                                 Ok(v) => v,
-                                                Err(_) => (None, None, Vec::new(), None),
+                                                Err(_) => (None, None, Vec::new(), None, false),
                                             };
                                         let connect_ms = connect_started.elapsed().as_millis();
+                                        if orphan_unknown && orphan_storm_hit(addr.ip()).await {
+                                            P2PNode::log_event(
+                                                "warn",
+                                                "sync",
+                                                format!("P2P {}: orphan storm detected; penalizing peer", addr),
+                                            );
+                                            record_verdict = Some(false);
+                                            orphan_prev = None;
+                                        }
                                         for (height, b) in persist_blocks {
                                             let h = b.header.hash();
                                             enqueue_persist_block(height, h, b).await;
                                         }
                                         sync_perf_record(decode_ms, precheck_ms, connect_ms, 0);
                                         if let Some(prev_hash) = orphan_prev {
-                                            request_orphan_headers(
-                                                &writer,
-                                                addr,
-                                                prev_hash,
-                                                &chain_for_sync,
-                                                &sync_requests,
-                                                &peer_state,
-                                            )
-                                            .await;
+                                            if orphan_recovery_allowed(addr.ip()).await {
+                                                request_orphan_headers(
+                                                    &writer,
+                                                    addr,
+                                                    prev_hash,
+                                                    &chain_for_sync,
+                                                    &sync_requests,
+                                                    &peer_state,
+                                                )
+                                                .await;
+                                            }
                                         }
                                         if let Some(new_height) = new_height_opt {
                                             peer_mark_block_progress(addr.ip()).await;
@@ -5690,12 +5772,13 @@ async fn handle_incoming_with_sybil(
                             let short = short.get(0..12).unwrap_or(&short).to_string();
 
                             let connect_started = Instant::now();
-                            let (new_height_opt, verdict, persist_blocks) =
+                            let (new_height_opt, mut verdict, persist_blocks, orphan_unknown) =
                                 match spawn_blocking_limited(move || {
                                     let mut guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
                                     let mut new_height_opt = None;
                                     let mut verdict = None;
                                     let mut persist_blocks = Vec::new();
+                                    let mut orphan_unknown = false;
 
                                     match guard.process_block(block.clone()) {
                                         Ok((new_height, _)) => {
@@ -5708,7 +5791,9 @@ async fn handle_incoming_with_sybil(
                                         }
                                         Err(e) => {
                                             if P2PNode::is_soft_block_reject(&e) {
-                                                // ignore
+                                                if e.contains("prev hash unknown") {
+                                                    orphan_unknown = true;
+                                                }
                                             } else {
                                                 verdict = Some(false);
                                                 P2PNode::log_event(
@@ -5720,7 +5805,7 @@ async fn handle_incoming_with_sybil(
                                         }
                                     }
 
-                                    (new_height_opt, verdict, persist_blocks)
+                                    (new_height_opt, verdict, persist_blocks, orphan_unknown)
                                 })
                                 .await
                                 {
@@ -5729,6 +5814,14 @@ async fn handle_incoming_with_sybil(
                                 };
                             drop(permit_guard);
                             let connect_ms = connect_started.elapsed().as_millis();
+                            if orphan_unknown && orphan_storm_hit(addr2.ip()).await {
+                                P2PNode::log_event(
+                                    "warn",
+                                    "sync",
+                                    format!("P2P {}: orphan storm detected; penalizing peer", addr2),
+                                );
+                                verdict = Some(false);
+                            }
 
                             for (height, b) in persist_blocks {
                                 let h = b.header.hash();
