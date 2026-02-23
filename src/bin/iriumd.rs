@@ -2918,6 +2918,8 @@ async fn main() {
             let mut last_progress_height: u64 = 0;
             let mut stalled_ticks: u32 = 0;
             let mut last_tip_hash: String = genesis_hex.clone();
+            let mut last_tip_bytes: [u8; 32] = [0u8; 32];
+            let mut last_sync_burst_at: Option<std::time::Instant> = None;
             let mut last_mempool_size: usize = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -2989,21 +2991,24 @@ async fn main() {
                     seed_list.push("-".to_string());
                 }
 
-                let (local_height, tip_hash) = match chain_clone.try_lock() {
+                let (local_height, tip_hash, tip_bytes) = match chain_clone.try_lock() {
                     Ok(g) => {
-                        let tip = g
+                        let tip_bytes = g
                             .chain
                             .last()
-                            .map(|b| hex::encode(b.header.hash()))
-                            .unwrap_or_else(|| genesis_hex.clone());
-                        (g.tip_height(), tip)
+                            .map(|b| b.header.hash())
+                            .unwrap_or([0u8; 32]);
+                        let tip = hex::encode(tip_bytes);
+                        (g.tip_height(), tip, tip_bytes)
                     }
                     Err(_) => (
                         status_height.load(Ordering::Relaxed),
                         last_tip_hash.clone(),
+                        last_tip_bytes,
                     ),
                 };
                 last_tip_hash = tip_hash.clone();
+                last_tip_bytes = tip_bytes;
 
                 let mempool_size = match mempool_clone.try_lock() {
                     Ok(g) => g.len(),
@@ -3034,6 +3039,23 @@ async fn main() {
 
                 let dbg = node_clone.sync_debug_snapshot().await;
 
+                let behind = peer_height >= local_height.saturating_add(3);
+                let header_only_stall = dbg.sync_requests > 0 && dbg.getblocks_inflight == 0;
+                let need_sync_burst = behind && (dbg.getblocks_inflight == 0 || header_only_stall);
+                if need_sync_burst {
+                    let burst_ok = last_sync_burst_at
+                        .map(|t| t.elapsed() >= std::time::Duration::from_secs(10))
+                        .unwrap_or(true);
+                    if burst_ok {
+                        let burst_node = node_clone.clone();
+                        let start = tip_bytes;
+                        tokio::spawn(async move {
+                            let _ = burst_node.force_sync_burst_from_tip(start).await;
+                        });
+                        last_sync_burst_at = Some(std::time::Instant::now());
+                    }
+                }
+
                 // Periodic sync status line to diagnose stalls quickly.
                 if hb_ticks % 6 == 0 {
                     let ahead = peer_height.saturating_sub(local_height);
@@ -3052,8 +3074,7 @@ async fn main() {
 
                 // If we're behind OR stuck in header-only mode and not making progress, clear
                 // throttles and reconnect peers to kick block body sync.
-                let header_only_stall = dbg.sync_requests > 0 && dbg.getblocks_inflight == 0;
-                if peer_height >= local_height.saturating_add(3) || header_only_stall {
+                if behind || header_only_stall {
                     if local_height == last_progress_height {
                         stalled_ticks = stalled_ticks.saturating_add(1);
                     } else {
