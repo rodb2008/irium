@@ -10,6 +10,7 @@ WorkingDirectory=@IRIUM_HOME@
 ExecStart=@IRIUM_HOME@/target/release/iriumd
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=90
 LimitNOFILE=65535
 StandardOutput=journal
 StandardError=journal
