@@ -3276,7 +3276,7 @@ async fn main() {
                 if ok {
                     eprintln!("[i] persist queue drained on shutdown");
                 } else {
-                    eprintln!("[warn] persist queue drain timeout on shutdown");
+                    eprintln!("[warn] persist queue drain timeout on shutdown; remaining_queue_len={}", storage::persist_queue_len());
                 }
             });
         }
