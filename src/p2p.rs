@@ -3148,7 +3148,9 @@ impl P2PNode {
                                     let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.tip_height()
                                 };
-                                let validated_peer_height = local_height;
+                                let validated_peer_height = last_handshake_height
+                                    .unwrap_or(local_height)
+                                    .max(local_height);
                                 {
                                     let mut state = peer_state.lock().await;
                                     state.height = Some(validated_peer_height);
@@ -3185,7 +3187,7 @@ impl P2PNode {
                                     }
                                     continue;
                                 }
-                                if header_count >= MAX_HEADERS_PER_REQUEST && peer_height > local_height {
+                                if header_count >= MAX_HEADERS_PER_REQUEST && added_any && peer_height > local_height {
                                     if let Some(last_hash) = last_header_hash {
                                         let get_headers = GetHeadersPayload {
                                             start_hash: last_hash.to_vec(),
@@ -4964,7 +4966,9 @@ async fn handle_incoming_with_sybil(
                                 let guard = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
                                 guard.tip_height()
                             };
-                            let validated_peer_height = local_height;
+                            let validated_peer_height = last_handshake_height
+                                    .unwrap_or(local_height)
+                                    .max(local_height);
                             {
                                 let mut state = peer_state2.lock().await;
                                 state.height = Some(validated_peer_height);
@@ -5005,7 +5009,7 @@ async fn handle_incoming_with_sybil(
                                 return;
                             }
 
-                            if header_count >= MAX_HEADERS_PER_REQUEST && peer_height > local_height {
+                            if header_count >= MAX_HEADERS_PER_REQUEST && added_any && peer_height > local_height {
                                 if let Some(last_hash) = last_header_hash {
                                     let get_headers = GetHeadersPayload {
                                         start_hash: last_hash.to_vec(),
