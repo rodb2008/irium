@@ -61,6 +61,13 @@ pub struct UtxoEntry {
 }
 
 /// In-memory chain state: height, tip, total work, and UTXO set.
+#[derive(Debug, Clone, Default)]
+struct BlockUndo {
+    spent: Vec<(OutPoint, UtxoEntry)>,
+    created: Vec<OutPoint>,
+    subsidy_created: u64,
+}
+
 #[derive(Debug)]
 pub struct ChainState {
     pub params: ChainParams,
@@ -79,6 +86,8 @@ pub struct ChainState {
     pub heights: HashMap<[u8; 32], u64>,
     pub cumulative_work: HashMap<[u8; 32], BigUint>,
     pub anchors: Option<AnchorManager>,
+    pub best_tip: [u8; 32],
+    undo_logs: HashMap<[u8; 32], BlockUndo>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +113,8 @@ impl ChainState {
             heights: HashMap::new(),
             cumulative_work: HashMap::new(),
             anchors: None,
+            best_tip: [0u8; 32],
+            undo_logs: HashMap::new(),
         };
         let genesis = state.params.genesis_block.clone();
         state
@@ -115,6 +126,7 @@ impl ChainState {
         state.heights.insert(genesis_hash, 0);
         state.cumulative_work.insert(genesis_hash, work.clone());
         state.total_work = work;
+        state.best_tip = genesis_hash;
         state
     }
 
@@ -275,7 +287,6 @@ impl ChainState {
         let max = BigUint::from(1u8) << 256;
         max / (target + BigUint::from(1u8))
     }
-
     #[allow(dead_code)]
     pub fn connect_block(&mut self, block: Block) -> Result<(), String> {
         let expected_height = self.height;
@@ -283,7 +294,7 @@ impl ChainState {
         self.validate_block_header(&block, expected_height, previous)?;
 
         let reward = block_reward(expected_height);
-        let (_fees, _coinbase_total, subsidy_created) = self.validate_and_apply_transactions(
+        let (_fees, _coinbase_total, subsidy_created, undo) = self.validate_and_apply_transactions(
             &block,
             reward,
             expected_height,
@@ -296,9 +307,8 @@ impl ChainState {
             .checked_add(subsidy_created)
             .ok_or_else(|| "Supply overflow".to_string())?;
 
-        // Approximate work: 0xFFFF_FFFF / target
         let work = ChainState::block_work(&block);
-        self.total_work += work.clone();
+        self.total_work += work;
         let hash = block.header.hash();
         self.chain.push(block.clone());
         self.height += 1;
@@ -307,25 +317,121 @@ impl ChainState {
         self.block_store.insert(hash, block);
         self.heights.insert(hash, expected_height);
         self.cumulative_work.insert(hash, self.total_work.clone());
+        self.undo_logs.insert(hash, undo);
+        self.best_tip = hash;
         self.prune_caches();
 
         Ok(())
     }
 
+    fn is_hash_on_main_chain(&self, hash: &[u8; 32]) -> Option<u64> {
+        let h = *self.heights.get(hash)?;
+        if self
+            .chain
+            .get(h as usize)
+            .map(|b| b.header.hash() == *hash)
+            .unwrap_or(false)
+        {
+            Some(h)
+        } else {
+            None
+        }
+    }
+
+    fn disconnect_tip_block(&mut self) -> Result<Block, String> {
+        let tip_block = self
+            .chain
+            .last()
+            .cloned()
+            .ok_or_else(|| "cannot disconnect empty chain".to_string())?;
+        if self.chain.len() <= 1 {
+            return Err("cannot disconnect genesis".to_string());
+        }
+        let tip_hash = tip_block.header.hash();
+        let undo = self
+            .undo_logs
+            .remove(&tip_hash)
+            .ok_or_else(|| "missing undo data for tip block".to_string())?;
+
+        for op in undo.created {
+            self.utxos.remove(&op);
+        }
+        for (op, entry) in undo.spent {
+            self.utxos.insert(op, entry);
+        }
+
+        self.issued = self.issued.saturating_sub(undo.subsidy_created);
+        let work = ChainState::block_work(&tip_block);
+        if self.total_work >= work {
+            self.total_work -= work;
+        } else {
+            self.total_work = BigUint::zero();
+        }
+
+        self.chain.pop();
+        self.height = self.chain.len() as u64;
+        self.best_tip = self.chain.last().map(|b| b.header.hash()).unwrap_or([0u8; 32]);
+        Ok(tip_block)
+    }
+
+    fn find_reorg_path(&self, new_tip: [u8; 32]) -> Result<(u64, Vec<Block>), String> {
+        let mut cur = new_tip;
+        let mut new_branch_rev: Vec<Block> = Vec::new();
+        loop {
+            if let Some(h) = self.is_hash_on_main_chain(&cur) {
+                new_branch_rev.reverse();
+                return Ok((h, new_branch_rev));
+            }
+            let block = self
+                .block_by_hash(&cur)
+                .ok_or_else(|| "missing block for reorg path".to_string())?;
+            let prev = block.header.prev_hash;
+            new_branch_rev.push(block);
+            if prev == [0u8; 32] {
+                return Err("reorg path has no common ancestor".to_string());
+            }
+            cur = prev;
+        }
+    }
+
+    fn reorg_to_tip(&mut self, new_tip: [u8; 32]) -> Result<(), String> {
+        let (ancestor_height, new_branch) = self.find_reorg_path(new_tip)?;
+        let current_tip_height = self.tip_height();
+        if ancestor_height >= current_tip_height {
+            return Ok(());
+        }
+
+        let mut disconnected: Vec<Block> = Vec::new();
+        while self.tip_height() > ancestor_height {
+            disconnected.push(self.disconnect_tip_block()?);
+        }
+
+        let mut connected_new: Vec<Block> = Vec::new();
+        for block in &new_branch {
+            if let Err(e) = self.connect_block(block.clone()) {
+                for _ in 0..connected_new.len() {
+                    let _ = self.disconnect_tip_block();
+                }
+                for old in disconnected.iter().rev() {
+                    let _ = self.connect_block(old.clone());
+                }
+                return Err(format!("reorg connect failed: {}", e));
+            }
+            connected_new.push(block.clone());
+        }
+        Ok(())
+    }
+
     /// Try to connect a block at an explicit height and return true if accepted.
-    /// This is a simple append-only model; fork handling would extend this.
     pub fn try_connect_at(&mut self, height: u64, block: Block) -> bool {
         if height != self.height {
             return false;
         }
-        if self.connect_block(block).is_ok() {
-            true
-        } else {
-            false
-        }
+        self.connect_block(block).is_ok()
     }
 
     /// Add a header to the header tree if it extends a known header and compute cumulative work.
+
     pub fn add_header(&mut self, header: BlockHeader) -> Result<u64, String> {
         let hash = header.hash();
         if self.headers.contains_key(&hash) || self.heights.contains_key(&hash) {
@@ -434,13 +540,15 @@ impl ChainState {
             return Err("Genesis block already connected".to_string());
         }
         self.validate_block_header(&block, 0, None)?;
-        let (_fees, _coinbase_total, subsidy_created) =
+        let (_fees, _coinbase_total, subsidy_created, _undo) =
             self.validate_and_apply_transactions(&block, 0, 0, false, Some(MAX_MONEY))?;
 
         self.total_work = ChainState::block_work(&block);
+        let h = block.header.hash();
         self.chain.push(block);
         self.height = 1;
         self.issued = subsidy_created;
+        self.best_tip = h;
         Ok(())
     }
 
@@ -497,7 +605,7 @@ impl ChainState {
         height: u64,
         enforce_reward: bool,
         max_subsidy: Option<u64>,
-    ) -> Result<(u64, u64, u64), String> {
+    ) -> Result<(u64, u64, u64, BlockUndo), String> {
         if block.transactions.is_empty() {
             return Err("Block must include transactions".to_string());
         }
@@ -559,10 +667,19 @@ impl ChainState {
             }
         }
 
-        for key in seen_inputs {
-            self.utxos.remove(&key);
+        let mut spent_for_undo: Vec<(OutPoint, UtxoEntry)> = Vec::new();
+        for key in &seen_inputs {
+            if let Some(entry) = self.utxos.get(key) {
+                spent_for_undo.push((key.clone(), entry.clone()));
+            }
         }
+
+        for key in &seen_inputs {
+            self.utxos.remove(key);
+        }
+        let mut created_outpoints: Vec<OutPoint> = Vec::new();
         for (op, output, is_coinbase) in created {
+            created_outpoints.push(op.clone());
             self.utxos.insert(
                 op,
                 UtxoEntry {
@@ -573,7 +690,13 @@ impl ChainState {
             );
         }
 
-        Ok((fees as u64, coinbase_total, subsidy_created))
+        let undo = BlockUndo {
+            spent: spent_for_undo,
+            created: created_outpoints,
+            subsidy_created,
+        };
+
+        Ok((fees as u64, coinbase_total, subsidy_created, undo))
     }
 
     /// Validate a single transaction against the current UTXO set,
@@ -659,6 +782,8 @@ impl ChainState {
             heights: self.heights.clone(),
             cumulative_work: self.cumulative_work.clone(),
             anchors: self.anchors.clone(),
+            best_tip: self.best_tip,
+            undo_logs: self.undo_logs.clone(),
         };
 
         let branch = self.gather_branch_to_genesis(tip_hash)?;
@@ -690,7 +815,7 @@ impl ChainState {
         Ok(new_state)
     }
 
-    /// Store a block that may trigger a reorg if it has higher cumulative work.
+    /// Store a block and update best chain incrementally.
     pub fn process_block(&mut self, block: Block) -> Result<(u64, [u8; 32]), String> {
         let hash = block.header.hash();
         if self.heights.contains_key(&hash) {
@@ -704,7 +829,6 @@ impl ChainState {
             return Err("block stored as orphan (prev hash unknown)".to_string());
         }
 
-        // Minimal PoW check before storing. Full validation happens when rebuilding.
         if !meets_target(&hash, block.header.target()) {
             return Err("block does not satisfy proof-of-work target".to_string());
         }
@@ -724,6 +848,7 @@ impl ChainState {
         };
         let cumulative = parent_work + ChainState::block_work(&block);
         let height = parent_height + 1;
+
         if let Some(a) = &self.anchors {
             let hhex = hex::encode(hash);
             if !a.verify_block_against_anchors(height, &hhex) {
@@ -735,19 +860,10 @@ impl ChainState {
         self.heights.insert(hash, height);
         self.cumulative_work.insert(hash, cumulative.clone());
 
-        let should_reorg = cumulative > self.total_work;
-        if should_reorg {
-            match self.rebuild_to_tip(hash) {
-                Ok(rebuilt) => {
-                    *self = rebuilt;
-                }
-                Err(e) => {
-                    self.block_store.remove(&hash);
-                    self.heights.remove(&hash);
-                    self.cumulative_work.remove(&hash);
-                    return Err(e);
-                }
-            }
+        if parent_hash == self.tip_hash() && cumulative > self.total_work {
+            self.connect_block(block)?;
+        } else if cumulative > self.total_work {
+            self.reorg_to_tip(hash)?;
         }
 
         let mut new_hash = self.tip_hash();
@@ -764,6 +880,7 @@ impl ChainState {
     }
 
     fn validate_transaction_internal(
+
         &self,
         tx: &Transaction,
         height: u64,
