@@ -1003,32 +1003,19 @@ fn collect_block_files_from_dir(dir: &std::path::Path, out: &mut Vec<std::path::
     if !dir.exists() {
         return;
     }
-    let Ok(read_dir) = dir.read_dir() else {
-        return;
-    };
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            if block_height_from_filename(&path).is_some() {
-                out.push(path);
-            }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let Ok(read_dir) = cur.read_dir() else {
             continue;
-        }
-        if path.is_dir() {
-            let is_orphan_bucket = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.starts_with("orphaned_"))
-                .unwrap_or(false);
-            if is_orphan_bucket {
-                if let Ok(inner) = path.read_dir() {
-                    for file in inner.flatten() {
-                        let file_path = file.path();
-                        if file_path.is_file() && block_height_from_filename(&file_path).is_some() {
-                            out.push(file_path);
-                        }
-                    }
-                }
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.is_file() && block_height_from_filename(&path).is_some() {
+                out.push(path);
             }
         }
     }
