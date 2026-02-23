@@ -33,6 +33,9 @@ struct PersistWriter {
 static PERSIST_WRITER: OnceLock<PersistWriter> = OnceLock::new();
 static PERSIST_QUEUE_LEN: AtomicUsize = AtomicUsize::new(0);
 static PERSISTED_HEIGHT: AtomicU64 = AtomicU64::new(0);
+static PERSISTED_CONTIGUOUS_HEIGHT: AtomicU64 = AtomicU64::new(0);
+static PERSISTED_MAX_HEIGHT_ON_DISK: AtomicU64 = AtomicU64::new(0);
+static QUARANTINE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn persist_async_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -79,6 +82,58 @@ pub fn set_persisted_height(height: u64) {
 
 pub fn persist_queue_len() -> usize {
     PERSIST_QUEUE_LEN.load(Ordering::Relaxed)
+}
+
+pub fn persisted_contiguous_height() -> u64 {
+    PERSISTED_CONTIGUOUS_HEIGHT.load(Ordering::Relaxed)
+}
+
+pub fn set_persisted_contiguous_height(height: u64) {
+    let mut current = PERSISTED_CONTIGUOUS_HEIGHT.load(Ordering::Relaxed);
+    while height > current {
+        match PERSISTED_CONTIGUOUS_HEIGHT.compare_exchange_weak(
+            current,
+            height,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(v) => current = v,
+        }
+    }
+}
+
+pub fn persisted_max_height_on_disk() -> u64 {
+    PERSISTED_MAX_HEIGHT_ON_DISK.load(Ordering::Relaxed)
+}
+
+pub fn set_persisted_max_height_on_disk(height: u64) {
+    let mut current = PERSISTED_MAX_HEIGHT_ON_DISK.load(Ordering::Relaxed);
+    while height > current {
+        match PERSISTED_MAX_HEIGHT_ON_DISK.compare_exchange_weak(
+            current,
+            height,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(v) => current = v,
+        }
+    }
+}
+
+pub fn quarantine_count() -> u64 {
+    QUARANTINE_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn reset_quarantine_count() {
+    QUARANTINE_COUNT.store(0, Ordering::Relaxed);
+}
+
+pub fn add_quarantine_count(delta: u64) {
+    if delta > 0 {
+        QUARANTINE_COUNT.fetch_add(delta, Ordering::Relaxed);
+    }
 }
 
 pub fn init_persist_writer() {
@@ -347,6 +402,23 @@ fn maybe_quarantine_existing_block(path: &Path, new_hash: &str) -> std::io::Resu
     Ok(())
 }
 
+fn maybe_advance_contiguous(dir: &Path, written_height: u64) {
+    let contiguous = persisted_contiguous_height();
+    if written_height != contiguous.saturating_add(1) {
+        return;
+    }
+    let mut probe = contiguous.saturating_add(1);
+    loop {
+        let path = dir.join(format!("block_{}.json", probe));
+        if path.exists() {
+            set_persisted_contiguous_height(probe);
+            probe = probe.saturating_add(1);
+            continue;
+        }
+        break;
+    }
+}
+
 fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
     let dir = blocks_dir();
     fs::create_dir_all(&dir)?;
@@ -378,8 +450,10 @@ fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
     };
 
     let json = serde_json::to_string_pretty(&jb)?;
-    fs::write(path, json)?;
+    fs::write(&path, json)?;
     set_persisted_height(height);
+    set_persisted_max_height_on_disk(height);
+    maybe_advance_contiguous(&dir, height);
     Ok(())
 }
 

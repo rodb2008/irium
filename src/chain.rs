@@ -141,6 +141,12 @@ impl ChainState {
         }
     }
 
+    pub fn clear_orphan_pool(&mut self) -> usize {
+        let count = self.orphan_pool_size();
+        self.orphan_pool.clear();
+        count
+    }
+
     fn prune_header_cache(&mut self) {
         let window = header_cache_window();
         if window == 0 {

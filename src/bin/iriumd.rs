@@ -62,6 +62,9 @@ struct AppState {
     status_sybil_cache: Arc<AtomicU8>,
     status_persisted_height_cache: Arc<AtomicU64>,
     status_persist_queue_cache: Arc<AtomicUsize>,
+    status_persisted_contiguous_cache: Arc<AtomicU64>,
+    status_persisted_max_on_disk_cache: Arc<AtomicU64>,
+    status_quarantine_count_cache: Arc<AtomicU64>,
 }
 
 #[derive(Serialize)]
@@ -88,6 +91,9 @@ struct StatusResponse {
     sybil_difficulty: Option<u8>,
     persisted_height: u64,
     persist_queue_len: usize,
+    persisted_contiguous_height: u64,
+    persisted_max_height_on_disk: u64,
+    quarantine_count: u64,
 }
 
 #[derive(Serialize)]
@@ -812,13 +818,13 @@ fn same_dir(a: &PathBuf, b: &PathBuf) -> bool {
     }
 }
 
-fn quarantine_blocks_above_dir(dir: &std::path::Path, height: u64) {
+fn quarantine_blocks_above_dir(dir: &std::path::Path, height: u64) -> u64 {
     if !dir.exists() {
-        return;
+        return 0;
     }
     let read_dir = match dir.read_dir() {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => return 0,
     };
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -826,6 +832,7 @@ fn quarantine_blocks_above_dir(dir: &std::path::Path, height: u64) {
         .as_secs();
     let backup_dir = dir.join(format!("orphaned_{}", stamp));
     let _ = fs::create_dir_all(&backup_dir);
+    let mut moved = 0u64;
     for entry in read_dir.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -842,9 +849,12 @@ fn quarantine_blocks_above_dir(dir: &std::path::Path, height: u64) {
         };
         if h > height {
             let dest = backup_dir.join(name);
-            let _ = fs::rename(&path, &dest);
+            if fs::rename(&path, &dest).is_ok() {
+                moved = moved.saturating_add(1);
+            }
         }
     }
+    moved
 }
 
 fn load_persisted_blocks_from(state: &mut ChainState, dir: &std::path::Path, skip_below_tip: bool) {
@@ -964,8 +974,9 @@ fn load_persisted_blocks_from(state: &mut ChainState, dir: &std::path::Path, ski
                 if let Err(e) = state.connect_block(block) {
                     eprintln!("[⚠️] Failed to connect persisted block {}: {}", h, e);
                     let tip = state.tip_height();
-                    quarantine_blocks_above_dir(dir, tip);
-                    println!("[🧹] Quarantined persisted blocks above height {}", tip);
+                    let moved = quarantine_blocks_above_dir(dir, tip);
+                    storage::add_quarantine_count(moved);
+                    println!("[🧹] Quarantined persisted blocks above height {} (moved={})", tip, moved);
                     break;
                 }
             }
@@ -999,6 +1010,7 @@ fn highest_persisted_height_in_dir(dir: &std::path::Path) -> u64 {
 }
 
 fn load_persisted_blocks(state: &mut ChainState) {
+    storage::reset_quarantine_count();
     let node_dir = storage::blocks_dir();
     let miner_dir = miner_blocks_dir();
 
@@ -1015,6 +1027,8 @@ fn load_persisted_blocks(state: &mut ChainState) {
     let tip_height = state.tip_height();
     let tip_hash = hex::encode(state.tip_hash());
     storage::set_persisted_height(tip_height);
+    storage::set_persisted_contiguous_height(tip_height);
+    storage::set_persisted_max_height_on_disk(highest_persisted);
     let queue_len = storage::persist_queue_len();
 
     println!(
@@ -1494,6 +1508,18 @@ async fn status(
     state
         .status_persist_queue_cache
         .store(persist_queue_len, Ordering::Relaxed);
+    let persisted_contiguous_height = storage::persisted_contiguous_height();
+    state
+        .status_persisted_contiguous_cache
+        .store(persisted_contiguous_height, Ordering::Relaxed);
+    let persisted_max_height_on_disk = storage::persisted_max_height_on_disk();
+    state
+        .status_persisted_max_on_disk_cache
+        .store(persisted_max_height_on_disk, Ordering::Relaxed);
+    let quarantine_count = storage::quarantine_count();
+    state
+        .status_quarantine_count_cache
+        .store(quarantine_count, Ordering::Relaxed);
 
     Ok(Json(StatusResponse {
         height,
@@ -1505,6 +1531,9 @@ async fn status(
         sybil_difficulty: sybil_diff,
         persisted_height,
         persist_queue_len,
+        persisted_contiguous_height,
+        persisted_max_height_on_disk,
+        quarantine_count,
     }))
 }
 
@@ -2989,6 +3018,9 @@ async fn main() {
     let status_sybil_cache = Arc::new(AtomicU8::new(0));
     let status_persisted_height_cache = Arc::new(AtomicU64::new(storage::persisted_height()));
     let status_persist_queue_cache = Arc::new(AtomicUsize::new(storage::persist_queue_len()));
+    let status_persisted_contiguous_cache = Arc::new(AtomicU64::new(storage::persisted_contiguous_height()));
+    let status_persisted_max_on_disk_cache = Arc::new(AtomicU64::new(storage::persisted_max_height_on_disk()));
+    let status_quarantine_count_cache = Arc::new(AtomicU64::new(storage::quarantine_count()));
 
     // Periodic heartbeat logging to surface peers and seedlist.
     if let Some(ref node) = p2p {
@@ -3242,6 +3274,71 @@ async fn main() {
         });
     }
 
+    {
+        let chain_for_backfill = shared_state.clone();
+        tokio::spawn(async move {
+            let interval_secs = std::env::var("IRIUM_PERSIST_BACKFILL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(5)
+                .clamp(1, 60);
+            let mut logged_idle = false;
+            loop {
+                tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                let contiguous = storage::persisted_contiguous_height();
+                let tip_height = {
+                    let guard = chain_for_backfill.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.tip_height()
+                };
+                if contiguous >= tip_height {
+                    if !logged_idle {
+                        eprintln!(
+                            "[i] persist backfill: nothing to do yet (contiguous={} tip={})",
+                            contiguous, tip_height
+                        );
+                        logged_idle = true;
+                    }
+                    continue;
+                }
+
+                let mut wrote_any = false;
+                for _ in 0..64 {
+                    let next_h = storage::persisted_contiguous_height().saturating_add(1);
+                    let block_opt = {
+                        let guard = chain_for_backfill.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.chain.get(next_h as usize).cloned()
+                    };
+                    let Some(block) = block_opt else {
+                        break;
+                    };
+                    match storage::write_block_json(next_h, &block) {
+                        Ok(_) => {
+                            wrote_any = true;
+                            logged_idle = false;
+                            eprintln!(
+                                "[i] persist backfill: wrote block_{}.json; contiguous now {}",
+                                next_h,
+                                storage::persisted_contiguous_height()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("[warn] persist backfill failed for block {}: {}", next_h, e);
+                            break;
+                        }
+                    }
+                }
+
+                if !wrote_any {
+                    let now_contig = storage::persisted_contiguous_height();
+                    eprintln!(
+                        "[i] persist backfill: no connected main-chain block available yet (contiguous={} tip={})",
+                        now_contig, tip_height
+                    );
+                }
+            }
+        });
+    }
+
     let app_state = AppState {
         chain: shared_state.clone(),
         genesis_hash: genesis_hash.clone(),
@@ -3255,6 +3352,9 @@ async fn main() {
         status_sybil_cache,
         status_persisted_height_cache,
         status_persist_queue_cache,
+        status_persisted_contiguous_cache,
+        status_persisted_max_on_disk_cache,
+        status_quarantine_count_cache,
     };
 
     let persist_drain_secs = std::env::var("IRIUM_PERSIST_DRAIN_SECS")
@@ -3307,13 +3407,40 @@ async fn main() {
         .route("/wallet/new_address", post(wallet_new_address))
         .route("/wallet/send", post(wallet_send))
         .layer(DefaultBodyLimit::max(rpc_body_limit_bytes()))
-        .with_state(app_state);
+        .with_state(app_state.clone());
 
     if let Some(cors) = cors_layer() {
         app = app.layer(cors);
     }
 
     let app = app.into_make_service_with_connect_info::<SocketAddr>();
+
+    let status_host = std::env::var("IRIUM_STATUS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let status_port: u16 = std::env::var("IRIUM_STATUS_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+    let status_addr: SocketAddr = format!("{}:{}", status_host, status_port)
+        .parse()
+        .expect("valid status bind address");
+
+    let status_app = Router::new()
+        .route("/status", get(status))
+        .with_state(app_state.clone())
+        .into_make_service_with_connect_info::<SocketAddr>();
+
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(status_addr).await {
+            Ok(listener) => {
+                if let Err(e) = axum::serve(listener, status_app).await {
+                    eprintln!("[warn] HTTP status server exited: {}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("[warn] failed to bind HTTP status listener on {}: {}", status_addr, e);
+            }
+        }
+    });
 
     let host = std::env::var("IRIUM_NODE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port: u16 = std::env::var("IRIUM_NODE_PORT")
@@ -3324,6 +3451,9 @@ async fn main() {
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .expect("valid bind address");
+
+    println!("[i] RPC status: https://{}:{}/status", host, port);
+    println!("[i] HTTP status: http://{}:{}/status", status_host, status_port);
 
     let tls_cert = std::env::var("IRIUM_TLS_CERT").ok();
     let tls_key = std::env::var("IRIUM_TLS_KEY").ok();
