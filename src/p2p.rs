@@ -911,6 +911,45 @@ async fn maybe_request_headers_fallback(
     }
 }
 
+fn orphan_storm_threshold() -> u32 {
+    std::env::var("IRIUM_ORPHAN_STORM_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(200)
+        .clamp(20, 20000)
+}
+
+fn orphan_storm_window_secs() -> u64 {
+    std::env::var("IRIUM_ORPHAN_STORM_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60)
+        .clamp(10, 600)
+}
+
+fn orphan_storm_tracker() -> &'static Mutex<(Instant, u32)> {
+    static TRACK: OnceLock<Mutex<(Instant, u32)>> = OnceLock::new();
+    TRACK.get_or_init(|| Mutex::new((Instant::now(), 0)))
+}
+
+async fn note_orphan_and_check_storm() -> bool {
+    let window = Duration::from_secs(orphan_storm_window_secs());
+    let threshold = orphan_storm_threshold();
+    let now = Instant::now();
+    let mut guard = orphan_storm_tracker().lock().await;
+    if now.duration_since(guard.0) > window {
+        guard.0 = now;
+        guard.1 = 0;
+    }
+    guard.1 = guard.1.saturating_add(1);
+    if guard.1 >= threshold {
+        guard.0 = now;
+        guard.1 = 0;
+        return true;
+    }
+    false
+}
+
 async fn request_orphan_headers(
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     addr: SocketAddr,
@@ -919,13 +958,17 @@ async fn request_orphan_headers(
     sync_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
     peer_state: &Arc<Mutex<PeerSyncState>>,
 ) {
-    let (local_height, prev_known) = chain
+    let (local_height, prev_known, prev_in_headers) = chain
         .as_ref()
         .and_then(|c| {
             let guard = c.lock().ok()?;
-            Some((guard.tip_height(), guard.heights.contains_key(&prev_hash)))
+            Some((
+                guard.tip_height(),
+                guard.heights.contains_key(&prev_hash),
+                guard.headers.contains_key(&prev_hash),
+            ))
         })
-        .unwrap_or((0, false));
+        .unwrap_or((0, false, false));
 
     let peer_height = {
         let guard = peer_state.lock().await;
@@ -933,12 +976,46 @@ async fn request_orphan_headers(
     };
 
     if prev_hash != [0u8; 32] && !prev_known {
+        let prev = hex::encode(prev_hash);
+        let prev_short = prev.get(0..12).unwrap_or(&prev);
         P2PNode::log_event(
             "warn",
             "sync",
-            "Orphan block received (prev unknown). Possible fork/split or missing ancestors. Attempting recovery..."
-                .to_string(),
+            format!(
+                "Orphan block received (prev unknown={}; prev_in_headers={}; prev={}). Possible fork/split or missing ancestors. Attempting recovery...",
+                !prev_known,
+                prev_in_headers,
+                prev_short
+            ),
         );
+
+        if note_orphan_and_check_storm().await {
+            let cleared = chain
+                .as_ref()
+                .and_then(|c| c.lock().ok().map(|mut g| g.clear_orphan_pool()))
+                .unwrap_or(0);
+            sync_requests.lock().await.clear();
+            P2PNode::log_event(
+                "warn",
+                "sync",
+                format!(
+                    "orphan storm detected; clearing orphan pool and restarting header-first sync from best peer (cleared={})",
+                    cleared
+                ),
+            );
+            let get_headers = GetHeadersPayload {
+                start_hash: vec![0u8; 32],
+                count: MAX_HEADERS_PER_REQUEST,
+            };
+            if let Ok(msg) = get_headers.to_message() {
+                let _ = send_message(writer, msg, addr).await;
+            }
+            let mut guard = peer_state.lock().await;
+            guard.last_headers_request = Some(Instant::now());
+            guard.last_headers_start = Some([0u8; 32]);
+            guard.headers_inflight = true;
+            return;
+        }
     }
 
     let start_hash = if prev_hash == [0u8; 32] || !prev_known {
@@ -3437,12 +3514,24 @@ impl P2PNode {
                                         let h = hex::encode(start_hash);
                                         h.get(0..12).unwrap_or(&h).to_string()
                                     };
+                                    let (range_start, range_end, header_tip_short) = {
+                                        let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                        let start_h = if start_hash == [0u8; 32] {
+                                            0
+                                        } else {
+                                            guard.heights.get(&start_hash).copied().unwrap_or(0).saturating_add(1)
+                                        };
+                                        let end_h = start_h.saturating_add(count as u64).saturating_sub(1);
+                                        let tip_hex = hex::encode(guard.best_header_hash());
+                                        let tip_short = tip_hex.get(0..12).unwrap_or(&tip_hex).to_string();
+                                        (start_h, end_h, tip_short)
+                                    };
                                     P2PNode::log_event(
                                         "info",
                                         "sync",
                                         format!(
-                                            "P2P {}: requesting {} blocks from {}",
-                                            addr, count, short
+                                            "P2P {}: requesting {} blocks from {} (range=[{}-{}], header_tip={})",
+                                            addr, count, short, range_start, range_end, header_tip_short
                                         ),
                                     );
 
@@ -3465,40 +3554,14 @@ impl P2PNode {
                                         }
                                     }
                                 } else if peer_height > local_height || header_count > 0 {
-                                    let tip_hash = {
-                                        let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                        guard.tip_hash()
-                                    };
-                                    let get_blocks = GetBlocksPayload {
-                                        start_hash: tip_hash.to_vec(),
-                                        count: MAX_BLOCKS_PER_REQUEST,
-                                    };
-                                    if sync_block_request_allowed_for(
-                                        &block_requests,
-                                        addr.ip(),
-                                        local_height,
-                                        peer_height,
-                                        &tip_hash,
-                                        MAX_BLOCKS_PER_REQUEST,
-                                    )
-                                    .await
-                                    {
-                                        let short = {
-                                            let h = hex::encode(tip_hash);
-                                            h.get(0..12).unwrap_or(&h).to_string()
-                                        };
-                                        P2PNode::log_event(
-                                            "info",
-                                            "sync",
-                                            format!(
-                                                "P2P {}: fallback requesting {} blocks from tip {}",
-                                                addr, MAX_BLOCKS_PER_REQUEST, short
-                                            ),
-                                        );
-                                        if let Ok(msg) = get_blocks.to_message() {
-                                            send_message_detached(&writer, msg, addr);
-                                        }
-                                    }
+                                    P2PNode::log_event(
+                                        "info",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: no best-header block path yet; waiting for header-first sync",
+                                            addr
+                                        ),
+                                    );
                                 }
                                 {
                                     let mut state = peer_state.lock().await;
@@ -3650,6 +3713,28 @@ impl P2PNode {
                                         let short2 = short.to_string();
                                         let bhash2 = bhash;
                                         let block2 = block.clone();
+                                        let prev_hash = block.header.prev_hash;
+                                        let (prev_in_headers, prev_in_blocks) = {
+                                            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                            (
+                                                guard.headers.contains_key(&prev_hash),
+                                                guard.heights.contains_key(&prev_hash),
+                                            )
+                                        };
+                                        let prev_hex = hex::encode(prev_hash);
+                                        let prev_short = prev_hex.get(0..12).unwrap_or(&prev_hex);
+                                        P2PNode::log_event(
+                                            "info",
+                                            "sync",
+                                            format!(
+                                                "P2P {}: inbound block {} prev={} prev_in_headers={} prev_in_blocks={}",
+                                                addr,
+                                                short,
+                                                prev_short,
+                                                prev_in_headers,
+                                                prev_in_blocks
+                                            ),
+                                        );
 
                                         let (new_height_opt, record_verdict, persist_blocks, orphan_prev) =
                                             match spawn_blocking_limited(move || {
@@ -5308,6 +5393,26 @@ async fn handle_incoming_with_sybil(
                             };
 
                             if let Some((start_hash, count)) = request {
+                                let (range_start, range_end, header_tip_short) = {
+                                    let guard = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
+                                    let start_h = if start_hash == [0u8; 32] {
+                                        0
+                                    } else {
+                                        guard.heights.get(&start_hash).copied().unwrap_or(0).saturating_add(1)
+                                    };
+                                    let end_h = start_h.saturating_add(count as u64).saturating_sub(1);
+                                    let tip_hex = hex::encode(guard.best_header_hash());
+                                    let tip_short = tip_hex.get(0..12).unwrap_or(&tip_hex).to_string();
+                                    (start_h, end_h, tip_short)
+                                };
+                                P2PNode::log_event(
+                                    "info",
+                                    "sync",
+                                    format!(
+                                        "P2P {}: requesting {} blocks (range=[{}-{}], header_tip={})",
+                                        addr2, count, range_start, range_end, header_tip_short
+                                    ),
+                                );
                                 let get_blocks = GetBlocksPayload {
                                     start_hash: start_hash.to_vec(),
                                     count,
@@ -5329,42 +5434,14 @@ async fn handle_incoming_with_sybil(
                                     }
                                 }
                             } else if peer_height > local_height || header_count > 0 {
-                                let tip_hash = {
-                                    let guard = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
-                                    guard.tip_hash()
-                                };
-                                let get_blocks = GetBlocksPayload {
-                                    start_hash: tip_hash.to_vec(),
-                                    count: MAX_BLOCKS_PER_REQUEST,
-                                };
-                                if sync_block_request_allowed_for(
-                                    &block_requests2,
-                                    addr2.ip(),
-                                    local_height,
-                                    peer_height,
-                                    &tip_hash,
-                                    MAX_BLOCKS_PER_REQUEST,
-                                )
-                                .await
-                                {
-                                    let short = {
-                                        let h = hex::encode(tip_hash);
-                                        h.get(0..12).unwrap_or(&h).to_string()
-                                    };
-                                    P2PNode::log_event(
-                                        "info",
-                                        "sync",
-                                        format!(
-                                            "P2P {}: fallback requesting {} blocks from tip {}",
-                                            addr2, MAX_BLOCKS_PER_REQUEST, short
-                                        ),
-                                    );
-                                    if let Ok(msg) = get_blocks.to_message() {
-                                        if let Some(writer) = writer_weak.upgrade() {
-                                            send_message_detached(&writer, msg, addr2);
-                                        }
-                                    }
-                                }
+                                P2PNode::log_event(
+                                    "info",
+                                    "sync",
+                                    format!(
+                                        "P2P {}: no best-header block path yet; waiting for header-first sync",
+                                        addr2
+                                    ),
+                                );
                             }
 
                             {
