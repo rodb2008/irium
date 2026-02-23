@@ -37,7 +37,7 @@ use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::MempoolManager;
 use irium_node_rs::network::SeedlistManager;
 use irium_node_rs::p2p::P2PNode;
-use irium_node_rs::pow::{sha256d, Target};
+use irium_node_rs::pow::{meets_target, sha256d, Target};
 use irium_node_rs::rate_limiter::RateLimiter;
 use irium_node_rs::reputation::ReputationManager;
 use irium_node_rs::storage;
@@ -65,6 +65,8 @@ struct AppState {
     status_persisted_contiguous_cache: Arc<AtomicU64>,
     status_persisted_max_on_disk_cache: Arc<AtomicU64>,
     status_quarantine_count_cache: Arc<AtomicU64>,
+    status_persisted_window_tip_cache: Arc<AtomicU64>,
+    status_missing_persisted_in_window_cache: Arc<AtomicU64>,
 }
 
 #[derive(Serialize)]
@@ -101,6 +103,8 @@ struct StatusResponse {
     persisted_contiguous_height: u64,
     persisted_max_height_on_disk: u64,
     quarantine_count: u64,
+    persisted_window_tip: u64,
+    missing_persisted_in_window: u64,
 }
 
 #[derive(Serialize)]
@@ -825,250 +829,382 @@ fn same_dir(a: &PathBuf, b: &PathBuf) -> bool {
     }
 }
 
-fn quarantine_blocks_above_dir(dir: &std::path::Path, height: u64) -> u64 {
-    if !dir.exists() {
-        return 0;
+fn persist_window_size() -> u64 {
+    std::env::var("IRIUM_PERSIST_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(128, 200_000))
+        .unwrap_or(2000)
+}
+
+fn block_height_from_filename(path: &std::path::Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let stripped = name.strip_prefix("block_")?;
+    let num_part = stripped.strip_suffix(".json")?;
+    num_part.parse::<u64>().ok()
+}
+
+fn path_contains_orphaned_dir(path: &std::path::Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .map(|s| s.starts_with("orphaned_"))
+            .unwrap_or(false)
+    })
+}
+
+fn quarantine_single_block_file(path: &std::path::Path, reason: &str) -> bool {
+    if !path.exists() || path_contains_orphaned_dir(path) {
+        return false;
     }
-    let read_dir = match dir.read_dir() {
-        Ok(r) => r,
-        Err(_) => return 0,
+    let Some(parent) = path.parent() else {
+        return false;
     };
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let backup_dir = dir.join(format!("orphaned_{}", stamp));
-    let _ = fs::create_dir_all(&backup_dir);
-    let mut moved = 0u64;
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Some(stripped) = name.strip_prefix("block_") else {
-            continue;
-        };
-        let Some(num_part) = stripped.strip_suffix(".json") else {
-            continue;
-        };
-        let Ok(h) = num_part.parse::<u64>() else {
-            continue;
-        };
-        if h > height {
-            let dest = backup_dir.join(name);
-            if fs::rename(&path, &dest).is_ok() {
-                moved = moved.saturating_add(1);
+    let quarantine_dir = parent.join(format!("orphaned_{}", stamp));
+    if fs::create_dir_all(&quarantine_dir).is_err() {
+        return false;
+    }
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let mut dest = quarantine_dir.join(name);
+    if dest.exists() {
+        let mut n = 1u32;
+        loop {
+            let candidate = quarantine_dir.join(format!("{}.dup{}", name.to_string_lossy(), n));
+            if !candidate.exists() {
+                dest = candidate;
+                break;
             }
+            n = n.saturating_add(1);
         }
     }
-    moved
+    match fs::rename(path, &dest) {
+        Ok(_) => {
+            println!(
+                "[🧹] Quarantined persisted block file {} (reason: {}; to={})",
+                path.display(),
+                reason,
+                dest.display()
+            );
+            true
+        }
+        Err(_) => false,
+    }
 }
 
-fn load_persisted_blocks_from(state: &mut ChainState, dir: &std::path::Path, skip_below_tip: bool) {
+fn parse_persisted_block_file(
+    path: &std::path::Path,
+    genesis_hash_lc: &str,
+) -> Result<(u64, Block), String> {
+    let height =
+        block_height_from_filename(path).ok_or_else(|| "invalid block file name".to_string())?;
+
+    let md = fs::metadata(path).map_err(|e| format!("metadata read failed: {}", e))?;
+    if md.len() == 0 {
+        return Err("file is empty".to_string());
+    }
+
+    let data = fs::read_to_string(path).map_err(|e| format!("file read failed: {}", e))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| format!("json parse failed: {}", e))?;
+    let header_obj = parsed
+        .get("header")
+        .ok_or_else(|| "missing header".to_string())?;
+
+    let get_hex32 = |key: &str| -> Result<[u8; 32], String> {
+        let s = header_obj
+            .get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("missing header.{}", key))?;
+        let bytes = hex::decode(s).map_err(|e| format!("bad hex in {}: {}", key, e))?;
+        if bytes.len() != 32 {
+            return Err(format!("{} must be 32 bytes", key));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    };
+
+    let prev_hash = get_hex32("prev_hash")?;
+    let merkle_root = get_hex32("merkle_root")?;
+    let version = header_obj
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
+    let time = header_obj.get("time").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let bits_str = header_obj
+        .get("bits")
+        .and_then(|v| v.as_str())
+        .unwrap_or("1d00ffff");
+    let bits = u32::from_str_radix(bits_str, 16).map_err(|e| format!("invalid bits: {}", e))?;
+    let nonce = header_obj
+        .get("nonce")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    let txs: Vec<Transaction> = match parsed.get("tx_hex").and_then(|v| v.as_array()) {
+        Some(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for t in arr {
+                let s = t
+                    .as_str()
+                    .ok_or_else(|| "tx_hex entry is not a string".to_string())?;
+                let bytes = hex::decode(s).map_err(|e| format!("invalid tx hex: {}", e))?;
+                let tx = decode_compact_tx(&bytes)
+                    .map_err(|e| format!("failed to decode compact tx: {}", e))?;
+                out.push(tx);
+            }
+            out
+        }
+        None => Vec::new(),
+    };
+
+    let block = Block {
+        header: BlockHeader {
+            version,
+            prev_hash,
+            merkle_root,
+            time,
+            bits,
+            nonce,
+        },
+        transactions: txs,
+    };
+
+    if height == 0 {
+        let h = hex::encode(block.header.hash()).to_lowercase();
+        if h != genesis_hash_lc {
+            return Err("genesis hash mismatch".to_string());
+        }
+    } else {
+        if block.transactions.is_empty() {
+            return Err("block has no transactions".to_string());
+        }
+        if block.merkle_root() != block.header.merkle_root {
+            return Err("block merkle root mismatch".to_string());
+        }
+        if block.header.bits == 0 {
+            return Err("header bits is zero".to_string());
+        }
+        if !meets_target(&block.header.hash(), block.header.target()) {
+            return Err("header hash does not meet declared target".to_string());
+        }
+    }
+
+    Ok((height, block))
+}
+
+fn collect_block_files_from_dir(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     if !dir.exists() {
         return;
     }
-    let base_height = if skip_below_tip {
-        state.tip_height()
-    } else {
-        0
-    };
-    let mut entries: Vec<(u64, std::path::PathBuf)> = Vec::new();
-    if let Ok(read_dir) = dir.read_dir() {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let Ok(read_dir) = cur.read_dir() else {
+            continue;
+        };
         for entry in read_dir.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if let Some(stripped) = name.strip_prefix("block_") {
-                    if let Some(num_part) = stripped.strip_suffix(".json") {
-                        if let Ok(h) = num_part.parse::<u64>() {
-                            if skip_below_tip && h <= base_height {
-                                continue;
-                            }
-                            entries.push((h, path));
-                        }
-                    }
-                }
+            if path.is_dir() {
+                stack.push(path);
+                continue;
             }
-        }
-    }
-    entries.sort_by_key(|(h, _)| *h);
-
-    for (h, path) in entries {
-        if h == 0 {
-            continue;
-        }
-        match std::fs::read_to_string(&path) {
-            Ok(data) => {
-                let parsed: serde_json::Value = match serde_json::from_str(&data) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("[⚠️] Failed to parse {}: {}", path.display(), e);
-                        continue;
-                    }
-                };
-                let header_obj = match parsed.get("header") {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let get_hex32 = |key: &str| -> Option<[u8; 32]> {
-                    let s = header_obj.get(key)?.as_str()?;
-                    let bytes = hex::decode(s).ok()?;
-                    if bytes.len() != 32 {
-                        return None;
-                    }
-                    let mut out = [0u8; 32];
-                    out.copy_from_slice(&bytes);
-                    Some(out)
-                };
-                let prev_hash = match get_hex32("prev_hash") {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let merkle_root = match get_hex32("merkle_root") {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let version = header_obj
-                    .get("version")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as u32;
-                let time = header_obj.get("time").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let bits_str = header_obj
-                    .get("bits")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("1d00ffff");
-                let bits = u32::from_str_radix(bits_str, 16).unwrap_or(0x1d00_ffff);
-                let nonce = header_obj
-                    .get("nonce")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-
-                let txs: Vec<Transaction> = match parsed.get("tx_hex").and_then(|v| v.as_array()) {
-                    Some(arr) => {
-                        let mut out = Vec::new();
-                        for t in arr {
-                            if let Some(s) = t.as_str() {
-                                if let Ok(bytes) = hex::decode(s) {
-                                    match decode_compact_tx(&bytes) {
-                                        Ok(tx) => out.push(tx),
-                                        Err(e) => eprintln!(
-                                            "[⚠️] Failed to decode tx in {}: {}",
-                                            path.display(),
-                                            e
-                                        ),
-                                    }
-                                }
-                            }
-                        }
-                        out
-                    }
-                    None => Vec::new(),
-                };
-
-                let mut block = Block {
-                    header: BlockHeader {
-                        version,
-                        prev_hash,
-                        merkle_root,
-                        time,
-                        bits,
-                        nonce,
-                    },
-                    transactions: txs,
-                };
-                block.header.merkle_root = block.merkle_root();
-
-                if let Err(e) = state.connect_block(block) {
-                    eprintln!("[⚠️] Failed to connect persisted block {}: {}", h, e);
-                    let tip = state.tip_height();
-                    let moved = quarantine_blocks_above_dir(dir, tip);
-                    storage::add_quarantine_count(moved);
-                    println!("[🧹] Quarantined persisted blocks above height {} (moved={})", tip, moved);
-                    break;
-                }
+            if path.is_file() && block_height_from_filename(&path).is_some() {
+                out.push(path);
             }
-            Err(e) => eprintln!("[⚠️] Failed to read {}: {}", path.display(), e),
         }
     }
 }
 
-fn highest_persisted_height_in_dir(dir: &std::path::Path) -> u64 {
-    let mut highest = 0u64;
-    let Ok(read_dir) = dir.read_dir() else {
-        return highest;
-    };
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Some(stripped) = name.strip_prefix("block_") else {
-            continue;
-        };
-        let Some(num_part) = stripped.strip_suffix(".json") else {
-            continue;
-        };
-        let Ok(h) = num_part.parse::<u64>() else {
-            continue;
-        };
-        highest = highest.max(h);
-    }
-    highest
+#[derive(Default)]
+struct PersistWindowStats {
+    max_height_on_disk: u64,
+    contiguous_from_zero: u64,
+    window_tip: u64,
+    missing_in_window: u64,
 }
 
-fn load_persisted_blocks(state: &mut ChainState) {
+fn compute_persist_window_stats(
+    all_heights: &std::collections::HashSet<u64>,
+    valid_heights: &std::collections::HashSet<u64>,
+) -> PersistWindowStats {
+    let max_height_on_disk = all_heights.iter().copied().max().unwrap_or(0);
+    let mut contiguous = 0u64;
+    while valid_heights.contains(&contiguous) {
+        contiguous = contiguous.saturating_add(1);
+    }
+    let contiguous_from_zero = contiguous.saturating_sub(1);
+    let window_tip = valid_heights
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(contiguous_from_zero);
+    let window = persist_window_size();
+    let window_start = window_tip.saturating_sub(window.saturating_sub(1));
+    let mut missing = 0u64;
+    for h in window_start..=window_tip {
+        if !valid_heights.contains(&h) {
+            missing = missing.saturating_add(1);
+        }
+    }
+    PersistWindowStats {
+        max_height_on_disk,
+        contiguous_from_zero,
+        window_tip,
+        missing_in_window: missing,
+    }
+}
+
+fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
     storage::reset_quarantine_count();
+    storage::set_missing_persisted_in_window(0);
+    storage::set_persisted_window_tip(0);
+
     let node_dir = storage::blocks_dir();
     let miner_dir = miner_blocks_dir();
 
-    let mut highest_persisted = highest_persisted_height_in_dir(&node_dir);
+    let mut files = Vec::new();
+    collect_block_files_from_dir(&node_dir, &mut files);
     if !same_dir(&node_dir, &miner_dir) {
-        highest_persisted = highest_persisted.max(highest_persisted_height_in_dir(&miner_dir));
+        collect_block_files_from_dir(&miner_dir, &mut files);
+    }
+    files.sort();
+    files.dedup();
+
+    let mut all_heights: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut valid_heights: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut candidates: Vec<(u64, std::path::PathBuf, Block)> = Vec::new();
+
+    for path in files {
+        let Some(h) = block_height_from_filename(&path) else {
+            continue;
+        };
+        all_heights.insert(h);
+        match parse_persisted_block_file(&path, genesis_hash_lc) {
+            Ok((height, block)) => {
+                valid_heights.insert(height);
+                candidates.push((height, path, block));
+            }
+            Err(e) => {
+                eprintln!("[⚠️] Invalid persisted block {}: {}", path.display(), e);
+                if quarantine_single_block_file(&path, &e) {
+                    storage::add_quarantine_count(1);
+                }
+            }
+        }
     }
 
-    load_persisted_blocks_from(state, &node_dir, false);
-    if !same_dir(&node_dir, &miner_dir) {
-        load_persisted_blocks_from(state, &miner_dir, true);
+    let stats = compute_persist_window_stats(&all_heights, &valid_heights);
+    storage::set_persisted_max_height_on_disk(stats.max_height_on_disk);
+    storage::set_persisted_contiguous_height(stats.contiguous_from_zero);
+    storage::set_persisted_window_tip(stats.window_tip);
+    storage::set_missing_persisted_in_window(stats.missing_in_window);
+
+    let window = persist_window_size();
+    let window_start = stats.window_tip.saturating_sub(window.saturating_sub(1));
+    println!(
+        "[i] persist continuity window: tip={} window_start={} missing_in_window={}",
+        stats.window_tip, window_start, stats.missing_in_window
+    );
+    if stats.missing_in_window > 0 {
+        eprintln!(
+            "[warn] persist continuity window has gaps near tip (missing_in_window={}); writer may be behind; will backfill",
+            stats.missing_in_window
+        );
+    }
+
+    candidates.sort_by_key(|(h, _, _)| *h);
+    let mut pending = candidates;
+    let mut rounds = 0u32;
+    loop {
+        rounds = rounds.saturating_add(1);
+        let mut progressed = false;
+        let mut next_pending: Vec<(u64, std::path::PathBuf, Block)> = Vec::new();
+
+        for (h, path, block) in pending.into_iter() {
+            if h == 0 || h <= state.tip_height() {
+                continue;
+            }
+            match state.connect_block(block.clone()) {
+                Ok(_) => {
+                    progressed = true;
+                }
+                Err(e) => {
+                    let e_lc = e.to_ascii_lowercase();
+                    let should_quarantine = e_lc.contains("merkle")
+                        || e_lc.contains("proof-of-work")
+                        || e_lc.contains("bits mismatch")
+                        || e_lc.contains("coinbase")
+                        || e_lc.contains("timestamp");
+                    if should_quarantine {
+                        eprintln!(
+                            "[⚠️] Persisted block {} failed validation: {}",
+                            path.display(),
+                            e
+                        );
+                        if quarantine_single_block_file(&path, &e) {
+                            storage::add_quarantine_count(1);
+                        }
+                    } else {
+                        next_pending.push((h, path, block));
+                    }
+                }
+            }
+        }
+
+        pending = next_pending;
+        if !progressed || pending.is_empty() || rounds > 4 {
+            break;
+        }
+    }
+
+    if !pending.is_empty() {
+        eprintln!(
+            "[i] persisted replay deferred {} block files due to missing ancestors; network sync will fill gaps",
+            pending.len()
+        );
     }
 
     let tip_height = state.tip_height();
     let tip_hash = hex::encode(state.tip_hash());
     storage::set_persisted_height(tip_height);
-    storage::set_persisted_contiguous_height(tip_height);
-    storage::set_persisted_max_height_on_disk(highest_persisted);
     let queue_len = storage::persist_queue_len();
 
     println!(
-        "[i] Startup source-of-truth: disk blocks are authoritative only up to last contiguous persisted height; node will continue from tip={} hash={} and resync missing continuity from network.",
+        "[i] Startup source-of-truth: using validated persisted chain data near tip; old historical holes do not force rewind. tip={} hash={}",
         tip_height, tip_hash
     );
 
-    if highest_persisted > tip_height {
-        let gap = highest_persisted - tip_height;
-        let writer_may_be_behind = queue_len as u64 >= gap;
-        if writer_may_be_behind {
+    if storage::persisted_max_height_on_disk() > tip_height {
+        let gap = storage::persisted_max_height_on_disk().saturating_sub(tip_height);
+        if queue_len as u64 >= gap {
             println!(
                 "[i] Persisted block gap detected: tip_height={} tip_hash={} highest_persisted_height={} persist_queue_len={}. writer may be behind; will backfill.",
                 tip_height,
                 tip_hash,
-                highest_persisted,
+                storage::persisted_max_height_on_disk(),
                 queue_len
             );
         } else {
             eprintln!(
-                "[warn] Persisted block gap detected: tip_height={} tip_hash={} highest_persisted_height={} persist_queue_len={}. gap may break restart continuity; will resync from network.",
+                "[warn] Persisted block gap detected: tip_height={} tip_hash={} highest_persisted_height={} persist_queue_len={}. will resync missing continuity from network.",
                 tip_height,
                 tip_hash,
-                highest_persisted,
+                storage::persisted_max_height_on_disk(),
                 queue_len
             );
         }
     } else {
         println!(
-            "[i] Persist continuity OK: tip_height={} tip_hash={} highest_persisted_height={} persist_queue_len={}.",
+            "[i] Persist continuity OK: tip_height={} tip_hash={} highest_persisted_height={} persist_queue_len={}",
             tip_height,
             tip_hash,
-            highest_persisted,
+            storage::persisted_max_height_on_disk(),
             queue_len
         );
     }
@@ -1549,6 +1685,14 @@ async fn status(
     state
         .status_quarantine_count_cache
         .store(quarantine_count, Ordering::Relaxed);
+    let persisted_window_tip = storage::persisted_window_tip();
+    state
+        .status_persisted_window_tip_cache
+        .store(persisted_window_tip, Ordering::Relaxed);
+    let missing_persisted_in_window = storage::missing_persisted_in_window();
+    state
+        .status_missing_persisted_in_window_cache
+        .store(missing_persisted_in_window, Ordering::Relaxed);
 
     Ok(Json(StatusResponse {
         height,
@@ -1564,6 +1708,8 @@ async fn status(
         persisted_contiguous_height,
         persisted_max_height_on_disk,
         quarantine_count,
+        persisted_window_tip,
+        missing_persisted_in_window,
     }))
 }
 
@@ -2822,7 +2968,7 @@ async fn main() {
     };
     let mut state = ChainState::new(params);
     if load_persisted {
-        load_persisted_blocks(&mut state);
+        load_persisted_blocks(&mut state, &genesis_hash_lc);
     }
     let shared_state = Arc::new(Mutex::new(state));
     let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));
@@ -2933,6 +3079,8 @@ async fn main() {
     let signed_seeds = load_signed_seeds();
     let local_ips = local_ip_set(node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.as_ref()));
 
+    let startup_missing_window = storage::missing_persisted_in_window();
+
     // Connect to seed peers using a basic handshake and keep retrying in background.
     if let Some(node) = p2p.clone() {
         let config_seeds = config_seeds.clone();
@@ -3040,6 +3188,24 @@ async fn main() {
         });
     }
 
+    if startup_missing_window > 0 {
+        if let Some(node) = p2p.clone() {
+            let shared_for_gap = shared_state.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let start_hash = {
+                    let guard = shared_for_gap.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.tip_hash()
+                };
+                eprintln!(
+                    "[i] persist gap healer: requesting network sync burst for missing persisted window blocks (missing_in_window={})",
+                    startup_missing_window
+                );
+                let _ = node.force_sync_burst_from_tip(start_hash).await;
+            });
+        }
+    }
+
     let status_height_cache = Arc::new(AtomicU64::new({
         let g = shared_state.lock().unwrap_or_else(|e| e.into_inner());
         g.tip_height()
@@ -3048,9 +3214,15 @@ async fn main() {
     let status_sybil_cache = Arc::new(AtomicU8::new(0));
     let status_persisted_height_cache = Arc::new(AtomicU64::new(storage::persisted_height()));
     let status_persist_queue_cache = Arc::new(AtomicUsize::new(storage::persist_queue_len()));
-    let status_persisted_contiguous_cache = Arc::new(AtomicU64::new(storage::persisted_contiguous_height()));
-    let status_persisted_max_on_disk_cache = Arc::new(AtomicU64::new(storage::persisted_max_height_on_disk()));
+    let status_persisted_contiguous_cache =
+        Arc::new(AtomicU64::new(storage::persisted_contiguous_height()));
+    let status_persisted_max_on_disk_cache =
+        Arc::new(AtomicU64::new(storage::persisted_max_height_on_disk()));
     let status_quarantine_count_cache = Arc::new(AtomicU64::new(storage::quarantine_count()));
+    let status_persisted_window_tip_cache =
+        Arc::new(AtomicU64::new(storage::persisted_window_tip()));
+    let status_missing_persisted_in_window_cache =
+        Arc::new(AtomicU64::new(storage::missing_persisted_in_window()));
 
     // Periodic heartbeat logging to surface peers and seedlist.
     if let Some(ref node) = p2p {
@@ -3143,11 +3315,8 @@ async fn main() {
 
                 let (local_height, tip_hash, tip_bytes) = match chain_clone.try_lock() {
                     Ok(g) => {
-                        let tip_bytes = g
-                            .chain
-                            .last()
-                            .map(|b| b.header.hash())
-                            .unwrap_or([0u8; 32]);
+                        let tip_bytes =
+                            g.chain.last().map(|b| b.header.hash()).unwrap_or([0u8; 32]);
                         let tip = hex::encode(tip_bytes);
                         (g.tip_height(), tip, tip_bytes)
                     }
@@ -3386,13 +3555,15 @@ async fn main() {
         status_persisted_contiguous_cache,
         status_persisted_max_on_disk_cache,
         status_quarantine_count_cache,
+        status_persisted_window_tip_cache,
+        status_missing_persisted_in_window_cache,
     };
 
     let persist_drain_secs = std::env::var("IRIUM_PERSIST_DRAIN_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(5)
-        .clamp(0, 60);
+        .unwrap_or(15)
+        .clamp(0, 20);
     if persist_drain_secs > 0 {
         #[cfg(unix)]
         {
@@ -3407,7 +3578,10 @@ async fn main() {
                 if ok {
                     eprintln!("[i] persist queue drained on shutdown");
                 } else {
-                    eprintln!("[warn] persist queue drain timeout on shutdown; remaining_queue_len={}", storage::persist_queue_len());
+                    eprintln!(
+                        "[warn] persist queue drain timeout on shutdown; remaining_queue_len={}",
+                        storage::persist_queue_len()
+                    );
                 }
             });
         }
@@ -3446,7 +3620,8 @@ async fn main() {
 
     let app = app.into_make_service_with_connect_info::<SocketAddr>();
 
-    let status_host = std::env::var("IRIUM_STATUS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let status_host =
+        std::env::var("IRIUM_STATUS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let status_port: u16 = std::env::var("IRIUM_STATUS_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -3468,7 +3643,10 @@ async fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("[warn] failed to bind HTTP status listener on {}: {}", status_addr, e);
+                eprintln!(
+                    "[warn] failed to bind HTTP status listener on {}: {}",
+                    status_addr, e
+                );
             }
         }
     });
@@ -3484,7 +3662,10 @@ async fn main() {
         .expect("valid bind address");
 
     println!("[i] RPC status: https://{}:{}/status", host, port);
-    println!("[i] HTTP status: http://{}:{}/status", status_host, status_port);
+    println!(
+        "[i] HTTP status: http://{}:{}/status",
+        status_host, status_port
+    );
 
     let tls_cert = std::env::var("IRIUM_TLS_CERT").ok();
     let tls_key = std::env::var("IRIUM_TLS_KEY").ok();

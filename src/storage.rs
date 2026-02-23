@@ -35,6 +35,8 @@ static PERSIST_QUEUE_LEN: AtomicUsize = AtomicUsize::new(0);
 static PERSISTED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 static PERSISTED_CONTIGUOUS_HEIGHT: AtomicU64 = AtomicU64::new(0);
 static PERSISTED_MAX_HEIGHT_ON_DISK: AtomicU64 = AtomicU64::new(0);
+static PERSISTED_WINDOW_TIP: AtomicU64 = AtomicU64::new(0);
+static MISSING_PERSISTED_IN_WINDOW: AtomicU64 = AtomicU64::new(0);
 static QUARANTINE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn persist_async_enabled() -> bool {
@@ -120,6 +122,33 @@ pub fn set_persisted_max_height_on_disk(height: u64) {
             Err(v) => current = v,
         }
     }
+}
+
+pub fn persisted_window_tip() -> u64 {
+    PERSISTED_WINDOW_TIP.load(Ordering::Relaxed)
+}
+
+pub fn set_persisted_window_tip(height: u64) {
+    let mut current = PERSISTED_WINDOW_TIP.load(Ordering::Relaxed);
+    while height > current {
+        match PERSISTED_WINDOW_TIP.compare_exchange_weak(
+            current,
+            height,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(v) => current = v,
+        }
+    }
+}
+
+pub fn missing_persisted_in_window() -> u64 {
+    MISSING_PERSISTED_IN_WINDOW.load(Ordering::Relaxed)
+}
+
+pub fn set_missing_persisted_in_window(missing: u64) {
+    MISSING_PERSISTED_IN_WINDOW.store(missing, Ordering::Relaxed);
 }
 
 pub fn quarantine_count() -> u64 {
