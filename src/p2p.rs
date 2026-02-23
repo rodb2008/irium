@@ -3595,7 +3595,7 @@ impl P2PNode {
                                         state.tip = None;
                                         state.last_bad_headers = Some(Instant::now());
                                     }
-                                    if reset_headers && added_any {
+                                    if reset_headers {
                                         let get_headers = GetHeadersPayload {
                                             start_hash: vec![0u8; 32],
                                             count: MAX_HEADERS_PER_REQUEST,
@@ -5487,7 +5487,7 @@ async fn handle_incoming_with_sybil(
                                     state.tip = None;
                                     state.last_bad_headers = Some(Instant::now());
                                 }
-                                if reset_headers && added_any {
+                                if reset_headers {
                                     let get_headers = GetHeadersPayload {
                                         start_hash: vec![0u8; 32],
                                         count: MAX_HEADERS_PER_REQUEST,
