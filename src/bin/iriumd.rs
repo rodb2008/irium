@@ -3283,9 +3283,17 @@ async fn main() {
                 .unwrap_or(5)
                 .clamp(1, 60);
             let mut logged_idle = false;
+            let mut pending_height: Option<u64> = None;
             loop {
                 tokio::time::sleep(Duration::from_secs(interval_secs)).await;
                 let contiguous = storage::persisted_contiguous_height();
+                if let Some(pending) = pending_height {
+                    if contiguous >= pending {
+                        pending_height = None;
+                    } else {
+                        continue;
+                    }
+                }
                 let tip_height = {
                     let guard = chain_for_backfill.lock().unwrap_or_else(|e| e.into_inner());
                     guard.tip_height()
@@ -3301,39 +3309,32 @@ async fn main() {
                     continue;
                 }
 
-                let mut wrote_any = false;
-                for _ in 0..64 {
-                    let next_h = storage::persisted_contiguous_height().saturating_add(1);
-                    let block_opt = {
-                        let guard = chain_for_backfill.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.chain.get(next_h as usize).cloned()
-                    };
-                    let Some(block) = block_opt else {
-                        break;
-                    };
-                    match storage::write_block_json(next_h, &block) {
-                        Ok(_) => {
-                            wrote_any = true;
-                            logged_idle = false;
-                            eprintln!(
-                                "[i] persist backfill: wrote block_{}.json; contiguous now {}",
-                                next_h,
-                                storage::persisted_contiguous_height()
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("[warn] persist backfill failed for block {}: {}", next_h, e);
-                            break;
-                        }
-                    }
-                }
-
-                if !wrote_any {
-                    let now_contig = storage::persisted_contiguous_height();
+                let next_h = contiguous.saturating_add(1);
+                let block_opt = {
+                    let guard = chain_for_backfill.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.chain.get(next_h as usize).cloned()
+                };
+                let Some(block) = block_opt else {
                     eprintln!(
                         "[i] persist backfill: no connected main-chain block available yet (contiguous={} tip={})",
-                        now_contig, tip_height
+                        contiguous, tip_height
                     );
+                    continue;
+                };
+
+                match storage::write_block_json(next_h, &block) {
+                    Ok(_) => {
+                        logged_idle = false;
+                        pending_height = Some(next_h);
+                        eprintln!(
+                            "[i] persist backfill: wrote block_{}.json; contiguous now {}",
+                            next_h,
+                            storage::persisted_contiguous_height()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[warn] persist backfill failed for block {}: {}", next_h, e);
+                    }
                 }
             }
         });
