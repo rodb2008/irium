@@ -3523,22 +3523,28 @@ impl P2PNode {
                                             let already_known = guard.headers.contains_key(&header_hash)
                                                 || guard.block_store.contains_key(&header_hash);
                                             if let Err(e) = guard.add_header(header.clone()) {
-                                                header_error = true;
-                                                reject_reason = Some(classify_header_reject_reason(&e));
                                                 if e.contains("unknown parent") {
                                                     unknown_parent = true;
+                                                    reject_reason.get_or_insert_with(|| classify_header_reject_reason(&e));
                                                     if let Some(peer_height) = peer_height_hint {
                                                         let local_height = guard.tip_height();
                                                         if peer_height > local_height {
                                                             reset_headers = true;
                                                         }
                                                     }
+                                                    continue;
                                                 }
+                                                header_error = true;
+                                                reject_reason = Some(classify_header_reject_reason(&e));
                                                 break;
                                             }
                                             if !already_known {
                                                 added_any = true;
                                             }
+                                        }
+
+                                        if unknown_parent && !added_any && !header_error {
+                                            header_error = true;
                                         }
 
                                         (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason)
@@ -5411,25 +5417,31 @@ async fn handle_incoming_with_sybil(
                                         let already_known = guard.headers.contains_key(&header_hash)
                                             || guard.block_store.contains_key(&header_hash);
                                         if let Err(e) = guard.add_header(header.clone()) {
-                                            header_error = true;
-                                            reject_reason = Some(classify_header_reject_reason(&e));
-                                            if e.contains("unknown parent") {
-                                                unknown_parent = true;
-                                                if let Some(peer_height) = peer_height_hint {
-                                                    let local_height = guard.tip_height();
-                                                    if peer_height > local_height {
-                                                        reset_headers = true;
+                                                if e.contains("unknown parent") {
+                                                    unknown_parent = true;
+                                                    reject_reason.get_or_insert_with(|| classify_header_reject_reason(&e));
+                                                    if let Some(peer_height) = peer_height_hint {
+                                                        let local_height = guard.tip_height();
+                                                        if peer_height > local_height {
+                                                            reset_headers = true;
+                                                        }
                                                     }
+                                                    continue;
                                                 }
+                                                header_error = true;
+                                                reject_reason = Some(classify_header_reject_reason(&e));
+                                                break;
                                             }
-                                            break;
-                                        }
                                         if !already_known {
                                             added_any = true;
                                         }
                                     }
 
-                                    (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason)
+                                        if unknown_parent && !added_any && !header_error {
+                                            header_error = true;
+                                        }
+
+                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason)
                                 })
                                 .await
                                 {
