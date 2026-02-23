@@ -343,11 +343,105 @@ async fn sync_request_allowed_for(
     true
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PeerSyncPerf {
+    score: i32,
+    last_progress: Option<Instant>,
+    last_update: Option<Instant>,
+}
+
+fn peer_sync_perf() -> Arc<Mutex<HashMap<IpAddr, PeerSyncPerf>>> {
+    static PERF: OnceLock<Arc<Mutex<HashMap<IpAddr, PeerSyncPerf>>>> = OnceLock::new();
+    PERF.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))).clone()
+}
+
+fn block_range_owner_ttl() -> Duration {
+    let secs = std::env::var("IRIUM_P2P_RANGE_OWNER_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(6);
+    Duration::from_secs(secs.clamp(2, 30))
+}
+
+fn block_range_owners() -> Arc<Mutex<HashMap<Vec<u8>, (IpAddr, Instant)>>> {
+    static OWNERS: OnceLock<Arc<Mutex<HashMap<Vec<u8>, (IpAddr, Instant)>>>> = OnceLock::new();
+    OWNERS
+        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone()
+}
+
+fn range_key(start_hash: &[u8], count: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + start_hash.len());
+    key.extend_from_slice(&count.to_be_bytes());
+    key.extend_from_slice(start_hash);
+    key
+}
+
+async fn claim_block_range_owner(ip: IpAddr, start_hash: &[u8], count: u32) -> bool {
+    let owners = block_range_owners();
+    let ttl = block_range_owner_ttl();
+    let now = Instant::now();
+    let key = range_key(start_hash, count);
+    let mut guard = owners.lock().await;
+    guard.retain(|_, (_, ts)| now.duration_since(*ts) <= ttl);
+    if let Some((owner, ts)) = guard.get(&key).copied() {
+        if owner != ip && now.duration_since(ts) <= ttl {
+            return false;
+        }
+    }
+    guard.insert(key, (ip, now));
+    true
+}
+
+fn peer_score_gate_enabled() -> bool {
+    std::env::var("IRIUM_P2P_PEER_SCORE_GATE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
+async fn peer_mark_header_event(ip: IpAddr, added_any: bool, header_count: u32) {
+    let perf = peer_sync_perf();
+    let now = Instant::now();
+    let mut guard = perf.lock().await;
+    let entry = guard.entry(ip).or_default();
+    if added_any {
+        entry.score = (entry.score + 1).clamp(-50, 50);
+    } else if header_count > 0 {
+        entry.score = (entry.score - 2).clamp(-50, 50);
+    }
+    entry.last_update = Some(now);
+}
+
+async fn peer_mark_block_progress(ip: IpAddr) {
+    let perf = peer_sync_perf();
+    let now = Instant::now();
+    let mut guard = perf.lock().await;
+    let entry = guard.entry(ip).or_default();
+    entry.score = (entry.score + 6).clamp(-50, 50);
+    entry.last_progress = Some(now);
+    entry.last_update = Some(now);
+}
+
+async fn peer_score(ip: IpAddr) -> i32 {
+    let perf = peer_sync_perf();
+    let guard = perf.lock().await;
+    guard.get(&ip).map(|p| p.score).unwrap_or(0)
+}
+
+async fn best_peer_score() -> i32 {
+    let perf = peer_sync_perf();
+    let guard = perf.lock().await;
+    guard.values().map(|p| p.score).max().unwrap_or(0)
+}
+
 async fn sync_block_request_allowed_for(
     block_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
     ip: IpAddr,
     local_height: u64,
     peer_height: u64,
+    start_hash: &[u8],
+    count: u32,
 ) -> bool {
     let cooldown = sync_cooldown_for(local_height, peer_height);
     let mut guard = block_requests.lock().await;
@@ -357,6 +451,19 @@ async fn sync_block_request_allowed_for(
             return false;
         }
     }
+
+    if peer_score_gate_enabled() {
+        let best = best_peer_score().await;
+        let score = peer_score(ip).await;
+        if best >= 10 && score <= -6 {
+            return false;
+        }
+    }
+
+    if !claim_block_range_owner(ip, start_hash, count).await {
+        return false;
+    }
+
     guard.insert(ip, now);
     true
 }
@@ -365,8 +472,28 @@ fn headers_request_cooldown() -> Duration {
     let secs = std::env::var("IRIUM_P2P_HEADERS_REQUEST_COOLDOWN_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(120);
-    Duration::from_secs(secs.max(5).min(300))
+        .unwrap_or(30);
+    Duration::from_secs(secs.max(2).min(120))
+}
+
+fn headers_request_cooldown_for(local_height: u64, peer_height: u64) -> Duration {
+    let base = headers_request_cooldown();
+    if peer_height <= local_height {
+        return base;
+    }
+    let gap = peer_height.saturating_sub(local_height);
+    let fast_secs = if gap >= 10_000 {
+        2
+    } else if gap >= 2_000 {
+        3
+    } else if gap >= 500 {
+        4
+    } else if gap >= 100 {
+        6
+    } else {
+        base.as_secs()
+    };
+    Duration::from_secs(fast_secs.max(1).min(base.as_secs().max(1)))
 }
 
 fn headers_response_window() -> Duration {
@@ -699,9 +826,16 @@ async fn maybe_request_sync(
         }
     }
     if peer_height > local_height || tip_mismatch {
-        if sync_block_request_allowed_for(block_requests, addr.ip(), local_height, peer_height)
-            .await
-        {
+        if sync_block_request_allowed_for(
+            block_requests,
+            addr.ip(),
+            local_height,
+            peer_height,
+            &start_hash,
+            MAX_BLOCKS_PER_REQUEST,
+        )
+        .await
+    {
             let get_blocks = GetBlocksPayload {
                 start_hash: start_hash.to_vec(),
                 count: MAX_BLOCKS_PER_REQUEST,
@@ -1698,7 +1832,7 @@ impl P2PNode {
         let sync_requests = self.sync_requests.lock().await.len();
         let block_requests = self.block_requests.lock().await.len();
         let handshake_failures = self.handshake_failures.lock().await.len();
-        let getblocks_inflight = self.getblocks_last.lock().await.len();
+        let getblocks_inflight = block_requests;
         SyncDebugSnapshot {
             sync_requests,
             block_requests,
@@ -1715,6 +1849,24 @@ impl P2PNode {
         // Allow fresh attempts against previously failing peers.
         self.handshake_failures.lock().await.clear();
     }
+
+    pub async fn clear_transient_headers(&self) {
+        let Some(chain_arc) = self.chain.as_ref() else {
+            return;
+        };
+        let mut guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+        let dropped = guard.headers.len();
+        if dropped > 0 {
+            guard.headers.clear();
+            guard.header_chain.clear();
+            P2PNode::log_event(
+                "warn",
+                "sync",
+                format!("Cleared {} transient headers after sync stall", dropped),
+            );
+        }
+    }
+
 
     /// Proactively request headers and blocks from all connected peers at the current tip.
     pub async fn force_sync_burst_from_tip(
@@ -2761,12 +2913,24 @@ impl P2PNode {
                                 )
                                 .await;
                                 if allowed {
+                                    let now = Instant::now();
                                     let (last_req, last_start) = {
-                                        let guard = peer_state.lock().await;
+                                        let mut guard = peer_state.lock().await;
+                                        let stale_inflight = guard
+                                            .headers_inflight
+                                            && guard
+                                                .last_headers_request
+                                                .map(|ts| now.duration_since(ts) > headers_response_window())
+                                                .unwrap_or(false);
+                                        if stale_inflight {
+                                            guard.headers_inflight = false;
+                                            guard.headers_processing = false;
+                                        }
                                         (guard.last_headers_request, guard.last_headers_start)
                                     };
                                     if let Some(ts) = last_req {
-                                        if ts.elapsed() < headers_request_cooldown()
+                                        if now.duration_since(ts)
+                                            < headers_request_cooldown_for(local_height, payload.height)
                                             && last_start == Some(start_hash)
                                         {
                                             allowed = false;
@@ -3111,6 +3275,7 @@ impl P2PNode {
                                     };
 
                                 if header_count > 0 {
+                                    peer_mark_header_event(addr.ip(), added_any, header_count).await;
                                     let last_short = last_header_hash
                                         .map(|h| {
                                             let hex = hex::encode(h);
@@ -3290,6 +3455,8 @@ impl P2PNode {
                                         addr.ip(),
                                         local_height,
                                         peer_height,
+                                        &start_hash,
+                                        count,
                                     )
                                     .await
                                     {
@@ -3311,6 +3478,8 @@ impl P2PNode {
                                         addr.ip(),
                                         local_height,
                                         peer_height,
+                                        &tip_hash,
+                                        MAX_BLOCKS_PER_REQUEST,
                                     )
                                     .await
                                     {
@@ -3581,6 +3750,7 @@ impl P2PNode {
                                             .await;
                                         }
                                         if let Some(new_height) = new_height_opt {
+                                            peer_mark_block_progress(addr.ip()).await;
                                             let multiaddr =
                                                 format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
                                             let mut directory = dir.lock().await;
@@ -4578,12 +4748,24 @@ async fn handle_incoming_with_sybil(
                         )
                         .await;
                         if allowed {
+                            let now = Instant::now();
                             let (last_req, last_start) = {
-                                let guard = peer_state.lock().await;
+                                let mut guard = peer_state.lock().await;
+                                let stale_inflight = guard
+                                    .headers_inflight
+                                    && guard
+                                        .last_headers_request
+                                        .map(|ts| now.duration_since(ts) > headers_response_window())
+                                        .unwrap_or(false);
+                                if stale_inflight {
+                                    guard.headers_inflight = false;
+                                    guard.headers_processing = false;
+                                }
                                 (guard.last_headers_request, guard.last_headers_start)
                             };
                             if let Some(ts) = last_req {
-                                if ts.elapsed() < headers_request_cooldown()
+                                if now.duration_since(ts)
+                                    < headers_request_cooldown_for(local_height, payload.height)
                                     && last_start == Some(start_hash)
                                 {
                                     allowed = false;
@@ -4960,6 +5142,7 @@ async fn handle_incoming_with_sybil(
                             drop(permit_guard);
 
                             if header_count > 0 {
+                                peer_mark_header_event(addr2.ip(), added_any, header_count).await;
                                 let last_short = last_header_hash
                                     .map(|h| {
                                         let hex = hex::encode(h);
@@ -5134,6 +5317,8 @@ async fn handle_incoming_with_sybil(
                                     addr2.ip(),
                                     local_height,
                                     peer_height,
+                                    &start_hash,
+                                    count,
                                 )
                                 .await
                                 {
@@ -5157,6 +5342,8 @@ async fn handle_incoming_with_sybil(
                                     addr2.ip(),
                                     local_height,
                                     peer_height,
+                                    &tip_hash,
+                                    MAX_BLOCKS_PER_REQUEST,
                                 )
                                 .await
                                 {
@@ -5402,6 +5589,7 @@ async fn handle_incoming_with_sybil(
                             }
 
                             if let Some(new_height) = new_height_opt {
+                                peer_mark_block_progress(addr2.ip()).await;
                                 let multiaddr = format!("/ip4/{}/tcp/{}", addr2.ip(), addr2.port());
                                 let mut dir = directory2.lock().await;
                                 dir.record_height(&multiaddr, new_height.saturating_sub(1));

@@ -3094,6 +3094,7 @@ async fn main() {
                         let stalled_node = node_clone.clone();
                         tokio::spawn(async move {
                             stalled_node.clear_sync_throttles().await;
+                            stalled_node.clear_transient_headers().await;
                             let _ = tokio::time::timeout(
                                 std::time::Duration::from_secs(2),
                                 stalled_node.connect_known_peers(5),
