@@ -3032,9 +3032,10 @@ async fn main() {
 
                 hb_ticks = hb_ticks.wrapping_add(1);
 
+                let dbg = node_clone.sync_debug_snapshot().await;
+
                 // Periodic sync status line to diagnose stalls quickly.
                 if hb_ticks % 6 == 0 {
-                    let dbg = node_clone.sync_debug_snapshot().await;
                     let ahead = peer_height.saturating_sub(local_height);
                     eprintln!(
                         "[{}] [🔁 sync] status local={} best_peer={} ahead={} peers={} inflight(getheaders)={} inflight(getblocks)={} handshake_failures={}",
@@ -3049,8 +3050,10 @@ async fn main() {
                     );
                 }
 
-                // If we're behind and not making progress for ~60s, clear throttles and try fresh peers.
-                if peer_height >= local_height.saturating_add(3) {
+                // If we're behind OR stuck in header-only mode and not making progress, clear
+                // throttles and reconnect peers to kick block body sync.
+                let header_only_stall = dbg.sync_requests > 0 && dbg.getblocks_inflight == 0;
+                if peer_height >= local_height.saturating_add(3) || header_only_stall {
                     if local_height == last_progress_height {
                         stalled_ticks = stalled_ticks.saturating_add(1);
                     } else {
@@ -3060,10 +3063,12 @@ async fn main() {
 
                     if stalled_ticks >= 12 {
                         eprintln!(
-                            "[{}] [🔁 sync] WARN stalled (local={}, best_peer={}); clearing sync throttles and reconnecting",
+                            "[{}] [🔁 sync] WARN stalled (local={}, best_peer={}, headers_inflight={}, getblocks_inflight={}); clearing sync throttles and reconnecting",
                             Utc::now().format("%H:%M:%S"),
                             local_height,
-                            peer_height
+                            peer_height,
+                            dbg.sync_requests,
+                            dbg.getblocks_inflight
                         );
                         let stalled_node = node_clone.clone();
                         tokio::spawn(async move {
