@@ -435,6 +435,201 @@ async fn best_peer_score() -> i32 {
     guard.values().map(|p| p.score).max().unwrap_or(0)
 }
 
+fn header_reject_counters() -> Arc<Mutex<HashMap<String, u64>>> {
+    static COUNTERS: OnceLock<Arc<Mutex<HashMap<String, u64>>>> = OnceLock::new();
+    COUNTERS
+        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone()
+}
+
+fn header_reject_streaks() -> Arc<Mutex<HashMap<IpAddr, u32>>> {
+    static STREAKS: OnceLock<Arc<Mutex<HashMap<IpAddr, u32>>>> = OnceLock::new();
+    STREAKS
+        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone()
+}
+
+fn header_state_log_gate() -> Arc<Mutex<HashMap<IpAddr, Instant>>> {
+    static GATE: OnceLock<Arc<Mutex<HashMap<IpAddr, Instant>>>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))).clone()
+}
+
+fn header_state_log_interval() -> Duration {
+    Duration::from_secs(30)
+}
+
+async fn should_emit_header_state_log(ip: IpAddr) -> bool {
+    let gate = header_state_log_gate();
+    let mut guard = gate.lock().await;
+    let now = Instant::now();
+    let interval = header_state_log_interval();
+    if let Some(last) = guard.get(&ip) {
+        if now.duration_since(*last) < interval {
+            return false;
+        }
+    }
+    guard.insert(ip, now);
+    true
+}
+
+fn classify_header_reject_reason(err: &str) -> String {
+    let e = err.to_ascii_lowercase();
+    if e.contains("unknown parent") {
+        "unknown_parent".to_string()
+    } else if e.contains("target") || e.contains("pow") {
+        "pow_or_target".to_string()
+    } else if e.contains("retarget") {
+        "retarget".to_string()
+    } else if e.contains("timestamp") {
+        "timestamp".to_string()
+    } else if e.contains("bits") {
+        "bits".to_string()
+    } else if e.contains("anchor") {
+        "anchors".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+async fn note_header_reject(ip: IpAddr, reason: &str) -> u32 {
+    {
+        let counters = header_reject_counters();
+        let mut guard = counters.lock().await;
+        *guard.entry(reason.to_string()).or_insert(0) += 1;
+    }
+    let streaks = header_reject_streaks();
+    let mut guard = streaks.lock().await;
+    let streak = guard.entry(ip).or_insert(0);
+    *streak = streak.saturating_add(1);
+    *streak
+}
+
+async fn clear_header_reject_streak(ip: IpAddr) {
+    let streaks = header_reject_streaks();
+    let mut guard = streaks.lock().await;
+    guard.remove(&ip);
+}
+
+async fn top_header_reject_reasons(limit: usize) -> Vec<(String, u64)> {
+    let counters = header_reject_counters();
+    let guard = counters.lock().await;
+    let mut v: Vec<(String, u64)> = guard.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(limit);
+    v
+}
+
+async fn penalize_rejecting_header_peer(ip: IpAddr, streak: u32) {
+    let penalty = if streak >= 12 { 8 } else if streak >= 8 { 5 } else { 2 };
+    for _ in 0..penalty {
+        peer_mark_header_event(ip, false, 1).await;
+    }
+}
+
+fn short_hash(hash: [u8; 32]) -> String {
+    let h = hex::encode(hash);
+    h.get(0..12).unwrap_or(&h).to_string()
+}
+
+async fn best_scored_peer_snapshot() -> Option<(IpAddr, i32)> {
+    let perf = peer_sync_perf();
+    let guard = perf.lock().await;
+    guard
+        .iter()
+        .max_by(|a, b| a.1.score.cmp(&b.1.score))
+        .map(|(ip, p)| (*ip, p.score))
+}
+
+async fn maybe_log_header_sync_state(
+    addr: SocketAddr,
+    chain: &Arc<StdMutex<ChainState>>,
+    peer_state: &Arc<Mutex<PeerSyncState>>,
+    reason_hint: &str,
+) {
+    if !should_emit_header_state_log(addr.ip()).await {
+        return;
+    }
+
+    let (local_h, local_hash, best_h, best_hash, headers_known, has_best_path) = {
+        let guard = chain.lock().unwrap_or_else(|e| e.into_inner());
+        let local_h = guard.tip_height();
+        let local_hash = guard.tip_hash();
+        let best_hash = guard.best_header_hash();
+        let best_h = guard
+            .headers
+            .get(&best_hash)
+            .map(|hw| hw.height)
+            .or_else(|| guard.heights.get(&best_hash).copied())
+            .unwrap_or(local_h);
+        let has_best_path = guard
+            .best_header_if_better()
+            .and_then(|best| guard.header_path_to_known(best.header.hash()))
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
+        (
+            local_h,
+            local_hash,
+            best_h,
+            best_hash,
+            guard.headers.len(),
+            has_best_path,
+        )
+    };
+
+    let (headers_inflight, headers_processing) = {
+        let st = peer_state.lock().await;
+        (st.headers_inflight, st.headers_processing)
+    };
+
+    let this_score = peer_score(addr.ip()).await;
+    let best_peer = best_scored_peer_snapshot().await
+        .map(|(ip, score)| format!("{}({})", ip, score))
+        .unwrap_or_else(|| "-".to_string());
+    let top = top_header_reject_reasons(3).await;
+    let top_str = if top.is_empty() {
+        "none".to_string()
+    } else {
+        top.into_iter()
+            .map(|(r, c)| format!("{}:{}", r, c))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    let reason = if !reason_hint.is_empty() {
+        reason_hint.to_string()
+    } else if best_h <= local_h {
+        "best_header_not_ahead".to_string()
+    } else if !has_best_path {
+        "no_best_header_block_path".to_string()
+    } else if headers_processing {
+        "headers_processing".to_string()
+    } else if headers_inflight {
+        "waiting_headers_response".to_string()
+    } else {
+        "ready".to_string()
+    };
+
+    P2PNode::log_event(
+        "info",
+        "sync",
+        format!(
+            "header-state peer={} local_tip={}/{} best_header_tip={}/{} headers_known={} headers_inflight={} headers_processing={} best_peer={} peer_score={} reason={} reject_top3={}",
+            addr,
+            local_h,
+            short_hash(local_hash),
+            best_h,
+            short_hash(best_hash),
+            headers_known,
+            headers_inflight,
+            headers_processing,
+            best_peer,
+            this_score,
+            reason,
+            top_str,
+        ),
+    );
+}
+
 async fn sync_block_request_allowed_for(
     block_requests: &Arc<Mutex<HashMap<IpAddr, Instant>>>,
     ip: IpAddr,
@@ -3292,7 +3487,7 @@ impl P2PNode {
                                 let chain_arc2 = chain_arc.clone();
                                 let peer_height_hint = last_handshake_height;
 
-                                let (last_header_hash, header_error, unknown_parent, reset_headers, added_any) =
+                                let (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason) =
                                     match spawn_blocking_limited(move || {
                                         let mut offset = 0usize;
                                         let mut last_header_hash: Option<[u8; 32]> = None;
@@ -3300,6 +3495,7 @@ impl P2PNode {
                                         let mut unknown_parent = false;
                                         let mut reset_headers = false;
                                         let mut added_any = false;
+                                        let mut reject_reason: Option<String> = None;
 
                                         let mut guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -3309,6 +3505,7 @@ impl P2PNode {
                                                 Ok(v) => v,
                                                 Err(_) => {
                                                     header_error = true;
+                                                    reject_reason = Some("decode_error".to_string());
                                                     break;
                                                 }
                                             };
@@ -3327,13 +3524,14 @@ impl P2PNode {
                                                 || guard.block_store.contains_key(&header_hash);
                                             if let Err(e) = guard.add_header(header.clone()) {
                                                 header_error = true;
+                                                reject_reason = Some(classify_header_reject_reason(&e));
                                                 if e.contains("unknown parent") {
                                                     unknown_parent = true;
                                                     if let Some(peer_height) = peer_height_hint {
                                                         let local_height = guard.tip_height();
                                                         if peer_height > local_height && local_height < 64 {
-                                                        reset_headers = true;
-                                                    }
+                                                            reset_headers = true;
+                                                        }
                                                     }
                                                 }
                                                 break;
@@ -3343,12 +3541,12 @@ impl P2PNode {
                                             }
                                         }
 
-                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any)
+                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason)
                                     })
                                     .await
                                     {
                                         Ok(v) => v,
-                                        Err(_) => (None, true, false, false, false),
+                                        Err(_) => (None, true, false, false, false, Some("task_join_error".to_string())),
                                     };
 
                                 if header_count > 0 {
@@ -3370,6 +3568,16 @@ impl P2PNode {
                                 }
 
                                 if header_error {
+                                    let reason = reject_reason.clone().unwrap_or_else(|| "unknown".to_string());
+                                    let streak = note_header_reject(addr.ip(), &reason).await;
+                                    penalize_rejecting_header_peer(addr.ip(), streak).await;
+                                    if streak >= 8 {
+                                        P2PNode::log_event(
+                                            "warn",
+                                            "sync",
+                                            format!("P2P {}: repeated rejected headers (reason={}, streak={}); lowering peer score", addr, reason, streak),
+                                        );
+                                    }
                                     if unknown_parent && !added_any {
                                         P2PNode::log_event(
                                                     "warn",
@@ -3427,6 +3635,7 @@ impl P2PNode {
                                     state.height = Some(peer_height);
                                     state.last_bad_headers = None;
                                 }
+                                clear_header_reject_streak(addr.ip()).await;
                                 let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
                                 let mut directory = dir.lock().await;
                                 directory.record_height(&multiaddr, peer_height);
@@ -3554,15 +3763,15 @@ impl P2PNode {
                                         }
                                     }
                                 } else if peer_height > local_height || header_count > 0 {
-                                    P2PNode::log_event(
-                                        "info",
-                                        "sync",
-                                        format!(
-                                            "P2P {}: no best-header block path yet; waiting for header-first sync",
-                                            addr
-                                        ),
-                                    );
+                                    maybe_log_header_sync_state(
+                                        addr,
+                                        chain_arc,
+                                        &peer_state,
+                                        "no_best_header_block_path",
+                                    )
+                                    .await;
                                 }
+                                maybe_log_header_sync_state(addr, chain_arc, &peer_state, "").await;
                                 {
                                     let mut state = peer_state.lock().await;
                                     state.last_headers_received = Some(Instant::now());
@@ -5163,7 +5372,7 @@ async fn handle_incoming_with_sybil(
                         tokio::spawn(async move {
                             let permit_guard = permit;
 
-                            let (last_header_hash, header_error, unknown_parent, reset_headers, added_any) =
+                            let (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason) =
                                 match spawn_blocking_limited(move || {
                                     let mut offset = 0usize;
                                     let mut last_header_hash: Option<[u8; 32]> = None;
@@ -5171,6 +5380,7 @@ async fn handle_incoming_with_sybil(
                                     let mut unknown_parent = false;
                                     let mut reset_headers = false;
                                     let mut added_any = false;
+                                    let mut reject_reason: Option<String> = None;
 
                                     let mut guard =
                                         chain_arc_for_headers.lock().unwrap_or_else(|e| e.into_inner());
@@ -5182,6 +5392,7 @@ async fn handle_incoming_with_sybil(
                                                 Ok(v) => v,
                                                 Err(_) => {
                                                     header_error = true;
+                                                    reject_reason = Some("decode_error".to_string());
                                                     break;
                                                 }
                                             };
@@ -5201,6 +5412,7 @@ async fn handle_incoming_with_sybil(
                                             || guard.block_store.contains_key(&header_hash);
                                         if let Err(e) = guard.add_header(header.clone()) {
                                             header_error = true;
+                                            reject_reason = Some(classify_header_reject_reason(&e));
                                             if e.contains("unknown parent") {
                                                 unknown_parent = true;
                                                 if let Some(peer_height) = peer_height_hint {
@@ -5217,12 +5429,12 @@ async fn handle_incoming_with_sybil(
                                         }
                                     }
 
-                                    (last_header_hash, header_error, unknown_parent, reset_headers, added_any)
+                                    (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason)
                                 })
                                 .await
                                 {
                                     Ok(v) => v,
-                                    Err(_) => (None, true, false, false, false),
+                                    Err(_) => (None, true, false, false, false, Some("task_join_error".to_string())),
                                 };
                             drop(permit_guard);
 
@@ -5245,6 +5457,16 @@ async fn handle_incoming_with_sybil(
                             }
 
                             if header_error {
+                                let reason = reject_reason.clone().unwrap_or_else(|| "unknown".to_string());
+                                let streak = note_header_reject(addr2.ip(), &reason).await;
+                                penalize_rejecting_header_peer(addr2.ip(), streak).await;
+                                if streak >= 8 {
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "sync",
+                                        format!("P2P {}: repeated rejected headers (reason={}, streak={}); lowering peer score", addr2, reason, streak),
+                                    );
+                                }
                                 if unknown_parent && !added_any {
                                     P2PNode::log_event(
                                         "warn",
@@ -5308,6 +5530,7 @@ async fn handle_incoming_with_sybil(
                                 state.height = Some(peer_height);
                                 state.last_bad_headers = None;
                             }
+                            clear_header_reject_streak(addr2.ip()).await;
                             let multiaddr = format!("/ip4/{}/tcp/{}", addr2.ip(), addr2.port());
                             let mut dir = directory2.lock().await;
                             dir.record_height(&multiaddr, peer_height);
@@ -5434,15 +5657,16 @@ async fn handle_incoming_with_sybil(
                                     }
                                 }
                             } else if peer_height > local_height || header_count > 0 {
-                                P2PNode::log_event(
-                                    "info",
-                                    "sync",
-                                    format!(
-                                        "P2P {}: no best-header block path yet; waiting for header-first sync",
-                                        addr2
-                                    ),
-                                );
+                                maybe_log_header_sync_state(
+                                    addr2,
+                                    &chain_arc_for_tip,
+                                    &peer_state2,
+                                    "no_best_header_block_path",
+                                )
+                                .await;
                             }
+
+                            maybe_log_header_sync_state(addr2, &chain_arc_for_tip, &peer_state2, "").await;
 
                             {
                                 let mut state = peer_state2.lock().await;

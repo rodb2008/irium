@@ -81,6 +81,12 @@ struct PeersResponse {
 }
 
 #[derive(Serialize)]
+struct BestHeaderTipResponse {
+    height: u64,
+    hash: String,
+}
+
+#[derive(Serialize)]
 struct StatusResponse {
     height: u64,
     genesis_hash: String,
@@ -89,6 +95,7 @@ struct StatusResponse {
     anchor_loaded: bool,
     node_id: Option<String>,
     sybil_difficulty: Option<u8>,
+    best_header_tip: BestHeaderTipResponse,
     persisted_height: u64,
     persist_queue_len: usize,
     persisted_contiguous_height: u64,
@@ -1491,13 +1498,35 @@ async fn status(
         .as_ref()
         .map(|a| a.payload_digest().to_string());
 
-    let height = match state.chain.try_lock() {
+    let (height, best_header_tip) = match state.chain.try_lock() {
         Ok(guard) => {
             let h = guard.tip_height();
             state.status_height_cache.store(h, Ordering::Relaxed);
-            h
+            let best_hash = guard.best_header_hash();
+            let best_height = guard
+                .headers
+                .get(&best_hash)
+                .map(|hw| hw.height)
+                .or_else(|| guard.heights.get(&best_hash).copied())
+                .unwrap_or(h);
+            (
+                h,
+                BestHeaderTipResponse {
+                    height: best_height,
+                    hash: hex::encode(best_hash),
+                },
+            )
         }
-        Err(_) => state.status_height_cache.load(Ordering::Relaxed),
+        Err(_) => {
+            let h = state.status_height_cache.load(Ordering::Relaxed);
+            (
+                h,
+                BestHeaderTipResponse {
+                    height: h,
+                    hash: String::new(),
+                },
+            )
+        }
     };
 
     let persisted_height = storage::persisted_height();
@@ -1529,6 +1558,7 @@ async fn status(
         anchor_loaded: state.anchors.is_some(),
         node_id,
         sybil_difficulty: sybil_diff,
+        best_header_tip,
         persisted_height,
         persist_queue_len,
         persisted_contiguous_height,
