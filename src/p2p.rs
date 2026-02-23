@@ -3187,7 +3187,7 @@ impl P2PNode {
                                     }
                                     continue;
                                 }
-                                if header_count >= MAX_HEADERS_PER_REQUEST && added_any && peer_height > local_height {
+                                if header_count > 0 && added_any && peer_height > local_height {
                                     if let Some(last_hash) = last_header_hash {
                                         let get_headers = GetHeadersPayload {
                                             start_hash: last_hash.to_vec(),
@@ -5009,7 +5009,7 @@ async fn handle_incoming_with_sybil(
                                 return;
                             }
 
-                            if header_count >= MAX_HEADERS_PER_REQUEST && added_any && peer_height > local_height {
+                            if header_count > 0 && added_any && peer_height > local_height {
                                 if let Some(last_hash) = last_header_hash {
                                     let get_headers = GetHeadersPayload {
                                         start_hash: last_hash.to_vec(),
