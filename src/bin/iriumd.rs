@@ -1072,15 +1072,13 @@ fn rebuild_startup_header_index(
     window_tip: u64,
     missing_in_window: u64,
 ) {
-    let lower = window_start.saturating_sub(1);
-    let mut window_blocks: Vec<(u64, Block)> = candidates
+    let mut bootstrap_blocks: Vec<(u64, Block)> = candidates
         .iter()
-        .filter(|(h, _, _)| *h >= lower && *h <= window_tip)
         .map(|(h, _, b)| (*h, b.clone()))
         .collect();
-    window_blocks.sort_by_key(|(h, _)| *h);
+    bootstrap_blocks.sort_by_key(|(h, _)| *h);
 
-    let mut pending = window_blocks;
+    let mut pending = bootstrap_blocks;
     let mut inserted = 0usize;
     let mut synthetic_roots = 0usize;
     let mut rounds = 0u8;
@@ -1145,7 +1143,7 @@ fn rebuild_startup_header_index(
         .map(|hw| hw.height)
         .unwrap_or_else(|| state.tip_height());
     println!(
-        "[i] startup header index rebuilt: headers_known={} inserted={} synthetic_roots={} best_header_tip={}/{} window=[{}..{}]",
+        "[i] startup header index rebuilt: headers_known={} inserted={} synthetic_roots={} best_header_tip={}/{} window=[{}..{}] (bootstrap_full_scan=true)",
         state.headers.len(),
         inserted,
         synthetic_roots,
