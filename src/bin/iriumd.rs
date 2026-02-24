@@ -105,6 +105,10 @@ struct StatusResponse {
     quarantine_count: u64,
     persisted_window_tip: u64,
     missing_persisted_in_window: u64,
+    gap_healer_active: bool,
+    gap_healer_last_progress_ts: u64,
+    gap_healer_last_filled_height: Option<u64>,
+    gap_healer_pending_count: u64,
 }
 
 #[derive(Serialize)]
@@ -1107,6 +1111,13 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
 
     let window = persist_window_size();
     let window_start = stats.window_tip.saturating_sub(window.saturating_sub(1));
+    let mut missing_heights = Vec::new();
+    for h in window_start..=stats.window_tip {
+        if !valid_heights.contains(&h) {
+            missing_heights.push(h);
+        }
+    }
+    storage::set_gap_healer_missing_heights(&missing_heights);
     println!(
         "[i] persist continuity window: tip={} window_start={} missing_in_window={}",
         stats.window_tip, window_start, stats.missing_in_window
@@ -1693,6 +1704,10 @@ async fn status(
     state
         .status_missing_persisted_in_window_cache
         .store(missing_persisted_in_window, Ordering::Relaxed);
+    let gap_healer_active = storage::gap_healer_active();
+    let gap_healer_last_progress_ts = storage::gap_healer_last_progress_ts();
+    let gap_healer_last_filled_height = storage::gap_healer_last_filled_height();
+    let gap_healer_pending_count = storage::gap_healer_pending_count();
 
     Ok(Json(StatusResponse {
         height,
@@ -1710,6 +1725,10 @@ async fn status(
         quarantine_count,
         persisted_window_tip,
         missing_persisted_in_window,
+        gap_healer_active,
+        gap_healer_last_progress_ts,
+        gap_healer_last_filled_height,
+        gap_healer_pending_count,
     }))
 }
 
@@ -3474,71 +3493,89 @@ async fn main() {
     }
 
     {
-        let chain_for_backfill = shared_state.clone();
+        let chain_for_gap_healer = shared_state.clone();
+        let p2p_for_gap_healer = p2p.clone();
         tokio::spawn(async move {
-            let interval_secs = std::env::var("IRIUM_PERSIST_BACKFILL_SECS")
+            let interval_secs = std::env::var("IRIUM_GAP_HEALER_SECS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(5)
-                .clamp(1, 60);
-            let mut logged_idle = false;
-            let mut pending_height: Option<u64> = None;
+                .unwrap_or(60)
+                .clamp(15, 600);
+            let batch_size = std::env::var("IRIUM_GAP_HEALER_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(25)
+                .clamp(1, 200);
+
             loop {
                 tokio::time::sleep(Duration::from_secs(interval_secs)).await;
-                let contiguous = storage::persisted_contiguous_height();
-                if let Some(pending) = pending_height {
-                    if contiguous >= pending {
-                        pending_height = None;
-                    } else {
+
+                let pending = storage::gap_healer_pending_count();
+                if pending == 0 {
+                    storage::set_gap_healer_active(false);
+                    continue;
+                }
+                storage::set_gap_healer_active(true);
+
+                let batch = storage::gap_healer_batch(batch_size);
+                if batch.is_empty() {
+                    continue;
+                }
+
+                let (tip_height, tip_bytes) = {
+                    let guard = chain_for_gap_healer.lock().unwrap_or_else(|e| e.into_inner());
+                    let tip_bytes = guard.chain.last().map(|b| b.header.hash()).unwrap_or([0u8; 32]);
+                    (guard.tip_height(), tip_bytes)
+                };
+
+                let mut filled: usize = 0;
+                for h in batch.iter().copied() {
+                    if h > tip_height {
                         continue;
                     }
-                }
-                let tip_height = {
-                    let guard = chain_for_backfill.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.tip_height()
-                };
-                if contiguous >= tip_height {
-                    if !logged_idle {
-                        eprintln!(
-                            "[i] persist backfill: nothing to do yet (contiguous={} tip={})",
-                            contiguous, tip_height
-                        );
-                        logged_idle = true;
+
+                    let block_opt = {
+                        let guard = chain_for_gap_healer.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.chain.get(h as usize).cloned()
+                    };
+
+                    let Some(block) = block_opt else {
+                        continue;
+                    };
+
+                    match storage::write_block_json(h, &block) {
+                        Ok(_) => {
+                            if storage::gap_healer_mark_filled(h) {
+                                filled = filled.saturating_add(1);
+                                eprintln!(
+                                    "[i] gap healer progress: filled height={} remaining={}",
+                                    h,
+                                    storage::gap_healer_pending_count()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[warn] gap healer persist failed for height {}: {}", h, e);
+                        }
                     }
-                    continue;
                 }
 
-                let next_h = contiguous.saturating_add(1);
-                let block_opt = {
-                    let guard = chain_for_backfill.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.chain.get(next_h as usize).cloned()
-                };
-                let Some(block) = block_opt else {
-                    eprintln!(
-                        "[i] persist backfill: no connected main-chain block available yet (contiguous={} tip={})",
-                        contiguous, tip_height
-                    );
-                    continue;
-                };
+                let remaining = storage::gap_healer_pending_count();
+                eprintln!(
+                    "[i] gap healer batch: requested={} filled={} remaining={}",
+                    batch.len(),
+                    filled,
+                    remaining
+                );
 
-                match storage::write_block_json(next_h, &block) {
-                    Ok(_) => {
-                        logged_idle = false;
-                        pending_height = Some(next_h);
-                        eprintln!(
-                            "[i] persist backfill: wrote block_{}.json; contiguous now {}",
-                            next_h,
-                            storage::persisted_contiguous_height()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("[warn] persist backfill failed for block {}: {}", next_h, e);
+                if filled == 0 {
+                    if let Some(node) = p2p_for_gap_healer.clone() {
+                        let _ = node.force_sync_burst_from_tip(tip_bytes).await;
                     }
                 }
             }
         });
     }
-
     let app_state = AppState {
         chain: shared_state.clone(),
         genesis_hash: genesis_hash.clone(),

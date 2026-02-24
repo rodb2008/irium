@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
-use crate::block::Block;
+use crate::block::{Block, BlockHeader};
 use crate::chain::ChainState;
 use crate::mempool::MempoolManager;
 use crate::network::{PeerDirectory, PeerRecord};
@@ -667,7 +667,7 @@ async fn maybe_log_header_sync_state(
         return;
     }
 
-    let (local_h, local_hash, best_h, best_hash, headers_known, has_best_path) = {
+    let (local_h, local_hash, best_h, best_hash, headers_known, has_best_path, path_debug) = {
         let guard = chain.lock().unwrap_or_else(|e| e.into_inner());
         let local_h = guard.tip_height();
         let local_hash = guard.tip_hash();
@@ -683,6 +683,11 @@ async fn maybe_log_header_sync_state(
             .and_then(|best| guard.header_path_to_known(best.header.hash()))
             .map(|p| !p.is_empty())
             .unwrap_or(false);
+        let path_debug = if !has_best_path && best_h > local_h {
+            best_header_linkage_debug(&guard)
+        } else {
+            "ok".to_string()
+        };
         (
             local_h,
             local_hash,
@@ -690,6 +695,7 @@ async fn maybe_log_header_sync_state(
             best_hash,
             guard.headers.len(),
             has_best_path,
+            path_debug,
         )
     };
 
@@ -730,7 +736,7 @@ async fn maybe_log_header_sync_state(
         "info",
         "sync",
         format!(
-            "header-state peer={} local_tip={}/{} best_header_tip={}/{} headers_known={} headers_inflight={} headers_processing={} best_peer={} peer_score={} reason={} reject_top3={}",
+            "header-state peer={} local_tip={}/{} best_header_tip={}/{} headers_known={} headers_inflight={} headers_processing={} best_peer={} peer_score={} reason={} reject_top3={} path_debug={}",
             addr,
             local_h,
             short_hash(local_hash),
@@ -743,6 +749,7 @@ async fn maybe_log_header_sync_state(
             this_score,
             reason,
             top_str,
+            path_debug,
         ),
     );
 }
@@ -1025,6 +1032,12 @@ struct PeerSyncState {
     unsolicited_headers: u32,
     last_unsolicited_log: Option<Instant>,
     last_bad_headers: Option<Instant>,
+
+    // Header-path recovery tracking.
+    last_best_header_height: u64,
+    last_best_header_hash: [u8; 32],
+    last_best_header_progress: Option<Instant>,
+    headers_recovery_exp: u8,
 }
 
 impl Default for PeerSyncState {
@@ -1044,8 +1057,178 @@ impl Default for PeerSyncState {
             unsolicited_headers: 0,
             last_unsolicited_log: None,
             last_bad_headers: None,
+            last_best_header_height: 0,
+            last_best_header_hash: [0u8; 32],
+            last_best_header_progress: None,
+            headers_recovery_exp: 0,
         }
     }
+}
+
+#[derive(Clone)]
+struct OrphanHeaderEntry {
+    header: BlockHeader,
+    inserted_at: Instant,
+}
+
+fn orphan_headers_limit() -> usize {
+    std::env::var("IRIUM_ORPHAN_HEADERS_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20_000)
+        .clamp(512, 200_000)
+}
+
+fn orphan_headers_ttl() -> Duration {
+    let secs = std::env::var("IRIUM_ORPHAN_HEADERS_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(600)
+        .clamp(30, 3600);
+    Duration::from_secs(secs)
+}
+
+fn orphan_headers_map() -> &'static StdMutex<HashMap<[u8; 32], Vec<OrphanHeaderEntry>>> {
+    static MAP: OnceLock<StdMutex<HashMap<[u8; 32], Vec<OrphanHeaderEntry>>>> = OnceLock::new();
+    MAP.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn orphan_headers_count_locked(m: &HashMap<[u8; 32], Vec<OrphanHeaderEntry>>) -> usize {
+    m.values().map(|v| v.len()).sum()
+}
+
+fn prune_orphan_headers_locked(m: &mut HashMap<[u8; 32], Vec<OrphanHeaderEntry>>) {
+    let ttl = orphan_headers_ttl();
+    let now = Instant::now();
+    m.retain(|_, v| {
+        v.retain(|e| now.duration_since(e.inserted_at) <= ttl);
+        !v.is_empty()
+    });
+
+    let limit = orphan_headers_limit();
+    while orphan_headers_count_locked(m) > limit {
+        let key = match m.keys().next().copied() {
+            Some(k) => k,
+            None => break,
+        };
+        let mut remove_key = false;
+        if let Some(v) = m.get_mut(&key) {
+            if !v.is_empty() {
+                v.remove(0);
+            }
+            if v.is_empty() {
+                remove_key = true;
+            }
+        }
+        if remove_key {
+            m.remove(&key);
+        }
+    }
+}
+
+fn orphan_headers_count() -> usize {
+    let guard = orphan_headers_map().lock().unwrap_or_else(|e| e.into_inner());
+    orphan_headers_count_locked(&guard)
+}
+
+fn store_orphan_header(header: BlockHeader) -> usize {
+    let mut guard = orphan_headers_map().lock().unwrap_or_else(|e| e.into_inner());
+    prune_orphan_headers_locked(&mut guard);
+    guard
+        .entry(header.prev_hash)
+        .or_default()
+        .push(OrphanHeaderEntry {
+            header,
+            inserted_at: Instant::now(),
+        });
+    orphan_headers_count_locked(&guard)
+}
+
+fn take_orphan_header_children(parent_hash: [u8; 32]) -> Vec<BlockHeader> {
+    let mut guard = orphan_headers_map().lock().unwrap_or_else(|e| e.into_inner());
+    prune_orphan_headers_locked(&mut guard);
+    let entries = guard.remove(&parent_hash).unwrap_or_default();
+    entries.into_iter().map(|e| e.header).collect()
+}
+
+fn attach_orphan_header_chain(guard: &mut ChainState, root_hash: [u8; 32]) -> (usize, Option<String>) {
+    let mut attached = 0usize;
+    let mut queue = VecDeque::new();
+    queue.push_back(root_hash);
+    let mut first_err: Option<String> = None;
+
+    while let Some(parent_hash) = queue.pop_front() {
+        let children = take_orphan_header_children(parent_hash);
+        if children.is_empty() {
+            continue;
+        }
+        for child in children {
+            let child_hash = child.hash();
+            if guard.headers.contains_key(&child_hash) || guard.heights.contains_key(&child_hash) {
+                continue;
+            }
+            match guard.add_header(child.clone()) {
+                Ok(_) => {
+                    attached = attached.saturating_add(1);
+                    queue.push_back(child_hash);
+                }
+                Err(e) => {
+                    if e.contains("unknown parent") {
+                        let _ = store_orphan_header(child);
+                    } else if first_err.is_none() {
+                        first_err = Some(classify_header_reject_reason(&e));
+                    }
+                }
+            }
+        }
+    }
+
+    (attached, first_err)
+}
+
+fn best_header_linkage_debug(chain: &ChainState) -> String {
+    let Some(best) = chain.best_header_if_better() else {
+        return "best_header_not_better".to_string();
+    };
+    let mut cur = best.header.hash();
+    let mut steps: u32 = 0;
+    loop {
+        if let Some(h) = chain.heights.get(&cur) {
+            return format!("linked_to_main_at_height={}", h);
+        }
+        let Some(hw) = chain.headers.get(&cur) else {
+            return format!("break_missing_header_node hash={}", short_hash(cur));
+        };
+        let prev = hw.header.prev_hash;
+        if prev == [0u8; 32] {
+            return format!(
+                "break_genesis_prev_without_main height={} hash={}",
+                hw.height,
+                short_hash(cur)
+            );
+        }
+        if !chain.headers.contains_key(&prev) && !chain.heights.contains_key(&prev) {
+            return format!(
+                "break_missing_prev height={} hash={} prev={}",
+                hw.height,
+                short_hash(cur),
+                short_hash(prev)
+            );
+        }
+        cur = prev;
+        steps = steps.saturating_add(1);
+        if steps > 200_000 {
+            return "break_walk_limit".to_string();
+        }
+    }
+}
+
+fn locator_hash_at_height(chain: &ChainState, height: u64) -> [u8; 32] {
+    chain
+        .chain
+        .get(height as usize)
+        .map(|b| b.header.hash())
+        .unwrap_or([0u8; 32])
 }
 
 struct OutboundDialGuard {
@@ -1086,27 +1269,21 @@ async fn maybe_request_sync(
         Some(h) => h,
         None => return,
     };
-    let (local_height, local_tip, _peer_tip_on_main) = match chain {
+    let (local_height, local_tip, best_header_height, best_header_hash) = match chain {
         Some(c) => {
             let guard = c.lock().unwrap_or_else(|e| e.into_inner());
             let local_height = guard.tip_height();
             let local_tip = guard.tip_hash();
-            let peer_tip_on_main = peer_tip
-                .map(|tip| {
-                    if let Some(h) = guard.heights.get(&tip) {
-                        guard
-                            .chain
-                            .get(*h as usize)
-                            .map(|b| b.header.hash() == tip)
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                })
-                .unwrap_or(true);
-            (local_height, local_tip, peer_tip_on_main)
+            let best_header_hash = guard.best_header_hash();
+            let best_header_height = guard
+                .headers
+                .get(&best_header_hash)
+                .map(|hw| hw.height)
+                .or_else(|| guard.heights.get(&best_header_hash).copied())
+                .unwrap_or(local_height);
+            (local_height, local_tip, best_header_height, best_header_hash)
         }
-        None => (0, [0u8; 32], true),
+        None => (0, [0u8; 32], 0, [0u8; 32]),
     };
     let tip_mismatch = peer_tip
         .map(|t| peer_height == local_height && t != local_tip)
@@ -1116,11 +1293,58 @@ async fn maybe_request_sync(
         return;
     }
 
-    let start_hash = if local_height == 0 || tip_mismatch {
+    let mut start_hash = if local_height == 0 || tip_mismatch {
         [0u8; 32]
     } else {
         local_tip
     };
+
+    let mut recovery_triggered = false;
+    let mut recovery_exp = 0u8;
+    {
+        let mut state = peer_state.lock().await;
+        let now = Instant::now();
+        if state.last_best_header_height != best_header_height
+            || state.last_best_header_hash != best_header_hash
+        {
+            state.last_best_header_height = best_header_height;
+            state.last_best_header_hash = best_header_hash;
+            state.last_best_header_progress = Some(now);
+            state.headers_recovery_exp = 0;
+        } else if peer_height > local_height.saturating_add(8)
+            && best_header_height <= local_height
+            && state
+                .last_best_header_progress
+                .map(|t| now.duration_since(t) >= Duration::from_secs(120))
+                .unwrap_or(false)
+        {
+            state.headers_recovery_exp = state.headers_recovery_exp.saturating_add(1).min(16);
+            recovery_triggered = true;
+        }
+        recovery_exp = state.headers_recovery_exp;
+    }
+
+    if recovery_triggered && start_hash != [0u8; 32] {
+        if let Some(c) = chain {
+            let rewind = 1u64 << recovery_exp;
+            let guard = c.lock().unwrap_or_else(|e| e.into_inner());
+            let start_height = guard.tip_height().saturating_sub(rewind);
+            start_hash = locator_hash_at_height(&guard, start_height);
+            P2PNode::log_event(
+                "warn",
+                "sync",
+                format!(
+                    "GetHeaders locator recovery: peer={} local={} best_header={} rewind={} start_height={} start_hash={}",
+                    addr,
+                    guard.tip_height(),
+                    best_header_height,
+                    rewind,
+                    start_height,
+                    short_hash(start_hash),
+                ),
+            );
+        }
+    }
 
     if sync_request_allowed_for(sync_requests, addr.ip(), local_height, peer_height).await {
         let get_headers = GetHeadersPayload {
@@ -1201,16 +1425,29 @@ async fn maybe_request_headers_fallback(
         return;
     }
     if sync_request_allowed_for(sync_requests, addr.ip(), local_height, peer_height).await {
+        let mut start_hash = [0u8; 32];
+        let mut rewind = 0u64;
+        if let Some(c) = chain {
+            let mut st = peer_state.lock().await;
+            st.headers_recovery_exp = st.headers_recovery_exp.saturating_add(1).min(16);
+            rewind = 1u64 << st.headers_recovery_exp;
+            let guard = c.lock().unwrap_or_else(|e| e.into_inner());
+            let start_height = guard.tip_height().saturating_sub(rewind);
+            start_hash = locator_hash_at_height(&guard, start_height);
+        }
+
         let get_headers = GetHeadersPayload {
-            start_hash: vec![0u8; 32],
+            start_hash: start_hash.to_vec(),
             count: MAX_HEADERS_PER_REQUEST,
         };
         P2PNode::log_event(
-            "info",
+            "warn",
             "sync",
             format!(
-                "P2P {}: no headers response, falling back to genesis locator",
-                addr
+                "P2P {}: no headers response, locator rewind fallback (rewind={} start={})",
+                addr,
+                rewind,
+                short_hash(start_hash)
             ),
         );
         if let Ok(msg) = get_headers.to_message() {
@@ -1218,7 +1455,7 @@ async fn maybe_request_headers_fallback(
         }
         let mut guard = peer_state.lock().await;
         guard.last_headers_request = Some(Instant::now());
-        guard.last_headers_start = Some([0u8; 32]);
+        guard.last_headers_start = Some(start_hash);
         guard.headers_inflight = true;
     }
 }
@@ -3604,7 +3841,7 @@ impl P2PNode {
                                 let chain_arc2 = chain_arc.clone();
                                 let peer_height_hint = last_handshake_height;
 
-                                let (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason) =
+                                let (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason, first_unknown_prev) =
                                     match spawn_blocking_limited(move || {
                                         let mut offset = 0usize;
                                         let mut last_header_hash: Option<[u8; 32]> = None;
@@ -3613,6 +3850,7 @@ impl P2PNode {
                                         let mut reset_headers = false;
                                         let mut added_any = false;
                                         let mut reject_reason: Option<String> = None;
+                                        let mut first_unknown_prev: Option<[u8; 32]> = None;
 
                                         let mut guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -3636,40 +3874,64 @@ impl P2PNode {
                                                     continue;
                                                 }
                                             }
-
-                                            let already_known = guard.headers.contains_key(&header_hash)
-                                                || guard.block_store.contains_key(&header_hash);
-                                            if let Err(e) = guard.add_header(header.clone()) {
-                                                if e.contains("unknown parent") {
-                                                    unknown_parent = true;
-                                                    reject_reason.get_or_insert_with(|| classify_header_reject_reason(&e));
-                                                    if let Some(peer_height) = peer_height_hint {
-                                                        let local_height = guard.tip_height();
-                                                        if peer_height > local_height {
-                                                            reset_headers = true;
-                                                        }
-                                                    }
-                                                    continue;
+                                        let already_known = guard.headers.contains_key(&header_hash)
+                                            || guard.block_store.contains_key(&header_hash);
+                                        if let Err(e) = guard.add_header(header.clone()) {
+                                            if e.contains("unknown parent") {
+                                                unknown_parent = true;
+                                                if first_unknown_prev.is_none() {
+                                                    first_unknown_prev = Some(header.prev_hash);
                                                 }
-                                                header_error = true;
-                                                reject_reason = Some(classify_header_reject_reason(&e));
-                                                break;
+                                                reject_reason.get_or_insert_with(|| classify_header_reject_reason(&e));
+                                                let orphan_n = store_orphan_header(header.clone());
+                                                P2PNode::log_event(
+                                                    "info",
+                                                    "sync",
+                                                    format!(
+                                                        "stored orphan header: hash={} prev={} orphan_headers={}",
+                                                        short_hash(header_hash),
+                                                        short_hash(header.prev_hash),
+                                                        orphan_n
+                                                    ),
+                                                );
+                                                if let Some(peer_height) = peer_height_hint {
+                                                    let local_height = guard.tip_height();
+                                                    if peer_height > local_height {
+                                                        reset_headers = true;
+                                                    }
+                                                }
+                                                continue;
                                             }
-                                            if !already_known {
-                                                added_any = true;
-                                            }
-                                        }
-
-                                        if unknown_parent && !added_any && !header_error {
                                             header_error = true;
+                                            reject_reason = Some(classify_header_reject_reason(&e));
+                                            break;
+                                        }
+                                        if !already_known {
+                                            added_any = true;
+                                        }
+                                        let (attached, attach_err) = attach_orphan_header_chain(&mut guard, header_hash);
+                                        if attached > 0 {
+                                            P2PNode::log_event(
+                                                "info",
+                                                "sync",
+                                                format!(
+                                                    "attached orphan header chain: attached={} orphan_headers={}",
+                                                    attached,
+                                                    orphan_headers_count()
+                                                ),
+                                            );
+                                        }
+                                        if let Some(reason) = attach_err {
+                                            reject_reason.get_or_insert(reason);
+                                        }
                                         }
 
-                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason)
+                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason, first_unknown_prev)
                                     })
                                     .await
                                     {
                                         Ok(v) => v,
-                                        Err(_) => (None, true, false, false, false, Some("task_join_error".to_string())),
+                                        Err(_) => (None, true, false, false, false, Some("task_join_error".to_string()), None),
                                     };
 
                                 if header_count > 0 {
@@ -3701,6 +3963,18 @@ impl P2PNode {
                                             format!("P2P {}: repeated rejected headers (reason={}, streak={}); lowering peer score", addr, reason, streak),
                                         );
                                     }
+                                    if let Some(prev_hash) = first_unknown_prev {
+                                        request_orphan_headers(
+                                            &writer,
+                                            addr,
+                                            prev_hash,
+                                            &chain_for_sync,
+                                            &sync_requests,
+                                            &peer_state,
+                                        )
+                                        .await;
+                                    }
+
                                     if unknown_parent && !added_any {
                                         P2PNode::log_event(
                                                     "warn",
@@ -5502,7 +5776,7 @@ async fn handle_incoming_with_sybil(
                         tokio::spawn(async move {
                             let permit_guard = permit;
 
-                            let (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason) =
+                            let (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason, first_unknown_prev) =
                                 match spawn_blocking_limited(move || {
                                     let mut offset = 0usize;
                                     let mut last_header_hash: Option<[u8; 32]> = None;
@@ -5511,6 +5785,7 @@ async fn handle_incoming_with_sybil(
                                     let mut reset_headers = false;
                                     let mut added_any = false;
                                     let mut reject_reason: Option<String> = None;
+                                    let mut first_unknown_prev: Option<[u8; 32]> = None;
 
                                     let mut guard =
                                         chain_arc_for_headers.lock().unwrap_or_else(|e| e.into_inner());
@@ -5537,40 +5812,64 @@ async fn handle_incoming_with_sybil(
                                                 continue;
                                             }
                                         }
-
                                         let already_known = guard.headers.contains_key(&header_hash)
                                             || guard.block_store.contains_key(&header_hash);
                                         if let Err(e) = guard.add_header(header.clone()) {
-                                                if e.contains("unknown parent") {
-                                                    unknown_parent = true;
-                                                    reject_reason.get_or_insert_with(|| classify_header_reject_reason(&e));
-                                                    if let Some(peer_height) = peer_height_hint {
-                                                        let local_height = guard.tip_height();
-                                                        if peer_height > local_height {
-                                                            reset_headers = true;
-                                                        }
-                                                    }
-                                                    continue;
+                                            if e.contains("unknown parent") {
+                                                unknown_parent = true;
+                                                if first_unknown_prev.is_none() {
+                                                    first_unknown_prev = Some(header.prev_hash);
                                                 }
-                                                header_error = true;
-                                                reject_reason = Some(classify_header_reject_reason(&e));
-                                                break;
+                                                reject_reason.get_or_insert_with(|| classify_header_reject_reason(&e));
+                                                let orphan_n = store_orphan_header(header.clone());
+                                                P2PNode::log_event(
+                                                    "info",
+                                                    "sync",
+                                                    format!(
+                                                        "stored orphan header: hash={} prev={} orphan_headers={}",
+                                                        short_hash(header_hash),
+                                                        short_hash(header.prev_hash),
+                                                        orphan_n
+                                                    ),
+                                                );
+                                                if let Some(peer_height) = peer_height_hint {
+                                                    let local_height = guard.tip_height();
+                                                    if peer_height > local_height {
+                                                        reset_headers = true;
+                                                    }
+                                                }
+                                                continue;
                                             }
+                                            header_error = true;
+                                            reject_reason = Some(classify_header_reject_reason(&e));
+                                            break;
+                                        }
                                         if !already_known {
                                             added_any = true;
                                         }
+                                        let (attached, attach_err) = attach_orphan_header_chain(&mut guard, header_hash);
+                                        if attached > 0 {
+                                            P2PNode::log_event(
+                                                "info",
+                                                "sync",
+                                                format!(
+                                                    "attached orphan header chain: attached={} orphan_headers={}",
+                                                    attached,
+                                                    orphan_headers_count()
+                                                ),
+                                            );
+                                        }
+                                        if let Some(reason) = attach_err {
+                                            reject_reason.get_or_insert(reason);
+                                        }
                                     }
 
-                                        if unknown_parent && !added_any && !header_error {
-                                            header_error = true;
-                                        }
-
-                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason)
+                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason, first_unknown_prev)
                                 })
                                 .await
                                 {
                                     Ok(v) => v,
-                                    Err(_) => (None, true, false, false, false, Some("task_join_error".to_string())),
+                                    Err(_) => (None, true, false, false, false, Some("task_join_error".to_string()), None),
                                 };
                             drop(permit_guard);
 
@@ -5603,6 +5902,20 @@ async fn handle_incoming_with_sybil(
                                         format!("P2P {}: repeated rejected headers (reason={}, streak={}); lowering peer score", addr2, reason, streak),
                                     );
                                 }
+                                    if let Some(prev_hash) = first_unknown_prev {
+                                        if let Some(writer) = writer_weak.upgrade() {
+                                            request_orphan_headers(
+                                                &writer,
+                                                addr2,
+                                                prev_hash,
+                                                &Some(chain_arc_for_tip.clone()),
+                                                &sync_requests2,
+                                                &peer_state2,
+                                            )
+                                            .await;
+                                        }
+                                    }
+
                                 if unknown_parent && !added_any {
                                     P2PNode::log_event(
                                         "warn",
@@ -6255,4 +6568,72 @@ async fn handle_incoming_with_sybil(
         }
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{attach_orphan_header_chain, orphan_headers_map, store_orphan_header};
+    use crate::block::BlockHeader;
+    use crate::chain::{block_from_locked, ChainParams, ChainState};
+    use crate::genesis::load_locked_genesis;
+    use crate::pow::meets_target;
+
+    fn mine_header(mut header: BlockHeader) -> BlockHeader {
+        for nonce in 0u32..u32::MAX {
+            header.nonce = nonce;
+            let h = header.hash();
+            if meets_target(&h, header.target()) {
+                return header;
+            }
+        }
+        panic!("failed to mine test header");
+    }
+
+    #[test]
+    fn attaches_out_of_order_orphan_headers() {
+        let locked = load_locked_genesis().expect("load locked genesis");
+        let genesis = block_from_locked(&locked).expect("build genesis block");
+        let params = ChainParams {
+            genesis_block: genesis,
+            pow_limit: crate::pow::Target { bits: 0x207fffff },
+        };
+        let mut chain = ChainState::new(params);
+
+        {
+            let mut guard = orphan_headers_map().lock().unwrap_or_else(|e| e.into_inner());
+            guard.clear();
+        }
+
+        let tip = chain.tip_hash();
+        let parent = mine_header(BlockHeader {
+            version: 1,
+            prev_hash: tip,
+            merkle_root: [1u8; 32],
+            time: 1_900_000_001,
+            bits: 0x207fffff,
+            nonce: 0,
+        });
+        let child = mine_header(BlockHeader {
+            version: 1,
+            prev_hash: parent.hash(),
+            merkle_root: [2u8; 32],
+            time: 1_900_000_002,
+            bits: 0x207fffff,
+            nonce: 0,
+        });
+
+        let orphan_count = store_orphan_header(child.clone());
+        assert!(orphan_count >= 1);
+
+        chain.add_header(parent.clone()).expect("add parent header");
+        let (attached, err) = attach_orphan_header_chain(&mut chain, parent.hash());
+        assert_eq!(err, None);
+        assert_eq!(attached, 1);
+        assert!(chain.headers.contains_key(&child.hash()));
+        let path = chain
+            .header_path_to_known(child.hash())
+            .expect("path from known to child");
+        assert_eq!(path, vec![parent.hash(), child.hash()]);
+    }
 }
