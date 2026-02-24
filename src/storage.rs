@@ -466,7 +466,25 @@ pub fn ensure_runtime_dirs() -> std::io::Result<(PathBuf, PathBuf)> {
     Ok((blocks, state))
 }
 
+
+fn sanitize_filename_fragment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
 fn maybe_quarantine_existing_block(path: &Path, new_hash: &str) -> std::io::Result<()> {
+
     if !path.exists() {
         return Ok(());
     }
@@ -494,17 +512,17 @@ fn maybe_quarantine_existing_block(path: &Path, new_hash: &str) -> std::io::Resu
         return Ok(());
     }
 
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("block");
+    let stem = sanitize_filename_fragment(path.file_stem().and_then(|s| s.to_str()).unwrap_or("block"));
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("json");
-    let existing_hash_suffix = existing_hash.as_deref().unwrap_or("unknown");
+    let existing_hash_suffix = sanitize_filename_fragment(existing_hash.as_deref().unwrap_or("unknown"));
 
-    let mut dest = path.with_file_name(format!("{stem}.fork.{existing_hash_suffix}.{ext}"));
+    let mut dest = path.with_file_name(format!("{}.fork.{}.{}", stem, existing_hash_suffix, ext));
     if dest.exists() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        dest = path.with_file_name(format!("{stem}.fork.{existing_hash_suffix}.{stamp}.{ext}"));
+        dest = path.with_file_name(format!("{}.fork.{}.{}.{}", stem, existing_hash_suffix, stamp, ext));
     }
 
     // Best-effort quarantine; if rename fails, keep the existing file.
