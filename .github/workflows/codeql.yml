@@ -36,3 +36,8 @@ jobs:
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
+        with:
+          # Keep analysis job green while GitHub "default setup" code scanning is enabled.
+          # Advanced SARIF upload conflicts with default setup and fails processing.
+          upload: false
+          wait-for-processing: false
