@@ -69,6 +69,8 @@ struct AppState {
     status_persisted_window_tip_cache: Arc<AtomicU64>,
     status_missing_persisted_in_window_cache: Arc<AtomicU64>,
     status_missing_or_mismatch_in_window_cache: Arc<AtomicU64>,
+    status_expected_hash_coverage_in_window_cache: Arc<AtomicU64>,
+    status_expected_hash_window_span_cache: Arc<AtomicU64>,
     status_best_header_hash_cache: Arc<Mutex<String>>,
 }
 
@@ -109,6 +111,8 @@ struct StatusResponse {
     persisted_window_tip: u64,
     missing_persisted_in_window: u64,
     missing_or_mismatch_in_window: u64,
+    expected_hash_coverage_in_window: u64,
+    expected_hash_window_span: u64,
     gap_healer_active: bool,
     gap_healer_last_progress_ts: u64,
     gap_healer_last_filled_height: Option<u64>,
@@ -1253,6 +1257,8 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
     storage::reset_quarantine_count();
     storage::set_missing_persisted_in_window(0);
     storage::set_missing_or_mismatch_in_window(0);
+    storage::set_expected_hash_coverage_in_window(0);
+    storage::set_expected_hash_window_span(0);
     storage::set_persisted_window_tip(0);
 
     let node_dir = storage::blocks_dir();
@@ -1337,6 +1343,18 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
 
     let expected_hashes_by_height =
         best_chain_hashes_in_window(state, window_start, stats.window_tip);
+    let expected_hash_coverage_in_window = expected_hashes_by_height.len() as u64;
+    let expected_hash_window_span = if window_start <= stats.window_tip {
+        stats
+            .window_tip
+            .saturating_sub(window_start)
+            .saturating_add(1)
+    } else {
+        0
+    };
+    storage::set_expected_hash_coverage_in_window(expected_hash_coverage_in_window);
+    storage::set_expected_hash_window_span(expected_hash_window_span);
+
     let mut target_heights = Vec::new();
 
     if expected_hashes_by_height.is_empty() {
@@ -1972,6 +1990,14 @@ async fn status(
     state
         .status_missing_or_mismatch_in_window_cache
         .store(missing_or_mismatch_in_window, Ordering::Relaxed);
+    let expected_hash_coverage_in_window = storage::expected_hash_coverage_in_window();
+    state
+        .status_expected_hash_coverage_in_window_cache
+        .store(expected_hash_coverage_in_window, Ordering::Relaxed);
+    let expected_hash_window_span = storage::expected_hash_window_span();
+    state
+        .status_expected_hash_window_span_cache
+        .store(expected_hash_window_span, Ordering::Relaxed);
     let gap_healer_active = storage::gap_healer_active();
     let gap_healer_last_progress_ts = storage::gap_healer_last_progress_ts();
     let gap_healer_last_filled_height = storage::gap_healer_last_filled_height();
@@ -1994,6 +2020,8 @@ async fn status(
         persisted_window_tip,
         missing_persisted_in_window,
         missing_or_mismatch_in_window,
+        expected_hash_coverage_in_window,
+        expected_hash_window_span,
         gap_healer_active,
         gap_healer_last_progress_ts,
         gap_healer_last_filled_height,
@@ -3513,6 +3541,10 @@ async fn main() {
         Arc::new(AtomicU64::new(storage::missing_persisted_in_window()));
     let status_missing_or_mismatch_in_window_cache =
         Arc::new(AtomicU64::new(storage::missing_or_mismatch_in_window()));
+    let status_expected_hash_coverage_in_window_cache =
+        Arc::new(AtomicU64::new(storage::expected_hash_coverage_in_window()));
+    let status_expected_hash_window_span_cache =
+        Arc::new(AtomicU64::new(storage::expected_hash_window_span()));
     let status_best_header_hash_cache = Arc::new(Mutex::new({
         let g = shared_state.lock().unwrap_or_else(|e| e.into_inner());
         let best = compute_best_header_tip_from_chain(&g, &genesis_hash);
@@ -3879,6 +3911,8 @@ async fn main() {
         status_persisted_window_tip_cache,
         status_missing_persisted_in_window_cache,
         status_missing_or_mismatch_in_window_cache,
+        status_expected_hash_coverage_in_window_cache,
+        status_expected_hash_window_span_cache,
         status_best_header_hash_cache,
     };
 

@@ -39,6 +39,8 @@ static PERSISTED_MAX_HEIGHT_ON_DISK: AtomicU64 = AtomicU64::new(0);
 static PERSISTED_WINDOW_TIP: AtomicU64 = AtomicU64::new(0);
 static MISSING_PERSISTED_IN_WINDOW: AtomicU64 = AtomicU64::new(0);
 static MISSING_OR_MISMATCH_IN_WINDOW: AtomicU64 = AtomicU64::new(0);
+static EXPECTED_HASH_COVERAGE_IN_WINDOW: AtomicU64 = AtomicU64::new(0);
+static EXPECTED_HASH_WINDOW_SPAN: AtomicU64 = AtomicU64::new(0);
 static GAP_HEALER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static GAP_HEALER_LAST_PROGRESS_TS: AtomicU64 = AtomicU64::new(0);
 static GAP_HEALER_LAST_FILLED_HEIGHT: AtomicU64 = AtomicU64::new(0);
@@ -162,6 +164,22 @@ pub fn missing_or_mismatch_in_window() -> u64 {
 
 pub fn set_missing_or_mismatch_in_window(count: u64) {
     MISSING_OR_MISMATCH_IN_WINDOW.store(count, Ordering::Relaxed);
+}
+
+pub fn expected_hash_coverage_in_window() -> u64 {
+    EXPECTED_HASH_COVERAGE_IN_WINDOW.load(Ordering::Relaxed)
+}
+
+pub fn set_expected_hash_coverage_in_window(count: u64) {
+    EXPECTED_HASH_COVERAGE_IN_WINDOW.store(count, Ordering::Relaxed);
+}
+
+pub fn expected_hash_window_span() -> u64 {
+    EXPECTED_HASH_WINDOW_SPAN.load(Ordering::Relaxed)
+}
+
+pub fn set_expected_hash_window_span(span: u64) {
+    EXPECTED_HASH_WINDOW_SPAN.store(span, Ordering::Relaxed);
 }
 
 fn gap_healer_pending_set() -> &'static Mutex<BTreeSet<u64>> {
