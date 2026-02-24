@@ -48,6 +48,7 @@ use k256::ecdsa::signature::hazmat::PrehashSigner;
 use k256::ecdsa::{Signature, SigningKey};
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
+const MAX_SUBMIT_BLOCK_TXS: usize = 10_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -3071,17 +3072,18 @@ async fn submit_block(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    if req.tx_hex.is_empty() || req.tx_hex.len() > MAX_SUBMIT_BLOCK_TXS {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     // Decode full transactions from hex payload.
-    let mut txs: Vec<Transaction> = Vec::with_capacity(req.tx_hex.len());
+    let mut txs: Vec<Transaction> = Vec::with_capacity(req.tx_hex.len().min(MAX_SUBMIT_BLOCK_TXS));
     for tx_hex in &req.tx_hex {
         let raw = hex::decode(tx_hex).map_err(|_| StatusCode::BAD_REQUEST)?;
         let tx = decode_full_tx(&raw).map_err(|_| StatusCode::BAD_REQUEST)?;
         txs.push(tx);
     }
 
-    if txs.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
 
     let block = Block {
         header: block_header,
