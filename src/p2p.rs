@@ -3841,7 +3841,7 @@ impl P2PNode {
                                 let chain_arc2 = chain_arc.clone();
                                 let peer_height_hint = last_handshake_height;
 
-                                let (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason) =
+                                let (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason, first_unknown_prev) =
                                     match spawn_blocking_limited(move || {
                                         let mut offset = 0usize;
                                         let mut last_header_hash: Option<[u8; 32]> = None;
@@ -3850,6 +3850,7 @@ impl P2PNode {
                                         let mut reset_headers = false;
                                         let mut added_any = false;
                                         let mut reject_reason: Option<String> = None;
+                                        let mut first_unknown_prev: Option<[u8; 32]> = None;
 
                                         let mut guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -3878,6 +3879,9 @@ impl P2PNode {
                                         if let Err(e) = guard.add_header(header.clone()) {
                                             if e.contains("unknown parent") {
                                                 unknown_parent = true;
+                                                if first_unknown_prev.is_none() {
+                                                    first_unknown_prev = Some(header.prev_hash);
+                                                }
                                                 reject_reason.get_or_insert_with(|| classify_header_reject_reason(&e));
                                                 let orphan_n = store_orphan_header(header.clone());
                                                 P2PNode::log_event(
@@ -3922,12 +3926,12 @@ impl P2PNode {
                                         }
                                         }
 
-                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason)
+                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason, first_unknown_prev)
                                     })
                                     .await
                                     {
                                         Ok(v) => v,
-                                        Err(_) => (None, true, false, false, false, Some("task_join_error".to_string())),
+                                        Err(_) => (None, true, false, false, false, Some("task_join_error".to_string()), None),
                                     };
 
                                 if header_count > 0 {
@@ -3959,6 +3963,18 @@ impl P2PNode {
                                             format!("P2P {}: repeated rejected headers (reason={}, streak={}); lowering peer score", addr, reason, streak),
                                         );
                                     }
+                                    if let Some(prev_hash) = first_unknown_prev {
+                                        request_orphan_headers(
+                                            &writer,
+                                            addr,
+                                            prev_hash,
+                                            &chain_for_sync,
+                                            &sync_requests,
+                                            &peer_state,
+                                        )
+                                        .await;
+                                    }
+
                                     if unknown_parent && !added_any {
                                         P2PNode::log_event(
                                                     "warn",
@@ -5760,7 +5776,7 @@ async fn handle_incoming_with_sybil(
                         tokio::spawn(async move {
                             let permit_guard = permit;
 
-                            let (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason) =
+                            let (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason, first_unknown_prev) =
                                 match spawn_blocking_limited(move || {
                                     let mut offset = 0usize;
                                     let mut last_header_hash: Option<[u8; 32]> = None;
@@ -5769,6 +5785,7 @@ async fn handle_incoming_with_sybil(
                                     let mut reset_headers = false;
                                     let mut added_any = false;
                                     let mut reject_reason: Option<String> = None;
+                                    let mut first_unknown_prev: Option<[u8; 32]> = None;
 
                                     let mut guard =
                                         chain_arc_for_headers.lock().unwrap_or_else(|e| e.into_inner());
@@ -5800,6 +5817,9 @@ async fn handle_incoming_with_sybil(
                                         if let Err(e) = guard.add_header(header.clone()) {
                                             if e.contains("unknown parent") {
                                                 unknown_parent = true;
+                                                if first_unknown_prev.is_none() {
+                                                    first_unknown_prev = Some(header.prev_hash);
+                                                }
                                                 reject_reason.get_or_insert_with(|| classify_header_reject_reason(&e));
                                                 let orphan_n = store_orphan_header(header.clone());
                                                 P2PNode::log_event(
@@ -5844,12 +5864,12 @@ async fn handle_incoming_with_sybil(
                                         }
                                     }
 
-                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason)
+                                        (last_header_hash, header_error, unknown_parent, reset_headers, added_any, reject_reason, first_unknown_prev)
                                 })
                                 .await
                                 {
                                     Ok(v) => v,
-                                    Err(_) => (None, true, false, false, false, Some("task_join_error".to_string())),
+                                    Err(_) => (None, true, false, false, false, Some("task_join_error".to_string()), None),
                                 };
                             drop(permit_guard);
 
@@ -5882,6 +5902,20 @@ async fn handle_incoming_with_sybil(
                                         format!("P2P {}: repeated rejected headers (reason={}, streak={}); lowering peer score", addr2, reason, streak),
                                     );
                                 }
+                                    if let Some(prev_hash) = first_unknown_prev {
+                                        if let Some(writer) = writer_weak.upgrade() {
+                                            request_orphan_headers(
+                                                &writer,
+                                                addr2,
+                                                prev_hash,
+                                                &Some(chain_arc_for_tip.clone()),
+                                                &sync_requests2,
+                                                &peer_state2,
+                                            )
+                                            .await;
+                                        }
+                                    }
+
                                 if unknown_parent && !added_any {
                                     P2PNode::log_event(
                                         "warn",
