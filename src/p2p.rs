@@ -284,6 +284,17 @@ fn incoming_conn_log_cooldown_secs() -> u64 {
     })
 }
 
+fn headers_batch_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_HEADERS_BATCH_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(30)
+    })
+}
+
 fn incoming_conn_log_enabled() -> bool {
     static VAL: OnceLock<bool> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -1164,6 +1175,7 @@ struct PeerSyncState {
     headers_processing: bool,
     unsolicited_headers: u32,
     last_unsolicited_log: Option<Instant>,
+    last_headers_batch_log: Option<Instant>,
     last_bad_headers: Option<Instant>,
 
     // Header-path recovery tracking.
@@ -1190,6 +1202,7 @@ impl Default for PeerSyncState {
             headers_processing: false,
             unsolicited_headers: 0,
             last_unsolicited_log: None,
+            last_headers_batch_log: None,
             last_bad_headers: None,
             last_best_header_height: 0,
             last_best_header_hash: [0u8; 32],
@@ -4110,20 +4123,38 @@ impl P2PNode {
                                 if header_count > 0 {
                                     peer_mark_header_event(addr.ip(), added_any, header_count)
                                         .await;
-                                    let last_short = last_header_hash
-                                        .map(|h| {
-                                            let hex = hex::encode(h);
-                                            hex.get(0..12).unwrap_or(&hex).to_string()
-                                        })
-                                        .unwrap_or_else(|| "-".to_string());
-                                    P2PNode::log_event(
-                                        "info",
-                                        "sync",
-                                        format!(
-                                            "P2P {}: received {} headers (new={}) last={}",
-                                            addr, header_count, added_any, last_short
-                                        ),
-                                    );
+                                    let should_log = {
+                                        let mut st = peer_state.lock().await;
+                                        let now = Instant::now();
+                                        let noisy = !added_any && header_count >= 2000;
+                                        let allow = if noisy {
+                                            st.last_headers_batch_log
+                                                .map(|t| now.duration_since(t) > Duration::from_secs(headers_batch_log_cooldown_secs()))
+                                                .unwrap_or(true)
+                                        } else {
+                                            true
+                                        };
+                                        if allow {
+                                            st.last_headers_batch_log = Some(now);
+                                        }
+                                        allow
+                                    };
+                                    if should_log {
+                                        let last_short = last_header_hash
+                                            .map(|h| {
+                                                let hex = hex::encode(h);
+                                                hex.get(0..12).unwrap_or(&hex).to_string()
+                                            })
+                                            .unwrap_or_else(|| "-".to_string());
+                                        P2PNode::log_event(
+                                            "info",
+                                            "sync",
+                                            format!(
+                                                "P2P {}: received {} headers (new={}) last={}",
+                                                addr, header_count, added_any, last_short
+                                            ),
+                                        );
+                                    }
                                 }
 
                                 if header_error {
@@ -6085,20 +6116,38 @@ async fn handle_incoming_with_sybil(
 
                             if header_count > 0 {
                                 peer_mark_header_event(addr2.ip(), added_any, header_count).await;
-                                let last_short = last_header_hash
-                                    .map(|h| {
-                                        let hex = hex::encode(h);
-                                        hex.get(0..12).unwrap_or(&hex).to_string()
-                                    })
-                                    .unwrap_or_else(|| "-".to_string());
-                                P2PNode::log_event(
-                                    "info",
-                                    "sync",
-                                    format!(
-                                        "P2P {}: received {} headers (new={}) last={}",
-                                        addr2, header_count, added_any, last_short
-                                    ),
-                                );
+                                let should_log = {
+                                    let mut st = peer_state2.lock().await;
+                                    let now = Instant::now();
+                                    let noisy = !added_any && header_count >= 2000;
+                                    let allow = if noisy {
+                                        st.last_headers_batch_log
+                                            .map(|t| now.duration_since(t) > Duration::from_secs(headers_batch_log_cooldown_secs()))
+                                            .unwrap_or(true)
+                                    } else {
+                                        true
+                                    };
+                                    if allow {
+                                        st.last_headers_batch_log = Some(now);
+                                    }
+                                    allow
+                                };
+                                if should_log {
+                                    let last_short = last_header_hash
+                                        .map(|h| {
+                                            let hex = hex::encode(h);
+                                            hex.get(0..12).unwrap_or(&hex).to_string()
+                                        })
+                                        .unwrap_or_else(|| "-".to_string());
+                                    P2PNode::log_event(
+                                        "info",
+                                        "sync",
+                                        format!(
+                                            "P2P {}: received {} headers (new={}) last={}",
+                                            addr2, header_count, added_any, last_short
+                                        ),
+                                    );
+                                }
                             }
 
                             if header_error {
