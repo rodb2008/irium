@@ -68,6 +68,7 @@ struct AppState {
     status_quarantine_count_cache: Arc<AtomicU64>,
     status_persisted_window_tip_cache: Arc<AtomicU64>,
     status_missing_persisted_in_window_cache: Arc<AtomicU64>,
+    status_best_header_hash_cache: Arc<Mutex<String>>,
 }
 
 #[derive(Serialize)]
@@ -1137,21 +1138,44 @@ fn rebuild_startup_header_index(
     }
 
     let best_hash = state.best_header_hash();
-    let best_height = state
+    let best_linked_persisted_tip = state
         .headers
         .get(&best_hash)
         .map(|hw| hw.height)
+        .or_else(|| state.heights.get(&best_hash).copied())
         .unwrap_or_else(|| state.tip_height());
+
+    let mut unlinked_in_window = 0u64;
+    for (h, _, block) in candidates.iter() {
+        if *h < window_start || *h > window_tip {
+            continue;
+        }
+        let hash = block.header.hash();
+        let linked = state.headers.contains_key(&hash) || state.heights.contains_key(&hash);
+        if !linked {
+            unlinked_in_window = unlinked_in_window.saturating_add(1);
+        }
+    }
+
     println!(
-        "[i] startup header index rebuilt: headers_known={} inserted={} synthetic_roots={} best_header_tip={}/{} window=[{}..{}] (bootstrap_full_scan=true)",
+        "[i] startup header index rebuilt: headers_known={} inserted={} synthetic_roots={} best_linked_persisted_tip={}/{} persisted_window_tip={} missing_in_window={} unlinked_in_window={} window=[{}..{}]",
         state.headers.len(),
         inserted,
         synthetic_roots,
-        best_height,
+        best_linked_persisted_tip,
         hex::encode(best_hash),
+        window_tip,
+        missing_in_window,
+        unlinked_in_window,
         window_start,
         window_tip
     );
+    if missing_in_window == 0 && unlinked_in_window > 0 {
+        eprintln!(
+            "[warn] startup header index has unlinked window headers despite missing_in_window=0 (unlinked_in_window={})",
+            unlinked_in_window
+        );
+    }
     if state.headers.is_empty() {
         eprintln!(
             "[warn] startup header index empty after rebuild (window_tip={} missing_in_window={}); no parsed headers were linkable",
@@ -1713,6 +1737,38 @@ async fn mining_metrics(
     }))
 }
 
+fn cached_best_header_tip(height: u64, cached_hash: &str, genesis_hash: &str) -> BestHeaderTipResponse {
+    let hash = if cached_hash.is_empty() {
+        if height > 0 {
+            genesis_hash.to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        cached_hash.to_string()
+    };
+    BestHeaderTipResponse { height, hash }
+}
+
+fn compute_best_header_tip_from_chain(guard: &ChainState, genesis_hash: &str) -> BestHeaderTipResponse {
+    let h = guard.tip_height();
+    let best_hash = guard.best_header_hash();
+    let best_height = guard
+        .headers
+        .get(&best_hash)
+        .map(|hw| hw.height)
+        .or_else(|| guard.heights.get(&best_hash).copied())
+        .unwrap_or(h);
+    let best_hash_hex = hex::encode(best_hash);
+    if best_height > 0 && best_hash_hex.is_empty() {
+        return cached_best_header_tip(best_height, "", genesis_hash);
+    }
+    BestHeaderTipResponse {
+        height: best_height,
+        hash: best_hash_hex,
+    }
+}
+
 async fn status(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -1757,30 +1813,22 @@ async fn status(
         Ok(guard) => {
             let h = guard.tip_height();
             state.status_height_cache.store(h, Ordering::Relaxed);
-            let best_hash = guard.best_header_hash();
-            let best_height = guard
-                .headers
-                .get(&best_hash)
-                .map(|hw| hw.height)
-                .or_else(|| guard.heights.get(&best_hash).copied())
-                .unwrap_or(h);
-            (
-                h,
-                BestHeaderTipResponse {
-                    height: best_height,
-                    hash: hex::encode(best_hash),
-                },
-            )
+            let best = compute_best_header_tip_from_chain(&guard, &state.genesis_hash);
+            if let Ok(mut cached) = state.status_best_header_hash_cache.lock() {
+                if !best.hash.is_empty() {
+                    *cached = best.hash.clone();
+                }
+            }
+            (h, best)
         }
         Err(_) => {
             let h = state.status_height_cache.load(Ordering::Relaxed);
-            (
-                h,
-                BestHeaderTipResponse {
-                    height: h,
-                    hash: String::new(),
-                },
-            )
+            let cached_hash = state
+                .status_best_header_hash_cache
+                .lock()
+                .map(|v| v.clone())
+                .unwrap_or_default();
+            (h, cached_best_header_tip(h, &cached_hash, &state.genesis_hash))
         }
     };
 
@@ -3350,6 +3398,11 @@ async fn main() {
         Arc::new(AtomicU64::new(storage::persisted_window_tip()));
     let status_missing_persisted_in_window_cache =
         Arc::new(AtomicU64::new(storage::missing_persisted_in_window()));
+    let status_best_header_hash_cache = Arc::new(Mutex::new({
+        let g = shared_state.lock().unwrap_or_else(|e| e.into_inner());
+        let best = compute_best_header_tip_from_chain(&g, &genesis_hash);
+        best.hash
+    }));
 
     // Periodic heartbeat logging to surface peers and seedlist.
     if let Some(ref node) = p2p {
@@ -3702,6 +3755,7 @@ async fn main() {
         status_quarantine_count_cache,
         status_persisted_window_tip_cache,
         status_missing_persisted_in_window_cache,
+        status_best_header_hash_cache,
     };
 
     let persist_drain_secs = std::env::var("IRIUM_PERSIST_DRAIN_SECS")
@@ -3848,5 +3902,34 @@ async fn main() {
             .expect("bind failed");
 
         axum::serve(listener, app).await.expect("server error");
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{cached_best_header_tip, compute_best_header_tip_from_chain};
+    use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState};
+    use irium_node_rs::genesis::load_locked_genesis;
+
+    #[test]
+    fn status_best_header_tip_hash_non_empty_when_height_positive() {
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis_block = block_from_locked(&locked).expect("genesis block");
+        let params = ChainParams {
+            pow_limit: genesis_block.header.target(),
+            genesis_block,
+        };
+        let chain = ChainState::new(params);
+        let genesis_hash = hex::encode(chain.tip_hash());
+
+        let tip = compute_best_header_tip_from_chain(&chain, &genesis_hash);
+        assert!(!tip.hash.is_empty(), "best header hash should not be empty");
+
+        let fallback = cached_best_header_tip(1, "", &genesis_hash);
+        assert!(
+            !fallback.hash.is_empty(),
+            "fallback best_header_tip.hash must not be empty when height > 0"
+        );
     }
 }
