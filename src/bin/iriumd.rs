@@ -68,6 +68,7 @@ struct AppState {
     status_quarantine_count_cache: Arc<AtomicU64>,
     status_persisted_window_tip_cache: Arc<AtomicU64>,
     status_missing_persisted_in_window_cache: Arc<AtomicU64>,
+    status_missing_or_mismatch_in_window_cache: Arc<AtomicU64>,
     status_best_header_hash_cache: Arc<Mutex<String>>,
 }
 
@@ -107,6 +108,7 @@ struct StatusResponse {
     quarantine_count: u64,
     persisted_window_tip: u64,
     missing_persisted_in_window: u64,
+    missing_or_mismatch_in_window: u64,
     gap_healer_active: bool,
     gap_healer_last_progress_ts: u64,
     gap_healer_last_filled_height: Option<u64>,
@@ -1066,6 +1068,67 @@ fn compute_persist_window_stats(
     }
 }
 
+fn best_chain_hashes_in_window(
+    state: &ChainState,
+    window_start: u64,
+    window_tip: u64,
+) -> std::collections::BTreeMap<u64, [u8; 32]> {
+    let mut by_height = std::collections::BTreeMap::new();
+    if window_start > window_tip {
+        return by_height;
+    }
+
+    let mut current = state.best_header_hash();
+    let mut guard = 0usize;
+    let guard_limit = ((window_tip.saturating_sub(window_start) + 1) as usize)
+        .saturating_mul(8)
+        .saturating_add(8192);
+
+    while current != [0u8; 32] && guard < guard_limit {
+        guard = guard.saturating_add(1);
+
+        if let Some(height) = state.heights.get(&current).copied() {
+            let mut h = height;
+            loop {
+                if h < window_start {
+                    break;
+                }
+                if h > window_tip {
+                    if h == 0 {
+                        break;
+                    }
+                    h = h.saturating_sub(1);
+                    continue;
+                }
+                if let Some(block) = state.chain.get(h as usize) {
+                    by_height.entry(h).or_insert(block.header.hash());
+                }
+                if h == 0 {
+                    break;
+                }
+                h = h.saturating_sub(1);
+            }
+            break;
+        }
+
+        if let Some(hw) = state.headers.get(&current) {
+            let h = hw.height;
+            if h >= window_start && h <= window_tip {
+                by_height.entry(h).or_insert(current);
+            }
+            if hw.header.prev_hash == [0u8; 32] {
+                break;
+            }
+            current = hw.header.prev_hash;
+            continue;
+        }
+
+        break;
+    }
+
+    by_height
+}
+
 fn rebuild_startup_header_index(
     state: &mut ChainState,
     candidates: &[(u64, std::path::PathBuf, Block)],
@@ -1073,10 +1136,8 @@ fn rebuild_startup_header_index(
     window_tip: u64,
     missing_in_window: u64,
 ) {
-    let mut bootstrap_blocks: Vec<(u64, Block)> = candidates
-        .iter()
-        .map(|(h, _, b)| (*h, b.clone()))
-        .collect();
+    let mut bootstrap_blocks: Vec<(u64, Block)> =
+        candidates.iter().map(|(h, _, b)| (*h, b.clone())).collect();
     bootstrap_blocks.sort_by_key(|(h, _)| *h);
 
     let mut pending = bootstrap_blocks;
@@ -1110,8 +1171,8 @@ fn rebuild_startup_header_index(
                             );
                             continue;
                         }
-                        let synthetic_work = state.total_work.clone()
-                            + BigUint::from(h.saturating_add(1));
+                        let synthetic_work =
+                            state.total_work.clone() + BigUint::from(h.saturating_add(1));
                         state.headers.insert(
                             hash,
                             HeaderWork {
@@ -1191,6 +1252,7 @@ fn rebuild_startup_header_index(
 fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
     storage::reset_quarantine_count();
     storage::set_missing_persisted_in_window(0);
+    storage::set_missing_or_mismatch_in_window(0);
     storage::set_persisted_window_tip(0);
 
     let node_dir = storage::blocks_dir();
@@ -1241,7 +1303,7 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
             missing_heights.push(h);
         }
     }
-    storage::set_gap_healer_missing_heights(&missing_heights);
+
     println!(
         "[i] persist continuity window: tip={} window_start={} missing_in_window={}",
         stats.window_tip, window_start, stats.missing_in_window
@@ -1260,6 +1322,42 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
         stats.window_tip,
         stats.missing_in_window,
     );
+
+    let mut observed_hashes_by_height: std::collections::BTreeMap<u64, Vec<[u8; 32]>> =
+        std::collections::BTreeMap::new();
+    for (h, _, block) in candidates.iter() {
+        if *h < window_start || *h > stats.window_tip {
+            continue;
+        }
+        observed_hashes_by_height
+            .entry(*h)
+            .or_default()
+            .push(block.header.hash());
+    }
+
+    let expected_hashes_by_height =
+        best_chain_hashes_in_window(state, window_start, stats.window_tip);
+    let mut target_heights = Vec::new();
+
+    if expected_hashes_by_height.is_empty() {
+        target_heights = missing_heights.clone();
+    } else {
+        for h in window_start..=stats.window_tip {
+            let Some(expected_hash) = expected_hashes_by_height.get(&h) else {
+                continue;
+            };
+            let matched = observed_hashes_by_height
+                .get(&h)
+                .map(|hashes| hashes.iter().any(|v| v == expected_hash))
+                .unwrap_or(false);
+            if !matched {
+                target_heights.push(h);
+            }
+        }
+    }
+
+    storage::set_gap_healer_target_heights(&target_heights);
+    storage::set_missing_or_mismatch_in_window(target_heights.len() as u64);
 
     candidates.sort_by_key(|(h, _, _)| *h);
     let mut pending = candidates;
@@ -1737,7 +1835,11 @@ async fn mining_metrics(
     }))
 }
 
-fn cached_best_header_tip(height: u64, cached_hash: &str, genesis_hash: &str) -> BestHeaderTipResponse {
+fn cached_best_header_tip(
+    height: u64,
+    cached_hash: &str,
+    genesis_hash: &str,
+) -> BestHeaderTipResponse {
     let hash = if cached_hash.is_empty() {
         if height > 0 {
             genesis_hash.to_string()
@@ -1750,7 +1852,10 @@ fn cached_best_header_tip(height: u64, cached_hash: &str, genesis_hash: &str) ->
     BestHeaderTipResponse { height, hash }
 }
 
-fn compute_best_header_tip_from_chain(guard: &ChainState, genesis_hash: &str) -> BestHeaderTipResponse {
+fn compute_best_header_tip_from_chain(
+    guard: &ChainState,
+    genesis_hash: &str,
+) -> BestHeaderTipResponse {
     let h = guard.tip_height();
     let best_hash = guard.best_header_hash();
     let best_height = guard
@@ -1828,7 +1933,10 @@ async fn status(
                 .lock()
                 .map(|v| v.clone())
                 .unwrap_or_default();
-            (h, cached_best_header_tip(h, &cached_hash, &state.genesis_hash))
+            (
+                h,
+                cached_best_header_tip(h, &cached_hash, &state.genesis_hash),
+            )
         }
     };
 
@@ -1860,6 +1968,10 @@ async fn status(
     state
         .status_missing_persisted_in_window_cache
         .store(missing_persisted_in_window, Ordering::Relaxed);
+    let missing_or_mismatch_in_window = storage::missing_or_mismatch_in_window();
+    state
+        .status_missing_or_mismatch_in_window_cache
+        .store(missing_or_mismatch_in_window, Ordering::Relaxed);
     let gap_healer_active = storage::gap_healer_active();
     let gap_healer_last_progress_ts = storage::gap_healer_last_progress_ts();
     let gap_healer_last_filled_height = storage::gap_healer_last_filled_height();
@@ -1881,6 +1993,7 @@ async fn status(
         quarantine_count,
         persisted_window_tip,
         missing_persisted_in_window,
+        missing_or_mismatch_in_window,
         gap_healer_active,
         gap_healer_last_progress_ts,
         gap_healer_last_filled_height,
@@ -3398,6 +3511,8 @@ async fn main() {
         Arc::new(AtomicU64::new(storage::persisted_window_tip()));
     let status_missing_persisted_in_window_cache =
         Arc::new(AtomicU64::new(storage::missing_persisted_in_window()));
+    let status_missing_or_mismatch_in_window_cache =
+        Arc::new(AtomicU64::new(storage::missing_or_mismatch_in_window()));
     let status_best_header_hash_cache = Arc::new(Mutex::new({
         let g = shared_state.lock().unwrap_or_else(|e| e.into_inner());
         let best = compute_best_header_tip_from_chain(&g, &genesis_hash);
@@ -3684,8 +3799,14 @@ async fn main() {
                 }
 
                 let (tip_height, tip_bytes) = {
-                    let guard = chain_for_gap_healer.lock().unwrap_or_else(|e| e.into_inner());
-                    let tip_bytes = guard.chain.last().map(|b| b.header.hash()).unwrap_or([0u8; 32]);
+                    let guard = chain_for_gap_healer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let tip_bytes = guard
+                        .chain
+                        .last()
+                        .map(|b| b.header.hash())
+                        .unwrap_or([0u8; 32]);
                     (guard.tip_height(), tip_bytes)
                 };
 
@@ -3696,7 +3817,9 @@ async fn main() {
                     }
 
                     let block_opt = {
-                        let guard = chain_for_gap_healer.lock().unwrap_or_else(|e| e.into_inner());
+                        let guard = chain_for_gap_healer
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         guard.chain.get(h as usize).cloned()
                     };
 
@@ -3755,6 +3878,7 @@ async fn main() {
         status_quarantine_count_cache,
         status_persisted_window_tip_cache,
         status_missing_persisted_in_window_cache,
+        status_missing_or_mismatch_in_window_cache,
         status_best_header_hash_cache,
     };
 
@@ -3904,7 +4028,6 @@ async fn main() {
         axum::serve(listener, app).await.expect("server error");
     }
 }
-
 
 #[cfg(test)]
 mod tests {

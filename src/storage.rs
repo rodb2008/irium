@@ -38,6 +38,7 @@ static PERSISTED_CONTIGUOUS_HEIGHT: AtomicU64 = AtomicU64::new(0);
 static PERSISTED_MAX_HEIGHT_ON_DISK: AtomicU64 = AtomicU64::new(0);
 static PERSISTED_WINDOW_TIP: AtomicU64 = AtomicU64::new(0);
 static MISSING_PERSISTED_IN_WINDOW: AtomicU64 = AtomicU64::new(0);
+static MISSING_OR_MISMATCH_IN_WINDOW: AtomicU64 = AtomicU64::new(0);
 static GAP_HEALER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static GAP_HEALER_LAST_PROGRESS_TS: AtomicU64 = AtomicU64::new(0);
 static GAP_HEALER_LAST_FILLED_HEIGHT: AtomicU64 = AtomicU64::new(0);
@@ -155,6 +156,13 @@ pub fn missing_persisted_in_window() -> u64 {
 pub fn set_missing_persisted_in_window(missing: u64) {
     MISSING_PERSISTED_IN_WINDOW.store(missing, Ordering::Relaxed);
 }
+pub fn missing_or_mismatch_in_window() -> u64 {
+    MISSING_OR_MISMATCH_IN_WINDOW.load(Ordering::Relaxed)
+}
+
+pub fn set_missing_or_mismatch_in_window(count: u64) {
+    MISSING_OR_MISMATCH_IN_WINDOW.store(count, Ordering::Relaxed);
+}
 
 fn gap_healer_pending_set() -> &'static Mutex<BTreeSet<u64>> {
     GAP_HEALER_PENDING.get_or_init(|| Mutex::new(BTreeSet::new()))
@@ -197,14 +205,18 @@ pub fn gap_healer_pending_count() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn set_gap_healer_missing_heights(heights: &[u64]) {
+pub fn set_gap_healer_target_heights(heights: &[u64]) {
     if let Ok(mut g) = gap_healer_pending_set().lock() {
         g.clear();
         for h in heights {
             g.insert(*h);
         }
-        MISSING_PERSISTED_IN_WINDOW.store(g.len() as u64, Ordering::Relaxed);
+        MISSING_OR_MISMATCH_IN_WINDOW.store(g.len() as u64, Ordering::Relaxed);
     }
+}
+
+pub fn set_gap_healer_missing_heights(heights: &[u64]) {
+    set_gap_healer_target_heights(heights);
 }
 
 pub fn gap_healer_batch(limit: usize) -> Vec<u64> {
@@ -217,7 +229,7 @@ pub fn gap_healer_batch(limit: usize) -> Vec<u64> {
 pub fn gap_healer_mark_filled(height: u64) -> bool {
     if let Ok(mut g) = gap_healer_pending_set().lock() {
         if g.remove(&height) {
-            MISSING_PERSISTED_IN_WINDOW.store(g.len() as u64, Ordering::Relaxed);
+            MISSING_OR_MISMATCH_IN_WINDOW.store(g.len() as u64, Ordering::Relaxed);
             gap_healer_touch_progress(height);
             return true;
         }
@@ -292,23 +304,6 @@ pub fn drain_persist_queue(timeout: Duration) -> bool {
         thread::sleep(Duration::from_millis(20));
     }
     true
-}
-
-fn sanitize_filename_component(name: &std::ffi::OsStr) -> String {
-    // This file name ultimately comes from `Path::file_name()`, but we still sanitize
-    // to defend against path traversal if future callers ever pass tainted input.
-    let s = name.to_string_lossy();
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        let ok = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-');
-        out.push(if ok { ch } else { '_' });
-    }
-    let trimmed = out.trim_matches('.');
-    if trimmed.is_empty() {
-        "file".to_string()
-    } else {
-        out
-    }
 }
 
 fn p2pkh_hash_from_script(script: &[u8]) -> Option<[u8; 20]> {
@@ -468,6 +463,11 @@ fn maybe_quarantine_existing_block(path: &Path, new_hash: &str) -> std::io::Resu
         .and_then(|v| {
             v.get("header")
                 .and_then(|h| h.get("hash"))
+                .or_else(|| {
+                    v.get("block")
+                        .and_then(|b| b.get("header"))
+                        .and_then(|h| h.get("hash"))
+                })
                 .and_then(|h| h.as_str())
                 .map(|s| s.to_string())
         });
@@ -476,28 +476,17 @@ fn maybe_quarantine_existing_block(path: &Path, new_hash: &str) -> std::io::Resu
         return Ok(());
     }
 
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let backup_dir = dir.join(format!("orphaned_{}", stamp));
-    fs::create_dir_all(&backup_dir)?;
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("block");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("json");
+    let existing_hash_suffix = existing_hash.as_deref().unwrap_or("unknown");
 
-    let name = path.file_name().unwrap_or_default();
-    let safe_name = sanitize_filename_component(name);
-    let mut dest = backup_dir.join(&safe_name);
+    let mut dest = path.with_file_name(format!("{stem}.fork.{existing_hash_suffix}.{ext}"));
     if dest.exists() {
-        // Avoid clobbering an existing quarantine file.
-        let mut n = 1u32;
-        loop {
-            let candidate = backup_dir.join(format!("{safe_name}.dup{n}"));
-            if !candidate.exists() {
-                dest = candidate;
-                break;
-            }
-            n += 1;
-        }
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        dest = path.with_file_name(format!("{stem}.fork.{existing_hash_suffix}.{stamp}.{ext}"));
     }
 
     // Best-effort quarantine; if rename fails, keep the existing file.
