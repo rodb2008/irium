@@ -23,6 +23,8 @@ use tokio::time::Instant;
 struct AppState {
     client: Client,
     node_base: String,
+    node_bases: Arc<Vec<String>>,
+    active_node: Arc<RwLock<usize>>,
     limiter: Arc<Mutex<RateLimiter>>,
     api_token: Option<String>,
     rpc_token: Option<String>,
@@ -143,6 +145,59 @@ fn node_url(base: &str, path: &str) -> String {
     )
 }
 
+
+fn parse_node_bases() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(list) = env::var("IRIUM_NODE_RPCS") {
+        for raw in list.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+            let v = raw.trim();
+            if !v.is_empty() {
+                out.push(v.trim_end_matches('/').to_string());
+            }
+        }
+    }
+    if let Ok(primary) = env::var("IRIUM_NODE_RPC") {
+        let p = primary.trim();
+        if !p.is_empty() {
+            out.push(p.trim_end_matches('/').to_string());
+        }
+    }
+    if out.is_empty() {
+        out.push("https://127.0.0.1:38300".to_string());
+    }
+    let mut dedup = Vec::new();
+    let mut seen = HashSet::new();
+    for base in out {
+        if seen.insert(base.clone()) {
+            dedup.push(base);
+        }
+    }
+    dedup
+}
+
+fn best_height_from_status(v: &Value) -> u64 {
+    v.get("best_header_tip")
+        .and_then(|b| b.get("height"))
+        .and_then(|h| h.as_u64())
+        .or_else(|| v.get("height").and_then(|h| h.as_u64()))
+        .unwrap_or(0)
+}
+
+fn ordered_node_indexes(total: usize, active: usize) -> Vec<usize> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let mut idxs = Vec::with_capacity(total);
+    let start = active.min(total.saturating_sub(1));
+    idxs.push(start);
+    for i in 0..total {
+        if i != start {
+            idxs.push(i);
+        }
+    }
+    idxs
+}
+
 fn value_f64(v: Option<&Value>) -> Option<f64> {
     match v {
         Some(Value::Number(n)) => n.as_f64(),
@@ -192,22 +247,39 @@ async fn load_block_entry(state: &AppState, height: u64) -> Option<MinedBlockEnt
 }
 
 async fn proxy_json(state: &AppState, path: &str) -> Result<Json<Value>, StatusCode> {
-    let url = node_url(&state.node_base, path);
-    let mut req = state.client.get(url);
-    if let Some(token) = &state.rpc_token {
-        if !token.is_empty() {
-            req = req.bearer_auth(token);
+    let active = *state.active_node.read().await;
+    let order = ordered_node_indexes(state.node_bases.len(), active);
+    let mut last_status = StatusCode::BAD_GATEWAY;
+
+    for idx in order {
+        let base = &state.node_bases[idx];
+        let url = node_url(base, path);
+        let mut req = state.client.get(url);
+        if let Some(token) = &state.rpc_token {
+            if !token.is_empty() {
+                req = req.bearer_auth(token);
+            }
         }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !resp.status().is_success() {
+            last_status = map_status(resp.status());
+            continue;
+        }
+        let payload = match resp.json::<Value>().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        {
+            let mut w = state.active_node.write().await;
+            *w = idx;
+        }
+        return Ok(Json(payload));
     }
-    let resp = req.send().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
-    if !resp.status().is_success() {
-        return Err(map_status(resp.status()));
-    }
-    let payload = resp
-        .json::<Value>()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    Ok(Json(payload))
+
+    Err(last_status)
 }
 
 async fn proxy_value(state: &AppState, path: &str) -> Result<Value, StatusCode> {
@@ -216,19 +288,39 @@ async fn proxy_value(state: &AppState, path: &str) -> Result<Value, StatusCode> 
 }
 
 async fn proxy_text(state: &AppState, path: &str) -> Result<Response, StatusCode> {
-    let url = node_url(&state.node_base, path);
-    let mut req = state.client.get(url);
-    if let Some(token) = &state.rpc_token {
-        if !token.is_empty() {
-            req = req.bearer_auth(token);
+    let active = *state.active_node.read().await;
+    let order = ordered_node_indexes(state.node_bases.len(), active);
+    let mut last_status = StatusCode::BAD_GATEWAY;
+
+    for idx in order {
+        let base = &state.node_bases[idx];
+        let url = node_url(base, path);
+        let mut req = state.client.get(url);
+        if let Some(token) = &state.rpc_token {
+            if !token.is_empty() {
+                req = req.bearer_auth(token);
+            }
         }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !resp.status().is_success() {
+            last_status = map_status(resp.status());
+            continue;
+        }
+        let body = match resp.text().await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        {
+            let mut w = state.active_node.write().await;
+            *w = idx;
+        }
+        return Ok(body.into_response());
     }
-    let resp = req.send().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
-    if !resp.status().is_success() {
-        return Err(map_status(resp.status()));
-    }
-    let body = resp.text().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
-    Ok(body.into_response())
+
+    Err(last_status)
 }
 
 async fn refresh_active_miners_once(
@@ -289,6 +381,52 @@ async fn miners_refresher_task(state: AppState, window_blocks: u64, interval: Du
                 w.last_error = Some(e);
             }
         }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+
+async fn node_selector_task(state: AppState, interval: Duration) {
+    loop {
+        let mut best_idx: Option<usize> = None;
+        let mut best_height = 0u64;
+        let mut best_latency_ms = u128::MAX;
+
+        for (idx, base) in state.node_bases.iter().enumerate() {
+            let t0 = Instant::now();
+            let url = node_url(base, "/status");
+            let mut req = state.client.get(url);
+            if let Some(token) = &state.rpc_token {
+                if !token.is_empty() {
+                    req = req.bearer_auth(token);
+                }
+            }
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if !resp.status().is_success() {
+                continue;
+            }
+            let payload = match resp.json::<Value>().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let latency = t0.elapsed().as_millis();
+            let h = best_height_from_status(&payload);
+
+            if h > best_height || (h == best_height && latency < best_latency_ms) {
+                best_height = h;
+                best_latency_ms = latency;
+                best_idx = Some(idx);
+            }
+        }
+
+        if let Some(idx) = best_idx {
+            let mut w = state.active_node.write().await;
+            *w = idx;
+        }
+
         tokio::time::sleep(interval).await;
     }
 }
@@ -773,8 +911,11 @@ async fn pool_account(
 
 #[tokio::main]
 async fn main() {
-    let node_base =
-        env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string());
+    let node_bases = parse_node_bases();
+    let node_base = node_bases
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "https://127.0.0.1:38300".to_string());
     let client = match build_client(&node_base) {
         Ok(c) => c,
         Err(e) => {
@@ -798,9 +939,17 @@ async fn main() {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(60);
 
+    let node_probe_secs = env::var("IRIUM_EXPLORER_NODE_PROBE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(15)
+        .max(5);
+
     let state = AppState {
         client,
         node_base: node_base.trim_end_matches('/').to_string(),
+        node_bases: Arc::new(node_bases.clone()),
+        active_node: Arc::new(RwLock::new(0)),
         limiter: Arc::new(Mutex::new(RateLimiter::new(rate))),
         api_token,
         rpc_token,
@@ -815,6 +964,12 @@ async fn main() {
         state.clone(),
         miners_window_blocks,
         Duration::from_secs(miners_refresh_secs.max(10)),
+    ));
+
+    // Background probe that auto-selects the healthiest/highest node.
+    tokio::spawn(node_selector_task(
+        state.clone(),
+        Duration::from_secs(node_probe_secs),
     ));
 
     let app = Router::new()
@@ -834,7 +989,7 @@ async fn main() {
         .route("/pool/workers", get(pool_workers))
         .route("/pool/health", get(pool_health))
         .route("/pool/account/:address", get(pool_account))
-        .with_state(state)
+        .with_state(state.clone())
         .into_make_service_with_connect_info::<SocketAddr>();
 
     let host = env::var("IRIUM_EXPLORER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -847,8 +1002,11 @@ async fn main() {
         .expect("valid bind address");
 
     println!(
-        "Irium explorer API listening on http://{}:{} (node rpc {})",
-        host, port, node_base
+        "Irium explorer API listening on http://{}:{} (node rpc primary {}, pool size {})",
+        host,
+        port,
+        node_base,
+        state.node_bases.len()
     );
 
     let listener = tokio::net::TcpListener::bind(addr)
