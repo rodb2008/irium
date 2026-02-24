@@ -327,6 +327,29 @@ fn headers_new_false_log_cooldown_secs() -> u64 {
     })
 }
 
+
+fn locator_recovery_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_LOCATOR_RECOVERY_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(30)
+    })
+}
+
+fn locator_recovery_tip_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_LOCATOR_RECOVERY_TIP_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(10).min(7200))
+            .unwrap_or(600)
+    })
+}
+
 fn inbound_accept_cooldown_ms() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -1148,6 +1171,7 @@ struct PeerSyncState {
     last_best_header_hash: [u8; 32],
     last_best_header_progress: Option<Instant>,
     headers_recovery_exp: u8,
+    last_locator_recovery: Option<Instant>,
 }
 
 impl Default for PeerSyncState {
@@ -1171,6 +1195,7 @@ impl Default for PeerSyncState {
             last_best_header_hash: [0u8; 32],
             last_best_header_progress: None,
             headers_recovery_exp: 0,
+            last_locator_recovery: None,
         }
     }
 }
@@ -1442,8 +1467,21 @@ async fn maybe_request_sync(
                 .map(|t| now.duration_since(t) >= Duration::from_secs(120))
                 .unwrap_or(false)
         {
-            state.headers_recovery_exp = state.headers_recovery_exp.saturating_add(1).min(16);
-            recovery_triggered = true;
+            let at_tip = best_header_height >= local_height;
+            let cooldown = if at_tip {
+                Duration::from_secs(locator_recovery_tip_cooldown_secs())
+            } else {
+                Duration::from_secs(locator_recovery_cooldown_secs())
+            };
+            let allow_recovery = state
+                .last_locator_recovery
+                .map(|t| now.duration_since(t) >= cooldown)
+                .unwrap_or(true);
+            if allow_recovery {
+                state.headers_recovery_exp = state.headers_recovery_exp.saturating_add(1).min(16);
+                state.last_locator_recovery = Some(now);
+                recovery_triggered = true;
+            }
         }
         recovery_exp = state.headers_recovery_exp;
     }
