@@ -21,6 +21,7 @@ use axum::{
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Utc;
 use hex;
+use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -31,7 +32,7 @@ use bs58;
 use get_if_addrs::get_if_addrs;
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
-use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, OutPoint};
+use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, HeaderWork, OutPoint};
 use irium_node_rs::constants::{block_reward, COINBASE_MATURITY};
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::MempoolManager;
@@ -1064,6 +1065,107 @@ fn compute_persist_window_stats(
     }
 }
 
+fn rebuild_startup_header_index(
+    state: &mut ChainState,
+    candidates: &[(u64, std::path::PathBuf, Block)],
+    window_start: u64,
+    window_tip: u64,
+    missing_in_window: u64,
+) {
+    let lower = window_start.saturating_sub(1);
+    let mut window_blocks: Vec<(u64, Block)> = candidates
+        .iter()
+        .filter(|(h, _, _)| *h >= lower && *h <= window_tip)
+        .map(|(h, _, b)| (*h, b.clone()))
+        .collect();
+    window_blocks.sort_by_key(|(h, _)| *h);
+
+    let mut pending = window_blocks;
+    let mut inserted = 0usize;
+    let mut synthetic_roots = 0usize;
+    let mut rounds = 0u8;
+
+    while !pending.is_empty() && rounds < 8 {
+        rounds = rounds.saturating_add(1);
+        let mut progressed = false;
+        let mut next_pending: Vec<(u64, Block)> = Vec::new();
+
+        for (h, block) in pending.into_iter() {
+            let hash = block.header.hash();
+            if state.headers.contains_key(&hash) || state.heights.contains_key(&hash) {
+                continue;
+            }
+
+            match state.add_header(block.header.clone()) {
+                Ok(_) => {
+                    inserted = inserted.saturating_add(1);
+                    progressed = true;
+                }
+                Err(e) => {
+                    if e.contains("unknown parent") && synthetic_roots == 0 {
+                        if !meets_target(&hash, block.header.target()) {
+                            eprintln!(
+                                "[warn] startup header index skipped invalid PoW header at h={} hash= {}",
+                                h,
+                                hex::encode(hash)
+                            );
+                            continue;
+                        }
+                        let synthetic_work = state.total_work.clone()
+                            + BigUint::from(h.saturating_add(1));
+                        state.headers.insert(
+                            hash,
+                            HeaderWork {
+                                header: block.header.clone(),
+                                height: h,
+                                work: synthetic_work,
+                            },
+                        );
+                        state.header_chain.push(hash);
+                        inserted = inserted.saturating_add(1);
+                        synthetic_roots = synthetic_roots.saturating_add(1);
+                        progressed = true;
+                    } else {
+                        next_pending.push((h, block));
+                    }
+                }
+            }
+        }
+
+        pending = next_pending;
+        if !progressed {
+            break;
+        }
+    }
+
+    let best_hash = state.best_header_hash();
+    let best_height = state
+        .headers
+        .get(&best_hash)
+        .map(|hw| hw.height)
+        .unwrap_or_else(|| state.tip_height());
+    println!(
+        "[i] startup header index rebuilt: headers_known={} inserted={} synthetic_roots={} best_header_tip={}/{} window=[{}..{}]",
+        state.headers.len(),
+        inserted,
+        synthetic_roots,
+        best_height,
+        hex::encode(best_hash),
+        window_start,
+        window_tip
+    );
+    if state.headers.is_empty() {
+        eprintln!(
+            "[warn] startup header index empty after rebuild (window_tip={} missing_in_window={}); no parsed headers were linkable",
+            window_tip,
+            missing_in_window
+        );
+    }
+    if missing_in_window == 0 && state.headers.is_empty() {
+        eprintln!("[warn] BUG: missing_in_window=0 but headers_known=0 after startup rebuild");
+    }
+}
+
 fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
     storage::reset_quarantine_count();
     storage::set_missing_persisted_in_window(0);
@@ -1128,6 +1230,14 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
             stats.missing_in_window
         );
     }
+
+    rebuild_startup_header_index(
+        state,
+        &candidates,
+        window_start,
+        stats.window_tip,
+        stats.missing_in_window,
+    );
 
     candidates.sort_by_key(|(h, _, _)| *h);
     let mut pending = candidates;
