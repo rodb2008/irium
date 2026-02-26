@@ -1,6 +1,6 @@
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    mpsc::{sync_channel, SyncSender},
+    mpsc::{sync_channel, SyncSender, TrySendError},
     Mutex, OnceLock,
 };
 use std::thread;
@@ -590,15 +590,20 @@ pub fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
     if let Some(writer) = PERSIST_WRITER.get() {
         if writer.async_mode {
             if let Some(ref tx) = writer.sender {
-                PERSIST_QUEUE_LEN.fetch_add(1, Ordering::Relaxed);
-                if let Err(err) = tx.send(PersistJob {
+                // Never block async/P2P tasks on a full persist queue.
+                let job = PersistJob {
                     height,
                     block: block.clone(),
-                }) {
-                    PERSIST_QUEUE_LEN.fetch_sub(1, Ordering::Relaxed);
-                    return write_block_json_sync(err.0.height, &err.0.block);
+                };
+                match tx.try_send(job) {
+                    Ok(()) => {
+                        PERSIST_QUEUE_LEN.fetch_add(1, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                    Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => {
+                        return write_block_json_sync(job.height, &job.block);
+                    }
                 }
-                return Ok(());
             }
         }
     }
