@@ -3164,23 +3164,54 @@ async fn submit_tx(
         Ok(b) => b,
         Err(_) => return Err(StatusCode::BAD_REQUEST),
     };
-    let tx = decode_full_tx(&bytes)
-        .or_else(|_| decode_compact_tx(&bytes))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    if tx.inputs.is_empty() || tx.outputs.is_empty() {
+    // A compact wallet tx payload may be ambiguously parseable by the full decoder.
+    // Try both decoders and select the candidate that passes fee/signature checks.
+    let mut candidates: Vec<(&'static str, Transaction)> = Vec::new();
+    if let Ok(tx) = decode_compact_tx(&bytes) {
+        candidates.push(("compact", tx));
+    }
+    if let Ok(tx) = decode_full_tx(&bytes) {
+        candidates.push(("full", tx));
+    }
+    if candidates.is_empty() {
+        eprintln!("submit_tx decode failed: no valid decoder for payload");
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let txid = tx.txid();
-
-    // Delegate validation to ChainState and compute fees.
-    let fee = {
+    let (tx, fee) = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        match chain.calculate_fees(&tx) {
-            Ok(f) => f,
-            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        let mut last_err: Option<String> = None;
+        let mut selected: Option<(Transaction, u64)> = None;
+
+        for (kind, cand) in candidates.into_iter() {
+            if cand.inputs.is_empty() || cand.outputs.is_empty() {
+                last_err = Some(format!("{} decode yielded empty tx", kind));
+                continue;
+            }
+            match chain.calculate_fees(&cand) {
+                Ok(f) => {
+                    selected = Some((cand, f));
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(format!("{} decode: {}", kind, e));
+                }
+            }
+        }
+
+        match selected {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "submit_tx fee validation failed: {}",
+                    last_err.unwrap_or_else(|| "no valid decoded transaction".to_string())
+                );
+                return Err(StatusCode::BAD_REQUEST);
+            }
         }
     };
+
+    let txid = tx.txid();
 
     let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
     let hex_txid = hex::encode(txid);
