@@ -235,6 +235,26 @@ Public SOLO Stratum pool:
 - Password: `x`
 - Mode: SOLO (full block reward pays to the IRM address in the username)
 
+OS setup and install/download paths:
+- ASIC miners (recommended): use Antminer/Whatsminer web UI and set:
+  - Algorithm: `SHA-256d`
+  - URL: `stratum+tcp://pool.iriumlabs.org:3333`
+  - Worker: `YOUR_IRIUM_WALLET_ADDRESS.worker1`
+  - Password: `x`
+- Windows software miner (CPU/GPU): download a SHA-256d miner build from:
+  - `https://github.com/JayDDee/cpuminer-opt/releases`
+  - Example command:
+    - `minerd.exe -a sha256d -o stratum+tcp://pool.iriumlabs.org:3333 -u YOUR_IRIUM_WALLET_ADDRESS.worker1 -p x`
+- Linux software miner (CPU/GPU): install/build from:
+  - `https://github.com/JayDDee/cpuminer-opt`
+  - Example command:
+    - `./minerd -a sha256d -o stratum+tcp://pool.iriumlabs.org:3333 -u YOUR_IRIUM_WALLET_ADDRESS.worker1 -p x`
+- macOS software miner: use a SHA-256d compatible binary or build from the same project above, then run the same command as Linux.
+
+Important:
+- For pool mining, use Stratum (`pool.iriumlabs.org:3333`).
+- Do not point pool miners at local node RPC (`127.0.0.1:38300`) unless you are intentionally doing local template mining.
+
 See `docs/POOL_STRATUM.md` for full miner quickstart, troubleshooting, and operator runbook.
 ## Wallet
 The wallet CLI stores keys in `~/.irium/wallet.json` (override with `IRIUM_WALLET_FILE`).
