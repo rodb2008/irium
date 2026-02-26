@@ -260,11 +260,11 @@ Recovery options (all supported):
 ```bash
 # 1) Seed-based recovery
 ./target/release/irium-wallet init
-./target/release/irium-wallet export-seed
+./target/release/irium-wallet export-seed --out <file>
 ./target/release/irium-wallet import-seed <64hex> [--force]
 
 # 2) WIF-based recovery
-./target/release/irium-wallet export-wif <base58_address>
+./target/release/irium-wallet export-wif <base58_address> --out <file>
 ./target/release/irium-wallet import-wif <wif>
 
 # 3) Full wallet backup / restore
