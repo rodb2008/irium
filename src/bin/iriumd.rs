@@ -3164,7 +3164,9 @@ async fn submit_tx(
         Ok(b) => b,
         Err(_) => return Err(StatusCode::BAD_REQUEST),
     };
-    let tx = decode_compact_tx(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let tx = decode_full_tx(&bytes)
+        .or_else(|_| decode_compact_tx(&bytes))
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     if tx.inputs.is_empty() || tx.outputs.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
