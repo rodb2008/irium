@@ -3654,6 +3654,7 @@ async fn main() {
             let mut stalled_ticks: u32 = 0;
             let mut last_tip_hash: String = genesis_hex.clone();
             let mut last_tip_bytes: [u8; 32] = [0u8; 32];
+            let mut last_best_header_height: u64 = 0;
             let mut last_sync_burst_at: Option<std::time::Instant> = None;
             let mut last_mempool_size: usize = 0;
             loop {
@@ -3726,21 +3727,32 @@ async fn main() {
                     seed_list.push("-".to_string());
                 }
 
-                let (local_height, tip_hash, tip_bytes) = match chain_clone.try_lock() {
+                let (local_height, tip_hash, tip_bytes, best_header_height) = match chain_clone.try_lock() {
                     Ok(g) => {
+                        let local_height = g.tip_height();
                         let tip_bytes =
                             g.chain.last().map(|b| b.header.hash()).unwrap_or([0u8; 32]);
                         let tip = hex::encode(tip_bytes);
-                        (g.tip_height(), tip, tip_bytes)
+                        let best_hash = g.best_header_hash();
+                        let best_header_height = g
+                            .headers
+                            .get(&best_hash)
+                            .map(|hw| hw.height)
+                            .or_else(|| g.heights.get(&best_hash).copied())
+                            .unwrap_or(local_height)
+                            .max(local_height);
+                        (local_height, tip, tip_bytes, best_header_height)
                     }
                     Err(_) => (
                         status_height.load(Ordering::Relaxed),
                         last_tip_hash.clone(),
                         last_tip_bytes,
+                        last_best_header_height.max(status_height.load(Ordering::Relaxed)),
                     ),
                 };
                 last_tip_hash = tip_hash.clone();
                 last_tip_bytes = tip_bytes;
+                last_best_header_height = best_header_height;
 
                 let mempool_size = match mempool_clone.try_lock() {
                     Ok(g) => g.len(),
@@ -3763,6 +3775,7 @@ async fn main() {
 
                 let next_height = local_height.saturating_add(1);
                 let peer_height = best_peer_height.unwrap_or(0);
+                let sync_target_height = best_header_height.max(local_height);
                 // Report validated local chain height in heartbeat to avoid misleading
                 // peer-advertised heights during fork/header-spam conditions.
                 let chain_height = local_height;
@@ -3771,7 +3784,9 @@ async fn main() {
 
                 let dbg = node_clone.sync_debug_snapshot().await;
 
-                let behind = peer_height >= local_height.saturating_add(3);
+                // Use validated best-header progress for sync decisions (peer-advertised
+                // heights are untrusted and can cause false stall churn).
+                let behind = sync_target_height >= local_height.saturating_add(3);
                 let header_only_stall = dbg.sync_requests > 0 && dbg.getblocks_inflight == 0;
                 let need_sync_burst = behind && (dbg.getblocks_inflight == 0 || header_only_stall);
                 if need_sync_burst {
@@ -3790,11 +3805,12 @@ async fn main() {
 
                 // Periodic sync status line to diagnose stalls quickly.
                 if hb_ticks % 6 == 0 {
-                    let ahead = peer_height.saturating_sub(local_height);
+                    let ahead = sync_target_height.saturating_sub(local_height);
                     eprintln!(
-                        "[{}] [🔁 sync] status local={} best_peer={} ahead={} peers={} inflight(getheaders)={} inflight(getblocks)={} handshake_failures={}",
+                        "[{}] [🔁 sync] status local={} best_header={} best_peer={} ahead={} peers={} inflight(getheaders)={} inflight(getblocks)={} handshake_failures={}",
                         Utc::now().format("%H:%M:%S"),
                         local_height,
+                        sync_target_height,
                         peer_height,
                         ahead,
                         current_peer_count,
@@ -3816,9 +3832,10 @@ async fn main() {
 
                     if stalled_ticks >= 12 {
                         eprintln!(
-                            "[{}] [🔁 sync] WARN stalled (local={}, best_peer={}, headers_inflight={}, getblocks_inflight={}); clearing sync throttles and reconnecting",
+                            "[{}] [🔁 sync] WARN stalled (local={}, best_header={}, best_peer={}, headers_inflight={}, getblocks_inflight={}); clearing sync throttles and reconnecting",
                             Utc::now().format("%H:%M:%S"),
                             local_height,
+                            sync_target_height,
                             peer_height,
                             dbg.sync_requests,
                             dbg.getblocks_inflight
