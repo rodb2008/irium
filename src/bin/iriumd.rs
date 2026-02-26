@@ -1034,6 +1034,35 @@ fn collect_block_files_from_dir(dir: &std::path::Path, out: &mut Vec<std::path::
     }
 }
 
+
+fn discover_persist_mismatch_heights(
+    expected: &[(u64, [u8; 32])],
+    blocks_dir: &std::path::Path,
+    genesis_hash_lc: &str,
+    current_contiguous: u64,
+) -> (Vec<u64>, u64) {
+    let mut out = Vec::new();
+    let mut contiguous = current_contiguous;
+
+    for (height, expected_hash) in expected.iter().copied() {
+        let path = blocks_dir.join(format!("block_{}.json", height));
+        let valid_and_matching = match parse_persisted_block_file(&path, genesis_hash_lc) {
+            Ok((parsed_h, block)) => parsed_h == height && block.header.hash() == expected_hash,
+            Err(_) => false,
+        };
+
+        if valid_and_matching {
+            if height == contiguous.saturating_add(1) {
+                contiguous = height;
+            }
+        } else {
+            out.push(height);
+        }
+    }
+
+    (out, contiguous)
+}
+
 #[derive(Default)]
 struct PersistWindowStats {
     max_height_on_disk: u64,
@@ -1298,7 +1327,9 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
 
     let stats = compute_persist_window_stats(&all_heights, &valid_heights);
     storage::set_persisted_max_height_on_disk(stats.max_height_on_disk);
-    storage::set_persisted_contiguous_height(stats.contiguous_from_zero);
+    // contiguous_from_zero from file parsing is informational only; authoritative
+    // contiguous height is the replay-connected tip set later in startup.
+    storage::force_set_persisted_contiguous_height(0);
     storage::set_persisted_window_tip(stats.window_tip);
     storage::set_missing_persisted_in_window(stats.missing_in_window);
 
@@ -1311,9 +1342,25 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
         }
     }
 
+    // Also track missing persisted files before the continuity window.
+    // If this backlog is never healed, restarts can resume from a much lower
+    // contiguous height even when near-tip files exist.
+    let mut historical_missing_heights = Vec::new();
+    if stats.contiguous_from_zero.saturating_add(1) < window_start {
+        for h in (stats.contiguous_from_zero.saturating_add(1))..window_start {
+            if !valid_heights.contains(&h) {
+                historical_missing_heights.push(h);
+            }
+        }
+    }
+
     println!(
-        "[i] persist continuity window: tip={} window_start={} missing_in_window={}",
-        stats.window_tip, window_start, stats.missing_in_window
+        "[i] persist continuity window: tip={} window_start={} missing_in_window={} contiguous_from_zero={} historical_missing_before_window={}",
+        stats.window_tip,
+        window_start,
+        stats.missing_in_window,
+        stats.contiguous_from_zero,
+        historical_missing_heights.len()
     );
     if stats.missing_in_window > 0 {
         eprintln!(
@@ -1356,10 +1403,10 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
     storage::set_expected_hash_coverage_in_window(expected_hash_coverage_in_window);
     storage::set_expected_hash_window_span(expected_hash_window_span);
 
-    let mut target_heights = Vec::new();
+    let mut target_heights = historical_missing_heights.clone();
 
     if expected_hashes_by_height.is_empty() {
-        target_heights = missing_heights.clone();
+        target_heights.extend(missing_heights.iter().copied());
     } else {
         for h in window_start..=stats.window_tip {
             let Some(expected_hash) = expected_hashes_by_height.get(&h) else {
@@ -1374,6 +1421,9 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
             }
         }
     }
+
+    target_heights.sort_unstable();
+    target_heights.dedup();
 
     storage::set_gap_healer_target_heights(&target_heights);
     storage::set_missing_or_mismatch_in_window(target_heights.len() as u64);
@@ -1433,6 +1483,7 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
     let tip_height = state.tip_height();
     let tip_hash = hex::encode(state.tip_hash());
     storage::set_persisted_height(tip_height);
+    storage::force_set_persisted_contiguous_height(tip_height);
     let queue_len = storage::persist_queue_len();
 
     println!(
@@ -3164,23 +3215,54 @@ async fn submit_tx(
         Ok(b) => b,
         Err(_) => return Err(StatusCode::BAD_REQUEST),
     };
-    let tx = decode_full_tx(&bytes)
-        .or_else(|_| decode_compact_tx(&bytes))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    if tx.inputs.is_empty() || tx.outputs.is_empty() {
+    // A compact wallet tx payload may be ambiguously parseable by the full decoder.
+    // Try both decoders and select the candidate that passes fee/signature checks.
+    let mut candidates: Vec<(&'static str, Transaction)> = Vec::new();
+    if let Ok(tx) = decode_compact_tx(&bytes) {
+        candidates.push(("compact", tx));
+    }
+    if let Ok(tx) = decode_full_tx(&bytes) {
+        candidates.push(("full", tx));
+    }
+    if candidates.is_empty() {
+        eprintln!("submit_tx decode failed: no valid decoder for payload");
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let txid = tx.txid();
-
-    // Delegate validation to ChainState and compute fees.
-    let fee = {
+    let (tx, fee) = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        match chain.calculate_fees(&tx) {
-            Ok(f) => f,
-            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        let mut last_err: Option<String> = None;
+        let mut selected: Option<(Transaction, u64)> = None;
+
+        for (kind, cand) in candidates.into_iter() {
+            if cand.inputs.is_empty() || cand.outputs.is_empty() {
+                last_err = Some(format!("{} decode yielded empty tx", kind));
+                continue;
+            }
+            match chain.calculate_fees(&cand) {
+                Ok(f) => {
+                    selected = Some((cand, f));
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(format!("{} decode: {}", kind, e));
+                }
+            }
+        }
+
+        match selected {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "submit_tx fee validation failed: {}",
+                    last_err.unwrap_or_else(|| "no valid decoded transaction".to_string())
+                );
+                return Err(StatusCode::BAD_REQUEST);
+            }
         }
     };
+
+    let txid = tx.txid();
 
     let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
     let hex_txid = hex::encode(txid);
@@ -3572,6 +3654,7 @@ async fn main() {
             let mut stalled_ticks: u32 = 0;
             let mut last_tip_hash: String = genesis_hex.clone();
             let mut last_tip_bytes: [u8; 32] = [0u8; 32];
+            let mut last_best_header_height: u64 = 0;
             let mut last_sync_burst_at: Option<std::time::Instant> = None;
             let mut last_mempool_size: usize = 0;
             loop {
@@ -3644,21 +3727,32 @@ async fn main() {
                     seed_list.push("-".to_string());
                 }
 
-                let (local_height, tip_hash, tip_bytes) = match chain_clone.try_lock() {
+                let (local_height, tip_hash, tip_bytes, best_header_height) = match chain_clone.try_lock() {
                     Ok(g) => {
+                        let local_height = g.tip_height();
                         let tip_bytes =
                             g.chain.last().map(|b| b.header.hash()).unwrap_or([0u8; 32]);
                         let tip = hex::encode(tip_bytes);
-                        (g.tip_height(), tip, tip_bytes)
+                        let best_hash = g.best_header_hash();
+                        let best_header_height = g
+                            .headers
+                            .get(&best_hash)
+                            .map(|hw| hw.height)
+                            .or_else(|| g.heights.get(&best_hash).copied())
+                            .unwrap_or(local_height)
+                            .max(local_height);
+                        (local_height, tip, tip_bytes, best_header_height)
                     }
                     Err(_) => (
                         status_height.load(Ordering::Relaxed),
                         last_tip_hash.clone(),
                         last_tip_bytes,
+                        last_best_header_height.max(status_height.load(Ordering::Relaxed)),
                     ),
                 };
                 last_tip_hash = tip_hash.clone();
                 last_tip_bytes = tip_bytes;
+                last_best_header_height = best_header_height;
 
                 let mempool_size = match mempool_clone.try_lock() {
                     Ok(g) => g.len(),
@@ -3681,6 +3775,7 @@ async fn main() {
 
                 let next_height = local_height.saturating_add(1);
                 let peer_height = best_peer_height.unwrap_or(0);
+                let sync_target_height = best_header_height.max(local_height);
                 // Report validated local chain height in heartbeat to avoid misleading
                 // peer-advertised heights during fork/header-spam conditions.
                 let chain_height = local_height;
@@ -3689,7 +3784,9 @@ async fn main() {
 
                 let dbg = node_clone.sync_debug_snapshot().await;
 
-                let behind = peer_height >= local_height.saturating_add(3);
+                // Use validated best-header progress for sync decisions (peer-advertised
+                // heights are untrusted and can cause false stall churn).
+                let behind = sync_target_height >= local_height.saturating_add(3);
                 let header_only_stall = dbg.sync_requests > 0 && dbg.getblocks_inflight == 0;
                 let need_sync_burst = behind && (dbg.getblocks_inflight == 0 || header_only_stall);
                 if need_sync_burst {
@@ -3708,11 +3805,12 @@ async fn main() {
 
                 // Periodic sync status line to diagnose stalls quickly.
                 if hb_ticks % 6 == 0 {
-                    let ahead = peer_height.saturating_sub(local_height);
+                    let ahead = sync_target_height.saturating_sub(local_height);
                     eprintln!(
-                        "[{}] [🔁 sync] status local={} best_peer={} ahead={} peers={} inflight(getheaders)={} inflight(getblocks)={} handshake_failures={}",
+                        "[{}] [🔁 sync] status local={} best_header={} best_peer={} ahead={} peers={} inflight(getheaders)={} inflight(getblocks)={} handshake_failures={}",
                         Utc::now().format("%H:%M:%S"),
                         local_height,
+                        sync_target_height,
                         peer_height,
                         ahead,
                         current_peer_count,
@@ -3734,9 +3832,10 @@ async fn main() {
 
                     if stalled_ticks >= 12 {
                         eprintln!(
-                            "[{}] [🔁 sync] WARN stalled (local={}, best_peer={}, headers_inflight={}, getblocks_inflight={}); clearing sync throttles and reconnecting",
+                            "[{}] [🔁 sync] WARN stalled (local={}, best_header={}, best_peer={}, headers_inflight={}, getblocks_inflight={}); clearing sync throttles and reconnecting",
                             Utc::now().format("%H:%M:%S"),
                             local_height,
+                            sync_target_height,
                             peer_height,
                             dbg.sync_requests,
                             dbg.getblocks_inflight
@@ -3807,29 +3906,89 @@ async fn main() {
     {
         let chain_for_gap_healer = shared_state.clone();
         let p2p_for_gap_healer = p2p.clone();
+        let genesis_hash_for_gap_healer = genesis_hash_lc.clone();
         tokio::spawn(async move {
             let interval_secs = std::env::var("IRIUM_GAP_HEALER_SECS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(60)
-                .clamp(15, 600);
+                .unwrap_or(30)
+                .clamp(10, 600);
             let batch_size = std::env::var("IRIUM_GAP_HEALER_BATCH")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(25)
-                .clamp(1, 200);
+                .unwrap_or(100)
+                .clamp(1, 500);
 
             loop {
                 tokio::time::sleep(Duration::from_secs(interval_secs)).await;
 
-                let pending = storage::gap_healer_pending_count();
+                let mut pending = storage::gap_healer_pending_count();
+                if pending == 0 {
+                    // Opportunistically scan the next segment above contiguous persisted
+                    // height and queue missing/mismatched files for repair.
+                    let expected_segment = {
+                        let guard = chain_for_gap_healer
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let tip = guard.tip_height();
+                        let start = storage::persisted_contiguous_height().saturating_add(1);
+                        if start > tip {
+                            Vec::new()
+                        } else {
+                            let end = (start.saturating_add(799)).min(tip);
+                            let mut v = Vec::with_capacity((end.saturating_sub(start) + 1) as usize);
+                            for h in start..=end {
+                                if let Some(block) = guard.chain.get(h as usize) {
+                                    v.push((h, block.header.hash()));
+                                }
+                            }
+                            v
+                        }
+                    };
+
+                    if !expected_segment.is_empty() {
+                        let blocks_dir = storage::blocks_dir();
+                        let current_contiguous = storage::persisted_contiguous_height();
+                        let (discovered, contiguous_end) = discover_persist_mismatch_heights(
+                            &expected_segment,
+                            &blocks_dir,
+                            &genesis_hash_for_gap_healer,
+                            current_contiguous,
+                        );
+
+                        if contiguous_end > current_contiguous {
+                            storage::force_set_persisted_contiguous_height(contiguous_end);
+                        }
+
+                        if !discovered.is_empty() {
+                            storage::set_gap_healer_target_heights(&discovered);
+                            pending = storage::gap_healer_pending_count();
+                            eprintln!(
+                                "[i] gap healer discovered backlog: queued={} contiguous={} tip={}",
+                                pending,
+                                storage::persisted_contiguous_height(),
+                                expected_segment.last().map(|(h, _)| *h).unwrap_or(0)
+                            );
+                        }
+                    }
+                }
+
                 if pending == 0 {
                     storage::set_gap_healer_active(false);
                     continue;
                 }
                 storage::set_gap_healer_active(true);
 
-                let batch = storage::gap_healer_batch(batch_size);
+                let adaptive_batch = if pending > 5_000 {
+                    batch_size.max(300)
+                } else if pending > 2_000 {
+                    batch_size.max(200)
+                } else if pending > 500 {
+                    batch_size.max(120)
+                } else {
+                    batch_size
+                };
+                let batch = storage::gap_healer_batch(adaptive_batch);
                 if batch.is_empty() {
                     continue;
                 }

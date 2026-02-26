@@ -1049,12 +1049,23 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let pub_bytes = match hex::decode(&key.pubkey) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("Invalid public key hex: {}", e);
-                    std::process::exit(1);
-                }
+            // Derive pubkey from private key at send-time so stale wallet metadata
+            // cannot produce invalid signatures.
+            let from_pkh_arr = {
+                let mut arr = [0u8; 20];
+                arr.copy_from_slice(&from_pkh);
+                arr
+            };
+            let vk = signing_key.verifying_key();
+            let pk_comp = vk.to_encoded_point(true);
+            let pk_uncomp = vk.to_encoded_point(false);
+            let pub_bytes = if hash160(pk_comp.as_bytes()) == from_pkh_arr {
+                pk_comp.as_bytes().to_vec()
+            } else if hash160(pk_uncomp.as_bytes()) == from_pkh_arr {
+                pk_uncomp.as_bytes().to_vec()
+            } else {
+                eprintln!("Wallet key mismatch: source address does not match derived private key");
+                std::process::exit(1);
             };
 
             let mut inputs: Vec<TxInput> = Vec::new();

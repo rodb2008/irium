@@ -997,7 +997,7 @@ fn verify_transaction_signature(
     txin: &TxInput,
     utxo: &TxOutput,
 ) -> bool {
-    use k256::ecdsa::signature::Verifier;
+    use k256::ecdsa::signature::hazmat::PrehashVerifier;
     use k256::ecdsa::{Signature, VerifyingKey};
 
     let script = &txin.script_sig;
@@ -1040,11 +1040,9 @@ fn verify_transaction_signature(
         Ok(s) => s,
         Err(_) => return false,
     };
-    if let Some(norm) = signature.normalize_s() {
-        if norm != signature {
-            return false;
-        }
-    } else {
+    // normalize_s() returns Some(_) only when signature is high-S.
+    // Signed transactions already use low-S; treat high-S as non-standard.
+    if signature.normalize_s().is_some() {
         return false;
     }
     let vk = match VerifyingKey::from_sec1_bytes(pubkey) {
@@ -1052,7 +1050,7 @@ fn verify_transaction_signature(
         Err(_) => return false,
     };
 
-    vk.verify(&digest, &signature).is_ok()
+    vk.verify_prehash(&digest, &signature).is_ok()
 }
 
 pub fn block_from_locked(gen: &LockedGenesis) -> Result<Block, String> {

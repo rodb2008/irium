@@ -113,6 +113,11 @@ pub fn set_persisted_contiguous_height(height: u64) {
     }
 }
 
+
+pub fn force_set_persisted_contiguous_height(height: u64) {
+    PERSISTED_CONTIGUOUS_HEIGHT.store(height, Ordering::Relaxed);
+}
+
 pub fn persisted_max_height_on_disk() -> u64 {
     PERSISTED_MAX_HEIGHT_ON_DISK.load(Ordering::Relaxed)
 }
@@ -530,20 +535,12 @@ fn maybe_quarantine_existing_block(path: &Path, new_hash: &str) -> std::io::Resu
     Ok(())
 }
 
-fn maybe_advance_contiguous(dir: &Path, written_height: u64) {
+fn maybe_advance_contiguous(_dir: &Path, written_height: u64) {
     let contiguous = persisted_contiguous_height();
-    if written_height != contiguous.saturating_add(1) {
-        return;
-    }
-    let mut probe = contiguous.saturating_add(1);
-    loop {
-        let path = dir.join(format!("block_{}.json", probe));
-        if path.exists() {
-            set_persisted_contiguous_height(probe);
-            probe = probe.saturating_add(1);
-            continue;
-        }
-        break;
+    if written_height == contiguous.saturating_add(1) {
+        // Advance strictly one height at a time based on freshly persisted blocks.
+        // Do not leap ahead by file existence alone; old fork files can create false continuity.
+        set_persisted_contiguous_height(written_height);
     }
 }
 
