@@ -495,7 +495,8 @@ fn block_json_path_for_height(height: u64) -> std::io::Result<PathBuf> {
             "height out of range",
         ));
     }
-    let dir = blocks_dir();
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let dir = PathBuf::from(home).join(".irium/blocks");
     fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("block_{}.json", height)))
 }
