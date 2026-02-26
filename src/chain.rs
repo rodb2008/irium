@@ -1040,11 +1040,9 @@ fn verify_transaction_signature(
         Ok(s) => s,
         Err(_) => return false,
     };
-    if let Some(norm) = signature.normalize_s() {
-        if norm != signature {
-            return false;
-        }
-    } else {
+    // normalize_s() returns Some(_) only when signature is high-S.
+    // Signed transactions already use low-S; treat high-S as non-standard.
+    if signature.normalize_s().is_some() {
         return false;
     }
     let vk = match VerifyingKey::from_sec1_bytes(pubkey) {
