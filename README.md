@@ -315,3 +315,4 @@ Verify with `ssh-keygen -Y verify -f bootstrap/trust/allowed_ban_signers -I ban-
 ## Status / TODO
 - Fork‑aware sync, header tracking, relay‑address coinbase support are in place.
 - Outstanding: anchor enforcement, richer peer scoring/libp2p parity, production monitoring hardening.
+
