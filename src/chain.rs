@@ -997,7 +997,7 @@ fn verify_transaction_signature(
     txin: &TxInput,
     utxo: &TxOutput,
 ) -> bool {
-    use k256::ecdsa::signature::Verifier;
+    use k256::ecdsa::signature::hazmat::PrehashVerifier;
     use k256::ecdsa::{Signature, VerifyingKey};
 
     let script = &txin.script_sig;
@@ -1052,7 +1052,7 @@ fn verify_transaction_signature(
         Err(_) => return false,
     };
 
-    vk.verify(&digest, &signature).is_ok()
+    vk.verify_prehash(&digest, &signature).is_ok()
 }
 
 pub fn block_from_locked(gen: &LockedGenesis) -> Result<Block, String> {
