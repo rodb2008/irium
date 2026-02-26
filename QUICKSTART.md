@@ -73,13 +73,36 @@ If you prefer pool mode, use the public Irium Stratum endpoint:
 - Password: `x`
 - Mode: SOLO (if your worker finds a valid block, reward pays to the IRM address in the username)
 
-Quick example:
+How to start on each OS:
+- ASIC miners (recommended): in miner web UI (Antminer/Whatsminer), set:
+  - Algorithm: `SHA-256d`
+  - URL: `stratum+tcp://pool.iriumlabs.org:3333`
+  - Worker: `YOUR_IRIUM_WALLET_ADDRESS.worker1`
+  - Password: `x`
+- Windows software miner: download SHA-256d miner binaries from:
+  - `https://github.com/JayDDee/cpuminer-opt/releases`
+  - Run:
+```bash
+minerd.exe -a sha256d -o stratum+tcp://pool.iriumlabs.org:3333 -u YOUR_IRIUM_WALLET_ADDRESS.worker1 -p x
+```
+- Linux/macOS software miner: build/install from:
+  - `https://github.com/JayDDee/cpuminer-opt`
+  - Run:
+```bash
+./minerd -a sha256d -o stratum+tcp://pool.iriumlabs.org:3333 -u YOUR_IRIUM_WALLET_ADDRESS.worker1 -p x
+```
+
+Using `irium-miner` in Stratum mode:
 ```bash
 export IRIUM_STRATUM_URL=stratum+tcp://pool.iriumlabs.org:3333
 export IRIUM_STRATUM_USER=IRM_ADDRESS.worker1
 export IRIUM_STRATUM_PASS=x
 ./target/release/irium-miner --threads 2
 ```
+
+Important:
+- For pool mining, use Stratum endpoint `pool.iriumlabs.org:3333`.
+- Do not use `127.0.0.1:38300` for pool mode (that is local node RPC/template path).
 
 For troubleshooting and operator notes, see `docs/POOL_STRATUM.md`.
 
