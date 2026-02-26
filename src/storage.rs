@@ -488,13 +488,26 @@ fn sanitize_filename_fragment(input: &str) -> String {
     }
 }
 
-fn maybe_quarantine_existing_block(path: &Path, new_hash: &str) -> std::io::Result<()> {
+fn block_json_path_for_height(height: u64) -> std::io::Result<PathBuf> {
+    if height > 100_000_000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "height out of range",
+        ));
+    }
+    let dir = blocks_dir();
+    fs::create_dir_all(&dir)?;
+    Ok(dir.join(format!("block_{}.json", height)))
+}
+
+fn maybe_quarantine_existing_block(height: u64, new_hash: &str) -> std::io::Result<()> {
+    let path = block_json_path_for_height(height)?;
 
     if !path.exists() {
         return Ok(());
     }
 
-    let existing = match fs::read_to_string(path) {
+    let existing = match fs::read_to_string(&path) {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
@@ -545,15 +558,17 @@ fn maybe_advance_contiguous(_dir: &Path, written_height: u64) {
 }
 
 fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
-    let dir = blocks_dir();
-    fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("block_{}.json", height));
+    let path = block_json_path_for_height(height)?;
+    let dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(blocks_dir);
 
     let header = &block.header;
     let hash = header.hash();
 
     let new_hash = hex::encode(hash);
-    let _ = maybe_quarantine_existing_block(&path, &new_hash);
+    let _ = maybe_quarantine_existing_block(height, &new_hash);
 
     let jb = JsonBlock {
         height,

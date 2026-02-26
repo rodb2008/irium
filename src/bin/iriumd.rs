@@ -3128,7 +3128,7 @@ async fn submit_block(
     }
 
     // Decode full transactions from hex payload.
-    let mut txs: Vec<Transaction> = Vec::with_capacity(req.tx_hex.len().min(MAX_SUBMIT_BLOCK_TXS));
+    let mut txs: Vec<Transaction> = Vec::new();
     for tx_hex in &req.tx_hex {
         let raw = hex::decode(tx_hex).map_err(|_| StatusCode::BAD_REQUEST)?;
         let tx = decode_full_tx(&raw).map_err(|_| StatusCode::BAD_REQUEST)?;
