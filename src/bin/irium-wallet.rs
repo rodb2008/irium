@@ -6,7 +6,7 @@ use k256::ecdsa::signature::hazmat::PrehashSigner;
 use k256::ecdsa::{Signature, SigningKey};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use reqwest::blocking::Client;
 use ripemd::Ripemd160;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,10 @@ const DEFAULT_FEE_PER_BYTE: u64 = 1;
 #[derive(Serialize, Deserialize)]
 struct WalletFile {
     version: u32,
+    #[serde(default)]
+    seed_hex: Option<String>,
+    #[serde(default)]
+    next_index: u32,
     keys: Vec<WalletKey>,
 }
 
@@ -90,6 +94,8 @@ fn maybe_migrate_legacy_wallet(path: &Path, data: &str) -> Result<Option<WalletF
     if legacy.keys.is_empty() {
         return Ok(Some(WalletFile {
             version: 1,
+            seed_hex: None,
+            next_index: 0,
             keys: Vec::new(),
         }));
     }
@@ -122,7 +128,12 @@ fn maybe_migrate_legacy_wallet(path: &Path, data: &str) -> Result<Option<WalletF
         });
     }
 
-    let wallet = WalletFile { version: 1, keys };
+    let wallet = WalletFile {
+        version: 1,
+        seed_hex: None,
+        next_index: keys.len() as u32,
+        keys,
+    };
 
     // Backup the legacy file before rewriting it.
     let ts = SystemTime::now()
@@ -278,20 +289,25 @@ fn save_wallet(path: &Path, wallet: &WalletFile) -> Result<(), String> {
 }
 
 fn ensure_wallet(path: &Path) -> Result<WalletFile, String> {
-    if path.exists() {
-        load_wallet(path)
+    let mut wallet = if path.exists() {
+        load_wallet(path)?
     } else {
-        Ok(WalletFile {
+        WalletFile {
             version: 1,
+            seed_hex: None,
+            next_index: 0,
             keys: Vec::new(),
-        })
+        }
+    };
+    if wallet.seed_hex.is_some() && wallet.next_index < wallet.keys.len() as u32 {
+        wallet.next_index = wallet.keys.len() as u32;
     }
+    Ok(wallet)
 }
 
-fn generate_key() -> WalletKey {
-    let secret = SecretKey::random(&mut OsRng);
+fn wallet_key_from_secret(secret: &SecretKey, compressed: bool) -> WalletKey {
     let public = secret.public_key();
-    let pubkey = public.to_encoded_point(true);
+    let pubkey = public.to_encoded_point(compressed);
     let pkh = hash160(pubkey.as_bytes());
     let address = base58_p2pkh_from_hash(&pkh);
     WalletKey {
@@ -302,15 +318,77 @@ fn generate_key() -> WalletKey {
     }
 }
 
+fn generate_key() -> WalletKey {
+    let secret = SecretKey::random(&mut OsRng);
+    wallet_key_from_secret(&secret, true)
+}
+
+fn base58check_encode(body: &[u8]) -> String {
+    let first = Sha256::digest(body);
+    let second = Sha256::digest(&first);
+    let mut full = Vec::with_capacity(body.len() + 4);
+    full.extend_from_slice(body);
+    full.extend_from_slice(&second[0..4]);
+    bs58::encode(full).into_string()
+}
+
+fn secret_to_wif(secret: &[u8; 32], compressed: bool) -> String {
+    let mut body = Vec::with_capacity(34);
+    body.push(0x80);
+    body.extend_from_slice(secret);
+    if compressed {
+        body.push(0x01);
+    }
+    base58check_encode(&body)
+}
+
+fn parse_seed_hex(seed_hex: &str) -> Result<[u8; 32], String> {
+    let raw = hex::decode(seed_hex).map_err(|_| "seed must be 64-char hex".to_string())?;
+    if raw.len() != 32 {
+        return Err("seed must be 64-char hex".to_string());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+fn generate_seed_hex() -> String {
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    hex::encode(seed)
+}
+
+fn derive_secret_from_seed_hex(seed_hex: &str, index: u32) -> Result<SecretKey, String> {
+    let seed = parse_seed_hex(seed_hex)?;
+    let mut material = Vec::with_capacity(36);
+    material.extend_from_slice(&seed);
+    material.extend_from_slice(&index.to_le_bytes());
+    for ctr in 0u32..1024 {
+        let mut data = material.clone();
+        data.extend_from_slice(&ctr.to_le_bytes());
+        let digest = Sha256::digest(&data);
+        if let Ok(secret) = SecretKey::from_slice(&digest) {
+            return Ok(secret);
+        }
+    }
+    Err("failed to derive valid key from seed".to_string())
+}
+
 fn find_key<'a>(wallet: &'a WalletFile, addr: &str) -> Option<&'a WalletKey> {
     wallet.keys.iter().find(|k| k.address == addr)
 }
 
 fn usage() {
     eprintln!("Usage:");
-    eprintln!("  irium-wallet init");
+    eprintln!("  irium-wallet init [--seed <64hex>]");
     eprintln!("  irium-wallet new-address");
     eprintln!("  irium-wallet list-addresses");
+    eprintln!("  irium-wallet export-wif <base58_addr>");
+    eprintln!("  irium-wallet import-wif <wif>");
+    eprintln!("  irium-wallet export-seed");
+    eprintln!("  irium-wallet import-seed <64hex> [--force]");
+    eprintln!("  irium-wallet backup [--out <file>]");
+    eprintln!("  irium-wallet restore-backup <file> [--force]");
     eprintln!("  irium-wallet address-to-pkh <base58_addr>");
     eprintln!("  irium-wallet qr <base58_addr> [--svg] [--out <file>]");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
@@ -592,13 +670,38 @@ fn main() {
                 eprintln!("Wallet already exists: {}", path.display());
                 std::process::exit(1);
             }
-            let mut wallet = WalletFile {
-                version: 1,
-                keys: Vec::new(),
+            let seed_hex = if args.len() == 3 {
+                if args[1] != "--seed" {
+                    usage();
+                    std::process::exit(1);
+                }
+                if let Err(e) = parse_seed_hex(&args[2]) {
+                    eprintln!("Invalid seed: {}", e);
+                    std::process::exit(1);
+                }
+                args[2].clone()
+            } else if args.len() == 1 {
+                generate_seed_hex()
+            } else {
+                usage();
+                std::process::exit(1);
             };
-            let key = generate_key();
+            let secret = match derive_secret_from_seed_hex(&seed_hex, 0) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Failed to derive key from seed: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let key = wallet_key_from_secret(&secret, true);
+            let wallet = WalletFile {
+                version: 1,
+                seed_hex: Some(seed_hex.clone()),
+                next_index: 1,
+                keys: vec![key.clone()],
+            };
             println!("address {}", key.address);
-            wallet.keys.push(key);
+            println!("seed {}", seed_hex);
             if let Err(e) = save_wallet(&path, &wallet) {
                 eprintln!("Failed to save wallet: {}", e);
                 std::process::exit(1);
@@ -614,7 +717,20 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let key = generate_key();
+            let key = if let Some(seed_hex) = wallet.seed_hex.as_deref() {
+                let index = wallet.next_index;
+                let secret = match derive_secret_from_seed_hex(seed_hex, index) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Failed to derive key from seed: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                wallet.next_index = wallet.next_index.saturating_add(1);
+                wallet_key_from_secret(&secret, true)
+            } else {
+                generate_key()
+            };
             println!("address {}", key.address);
             wallet.keys.push(key);
             if let Err(e) = save_wallet(&path, &wallet) {
@@ -622,6 +738,229 @@ fn main() {
                 std::process::exit(1);
             }
             println!("wallet {}", path.display());
+        }
+        "export-wif" => {
+            if args.len() != 2 {
+                usage();
+                std::process::exit(1);
+            }
+            let path = wallet_path();
+            let wallet = match load_wallet(&path) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Failed to load wallet: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let key = match find_key(&wallet, &args[1]) {
+                Some(k) => k,
+                None => {
+                    eprintln!("Address not found in wallet");
+                    std::process::exit(1);
+                }
+            };
+            let priv_bytes = match hex::decode(&key.privkey) {
+                Ok(v) if v.len() == 32 => v,
+                _ => {
+                    eprintln!("Wallet key is invalid");
+                    std::process::exit(1);
+                }
+            };
+            let mut sec = [0u8; 32];
+            sec.copy_from_slice(&priv_bytes);
+            println!("{}", secret_to_wif(&sec, true));
+        }
+        "import-wif" => {
+            if args.len() != 2 {
+                usage();
+                std::process::exit(1);
+            }
+            let path = wallet_path();
+            let mut wallet = match ensure_wallet(&path) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Failed to load wallet: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let (priv_bytes, compressed) = match wif_to_secret_and_compression(&args[1]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Invalid WIF: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let secret = match SecretKey::from_slice(&priv_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Invalid WIF secret: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let key = wallet_key_from_secret(&secret, compressed);
+            if wallet.keys.iter().any(|k| k.address == key.address) {
+                println!("address {} already exists", key.address);
+                std::process::exit(0);
+            }
+            println!("address {}", key.address);
+            wallet.keys.push(key);
+            if let Err(e) = save_wallet(&path, &wallet) {
+                eprintln!("Failed to save wallet: {}", e);
+                std::process::exit(1);
+            }
+            println!("wallet {}", path.display());
+        }
+        "export-seed" => {
+            if args.len() != 1 {
+                usage();
+                std::process::exit(1);
+            }
+            let path = wallet_path();
+            let wallet = match load_wallet(&path) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Failed to load wallet: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            match wallet.seed_hex {
+                Some(seed) => println!("{}", seed),
+                None => {
+                    eprintln!("No seed stored in wallet (legacy/imported key-only wallet)");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "import-seed" => {
+            if args.len() != 2 && args.len() != 3 {
+                usage();
+                std::process::exit(1);
+            }
+            let force = args.len() == 3 && args[2] == "--force";
+            if args.len() == 3 && !force {
+                usage();
+                std::process::exit(1);
+            }
+            if let Err(e) = parse_seed_hex(&args[1]) {
+                eprintln!("Invalid seed: {}", e);
+                std::process::exit(1);
+            }
+            let path = wallet_path();
+            let mut wallet = match ensure_wallet(&path) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Failed to load wallet: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            if !wallet.keys.is_empty() && !force {
+                eprintln!(
+                    "Wallet already has keys. Re-run with --force to replace wallet keys from seed."
+                );
+                std::process::exit(1);
+            }
+            let seed_hex = args[1].clone();
+            let secret = match derive_secret_from_seed_hex(&seed_hex, 0) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Failed to derive key from seed: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let key = wallet_key_from_secret(&secret, true);
+            wallet.version = 1;
+            wallet.seed_hex = Some(seed_hex);
+            wallet.next_index = 1;
+            wallet.keys = vec![key.clone()];
+            if let Err(e) = save_wallet(&path, &wallet) {
+                eprintln!("Failed to save wallet: {}", e);
+                std::process::exit(1);
+            }
+            println!("address {}", key.address);
+            println!("wallet {}", path.display());
+        }
+        "backup" => {
+            if args.len() != 1 && args.len() != 3 {
+                usage();
+                std::process::exit(1);
+            }
+            let path = wallet_path();
+            if !path.exists() {
+                eprintln!("Wallet does not exist: {}", path.display());
+                std::process::exit(1);
+            }
+            let out = if args.len() == 3 {
+                if args[1] != "--out" {
+                    usage();
+                    std::process::exit(1);
+                }
+                PathBuf::from(&args[2])
+            } else {
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
+                PathBuf::from(home)
+                    .join(".irium/wallet-backups")
+                    .join(format!("wallet.json.bak.{ts}"))
+            };
+            if let Some(parent) = out.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!("Failed to create backup dir: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            if let Err(e) = fs::copy(&path, &out) {
+                eprintln!("Failed to backup wallet: {}", e);
+                std::process::exit(1);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&out, fs::Permissions::from_mode(0o600));
+            }
+            println!("backup {}", out.display());
+        }
+        "restore-backup" => {
+            if args.len() != 2 && args.len() != 3 {
+                usage();
+                std::process::exit(1);
+            }
+            let force = args.len() == 3 && args[2] == "--force";
+            if args.len() == 3 && !force {
+                usage();
+                std::process::exit(1);
+            }
+            let src = PathBuf::from(&args[1]);
+            if !src.exists() {
+                eprintln!("Backup file not found: {}", src.display());
+                std::process::exit(1);
+            }
+            let dst = wallet_path();
+            if dst.exists() && !force {
+                eprintln!(
+                    "Wallet already exists at {}. Re-run with --force to overwrite.",
+                    dst.display()
+                );
+                std::process::exit(1);
+            }
+            if let Some(parent) = dst.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!("Failed to create wallet dir: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            if let Err(e) = fs::copy(&src, &dst) {
+                eprintln!("Failed to restore wallet: {}", e);
+                std::process::exit(1);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o600));
+            }
+            println!("wallet {}", dst.display());
         }
         "list-addresses" => {
             let path = wallet_path();

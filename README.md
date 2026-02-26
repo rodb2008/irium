@@ -255,6 +255,22 @@ source ~/.cargo/env
 ./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm>
 ./target/release/irium-wallet send <from_addr> <to_addr> <amount_irm> --coin-select largest
 ```
+
+Recovery options (all supported):
+```bash
+# 1) Seed-based recovery
+./target/release/irium-wallet init
+./target/release/irium-wallet export-seed
+./target/release/irium-wallet import-seed <64hex> [--force]
+
+# 2) WIF-based recovery
+./target/release/irium-wallet export-wif <base58_address>
+./target/release/irium-wallet import-wif <wif>
+
+# 3) Full wallet backup / restore
+./target/release/irium-wallet backup [--out <file>]
+./target/release/irium-wallet restore-backup <file> [--force]
+```
 - Wallet RPC defaults to `IRIUM_NODE_RPC` (or legacy `IRIUM_RPC_URL`), otherwise https://127.0.0.1:38300. If HTTPS fails and the URL starts with `https://`, it retries once over `http://`.
 Use `irium-wallet address-to-pkh <base58_address>` to convert an address to its 20-byte pubkey hash.
 
