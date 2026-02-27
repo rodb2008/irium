@@ -692,6 +692,23 @@ async fn penalize_rejecting_header_peer(ip: IpAddr, streak: u32) {
     }
 }
 
+
+fn normalize_reason_hint(reason_hint: &str, local_h: u64, best_h: u64) -> Option<String> {
+    if reason_hint.is_empty() {
+        return None;
+    }
+    if reason_hint == "no_best_header_block_path" && best_h <= local_h {
+        return Some("no_block_download_needed_at_tip".to_string());
+    }
+    Some(reason_hint.to_string())
+}
+
+fn trusted_remote_height(peer_h: u64, best_h: u64, local_h: u64) -> u64 {
+    let floor = local_h;
+    let cap = best_h.max(local_h);
+    peer_h.max(floor).min(cap)
+}
+
 fn short_hash(hash: [u8; 32]) -> String {
     let h = hex::encode(hash);
     h.get(0..12).unwrap_or(&h).to_string()
@@ -849,8 +866,8 @@ async fn maybe_log_header_sync_state(
             .join(",")
     };
 
-    let reason = if !reason_hint.is_empty() {
-        reason_hint.to_string()
+    let reason = if let Some(r) = normalize_reason_hint(reason_hint, local_h, best_h) {
+        r
     } else if best_h <= local_h {
         "best_header_not_ahead".to_string()
     } else if !has_best_path {
@@ -1452,6 +1469,13 @@ async fn maybe_request_sync(
         .unwrap_or(false);
 
     if peer_height < local_height || (peer_height == local_height && !tip_mismatch) {
+        return;
+    }
+
+    // At validated tip with no mismatch, ignore inflated peer-advertised heights.
+    if best_header_height <= local_height && !tip_mismatch {
+        let mut state = peer_state.lock().await;
+        state.headers_inflight = false;
         return;
     }
 
@@ -3330,9 +3354,24 @@ impl P2PNode {
                     let guard = ping_peer_state.lock().await;
                     guard.height
                 };
-                if let Some(net_height) = peer_height {
+                if let Some(net_height_raw) = peer_height {
+                    let best_header_height = if let Some(ref c) = ping_chain {
+                        let guard = c.lock().unwrap_or_else(|e| e.into_inner());
+                        let best_hash = guard.best_header_hash();
+                        guard
+                            .headers
+                            .get(&best_hash)
+                            .map(|hw| hw.height)
+                            .or_else(|| guard.heights.get(&best_hash).copied())
+                            .unwrap_or(current_height)
+                    } else {
+                        current_height
+                    };
+                    let net_height = trusted_remote_height(net_height_raw, best_header_height, current_height);
                     let ahead_delta = sync_stall_ahead_delta();
-                    if net_height >= current_height.saturating_add(ahead_delta) {
+                    if best_header_height >= current_height.saturating_add(ahead_delta)
+                        && net_height >= current_height.saturating_add(ahead_delta)
+                    {
                         if current_height == last_progress_height {
                             stalled_heartbeats = stalled_heartbeats.saturating_add(1);
                         } else {
@@ -4126,7 +4165,19 @@ impl P2PNode {
                                     let should_log = {
                                         let mut st = peer_state.lock().await;
                                         let now = Instant::now();
-                                        let noisy = !added_any && header_count >= 2000;
+                                        let at_tip = {
+                                            let g = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                            let local_h = g.tip_height();
+                                            let best_hash = g.best_header_hash();
+                                            let best_h = g
+                                                .headers
+                                                .get(&best_hash)
+                                                .map(|hw| hw.height)
+                                                .or_else(|| g.heights.get(&best_hash).copied())
+                                                .unwrap_or(local_h);
+                                            best_h <= local_h
+                                        };
+                                        let noisy = header_count >= 2000 && (!added_any || at_tip);
                                         let allow = if noisy {
                                             st.last_headers_batch_log
                                                 .map(|t| now.duration_since(t) > Duration::from_secs(headers_batch_log_cooldown_secs()))
@@ -4221,19 +4272,29 @@ impl P2PNode {
                                     }
                                     continue;
                                 }
-                                let local_height = {
+                                let (local_height, best_header_height) = {
                                     let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                    guard.tip_height()
+                                    let local_h = guard.tip_height();
+                                    let best_hash = guard.best_header_hash();
+                                    let best_h = guard
+                                        .headers
+                                        .get(&best_hash)
+                                        .map(|hw| hw.height)
+                                        .or_else(|| guard.heights.get(&best_hash).copied())
+                                        .unwrap_or(local_h);
+                                    (local_h, best_h)
                                 };
                                 let peer_height = {
                                     let state = peer_state.lock().await;
-                                    state
+                                    let advertised = state
                                         .height
                                         .unwrap_or(last_handshake_height.unwrap_or(local_height))
-                                        .max(last_handshake_height.unwrap_or(local_height))
-                                        .max(local_height)
-                                        .max(local_height.saturating_add(header_count as u64))
+                                        .max(last_handshake_height.unwrap_or(local_height));
+                                    trusted_remote_height(advertised, best_header_height, local_height)
                                 };
+                                if header_count >= 2000 && best_header_height <= local_height {
+                                    peer_mark_header_event(addr.ip(), false, 1).await;
+                                }
                                 {
                                     let mut state = peer_state.lock().await;
                                     state.height = Some(peer_height);
@@ -6119,7 +6180,19 @@ async fn handle_incoming_with_sybil(
                                 let should_log = {
                                     let mut st = peer_state2.lock().await;
                                     let now = Instant::now();
-                                    let noisy = !added_any && header_count >= 2000;
+                                    let at_tip = {
+                                        let g = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
+                                        let local_h = g.tip_height();
+                                        let best_hash = g.best_header_hash();
+                                        let best_h = g
+                                            .headers
+                                            .get(&best_hash)
+                                            .map(|hw| hw.height)
+                                            .or_else(|| g.heights.get(&best_hash).copied())
+                                            .unwrap_or(local_h);
+                                        best_h <= local_h
+                                    };
+                                    let noisy = header_count >= 2000 && (!added_any || at_tip);
                                     let allow = if noisy {
                                         st.last_headers_batch_log
                                             .map(|t| now.duration_since(t) > Duration::from_secs(headers_batch_log_cooldown_secs()))
@@ -6222,20 +6295,30 @@ async fn handle_incoming_with_sybil(
                                 return;
                             }
 
-                            let local_height = {
+                            let (local_height, best_header_height) = {
                                 let guard =
                                     chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
-                                guard.tip_height()
+                                let local_h = guard.tip_height();
+                                let best_hash = guard.best_header_hash();
+                                let best_h = guard
+                                    .headers
+                                    .get(&best_hash)
+                                    .map(|hw| hw.height)
+                                    .or_else(|| guard.heights.get(&best_hash).copied())
+                                    .unwrap_or(local_h);
+                                (local_h, best_h)
                             };
                             let peer_height = {
                                 let state = peer_state2.lock().await;
-                                state
+                                let advertised = state
                                     .height
                                     .unwrap_or(last_handshake_height.unwrap_or(local_height))
-                                    .max(last_handshake_height.unwrap_or(local_height))
-                                    .max(local_height)
-                                    .max(local_height.saturating_add(header_count as u64))
+                                    .max(last_handshake_height.unwrap_or(local_height));
+                                trusted_remote_height(advertised, best_header_height, local_height)
                             };
+                            if header_count >= 2000 && best_header_height <= local_height {
+                                peer_mark_header_event(addr2.ip(), false, 1).await;
+                            }
                             {
                                 let mut state = peer_state2.lock().await;
                                 state.height = Some(peer_height);
