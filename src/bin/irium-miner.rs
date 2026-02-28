@@ -913,6 +913,16 @@ fn miner_sync_guard_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn miner_guard_peer_fallback_enabled() -> bool {
+    env::var("IRIUM_MINER_GUARD_PEER_FALLBACK")
+        .ok()
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
 fn miner_max_behind() -> u64 {
     env::var("IRIUM_MINER_MAX_BEHIND")
         .ok()
@@ -965,13 +975,18 @@ fn guard_miner_sync(client: &Client, local_tip: u64) -> Result<bool, String> {
     let network_height = match fetch_best_network_height(client) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[warn] Miner sync guard status fallback to peers: {e}");
-            match fetch_best_peer_height(client) {
-                Ok(v) => v,
-                Err(e2) => {
-                    eprintln!("[warn] Miner sync guard skipped (peers): {e2}");
-                    return Ok(true);
+            if miner_guard_peer_fallback_enabled() {
+                eprintln!("[warn] Miner sync guard status fallback to peers enabled: {e}");
+                match fetch_best_peer_height(client) {
+                    Ok(v) => v,
+                    Err(e2) => {
+                        eprintln!("[warn] Miner sync guard skipped (peers): {e2}");
+                        return Ok(true);
+                    }
                 }
+            } else {
+                eprintln!("[warn] Miner sync guard skipped: status unavailable ({e}); set IRIUM_MINER_GUARD_PEER_FALLBACK=true to use peer-height fallback");
+                return Ok(true);
             }
         }
     };
