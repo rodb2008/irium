@@ -913,6 +913,16 @@ fn miner_sync_guard_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn miner_guard_peer_fallback_enabled() -> bool {
+    env::var("IRIUM_MINER_GUARD_PEER_FALLBACK")
+        .ok()
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
 fn miner_max_behind() -> u64 {
     env::var("IRIUM_MINER_MAX_BEHIND")
         .ok()
@@ -935,29 +945,63 @@ fn fetch_best_peer_height(client: &Client) -> Result<Option<u64>, String> {
     })
 }
 
+fn fetch_best_network_height(client: &Client) -> Result<Option<u64>, String> {
+    with_rpc_base(|base| {
+        let url = format!("{}/status", base.trim_end_matches('/'));
+        let mut req = client.get(url);
+        if let Some(token) = rpc_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().map_err(|e| format!("status failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(rpc_status_error("status failed", resp.status()));
+        }
+        let data: serde_json::Value = resp.json().map_err(|e| format!("status parse: {e}"))?;
+        let best_header = data
+            .get("best_header_tip")
+            .and_then(|v| v.get("height"))
+            .and_then(|v| v.as_u64());
+        let local = data.get("height").and_then(|v| v.as_u64());
+        Ok(best_header.or(local))
+    })
+}
+
 fn guard_miner_sync(client: &Client, local_tip: u64) -> Result<bool, String> {
     if !miner_sync_guard_enabled() {
         return Ok(true);
     }
     let max_behind = miner_max_behind();
-    let peer_height = match fetch_best_peer_height(client) {
+
+    let network_height = match fetch_best_network_height(client) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[warn] Miner sync guard skipped (peers): {e}");
-            return Ok(true);
+            if miner_guard_peer_fallback_enabled() {
+                eprintln!("[warn] Miner sync guard status fallback to peers enabled: {e}");
+                match fetch_best_peer_height(client) {
+                    Ok(v) => v,
+                    Err(e2) => {
+                        eprintln!("[warn] Miner sync guard skipped (peers): {e2}");
+                        return Ok(true);
+                    }
+                }
+            } else {
+                eprintln!("[warn] Miner sync guard skipped: status unavailable ({e}); set IRIUM_MINER_GUARD_PEER_FALLBACK=true to use peer-height fallback");
+                return Ok(true);
+            }
         }
     };
-    if let Some(peer_height) = peer_height {
-        if peer_height > local_tip.saturating_add(max_behind) {
+
+    if let Some(network_height) = network_height {
+        if network_height > local_tip.saturating_add(max_behind) {
             if json_log_enabled() {
                 println!(
                     "{}",
-                    json!({"event": "miner_sync_wait", "local_height": local_tip, "peer_height": peer_height, "ts": Utc::now().format("%H:%M:%S").to_string()})
+                    json!({"event": "miner_sync_wait", "local_height": local_tip, "network_height": network_height, "ts": Utc::now().format("%H:%M:%S").to_string()})
                 );
             } else {
                 println!(
-                    "[guard] Node behind network (local {} < peer {}); waiting...",
-                    local_tip, peer_height
+                    "[guard] Node behind network (local {} < network {}); waiting...",
+                    local_tip, network_height
                 );
             }
             return Ok(false);
