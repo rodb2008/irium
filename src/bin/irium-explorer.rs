@@ -709,15 +709,31 @@ async fn pool_health(
         None
     };
     let freshness_secs = tip_time.map(|t| now_unix().saturating_sub(t));
-    let healthy = backend_connected && freshness_secs.map(|s| s < 1800).unwrap_or(false);
+
+    // Dynamic freshness policy: based on observed block cadence, clamped to sane bounds.
+    let avg_block_time = value_f64(mining.get("avg_block_time")).unwrap_or(600.0);
+    let freshness_threshold_secs = ((avg_block_time * 6.0).round() as u64).clamp(1800, 21600);
+    let chain_fresh = freshness_secs
+        .map(|s| s <= freshness_threshold_secs)
+        .unwrap_or(false);
+    let freshness_state = if chain_fresh { "fresh" } else { "stale" };
+
+    // `healthy` now reflects API/backend availability. Chain freshness is reported separately.
+    let api_healthy = backend_connected;
+    let healthy = api_healthy;
 
     Ok(Json(json!({
         "healthy": healthy,
+        "api_healthy": api_healthy,
+        "chain_fresh": chain_fresh,
+        "freshness_state": freshness_state,
+        "freshness_threshold_secs": freshness_threshold_secs,
         "backend_connected": backend_connected,
         "height": chain_height,
         "peers_connected": peers,
         "difficulty": mining.get("difficulty"),
         "network_hashrate_hs": mining.get("hashrate"),
+        "avg_block_time": mining.get("avg_block_time"),
         "tip_time": tip_time,
         "freshness_secs": freshness_secs,
         "latency_ms": {
