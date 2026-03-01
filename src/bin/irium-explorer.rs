@@ -27,6 +27,7 @@ struct AppState {
     api_token: Option<String>,
     rpc_token: Option<String>,
     miners_cache: Arc<RwLock<MinersCache>>,
+    stratum_metrics_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -213,6 +214,18 @@ async fn proxy_json(state: &AppState, path: &str) -> Result<Json<Value>, StatusC
 async fn proxy_value(state: &AppState, path: &str) -> Result<Value, StatusCode> {
     let Json(payload) = proxy_json(state, path).await?;
     Ok(payload)
+}
+
+
+
+async fn fetch_stratum_metrics(state: &AppState) -> Option<Value> {
+    let base = state.stratum_metrics_url.as_ref()?;
+    let url = node_url(base, "/metrics");
+    let resp = state.client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<Value>().await.ok()
 }
 
 async fn proxy_text(state: &AppState, path: &str) -> Result<Response, StatusCode> {
@@ -488,17 +501,48 @@ async fn pool_stats(
     let miners = state.miners_cache.read().await.clone();
 
     let sample_window = q.window.unwrap_or(miners.window_blocks.max(1));
+    let stratum_metrics = fetch_stratum_metrics(&state).await;
+
+    let active_tcp_sessions = stratum_metrics
+        .as_ref()
+        .and_then(|m| m.get("active_tcp_sessions"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let accepted_shares = stratum_metrics
+        .as_ref()
+        .and_then(|m| m.get("accepted_shares"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let rejected_shares = stratum_metrics
+        .as_ref()
+        .and_then(|m| m.get("rejected_shares"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let last_share_accepted_at = stratum_metrics
+        .as_ref()
+        .and_then(|m| m.get("last_share_accepted_at"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let last_share_rejected_at = stratum_metrics
+        .as_ref()
+        .and_then(|m| m.get("last_share_rejected_at"))
+        .cloned()
+        .unwrap_or(Value::Null);
 
     let payload = json!({
         "backend_connected": true,
-        "source": "explorer-chain-derived",
+        "stratum_metrics_connected": stratum_metrics.is_some(),
+        "source": "explorer-chain-derived+stratum",
         "payout_model": "solo",
         "workers_online": miners.active_miners,
         "active_miners_window_blocks": miners.window_blocks,
         "active_miners_as_of_height": miners.as_of_height,
         "active_miners_updated_at": miners.updated_at_unix,
-        "accepted_shares": Value::Null,
-        "rejected_shares": Value::Null,
+        "active_tcp_sessions": active_tcp_sessions,
+        "accepted_shares": accepted_shares,
+        "rejected_shares": rejected_shares,
+        "last_share_accepted_at": last_share_accepted_at,
+        "last_share_rejected_at": last_share_rejected_at,
         "stale_shares": Value::Null,
         "round_luck": Value::Null,
         "round_effort": Value::Null,
@@ -798,6 +842,11 @@ async fn main() {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(60);
 
+    let stratum_metrics_url = env::var("IRIUM_STRATUM_TELEMETRY_URL")
+        .ok()
+        .map(|v| v.trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty());
+
     let state = AppState {
         client,
         node_base: node_base.trim_end_matches('/').to_string(),
@@ -808,6 +857,7 @@ async fn main() {
             window_blocks: miners_window_blocks,
             ..Default::default()
         })),
+        stratum_metrics_url,
     };
 
     // Background refresh for "active miners" estimate.
