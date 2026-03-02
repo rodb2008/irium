@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Irium Stratum health check every 30 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=irium-stratum-health.service
+
+[Install]
+WantedBy=timers.target
