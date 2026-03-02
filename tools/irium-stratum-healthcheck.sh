@@ -10,15 +10,13 @@ if [[ -z "$json" ]]; then
   exit 0
 fi
 
-status="$(python3 - <<PY "$json"
-import json,sys
+status="$(python3 -c 'import json,sys
+s=sys.stdin.read()
 try:
-    d=json.loads(sys.argv[1])
-    print(str(d.get(status,)).strip())
+    d=json.loads(s)
+    print(str(d.get("status", "")).strip())
 except Exception:
-    print()
-PY
-)"
+    print("")' <<<"$json")"
 
 if [[ "$status" != "ok" ]]; then
   echo "[healthcheck] status=$status response=$(echo "$json" | tr -d "\n" | cut -c1-220); restarting irium-stratum"
