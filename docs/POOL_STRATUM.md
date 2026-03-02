@@ -107,3 +107,13 @@ journalctl -u irium-stratum -f
 
 ## Disclaimer
 Current implementation has been validated with local Stratum handshake and submit-path testing. Broader validation with real ASIC miners is welcome.
+
+## Legacy cgminer compatibility (March 2, 2026)
+A server-side compatibility update was deployed for older ASIC clients (including older cgminer/bmminer variants).
+
+If direct IP TCP connects but your miner still reports "No servers were found", verify:
+- Algorithm is SHA-256/SHA-256d
+- SSL/TLS is disabled (`stratum+tcp://`)
+- Worker format is `IRM_ADDRESS.worker1`
+
+Use the 3-pool failover config above and share timestamped logs for handshake-level troubleshooting.
