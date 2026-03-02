@@ -69,6 +69,9 @@ If you want the detailed/advanced steps, continue below.
 If you prefer pool mode, use the public Irium Stratum endpoint:
 
 - Pool URL: `stratum+tcp://pool.iriumlabs.org:3333`
+- Fallback direct IP: `stratum+tcp://157.173.116.134:3333`
+- Recommended failover config: use hostname as pool 0, direct IP as pool 1/2.
+- Compatibility update (March 2, 2026): legacy Stratum handshake support enabled on the pool server for older ASIC firmware clients.
 - Username: `IRM_ADDRESS.worker1`
 - Password: `x`
 - Mode: SOLO (if your worker finds a valid block, reward pays to the IRM address in the username)

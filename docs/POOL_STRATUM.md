@@ -1,14 +1,24 @@
 # Irium Public Stratum Pool
 
 ## Quickstart (miners)
-Use the public pool endpoint:
+Primary pool endpoint:
 
 - URL: `stratum+tcp://pool.iriumlabs.org:3333`
+- Fallback URL: `stratum+tcp://157.173.116.134:3333`
 - Username: `IRM_ADDRESS.worker1`
 - Password: `x`
 
 Example username:
 - `Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa.worker1`
+
+## Recommended failover config
+Use 3 pool entries in miner UI/config:
+
+1. `stratum+tcp://pool.iriumlabs.org:3333`
+2. `stratum+tcp://157.173.116.134:3333`
+3. `stratum+tcp://157.173.116.134:3333`
+
+This keeps miners online if DNS resolution fails locally.
 
 ## Payout model (SOLO)
 This pool runs in SOLO mode.
@@ -22,29 +32,40 @@ If you cannot connect:
 
 1. Check DNS resolution:
 ```bash
-dig pool.iriumlabs.org +short
+getent hosts pool.iriumlabs.org
 ```
 
-2. Check TCP reachability on port 3333:
+2. Check TCP reachability on port 3333 (hostname + direct IP):
 ```bash
 nc -vz pool.iriumlabs.org 3333
+nc -vz 157.173.116.134 3333
 ```
 
-3. If DNS resolves but connect fails:
-- Confirm outbound TCP/3333 is allowed on your firewall/router.
-- Check ISP/VPS filtering for custom mining ports.
-- Try from another network to rule out local ISP filtering.
+3. Test a raw Stratum subscribe:
+```bash
+printf '{"id":1,"method":"mining.subscribe","params":[]}\n' | nc 157.173.116.134 3333
+```
+
+4. If hostname fails but IP works:
+- DNS issue on miner network/ISP.
+- Keep mining on direct IP and fix resolver settings later.
+
+5. If both fail:
+- Confirm outbound TCP/3333 is allowed on firewall/router.
+- Check ISP/VPS filtering for mining ports.
+- Try another network to isolate local filtering.
 
 ## How to verify service is up
 From any Linux/macOS shell:
 ```bash
 nc -vz pool.iriumlabs.org 3333
+nc -vz 157.173.116.134 3333
 ```
 
 From the pool host:
 ```bash
 systemctl status irium-stratum --no-pager
-ss -lntp | egrep ':3333'
+ss -lntp | egrep ':3333|:8081|:8332'
 ```
 
 ## Operator notes
@@ -86,3 +107,13 @@ journalctl -u irium-stratum -f
 
 ## Disclaimer
 Current implementation has been validated with local Stratum handshake and submit-path testing. Broader validation with real ASIC miners is welcome.
+
+## Legacy cgminer compatibility (March 2, 2026)
+A server-side compatibility update was deployed for older ASIC clients (including older cgminer/bmminer variants).
+
+If direct IP TCP connects but your miner still reports "No servers were found", verify:
+- Algorithm is SHA-256/SHA-256d
+- SSL/TLS is disabled (`stratum+tcp://`)
+- Worker format is `IRM_ADDRESS.worker1`
+
+Use the 3-pool failover config above and share timestamped logs for handshake-level troubleshooting.

@@ -231,6 +231,9 @@ Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinb
 ## Mining (Stratum Pool)
 Public SOLO Stratum pool:
 - Pool URL: `stratum+tcp://pool.iriumlabs.org:3333`
+- Fallback direct IP: `stratum+tcp://157.173.116.134:3333`
+- If DNS fails on your network, keep pool 0 as hostname and pool 1/2 as direct IP fallback.
+- Compatibility update (March 2, 2026): pool server now includes legacy Stratum handlers for older cgminer/bmminer handshakes.
 - Username: `IRM_ADDRESS.worker1`
 - Password: `x`
 - Mode: SOLO (full block reward pays to the IRM address in the username)
