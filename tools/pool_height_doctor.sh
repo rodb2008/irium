@@ -423,11 +423,13 @@ diagnose() {
       if [[ "$EXPLORER_HEIGHT" == "0" ]]; then
         warn "Explorer height parse returned 0 raw=$(trim200 "$ex_json")"
       fi
-      if [[ "$NODE_HEIGHT" =~ ^[0-9]+$ && "$EXPLORER_HEIGHT" =~ ^[0-9]+$ ]]; then
+      if [[ "$NODE_HEIGHT" =~ ^[0-9]+$ && "$EXPLORER_HEIGHT" =~ ^[0-9]+$ && "$EXPLORER_HEIGHT" -gt 0 ]]; then
         local de
         de="$(abs_diff "$NODE_HEIGHT" "$EXPLORER_HEIGHT")"
         say "node_vs_explorer_diff=$de"
         if (( de > 1000 )); then FORK_SUSPECT=1; warn "Large node/explorer height divergence (>1000)."; fi
+      else
+        warn "Explorer height unavailable/invalid; skipping divergence check"
       fi
     else
       warn "Explorer cross-check URL set but no response"
