@@ -4026,11 +4026,8 @@ async fn main() {
                         Ok(_) => {
                             if storage::gap_healer_mark_filled(h) {
                                 filled = filled.saturating_add(1);
-                                eprintln!(
-                                    "[i] gap healer progress: filled height={} remaining={}",
-                                    h,
-                                    storage::gap_healer_pending_count()
-                                );
+                                // Per-height progress logs are intentionally suppressed to avoid
+                                // flooding journals during large backfills; batch summary is logged below.
                             }
                         }
                         Err(e) => {

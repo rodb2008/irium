@@ -4356,11 +4356,18 @@ impl P2PNode {
                                             guard.header_path_to_known(best.header.hash())
                                         {
                                             if let Some(first_hash) = path.first() {
-                                                let start_hash = guard
+                                                let mut start_hash = guard
                                                     .headers
                                                     .get(first_hash)
                                                     .map(|hw| hw.header.prev_hash)
                                                     .unwrap_or([0u8; 32]);
+                                                if start_hash != [0u8; 32] && !guard.heights.contains_key(&start_hash) {
+                                                    start_hash = guard
+                                                        .chain
+                                                        .last()
+                                                        .map(|b| b.header.hash())
+                                                        .unwrap_or([0u8; 32]);
+                                                }
                                                 let count = std::cmp::min(
                                                     path.len(),
                                                     MAX_BLOCKS_PER_REQUEST as usize,
@@ -6387,11 +6394,18 @@ async fn handle_incoming_with_sybil(
                                         guard.header_path_to_known(best.header.hash())
                                     {
                                         if let Some(first_hash) = path.first() {
-                                            let start_hash = guard
+                                            let mut start_hash = guard
                                                 .headers
                                                 .get(first_hash)
                                                 .map(|hw| hw.header.prev_hash)
                                                 .unwrap_or([0u8; 32]);
+                                            if start_hash != [0u8; 32] && !guard.heights.contains_key(&start_hash) {
+                                                start_hash = guard
+                                                    .chain
+                                                    .last()
+                                                    .map(|b| b.header.hash())
+                                                    .unwrap_or([0u8; 32]);
+                                            }
                                             let count = std::cmp::min(
                                                 path.len(),
                                                 MAX_BLOCKS_PER_REQUEST as usize,
