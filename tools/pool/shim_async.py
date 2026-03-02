@@ -1,5 +1,7 @@
 import logging
 import os
+import subprocess
+import time
 from urllib.parse import urlparse, urlunparse
 
 import httpx
@@ -13,6 +15,13 @@ log = logging.getLogger("irium-pool-shim")
 IRIUM_RPC_URL = os.getenv("IRIUM_RPC_URL", "http://127.0.0.1:38300")
 IRIUM_RPC_TOKEN = os.getenv("IRIUM_RPC_TOKEN")
 HEIGHT_DRIFT_MAX = int(os.getenv("IRIUM_TEMPLATE_HEIGHT_DRIFT_MAX", "2"))
+STRATUM_HEALTH_URL = os.getenv("IRIUM_STRATUM_HEALTH_URL", "http://127.0.0.1:3334/health")
+PUBLIC_API_BASES = [
+    b.strip().rstrip("/")
+    for b in os.getenv("IRIUM_PUBLIC_API_BASES", "https://api.iriumlabs.org/api").split(",")
+    if b.strip()
+]
+POOL_PORT = int(os.getenv("IRIUM_POOL_PORT", "3333"))
 
 log.info("upstream_rpc_url=%s", IRIUM_RPC_URL)
 
@@ -39,9 +48,7 @@ async def _request_json(method: str, path: str, *, params=None, json_body=None, 
 
     last_err = None
     for i, u in enumerate(urls):
-        verify = u.startswith("https://")
-        if verify:
-            verify = False
+        verify = False if u.startswith("https://") else True
         try:
             async with httpx.AsyncClient(verify=verify, timeout=timeout) as client:
                 resp = await client.request(
@@ -65,6 +72,41 @@ async def _request_json(method: str, path: str, *, params=None, json_body=None, 
             break
 
     raise RuntimeError(f"upstream_connect_failed path={path} base={base}: {last_err}")
+
+
+async def _fetch_public_json(path: str, timeout=12):
+    last_err = None
+    for base in PUBLIC_API_BASES:
+        url = f"{base}{path}"
+        try:
+            async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                return r.json()
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        raise RuntimeError(f"public_api_fetch_failed path={path}: {last_err}")
+    raise RuntimeError("public_api_fetch_failed: no bases configured")
+
+
+def _count_tcp_sessions(port: int) -> int:
+    try:
+        out = subprocess.check_output(["ss", "-tn", "state", "established"], text=True, timeout=3)
+        return sum(1 for line in out.splitlines() if f":{port}" in line)
+    except Exception:
+        return 0
+
+
+async def _stratum_health():
+    try:
+        async with httpx.AsyncClient(timeout=8, verify=False) as client:
+            r = await client.get(STRATUM_HEALTH_URL)
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return None
 
 
 async def fetch_status():
@@ -163,12 +205,136 @@ async def status_alias():
 
 @app.get("/api/pool/health")
 async def pool_health():
-    return await health()
+    out = {
+        "healthy": False,
+        "backend_connected": False,
+        "updated_at": int(time.time()),
+        "issues": [],
+    }
+    try:
+        s = await fetch_status()
+        out["height"] = int(s.get("height", 0))
+        out["peer_count"] = int(s.get("peer_count", 0))
+        out["backend_connected"] = True
+    except Exception as e:
+        out["issues"].append(f"status fetch failed: {e}")
+
+    sh = await _stratum_health()
+    if sh:
+        now = int(time.time())
+        age = int(sh.get("age_seconds", 0) or 0)
+        out["stratum_status"] = sh.get("status", "unknown")
+        out["stratum_age_seconds"] = age
+        out["stratum_height"] = int(sh.get("height", 0) or 0)
+        out["stratum_prevhash"] = sh.get("prevhash", "")
+        out["last_template_update_ts"] = max(0, now - age)
+    else:
+        out["issues"].append("stratum health unavailable")
+
+    out["healthy"] = out["backend_connected"] and (out.get("stratum_status") in ("ok", "fresh", None))
+    return out
 
 
 @app.get("/api/pool/status")
 async def pool_status():
-    return await health()
+    return await pool_health()
+
+
+@app.get("/api/pool/stats")
+async def pool_stats():
+    now = int(time.time())
+    s = await fetch_status()
+    h = await pool_health()
+
+    active_miners = 0
+    active_window = 144
+    try:
+        st = await _fetch_public_json("/stats")
+        active_miners = int(st.get("active_miners", 0) or 0)
+        active_window = int(st.get("active_miners_window_blocks", 144) or 144)
+    except Exception:
+        pass
+
+    tcp = _count_tcp_sessions(POOL_PORT)
+
+    return {
+        "backend_connected": bool(h.get("backend_connected", False)),
+        "network_height": int(s.get("height", 0) or 0),
+        "active_tcp_sessions": int(tcp),
+        "workers_online": int(tcp),
+        "active_miners_as_of_height": int(active_miners),
+        "active_miners_window_blocks": int(active_window),
+        "accepted_shares": 0,
+        "rejected_shares": 0,
+        "stale_shares": 0,
+        "pending_count": 0,
+        "last_share_accept_ts": 0,
+        "last_share_reject_ts": 0,
+        "last_template_update_ts": int(h.get("last_template_update_ts", now)),
+        "template_updated_at": int(h.get("last_template_update_ts", now)),
+        "stratum_status": h.get("stratum_status", "unknown"),
+        "stratum_age_seconds": int(h.get("stratum_age_seconds", 0) or 0),
+        "updated_at": now,
+    }
+
+
+@app.get("/api/pool/payouts")
+async def pool_payouts(limit: int = 20):
+    rows = []
+    try:
+        blocks = await _fetch_public_json(f"/blocks?limit={max(1, min(limit, 100))}")
+        bl = blocks.get("blocks") if isinstance(blocks, dict) else None
+        if isinstance(bl, list):
+            for b in bl:
+                reward = b.get("reward")
+                if reward is None:
+                    reward = b.get("block_reward")
+                if reward is None:
+                    reward = 50
+                rows.append({
+                    "height": int(b.get("height", 0) or 0),
+                    "time": int((b.get("header") or {}).get("time", 0) or 0),
+                    "address": b.get("miner_address") or b.get("miner") or "",
+                    "reward_irm": float(reward),
+                    "status": "on_chain",
+                    "hash": (b.get("header") or {}).get("hash", ""),
+                    "maturity_remaining": 0,
+                })
+    except Exception:
+        rows = []
+
+    return {"pending_count": 0, "payouts": rows[: max(1, min(limit, 100))]}
+
+
+@app.get("/api/pool/account/{address}")
+async def pool_account(address: str, window: int = 5000, limit: int = 12):
+    payouts = await pool_payouts(limit=max(limit, 50))
+    rows = [r for r in payouts.get("payouts", []) if r.get("address") == address]
+    rows = rows[: max(1, min(limit, 100))]
+    total = sum(float(r.get("reward_irm", 0) or 0) for r in rows)
+    last = rows[0] if rows else None
+    return {
+        "address": address,
+        "window": int(window),
+        "blocks_found": len(rows),
+        "total_rewards_irm": total,
+        "paid_total_irm": total,
+        "pending_balance_irm": 0,
+        "last_found": last,
+        "records": rows,
+    }
+
+
+@app.get("/api/pool/workers")
+async def pool_workers(window: int = 144, limit: int = 20):
+    st = await _fetch_public_json("/stats")
+    count = int(st.get("active_miners", 0) or 0)
+    return {
+        "window": int(window),
+        "limit": int(limit),
+        "worker_count": count,
+        "workers": [],
+    }
 
 
 @app.post("/")
