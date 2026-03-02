@@ -10,7 +10,16 @@ if [[ -z "$json" ]]; then
   exit 0
 fi
 
-status="$(jq -r .status //  <<<"$json" 2>/dev/null || true)"
+status="$(python3 - <<PY "$json"
+import json,sys
+try:
+    d=json.loads(sys.argv[1])
+    print(str(d.get(status,)).strip())
+except Exception:
+    print()
+PY
+)"
+
 if [[ "$status" != "ok" ]]; then
   echo "[healthcheck] status=$status response=$(echo "$json" | tr -d "\n" | cut -c1-220); restarting irium-stratum"
   systemctl restart irium-stratum
