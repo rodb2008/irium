@@ -248,6 +248,16 @@ async fn fetch_stratum_metrics(state: &AppState) -> Option<Value> {
     resp.json::<Value>().await.ok()
 }
 
+async fn fetch_stratum_health(state: &AppState) -> Option<Value> {
+    let base = state.stratum_metrics_url.as_ref()?;
+    let url = node_url(base, "/health");
+    let resp = state.client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<Value>().await.ok()
+}
+
 async fn proxy_text(state: &AppState, path: &str) -> Result<Response, StatusCode> {
     let url = node_url(&state.node_base, path);
     let mut req = state.client.get(url);
@@ -717,6 +727,26 @@ async fn pool_health(
     };
     let mining_latency_ms = t_mining.elapsed().as_millis() as u64;
 
+    let stratum_health = fetch_stratum_health(&state).await;
+    let stratum_status = stratum_health
+        .as_ref()
+        .and_then(|v| v.get("status"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let stratum_age_seconds = stratum_health
+        .as_ref()
+        .and_then(|v| v.get("age_seconds"))
+        .and_then(|v| v.as_u64());
+    let stratum_height = stratum_health
+        .as_ref()
+        .and_then(|v| v.get("height"))
+        .and_then(|v| v.as_u64());
+    let stratum_prevhash = stratum_health
+        .as_ref()
+        .and_then(|v| v.get("prevhash"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
     let peers = status
         .get("peer_count")
@@ -754,6 +784,10 @@ async fn pool_health(
         "difficulty": mining.get("difficulty"),
         "network_hashrate_hs": mining.get("hashrate"),
         "avg_block_time": mining.get("avg_block_time"),
+        "stratum_status": stratum_status,
+        "stratum_age_seconds": stratum_age_seconds,
+        "stratum_height": stratum_height,
+        "stratum_prevhash": stratum_prevhash,
         "tip_time": tip_time,
         "freshness_secs": freshness_secs,
         "latency_ms": {
