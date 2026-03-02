@@ -311,6 +311,7 @@ pub struct PeerDirectory {
     db_path: PathBuf,
     seed_manager: SeedlistManager,
     records: HashMap<String, PeerRecord>,
+    last_flush: f64,
 }
 
 impl PeerDirectory {
@@ -334,6 +335,7 @@ impl PeerDirectory {
             db_path,
             seed_manager,
             records: HashMap::new(),
+            last_flush: 0.0,
         };
         dir.load();
         dir
@@ -402,7 +404,13 @@ impl PeerDirectory {
         }
     }
 
-    fn flush(&self) {
+    fn flush(&mut self) {
+        let now = now_secs();
+        if now - self.last_flush < 2.0 {
+            return;
+        }
+        self.last_flush = now;
+
         let mut map = serde_json::Map::new();
         for (addr, rec) in &self.records {
             let mut obj = serde_json::Map::new();
