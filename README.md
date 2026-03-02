@@ -229,6 +229,12 @@ Optional: set `IRIUM_RELAY_ADDRESS` to advertise a relay payout address in coinb
 
 
 ## Mining (Stratum Pool)
+> [!IMPORTANT]
+> Pool compatibility baseline (March 2026):
+> - Officially supported miner: irium-miner.
+> - Some third-party GPU miner builds (including some ccminer variants) may connect but still submit rejected shares (for example low_difficulty) due to protocol-handling differences.
+> - If this happens, share miner version, exact launch command, and 30-50 lines of logs so compatibility can be triaged quickly.
+
 Public SOLO Stratum pool:
 - Pool URL: `stratum+tcp://pool.iriumlabs.org:3333`
 - Fallback direct IP: `stratum+tcp://157.173.116.134:3333`

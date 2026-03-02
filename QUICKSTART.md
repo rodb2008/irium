@@ -68,8 +68,8 @@ If you want the detailed/advanced steps, continue below.
 ## Public Stratum Pool (SOLO)
 > [!IMPORTANT]
 > Pool compatibility baseline (March 2026):
-> - Officially supported miner: .
-> - Some third-party GPU miner builds (including some  variants) may connect but still submit rejected shares (for example ) due to protocol-handling differences.
+> - Officially supported miner: irium-miner.
+> - Some third-party GPU miner builds (including some ccminer variants) may connect but still submit rejected shares (for example low_difficulty) due to protocol-handling differences.
 > - If this happens, share miner version, exact launch command, and 30-50 lines of logs so compatibility can be triaged quickly.
 
 If you prefer pool mode, use the public Irium Stratum endpoint:
