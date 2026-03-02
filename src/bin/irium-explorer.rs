@@ -124,8 +124,28 @@ fn check_rate(state: &AppState, addr: &SocketAddr, headers: &HeaderMap) -> Resul
     if api_authorized(headers, &state.api_token) {
         return Ok(());
     }
+
+    // Behind reverse proxies, use forwarded client IP when present to avoid
+    // collapsing all traffic into the proxy's source IP bucket.
+    let client_key = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| addr.ip().to_string());
+
     let mut limiter = state.limiter.lock().unwrap_or_else(|e| e.into_inner());
-    if limiter.is_allowed(&addr.ip().to_string()) {
+    if limiter.is_allowed(&client_key) {
         Ok(())
     } else {
         Err(StatusCode::TOO_MANY_REQUESTS)
