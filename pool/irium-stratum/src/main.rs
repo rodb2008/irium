@@ -35,9 +35,15 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(1000);
 
-    let metrics_bind = env::var("STRATUM_METRICS_BIND")
-        .ok()
-        .or_else(|| Some("127.0.0.1:3334".to_string()));
+    let metrics_bind = Some(
+        env::var("STRATUM_METRICS_BIND")
+            .ok()
+            .filter(|v| {
+                let t = v.trim();
+                t.starts_with("127.0.0.1:") || t.starts_with("localhost:") || t.starts_with("[::1]:")
+            })
+            .unwrap_or_else(|| "127.0.0.1:3334".to_string())
+    );
 
     let max_template_age_seconds = env::var("IRIUM_TEMPLATE_MAX_AGE_SECONDS")
         .ok()
