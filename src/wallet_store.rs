@@ -15,6 +15,7 @@ use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
+const WIF_VERSION: u8 = 0x80;
 const PBKDF2_ITERS: u32 = 100_000;
 const WALLET_VERSION: u32 = 1;
 const DEFAULT_AUTO_LOCK_MIN: u64 = 10;
@@ -35,6 +36,10 @@ pub struct WalletCrypto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletPlain {
     pub keys: Vec<WalletKey>,
+    #[serde(default)]
+    pub seed_hex: Option<String>,
+    #[serde(default)]
+    pub next_index: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,14 +94,41 @@ impl WalletManager {
     }
 
     pub fn create(&mut self, passphrase: &str) -> Result<WalletKey, String> {
+        self.create_with_seed(passphrase, None)
+    }
+
+    pub fn create_with_seed(
+        &mut self,
+        passphrase: &str,
+        seed_hex: Option<&str>,
+    ) -> Result<WalletKey, String> {
         if passphrase.trim().is_empty() {
             return Err("passphrase required".to_string());
         }
         if self.path.exists() {
             return Err("wallet already exists".to_string());
         }
-        let mut plain = WalletPlain { keys: Vec::new() };
-        let key = generate_key();
+
+        let mut plain = WalletPlain {
+            keys: Vec::new(),
+            seed_hex: None,
+            next_index: 0,
+        };
+
+        let key = if let Some(seed) = seed_hex {
+            let clean = normalize_seed_hex(seed)?;
+            let secret = derive_secret_from_seed_hex(&clean, 0)?;
+            plain.seed_hex = Some(clean);
+            plain.next_index = 1;
+            key_from_secret(&secret, true)
+        } else {
+            let clean = generate_seed_hex();
+            let secret = derive_secret_from_seed_hex(&clean, 0)?;
+            plain.seed_hex = Some(clean);
+            plain.next_index = 1;
+            key_from_secret(&secret, true)
+        };
+
         plain.keys.push(key.clone());
         let file = encrypt_wallet(passphrase, &plain)?;
         save_wallet(&self.path, &file)?;
@@ -111,7 +143,10 @@ impl WalletManager {
             return Err("passphrase required".to_string());
         }
         let file = load_wallet(&self.path)?;
-        let plain = decrypt_wallet(passphrase, &file)?;
+        let mut plain = decrypt_wallet(passphrase, &file)?;
+        if plain.next_index == 0 && plain.seed_hex.is_some() {
+            plain.next_index = plain.keys.len() as u32;
+        }
         self.state.unlocked = Some(plain);
         self.state.passphrase = Some(passphrase.to_string());
         self.touch();
@@ -154,15 +189,30 @@ impl WalletManager {
             .passphrase
             .clone()
             .ok_or_else(|| "wallet locked".to_string())?;
-        let key = generate_key();
-        if let Some(ref mut plain) = self.state.unlocked {
+
+        let key = if let Some(ref mut plain) = self.state.unlocked {
+            let key = if let Some(seed_hex) = plain.seed_hex.clone() {
+                let index = plain.next_index;
+                let secret = derive_secret_from_seed_hex(&seed_hex, index)?;
+                let k = key_from_secret(&secret, true);
+                plain.next_index = plain.next_index.saturating_add(1);
+                k
+            } else {
+                generate_key()
+            };
+
+            if plain.keys.iter().any(|k| k.address == key.address) {
+                return Err("derived address already exists".to_string());
+            }
             plain.keys.push(key.clone());
-            let file = encrypt_wallet(&passphrase, plain)?;
-            save_wallet(&self.path, &file)?;
-            self.touch();
-            return Ok(key);
-        }
-        Err("wallet locked".to_string())
+            key
+        } else {
+            return Err("wallet locked".to_string());
+        };
+
+        self.persist_unlocked(&passphrase)?;
+        self.touch();
+        Ok(key)
     }
 
     pub fn keys(&mut self) -> Result<Vec<WalletKey>, String> {
@@ -175,6 +225,100 @@ impl WalletManager {
             .unwrap_or_default();
         self.touch();
         Ok(keys)
+    }
+
+    pub fn export_wif(&mut self, address: &str) -> Result<String, String> {
+        self.ensure_unlocked()?;
+        let key = self
+            .state
+            .unlocked
+            .as_ref()
+            .and_then(|w| w.keys.iter().find(|k| k.address == address.trim()))
+            .ok_or_else(|| "address not found in wallet".to_string())?;
+        let priv_bytes = hex::decode(&key.privkey).map_err(|_| "invalid wallet key".to_string())?;
+        if priv_bytes.len() != 32 {
+            return Err("invalid wallet key length".to_string());
+        }
+        let mut sec = [0u8; 32];
+        sec.copy_from_slice(&priv_bytes);
+        self.touch();
+        Ok(secret_to_wif(&sec, true))
+    }
+
+    pub fn import_wif(&mut self, wif: &str) -> Result<WalletKey, String> {
+        self.ensure_unlocked()?;
+        let passphrase = self
+            .state
+            .passphrase
+            .clone()
+            .ok_or_else(|| "wallet locked".to_string())?;
+
+        let (secret, compressed) = wif_to_secret_and_compression(wif.trim())?;
+        let secret_key = SecretKey::from_slice(&secret).map_err(|_| "invalid WIF secret".to_string())?;
+        let key = key_from_secret(&secret_key, compressed);
+
+        if let Some(ref mut plain) = self.state.unlocked {
+            if plain.keys.iter().any(|k| k.address == key.address) {
+                return Err("address already exists in wallet".to_string());
+            }
+            plain.keys.push(key.clone());
+            // Imported-key wallet should not continue deterministic derivation blindly.
+            plain.seed_hex = None;
+            plain.next_index = plain.keys.len() as u32;
+        }
+
+        self.persist_unlocked(&passphrase)?;
+        self.touch();
+        Ok(key)
+    }
+
+    pub fn export_seed(&mut self) -> Result<String, String> {
+        self.ensure_unlocked()?;
+        let seed = self
+            .state
+            .unlocked
+            .as_ref()
+            .and_then(|w| w.seed_hex.clone())
+            .ok_or_else(|| "no deterministic seed stored in wallet".to_string())?;
+        self.touch();
+        Ok(seed)
+    }
+
+    pub fn import_seed(&mut self, seed_hex: &str, force: bool) -> Result<WalletKey, String> {
+        self.ensure_unlocked()?;
+        let passphrase = self
+            .state
+            .passphrase
+            .clone()
+            .ok_or_else(|| "wallet locked".to_string())?;
+
+        let clean = normalize_seed_hex(seed_hex)?;
+        let secret = derive_secret_from_seed_hex(&clean, 0)?;
+        let key = key_from_secret(&secret, true);
+
+        if let Some(ref mut plain) = self.state.unlocked {
+            if !force && !plain.keys.is_empty() {
+                return Err("wallet already has keys; pass force=true to replace".to_string());
+            }
+            plain.seed_hex = Some(clean);
+            plain.next_index = 1;
+            plain.keys.clear();
+            plain.keys.push(key.clone());
+        }
+
+        self.persist_unlocked(&passphrase)?;
+        self.touch();
+        Ok(key)
+    }
+
+    fn persist_unlocked(&self, passphrase: &str) -> Result<(), String> {
+        let plain = self
+            .state
+            .unlocked
+            .as_ref()
+            .ok_or_else(|| "wallet locked".to_string())?;
+        let file = encrypt_wallet(passphrase, plain)?;
+        save_wallet(&self.path, &file)
     }
 
     fn ensure_unlocked(&mut self) -> Result<(), String> {
@@ -294,10 +438,91 @@ fn base58_p2pkh_from_hash(pkh: &[u8; 20]) -> String {
     bs58::encode(full).into_string()
 }
 
-fn generate_key() -> WalletKey {
-    let secret = SecretKey::random(&mut OsRng);
+fn base58check_decode(input: &str) -> Option<Vec<u8>> {
+    let data = bs58::decode(input).into_vec().ok()?;
+    if data.len() < 5 {
+        return None;
+    }
+    let (payload, check) = data.split_at(data.len() - 4);
+    let first = Sha256::digest(payload);
+    let second = Sha256::digest(&first);
+    if &second[0..4] != check {
+        return None;
+    }
+    Some(payload.to_vec())
+}
+
+fn secret_to_wif(secret: &[u8; 32], compressed: bool) -> String {
+    let mut payload = Vec::with_capacity(34);
+    payload.push(WIF_VERSION);
+    payload.extend_from_slice(secret);
+    if compressed {
+        payload.push(0x01);
+    }
+    let first = Sha256::digest(&payload);
+    let second = Sha256::digest(&first);
+    let mut full = payload;
+    full.extend_from_slice(&second[0..4]);
+    bs58::encode(full).into_string()
+}
+
+fn wif_to_secret_and_compression(wif: &str) -> Result<([u8; 32], bool), String> {
+    let data = base58check_decode(wif).ok_or_else(|| "invalid WIF".to_string())?;
+    if data.len() != 33 && data.len() != 34 {
+        return Err("invalid WIF length".to_string());
+    }
+    if data[0] != WIF_VERSION {
+        return Err("unsupported WIF version".to_string());
+    }
+    let compressed = if data.len() == 34 {
+        if data[33] != 0x01 {
+            return Err("invalid WIF compression flag".to_string());
+        }
+        true
+    } else {
+        false
+    };
+    let mut sec = [0u8; 32];
+    sec.copy_from_slice(&data[1..33]);
+    Ok((sec, compressed))
+}
+
+fn normalize_seed_hex(seed_hex: &str) -> Result<String, String> {
+    let s = seed_hex.trim().to_lowercase();
+    if s.len() != 64 {
+        return Err("seed must be 64-char hex".to_string());
+    }
+    let _ = hex::decode(&s).map_err(|_| "seed must be valid hex".to_string())?;
+    Ok(s)
+}
+
+fn generate_seed_hex() -> String {
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    hex::encode(seed)
+}
+
+fn derive_secret_from_seed_hex(seed_hex: &str, index: u32) -> Result<SecretKey, String> {
+    let seed = hex::decode(seed_hex).map_err(|_| "seed must be valid hex".to_string())?;
+    if seed.len() != 32 {
+        return Err("seed must be 64-char hex".to_string());
+    }
+    for attempt in 0u32..=1024 {
+        let mut h = Sha256::new();
+        h.update(&seed);
+        h.update(index.to_be_bytes());
+        h.update(attempt.to_be_bytes());
+        let digest = h.finalize();
+        if let Ok(sec) = SecretKey::from_slice(&digest) {
+            return Ok(sec);
+        }
+    }
+    Err("failed to derive valid key from seed".to_string())
+}
+
+fn key_from_secret(secret: &SecretKey, compressed: bool) -> WalletKey {
     let public = secret.public_key();
-    let pubkey = public.to_encoded_point(true);
+    let pubkey = public.to_encoded_point(compressed);
     let pkh = hash160(pubkey.as_bytes());
     let address = base58_p2pkh_from_hash(&pkh);
     WalletKey {
@@ -306,4 +531,9 @@ fn generate_key() -> WalletKey {
         pubkey: hex::encode(pubkey.as_bytes()),
         privkey: hex::encode(secret.to_bytes()),
     }
+}
+
+fn generate_key() -> WalletKey {
+    let secret = SecretKey::random(&mut OsRng);
+    key_from_secret(&secret, true)
 }

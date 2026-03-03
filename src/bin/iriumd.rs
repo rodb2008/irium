@@ -294,6 +294,7 @@ struct SubmitTxResponse {
 #[derive(Deserialize)]
 struct WalletCreateRequest {
     passphrase: String,
+    seed_hex: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -309,6 +310,22 @@ struct WalletSendRequest {
     fee_mode: Option<String>,
     fee_per_byte: Option<u64>,
     coin_select: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WalletImportWifRequest {
+    wif: String,
+}
+
+#[derive(Deserialize)]
+struct WalletImportSeedRequest {
+    seed_hex: String,
+    force: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct WalletExportWifQuery {
+    address: String,
 }
 
 #[derive(Serialize)]
@@ -345,6 +362,27 @@ struct WalletSendResponse {
     fee: u64,
     total_input: u64,
     change: u64,
+}
+
+#[derive(Serialize)]
+struct WalletExportWifResponse {
+    address: String,
+    wif: String,
+}
+
+#[derive(Serialize)]
+struct WalletImportWifResponse {
+    address: String,
+}
+
+#[derive(Serialize)]
+struct WalletSeedResponse {
+    seed_hex: String,
+}
+
+#[derive(Serialize)]
+struct WalletImportSeedResponse {
+    address: String,
 }
 
 #[derive(Clone)]
@@ -2433,7 +2471,7 @@ async fn wallet_create(
         return Err(StatusCode::CONFLICT);
     }
     let key = wallet
-        .create(&req.passphrase)
+        .create_with_seed(&req.passphrase, req.seed_hex.as_deref())
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     Ok(Json(WalletCreateResponse {
@@ -2524,6 +2562,72 @@ async fn wallet_new_address(
     Ok(Json(WalletReceiveResponse {
         address: key.address,
     }))
+}
+
+async fn wallet_export_wif(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<WalletExportWifQuery>,
+) -> Result<Json<WalletExportWifResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let wif = wallet
+        .export_wif(&q.address)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(WalletExportWifResponse {
+        address: q.address,
+        wif,
+    }))
+}
+
+async fn wallet_import_wif(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<WalletImportWifRequest>,
+) -> Result<Json<WalletImportWifResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let key = wallet
+        .import_wif(&req.wif)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(WalletImportWifResponse { address: key.address }))
+}
+
+async fn wallet_export_seed(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WalletSeedResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let seed_hex = wallet
+        .export_seed()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(WalletSeedResponse { seed_hex }))
+}
+
+async fn wallet_import_seed(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<WalletImportSeedRequest>,
+) -> Result<Json<WalletImportSeedResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let key = wallet
+        .import_seed(&req.seed_hex, req.force.unwrap_or(false))
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(WalletImportSeedResponse { address: key.address }))
 }
 
 async fn wallet_send(
@@ -4127,6 +4231,10 @@ async fn main() {
         .route("/wallet/addresses", get(wallet_addresses))
         .route("/wallet/receive", get(wallet_receive))
         .route("/wallet/new_address", post(wallet_new_address))
+        .route("/wallet/export_wif", get(wallet_export_wif))
+        .route("/wallet/import_wif", post(wallet_import_wif))
+        .route("/wallet/export_seed", get(wallet_export_seed))
+        .route("/wallet/import_seed", post(wallet_import_seed))
         .route("/wallet/send", post(wallet_send))
         .layer(DefaultBodyLimit::max(rpc_body_limit_bytes()))
         .with_state(app_state.clone());
