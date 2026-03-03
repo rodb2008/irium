@@ -16,6 +16,7 @@ use irium_node_rs::rate_limiter::RateLimiter;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
@@ -28,6 +29,7 @@ struct AppState {
     rpc_token: Option<String>,
     miners_cache: Arc<RwLock<MinersCache>>,
     stratum_metrics_url: Option<String>,
+    stratum_port: u16,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -246,6 +248,48 @@ async fn fetch_stratum_metrics(state: &AppState) -> Option<Value> {
         return None;
     }
     resp.json::<Value>().await.ok()
+}
+
+async fn fetch_stratum_health(state: &AppState) -> Option<Value> {
+    let base = state.stratum_metrics_url.as_ref()?;
+    let url = node_url(base, "/health");
+    let resp = state.client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<Value>().await.ok()
+}
+
+
+fn socket_ends_with_port(token: &str, port: u16) -> bool {
+    token
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        == Some(port)
+}
+
+async fn count_local_tcp_sessions(port: u16) -> Option<u64> {
+    let output = Command::new("ss")
+        .args(["-Htan", "state", "established"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut count = 0u64;
+    for line in stdout.lines() {
+        let mut cols = line.split_whitespace();
+        let _recvq = cols.next();
+        let _sendq = cols.next();
+        let local = cols.next().unwrap_or("");
+        if socket_ends_with_port(local, port) {
+            count = count.saturating_add(1);
+        }
+    }
+    Some(count)
 }
 
 async fn proxy_text(state: &AppState, path: &str) -> Result<Response, StatusCode> {
@@ -522,12 +566,13 @@ async fn pool_stats(
 
     let sample_window = q.window.unwrap_or(miners.window_blocks.max(1));
     let stratum_metrics = fetch_stratum_metrics(&state).await;
+    let fallback_tcp_sessions = count_local_tcp_sessions(state.stratum_port).await;
 
     let active_tcp_sessions = stratum_metrics
         .as_ref()
         .and_then(|m| m.get("active_tcp_sessions"))
         .cloned()
-        .unwrap_or(Value::Null);
+        .unwrap_or_else(|| fallback_tcp_sessions.map(Value::from).unwrap_or(Value::Null));
     let accepted_shares = stratum_metrics
         .as_ref()
         .and_then(|m| m.get("accepted_shares"))
@@ -717,6 +762,26 @@ async fn pool_health(
     };
     let mining_latency_ms = t_mining.elapsed().as_millis() as u64;
 
+    let stratum_health = fetch_stratum_health(&state).await;
+    let stratum_status = stratum_health
+        .as_ref()
+        .and_then(|v| v.get("status"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let stratum_age_seconds = stratum_health
+        .as_ref()
+        .and_then(|v| v.get("age_seconds"))
+        .and_then(|v| v.as_u64());
+    let stratum_height = stratum_health
+        .as_ref()
+        .and_then(|v| v.get("height"))
+        .and_then(|v| v.as_u64());
+    let stratum_prevhash = stratum_health
+        .as_ref()
+        .and_then(|v| v.get("prevhash"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
     let peers = status
         .get("peer_count")
@@ -754,6 +819,10 @@ async fn pool_health(
         "difficulty": mining.get("difficulty"),
         "network_hashrate_hs": mining.get("hashrate"),
         "avg_block_time": mining.get("avg_block_time"),
+        "stratum_status": stratum_status,
+        "stratum_age_seconds": stratum_age_seconds,
+        "stratum_height": stratum_height,
+        "stratum_prevhash": stratum_prevhash,
         "tip_time": tip_time,
         "freshness_secs": freshness_secs,
         "latency_ms": {
@@ -882,6 +951,11 @@ async fn main() {
         .ok()
         .map(|v| v.trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty());
+    let stratum_port = env::var("IRIUM_STRATUM_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(3333);
+
 
     let state = AppState {
         client,
@@ -894,6 +968,7 @@ async fn main() {
             ..Default::default()
         })),
         stratum_metrics_url,
+        stratum_port,
     };
 
     // Background refresh for "active miners" estimate.
