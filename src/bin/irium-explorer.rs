@@ -16,6 +16,7 @@ use irium_node_rs::rate_limiter::RateLimiter;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
@@ -28,6 +29,7 @@ struct AppState {
     rpc_token: Option<String>,
     miners_cache: Arc<RwLock<MinersCache>>,
     stratum_metrics_url: Option<String>,
+    stratum_port: u16,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -256,6 +258,38 @@ async fn fetch_stratum_health(state: &AppState) -> Option<Value> {
         return None;
     }
     resp.json::<Value>().await.ok()
+}
+
+
+fn socket_ends_with_port(token: &str, port: u16) -> bool {
+    token
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        == Some(port)
+}
+
+async fn count_local_tcp_sessions(port: u16) -> Option<u64> {
+    let output = Command::new("ss")
+        .args(["-Htan", "state", "established"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut count = 0u64;
+    for line in stdout.lines() {
+        let mut cols = line.split_whitespace();
+        let _recvq = cols.next();
+        let _sendq = cols.next();
+        let local = cols.next().unwrap_or("");
+        if socket_ends_with_port(local, port) {
+            count = count.saturating_add(1);
+        }
+    }
+    Some(count)
 }
 
 async fn proxy_text(state: &AppState, path: &str) -> Result<Response, StatusCode> {
@@ -532,12 +566,13 @@ async fn pool_stats(
 
     let sample_window = q.window.unwrap_or(miners.window_blocks.max(1));
     let stratum_metrics = fetch_stratum_metrics(&state).await;
+    let fallback_tcp_sessions = count_local_tcp_sessions(state.stratum_port).await;
 
     let active_tcp_sessions = stratum_metrics
         .as_ref()
         .and_then(|m| m.get("active_tcp_sessions"))
         .cloned()
-        .unwrap_or(Value::Null);
+        .unwrap_or_else(|| fallback_tcp_sessions.map(Value::from).unwrap_or(Value::Null));
     let accepted_shares = stratum_metrics
         .as_ref()
         .and_then(|m| m.get("accepted_shares"))
@@ -916,6 +951,11 @@ async fn main() {
         .ok()
         .map(|v| v.trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty());
+    let stratum_port = env::var("IRIUM_STRATUM_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(3333);
+
 
     let state = AppState {
         client,
@@ -928,6 +968,7 @@ async fn main() {
             ..Default::default()
         })),
         stratum_metrics_url,
+        stratum_port,
     };
 
     // Background refresh for "active miners" estimate.
