@@ -560,23 +560,30 @@ async fn pool_stats(
         .unwrap_or(Value::Null);
 
     let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
-    let tip_entry = if chain_height > 0 {
-        load_block_entry(&state, chain_height).await
+    let last_found = if chain_height > 0 {
+        let floor = chain_height.saturating_sub(512);
+        let mut found: Option<(u64, MinedBlockEntry)> = None;
+        for h in (floor..=chain_height).rev() {
+            if let Some(entry) = load_block_entry(&state, h).await {
+                found = Some((h, entry));
+                break;
+            }
+        }
+        found
     } else {
         None
     };
-    let last_found_block = if tip_entry.is_some() {
-        Value::from(chain_height)
-    } else {
-        Value::Null
-    };
-    let last_found_at = tip_entry
+    let last_found_block = last_found
         .as_ref()
-        .map(|b| Value::from(b.time))
+        .map(|(h, _)| Value::from(*h))
         .unwrap_or(Value::Null);
-    let last_found_miner = tip_entry
+    let last_found_at = last_found
         .as_ref()
-        .map(|b| Value::from(b.miner.clone()))
+        .map(|(_, b)| Value::from(b.time))
+        .unwrap_or(Value::Null);
+    let last_found_miner = last_found
+        .as_ref()
+        .map(|(_, b)| Value::from(b.miner.clone()))
         .unwrap_or(Value::Null);
 
     let payload = json!({
