@@ -91,6 +91,7 @@ pub struct StratumConfig {
     pub max_template_age_seconds: u64,
     pub coinbase_bip34: bool,
     pub found_blocks_file: String,
+    pub keepalive_notify_secs: u64,
 }
 
 #[derive(Clone)]
@@ -411,16 +412,29 @@ async fn handle_conn(
 
     let (rd, mut wr) = stream.into_split();
     let mut lines = BufReader::new(rd).lines();
+    let keepalive_secs = config.keepalive_notify_secs;
 
     let result = loop {
+        let keepalive_wait = sleep(Duration::from_secs(keepalive_secs.max(1)));
+        tokio::pin!(keepalive_wait);
         tokio::select! {
             job = rx.recv() => {
                 if let Ok(j) = job {
                     if session.pkh.is_some() {
                         if let Err(e) = send_set_difficulty(&mut wr, id, session.worker.as_deref(), session.difficulty).await { break Err(e); }
-                        if let Err(e) = send_notify(&mut wr, &session, &j).await { break Err(e); }
+                        if let Err(e) = send_notify(&mut wr, &session, &j, true).await { break Err(e); }
                     }
                     session.current_job = Some(j);
+                }
+            }
+            _ = &mut keepalive_wait, if keepalive_secs > 0 => {
+                if session.pkh.is_some() {
+                    if let Some(job) = session.current_job.clone() {
+                        // Idle keepalive: resend current job without forcing clean-jobs.
+                        if let Err(e) = send_set_difficulty(&mut wr, id, session.worker.as_deref(), session.difficulty).await { break Err(e); }
+                        if let Err(e) = send_notify(&mut wr, &session, &job, false).await { break Err(e); }
+                        debug!("[keepalive] conn={} worker={} job={}", id, session.worker.as_deref().unwrap_or("-"), job.job_id);
+                    }
                 }
             }
             line = lines.next_line() => {
@@ -485,7 +499,7 @@ async fn handle_message(
                     if let Some(job) = cur.clone() {
                         session.current_job = Some(job.clone());
                         send_set_difficulty(wr, conn_id, session.worker.as_deref(), session.difficulty).await?;
-                        send_notify(wr, session, &job).await?;
+                        send_notify(wr, session, &job, true).await?;
                     }
                 }
                 Err(e) => {
@@ -865,6 +879,7 @@ async fn send_notify(
     wr: &mut tokio::net::tcp::OwnedWriteHalf,
     session: &SessionState,
     job: &Job,
+    clean_jobs: bool,
 ) -> Result<()> {
     let pkh = session.pkh.ok_or_else(|| anyhow!("unauthorized"))?;
     let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34);
@@ -896,7 +911,7 @@ async fn send_notify(
             "00000001",
             job.nbits_hex,
             job.ntime_hex,
-            true
+            clean_jobs
         ]
     });
     write_json(wr, &msg).await
