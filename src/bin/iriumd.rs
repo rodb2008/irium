@@ -443,6 +443,16 @@ struct NodeConfig {
     /// Optional relay payout address to advertise to peers.
     #[serde(default)]
     relay_address: Option<String>,
+    /// Optional runtime root directory for blocks/state (used by mobile/Termux).
+    #[serde(default)]
+    data_dir: Option<String>,
+}
+
+fn load_node_config_from_env() -> Option<NodeConfig> {
+    std::env::var("IRIUM_NODE_CONFIG")
+        .ok()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str::<NodeConfig>(&raw).ok())
 }
 
 fn cors_layer() -> Option<CorsLayer> {
@@ -1071,7 +1081,6 @@ fn collect_block_files_from_dir(dir: &std::path::Path, out: &mut Vec<std::path::
         }
     }
 }
-
 
 fn discover_persist_mismatch_heights(
     expected: &[(u64, [u8; 32])],
@@ -2596,7 +2605,9 @@ async fn wallet_import_wif(
     let key = wallet
         .import_wif(&req.wif)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    Ok(Json(WalletImportWifResponse { address: key.address }))
+    Ok(Json(WalletImportWifResponse {
+        address: key.address,
+    }))
 }
 
 async fn wallet_export_seed(
@@ -2608,9 +2619,7 @@ async fn wallet_export_seed(
     require_rpc_auth(&headers)?;
 
     let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-    let seed_hex = wallet
-        .export_seed()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let seed_hex = wallet.export_seed().map_err(|_| StatusCode::BAD_REQUEST)?;
     Ok(Json(WalletSeedResponse { seed_hex }))
 }
 
@@ -2627,7 +2636,9 @@ async fn wallet_import_seed(
     let key = wallet
         .import_seed(&req.seed_hex, req.force.unwrap_or(false))
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    Ok(Json(WalletImportSeedResponse { address: key.address }))
+    Ok(Json(WalletImportSeedResponse {
+        address: key.address,
+    }))
 }
 
 async fn wallet_send(
@@ -3239,7 +3250,6 @@ async fn submit_block(
         txs.push(tx);
     }
 
-
     let block = Block {
         header: block_header,
         transactions: txs,
@@ -3394,6 +3404,20 @@ async fn submit_tx(
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
+    // Load config first so data_dir can influence runtime path selection.
+    let node_cfg: Option<NodeConfig> = load_node_config_from_env();
+    if let Some(data_dir) = node_cfg
+        .as_ref()
+        .and_then(|cfg| cfg.data_dir.as_ref())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        if std::env::var_os("IRIUM_DATA_DIR").is_none() {
+            std::env::set_var("IRIUM_DATA_DIR", data_dir);
+            println!("Using config data_dir via IRIUM_DATA_DIR={}", data_dir);
+        }
+    }
+
     let (blocks_dir, state_dir) = storage::ensure_runtime_dirs().unwrap_or_else(|e| {
         eprintln!("Failed to init runtime dirs: {e}");
         std::process::exit(1);
@@ -3496,12 +3520,6 @@ async fn main() {
         let mut guard = shared_state.lock().unwrap_or_else(|e| e.into_inner());
         guard.set_anchors(a);
     }
-
-    // Optional node configuration from JSON file, e.g. configs/node.json.
-    let node_cfg: Option<NodeConfig> = std::env::var("IRIUM_NODE_CONFIG")
-        .ok()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|raw| serde_json::from_str::<NodeConfig>(&raw).ok());
 
     // Enforce anchor consistency if anchors are present
     if let Some(ref a) = anchors {
@@ -3831,29 +3849,30 @@ async fn main() {
                     seed_list.push("-".to_string());
                 }
 
-                let (local_height, tip_hash, tip_bytes, best_header_height) = match chain_clone.try_lock() {
-                    Ok(g) => {
-                        let local_height = g.tip_height();
-                        let tip_bytes =
-                            g.chain.last().map(|b| b.header.hash()).unwrap_or([0u8; 32]);
-                        let tip = hex::encode(tip_bytes);
-                        let best_hash = g.best_header_hash();
-                        let best_header_height = g
-                            .headers
-                            .get(&best_hash)
-                            .map(|hw| hw.height)
-                            .or_else(|| g.heights.get(&best_hash).copied())
-                            .unwrap_or(local_height)
-                            .max(local_height);
-                        (local_height, tip, tip_bytes, best_header_height)
-                    }
-                    Err(_) => (
-                        status_height.load(Ordering::Relaxed),
-                        last_tip_hash.clone(),
-                        last_tip_bytes,
-                        last_best_header_height.max(status_height.load(Ordering::Relaxed)),
-                    ),
-                };
+                let (local_height, tip_hash, tip_bytes, best_header_height) =
+                    match chain_clone.try_lock() {
+                        Ok(g) => {
+                            let local_height = g.tip_height();
+                            let tip_bytes =
+                                g.chain.last().map(|b| b.header.hash()).unwrap_or([0u8; 32]);
+                            let tip = hex::encode(tip_bytes);
+                            let best_hash = g.best_header_hash();
+                            let best_header_height = g
+                                .headers
+                                .get(&best_hash)
+                                .map(|hw| hw.height)
+                                .or_else(|| g.heights.get(&best_hash).copied())
+                                .unwrap_or(local_height)
+                                .max(local_height);
+                            (local_height, tip, tip_bytes, best_header_height)
+                        }
+                        Err(_) => (
+                            status_height.load(Ordering::Relaxed),
+                            last_tip_hash.clone(),
+                            last_tip_bytes,
+                            last_best_header_height.max(status_height.load(Ordering::Relaxed)),
+                        ),
+                    };
                 last_tip_hash = tip_hash.clone();
                 last_tip_bytes = tip_bytes;
                 last_best_header_height = best_header_height;
@@ -4040,7 +4059,8 @@ async fn main() {
                             Vec::new()
                         } else {
                             let end = (start.saturating_add(799)).min(tip);
-                            let mut v = Vec::with_capacity((end.saturating_sub(start) + 1) as usize);
+                            let mut v =
+                                Vec::with_capacity((end.saturating_sub(start) + 1) as usize);
                             for h in start..=end {
                                 if let Some(block) = guard.chain.get(h as usize) {
                                     v.push((h, block.header.hash()));
