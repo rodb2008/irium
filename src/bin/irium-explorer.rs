@@ -16,7 +16,6 @@ use irium_node_rs::rate_limiter::RateLimiter;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
@@ -29,7 +28,6 @@ struct AppState {
     rpc_token: Option<String>,
     miners_cache: Arc<RwLock<MinersCache>>,
     stratum_metrics_url: Option<String>,
-    stratum_port: u16,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -258,38 +256,6 @@ async fn fetch_stratum_health(state: &AppState) -> Option<Value> {
         return None;
     }
     resp.json::<Value>().await.ok()
-}
-
-
-fn socket_ends_with_port(token: &str, port: u16) -> bool {
-    token
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse::<u16>().ok())
-        == Some(port)
-}
-
-async fn count_local_tcp_sessions(port: u16) -> Option<u64> {
-    let output = Command::new("ss")
-        .args(["-Htan", "state", "established"])
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut count = 0u64;
-    for line in stdout.lines() {
-        let mut cols = line.split_whitespace();
-        let _recvq = cols.next();
-        let _sendq = cols.next();
-        let local = cols.next().unwrap_or("");
-        if socket_ends_with_port(local, port) {
-            count = count.saturating_add(1);
-        }
-    }
-    Some(count)
 }
 
 async fn proxy_text(state: &AppState, path: &str) -> Result<Response, StatusCode> {
@@ -566,13 +532,13 @@ async fn pool_stats(
 
     let sample_window = q.window.unwrap_or(miners.window_blocks.max(1));
     let stratum_metrics = fetch_stratum_metrics(&state).await;
-    let fallback_tcp_sessions = count_local_tcp_sessions(state.stratum_port).await;
+    let stratum_health = fetch_stratum_health(&state).await;
 
     let active_tcp_sessions = stratum_metrics
         .as_ref()
         .and_then(|m| m.get("active_tcp_sessions"))
         .cloned()
-        .unwrap_or_else(|| fallback_tcp_sessions.map(Value::from).unwrap_or(Value::Null));
+        .unwrap_or(Value::Null);
     let accepted_shares = stratum_metrics
         .as_ref()
         .and_then(|m| m.get("accepted_shares"))
@@ -594,6 +560,42 @@ async fn pool_stats(
         .cloned()
         .unwrap_or(Value::Null);
 
+    let template_age_seconds = stratum_health
+        .as_ref()
+        .and_then(|h| h.get("age_seconds"))
+        .and_then(|v| v.as_u64());
+    let last_template_update_ts = template_age_seconds
+        .map(|age| now_unix().saturating_sub(age))
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+
+    let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+    let last_found = if chain_height > 0 {
+        let floor = chain_height.saturating_sub(512);
+        let mut found: Option<(u64, MinedBlockEntry)> = None;
+        for h in (floor..=chain_height).rev() {
+            if let Some(entry) = load_block_entry(&state, h).await {
+                found = Some((h, entry));
+                break;
+            }
+        }
+        found
+    } else {
+        None
+    };
+    let last_found_block = last_found
+        .as_ref()
+        .map(|(h, _)| Value::from(*h))
+        .unwrap_or(Value::Null);
+    let last_found_at = last_found
+        .as_ref()
+        .map(|(_, b)| Value::from(b.time))
+        .unwrap_or(Value::Null);
+    let last_found_miner = last_found
+        .as_ref()
+        .map(|(_, b)| Value::from(b.miner.clone()))
+        .unwrap_or(Value::Null);
+
     let payload = json!({
         "backend_connected": true,
         "stratum_metrics_connected": stratum_metrics.is_some(),
@@ -608,12 +610,18 @@ async fn pool_stats(
         "rejected_shares": rejected_shares,
         "last_share_accepted_at": last_share_accepted_at,
         "last_share_rejected_at": last_share_rejected_at,
+        "template_updated_at": last_template_update_ts,
+        "last_template_update_ts": last_template_update_ts,
+        "template_age_seconds": template_age_seconds,
         "stale_shares": Value::Null,
         "round_luck": Value::Null,
         "round_effort": Value::Null,
         "pool_hashrate": mining.get("hashrate"),
         "difficulty": mining.get("difficulty"),
         "network_height": status.get("height"),
+        "last_found_block": last_found_block,
+        "last_found_at": last_found_at,
+        "last_found_miner": last_found_miner,
         "sample_window_blocks": sample_window,
     });
 
@@ -660,6 +668,8 @@ async fn pool_payouts(
     Ok(Json(json!({
         "height": chain_height,
         "count": payouts.len(),
+        "pending_count": 0,
+        "payout_model": "solo",
         "coinbase_maturity": COINBASE_MATURITY,
         "payouts": payouts
     })))
@@ -951,11 +961,6 @@ async fn main() {
         .ok()
         .map(|v| v.trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty());
-    let stratum_port = env::var("IRIUM_STRATUM_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(3333);
-
 
     let state = AppState {
         client,
@@ -968,7 +973,6 @@ async fn main() {
             ..Default::default()
         })),
         stratum_metrics_url,
-        stratum_port,
     };
 
     // Background refresh for "active miners" estimate.
