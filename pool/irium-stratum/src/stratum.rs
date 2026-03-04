@@ -15,6 +15,9 @@ use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub enum HashCmpMode {
@@ -87,6 +90,7 @@ pub struct StratumConfig {
     pub vardiff_retarget_secs: u64,
     pub max_template_age_seconds: u64,
     pub coinbase_bip34: bool,
+    pub found_blocks_file: String,
 }
 
 #[derive(Clone)]
@@ -224,6 +228,30 @@ struct SubmitRequest {
     height: u64,
     header: SubmitHeader,
     tx_hex: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct FoundBlockRecord {
+    height: u64,
+    hash: String,
+    time: u64,
+    worker: String,
+    address: String,
+}
+
+fn worker_address(worker: &str) -> String {
+    worker.split('.').next().unwrap_or(worker).to_string()
+}
+
+fn append_found_block(path: &str, row: &FoundBlockRecord) -> Result<()> {
+    let p = Path::new(path);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = OpenOptions::new().create(true).append(true).open(p)?;
+    let line = serde_json::to_string(row)?;
+    writeln!(f, "{}", line)?;
+    Ok(())
 }
 
 pub async fn run(config: StratumConfig) -> Result<()> {
@@ -771,6 +799,16 @@ async fn handle_submit(
             .await?;
         if resp.status().is_success() {
             info!("[block] submitted worker={} height={}", worker, job.height);
+            let row = FoundBlockRecord {
+                height: job.height,
+                hash: hex::encode(hash),
+                time: unix_now_secs(),
+                worker: worker.to_string(),
+                address: worker_address(&worker),
+            };
+            if let Err(e) = append_found_block(&config.found_blocks_file, &row) {
+                warn!("[block] record append failed worker={} height={} err={}", worker, job.height, e);
+            }
         } else {
             warn!("[block] submit failed status={} worker={}", resp.status(), worker);
         }

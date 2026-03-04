@@ -99,6 +99,9 @@ async fn main() -> Result<()> {
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(true);
 
+    let found_blocks_file = env::var("IRIUM_STRATUM_FOUND_BLOCKS_FILE")
+        .unwrap_or_else(|_| "/opt/irium-pool/data/found_blocks.jsonl".to_string());
+
     let cfg = StratumConfig {
         bind,
         metrics_bind,
@@ -119,6 +122,7 @@ async fn main() -> Result<()> {
         vardiff_retarget_secs,
         max_template_age_seconds,
         coinbase_bip34,
+        found_blocks_file,
     };
 
     run(cfg).await
