@@ -102,6 +102,11 @@ async fn main() -> Result<()> {
     let found_blocks_file = env::var("IRIUM_STRATUM_FOUND_BLOCKS_FILE")
         .unwrap_or_else(|_| "/opt/irium-pool/data/found_blocks.jsonl".to_string());
 
+    let keepalive_notify_secs = env::var("IRIUM_STRATUM_KEEPALIVE_NOTIFY_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120);
+
     let cfg = StratumConfig {
         bind,
         metrics_bind,
@@ -123,6 +128,7 @@ async fn main() -> Result<()> {
         max_template_age_seconds,
         coinbase_bip34,
         found_blocks_file,
+        keepalive_notify_secs,
     };
 
     run(cfg).await
