@@ -113,7 +113,6 @@ pub fn set_persisted_contiguous_height(height: u64) {
     }
 }
 
-
 pub fn force_set_persisted_contiguous_height(height: u64) {
     PERSISTED_CONTIGUOUS_HEIGHT.store(height, Ordering::Relaxed);
 }
@@ -440,27 +439,29 @@ fn normalize_under(base: &Path, input: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-fn configured_dir(var: &str, default_rel: &Path) -> PathBuf {
+fn configured_dir(var: &str) -> Option<PathBuf> {
     let home = os_home_dir();
 
-    if let Some(raw) = env::var_os(var) {
-        let candidate = PathBuf::from(raw);
-        if let Some(normalized) = normalize_under(&home, &candidate) {
-            if normalized.starts_with(&home) {
-                return normalized;
-            }
-        }
+    let raw = env::var_os(var)?;
+    let candidate = PathBuf::from(raw);
+    let normalized = normalize_under(&home, &candidate)?;
+    if normalized.starts_with(&home) {
+        Some(normalized)
+    } else {
+        None
     }
+}
 
-    home.join(default_rel)
+fn runtime_root_dir() -> PathBuf {
+    configured_dir("IRIUM_DATA_DIR").unwrap_or_else(|| os_home_dir().join(".irium"))
 }
 
 pub fn blocks_dir() -> PathBuf {
-    configured_dir("IRIUM_BLOCKS_DIR", Path::new(".irium/blocks"))
+    configured_dir("IRIUM_BLOCKS_DIR").unwrap_or_else(|| runtime_root_dir().join("blocks"))
 }
 
 pub fn state_dir() -> PathBuf {
-    configured_dir("IRIUM_STATE_DIR", Path::new(".irium/state"))
+    configured_dir("IRIUM_STATE_DIR").unwrap_or_else(|| runtime_root_dir().join("state"))
 }
 
 pub fn ensure_runtime_dirs() -> std::io::Result<(PathBuf, PathBuf)> {
@@ -470,7 +471,6 @@ pub fn ensure_runtime_dirs() -> std::io::Result<(PathBuf, PathBuf)> {
     fs::create_dir_all(&state)?;
     Ok((blocks, state))
 }
-
 
 fn sanitize_filename_fragment(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -495,8 +495,7 @@ fn block_json_path_for_height(height: u64) -> std::io::Result<PathBuf> {
             "height out of range",
         ));
     }
-    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let dir = PathBuf::from(home).join(".irium/blocks");
+    let dir = blocks_dir();
     fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("block_{}.json", height)))
 }
@@ -531,9 +530,11 @@ fn maybe_quarantine_existing_block(height: u64, new_hash: &str) -> std::io::Resu
         return Ok(());
     }
 
-    let stem = sanitize_filename_fragment(path.file_stem().and_then(|s| s.to_str()).unwrap_or("block"));
+    let stem =
+        sanitize_filename_fragment(path.file_stem().and_then(|s| s.to_str()).unwrap_or("block"));
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("json");
-    let existing_hash_suffix = sanitize_filename_fragment(existing_hash.as_deref().unwrap_or("unknown"));
+    let existing_hash_suffix =
+        sanitize_filename_fragment(existing_hash.as_deref().unwrap_or("unknown"));
 
     let mut dest = path.with_file_name(format!("{}.fork.{}.{}", stem, existing_hash_suffix, ext));
     if dest.exists() {
@@ -541,7 +542,10 @@ fn maybe_quarantine_existing_block(height: u64, new_hash: &str) -> std::io::Resu
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        dest = path.with_file_name(format!("{}.fork.{}.{}.{}", stem, existing_hash_suffix, stamp, ext));
+        dest = path.with_file_name(format!(
+            "{}.fork.{}.{}.{}",
+            stem, existing_hash_suffix, stamp, ext
+        ));
     }
 
     // Best-effort quarantine; if rename fails, keep the existing file.
