@@ -532,6 +532,7 @@ async fn pool_stats(
 
     let sample_window = q.window.unwrap_or(miners.window_blocks.max(1));
     let stratum_metrics = fetch_stratum_metrics(&state).await;
+    let stratum_health = fetch_stratum_health(&state).await;
 
     let active_tcp_sessions = stratum_metrics
         .as_ref()
@@ -557,6 +558,15 @@ async fn pool_stats(
         .as_ref()
         .and_then(|m| m.get("last_share_rejected_at"))
         .cloned()
+        .unwrap_or(Value::Null);
+
+    let template_age_seconds = stratum_health
+        .as_ref()
+        .and_then(|h| h.get("age_seconds"))
+        .and_then(|v| v.as_u64());
+    let last_template_update_ts = template_age_seconds
+        .map(|age| now_unix().saturating_sub(age))
+        .map(Value::from)
         .unwrap_or(Value::Null);
 
     let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -600,6 +610,9 @@ async fn pool_stats(
         "rejected_shares": rejected_shares,
         "last_share_accepted_at": last_share_accepted_at,
         "last_share_rejected_at": last_share_rejected_at,
+        "template_updated_at": last_template_update_ts,
+        "last_template_update_ts": last_template_update_ts,
+        "template_age_seconds": template_age_seconds,
         "stale_shares": Value::Null,
         "round_luck": Value::Null,
         "round_effort": Value::Null,
@@ -655,6 +668,8 @@ async fn pool_payouts(
     Ok(Json(json!({
         "height": chain_height,
         "count": payouts.len(),
+        "pending_count": 0,
+        "payout_model": "solo",
         "coinbase_maturity": COINBASE_MATURITY,
         "payouts": payouts
     })))
