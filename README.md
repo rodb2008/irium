@@ -264,7 +264,6 @@ Important:
 - For pool mining, use Stratum (`pool.iriumlabs.org:3333`).
 - Do not point pool miners at local node RPC (`127.0.0.1:38300`) unless you are intentionally doing local template mining.
 
-See `docs/POOL_STRATUM.md` for full miner quickstart, troubleshooting, and operator runbook.
 ## Wallet
 The wallet CLI stores keys in `~/.irium/wallet.json` (override with `IRIUM_WALLET_FILE`).
 ```bash
