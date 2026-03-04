@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 use std::env;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -28,6 +29,7 @@ struct AppState {
     rpc_token: Option<String>,
     miners_cache: Arc<RwLock<MinersCache>>,
     stratum_metrics_url: Option<String>,
+    stratum_found_blocks_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -181,6 +183,35 @@ struct MinedBlockEntry {
     miner: String,
     time: u64,
     hash: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StratumFoundBlockEntry {
+    height: u64,
+    hash: String,
+    time: u64,
+    worker: String,
+    address: String,
+}
+
+fn load_stratum_found_blocks(path: &str, limit: usize) -> Vec<StratumFoundBlockEntry> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file);
+    let mut rows: Vec<StratumFoundBlockEntry> = Vec::new();
+    for line in reader.lines().flatten() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(row) = serde_json::from_str::<StratumFoundBlockEntry>(&line) {
+            rows.push(row);
+        }
+    }
+    rows.sort_by(|a, b| b.height.cmp(&a.height));
+    rows.truncate(limit);
+    rows
 }
 
 async fn load_block_entry(state: &AppState, height: u64) -> Option<MinedBlockEntry> {
@@ -570,30 +601,20 @@ async fn pool_stats(
         .unwrap_or(Value::Null);
 
     let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
-    let last_found = if chain_height > 0 {
-        let floor = chain_height.saturating_sub(512);
-        let mut found: Option<(u64, MinedBlockEntry)> = None;
-        for h in (floor..=chain_height).rev() {
-            if let Some(entry) = load_block_entry(&state, h).await {
-                found = Some((h, entry));
-                break;
-            }
-        }
-        found
-    } else {
-        None
-    };
-    let last_found_block = last_found
+    let attributed = state
+        .stratum_found_blocks_file
         .as_ref()
-        .map(|(h, _)| Value::from(*h))
+        .map(|p| load_stratum_found_blocks(p, 1))
+        .unwrap_or_default();
+    let last_found = attributed.first();
+    let last_found_block = last_found
+        .map(|b| Value::from(b.height))
         .unwrap_or(Value::Null);
     let last_found_at = last_found
-        .as_ref()
-        .map(|(_, b)| Value::from(b.time))
+        .map(|b| Value::from(b.time))
         .unwrap_or(Value::Null);
     let last_found_miner = last_found
-        .as_ref()
-        .map(|(_, b)| Value::from(b.miner.clone()))
+        .map(|b| Value::from(b.address.clone()))
         .unwrap_or(Value::Null);
 
     let payload = json!({
@@ -640,29 +661,35 @@ async fn pool_payouts(
     let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
     let limit = q.limit.unwrap_or(100).min(500);
 
-    let mut payouts = Vec::new();
-    let mut h = chain_height as i64;
-    while h >= 0 && payouts.len() < limit {
-        let height = h as u64;
-        if let Some(entry) = load_block_entry(&state, height).await {
-            let confirmations = chain_height.saturating_sub(height).saturating_add(1);
-            let mature = confirmations >= COINBASE_MATURITY;
-            let maturity_remaining = COINBASE_MATURITY.saturating_sub(confirmations);
+    let records = state
+        .stratum_found_blocks_file
+        .as_ref()
+        .map(|p| load_stratum_found_blocks(p, limit))
+        .unwrap_or_default();
 
-            payouts.push(json!({
-                "height": height,
-                "address": entry.miner,
-                "reward_irm": reward_irm_for_height(height),
-                "time": entry.time,
-                "hash": entry.hash,
-                "status": "on_chain",
-                "confirmations": confirmations,
-                "coinbase_maturity": COINBASE_MATURITY,
-                "mature": mature,
-                "maturity_remaining": maturity_remaining
-            }));
-        }
-        h -= 1;
+    let mut payouts = Vec::new();
+    for row in records {
+        let confirmations = if row.height <= chain_height {
+            chain_height.saturating_sub(row.height).saturating_add(1)
+        } else {
+            0
+        };
+        let mature = confirmations >= COINBASE_MATURITY;
+        let maturity_remaining = COINBASE_MATURITY.saturating_sub(confirmations);
+
+        payouts.push(json!({
+            "height": row.height,
+            "address": row.address,
+            "worker": row.worker,
+            "reward_irm": reward_irm_for_height(row.height),
+            "time": row.time,
+            "hash": row.hash,
+            "status": "on_chain",
+            "confirmations": confirmations,
+            "coinbase_maturity": COINBASE_MATURITY,
+            "mature": mature,
+            "maturity_remaining": maturity_remaining
+        }));
     }
 
     Ok(Json(json!({
@@ -962,6 +989,12 @@ async fn main() {
         .map(|v| v.trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty());
 
+    let stratum_found_blocks_file = env::var("IRIUM_STRATUM_FOUND_BLOCKS_FILE")
+        .ok()
+        .or_else(|| Some("/opt/irium-pool/data/found_blocks.jsonl".to_string()))
+        .filter(|v| !v.trim().is_empty());
+
+
     let state = AppState {
         client,
         node_base: node_base.trim_end_matches('/').to_string(),
@@ -973,6 +1006,7 @@ async fn main() {
             ..Default::default()
         })),
         stratum_metrics_url,
+        stratum_found_blocks_file,
     };
 
     // Background refresh for "active miners" estimate.
