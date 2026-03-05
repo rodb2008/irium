@@ -518,6 +518,21 @@ async fn pool_stats(
         .and_then(|m| m.get("rejected_shares"))
         .cloned()
         .unwrap_or(Value::Null);
+    let blocks_accepted = stratum_metrics
+        .as_ref()
+        .and_then(|m| m.get("blocks_accepted"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let candidates_detected = stratum_metrics
+        .as_ref()
+        .and_then(|m| m.get("candidates_detected"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let candidates_submitted = stratum_metrics
+        .as_ref()
+        .and_then(|m| m.get("candidates_submitted"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let rejected_stale = stratum_metrics
         .as_ref()
         .and_then(|m| m.get("rejected_stale"))
@@ -561,6 +576,9 @@ async fn pool_stats(
         "active_tcp_sessions": active_tcp_sessions,
         "accepted_shares": accepted_shares,
         "rejected_shares": rejected_shares,
+        "blocks_accepted": blocks_accepted,
+        "candidates_detected": candidates_detected,
+        "candidates_submitted": candidates_submitted,
         "rejected_stale": rejected_stale,
         "rejected_low_difficulty": rejected_low_difficulty,
         "rejected_invalid": rejected_invalid,
