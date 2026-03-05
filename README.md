@@ -78,17 +78,6 @@ Telegram https://t.me/iriumlabs
 
 GitHub Organization https://github.com/iriumlabs
 
----
-
-# Consensus Parameters
-
-Algorithm: SHA-256d
-Block Target: 600 seconds
-Difficulty Adjustment: 2016 blocks
-Starting Reward: 50 IRM
-Halving Interval: 210,000 blocks
-Coinbase Maturity: 100 blocks
-Max Supply: 100,000,000 IRM
 
 ---
 
