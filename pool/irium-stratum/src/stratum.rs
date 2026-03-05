@@ -438,7 +438,7 @@ async fn handle_conn(
                 }
             }
             line = lines.next_line() => {
-                let Some(line) = line? else { break Err(anyhow!("EOF")); };
+                let Some(line) = line? else { return Err(anyhow!("EOF")); };
                 let v: Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
                     Err(e) => {
