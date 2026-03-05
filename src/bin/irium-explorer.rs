@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
 use std::env;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -29,7 +28,6 @@ struct AppState {
     rpc_token: Option<String>,
     miners_cache: Arc<RwLock<MinersCache>>,
     stratum_metrics_url: Option<String>,
-    stratum_found_blocks_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -126,28 +124,8 @@ fn check_rate(state: &AppState, addr: &SocketAddr, headers: &HeaderMap) -> Resul
     if api_authorized(headers, &state.api_token) {
         return Ok(());
     }
-
-    // Behind reverse proxies, use forwarded client IP when present to avoid
-    // collapsing all traffic into the proxy's source IP bucket.
-    let client_key = headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| addr.ip().to_string());
-
     let mut limiter = state.limiter.lock().unwrap_or_else(|e| e.into_inner());
-    if limiter.is_allowed(&client_key) {
+    if limiter.is_allowed(&addr.ip().to_string()) {
         Ok(())
     } else {
         Err(StatusCode::TOO_MANY_REQUESTS)
@@ -183,35 +161,6 @@ struct MinedBlockEntry {
     miner: String,
     time: u64,
     hash: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct StratumFoundBlockEntry {
-    height: u64,
-    hash: String,
-    time: u64,
-    worker: String,
-    address: String,
-}
-
-fn load_stratum_found_blocks(path: &str, limit: usize) -> Vec<StratumFoundBlockEntry> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-    let reader = BufReader::new(file);
-    let mut rows: Vec<StratumFoundBlockEntry> = Vec::new();
-    for line in reader.lines().flatten() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(row) = serde_json::from_str::<StratumFoundBlockEntry>(&line) {
-            rows.push(row);
-        }
-    }
-    rows.sort_by(|a, b| b.height.cmp(&a.height));
-    rows.truncate(limit);
-    rows
 }
 
 async fn load_block_entry(state: &AppState, height: u64) -> Option<MinedBlockEntry> {
@@ -272,16 +221,6 @@ async fn proxy_value(state: &AppState, path: &str) -> Result<Value, StatusCode> 
 async fn fetch_stratum_metrics(state: &AppState) -> Option<Value> {
     let base = state.stratum_metrics_url.as_ref()?;
     let url = node_url(base, "/metrics");
-    let resp = state.client.get(url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    resp.json::<Value>().await.ok()
-}
-
-async fn fetch_stratum_health(state: &AppState) -> Option<Value> {
-    let base = state.stratum_metrics_url.as_ref()?;
-    let url = node_url(base, "/health");
     let resp = state.client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -563,7 +502,6 @@ async fn pool_stats(
 
     let sample_window = q.window.unwrap_or(miners.window_blocks.max(1));
     let stratum_metrics = fetch_stratum_metrics(&state).await;
-    let stratum_health = fetch_stratum_health(&state).await;
 
     let active_tcp_sessions = stratum_metrics
         .as_ref()
@@ -580,6 +518,26 @@ async fn pool_stats(
         .and_then(|m| m.get("rejected_shares"))
         .cloned()
         .unwrap_or(Value::Null);
+    let rejected_stale = stratum_metrics
+        .as_ref()
+        .and_then(|m| m.get("rejected_stale"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let rejected_low_difficulty = stratum_metrics
+        .as_ref()
+        .and_then(|m| m.get("rejected_low_difficulty"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let rejected_invalid = stratum_metrics
+        .as_ref()
+        .and_then(|m| m.get("rejected_invalid"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let rejected_duplicate = stratum_metrics
+        .as_ref()
+        .and_then(|m| m.get("rejected_duplicate"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let last_share_accepted_at = stratum_metrics
         .as_ref()
         .and_then(|m| m.get("last_share_accepted_at"))
@@ -589,32 +547,6 @@ async fn pool_stats(
         .as_ref()
         .and_then(|m| m.get("last_share_rejected_at"))
         .cloned()
-        .unwrap_or(Value::Null);
-
-    let template_age_seconds = stratum_health
-        .as_ref()
-        .and_then(|h| h.get("age_seconds"))
-        .and_then(|v| v.as_u64());
-    let last_template_update_ts = template_age_seconds
-        .map(|age| now_unix().saturating_sub(age))
-        .map(Value::from)
-        .unwrap_or(Value::Null);
-
-    let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
-    let attributed = state
-        .stratum_found_blocks_file
-        .as_ref()
-        .map(|p| load_stratum_found_blocks(p, 1))
-        .unwrap_or_default();
-    let last_found = attributed.first();
-    let last_found_block = last_found
-        .map(|b| Value::from(b.height))
-        .unwrap_or(Value::Null);
-    let last_found_at = last_found
-        .map(|b| Value::from(b.time))
-        .unwrap_or(Value::Null);
-    let last_found_miner = last_found
-        .map(|b| Value::from(b.address.clone()))
         .unwrap_or(Value::Null);
 
     let payload = json!({
@@ -629,20 +561,18 @@ async fn pool_stats(
         "active_tcp_sessions": active_tcp_sessions,
         "accepted_shares": accepted_shares,
         "rejected_shares": rejected_shares,
+        "rejected_stale": rejected_stale,
+        "rejected_low_difficulty": rejected_low_difficulty,
+        "rejected_invalid": rejected_invalid,
+        "rejected_duplicate": rejected_duplicate,
         "last_share_accepted_at": last_share_accepted_at,
         "last_share_rejected_at": last_share_rejected_at,
-        "template_updated_at": last_template_update_ts,
-        "last_template_update_ts": last_template_update_ts,
-        "template_age_seconds": template_age_seconds,
         "stale_shares": Value::Null,
         "round_luck": Value::Null,
         "round_effort": Value::Null,
         "pool_hashrate": mining.get("hashrate"),
         "difficulty": mining.get("difficulty"),
         "network_height": status.get("height"),
-        "last_found_block": last_found_block,
-        "last_found_at": last_found_at,
-        "last_found_miner": last_found_miner,
         "sample_window_blocks": sample_window,
     });
 
@@ -661,42 +591,34 @@ async fn pool_payouts(
     let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
     let limit = q.limit.unwrap_or(100).min(500);
 
-    let records = state
-        .stratum_found_blocks_file
-        .as_ref()
-        .map(|p| load_stratum_found_blocks(p, limit))
-        .unwrap_or_default();
-
     let mut payouts = Vec::new();
-    for row in records {
-        let confirmations = if row.height <= chain_height {
-            chain_height.saturating_sub(row.height).saturating_add(1)
-        } else {
-            0
-        };
-        let mature = confirmations >= COINBASE_MATURITY;
-        let maturity_remaining = COINBASE_MATURITY.saturating_sub(confirmations);
+    let mut h = chain_height as i64;
+    while h >= 0 && payouts.len() < limit {
+        let height = h as u64;
+        if let Some(entry) = load_block_entry(&state, height).await {
+            let confirmations = chain_height.saturating_sub(height).saturating_add(1);
+            let mature = confirmations >= COINBASE_MATURITY;
+            let maturity_remaining = COINBASE_MATURITY.saturating_sub(confirmations);
 
-        payouts.push(json!({
-            "height": row.height,
-            "address": row.address,
-            "worker": row.worker,
-            "reward_irm": reward_irm_for_height(row.height),
-            "time": row.time,
-            "hash": row.hash,
-            "status": "on_chain",
-            "confirmations": confirmations,
-            "coinbase_maturity": COINBASE_MATURITY,
-            "mature": mature,
-            "maturity_remaining": maturity_remaining
-        }));
+            payouts.push(json!({
+                "height": height,
+                "address": entry.miner,
+                "reward_irm": reward_irm_for_height(height),
+                "time": entry.time,
+                "hash": entry.hash,
+                "status": "on_chain",
+                "confirmations": confirmations,
+                "coinbase_maturity": COINBASE_MATURITY,
+                "mature": mature,
+                "maturity_remaining": maturity_remaining
+            }));
+        }
+        h -= 1;
     }
 
     Ok(Json(json!({
         "height": chain_height,
         "count": payouts.len(),
-        "pending_count": 0,
-        "payout_model": "solo",
         "coinbase_maturity": COINBASE_MATURITY,
         "payouts": payouts
     })))
@@ -767,6 +689,88 @@ async fn pool_workers(
     })))
 }
 
+async fn pool_distribution(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<PoolQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+
+    let status = proxy_value(&state, "/status").await?;
+    let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let window = q.window.unwrap_or(4000).clamp(200, 20000);
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let start = chain_height.saturating_sub(window.saturating_sub(1));
+
+    let mining = proxy_value(&state, "/rpc/mining_metrics").await.ok();
+    let network_hashrate = value_f64(mining.as_ref().and_then(|m| m.get("hashrate")));
+
+    let mut by_addr: HashMap<String, u64> = HashMap::new();
+    let mut scanned_blocks = 0u64;
+    for h in (start..=chain_height).rev() {
+        let Some(entry) = load_block_entry(&state, h).await else {
+            continue;
+        };
+        scanned_blocks = scanned_blocks.saturating_add(1);
+        if entry.miner.is_empty() || entry.miner == "N/A" {
+            continue;
+        }
+        *by_addr.entry(entry.miner).or_insert(0) += 1;
+    }
+
+    let total_found: u64 = by_addr.values().copied().sum();
+    let mut rows: Vec<(String, u64)> = by_addr.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let unique_addresses = rows.len() as u64;
+
+    let top1_share_pct = rows
+        .first()
+        .map(|(_, c)| if total_found > 0 { (*c as f64) * 100.0 / (total_found as f64) } else { 0.0 })
+        .unwrap_or(0.0);
+    let top5_total: u64 = rows.iter().take(5).map(|(_, c)| *c).sum();
+    let top5_share_pct = if total_found > 0 {
+        (top5_total as f64) * 100.0 / (total_found as f64)
+    } else {
+        0.0
+    };
+
+    let distribution: Vec<Value> = rows
+        .into_iter()
+        .take(limit)
+        .enumerate()
+        .map(|(i, (address, blocks_found))| {
+            let share = if total_found > 0 {
+                (blocks_found as f64) / (total_found as f64)
+            } else {
+                0.0
+            };
+            let est_hashrate = network_hashrate.map(|h| h * share);
+            json!({
+                "rank": i + 1,
+                "address": address,
+                "blocks_found": blocks_found,
+                "share_pct": share * 100.0,
+                "estimated_hashrate_hs": est_hashrate,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "height": chain_height,
+        "window_scanned": window,
+        "scanned_blocks": scanned_blocks,
+        "total_found_blocks": total_found,
+        "unique_addresses": unique_addresses,
+        "network_hashrate_hs": network_hashrate,
+        "top1_share_pct": top1_share_pct,
+        "top5_share_pct": top5_share_pct,
+        "distribution": distribution,
+    })))
+}
+
 async fn pool_health(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -798,26 +802,6 @@ async fn pool_health(
         }
     };
     let mining_latency_ms = t_mining.elapsed().as_millis() as u64;
-
-    let stratum_health = fetch_stratum_health(&state).await;
-    let stratum_status = stratum_health
-        .as_ref()
-        .and_then(|v| v.get("status"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let stratum_age_seconds = stratum_health
-        .as_ref()
-        .and_then(|v| v.get("age_seconds"))
-        .and_then(|v| v.as_u64());
-    let stratum_height = stratum_health
-        .as_ref()
-        .and_then(|v| v.get("height"))
-        .and_then(|v| v.as_u64());
-    let stratum_prevhash = stratum_health
-        .as_ref()
-        .and_then(|v| v.get("prevhash"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
 
     let chain_height = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
     let peers = status
@@ -856,10 +840,6 @@ async fn pool_health(
         "difficulty": mining.get("difficulty"),
         "network_hashrate_hs": mining.get("hashrate"),
         "avg_block_time": mining.get("avg_block_time"),
-        "stratum_status": stratum_status,
-        "stratum_age_seconds": stratum_age_seconds,
-        "stratum_height": stratum_height,
-        "stratum_prevhash": stratum_prevhash,
         "tip_time": tip_time,
         "freshness_secs": freshness_secs,
         "latency_ms": {
@@ -982,18 +962,12 @@ async fn main() {
     let miners_refresh_secs = env::var("IRIUM_EXPLORER_MINERS_REFRESH_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(60);
+        .unwrap_or(15);
 
     let stratum_metrics_url = env::var("IRIUM_STRATUM_TELEMETRY_URL")
         .ok()
         .map(|v| v.trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty());
-
-    let stratum_found_blocks_file = env::var("IRIUM_STRATUM_FOUND_BLOCKS_FILE")
-        .ok()
-        .or_else(|| Some("/opt/irium-pool/data/found_blocks.jsonl".to_string()))
-        .filter(|v| !v.trim().is_empty());
-
 
     let state = AppState {
         client,
@@ -1006,14 +980,13 @@ async fn main() {
             ..Default::default()
         })),
         stratum_metrics_url,
-        stratum_found_blocks_file,
     };
 
     // Background refresh for "active miners" estimate.
     tokio::spawn(miners_refresher_task(
         state.clone(),
         miners_window_blocks,
-        Duration::from_secs(miners_refresh_secs.max(10)),
+        Duration::from_secs(miners_refresh_secs.max(3)),
     ));
 
     let app = Router::new()
@@ -1046,6 +1019,8 @@ async fn main() {
         .route("/api/pool/payouts", get(pool_payouts))
         .route("/pool/workers", get(pool_workers))
         .route("/api/pool/workers", get(pool_workers))
+        .route("/pool/distribution", get(pool_distribution))
+        .route("/api/pool/distribution", get(pool_distribution))
         .route("/pool/health", get(pool_health))
         .route("/api/pool/health", get(pool_health))
         .route("/pool/account/:address", get(pool_account))
