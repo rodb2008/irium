@@ -488,6 +488,60 @@ fn sanitize_filename_fragment(input: &str) -> String {
     }
 }
 
+fn validate_block_data_path(path: &Path, height: u64) -> std::io::Result<()> {
+    let expected_name = format!("block_{}.json", height);
+    let file_name = path.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid block filename")
+    })?;
+    if file_name != expected_name {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unexpected block filename",
+        ));
+    }
+
+    let blocks = blocks_dir();
+    fs::create_dir_all(&blocks)?;
+    let blocks_canon = fs::canonicalize(&blocks).unwrap_or(blocks);
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent directory")
+    })?;
+    let parent_canon = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+
+    if parent_canon != blocks_canon {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "block path escapes blocks directory",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_block_quarantine_path(path: &Path, height: u64) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing quarantine parent",
+        )
+    })?;
+    let main_path = block_json_path_for_height(height)?;
+    let main_parent = main_path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing block parent")
+    })?;
+    let parent_canon = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    let main_parent_canon =
+        fs::canonicalize(main_parent).unwrap_or_else(|_| main_parent.to_path_buf());
+    if parent_canon != main_parent_canon {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "quarantine path escapes blocks directory",
+        ));
+    }
+    Ok(())
+}
+
 fn block_json_path_for_height(height: u64) -> std::io::Result<PathBuf> {
     if height > 100_000_000 {
         return Err(std::io::Error::new(
@@ -497,7 +551,9 @@ fn block_json_path_for_height(height: u64) -> std::io::Result<PathBuf> {
     }
     let dir = blocks_dir();
     fs::create_dir_all(&dir)?;
-    Ok(dir.join(format!("block_{}.json", height)))
+    let path = dir.join(format!("block_{}.json", height));
+    validate_block_data_path(&path, height)?;
+    Ok(path)
 }
 
 fn maybe_quarantine_existing_block(height: u64, new_hash: &str) -> std::io::Result<()> {
@@ -506,6 +562,8 @@ fn maybe_quarantine_existing_block(height: u64, new_hash: &str) -> std::io::Resu
     if !path.exists() {
         return Ok(());
     }
+
+    validate_block_data_path(&path, height)?;
 
     let existing = match fs::read_to_string(&path) {
         Ok(v) => v,
@@ -549,7 +607,12 @@ fn maybe_quarantine_existing_block(height: u64, new_hash: &str) -> std::io::Resu
     }
 
     // Best-effort quarantine; if rename fails, keep the existing file.
-    let _ = fs::rename(path, dest);
+    let _ = (|| -> std::io::Result<()> {
+        validate_block_data_path(&path, height)?;
+        validate_block_quarantine_path(&dest, height)?;
+        fs::rename(path, dest)?;
+        Ok(())
+    })();
     Ok(())
 }
 
@@ -595,6 +658,7 @@ fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
     };
 
     let json = serde_json::to_string_pretty(&jb)?;
+    validate_block_data_path(&path, height)?;
     fs::write(&path, json)?;
     set_persisted_height(height);
     set_persisted_max_height_on_disk(height);

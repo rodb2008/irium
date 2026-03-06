@@ -804,7 +804,7 @@ async fn handle_submit(
         };
 
         let url = format!("{}/rpc/submit_block", config.rpc_base.trim_end_matches('/'));
-        let client = reqwest::Client::builder().danger_accept_invalid_certs(true).build()?;
+        let client = reqwest::Client::builder().build()?;
         let resp = client
             .post(url)
             .bearer_auth(&config.rpc_token)
@@ -935,11 +935,10 @@ fn merkle_steps_hex(coinbase_hash: [u8; 32], branches: &[[u8; 32]]) -> String {
 
 fn decode_hex4(s: &str) -> Result<[u8; 4]> {
     let raw = hex::decode(s).map_err(|e| anyhow!("hex decode: {e}"))?;
-    if raw.len() != 4 {
-        return Err(anyhow!("expected 4-byte hex, got {} bytes", raw.len()));
-    }
-    let mut out = [0u8; 4];
-    out.copy_from_slice(&raw);
+    let out: [u8; 4] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("expected 4-byte hex, got {} bytes", raw.len()))?;
     Ok(out)
 }
 
