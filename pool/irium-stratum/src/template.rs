@@ -32,13 +32,16 @@ impl TemplateClient {
     pub fn new(base: String, token: String) -> Result<Self> {
         // Single global client reused for all template requests.
         let client = Client::builder()
-            .danger_accept_invalid_certs(true)
             .http1_only()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| anyhow!("client build: {e}"))?;
-        Ok(Self { client, base, token })
+        Ok(Self {
+            client,
+            base,
+            token,
+        })
     }
 
     async fn fetch_once(&self) -> Result<GetBlockTemplate> {
@@ -74,7 +77,11 @@ impl TemplateClient {
                     last_err = Some(e.context(format!("attempt {}", attempt + 1)));
                     if attempt + 1 < backoffs_ms.len() {
                         if let Some(err) = &last_err {
-                            debug!("[tmpl] transient fetch error (attempt {}): {:#}", attempt + 1, err);
+                            debug!(
+                                "[tmpl] transient fetch error (attempt {}): {:#}",
+                                attempt + 1,
+                                err
+                            );
                         }
                         sleep(Duration::from_millis(*backoff)).await;
                     }
