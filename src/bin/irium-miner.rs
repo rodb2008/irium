@@ -457,6 +457,8 @@ struct JsonBlock {
     height: u64,
     header: JsonHeader,
     tx_hex: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submit_source: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -464,6 +466,8 @@ struct SubmitBlockRequest {
     height: u64,
     header: JsonHeader,
     tx_hex: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submit_source: Option<String>,
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -656,6 +660,7 @@ fn submit_block_to_node(height: u64, block: &Block) -> Result<(), String> {
             .iter()
             .map(|tx| hex::encode(tx.serialize()))
             .collect(),
+        submit_source: Some("direct_node".to_string()),
     };
 
     let client = rpc_client()?;
@@ -1230,6 +1235,7 @@ fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
             .iter()
             .map(|tx| hex::encode(tx.serialize()))
             .collect(),
+        submit_source: Some("direct_node".to_string()),
     };
 
     let json = serde_json::to_string_pretty(&jb)?;

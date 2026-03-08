@@ -430,6 +430,8 @@ struct SubmitBlockRequest {
     height: u64,
     header: SubmitBlockHeader,
     tx_hex: Vec<String>,
+    #[serde(default)]
+    submit_source: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3013,7 +3015,8 @@ fn block_json_for(height: u64, block: &Block) -> Value {
             "hash": hex::encode(header.hash()),
         },
         "tx_hex": block.transactions.iter().map(|tx| hex::encode(tx.serialize())).collect::<Vec<_>>(),
-        "miner_address": miner_address_from_block(block)
+        "miner_address": miner_address_from_block(block),
+        "submit_source": storage::read_block_submit_source(height),
     })
 }
 async fn get_block(
@@ -3286,6 +3289,10 @@ async fn submit_block(
     // Persist JSON representation alongside miner-written blocks.
     if let Err(_e) = storage::write_block_json(req.height, &block) {
         // The block is already in memory; surface a server error if disk write fails.
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    if let Err(_e) = storage::write_block_json_with_source(req.height, &block, req.submit_source.as_deref()) {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
