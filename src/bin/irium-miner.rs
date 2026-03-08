@@ -1988,6 +1988,7 @@ fn main() {
     let params = ChainParams {
         genesis_block: block,
         pow_limit,
+        htlcv1_activation_height: None,
     };
 
     let mut state = ChainState::new(params.clone());

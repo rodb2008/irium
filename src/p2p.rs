@@ -6977,6 +6977,7 @@ mod tests {
         let params = ChainParams {
             genesis_block: genesis,
             pow_limit: crate::pow::Target { bits: 0x207fffff },
+            htlcv1_activation_height: None,
         };
         let mut chain = ChainState::new(params);
 
