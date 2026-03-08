@@ -229,6 +229,7 @@ struct SubmitRequest {
     height: u64,
     header: SubmitHeader,
     tx_hex: Vec<String>,
+    submit_source: String,
 }
 
 #[derive(serde::Serialize)]
@@ -801,6 +802,7 @@ async fn handle_submit(
                 hash: hex::encode(hash),
             },
             tx_hex,
+            submit_source: "pool_stratum".to_string(),
         };
 
         let url = format!("{}/rpc/submit_block", config.rpc_base.trim_end_matches('/'));

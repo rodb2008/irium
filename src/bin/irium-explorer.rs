@@ -161,6 +161,7 @@ struct MinedBlockEntry {
     miner: String,
     time: u64,
     hash: String,
+    source: Option<String>,
 }
 
 async fn load_block_entry(state: &AppState, height: u64) -> Option<MinedBlockEntry> {
@@ -185,10 +186,16 @@ async fn load_block_entry(state: &AppState, height: u64) -> Option<MinedBlockEnt
         .unwrap_or("")
         .to_string();
 
+    let source = block
+        .get("submit_source")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     Some(MinedBlockEntry {
         miner,
         time,
         hash,
+        source,
     })
 }
 
@@ -518,11 +525,30 @@ async fn pool_stats(
         .and_then(|m| m.get("rejected_shares"))
         .cloned()
         .unwrap_or(Value::Null);
+    let mut chain_pool_blocks = 0u64;
+    let mut h = status.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
+    let mut scanned = 0u64;
+    while h >= 0 && scanned < sample_window {
+        let height = h as u64;
+        if let Some(entry) = load_block_entry(&state, height).await {
+            scanned += 1;
+            if entry.source.as_deref() == Some("pool_stratum") {
+                chain_pool_blocks = chain_pool_blocks.saturating_add(1);
+            }
+        }
+        h -= 1;
+    }
+
     let blocks_accepted = stratum_metrics
         .as_ref()
         .and_then(|m| m.get("blocks_accepted"))
-        .cloned()
-        .unwrap_or(Value::Null);
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let blocks_accepted = if blocks_accepted > 0 {
+        blocks_accepted
+    } else {
+        chain_pool_blocks
+    };
     let candidates_detected = stratum_metrics
         .as_ref()
         .and_then(|m| m.get("candidates_detected"))
@@ -578,6 +604,7 @@ async fn pool_stats(
         "accepted_shares": accepted_shares,
         "rejected_shares": rejected_shares,
         "blocks_accepted": blocks_accepted,
+        "pool_blocks_accepted_chain_attributed": chain_pool_blocks,
         "candidates_detected": candidates_detected,
         "candidates_submitted": candidates_submitted,
         "rejected_stale": rejected_stale,
@@ -626,6 +653,7 @@ async fn pool_payouts(
                 "time": entry.time,
                 "hash": entry.hash,
                 "status": "on_chain",
+                "source": entry.source.clone().unwrap_or_else(|| "unknown".to_string()),
                 "confirmations": confirmations,
                 "coinbase_maturity": COINBASE_MATURITY,
                 "mature": mature,
@@ -920,6 +948,7 @@ async fn pool_account(
             "hash": entry.hash,
             "reward_irm": reward,
             "status": "on_chain",
+            "source": entry.source.clone().unwrap_or_else(|| "unknown".to_string()),
             "confirmations": confirmations,
             "coinbase_maturity": COINBASE_MATURITY,
             "mature": mature,

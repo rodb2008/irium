@@ -380,6 +380,8 @@ struct JsonBlock {
     tx_hex: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     miner_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submit_source: Option<String>,
 }
 
 #[cfg(unix)]
@@ -655,6 +657,7 @@ fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
             .map(|tx| hex::encode(tx.serialize()))
             .collect(),
         miner_address: miner_address_from_block(block),
+        submit_source: None,
     };
 
     let json = serde_json::to_string_pretty(&jb)?;
@@ -664,6 +667,41 @@ fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
     set_persisted_max_height_on_disk(height);
     maybe_advance_contiguous(&dir, height);
     Ok(())
+}
+
+pub fn write_block_json_with_source(
+    height: u64,
+    block: &Block,
+    submit_source: Option<&str>,
+) -> std::io::Result<()> {
+    let path = block_json_path_for_height(height)?;
+    let mut value = if path.exists() {
+        let raw = fs::read_to_string(&path)?;
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    if let Some(src) = submit_source {
+        value["submit_source"] = serde_json::Value::String(src.to_string());
+    }
+
+    validate_block_data_path(&path, height)?;
+    let json = serde_json::to_string_pretty(&value)?;
+    fs::write(&path, json)?;
+    let _ = block;
+    Ok(())
+}
+
+pub fn read_block_submit_source(height: u64) -> Option<String> {
+    let path = block_json_path_for_height(height).ok()?;
+    let raw = fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("submit_source")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 pub fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
