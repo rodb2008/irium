@@ -42,13 +42,23 @@ use irium_node_rs::pow::{meets_target, sha256d, Target};
 use irium_node_rs::rate_limiter::RateLimiter;
 use irium_node_rs::reputation::ReputationManager;
 use irium_node_rs::storage;
-use irium_node_rs::tx::{decode_full_tx, Transaction, TxInput, TxOutput};
+use irium_node_rs::tx::{
+    decode_full_tx, encode_htlcv1_claim_witness, encode_htlcv1_refund_witness,
+    encode_htlcv1_script, parse_htlcv1_script, parse_output_encumbrance, HtlcV1Output,
+    OutputEncumbrance, Transaction, TxInput, TxOutput,
+};
 use irium_node_rs::wallet_store::{WalletKey, WalletManager};
 use k256::ecdsa::signature::hazmat::PrehashSigner;
 use k256::ecdsa::{Signature, SigningKey};
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
 const MAX_SUBMIT_BLOCK_TXS: usize = 10_000;
+
+fn htlcv1_activation_height() -> Option<u64> {
+    env::var("IRIUM_HTLCV1_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -362,6 +372,85 @@ struct WalletSendResponse {
     fee: u64,
     total_input: u64,
     change: u64,
+}
+
+#[derive(Deserialize)]
+struct CreateHtlcRequest {
+    amount: String,
+    recipient_address: String,
+    refund_address: String,
+    secret_hash_hex: String,
+    timeout_height: u64,
+    fee_per_byte: Option<u64>,
+    broadcast: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct CreateHtlcResponse {
+    txid: String,
+    accepted: bool,
+    raw_tx_hex: String,
+    htlc_vout: u32,
+    expected_hash: String,
+    timeout_height: u64,
+    recipient_address: String,
+    refund_address: String,
+}
+
+#[derive(Deserialize)]
+struct DecodeHtlcRequest {
+    raw_tx_hex: String,
+    vout: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct DecodeHtlcResponse {
+    found: bool,
+    vout: Option<u32>,
+    output_type: String,
+    expected_hash: Option<String>,
+    timeout_height: Option<u64>,
+    recipient_address: Option<String>,
+    refund_address: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SpendHtlcRequest {
+    funding_txid: String,
+    vout: u32,
+    destination_address: String,
+    fee_per_byte: Option<u64>,
+    broadcast: Option<bool>,
+    secret_hex: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SpendHtlcResponse {
+    txid: String,
+    accepted: bool,
+    raw_tx_hex: String,
+    fee: u64,
+}
+
+#[derive(Deserialize)]
+struct InspectHtlcQuery {
+    txid: String,
+    vout: u32,
+}
+
+#[derive(Serialize)]
+struct InspectHtlcResponse {
+    exists: bool,
+    funded: bool,
+    unspent: bool,
+    spent: bool,
+    spend_type: Option<String>,
+    claimable_now: bool,
+    refundable_now: bool,
+    timeout_height: Option<u64>,
+    expected_hash: Option<String>,
+    recipient_address: Option<String>,
+    refund_address: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -792,6 +881,16 @@ fn base58_p2pkh_from_hash(pkh: &[u8; 20]) -> String {
     let mut full = body;
     full.extend_from_slice(checksum);
     bs58::encode(full).into_string()
+}
+
+fn hex_to_32(s: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(s).map_err(|e| e.to_string())?;
+    if bytes.len() != 32 {
+        return Err("expected 32-byte hex".to_string());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 fn parse_irm(s: &str) -> Result<u64, String> {
@@ -2893,6 +2992,492 @@ async fn wallet_send(
     }))
 }
 
+
+async fn create_htlc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<CreateHtlcRequest>,
+) -> Result<Json<CreateHtlcResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .htlcv1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    let amount = parse_irm(&req.amount).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if amount == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let recipient_vec = base58_p2pkh_to_hash(&req.recipient_address).ok_or(StatusCode::BAD_REQUEST)?;
+    let refund_vec = base58_p2pkh_to_hash(&req.refund_address).ok_or(StatusCode::BAD_REQUEST)?;
+    if recipient_vec.len() != 20 || refund_vec.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut recipient_pkh = [0u8; 20];
+    recipient_pkh.copy_from_slice(&recipient_vec);
+    let mut refund_pkh = [0u8; 20];
+    refund_pkh.copy_from_slice(&refund_vec);
+
+    let hash_bytes = hex::decode(req.secret_hash_hex.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if hash_bytes.len() != 32 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut expected_hash = [0u8; 32];
+    expected_hash.copy_from_slice(&hash_bytes);
+
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| StatusCode::BAD_REQUEST)?;
+        for key in keys {
+            let bytes = hex::decode(&key.pkh).map_err(|_| StatusCode::BAD_REQUEST)?;
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            key_map.insert(arr, key);
+        }
+    }
+    if key_map.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if key_map.contains_key(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+
+    if utxos.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
+
+    let mut fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    if fee_per_byte == 0 {
+        fee_per_byte = 1;
+    }
+
+    let mut selected: Vec<WalletUtxo> = Vec::new();
+    let mut total = 0u64;
+    let mut fee = 0u64;
+    for utxo in utxos.iter() {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+            continue;
+        }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.output.value);
+        let outputs = if total > amount { 2 } else { 1 };
+        fee = estimate_tx_size(selected.len(), outputs).saturating_mul(fee_per_byte);
+        if total >= amount.saturating_add(fee) {
+            break;
+        }
+    }
+
+    if total < amount.saturating_add(fee) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let htlc = HtlcV1Output {
+        expected_hash,
+        recipient_pkh,
+        refund_pkh,
+        timeout_height: req.timeout_height,
+    };
+
+    let inputs: Vec<TxInput> = selected
+        .iter()
+        .map(|u| TxInput {
+            prev_txid: u.outpoint.txid,
+            prev_index: u.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        })
+        .collect();
+
+    let mut outputs = vec![TxOutput {
+        value: amount,
+        script_pubkey: encode_htlcv1_script(&htlc),
+    }];
+
+    let mut change = total.saturating_sub(amount).saturating_sub(fee);
+    if change > 0 {
+        let change_pkh = selected
+            .first()
+            .map(|u| u.pkh)
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        outputs.push(TxOutput {
+            value: change,
+            script_pubkey: p2pkh_script(&change_pkh),
+        });
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+
+    for _ in 0..2 {
+        sign_wallet_inputs(&mut tx, &selected, &key_map)?;
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if change >= extra {
+                fee = needed_fee;
+                change = change.saturating_sub(extra);
+                if tx.outputs.len() > 1 {
+                    tx.outputs[1].value = change;
+                }
+                continue;
+            } else {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.calculate_fees(&tx).map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+
+    let raw = tx.serialize();
+    let txid = tx.txid();
+    let txid_hex = hex::encode(txid);
+    let mut accepted = false;
+
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid) {
+            accepted = mempool.add_transaction(tx.clone(), raw.clone(), fee_checked).is_ok();
+        }
+    }
+
+    Ok(Json(CreateHtlcResponse {
+        txid: txid_hex,
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        htlc_vout: 0,
+        expected_hash: hex::encode(expected_hash),
+        timeout_height: req.timeout_height,
+        recipient_address: req.recipient_address,
+        refund_address: req.refund_address,
+    }))
+}
+
+async fn decode_htlc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<DecodeHtlcRequest>,
+) -> Result<Json<DecodeHtlcResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let raw = hex::decode(req.raw_tx_hex.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let tx = decode_full_tx(&raw).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    if tx.outputs.is_empty() {
+        return Ok(Json(DecodeHtlcResponse {
+            found: false,
+            vout: None,
+            output_type: "none".to_string(),
+            expected_hash: None,
+            timeout_height: None,
+            recipient_address: None,
+            refund_address: None,
+        }));
+    }
+
+    let idx = req.vout.unwrap_or(0) as usize;
+    if idx >= tx.outputs.len() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let out = &tx.outputs[idx];
+    match parse_output_encumbrance(&out.script_pubkey) {
+        OutputEncumbrance::HtlcV1(htlc) => Ok(Json(DecodeHtlcResponse {
+            found: true,
+            vout: Some(idx as u32),
+            output_type: "htlcv1".to_string(),
+            expected_hash: Some(hex::encode(htlc.expected_hash)),
+            timeout_height: Some(htlc.timeout_height),
+            recipient_address: Some(base58_p2pkh_from_hash(&htlc.recipient_pkh)),
+            refund_address: Some(base58_p2pkh_from_hash(&htlc.refund_pkh)),
+        })),
+        OutputEncumbrance::P2pkh(_) => Ok(Json(DecodeHtlcResponse {
+            found: false,
+            vout: Some(idx as u32),
+            output_type: "p2pkh".to_string(),
+            expected_hash: None,
+            timeout_height: None,
+            recipient_address: None,
+            refund_address: None,
+        })),
+        OutputEncumbrance::Unknown => Ok(Json(DecodeHtlcResponse {
+            found: false,
+            vout: Some(idx as u32),
+            output_type: "unknown".to_string(),
+            expected_hash: None,
+            timeout_height: None,
+            recipient_address: None,
+            refund_address: None,
+        })),
+    }
+}
+
+async fn claim_htlc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<SpendHtlcRequest>,
+) -> Result<Json<SpendHtlcResponse>, StatusCode> {
+    spend_htlc_internal(true, addr, state, headers, req).await
+}
+
+async fn refund_htlc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<SpendHtlcRequest>,
+) -> Result<Json<SpendHtlcResponse>, StatusCode> {
+    spend_htlc_internal(false, addr, state, headers, req).await
+}
+
+async fn spend_htlc_internal(
+    claim: bool,
+    addr: SocketAddr,
+    state: AppState,
+    headers: HeaderMap,
+    req: SpendHtlcRequest,
+) -> Result<Json<SpendHtlcResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .htlcv1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    let txid_arr = hex_to_32(req.funding_txid.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let (funding_out, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let key = OutPoint {
+            txid: txid_arr,
+            index: req.vout,
+        };
+        let utxo = chain.utxos.get(&key).cloned().ok_or(StatusCode::BAD_REQUEST)?;
+        (utxo, chain.tip_height())
+    };
+
+    let htlc = match parse_htlcv1_script(&funding_out.output.script_pubkey) {
+        Some(v) => v,
+        None => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let signer_pkh = if claim { htlc.recipient_pkh } else { htlc.refund_pkh };
+    if !claim && tip_height < htlc.timeout_height {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let keys = wallet.keys().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut key: Option<WalletKey> = None;
+    for k in keys {
+        let b = hex::decode(&k.pkh).map_err(|_| StatusCode::BAD_REQUEST)?;
+        if b.len() != 20 {
+            continue;
+        }
+        let mut pkh = [0u8; 20];
+        pkh.copy_from_slice(&b);
+        if pkh == signer_pkh {
+            key = Some(k);
+            break;
+        }
+    }
+    let key = key.ok_or(StatusCode::FORBIDDEN)?;
+
+    let dest = base58_p2pkh_to_hash(&req.destination_address).ok_or(StatusCode::BAD_REQUEST)?;
+    if dest.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut dest_pkh = [0u8; 20];
+    dest_pkh.copy_from_slice(&dest);
+
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    if funding_out.output.value <= fee {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: txid_arr,
+            prev_index: req.vout,
+            script_sig: Vec::new(),
+            sequence: 0xffff_fffe,
+        }],
+        outputs: vec![TxOutput {
+            value: funding_out.output.value - fee,
+            script_pubkey: p2pkh_script(&dest_pkh),
+        }],
+        locktime: 0,
+    };
+
+    let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+    let priv_bytes = hex::decode(&key.privkey).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if priv_bytes.len() != 32 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(&priv_bytes);
+    let signing_key = SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let sig: Signature = signing_key
+        .sign_prehash(&digest)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let sig = sig.normalize_s().unwrap_or(sig);
+    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+    sig_bytes.push(0x01);
+    let pubkey = signing_key.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+
+    tx.inputs[0].script_sig = if claim {
+        let secret_hex = req.secret_hex.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
+        let preimage = hex::decode(secret_hex.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+        encode_htlcv1_claim_witness(&sig_bytes, &pubkey, &preimage).ok_or(StatusCode::BAD_REQUEST)?
+    } else {
+        encode_htlcv1_refund_witness(&sig_bytes, &pubkey).ok_or(StatusCode::BAD_REQUEST)?
+    };
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.calculate_fees(&tx).map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+
+    let raw = tx.serialize();
+    let txid = tx.txid();
+    let txid_hex = hex::encode(txid);
+
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid) {
+            accepted = mempool.add_transaction(tx, raw.clone(), fee_checked).is_ok();
+        }
+    }
+
+    Ok(Json(SpendHtlcResponse {
+        txid: txid_hex,
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    }))
+}
+
+async fn inspect_htlc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<InspectHtlcQuery>,
+) -> Result<Json<InspectHtlcResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let txid = hex_to_32(q.txid.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let key = OutPoint { txid, index: q.vout };
+
+    let (tip_height, maybe_utxo) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        (chain.tip_height(), chain.utxos.get(&key).cloned())
+    };
+
+    let Some(utxo) = maybe_utxo else {
+        return Ok(Json(InspectHtlcResponse {
+            exists: false,
+            funded: false,
+            unspent: false,
+            spent: true,
+            spend_type: None,
+            claimable_now: false,
+            refundable_now: false,
+            timeout_height: None,
+            expected_hash: None,
+            recipient_address: None,
+            refund_address: None,
+        }));
+    };
+
+    let htlc = match parse_htlcv1_script(&utxo.output.script_pubkey) {
+        Some(v) => v,
+        None => {
+            return Ok(Json(InspectHtlcResponse {
+                exists: false,
+                funded: false,
+                unspent: false,
+                spent: false,
+                spend_type: None,
+                claimable_now: false,
+                refundable_now: false,
+                timeout_height: None,
+                expected_hash: None,
+                recipient_address: None,
+                refund_address: None,
+            }))
+        }
+    };
+
+    Ok(Json(InspectHtlcResponse {
+        exists: true,
+        funded: true,
+        unspent: true,
+        spent: false,
+        spend_type: None,
+        claimable_now: true,
+        refundable_now: tip_height >= htlc.timeout_height,
+        timeout_height: Some(htlc.timeout_height),
+        expected_hash: Some(hex::encode(htlc.expected_hash)),
+        recipient_address: Some(base58_p2pkh_from_hash(&htlc.recipient_pkh)),
+        refund_address: Some(base58_p2pkh_from_hash(&htlc.refund_pkh)),
+    }))
+}
+
 async fn get_block_template(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -3503,9 +4088,14 @@ async fn main() {
     }
 
     let pow_limit = Target { bits: 0x1d00_ffff };
+    let htlc_activation = htlcv1_activation_height();
+    if let Some(h) = htlc_activation {
+        println!("HTLCv1 activation height set to {}", h);
+    }
     let params = ChainParams {
         genesis_block: genesis_block.clone(),
         pow_limit,
+        htlcv1_activation_height: htlc_activation,
     };
     let mut state = ChainState::new(params);
     if load_persisted {
@@ -4256,6 +4846,11 @@ async fn main() {
         .route("/rpc/tx", get(get_tx))
         .route("/rpc/submit_block", post(submit_block))
         .route("/rpc/submit_tx", post(submit_tx))
+        .route("/rpc/createhtlc", post(create_htlc))
+        .route("/rpc/decodehtlc", post(decode_htlc))
+        .route("/rpc/claimhtlc", post(claim_htlc))
+        .route("/rpc/refundhtlc", post(refund_htlc))
+        .route("/rpc/inspecthtlc", get(inspect_htlc))
         .route("/wallet/create", post(wallet_create))
         .route("/wallet/unlock", post(wallet_unlock))
         .route("/wallet/lock", post(wallet_lock))
@@ -4375,6 +4970,7 @@ mod tests {
         let params = ChainParams {
             pow_limit: genesis_block.header.target(),
             genesis_block,
+            htlcv1_activation_height: None,
         };
         let chain = ChainState::new(params);
         let genesis_hash = hex::encode(chain.tip_hash());
