@@ -1,41 +1,40 @@
 # HTLCv1 Review Notes
 
-Scope:
-- tx serialization compatibility
-- sighash behavior for claim/refund
-- mempool vs block validation consistency
-- activation boundary behavior at N-1 / N / N+1
-- unintended legacy non-HTLC changes
+Date: 2026-03-09
 
-Findings:
+## Scope Reviewed
+- Activation plumbing and boundary behavior (`N-1`, `N`, `N+1`)
+- Miner/template inclusion at activation boundary
+- Mempool vs consensus consistency
+- Signature/hash checks for claim/refund
+- Legacy P2PKH path regression risk with activation unset
 
-1) Serialization compatibility
-- Outer tx format unchanged.
-- HTLCv1 encoded only in script_pubkey/script_sig payloads.
-- Legacy P2PKH txid path unchanged.
+## Key Findings
 
-2) Signature hash behavior
-- Claim/refund use existing signature_digest path with HTLC script as scriptCode.
-- Same low-S and pubkey verification policy as legacy path.
+1. Activation plumbing issue (fixed)
+- Issue: miner path used `htlcv1_activation_height: None` regardless of env.
+- Impact: HTLC txs accepted by RPC/mempool but skipped in mining template path.
+- Fix: miner now reads `IRIUM_HTLCV1_ACTIVATION_HEIGHT` and uses it in `ChainParams`.
 
-3) Mempool vs block validation consistency
-- Admission paths call chain fee/validation checks (calculate_fees).
-- HTLC activation and witness validity checks are enforced consistently.
+2. Miner/template boundary issue (fixed)
+- Added explicit coverage proving HTLC template inclusion at activation height.
+- Activation interpretation aligned on candidate block height semantics.
 
-4) Activation boundary
-- height < activation: HTLC funding/spend rejected.
-- height >= activation: HTLC allowed if valid.
-- Covered by tests including pre/post activation checks.
+3. Consensus/mempool consistency
+- Before activation: HTLC funding/spend rejected.
+- At/after activation: HTLC funding/spend validated according to rules.
+- Mempool acceptance and block validation behavior align in covered scenarios.
 
-5) Legacy path stability
-- Legacy P2PKH regression tests pass.
-- decodehtlc non-HTLC path returns p2pkh/unknown without changing legacy tx behavior.
+4. Legacy safety with activation unset
+- Default remains disabled when `IRIUM_HTLCV1_ACTIVATION_HEIGHT` is unset.
+- Legacy P2PKH behavior remains normal in tested paths.
 
-Notes:
-- inspecthtlc currently reports state from UTXO presence and timeout checks; it does not yet infer historical spend path metadata.
-- RPC integration tests are in-process handler tests with deterministic chain-state application for mined-state simulation.
+## Remaining Known Limitations
+1. Full reorg lifecycle for HTLC spends not yet exhaustively tested.
+2. Mempool persistence/reload matrix coverage is partial.
+3. No coordinator/routing/app-layer orchestration (out of scope for HTLCv1 primitive).
 
-Conclusion:
-- No consensus regression proven in covered scenarios.
-- Safe for controlled devnet/testnet trial only.
-- Mainnet activation must remain off pending explicit rollout decision.
+## Recommendation
+- Safe to park code on `main` with HTLCv1 activation OFF by default.
+- Do not activate on mainnet yet.
+- Continue testnet/devnet soak plus reorg/persistence expansion before any activation proposal.

@@ -4969,7 +4969,7 @@ mod tests {
     use irium_node_rs::wallet_store::WalletManager;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize};
+    use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4977,12 +4977,15 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 38000)
     }
 
+    static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn unique_path(prefix: &str, ext: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        std::env::temp_dir().join(format!("{}_{}_{}.{}", prefix, std::process::id(), nanos, ext))
+        let seq = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{}_{}_{}_{}.{}", prefix, std::process::id(), nanos, seq, ext))
     }
 
     fn create_test_state(activation: Option<u64>) -> (AppState, String, String, String) {
@@ -5125,7 +5128,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn template_includes_htlc_at_activation_boundary() {
+        let (state, sender, recipient, refund) = create_test_state(Some(50));
+        add_wallet_utxo(&state, &sender, 20_000_000_000);
+
+        {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.height = 50; // candidate block height == activation height
+        }
+
+        let create = create_htlc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(CreateHtlcRequest {
+                amount: "5.00000000".to_string(),
+                recipient_address: recipient,
+                refund_address: refund,
+                secret_hash_hex: "33".repeat(32),
+                timeout_height: 120,
+                fee_per_byte: Some(1),
+                broadcast: Some(true),
+            }),
+        )
+        .await
+        .expect("createhtlc")
+        .0;
+
+        let tpl = get_block_template(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(TemplateQuery {
+                longpoll: None,
+                poll_secs: None,
+                max_txs: None,
+                min_fee: None,
+            }),
+        )
+        .await
+        .expect("template")
+        .0;
+
+        assert!(
+            tpl.txs.iter().any(|t| t.hex == create.raw_tx_hex),
+            "HTLC tx should be in template at activation height"
+        );
+
+        {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.height = 51; // activation + 1 should also include
+        }
+
+        let tpl_after = get_block_template(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Query(TemplateQuery {
+                longpoll: None,
+                poll_secs: None,
+                max_txs: None,
+                min_fee: None,
+            }),
+        )
+        .await
+        .expect("template after")
+        .0;
+
+        assert!(
+            tpl_after.txs.iter().any(|t| t.hex == create.raw_tx_hex),
+            "HTLC tx should remain template-eligible after activation"
+        );
+    }
+
+    #[tokio::test]
     async fn rpc_create_decode_inspect_and_claim_flow() {
+
         let (state, sender, recipient, refund) = create_test_state(Some(1));
         add_wallet_utxo(&state, &sender, 20_000_000_000);
 

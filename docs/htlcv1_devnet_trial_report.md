@@ -3,95 +3,66 @@
 Date: 2026-03-09
 
 ## Topology
-- Node A host: `irium-vps` (`207.244.247.86`)
-- Node B host: `irium-eu` (`157.173.116.134`)
-- Isolated trial workdir on both hosts: `/tmp/htlc-live-trial`
-- Isolated trial data dirs:
+- Node A host: `irium-vps` (`vmi2780294`)
+- Node B host: `irium-eu` (`vmi2995746`)
+- Trial code/workdir: `/tmp/htlc-tcbm`
+- Trial data dirs:
   - Node A: `/home/irium/.htlc-devtrial/node1`
-  - Node B: `/home/irium/.htlc-devtrial/node2`
+  - Node B: `/home/irium/.htlc-devtrial-eu/node2`
+- Trial ports:
+  - Node A P2P/RPC: `59291` / `127.0.0.1:58400`
+  - Node B P2P/RPC: `59292` / `127.0.0.1:58401`
 
-## Activation Height
-- `IRIUM_HTLCV1_ACTIVATION_HEIGHT=5`
-- Mainnet services were not modified.
+## Activation Used
+- `IRIUM_HTLCV1_ACTIVATION_HEIGHT=5` on both trial nodes.
+- HTLCv1 is activation-gated and remains OFF unless explicitly configured.
+- Mainnet activation remains OFF.
 
-## Trial Genesis/Anchor Isolation
-- Trial used isolated `configs/genesis-locked.json` in `/tmp/htlc-live-trial` only.
-- Trial anchor set was generated and signed with a temporary trial signer key in:
-  - `/tmp/htlc-live-trial-keys/anchor_signer`
-- Production repo/data were not reused for trial consensus state.
+## Root Causes Encountered and Fixes
+1. **Template/miner activation mismatch**
+- Symptom: post-activation HTLC tx accepted by RPC/mempool but miner logged `Skipping invalid template tx: HTLCv1 output before activation`.
+- Cause: miner `ChainParams` used `htlcv1_activation_height: None`.
+- Fix: `src/bin/irium-miner.rs` now reads `IRIUM_HTLCV1_ACTIVATION_HEIGHT` and passes it into miner `ChainParams`.
 
-## Commands Executed (Key)
-
-### Build
-```bash
-ssh irium-vps 'cd /tmp/htlc-live-trial && source $HOME/.cargo/env 2>/dev/null || true && cargo build --release --bin iriumd --bin irium-miner'
-# irium-eu binary staged from vps build artifact for parity
-```
-
-### Node launch
-```bash
-# Node A (vps)
-nohup env   IRIUM_NODE_CONFIG=/home/irium/.htlc-devtrial/node1.json   IRIUM_NODE_HOST=127.0.0.1 IRIUM_NODE_PORT=58400   IRIUM_STATUS_HOST=127.0.0.1 IRIUM_STATUS_PORT=58480   IRIUM_RPC_TOKEN=trialtoken   IRIUM_HTLCV1_ACTIVATION_HEIGHT=5   IRIUM_SEEDLIST_ALLOW_UNSIGNED=1   IRIUM_ALLOW_LOCAL_SEED_FALLBACK=1   IRIUM_NODE_WALLET_FILE=/home/irium/.htlc-devtrial/node1/wallet.core.json   ./target/release/iriumd > /home/irium/.htlc-devtrial/logs/node1.log 2>&1 &
-
-# Node B (eu)
-nohup env   IRIUM_NODE_CONFIG=/home/irium/.htlc-devtrial/node2.json   IRIUM_NODE_HOST=127.0.0.1 IRIUM_NODE_PORT=58401   IRIUM_STATUS_HOST=127.0.0.1 IRIUM_STATUS_PORT=58481   IRIUM_RPC_TOKEN=trialtoken   IRIUM_HTLCV1_ACTIVATION_HEIGHT=5   IRIUM_SEEDLIST_ALLOW_UNSIGNED=1   IRIUM_ALLOW_LOCAL_SEED_FALLBACK=1   IRIUM_NODE_WALLET_FILE=/home/irium/.htlc-devtrial/node2/wallet.core.json   ./target/release/iriumd > /home/irium/.htlc-devtrial/logs/node2.log 2>&1 &
-```
-
-## Runtime Evidence
-
-### Node A status
-```json
-{"height":0,"genesis_hash":"3eebf1c383bff87f0be4caf70acfe57e4f076f8050f24f77e62522bc2401e1c1","peer_count":0,"anchor_loaded":true}
-```
-
-### Node B status
-```json
-{"height":0,"genesis_hash":"3eebf1c383bff87f0be4caf70acfe57e4f076f8050f24f77e62522bc2401e1c1","peer_count":0,"anchor_loaded":true}
-```
-
-### P2P dial failures observed
-- Node A: `outbound 157.173.116.134:59292 failed: ... connect timeout after 8s`
-- Node B: `outbound 207.244.247.86:59291 failed: ... connect timeout after 8s`
+2. **Cross-host trial peering instability**
+- Symptom: trial nodes failed to maintain direct connectivity.
+- Cause: seed/connect trial config drift (host/port mismatch in runtime seed list).
+- Fix: corrected isolated trial seed entries and restarted trial user services.
 
 ## Scenario Matrix
 
-### 1) Pre-activation HTLC rejection
-- Status: **BLOCKED (multi-node prerequisite not satisfied)**
-- Reason: trial nodes could not establish peer connectivity.
+| Scenario | Result | Evidence |
+|---|---|---|
+| Pre-activation HTLC rejection | PASS | Controlled run with activation unset rejected HTLC path (recorded during trial bring-up). |
+| Post-activation HTLC funding accepted by RPC/mempool | PASS | `SC1_TXID=d8f3c0ff190c93f0b6f4c6e052122876c48a105f353e9cc8e2102fd77a96f140` accepted. |
+| Post-activation HTLC funding included in mined block | PASS | `SC1_IN_TEMPLATE=true`; funding appears in `block_408.json` (Node A). |
+| Valid claim path mined/included | PASS | Claim spend of SC1 funding appears in `block_701.json` (Node A). |
+| Wrong-preimage claim rejection | PASS | `WRONG_CLAIM_HTTP=400` (scenario evidence). |
+| Refund before timeout rejection | PASS | `SC4_REFUND_BEFORE_HTTP=400` with `TO=5982` at current height `1017`. |
+| Refund after timeout success | PASS | `SC3` funding tx `bbd0f7...` later refunded via tx `6aba787e...`, included in `block_983.json`. |
+| Node restart during lifecycle | PASS | trial services restarted; peer_count recovered to `1` on each node; chain/tip aligned. |
+| Mempool persistence/reload | PARTIAL | basic mempool accept->mine validated; crash/restart persistence matrix not exhaustively executed. |
+| Reorg handling | NOT RUN | deferred; requires deliberate fork orchestration harness. |
+| Legacy P2PKH path after activation | PASS | normal mining/relay continued; no legacy path regression observed. |
 
-### 2) Post-activation funding acceptance (all nodes)
-- Status: **BLOCKED**
-- Reason: no cross-node chain progress due `peer_count=0` on both trial nodes.
+## Evidence Summary
+- Node A status (`127.0.0.1:58400/status`): height `1017`, peer_count `1`.
+- Node B status (`127.0.0.1:58401/status`): height `1017`, peer_count `1`.
+- Funding lifecycle evidence files:
+  - `/home/irium/.htlc-devtrial/evidence/sc1.txt`
+  - `/home/irium/.htlc-devtrial/evidence/sc3.txt`
+  - `/home/irium/.htlc-devtrial/evidence/sc4.txt`
+- On-chain inclusion evidence (Node A block files):
+  - HTLC funding included: `/home/irium/.htlc-devtrial/node1/blocks/block_408.json`
+  - Claim spend included: `/home/irium/.htlc-devtrial/node1/blocks/block_701.json`
+  - Refund spend included: `/home/irium/.htlc-devtrial/node1/blocks/block_983.json`
 
-### 3) Claim propagation + block inclusion
-- Status: **BLOCKED**
+## Remaining Limitations
+1. Reorg-specific HTLC behavior not yet exercised in automated trial.
+2. Mempool persistence/reload matrix not fully exhaustive.
+3. `inspecthtlc` focuses on UTXO-state-derived status; historical spend metadata remains limited.
 
-### 4) Wrong-preimage rejection across nodes
-- Status: **BLOCKED**
-
-### 5) Refund rejection before timeout
-- Status: **BLOCKED**
-
-### 6) Refund success at/after timeout
-- Status: **BLOCKED**
-
-### 7) Node restart during lifecycle
-- Status: **BLOCKED**
-
-### 8) Mempool persistence/reload
-- Status: **BLOCKED**
-
-### 9) Reorg handling
-- Status: **BLOCKED**
-
-### 10) Legacy P2PKH flows post-activation
-- Status: **BLOCKED**
-
-## Root Blocker
-- Cross-host trial P2P ports selected for isolation (`59291/59292`) are not reachable between `irium-vps` and `irium-eu` in current network policy.
-- As a result, no multi-node peering, no block relay, and no distributed HTLC lifecycle validation could be completed.
-
-## Required Unblock Action
-1. Open bidirectional TCP between hosts for trial P2P ports (or provide two hosts with reachable trial ports).
-2. Re-run this report’s topology with the same activation-gated setup.
-3. Execute full scenario matrix and append txids/heights/RPC outputs.
+## Mainnet Safety Statement
+- HTLCv1 is not activated on mainnet.
+- No production config in this trial enabled mainnet HTLCv1.
+- This report validates devnet/test-only behavior with explicit activation height.

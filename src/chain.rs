@@ -1292,6 +1292,55 @@ mod tests {
     }
 
     #[test]
+    fn htlc_activation_boundary_n_minus_1_n_n_plus_1() {
+        let mut chain = base_chain(Some(10));
+        let sender = signing_key(1);
+        let recipient = signing_key(2);
+        let refund = signing_key(3);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 5_000);
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 4_000,
+                script_pubkey: encode_htlcv1_script(&HtlcV1Output {
+                    expected_hash: [0x42; 32],
+                    recipient_pkh: key_hash(&recipient),
+                    refund_pkh: key_hash(&refund),
+                    timeout_height: 20,
+                }),
+            }],
+            locktime: 0,
+        };
+        let utxo_script = chain.utxos.get(&prev).unwrap().output.script_pubkey.clone();
+        tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, &sender);
+
+        chain.height = 9;
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "N-1 must reject HTLC output"
+        );
+
+        chain.height = 10;
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "N must allow HTLC output"
+        );
+
+        chain.height = 11;
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "N+1 must allow HTLC output"
+        );
+    }
+
+    #[test]
     fn htlc_output_rejected_before_activation() {
         let mut chain = base_chain(Some(100));
         let sender = signing_key(1);
