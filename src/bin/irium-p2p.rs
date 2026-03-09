@@ -36,6 +36,7 @@ async fn main() {
     let params = ChainParams {
         genesis_block: block,
         pow_limit,
+        htlcv1_activation_height: None,
     };
     let chain = Arc::new(Mutex::new(ChainState::new(params)));
     let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));

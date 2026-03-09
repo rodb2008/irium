@@ -18,7 +18,11 @@ use crate::constants::{
 };
 use crate::genesis::LockedGenesis;
 use crate::pow::{meets_target, sha256d, Target};
-use crate::tx::{decode_hex, Transaction, TxInput, TxOutput};
+use crate::tx::{
+    decode_hex, encode_htlcv1_script, parse_htlcv1_script, parse_input_witness,
+    parse_output_encumbrance, InputWitness, OutputEncumbrance, Transaction,
+    TxInput, TxOutput, HTLC_V1_SCRIPT_TAG,
+};
 
 const MAX_ORPHAN_BLOCKS: usize = 100;
 
@@ -43,6 +47,7 @@ fn block_store_window() -> u64 {
 pub struct ChainParams {
     pub genesis_block: Block,
     pub pow_limit: Target,
+    pub htlcv1_activation_height: Option<u64>,
 }
 
 /// Reference to a specific transaction output.
@@ -137,6 +142,13 @@ impl ChainState {
 
     pub fn tip_height(&self) -> u64 {
         self.height.saturating_sub(1)
+    }
+
+    fn htlcv1_active_at(&self, height: u64) -> bool {
+        self.params
+            .htlcv1_activation_height
+            .map(|h| height >= h)
+            .unwrap_or(false)
     }
 
     fn orphan_pool_size(&self) -> usize {
@@ -635,7 +647,7 @@ impl ChainState {
 
         let mut coinbase_total: u64 = 0;
         for output in &coinbase.outputs {
-            validate_output(output)?;
+            validate_output(output, self.htlcv1_active_at(height))?;
             coinbase_total = coinbase_total
                 .checked_add(output.value)
                 .ok_or_else(|| "Coinbase outputs overflow".to_string())?;
@@ -911,7 +923,14 @@ impl ChainState {
                 }
             }
 
-            if !verify_transaction_signature(tx, input_index, txin, &utxo_entry.output) {
+            if !verify_transaction_signature(
+                tx,
+                input_index,
+                txin,
+                &utxo_entry.output,
+                height,
+                self.htlcv1_active_at(height),
+            ) {
                 return Err("Transaction signature verification failed".to_string());
             }
 
@@ -921,7 +940,7 @@ impl ChainState {
 
         let mut output_total: i64 = 0;
         for output in &tx.outputs {
-            validate_output(output)?;
+            validate_output(output, self.htlcv1_active_at(height))?;
             output_total += output.value as i64;
         }
         if input_total < output_total {
@@ -944,13 +963,23 @@ fn is_coinbase(tx: &Transaction) -> bool {
     coinbase_input.prev_txid == [0u8; 32] && coinbase_input.prev_index == 0xffff_ffff
 }
 
-fn validate_output(output: &TxOutput) -> Result<(), String> {
+fn validate_output(output: &TxOutput, htlcv1_active: bool) -> Result<(), String> {
     if output.value > MAX_MONEY {
         return Err("Output value out of range".to_string());
     }
     if output.script_pubkey.len() > 0xff {
         return Err("script_pubkey too large".to_string());
     }
+
+    if output.script_pubkey.first() == Some(&HTLC_V1_SCRIPT_TAG) {
+        if !htlcv1_active {
+            return Err("HTLCv1 output before activation".to_string());
+        }
+        if parse_htlcv1_script(&output.script_pubkey).is_none() {
+            return Err("Malformed HTLCv1 output".to_string());
+        }
+    }
+
     Ok(())
 }
 
@@ -960,21 +989,6 @@ fn hash160(data: &[u8]) -> [u8; 20] {
     let mut out = [0u8; 20];
     out.copy_from_slice(&rip);
     out
-}
-
-fn p2pkh_hash_from_script(script: &[u8]) -> Option<[u8; 20]> {
-    if script.len() != 25 {
-        return None;
-    }
-    if script[0] != 0x76 || script[1] != 0xa9 || script[2] != 0x14 {
-        return None;
-    }
-    if script[23] != 0x88 || script[24] != 0xac {
-        return None;
-    }
-    let mut out = [0u8; 20];
-    out.copy_from_slice(&script[3..23]);
-    Some(out)
 }
 
 fn signature_digest(tx: &Transaction, input_index: usize, script_pubkey: &[u8]) -> [u8; 32] {
@@ -991,57 +1005,25 @@ fn signature_digest(tx: &Transaction, input_index: usize, script_pubkey: &[u8]) 
     sha256d(&data)
 }
 
-fn verify_transaction_signature(
-    tx: &Transaction,
-    input_index: usize,
-    txin: &TxInput,
-    utxo: &TxOutput,
-) -> bool {
+fn verify_sig_with_pubkey(tx: &Transaction, input_index: usize, script_pubkey: &[u8], sig: &[u8], pubkey: &[u8]) -> bool {
     use k256::ecdsa::signature::hazmat::PrehashVerifier;
     use k256::ecdsa::{Signature, VerifyingKey};
 
-    let script = &txin.script_sig;
-    if script.len() < 2 {
+    if sig.len() < 2 || sig.last() != Some(&0x01) {
         return false;
     }
-    let sig_len = script[0] as usize;
-    if sig_len == 0 || script.len() < 1 + sig_len + 1 {
+    if !(pubkey.len() == 33 || pubkey.len() == 65) {
         return false;
     }
-    let sig = &script[1..1 + sig_len];
-    if sig.last() != Some(&0x01) {
-        return false;
-    }
-    let der = &sig[..sig.len() - 1];
-    let pk_len = script[1 + sig_len] as usize;
-    let pk_off = 1 + sig_len + 1;
-    if pk_len == 0 || script.len() != pk_off + pk_len {
-        return false;
-    }
-    let pubkey = &script[pk_off..pk_off + pk_len];
-    if !(pk_len == 33 || pk_len == 65) {
-        return false;
-    }
-
-    let expected_pkh = match p2pkh_hash_from_script(&utxo.script_pubkey) {
-        Some(v) => v,
-        None => return false,
-    };
-    if hash160(pubkey) != expected_pkh {
-        return false;
-    }
-
     if input_index >= tx.inputs.len() {
         return false;
     }
-    let digest = signature_digest(tx, input_index, &utxo.script_pubkey);
 
+    let der = &sig[..sig.len() - 1];
     let signature = match Signature::from_der(der) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    // normalize_s() returns Some(_) only when signature is high-S.
-    // Signed transactions already use low-S; treat high-S as non-standard.
     if signature.normalize_s().is_some() {
         return false;
     }
@@ -1050,7 +1032,68 @@ fn verify_transaction_signature(
         Err(_) => return false,
     };
 
+    let digest = signature_digest(tx, input_index, script_pubkey);
     vk.verify_prehash(&digest, &signature).is_ok()
+}
+
+fn verify_transaction_signature(
+    tx: &Transaction,
+    input_index: usize,
+    txin: &TxInput,
+    utxo: &TxOutput,
+    spend_height: u64,
+    htlcv1_active: bool,
+) -> bool {
+    match parse_output_encumbrance(&utxo.script_pubkey) {
+        OutputEncumbrance::P2pkh(expected_pkh) => {
+            let witness = parse_input_witness(&txin.script_sig);
+            let (sig, pubkey) = match witness {
+                InputWitness::P2pkh { sig, pubkey } => (sig, pubkey),
+                _ => return false,
+            };
+            if hash160(&pubkey) != expected_pkh {
+                return false;
+            }
+            verify_sig_with_pubkey(tx, input_index, &utxo.script_pubkey, &sig, &pubkey)
+        }
+        OutputEncumbrance::HtlcV1(htlc) => {
+            if !htlcv1_active {
+                return false;
+            }
+            match parse_input_witness(&txin.script_sig) {
+                InputWitness::HtlcClaim {
+                    sig,
+                    pubkey,
+                    preimage,
+                } => {
+                    if preimage.is_empty() || preimage.len() > 64 {
+                        return false;
+                    }
+                    let pre_hash = Sha256::digest(&preimage);
+                    if pre_hash[..] != htlc.expected_hash {
+                        return false;
+                    }
+                    if hash160(&pubkey) != htlc.recipient_pkh {
+                        return false;
+                    }
+                    let script = encode_htlcv1_script(&htlc);
+                    verify_sig_with_pubkey(tx, input_index, &script, &sig, &pubkey)
+                }
+                InputWitness::HtlcRefund { sig, pubkey } => {
+                    if spend_height < htlc.timeout_height {
+                        return false;
+                    }
+                    if hash160(&pubkey) != htlc.refund_pkh {
+                        return false;
+                    }
+                    let script = encode_htlcv1_script(&htlc);
+                    verify_sig_with_pubkey(tx, input_index, &script, &sig, &pubkey)
+                }
+                _ => false,
+            }
+        }
+        OutputEncumbrance::Unknown => false,
+    }
 }
 
 pub fn block_from_locked(gen: &LockedGenesis) -> Result<Block, String> {
@@ -1175,5 +1218,443 @@ pub fn decode_compact_tx(raw: &[u8]) -> Transaction {
         inputs,
         outputs,
         locktime,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::genesis::load_locked_genesis;
+    use crate::pow::Target;
+    use crate::tx::{
+        encode_htlcv1_claim_witness, encode_htlcv1_refund_witness, encode_htlcv1_script,
+        p2pkh_script, HtlcV1Output,
+    };
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    use k256::ecdsa::{Signature, SigningKey};
+
+    fn base_chain(activation: Option<u64>) -> ChainState {
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let params = ChainParams {
+            genesis_block: genesis,
+            pow_limit: Target { bits: 0x1f00ffff },
+            htlcv1_activation_height: activation,
+        };
+        ChainState::new(params)
+    }
+
+    fn signing_key(seed: u8) -> SigningKey {
+        let mut sk = [0u8; 32];
+        sk.fill(seed);
+        SigningKey::from_bytes((&sk).into()).expect("signing key")
+    }
+
+    fn key_hash(sk: &SigningKey) -> [u8; 20] {
+        let pubkey = sk.verifying_key().to_encoded_point(true);
+        hash160(pubkey.as_bytes())
+    }
+
+    fn p2pkh_witness(tx: &Transaction, input_index: usize, script: &[u8], sk: &SigningKey) -> Vec<u8> {
+        let digest = signature_digest(tx, input_index, script);
+        let sig: Signature = sk.sign_prehash(&digest).expect("sign");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+        let pubkey = sk.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+
+        let mut out = Vec::with_capacity(1 + sig_bytes.len() + 1 + pubkey.len());
+        out.push(sig_bytes.len() as u8);
+        out.extend_from_slice(&sig_bytes);
+        out.push(pubkey.len() as u8);
+        out.extend_from_slice(&pubkey);
+        out
+    }
+
+    fn add_spendable_p2pkh_utxo(chain: &mut ChainState, sk: &SigningKey, value: u64) -> OutPoint {
+        let pkh = key_hash(sk);
+        let op = OutPoint {
+            txid: [7u8; 32],
+            index: 0,
+        };
+        chain.utxos.insert(
+            op.clone(),
+            UtxoEntry {
+                output: TxOutput {
+                    value,
+                    script_pubkey: p2pkh_script(&pkh),
+                },
+                height: chain.tip_height(),
+                is_coinbase: false,
+            },
+        );
+        op
+    }
+
+    #[test]
+    fn htlc_activation_boundary_n_minus_1_n_n_plus_1() {
+        let mut chain = base_chain(Some(10));
+        let sender = signing_key(1);
+        let recipient = signing_key(2);
+        let refund = signing_key(3);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 5_000);
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 4_000,
+                script_pubkey: encode_htlcv1_script(&HtlcV1Output {
+                    expected_hash: [0x42; 32],
+                    recipient_pkh: key_hash(&recipient),
+                    refund_pkh: key_hash(&refund),
+                    timeout_height: 20,
+                }),
+            }],
+            locktime: 0,
+        };
+        let utxo_script = chain.utxos.get(&prev).unwrap().output.script_pubkey.clone();
+        tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, &sender);
+
+        chain.height = 9;
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "N-1 must reject HTLC output"
+        );
+
+        chain.height = 10;
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "N must allow HTLC output"
+        );
+
+        chain.height = 11;
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "N+1 must allow HTLC output"
+        );
+    }
+
+    #[test]
+    fn htlc_output_rejected_before_activation() {
+        let mut chain = base_chain(Some(100));
+        let sender = signing_key(1);
+        let recipient = signing_key(2);
+        let refund = signing_key(3);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 5_000);
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 4_000,
+                script_pubkey: encode_htlcv1_script(&HtlcV1Output {
+                    expected_hash: [11u8; 32],
+                    recipient_pkh: key_hash(&recipient),
+                    refund_pkh: key_hash(&refund),
+                    timeout_height: 10,
+                }),
+            }],
+            locktime: 0,
+        };
+        let utxo_script = chain.utxos.get(&prev).unwrap().output.script_pubkey.clone();
+        tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, &sender);
+
+        let err = chain.validate_transaction(&tx).expect_err("must reject pre-activation");
+        assert!(err.contains("HTLCv1 output before activation"));
+    }
+
+    #[test]
+    fn htlc_output_accepted_after_activation() {
+        let mut chain = base_chain(Some(1));
+        let sender = signing_key(4);
+        let recipient = signing_key(5);
+        let refund = signing_key(6);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 10_000);
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 8_000,
+                script_pubkey: encode_htlcv1_script(&HtlcV1Output {
+                    expected_hash: [22u8; 32],
+                    recipient_pkh: key_hash(&recipient),
+                    refund_pkh: key_hash(&refund),
+                    timeout_height: 10,
+                }),
+            }],
+            locktime: 0,
+        };
+
+        let utxo_script = chain.utxos.get(&prev).unwrap().output.script_pubkey.clone();
+        tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, &sender);
+        assert!(chain.validate_transaction(&tx).is_ok());
+    }
+
+    fn add_htlc_utxo(
+        chain: &mut ChainState,
+        value: u64,
+        recipient: &SigningKey,
+        refund: &SigningKey,
+        expected_hash: [u8; 32],
+        timeout_height: u64,
+    ) -> (OutPoint, HtlcV1Output) {
+        let htlc = HtlcV1Output {
+            expected_hash,
+            recipient_pkh: key_hash(recipient),
+            refund_pkh: key_hash(refund),
+            timeout_height,
+        };
+        let op = OutPoint {
+            txid: [9u8; 32],
+            index: 1,
+        };
+        chain.utxos.insert(
+            op.clone(),
+            UtxoEntry {
+                output: TxOutput {
+                    value,
+                    script_pubkey: encode_htlcv1_script(&htlc),
+                },
+                height: chain.tip_height(),
+                is_coinbase: false,
+            },
+        );
+        (op, htlc)
+    }
+
+    #[test]
+    fn htlc_claim_valid_and_wrong_preimage() {
+        let mut chain = base_chain(Some(1));
+        chain.height = 50;
+        let recipient = signing_key(7);
+        let refund = signing_key(8);
+        let preimage = b"secret-htlc";
+        let mut expected_hash = [0u8; 32];
+        expected_hash.copy_from_slice(&Sha256::digest(preimage));
+
+        let (prev, htlc) = add_htlc_utxo(&mut chain, 10_000, &recipient, &refund, expected_hash, 60);
+
+        let out_script = p2pkh_script(&key_hash(&recipient));
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_fffe,
+            }],
+            outputs: vec![TxOutput {
+                value: 9_000,
+                script_pubkey: out_script,
+            }],
+            locktime: 0,
+        };
+
+        let htlc_script = encode_htlcv1_script(&htlc);
+        let digest = signature_digest(&tx, 0, &htlc_script);
+        let sig: Signature = recipient.sign_prehash(&digest).expect("sign claim");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+        let pubkey = recipient.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+        tx.inputs[0].script_sig = encode_htlcv1_claim_witness(&sig_bytes, &pubkey, preimage)
+            .expect("claim witness");
+
+        assert!(chain.validate_transaction(&tx).is_ok());
+
+        let mut wrong = tx.clone();
+        wrong.inputs[0].script_sig = encode_htlcv1_claim_witness(&sig_bytes, &pubkey, b"wrong")
+            .expect("claim witness wrong");
+        assert!(chain.validate_transaction(&wrong).is_err());
+    }
+
+    #[test]
+    fn htlc_refund_respects_timeout() {
+        let mut chain = base_chain(Some(1));
+        let recipient = signing_key(9);
+        let refund = signing_key(10);
+        let (prev, htlc) = add_htlc_utxo(&mut chain, 10_000, &recipient, &refund, [44u8; 32], 120);
+
+        let out_script = p2pkh_script(&key_hash(&refund));
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_fffe,
+            }],
+            outputs: vec![TxOutput {
+                value: 9_000,
+                script_pubkey: out_script,
+            }],
+            locktime: 0,
+        };
+
+        let htlc_script = encode_htlcv1_script(&htlc);
+        let digest = signature_digest(&tx, 0, &htlc_script);
+        let sig: Signature = refund.sign_prehash(&digest).expect("sign refund");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+        let pubkey = refund.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+        tx.inputs[0].script_sig = encode_htlcv1_refund_witness(&sig_bytes, &pubkey)
+            .expect("refund witness");
+
+        chain.height = 119;
+        assert!(chain.validate_transaction(&tx).is_err());
+
+        chain.height = 120;
+        assert!(chain.validate_transaction(&tx).is_ok());
+    }
+
+    #[test]
+    fn htlc_malformed_witness_fails() {
+        let mut chain = base_chain(Some(1));
+        chain.height = 50;
+        let recipient = signing_key(11);
+        let refund = signing_key(12);
+        let (prev, _htlc) = add_htlc_utxo(&mut chain, 10_000, &recipient, &refund, [55u8; 32], 10);
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: vec![0x01, 0x02],
+                sequence: 0xffff_fffe,
+            }],
+            outputs: vec![TxOutput {
+                value: 9_000,
+                script_pubkey: p2pkh_script(&key_hash(&recipient)),
+            }],
+            locktime: 0,
+        };
+
+        assert!(chain.validate_transaction(&tx).is_err());
+
+        tx.inputs[0].script_sig = vec![];
+        assert!(chain.validate_transaction(&tx).is_err());
+    }
+
+    #[test]
+    fn htlc_claim_wrong_recipient_pubkey_fails() {
+        let mut chain = base_chain(Some(1));
+        chain.height = 50;
+        let recipient = signing_key(15);
+        let wrong = signing_key(16);
+        let refund = signing_key(17);
+        let mut expected_hash = [0u8; 32];
+        expected_hash.copy_from_slice(&Sha256::digest(b"ok-secret"));
+
+        let (prev, htlc) = add_htlc_utxo(&mut chain, 10_000, &recipient, &refund, expected_hash, 80);
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_fffe,
+            }],
+            outputs: vec![TxOutput {
+                value: 9_000,
+                script_pubkey: p2pkh_script(&key_hash(&recipient)),
+            }],
+            locktime: 0,
+        };
+
+        let htlc_script = encode_htlcv1_script(&htlc);
+        let digest = signature_digest(&tx, 0, &htlc_script);
+        let sig: Signature = wrong.sign_prehash(&digest).expect("sign wrong");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+        let pubkey = wrong.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+        tx.inputs[0].script_sig = encode_htlcv1_claim_witness(&sig_bytes, &pubkey, b"ok-secret")
+            .expect("claim witness");
+
+        assert!(chain.validate_transaction(&tx).is_err());
+    }
+
+    #[test]
+    fn htlc_refund_wrong_pubkey_fails() {
+        let mut chain = base_chain(Some(1));
+        chain.height = 500;
+        let recipient = signing_key(18);
+        let refund = signing_key(19);
+        let wrong = signing_key(20);
+        let (prev, htlc) = add_htlc_utxo(&mut chain, 10_000, &recipient, &refund, [66u8; 32], 120);
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_fffe,
+            }],
+            outputs: vec![TxOutput {
+                value: 9_000,
+                script_pubkey: p2pkh_script(&key_hash(&refund)),
+            }],
+            locktime: 0,
+        };
+
+        let htlc_script = encode_htlcv1_script(&htlc);
+        let digest = signature_digest(&tx, 0, &htlc_script);
+        let sig: Signature = wrong.sign_prehash(&digest).expect("sign wrong refund");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+        let pubkey = wrong.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+        tx.inputs[0].script_sig = encode_htlcv1_refund_witness(&sig_bytes, &pubkey)
+            .expect("refund witness");
+
+        assert!(chain.validate_transaction(&tx).is_err());
+    }
+
+    #[test]
+    fn legacy_p2pkh_unchanged() {
+        let mut chain = base_chain(None);
+        let sender = signing_key(13);
+        let recipient = signing_key(14);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 20_000);
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 18_000,
+                script_pubkey: p2pkh_script(&key_hash(&recipient)),
+            }],
+            locktime: 0,
+        };
+
+        let utxo_script = chain.utxos.get(&prev).unwrap().output.script_pubkey.clone();
+        tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, &sender);
+
+        assert!(chain.validate_transaction(&tx).is_ok());
     }
 }

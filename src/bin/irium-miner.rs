@@ -65,6 +65,12 @@ fn rpc_token() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn htlcv1_activation_height() -> Option<u64> {
+    env::var("IRIUM_HTLCV1_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
 fn rpc_status_error(prefix: &str, status: StatusCode) -> String {
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         format!("{}: HTTP {} (check IRIUM_RPC_TOKEN)", prefix, status)
@@ -220,7 +226,7 @@ fn coinbase_metadata_output() -> Option<TxOutput> {
 
 #[cfg(test)]
 mod tests {
-    use super::script_from_relay_address;
+    use super::{htlcv1_activation_height, script_from_relay_address};
 
     #[test]
     fn builds_p2pkh_from_hex() {
@@ -239,6 +245,14 @@ mod tests {
         let script = script_from_relay_address("relay-address").unwrap();
         assert!(script.starts_with(&[0x6a])); // OP_RETURN
     }
+
+    #[test]
+    fn reads_htlcv1_activation_height_from_env() {
+        std::env::set_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT", "42");
+        assert_eq!(htlcv1_activation_height(), Some(42));
+        std::env::remove_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT");
+    }
+
 }
 
 fn miner_address_info() -> Option<(String, Vec<u8>)> {
@@ -1988,6 +2002,7 @@ fn main() {
     let params = ChainParams {
         genesis_block: block,
         pow_limit,
+        htlcv1_activation_height: htlcv1_activation_height(),
     };
 
     let mut state = ChainState::new(params.clone());
