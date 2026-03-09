@@ -4959,9 +4959,397 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{cached_best_header_tip, compute_best_header_tip_from_chain};
-    use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState};
+    use super::*;
+    use axum::extract::{ConnectInfo, Query, State};
+    use axum::http::HeaderMap;
+    use axum::Json;
+    use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, OutPoint, UtxoEntry};
     use irium_node_rs::genesis::load_locked_genesis;
+    use irium_node_rs::mempool::MempoolManager;
+    use irium_node_rs::wallet_store::WalletManager;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize};
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_socket() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 38000)
+    }
+
+    fn unique_path(prefix: &str, ext: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}_{}_{}.{}", prefix, std::process::id(), nanos, ext))
+    }
+
+    fn create_test_state(activation: Option<u64>) -> (AppState, String, String, String) {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis_block = block_from_locked(&locked).expect("genesis block");
+        let params = ChainParams {
+            pow_limit: genesis_block.header.target(),
+            genesis_block,
+            htlcv1_activation_height: activation,
+        };
+        let chain = Arc::new(Mutex::new(ChainState::new(params)));
+
+        let mempool_path = unique_path("irium_htlc_mempool", "json");
+        let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_path, 1024, 0.0)));
+
+        let wallet_path = unique_path("irium_htlc_wallet", "json");
+        let wallet = Arc::new(Mutex::new(WalletManager::new(wallet_path)));
+
+        let (sender, recipient, refund) = {
+            let mut w = wallet.lock().unwrap_or_else(|e| e.into_inner());
+            let sender = w.create("test-pass").expect("wallet create").address;
+            let recipient = w.new_address().expect("recipient address").address;
+            let refund = w.new_address().expect("refund address").address;
+            (sender, recipient, refund)
+        };
+
+        let state = AppState {
+            chain,
+            genesis_hash: "00".repeat(32),
+            mempool,
+            wallet,
+            anchors: None,
+            p2p: None,
+            limiter: Arc::new(Mutex::new(rate_limiter())),
+            status_height_cache: Arc::new(AtomicU64::new(0)),
+            status_peer_count_cache: Arc::new(AtomicUsize::new(0)),
+            status_sybil_cache: Arc::new(AtomicU8::new(0)),
+            status_persisted_height_cache: Arc::new(AtomicU64::new(0)),
+            status_persist_queue_cache: Arc::new(AtomicUsize::new(0)),
+            status_persisted_contiguous_cache: Arc::new(AtomicU64::new(0)),
+            status_persisted_max_on_disk_cache: Arc::new(AtomicU64::new(0)),
+            status_quarantine_count_cache: Arc::new(AtomicU64::new(0)),
+            status_persisted_window_tip_cache: Arc::new(AtomicU64::new(0)),
+            status_missing_persisted_in_window_cache: Arc::new(AtomicU64::new(0)),
+            status_missing_or_mismatch_in_window_cache: Arc::new(AtomicU64::new(0)),
+            status_expected_hash_coverage_in_window_cache: Arc::new(AtomicU64::new(0)),
+            status_expected_hash_window_span_cache: Arc::new(AtomicU64::new(0)),
+            status_best_header_hash_cache: Arc::new(Mutex::new(String::new())),
+        };
+
+        (state, sender, recipient, refund)
+    }
+
+    fn add_wallet_utxo(state: &AppState, address: &str, value: u64) {
+        let pkh = base58_p2pkh_to_hash(address).expect("address decode");
+        let mut pkh20 = [0u8; 20];
+        pkh20.copy_from_slice(&pkh);
+        let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip = chain.tip_height();
+        chain.utxos.insert(
+            OutPoint {
+                txid: [0x55; 32],
+                index: 0,
+            },
+            UtxoEntry {
+                output: TxOutput {
+                    value,
+                    script_pubkey: p2pkh_script(&pkh20),
+                },
+                height: tip,
+                is_coinbase: false,
+            },
+        );
+    }
+
+    fn apply_tx_to_chain_for_test(state: &AppState, tx: &Transaction) {
+        let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        for input in &tx.inputs {
+            let _ = chain.utxos.remove(&OutPoint {
+                txid: input.prev_txid,
+                index: input.prev_index,
+            });
+        }
+        let txid = tx.txid();
+        let h = chain.tip_height();
+        for (idx, out) in tx.outputs.iter().cloned().enumerate() {
+            chain.utxos.insert(
+                OutPoint {
+                    txid,
+                    index: idx as u32,
+                },
+                UtxoEntry {
+                    output: out,
+                    height: h,
+                    is_coinbase: false,
+                },
+            );
+        }
+    }
+
+    fn htlc_create_request(
+        recipient: &str,
+        refund: &str,
+        secret_hash_hex: String,
+        timeout_height: u64,
+    ) -> CreateHtlcRequest {
+        CreateHtlcRequest {
+            amount: "5.00000000".to_string(),
+            recipient_address: recipient.to_string(),
+            refund_address: refund.to_string(),
+            secret_hash_hex,
+            timeout_height,
+            fee_per_byte: Some(1),
+            broadcast: Some(false),
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_createhtlc_rejected_before_activation() {
+        let (state, sender, recipient, refund) = create_test_state(Some(50));
+        add_wallet_utxo(&state, &sender, 20_000_000_000);
+
+        {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.height = 49;
+        }
+
+        let req = htlc_create_request(&recipient, &refund, "11".repeat(32), 100);
+        let res = create_htlc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(req),
+        )
+        .await;
+
+        assert!(matches!(res, Err(StatusCode::BAD_REQUEST)));
+    }
+
+    #[tokio::test]
+    async fn rpc_create_decode_inspect_and_claim_flow() {
+        let (state, sender, recipient, refund) = create_test_state(Some(1));
+        add_wallet_utxo(&state, &sender, 20_000_000_000);
+
+        let secret = b"swap-secret";
+        let secret_hash_hex = hex::encode(Sha256::digest(secret));
+
+        let create = create_htlc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(htlc_create_request(&recipient, &refund, secret_hash_hex.clone(), 10)),
+        )
+        .await
+        .expect("createhtlc")
+        .0;
+
+        let decode = decode_htlc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(DecodeHtlcRequest {
+                raw_tx_hex: create.raw_tx_hex.clone(),
+                vout: Some(0),
+            }),
+        )
+        .await
+        .expect("decodehtlc")
+        .0;
+
+        assert!(decode.found);
+        assert_eq!(decode.output_type, "htlcv1");
+        assert_eq!(decode.expected_hash.as_deref(), Some(secret_hash_hex.as_str()));
+
+        let funding_tx = decode_full_tx(&hex::decode(&create.raw_tx_hex).expect("hex")).expect("tx decode");
+        apply_tx_to_chain_for_test(&state, &funding_tx);
+
+        let inspect_funded = inspect_htlc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(InspectHtlcQuery {
+                txid: create.txid.clone(),
+                vout: 0,
+            }),
+        )
+        .await
+        .expect("inspect funded")
+        .0;
+
+        assert!(inspect_funded.exists);
+        assert!(inspect_funded.unspent);
+
+        let claim = claim_htlc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SpendHtlcRequest {
+                funding_txid: create.txid.clone(),
+                vout: 0,
+                destination_address: recipient.clone(),
+                fee_per_byte: Some(1),
+                broadcast: Some(false),
+                secret_hex: Some(hex::encode(secret)),
+            }),
+        )
+        .await
+        .expect("claim")
+        .0;
+
+        let claim_tx = decode_full_tx(&hex::decode(&claim.raw_tx_hex).expect("hex")).expect("claim decode");
+        apply_tx_to_chain_for_test(&state, &claim_tx);
+
+        let inspect_spent = inspect_htlc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Query(InspectHtlcQuery {
+                txid: create.txid,
+                vout: 0,
+            }),
+        )
+        .await
+        .expect("inspect spent")
+        .0;
+
+        assert!(!inspect_spent.exists);
+        assert!(inspect_spent.spent);
+    }
+
+    #[tokio::test]
+    async fn rpc_claim_wrong_preimage_rejected() {
+        let (state, sender, recipient, refund) = create_test_state(Some(1));
+        add_wallet_utxo(&state, &sender, 20_000_000_000);
+
+        let secret_hash_hex = hex::encode(Sha256::digest(b"right-secret"));
+        let create = create_htlc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(htlc_create_request(&recipient, &refund, secret_hash_hex, 10)),
+        )
+        .await
+        .expect("createhtlc")
+        .0;
+
+        let funding_tx = decode_full_tx(&hex::decode(&create.raw_tx_hex).expect("hex")).expect("tx decode");
+        apply_tx_to_chain_for_test(&state, &funding_tx);
+
+        let wrong = claim_htlc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(SpendHtlcRequest {
+                funding_txid: create.txid,
+                vout: 0,
+                destination_address: recipient,
+                fee_per_byte: Some(1),
+                broadcast: Some(true),
+                secret_hex: Some(hex::encode("wrong-secret")),
+            }),
+        )
+        .await;
+
+        assert!(matches!(wrong, Err(StatusCode::BAD_REQUEST)));
+    }
+
+    #[tokio::test]
+    async fn rpc_refund_before_and_after_timeout() {
+        let (state, sender, recipient, refund) = create_test_state(Some(1));
+        add_wallet_utxo(&state, &sender, 20_000_000_000);
+
+        let timeout = 20u64;
+        {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.height = 19;
+        }
+
+        let create = create_htlc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(htlc_create_request(&recipient, &refund, "22".repeat(32), timeout)),
+        )
+        .await
+        .expect("createhtlc")
+        .0;
+
+        let funding_tx = decode_full_tx(&hex::decode(&create.raw_tx_hex).expect("hex")).expect("tx decode");
+        apply_tx_to_chain_for_test(&state, &funding_tx);
+
+        let early = refund_htlc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SpendHtlcRequest {
+                funding_txid: create.txid.clone(),
+                vout: 0,
+                destination_address: refund.clone(),
+                fee_per_byte: Some(1),
+                broadcast: Some(false),
+                secret_hex: None,
+            }),
+        )
+        .await;
+        assert!(matches!(early, Err(StatusCode::BAD_REQUEST)));
+
+        {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.height = timeout + 1;
+        }
+
+        let late = refund_htlc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(SpendHtlcRequest {
+                funding_txid: create.txid,
+                vout: 0,
+                destination_address: refund,
+                fee_per_byte: Some(1),
+                broadcast: Some(false),
+                secret_hex: None,
+            }),
+        )
+        .await;
+
+        assert!(late.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rpc_decodehtlc_reports_non_htlc_output() {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0u8; 32],
+                prev_index: 0,
+                script_sig: vec![],
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 1,
+                script_pubkey: p2pkh_script(&[1u8; 20]),
+            }],
+            locktime: 0,
+        };
+        tx.inputs[0].script_sig = vec![1, 0, 1, 2];
+
+        let (state, _, _, _) = create_test_state(None);
+        let decode = decode_htlc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(DecodeHtlcRequest {
+                raw_tx_hex: hex::encode(tx.serialize()),
+                vout: Some(0),
+            }),
+        )
+        .await
+        .expect("decode")
+        .0;
+
+        assert!(!decode.found);
+        assert_eq!(decode.output_type, "p2pkh");
+    }
 
     #[test]
     fn status_best_header_tip_hash_non_empty_when_height_positive() {
@@ -4983,5 +5371,6 @@ mod tests {
             !fallback.hash.is_empty(),
             "fallback best_header_tip.hash must not be empty when height > 0"
         );
+        assert_eq!(fallback.height, 1);
     }
 }
