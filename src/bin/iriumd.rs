@@ -48,7 +48,7 @@ use irium_node_rs::tx::{
     OutputEncumbrance, Transaction, TxInput, TxOutput,
 };
 use irium_node_rs::wallet_store::{WalletKey, WalletManager};
-use k256::ecdsa::signature::hazmat::PrehashSigner;
+use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use k256::ecdsa::{Signature, SigningKey};
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
@@ -2548,12 +2548,25 @@ fn sign_wallet_inputs(
         let priv_bytes = hex::decode(&key.privkey).map_err(|_| StatusCode::BAD_REQUEST)?;
         let signing_key = SigningKey::from_bytes(priv_bytes.as_slice().into())
             .map_err(|_| StatusCode::BAD_REQUEST)?;
-        let pub_bytes = hex::decode(&key.pubkey).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let pub_bytes = signing_key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
         let digest = signature_digest(tx, idx, &utxo.output.script_pubkey);
-        let sig: Signature = signing_key
-            .sign_prehash(&digest)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-        let sig = sig.normalize_s().unwrap_or(sig);
+        let verify_key = signing_key.verifying_key();
+        let mut sig_opt: Option<Signature> = None;
+        for _ in 0..4 {
+            let sig_try: Signature = signing_key
+                .sign_prehash(&digest)
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            let sig_try = sig_try.normalize_s().unwrap_or(sig_try);
+            if verify_key.verify_prehash(&digest, &sig_try).is_ok() {
+                sig_opt = Some(sig_try);
+                break;
+            }
+        }
+        let sig = sig_opt.ok_or(StatusCode::BAD_REQUEST)?;
         let mut sig_bytes = sig.to_der().as_bytes().to_vec();
         sig_bytes.push(0x01);
 
@@ -2998,10 +3011,15 @@ async fn create_htlc(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumJson(req): AxumJson<CreateHtlcRequest>,
-) -> Result<Json<CreateHtlcResponse>, StatusCode> {
-    check_rate_with_auth(&state, &addr, &headers)?;
-    require_rpc_auth(&headers)?;
+) -> Result<Json<CreateHtlcResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[create_htlc] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
 
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
     {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let active = chain
@@ -3010,28 +3028,31 @@ async fn create_htlc(
             .map(|h| chain.height >= h)
             .unwrap_or(false);
         if !active {
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(bad("htlcv1_not_active_at_current_height"));
         }
     }
 
-    let amount = parse_irm(&req.amount).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let amount = parse_irm(&req.amount).map_err(|_| bad("amount_parse_failed"))?;
     if amount == 0 {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("amount_zero"));
     }
 
-    let recipient_vec = base58_p2pkh_to_hash(&req.recipient_address).ok_or(StatusCode::BAD_REQUEST)?;
-    let refund_vec = base58_p2pkh_to_hash(&req.refund_address).ok_or(StatusCode::BAD_REQUEST)?;
+    let recipient_vec = base58_p2pkh_to_hash(&req.recipient_address)
+        .ok_or_else(|| bad("recipient_address_decode_failed"))?;
+    let refund_vec = base58_p2pkh_to_hash(&req.refund_address)
+        .ok_or_else(|| bad("refund_address_decode_failed"))?;
     if recipient_vec.len() != 20 || refund_vec.len() != 20 {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("address_hash_len_invalid"));
     }
     let mut recipient_pkh = [0u8; 20];
     recipient_pkh.copy_from_slice(&recipient_vec);
     let mut refund_pkh = [0u8; 20];
     refund_pkh.copy_from_slice(&refund_vec);
 
-    let hash_bytes = hex::decode(req.secret_hash_hex.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let hash_bytes = hex::decode(req.secret_hash_hex.trim())
+        .map_err(|_| bad("secret_hash_hex_decode_failed"))?;
     if hash_bytes.len() != 32 {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("secret_hash_len_invalid"));
     }
     let mut expected_hash = [0u8; 32];
     expected_hash.copy_from_slice(&hash_bytes);
@@ -3039,9 +3060,9 @@ async fn create_htlc(
     let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
     {
         let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-        let keys = wallet.keys().map_err(|_| StatusCode::BAD_REQUEST)?;
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
         for key in keys {
-            let bytes = hex::decode(&key.pkh).map_err(|_| StatusCode::BAD_REQUEST)?;
+            let bytes = hex::decode(&key.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
             if bytes.len() != 20 {
                 continue;
             }
@@ -3051,7 +3072,7 @@ async fn create_htlc(
         }
     }
     if key_map.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("wallet_key_map_empty"));
     }
 
     let (mut utxos, tip_height) = {
@@ -3074,7 +3095,7 @@ async fn create_htlc(
     };
 
     if utxos.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("wallet_utxo_set_empty"));
     }
 
     utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
@@ -3102,7 +3123,7 @@ async fn create_htlc(
     }
 
     if total < amount.saturating_add(fee) {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("insufficient_spendable_funds_or_immature_coinbase"));
     }
 
     let htlc = HtlcV1Output {
@@ -3132,7 +3153,7 @@ async fn create_htlc(
         let change_pkh = selected
             .first()
             .map(|u| u.pkh)
-            .ok_or(StatusCode::BAD_REQUEST)?;
+            .ok_or_else(|| bad("change_output_missing_selected_input"))?;
         outputs.push(TxOutput {
             value: change,
             script_pubkey: p2pkh_script(&change_pkh),
@@ -3147,7 +3168,8 @@ async fn create_htlc(
     };
 
     for _ in 0..2 {
-        sign_wallet_inputs(&mut tx, &selected, &key_map)?;
+        sign_wallet_inputs(&mut tx, &selected, &key_map)
+            .map_err(|_| bad("sign_wallet_inputs_failed"))?;
         let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
         if needed_fee > fee {
             let extra = needed_fee - fee;
@@ -3159,7 +3181,7 @@ async fn create_htlc(
                 }
                 continue;
             } else {
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(bad("fee_recalculation_exceeded_change"));
             }
         }
         break;
@@ -3167,7 +3189,7 @@ async fn create_htlc(
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain.calculate_fees(&tx).map_err(|_| StatusCode::BAD_REQUEST)?
+        chain.calculate_fees(&tx).map_err(|_| bad("chain_fee_calculation_failed"))?
     };
 
     let raw = tx.serialize();
@@ -3178,7 +3200,13 @@ async fn create_htlc(
     if req.broadcast.unwrap_or(false) {
         let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         if !mempool.contains(&txid) {
-            accepted = mempool.add_transaction(tx.clone(), raw.clone(), fee_checked).is_ok();
+            match mempool.add_transaction(tx.clone(), raw.clone(), fee_checked) {
+                Ok(_) => accepted = true,
+                Err(e) => {
+                    eprintln!("[create_htlc] mempool_reject reason={}", e);
+                    accepted = false;
+                }
+            }
         }
     }
 
@@ -5008,7 +5036,7 @@ mod tests {
 
         let (sender, recipient, refund) = {
             let mut w = wallet.lock().unwrap_or_else(|e| e.into_inner());
-            let sender = w.create("test-pass").expect("wallet create").address;
+            let sender = w.create_with_seed("test-pass", Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")).expect("wallet create").address;
             let recipient = w.new_address().expect("recipient address").address;
             let refund = w.new_address().expect("refund address").address;
             (sender, recipient, refund)
@@ -5124,7 +5152,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(res, Err(StatusCode::BAD_REQUEST)));
+        assert!(matches!(res, Err((StatusCode::BAD_REQUEST, _))));
     }
 
     #[tokio::test]
@@ -5204,7 +5232,7 @@ mod tests {
     #[tokio::test]
     async fn rpc_create_decode_inspect_and_claim_flow() {
 
-        let (state, sender, recipient, refund) = create_test_state(Some(1));
+        let (state, sender, recipient, refund) = create_test_state(Some(0));
         add_wallet_utxo(&state, &sender, 20_000_000_000);
 
         let secret = b"swap-secret";
@@ -5295,15 +5323,19 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_claim_wrong_preimage_rejected() {
-        let (state, sender, recipient, refund) = create_test_state(Some(1));
+        let (state, sender, recipient, refund) = create_test_state(Some(0));
         add_wallet_utxo(&state, &sender, 20_000_000_000);
+        {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.height = 19;
+        }
 
         let secret_hash_hex = hex::encode(Sha256::digest(b"right-secret"));
         let create = create_htlc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(htlc_create_request(&recipient, &refund, secret_hash_hex, 10)),
+            Json(htlc_create_request(&recipient, &refund, secret_hash_hex, 40)),
         )
         .await
         .expect("createhtlc")
@@ -5330,9 +5362,10 @@ mod tests {
         assert!(matches!(wrong, Err(StatusCode::BAD_REQUEST)));
     }
 
+
     #[tokio::test]
     async fn rpc_refund_before_and_after_timeout() {
-        let (state, sender, recipient, refund) = create_test_state(Some(1));
+        let (state, sender, recipient, refund) = create_test_state(Some(0));
         add_wallet_utxo(&state, &sender, 20_000_000_000);
 
         let timeout = 20u64;
