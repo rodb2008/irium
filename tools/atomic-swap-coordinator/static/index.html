@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Irium Pilot Self-Serve Swap</title>
+  <style>
+    body{font-family:ui-sans-serif,system-ui;max-width:900px;margin:2rem auto;padding:0 1rem}
+    input,button{padding:.6rem;margin:.25rem 0;width:100%}
+    .card{border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0}
+    pre{background:#f6f8fa;padding:.75rem;overflow:auto}
+  </style>
+</head>
+<body>
+  <h1>Irium BTC↔IRM Pilot (Selected Testers)</h1>
+  <p>Testnet/trial only. Do not use real funds. HTLCv1 mainnet remains OFF.</p>
+  <div class="card">
+    <h3>Create Session</h3>
+    <input id="handle" placeholder="tester handle"/>
+    <input id="btcaddr" placeholder="BTC testnet receive address"/>
+    <input id="invite" placeholder="invite code"/>
+    <button onclick="createSession()">Create</button>
+    <pre id="createOut"></pre>
+  </div>
+  <div class="card">
+    <h3>Swap Status</h3>
+    <input id="swapid" placeholder="swap id"/>
+    <input id="token" placeholder="session token"/>
+    <button onclick="loadStatus()">Load</button>
+    <pre id="statusOut"></pre>
+  </div>
+  <div class="card">
+    <h3>Submit BTC Funding Txid</h3>
+    <input id="txid" placeholder="btc txid"/>
+    <button onclick="submitTxid()">Submit</button>
+    <pre id="submitOut"></pre>
+  </div>
+<script>
+async function createSession(){
+  const r = await fetch('/v1/public-swaps',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({tester_handle:handle.value,btc_testnet_receive_address:btcaddr.value,invite_code:invite.value||null})});
+  const t = await r.text();
+  createOut.textContent = 'HTTP ' + r.status + '
+' + t;
+}
+async function loadStatus(){
+  const r = await fetch('/v1/public-swaps/' + encodeURIComponent(swapid.value) + '?token=' + encodeURIComponent(token.value));
+  statusOut.textContent = 'HTTP ' + r.status + '
+' + (await r.text());
+}
+async function submitTxid(){
+  const r = await fetch('/v1/public-swaps/' + encodeURIComponent(swapid.value) + '/submit-btc-txid?token=' + encodeURIComponent(token.value),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({btc_txid:txid.value})});
+  submitOut.textContent = 'HTTP ' + r.status + '
+' + (await r.text());
+}
+</script>
+</body>
+</html>
