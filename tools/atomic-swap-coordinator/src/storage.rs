@@ -22,7 +22,10 @@ impl Storage {
     }
 
     fn init(&self) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite lock poisoned"))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS swaps (
                 id TEXT PRIMARY KEY,
@@ -33,6 +36,7 @@ impl Storage {
                 btc_funding_txid TEXT,
                 btc_spent_txid TEXT,
                 irium_htlc_txid TEXT,
+                irium_htlc_vout INTEGER,
                 irium_spend_txid TEXT,
                 secret_hash_hex TEXT NOT NULL,
                 state TEXT NOT NULL,
@@ -58,11 +62,15 @@ impl Storage {
                 value TEXT NOT NULL
             );",
         )?;
+        let _ = conn.execute("ALTER TABLE swaps ADD COLUMN irium_htlc_vout INTEGER", []);
         Ok(())
     }
 
     pub fn set_intake_paused(&self, paused: bool) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite lock poisoned"))?;
         conn.execute(
             "INSERT INTO settings(key, value) VALUES('intake_paused', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -72,21 +80,31 @@ impl Storage {
     }
 
     pub fn intake_paused(&self) -> Result<bool> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite lock poisoned"))?;
         let v: Option<String> = conn
-            .query_row("SELECT value FROM settings WHERE key='intake_paused'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key='intake_paused'",
+                [],
+                |r| r.get(0),
+            )
             .optional()?;
         Ok(matches!(v.as_deref(), Some("1") | Some("true")))
     }
 
     pub fn insert_swap(&self, swap: &Swap) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite lock poisoned"))?;
         conn.execute(
             "INSERT INTO swaps(
                 id,tester_handle,session_token,btc_receive_address,btc_htlc_address,btc_funding_txid,btc_spent_txid,
-                irium_htlc_txid,irium_spend_txid,secret_hash_hex,state,next_action,expected_amount_sats,
+                irium_htlc_txid,irium_htlc_vout,irium_spend_txid,secret_hash_hex,state,next_action,expected_amount_sats,
                 btc_confirmations,timeout_height_hint,manual_review,created_at,updated_at
-            ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 swap.id,
                 swap.tester_handle,
@@ -96,6 +114,7 @@ impl Storage {
                 swap.btc_funding_txid,
                 swap.btc_spent_txid,
                 swap.irium_htlc_txid,
+                swap.irium_htlc_vout.map(|v| v as i64),
                 swap.irium_spend_txid,
                 swap.secret_hash_hex,
                 state_to_str(swap.state),
@@ -116,10 +135,13 @@ impl Storage {
     }
 
     pub fn list_live_swaps(&self) -> Result<Vec<Swap>> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite lock poisoned"))?;
         let mut stmt = conn.prepare(
             "SELECT id,tester_handle,session_token,btc_receive_address,btc_htlc_address,btc_funding_txid,btc_spent_txid,
-                    irium_htlc_txid,irium_spend_txid,secret_hash_hex,state,next_action,expected_amount_sats,btc_confirmations,
+                    irium_htlc_txid,irium_htlc_vout,irium_spend_txid,secret_hash_hex,state,next_action,expected_amount_sats,btc_confirmations,
                     timeout_height_hint,manual_review,created_at,updated_at
              FROM swaps WHERE state NOT IN ('claimed','refunded','failed','expired') ORDER BY updated_at DESC",
         )?;
@@ -132,11 +154,14 @@ impl Storage {
     }
 
     pub fn update_swap(&self, swap: &Swap) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite lock poisoned"))?;
         conn.execute(
             "UPDATE swaps SET
-                btc_htlc_address=?2,btc_funding_txid=?3,btc_spent_txid=?4,irium_htlc_txid=?5,irium_spend_txid=?6,
-                state=?7,next_action=?8,btc_confirmations=?9,timeout_height_hint=?10,manual_review=?11,updated_at=?12
+                btc_htlc_address=?2,btc_funding_txid=?3,btc_spent_txid=?4,irium_htlc_txid=?5,irium_htlc_vout=?6,irium_spend_txid=?7,
+                state=?8,next_action=?9,btc_confirmations=?10,timeout_height_hint=?11,manual_review=?12,updated_at=?13
              WHERE id=?1",
             params![
                 swap.id,
@@ -144,6 +169,7 @@ impl Storage {
                 swap.btc_funding_txid,
                 swap.btc_spent_txid,
                 swap.irium_htlc_txid,
+                swap.irium_htlc_vout.map(|v| v as i64),
                 swap.irium_spend_txid,
                 state_to_str(swap.state),
                 swap.next_action,
@@ -156,17 +182,33 @@ impl Storage {
         Ok(())
     }
 
-    pub fn append_event(&self, swap_id: &str, event_type: &str, payload: serde_json::Value) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
+    pub fn append_event(
+        &self,
+        swap_id: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite lock poisoned"))?;
         conn.execute(
             "INSERT INTO swap_events(swap_id,event_type,payload,created_at) VALUES(?1,?2,?3,?4)",
-            params![swap_id, event_type, payload.to_string(), Utc::now().to_rfc3339()],
+            params![
+                swap_id,
+                event_type,
+                payload.to_string(),
+                Utc::now().to_rfc3339()
+            ],
         )?;
         Ok(())
     }
 
     pub fn list_events(&self, swap_id: &str) -> Result<Vec<SwapEvent>> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite lock poisoned"))?;
         let mut stmt = conn.prepare(
             "SELECT id,swap_id,event_type,payload,created_at FROM swap_events WHERE swap_id=?1 ORDER BY id ASC",
         )?;
@@ -192,10 +234,13 @@ impl Storage {
     }
 
     fn get_swap_internal(&self, field: &str, value: &str) -> Result<Option<Swap>> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("sqlite lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("sqlite lock poisoned"))?;
         let sql = format!(
             "SELECT id,tester_handle,session_token,btc_receive_address,btc_htlc_address,btc_funding_txid,btc_spent_txid,
-                    irium_htlc_txid,irium_spend_txid,secret_hash_hex,state,next_action,expected_amount_sats,btc_confirmations,
+                    irium_htlc_txid,irium_htlc_vout,irium_spend_txid,secret_hash_hex,state,next_action,expected_amount_sats,btc_confirmations,
                     timeout_height_hint,manual_review,created_at,updated_at
              FROM swaps WHERE {field}=?1"
         );
@@ -206,9 +251,9 @@ impl Storage {
 }
 
 fn row_to_swap(row: &rusqlite::Row) -> rusqlite::Result<Swap> {
-    let state_s: String = row.get(10)?;
-    let created_s: String = row.get(16)?;
-    let updated_s: String = row.get(17)?;
+    let state_s: String = row.get(11)?;
+    let created_s: String = row.get(17)?;
+    let updated_s: String = row.get(18)?;
     Ok(Swap {
         id: row.get(0)?,
         tester_handle: row.get(1)?,
@@ -218,14 +263,15 @@ fn row_to_swap(row: &rusqlite::Row) -> rusqlite::Result<Swap> {
         btc_funding_txid: row.get(5)?,
         btc_spent_txid: row.get(6)?,
         irium_htlc_txid: row.get(7)?,
-        irium_spend_txid: row.get(8)?,
-        secret_hash_hex: row.get(9)?,
+        irium_htlc_vout: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+        irium_spend_txid: row.get(9)?,
+        secret_hash_hex: row.get(10)?,
         state: str_to_state(&state_s),
-        next_action: row.get(11)?,
-        expected_amount_sats: row.get::<_, i64>(12)? as u64,
-        btc_confirmations: row.get::<_, i64>(13)? as u32,
-        timeout_height_hint: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
-        manual_review: row.get::<_, i64>(15)? != 0,
+        next_action: row.get(12)?,
+        expected_amount_sats: row.get::<_, i64>(13)? as u64,
+        btc_confirmations: row.get::<_, i64>(14)? as u32,
+        timeout_height_hint: row.get::<_, Option<i64>>(15)?.map(|v| v as u64),
+        manual_review: row.get::<_, i64>(16)? != 0,
         created_at: DateTime::parse_from_rfc3339(&created_s)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),

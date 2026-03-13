@@ -49,8 +49,8 @@ async fn main() -> Result<()> {
     let bind: SocketAddr = std::env::var("COORDINATOR_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8088".to_string())
         .parse()?;
-    let db_path = std::env::var("COORDINATOR_DB")
-        .unwrap_or_else(|_| "./swap-coordinator.db".to_string());
+    let db_path =
+        std::env::var("COORDINATOR_DB").unwrap_or_else(|_| "./swap-coordinator.db".to_string());
 
     let operator_token = std::env::var("COORDINATOR_OPERATOR_TOKEN")
         .unwrap_or_else(|_| "change-me-operator-token".to_string());

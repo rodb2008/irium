@@ -16,7 +16,8 @@ use uuid::Uuid;
 use crate::{
     model::{
         CreatePublicSwapRequest, CreatePublicSwapResponse, MarkReviewRequest, PauseIntakeRequest,
-        PublicSwapView, StatusResponse, SubmitBtcTxidRequest, Swap, SwapState,
+        PublicSwapView, StatusResponse, SubmitBtcTxidRequest, SubmitTerminalProofRequest, Swap,
+        SwapState,
     },
     state_machine::{can_transition, default_next_action},
     AppCtx,
@@ -30,10 +31,20 @@ pub fn router(ctx: AppCtx) -> Router {
         .route("/v1/public-swaps/:id", get(get_public_swap))
         .route("/v1/public-swaps/:id/status", get(get_status))
         .route("/v1/public-swaps/:id/events", get(get_public_events))
-        .route("/v1/public-swaps/:id/submit-btc-txid", post(submit_btc_txid))
+        .route(
+            "/v1/public-swaps/:id/submit-btc-txid",
+            post(submit_btc_txid),
+        )
         .route("/v1/admin/intake", post(set_intake))
         .route("/v1/admin/swaps", get(list_live_swaps))
-        .route("/v1/admin/swaps/:id/manual-review", post(mark_manual_review))
+        .route(
+            "/v1/admin/swaps/:id/manual-review",
+            post(mark_manual_review),
+        )
+        .route(
+            "/v1/admin/swaps/:id/submit-terminal-proof",
+            post(submit_terminal_proof),
+        )
         .with_state(ctx)
 }
 
@@ -80,21 +91,23 @@ pub async fn poll_progression(ctx: AppCtx) -> anyhow::Result<()> {
                         json!({"btc_txid": txid, "confirmations": conf}),
                     )?;
                     if ctx.cfg.auto_create_irium_htlc {
-                        if let Ok(Some(irium_txid)) = ctx.irium.create_htlc(&s.secret_hash_hex).await {
-                            s.irium_htlc_txid = Some(irium_txid.clone());
+                        if let Ok(Some(irium_ref)) = ctx.irium.create_htlc(&s.secret_hash_hex).await
+                        {
+                            s.irium_htlc_txid = Some(irium_ref.txid.clone());
+                            s.irium_htlc_vout = Some(irium_ref.vout);
                             transition(
                                 &ctx,
                                 &mut s,
                                 SwapState::IriumHtlcCreated,
                                 "irium_htlc_created",
-                                json!({"irium_txid": irium_txid}),
+                                json!({"irium_txid": irium_ref.txid, "vout": irium_ref.vout}),
                             )?;
                             transition(
                                 &ctx,
                                 &mut s,
                                 SwapState::IriumHtlcConfirmed,
                                 "irium_htlc_confirmed",
-                                json!({"irium_txid": irium_txid}),
+                                json!({"confirmations": 1}),
                             )?;
                         }
                     }
@@ -140,6 +153,7 @@ fn build_public_view(s: &Swap) -> PublicSwapView {
         btc_funding_txid: s.btc_funding_txid.clone(),
         btc_spent_txid: s.btc_spent_txid.clone(),
         irium_htlc_txid: s.irium_htlc_txid.clone(),
+        irium_htlc_vout: s.irium_htlc_vout,
         irium_spend_txid: s.irium_spend_txid.clone(),
         timeout_height_hint: s.timeout_height_hint,
         success: s.state == SwapState::Claimed,
@@ -169,13 +183,19 @@ async fn create_public_swap(
     Json(req): Json<CreatePublicSwapRequest>,
 ) -> Result<Json<CreatePublicSwapResponse>, (StatusCode, String)> {
     if !ctx.cfg.public_enabled {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "public_flow_disabled".to_string()));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "public_flow_disabled".to_string(),
+        ));
     }
     if *ctx.intake_paused.read().await {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "intake_paused".to_string()));
     }
     if req.tester_handle.trim().is_empty() || req.btc_testnet_receive_address.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "missing_required_fields".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "missing_required_fields".to_string(),
+        ));
     }
     if !ctx.cfg.invite_codes.is_empty() {
         let code = req.invite_code.clone().unwrap_or_default();
@@ -208,6 +228,7 @@ async fn create_public_swap(
         btc_funding_txid: None,
         btc_spent_txid: None,
         irium_htlc_txid: None,
+        irium_htlc_vout: None,
         irium_spend_txid: None,
         secret_hash_hex,
         state: SwapState::Created,
@@ -351,7 +372,10 @@ async fn submit_btc_txid(
     Json(req): Json<SubmitBtcTxidRequest>,
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
     if !ctx.cfg.public_enabled {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "public_flow_disabled".to_string()));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "public_flow_disabled".to_string(),
+        ));
     }
     let mut swap = ctx
         .storage
@@ -360,15 +384,18 @@ async fn submit_btc_txid(
         .ok_or((StatusCode::NOT_FOUND, "swap_not_found".to_string()))?;
 
     if !token_ok(&headers, &q, &swap) {
-        return Err((StatusCode::UNAUTHORIZED, "invalid_session_token".to_string()));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid_session_token".to_string(),
+        ));
     }
     if swap.manual_review {
         return Err((StatusCode::LOCKED, "swap_in_manual_review".to_string()));
     }
-    let expected_addr = swap
-        .btc_htlc_address
-        .clone()
-        .ok_or((StatusCode::BAD_REQUEST, "btc_htlc_address_missing".to_string()))?;
+    let expected_addr = swap.btc_htlc_address.clone().ok_or((
+        StatusCode::BAD_REQUEST,
+        "btc_htlc_address_missing".to_string(),
+    ))?;
     let ok = ctx
         .btc
         .validate_funding_tx(&req.btc_txid, &expected_addr, swap.expected_amount_sats)
@@ -398,7 +425,7 @@ async fn submit_btc_txid(
 
     let conf = ctx
         .btc
-        .tx_confirmations(swap.btc_funding_txid.as_deref().unwrap())
+        .tx_confirmations(swap.btc_funding_txid.as_deref().unwrap_or_default())
         .await
         .unwrap_or(0);
     swap.btc_confirmations = conf;
@@ -490,6 +517,185 @@ async fn mark_manual_review(
     }))
 }
 
+async fn submit_terminal_proof(
+    Path(id): Path<String>,
+    State(ctx): State<AppCtx>,
+    headers: HeaderMap,
+    Json(req): Json<SubmitTerminalProofRequest>,
+) -> Result<Json<StatusResponse>, (StatusCode, String)> {
+    if !operator_ok(&ctx, &headers) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "operator_token_invalid".to_string(),
+        ));
+    }
+
+    let mut swap = ctx
+        .storage
+        .get_swap_public(&id)
+        .map_err(internal_err)?
+        .ok_or((StatusCode::NOT_FOUND, "swap_not_found".to_string()))?;
+
+    let side = req.side.trim().to_ascii_lowercase();
+    let outcome = req.outcome.trim().to_ascii_lowercase();
+    let txid = req.txid.trim().to_ascii_lowercase();
+
+    if !is_hex_txid(&txid) {
+        return Err((StatusCode::BAD_REQUEST, "bad_txid_format".to_string()));
+    }
+    if side != "btc" && side != "irium" {
+        return Err((StatusCode::BAD_REQUEST, "invalid_side".to_string()));
+    }
+    if outcome != "claim" && outcome != "refund" {
+        return Err((StatusCode::BAD_REQUEST, "invalid_outcome".to_string()));
+    }
+
+    if outcome == "claim"
+        && swap.state == SwapState::Claimed
+        && ((side == "btc" && swap.btc_spent_txid.as_deref() == Some(txid.as_str()))
+            || (side == "irium" && swap.irium_spend_txid.as_deref() == Some(txid.as_str())))
+    {
+        return Ok(Json(StatusResponse {
+            state: swap.state,
+            next_action: swap.next_action,
+            terminal: true,
+        }));
+    }
+
+    if outcome == "refund"
+        && swap.state == SwapState::Refunded
+        && ((side == "btc" && swap.btc_spent_txid.as_deref() == Some(txid.as_str()))
+            || (side == "irium" && swap.irium_spend_txid.as_deref() == Some(txid.as_str())))
+    {
+        return Ok(Json(StatusResponse {
+            state: swap.state,
+            next_action: swap.next_action,
+            terminal: true,
+        }));
+    }
+
+    if swap.state.is_terminal() {
+        return Err((
+            StatusCode::CONFLICT,
+            "terminal_state_conflicts_with_new_proof".to_string(),
+        ));
+    }
+
+    if side == "btc" {
+        let conf = ctx.btc.tx_confirmations(&txid).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("btc_proof_check_failed:{e}"),
+            )
+        })?;
+        if conf < ctx.cfg.btc_min_confirmations {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "proof_not_confirmed:{}<{}",
+                    conf, ctx.cfg.btc_min_confirmations
+                ),
+            ));
+        }
+        swap.btc_spent_txid = Some(txid.clone());
+    } else {
+        let exists = ctx.irium.tx_exists(&txid).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("irium_proof_check_failed:{e}"),
+            )
+        })?;
+        if !exists {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "proof_tx_missing_on_irium".to_string(),
+            ));
+        }
+        if let (Some(htlc_txid), Some(vout)) = (swap.irium_htlc_txid.clone(), swap.irium_htlc_vout)
+        {
+            let spent = ctx.irium.htlc_spent(&htlc_txid, vout).await.map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("irium_spend_check_failed:{e}"),
+                )
+            })?;
+            if !spent {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "proof_tx_not_spending_known_irium_htlc".to_string(),
+                ));
+            }
+        }
+        swap.irium_spend_txid = Some(txid.clone());
+    }
+
+    if outcome == "claim" {
+        if !matches!(
+            swap.state,
+            SwapState::IriumHtlcConfirmed | SwapState::ClaimInitiated
+        ) {
+            return Err((
+                StatusCode::CONFLICT,
+                "claim_proof_not_allowed_in_current_state".to_string(),
+            ));
+        }
+        if swap.state != SwapState::ClaimInitiated {
+            transition(
+                &ctx,
+                &mut swap,
+                SwapState::ClaimInitiated,
+                "claim_proof_received",
+                json!({"side": side, "txid": txid}),
+            )
+            .map_err(internal_err)?;
+        }
+        transition(
+            &ctx,
+            &mut swap,
+            SwapState::Claimed,
+            "claim_proof_confirmed",
+            json!({"side": side, "txid": txid}),
+        )
+        .map_err(internal_err)?;
+    } else {
+        if !matches!(
+            swap.state,
+            SwapState::BtcHtlcConfirmed | SwapState::IriumHtlcConfirmed | SwapState::RefundPending
+        ) {
+            return Err((
+                StatusCode::CONFLICT,
+                "refund_proof_not_allowed_in_current_state".to_string(),
+            ));
+        }
+        if swap.state != SwapState::RefundPending {
+            transition(
+                &ctx,
+                &mut swap,
+                SwapState::RefundPending,
+                "refund_proof_received",
+                json!({"side": side, "txid": txid}),
+            )
+            .map_err(internal_err)?;
+        }
+        transition(
+            &ctx,
+            &mut swap,
+            SwapState::Refunded,
+            "refund_proof_confirmed",
+            json!({"side": side, "txid": txid}),
+        )
+        .map_err(internal_err)?;
+    }
+
+    ctx.storage.update_swap(&swap).map_err(internal_err)?;
+
+    Ok(Json(StatusResponse {
+        state: swap.state,
+        next_action: swap.next_action,
+        terminal: swap.state.is_terminal(),
+    }))
+}
+
 fn transition(
     ctx: &AppCtx,
     swap: &mut Swap,
@@ -506,6 +712,10 @@ fn transition(
     ctx.storage.append_event(&swap.id, event, payload)?;
     info!("swap={} state={:?}", swap.id, swap.state);
     Ok(())
+}
+
+fn is_hex_txid(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn internal_err<E: std::fmt::Display>(e: E) -> (StatusCode, String) {

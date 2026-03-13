@@ -12,6 +12,12 @@ pub struct IriumClient {
     pub timeout_blocks: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct IriumHtlcRef {
+    pub txid: String,
+    pub vout: u32,
+}
+
 impl IriumClient {
     pub fn disabled() -> Self {
         Self {
@@ -31,6 +37,7 @@ impl IriumClient {
             req
         }
     }
+
     async fn chain_height(&self) -> Result<u64> {
         let base = self
             .rpc_url
@@ -46,7 +53,38 @@ impl IriumClient {
         Ok(v["height"].as_u64().unwrap_or(0))
     }
 
-    pub async fn create_htlc(&self, secret_hash_hex: &str) -> Result<Option<String>> {
+    pub async fn tx_exists(&self, txid: &str) -> Result<bool> {
+        if self.rpc_url.is_none() {
+            return Ok(false);
+        }
+        let base = self.rpc_url.clone().unwrap_or_default();
+        let url = format!("{}/rpc/tx?txid={}", base.trim_end_matches('/'), txid);
+        let cli = Client::builder().build()?;
+        let r = self.auth_req(cli.get(url)).send().await?;
+        Ok(r.status().is_success())
+    }
+
+    pub async fn htlc_spent(&self, txid: &str, vout: u32) -> Result<bool> {
+        if self.rpc_url.is_none() {
+            return Ok(false);
+        }
+        let base = self.rpc_url.clone().unwrap_or_default();
+        let url = format!(
+            "{}/rpc/inspecthtlc?txid={}&vout={}",
+            base.trim_end_matches('/'),
+            txid,
+            vout
+        );
+        let cli = Client::builder().build()?;
+        let r = self.auth_req(cli.get(url)).send().await?;
+        if !r.status().is_success() {
+            return Ok(false);
+        }
+        let v: Value = r.json().await?;
+        Ok(v["spent"].as_bool().unwrap_or(false))
+    }
+
+    pub async fn create_htlc(&self, secret_hash_hex: &str) -> Result<Option<IriumHtlcRef>> {
         if self.rpc_url.is_none() {
             return Ok(None);
         }
@@ -60,7 +98,7 @@ impl IriumClient {
             .clone()
             .ok_or_else(|| anyhow!("missing_irium_refund"))?;
 
-        let base = self.rpc_url.clone().unwrap();
+        let base = self.rpc_url.clone().unwrap_or_default();
         let url = format!("{}/rpc/createhtlc", base.trim_end_matches('/'));
         let timeout_height = self.chain_height().await.unwrap_or(0) + self.timeout_blocks.max(6);
         let body = json!({
@@ -80,6 +118,11 @@ impl IriumClient {
             return Err(anyhow!("irium_createhtlc_http_{}:{}", status, txt));
         }
         let v: Value = r.json().await?;
-        Ok(v["txid"].as_str().map(|s| s.to_string()))
+        let txid = v["txid"]
+            .as_str()
+            .ok_or_else(|| anyhow!("irium_createhtlc_missing_txid"))?
+            .to_string();
+        let vout = v["htlc_vout"].as_u64().unwrap_or(0) as u32;
+        Ok(Some(IriumHtlcRef { txid, vout }))
     }
 }
