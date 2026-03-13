@@ -31,7 +31,6 @@ pub fn router(ctx: AppCtx) -> Router {
         .route("/v1/public-swaps/:id/status", get(get_status))
         .route("/v1/public-swaps/:id/events", get(get_public_events))
         .route("/v1/public-swaps/:id/submit-btc-txid", post(submit_btc_txid))
-        .route("/v1/public-swaps/:id/request-refund", post(request_refund))
         .route("/v1/admin/intake", post(set_intake))
         .route("/v1/admin/swaps", get(list_live_swaps))
         .route("/v1/admin/swaps/:id/manual-review", post(mark_manual_review))
@@ -96,22 +95,6 @@ pub async fn poll_progression(ctx: AppCtx) -> anyhow::Result<()> {
                                 SwapState::IriumHtlcConfirmed,
                                 "irium_htlc_confirmed",
                                 json!({"irium_txid": irium_txid}),
-                            )?;
-                            let spend_txid = format!("auto-claim:{}", s.irium_htlc_txid.clone().unwrap_or_default());
-                            s.irium_spend_txid = Some(spend_txid.clone());
-                            transition(
-                                &ctx,
-                                &mut s,
-                                SwapState::ClaimInitiated,
-                                "claim_initiated",
-                                json!({"irium_spend_txid": spend_txid}),
-                            )?;
-                            transition(
-                                &ctx,
-                                &mut s,
-                                SwapState::Claimed,
-                                "claimed",
-                                json!({"auto": true}),
                             )?;
                         }
                     }
@@ -185,6 +168,9 @@ async fn create_public_swap(
     State(ctx): State<AppCtx>,
     Json(req): Json<CreatePublicSwapRequest>,
 ) -> Result<Json<CreatePublicSwapResponse>, (StatusCode, String)> {
+    if !ctx.cfg.public_enabled {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "public_flow_disabled".to_string()));
+    }
     if *ctx.intake_paused.read().await {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "intake_paused".to_string()));
     }
@@ -283,6 +269,9 @@ async fn get_public_swap(
     headers: HeaderMap,
     State(ctx): State<AppCtx>,
 ) -> Result<Json<PublicSwapView>, StatusCode> {
+    if !ctx.cfg.public_enabled {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let swap = ctx
         .storage
         .get_swap_public(&id)
@@ -300,6 +289,9 @@ async fn get_status(
     headers: HeaderMap,
     State(ctx): State<AppCtx>,
 ) -> Result<Json<StatusResponse>, StatusCode> {
+    if !ctx.cfg.public_enabled {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let swap = ctx
         .storage
         .get_swap_public(&id)
@@ -321,6 +313,9 @@ async fn get_public_events(
     headers: HeaderMap,
     State(ctx): State<AppCtx>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    if !ctx.cfg.public_enabled {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let swap = ctx
         .storage
         .get_swap_public(&id)
@@ -355,6 +350,9 @@ async fn submit_btc_txid(
     State(ctx): State<AppCtx>,
     Json(req): Json<SubmitBtcTxidRequest>,
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
+    if !ctx.cfg.public_enabled {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "public_flow_disabled".to_string()));
+    }
     let mut swap = ctx
         .storage
         .get_swap_public(&id)
@@ -414,61 +412,6 @@ async fn submit_btc_txid(
         )
         .map_err(internal_err)?;
     }
-
-    ctx.storage.update_swap(&swap).map_err(internal_err)?;
-    Ok(Json(StatusResponse {
-        state: swap.state,
-        next_action: swap.next_action,
-        terminal: swap.state.is_terminal(),
-    }))
-}
-
-async fn request_refund(
-    Path(id): Path<String>,
-    Query(q): Query<TokenQuery>,
-    headers: HeaderMap,
-    State(ctx): State<AppCtx>,
-) -> Result<Json<StatusResponse>, (StatusCode, String)> {
-    let mut swap = ctx
-        .storage
-        .get_swap_public(&id)
-        .map_err(internal_err)?
-        .ok_or((StatusCode::NOT_FOUND, "swap_not_found".to_string()))?;
-
-    if !token_ok(&headers, &q, &swap) {
-        return Err((StatusCode::UNAUTHORIZED, "invalid_session_token".to_string()));
-    }
-    if swap.manual_review {
-        return Err((StatusCode::LOCKED, "swap_in_manual_review".to_string()));
-    }
-    if swap.state.is_terminal() {
-        return Ok(Json(StatusResponse {
-            state: swap.state,
-            next_action: swap.next_action,
-            terminal: true,
-        }));
-    }
-
-    transition(
-        &ctx,
-        &mut swap,
-        SwapState::RefundPending,
-        "refund_requested",
-        json!({"by": "tester"}),
-    )
-    .map_err(internal_err)?;
-
-    let refund_txid = format!("auto-refund:{}", swap.btc_funding_txid.clone().unwrap_or_else(|| swap.id.clone()));
-    swap.btc_spent_txid = Some(refund_txid.clone());
-    swap.irium_spend_txid = Some(refund_txid);
-    transition(
-        &ctx,
-        &mut swap,
-        SwapState::Refunded,
-        "refunded",
-        json!({"auto": true}),
-    )
-    .map_err(internal_err)?;
 
     ctx.storage.update_swap(&swap).map_err(internal_err)?;
     Ok(Json(StatusResponse {

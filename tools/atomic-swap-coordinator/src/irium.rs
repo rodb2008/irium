@@ -31,27 +31,6 @@ impl IriumClient {
             req
         }
     }
-
-    async fn wallet_receive_address(&self) -> Result<String> {
-        let base = self
-            .rpc_url
-            .clone()
-            .ok_or_else(|| anyhow!("irium_rpc_disabled"))?;
-        let url = format!("{}/wallet/receive", base.trim_end_matches('/'));
-        let cli = Client::builder().build()?;
-        let r = self.auth_req(cli.get(url)).send().await?;
-        let status = r.status();
-        if !status.is_success() {
-            let txt = r.text().await.unwrap_or_default();
-            return Err(anyhow!("irium_wallet_receive_http_{}:{}", status, txt));
-        }
-        let v: Value = r.json().await?;
-        v["address"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("irium_wallet_receive_missing_address"))
-    }
-
     async fn chain_height(&self) -> Result<u64> {
         let base = self
             .rpc_url
@@ -72,14 +51,14 @@ impl IriumClient {
             return Ok(None);
         }
 
-        let recipient = match self.recipient_address.clone() {
-            Some(v) if !v.trim().is_empty() => v,
-            _ => self.wallet_receive_address().await?,
-        };
-        let refund = match self.refund_address.clone() {
-            Some(v) if !v.trim().is_empty() => v,
-            _ => recipient.clone(),
-        };
+        let recipient = self
+            .recipient_address
+            .clone()
+            .ok_or_else(|| anyhow!("missing_irium_recipient"))?;
+        let refund = self
+            .refund_address
+            .clone()
+            .ok_or_else(|| anyhow!("missing_irium_refund"))?;
 
         let base = self.rpc_url.clone().unwrap();
         let url = format!("{}/rpc/createhtlc", base.trim_end_matches('/'));

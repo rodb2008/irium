@@ -22,6 +22,7 @@ fn test_ctx() -> AppCtx {
             btc_min_confirmations: 1,
             auto_detect_btc: false,
             auto_create_irium_htlc: false,
+            public_enabled: true,
         },
         btc: BtcClient::disabled(1),
         irium: IriumClient::disabled(),

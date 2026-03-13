@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub btc_min_confirmations: u32,
     pub auto_detect_btc: bool,
     pub auto_create_irium_htlc: bool,
+    pub public_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -32,6 +33,13 @@ pub struct AppCtx {
     pub intake_paused: Arc<RwLock<bool>>,
 }
 
+fn flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(default)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -39,11 +47,13 @@ async fn main() -> Result<()> {
         .init();
 
     let bind: SocketAddr = std::env::var("COORDINATOR_BIND")
-        .unwrap_or_else(|_| "0.0.0.0:8088".to_string())
+        .unwrap_or_else(|_| "127.0.0.1:8088".to_string())
         .parse()?;
-    let db_path = std::env::var("COORDINATOR_DB").unwrap_or_else(|_| "./swap-coordinator.db".to_string());
+    let db_path = std::env::var("COORDINATOR_DB")
+        .unwrap_or_else(|_| "./swap-coordinator.db".to_string());
 
-    let operator_token = std::env::var("COORDINATOR_OPERATOR_TOKEN").unwrap_or_else(|_| "pilot-operator-change-me".to_string());
+    let operator_token = std::env::var("COORDINATOR_OPERATOR_TOKEN")
+        .unwrap_or_else(|_| "change-me-operator-token".to_string());
     let invite_codes = std::env::var("COORDINATOR_INVITE_CODES")
         .unwrap_or_default()
         .split(',')
@@ -61,15 +71,10 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
 
-    let auto_detect_btc = std::env::var("COORDINATOR_AUTO_DETECT_BTC")
-        .ok()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(true);
-
-    let auto_create_irium_htlc = !std::env::var("COORDINATOR_DISABLE_AUTO_CREATE_IRIUM_HTLC")
-        .ok()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
+    // mainnet-safe defaults: off unless explicitly enabled
+    let public_enabled = flag("COORDINATOR_PUBLIC_ENABLED", false);
+    let auto_detect_btc = flag("COORDINATOR_AUTO_DETECT_BTC", false);
+    let auto_create_irium_htlc = flag("COORDINATOR_AUTO_CREATE_IRIUM_HTLC", false);
 
     let storage = Storage::open(&db_path)?;
     let paused = storage.intake_paused().unwrap_or(false);
@@ -87,16 +92,15 @@ async fn main() -> Result<()> {
         BtcClient::disabled(btc_min_confirmations)
     };
 
-    let irium_url = std::env::var("IRIUM_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:58400".to_string());
-    let irium = if !irium_url.trim().is_empty() {
-        let url = irium_url;
+    // no implicit local fallback: must be explicitly configured
+    let irium = if let Ok(url) = std::env::var("IRIUM_RPC_URL") {
         IriumClient {
             rpc_url: Some(url),
-            rpc_token: std::env::var("IRIUM_RPC_TOKEN").ok().or_else(|| std::env::var("IRIUM_PILOT_RPC_TOKEN").ok()).or(Some("trialtoken".to_string())),
-            recipient_address: std::env::var("IRIUM_PILOT_RECIPIENT_ADDRESS").ok(),
-            refund_address: std::env::var("IRIUM_PILOT_REFUND_ADDRESS").ok(),
-            amount_irm: std::env::var("IRIUM_PILOT_AMOUNT").unwrap_or_else(|_| "1.0".to_string()),
-            timeout_blocks: std::env::var("IRIUM_PILOT_TIMEOUT_BLOCKS")
+            rpc_token: std::env::var("IRIUM_RPC_TOKEN").ok(),
+            recipient_address: std::env::var("IRIUM_RECIPIENT_ADDRESS").ok(),
+            refund_address: std::env::var("IRIUM_REFUND_ADDRESS").ok(),
+            amount_irm: std::env::var("IRIUM_AMOUNT").unwrap_or_else(|_| "1.0".to_string()),
+            timeout_blocks: std::env::var("IRIUM_TIMEOUT_BLOCKS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(120),
@@ -114,6 +118,7 @@ async fn main() -> Result<()> {
             btc_min_confirmations,
             auto_detect_btc,
             auto_create_irium_htlc,
+            public_enabled,
         },
         btc,
         irium,
