@@ -78,7 +78,9 @@ async fn main() -> Result<()> {
         BtcClient::enabled(
             url,
             std::env::var("BTC_RPC_USER").ok(),
-            std::env::var("BTC_RPC_PASS").ok(),
+            std::env::var("BTC_RPC_PASS")
+                .ok()
+                .or_else(|| std::env::var("BTC_RPC_PASSWORD").ok()),
             btc_min_confirmations,
         )
     } else {
