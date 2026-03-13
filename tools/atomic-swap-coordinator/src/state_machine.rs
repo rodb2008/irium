@@ -18,6 +18,8 @@ pub fn can_transition(from: SwapState, to: SwapState) -> bool {
             | (SwapState::IriumHtlcCreated, SwapState::IriumHtlcConfirmed)
             | (SwapState::IriumHtlcConfirmed, SwapState::ClaimInitiated)
             | (SwapState::ClaimInitiated, SwapState::Claimed)
+            | (SwapState::SecretCommitted, SwapState::RefundPending)
+            | (SwapState::BtcHtlcCreated, SwapState::RefundPending)
             | (SwapState::BtcHtlcConfirmed, SwapState::RefundPending)
             | (SwapState::IriumHtlcConfirmed, SwapState::RefundPending)
             | (SwapState::RefundPending, SwapState::Refunded)

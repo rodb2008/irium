@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(true);
 
-    let auto_create_irium_htlc = std::env::var("COORDINATOR_AUTO_CREATE_IRIUM_HTLC")
+    let auto_create_irium_htlc = !std::env::var("COORDINATOR_DISABLE_AUTO_CREATE_IRIUM_HTLC")
         .ok()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
@@ -87,10 +87,12 @@ async fn main() -> Result<()> {
         BtcClient::disabled(btc_min_confirmations)
     };
 
-    let irium = if let Ok(url) = std::env::var("IRIUM_RPC_URL") {
+    let irium_url = std::env::var("IRIUM_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:58400".to_string());
+    let irium = if !irium_url.trim().is_empty() {
+        let url = irium_url;
         IriumClient {
             rpc_url: Some(url),
-            rpc_token: std::env::var("IRIUM_RPC_TOKEN").ok(),
+            rpc_token: std::env::var("IRIUM_RPC_TOKEN").ok().or_else(|| std::env::var("IRIUM_PILOT_RPC_TOKEN").ok()).or(Some("trialtoken".to_string())),
             recipient_address: std::env::var("IRIUM_PILOT_RECIPIENT_ADDRESS").ok(),
             refund_address: std::env::var("IRIUM_PILOT_REFUND_ADDRESS").ok(),
             amount_irm: std::env::var("IRIUM_PILOT_AMOUNT").unwrap_or_else(|_| "1.0".to_string()),
