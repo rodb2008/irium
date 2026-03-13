@@ -4,8 +4,8 @@ Status now: **NOT ACTIVATED**. This checklist is for approved execution only.
 
 ## A. Code and Build Readiness
 - [ ] `main` includes HTLCv1 + automation hardening commit set.
-- [ ] `IRIUM_HTLCV1_ACTIVATION_HEIGHT` is unset in all production node environments.
-- [ ] Coordinator/public self-serve remain disabled unless explicitly enabled.
+- [ ] `src/activation.rs` is the single mainnet activation source.
+- [ ] `MAINNET_HTLCV1_ACTIVATION_HEIGHT` is still `None` until approval.
 - [ ] Test suite green on release candidate commit:
   - [ ] `cargo test --manifest-path tools/atomic-swap-coordinator/Cargo.toml -- --nocapture`
   - [ ] `cargo test --lib`
@@ -16,28 +16,24 @@ Status now: **NOT ACTIVATED**. This checklist is for approved execution only.
 - [ ] Operator acknowledgment collected from a majority of economically relevant nodes.
 - [ ] Miner/pool upgrade acknowledgment collected.
 - [ ] Public notice window completed (recommended minimum: 7 days).
-- [ ] Final activation height selected with safety buffer (see runbook).
+- [ ] Final activation height selected with safety buffer.
 
 ## C. Pre-Activation Operations
 - [ ] Confirm live mainnet health (peer count, block propagation, no major forks).
-- [ ] Confirm all intended activation nodes run identical commit hash from GitHub.
+- [ ] Confirm intended activation nodes run identical release commit from GitHub.
 - [ ] Confirm no host runs from `/tmp` or unknown binary path.
-- [ ] Snapshot/backup:
-  - [ ] wallet files
-  - [ ] node data dir metadata
-  - [ ] coordinator DB (if used)
-- [ ] Monitoring/alerts armed (see `docs/mainnet_activation_monitoring.md`).
+- [ ] Snapshot/backup operational data.
+- [ ] Monitoring/alerts armed.
 
 ## D. Activation Execution Gate (T-60 to T-0)
 - [ ] NO-GO criteria reviewed and clear.
 - [ ] ABORT criteria reviewed and clear.
 - [ ] Operator on-duty matrix confirmed.
 - [ ] Incident channel open.
-- [ ] Activation env change prepared but not yet applied.
+- [ ] Activation release built with approved hardcoded height.
 
 ## E. At Activation Height
-- [ ] Apply activation env only on approved hosts.
-- [ ] Restart nodes with controlled staggering.
+- [ ] Nodes are running the release containing the approved hardcoded height.
 - [ ] Validate activation state on each node.
 - [ ] Confirm new blocks continue and no chain split symptoms appear.
 
@@ -53,4 +49,4 @@ Status now: **NOT ACTIVATED**. This checklist is for approved execution only.
 - [ ] Postmortem notes captured.
 - [ ] Roll-forward actions logged.
 
-Reminder: HTLCv1 remains OFF until an explicit activation-height rollout is approved and executed.
+Reminder: HTLCv1 remains OFF until an explicit code release with approved activation height is shipped and adopted.

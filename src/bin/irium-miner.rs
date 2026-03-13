@@ -20,6 +20,7 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use irium_node_rs::activation::{network_kind_from_env, resolved_htlcv1_activation_height};
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
 use irium_node_rs::chain::{block_from_locked, decode_compact_tx, ChainParams, ChainState};
@@ -63,12 +64,6 @@ fn rpc_token() -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-}
-
-fn htlcv1_activation_height() -> Option<u64> {
-    env::var("IRIUM_HTLCV1_ACTIVATION_HEIGHT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
 }
 
 fn rpc_status_error(prefix: &str, status: StatusCode) -> String {
@@ -226,7 +221,8 @@ fn coinbase_metadata_output() -> Option<TxOutput> {
 
 #[cfg(test)]
 mod tests {
-    use super::{htlcv1_activation_height, script_from_relay_address};
+    use super::script_from_relay_address;
+    use irium_node_rs::activation::{resolved_htlcv1_activation_height, NetworkKind};
 
     #[test]
     fn builds_p2pkh_from_hex() {
@@ -247,12 +243,24 @@ mod tests {
     }
 
     #[test]
-    fn reads_htlcv1_activation_height_from_env() {
+    fn mainnet_ignores_env_activation_override() {
         std::env::set_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT", "42");
-        assert_eq!(htlcv1_activation_height(), Some(42));
+        assert_eq!(
+            resolved_htlcv1_activation_height(NetworkKind::Mainnet),
+            None
+        );
         std::env::remove_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT");
     }
 
+    #[test]
+    fn devnet_can_use_env_activation_override() {
+        std::env::set_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT", "42");
+        assert_eq!(
+            resolved_htlcv1_activation_height(NetworkKind::Devnet),
+            Some(42)
+        );
+        std::env::remove_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT");
+    }
 }
 
 fn miner_address_info() -> Option<(String, Vec<u8>)> {
@@ -1999,10 +2007,17 @@ fn main() {
         }
     };
     let pow_limit = Target { bits: 0x1d00_ffff };
+    let network = network_kind_from_env();
+    let htlc_activation = resolved_htlcv1_activation_height(network);
+    if network == irium_node_rs::activation::NetworkKind::Mainnet
+        && env::var("IRIUM_HTLCV1_ACTIVATION_HEIGHT").is_ok()
+    {
+        eprintln!("[warn] Ignoring IRIUM_HTLCV1_ACTIVATION_HEIGHT on mainnet; activation source is code-defined");
+    }
     let params = ChainParams {
         genesis_block: block,
         pow_limit,
-        htlcv1_activation_height: htlcv1_activation_height(),
+        htlcv1_activation_height: htlc_activation,
     };
 
     let mut state = ChainState::new(params.clone());

@@ -30,6 +30,10 @@ use tower_http::cors::{Any, CorsLayer};
 
 use bs58;
 use get_if_addrs::get_if_addrs;
+use irium_node_rs::activation::{
+    network_kind_from_env, resolved_htlcv1_activation_height, runtime_htlcv1_env_override,
+    NetworkKind,
+};
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
 use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, HeaderWork, OutPoint};
@@ -53,12 +57,6 @@ use k256::ecdsa::{Signature, SigningKey};
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
 const MAX_SUBMIT_BLOCK_TXS: usize = 10_000;
-
-fn htlcv1_activation_height() -> Option<u64> {
-    env::var("IRIUM_HTLCV1_ACTIVATION_HEIGHT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-}
 
 #[derive(Clone)]
 struct AppState {
@@ -3005,7 +3003,6 @@ async fn wallet_send(
     }))
 }
 
-
 async fn create_htlc(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -3189,7 +3186,9 @@ async fn create_htlc(
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain.calculate_fees(&tx).map_err(|_| bad("chain_fee_calculation_failed"))?
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("chain_fee_calculation_failed"))?
     };
 
     let raw = tx.serialize();
@@ -3331,7 +3330,11 @@ async fn spend_htlc_internal(
             txid: txid_arr,
             index: req.vout,
         };
-        let utxo = chain.utxos.get(&key).cloned().ok_or(StatusCode::BAD_REQUEST)?;
+        let utxo = chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or(StatusCode::BAD_REQUEST)?;
         (utxo, chain.tip_height())
     };
 
@@ -3340,7 +3343,11 @@ async fn spend_htlc_internal(
         None => return Err(StatusCode::BAD_REQUEST),
     };
 
-    let signer_pkh = if claim { htlc.recipient_pkh } else { htlc.refund_pkh };
+    let signer_pkh = if claim {
+        htlc.recipient_pkh
+    } else {
+        htlc.refund_pkh
+    };
     if !claim && tip_height < htlc.timeout_height {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -3397,26 +3404,34 @@ async fn spend_htlc_internal(
     }
     let mut sk_bytes = [0u8; 32];
     sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let signing_key =
+        SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| StatusCode::BAD_REQUEST)?;
     let sig: Signature = signing_key
         .sign_prehash(&digest)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let sig = sig.normalize_s().unwrap_or(sig);
     let mut sig_bytes = sig.to_der().as_bytes().to_vec();
     sig_bytes.push(0x01);
-    let pubkey = signing_key.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+    let pubkey = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
 
     tx.inputs[0].script_sig = if claim {
         let secret_hex = req.secret_hex.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
         let preimage = hex::decode(secret_hex.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
-        encode_htlcv1_claim_witness(&sig_bytes, &pubkey, &preimage).ok_or(StatusCode::BAD_REQUEST)?
+        encode_htlcv1_claim_witness(&sig_bytes, &pubkey, &preimage)
+            .ok_or(StatusCode::BAD_REQUEST)?
     } else {
         encode_htlcv1_refund_witness(&sig_bytes, &pubkey).ok_or(StatusCode::BAD_REQUEST)?
     };
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain.calculate_fees(&tx).map_err(|_| StatusCode::BAD_REQUEST)?
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| StatusCode::BAD_REQUEST)?
     };
 
     let raw = tx.serialize();
@@ -3427,7 +3442,9 @@ async fn spend_htlc_internal(
     if req.broadcast.unwrap_or(false) {
         let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         if !mempool.contains(&txid) {
-            accepted = mempool.add_transaction(tx, raw.clone(), fee_checked).is_ok();
+            accepted = mempool
+                .add_transaction(tx, raw.clone(), fee_checked)
+                .is_ok();
         }
     }
 
@@ -3449,7 +3466,10 @@ async fn inspect_htlc(
     require_rpc_auth(&headers)?;
 
     let txid = hex_to_32(q.txid.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let key = OutPoint { txid, index: q.vout };
+    let key = OutPoint {
+        txid,
+        index: q.vout,
+    };
 
     let (tip_height, maybe_utxo) = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -3851,7 +3871,11 @@ async fn submit_block(
     // Sanity-check header hash matches payload.
     let derived_hash = block_header.hash();
     if derived_hash[..] != hash_bytes[..] {
-        eprintln!("[submit_block] reject branch=hash_mismatch derived={} provided={}", hex::encode(derived_hash), hex::encode(&hash_bytes));
+        eprintln!(
+            "[submit_block] reject branch=hash_mismatch derived={} provided={}",
+            hex::encode(derived_hash),
+            hex::encode(&hash_bytes)
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -3878,12 +3902,18 @@ async fn submit_block(
 
         // Height must match the next expected block height.
         if req.height != chain.height {
-            eprintln!("[submit_block] reject branch=height_mismatch req_height={} chain_height={}", req.height, chain.height);
+            eprintln!(
+                "[submit_block] reject branch=height_mismatch req_height={} chain_height={}",
+                req.height, chain.height
+            );
             return Err(StatusCode::BAD_REQUEST);
         }
 
         if let Err(e) = chain.connect_block(block.clone()) {
-            eprintln!("[submit_block] reject branch=connect_block_failed err={}", e);
+            eprintln!(
+                "[submit_block] reject branch=connect_block_failed err={}",
+                e
+            );
             return Err(StatusCode::BAD_REQUEST);
         }
 
@@ -3894,7 +3924,10 @@ async fn submit_block(
     // If anchors are loaded, enforce anchor consistency on the new tip.
     if let Some(ref anchors) = state.anchors {
         if !anchors.is_chain_valid(new_height, &new_tip_hash) {
-            eprintln!("[submit_block] reject branch=anchor_reject height={} tip={}", new_height, new_tip_hash);
+            eprintln!(
+                "[submit_block] reject branch=anchor_reject height={} tip={}",
+                new_height, new_tip_hash
+            );
             return Err(StatusCode::BAD_REQUEST);
         }
     }
@@ -3905,7 +3938,9 @@ async fn submit_block(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    if let Err(_e) = storage::write_block_json_with_source(req.height, &block, req.submit_source.as_deref()) {
+    if let Err(_e) =
+        storage::write_block_json_with_source(req.height, &block, req.submit_source.as_deref())
+    {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -4116,9 +4151,21 @@ async fn main() {
     }
 
     let pow_limit = Target { bits: 0x1d00_ffff };
-    let htlc_activation = htlcv1_activation_height();
-    if let Some(h) = htlc_activation {
-        println!("HTLCv1 activation height set to {}", h);
+    let network = network_kind_from_env();
+    let env_override = runtime_htlcv1_env_override();
+    let htlc_activation = resolved_htlcv1_activation_height(network);
+    match (network, htlc_activation) {
+        (NetworkKind::Mainnet, Some(h)) => {
+            println!("HTLCv1 mainnet activation height (code-defined): {}", h)
+        }
+        (NetworkKind::Mainnet, None) => {
+            println!("HTLCv1 mainnet activation disabled in code (no activation height set)")
+        }
+        (_, Some(h)) => println!("HTLCv1 non-mainnet activation height from env: {}", h),
+        (_, None) => println!("HTLCv1 non-mainnet activation unset (env not provided)"),
+    }
+    if network == NetworkKind::Mainnet && env_override.is_some() {
+        eprintln!("[warn] Ignoring IRIUM_HTLCV1_ACTIVATION_HEIGHT on mainnet; activation source is code-defined");
     }
     let params = ChainParams {
         genesis_block: genesis_block.clone(),
@@ -5013,7 +5060,14 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         let seq = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("{}_{}_{}_{}.{}", prefix, std::process::id(), nanos, seq, ext))
+        std::env::temp_dir().join(format!(
+            "{}_{}_{}_{}.{}",
+            prefix,
+            std::process::id(),
+            nanos,
+            seq,
+            ext
+        ))
     }
 
     fn create_test_state(activation: Option<u64>) -> (AppState, String, String, String) {
@@ -5036,7 +5090,13 @@ mod tests {
 
         let (sender, recipient, refund) = {
             let mut w = wallet.lock().unwrap_or_else(|e| e.into_inner());
-            let sender = w.create_with_seed("test-pass", Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")).expect("wallet create").address;
+            let sender = w
+                .create_with_seed(
+                    "test-pass",
+                    Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                )
+                .expect("wallet create")
+                .address;
             let recipient = w.new_address().expect("recipient address").address;
             let refund = w.new_address().expect("refund address").address;
             (sender, recipient, refund)
@@ -5231,7 +5291,6 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_create_decode_inspect_and_claim_flow() {
-
         let (state, sender, recipient, refund) = create_test_state(Some(0));
         add_wallet_utxo(&state, &sender, 20_000_000_000);
 
@@ -5242,7 +5301,12 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(htlc_create_request(&recipient, &refund, secret_hash_hex.clone(), 10)),
+            Json(htlc_create_request(
+                &recipient,
+                &refund,
+                secret_hash_hex.clone(),
+                10,
+            )),
         )
         .await
         .expect("createhtlc")
@@ -5263,9 +5327,13 @@ mod tests {
 
         assert!(decode.found);
         assert_eq!(decode.output_type, "htlcv1");
-        assert_eq!(decode.expected_hash.as_deref(), Some(secret_hash_hex.as_str()));
+        assert_eq!(
+            decode.expected_hash.as_deref(),
+            Some(secret_hash_hex.as_str())
+        );
 
-        let funding_tx = decode_full_tx(&hex::decode(&create.raw_tx_hex).expect("hex")).expect("tx decode");
+        let funding_tx =
+            decode_full_tx(&hex::decode(&create.raw_tx_hex).expect("hex")).expect("tx decode");
         apply_tx_to_chain_for_test(&state, &funding_tx);
 
         let inspect_funded = inspect_htlc(
@@ -5301,7 +5369,8 @@ mod tests {
         .expect("claim")
         .0;
 
-        let claim_tx = decode_full_tx(&hex::decode(&claim.raw_tx_hex).expect("hex")).expect("claim decode");
+        let claim_tx =
+            decode_full_tx(&hex::decode(&claim.raw_tx_hex).expect("hex")).expect("claim decode");
         apply_tx_to_chain_for_test(&state, &claim_tx);
 
         let inspect_spent = inspect_htlc(
@@ -5335,13 +5404,19 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(htlc_create_request(&recipient, &refund, secret_hash_hex, 40)),
+            Json(htlc_create_request(
+                &recipient,
+                &refund,
+                secret_hash_hex,
+                40,
+            )),
         )
         .await
         .expect("createhtlc")
         .0;
 
-        let funding_tx = decode_full_tx(&hex::decode(&create.raw_tx_hex).expect("hex")).expect("tx decode");
+        let funding_tx =
+            decode_full_tx(&hex::decode(&create.raw_tx_hex).expect("hex")).expect("tx decode");
         apply_tx_to_chain_for_test(&state, &funding_tx);
 
         let wrong = claim_htlc(
@@ -5362,7 +5437,6 @@ mod tests {
         assert!(matches!(wrong, Err(StatusCode::BAD_REQUEST)));
     }
 
-
     #[tokio::test]
     async fn rpc_refund_before_and_after_timeout() {
         let (state, sender, recipient, refund) = create_test_state(Some(0));
@@ -5378,13 +5452,19 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(htlc_create_request(&recipient, &refund, "22".repeat(32), timeout)),
+            Json(htlc_create_request(
+                &recipient,
+                &refund,
+                "22".repeat(32),
+                timeout,
+            )),
         )
         .await
         .expect("createhtlc")
         .0;
 
-        let funding_tx = decode_full_tx(&hex::decode(&create.raw_tx_hex).expect("hex")).expect("tx decode");
+        let funding_tx =
+            decode_full_tx(&hex::decode(&create.raw_tx_hex).expect("hex")).expect("tx decode");
         apply_tx_to_chain_for_test(&state, &funding_tx);
 
         let early = refund_htlc(

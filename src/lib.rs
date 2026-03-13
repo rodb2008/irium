@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod anchors;
 pub mod block;
 pub mod chain;

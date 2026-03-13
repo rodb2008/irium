@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
+use irium_node_rs::activation::{network_kind_from_env, resolved_htlcv1_activation_height};
 use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState};
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::MempoolManager;
@@ -36,7 +37,7 @@ async fn main() {
     let params = ChainParams {
         genesis_block: block,
         pow_limit,
-        htlcv1_activation_height: None,
+        htlcv1_activation_height: resolved_htlcv1_activation_height(network_kind_from_env()),
     };
     let chain = Arc::new(Mutex::new(ChainState::new(params)));
     let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));
