@@ -26,6 +26,7 @@ Status now: **NOT ACTIVATED**. This checklist is for approved execution only.
 - [ ] Monitoring/alerts armed.
 
 ## D. Activation Execution Gate (T-60 to T-0)
+- [ ] Activation commit workflow completed (`docs/htlcv1_activation_commit_workflow.md`).
 - [ ] NO-GO criteria reviewed and clear.
 - [ ] ABORT criteria reviewed and clear.
 - [ ] Operator on-duty matrix confirmed.

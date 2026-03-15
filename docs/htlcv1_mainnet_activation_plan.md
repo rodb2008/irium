@@ -19,11 +19,12 @@ This plan describes how to activate HTLCv1 on mainnet without runtime env activa
 - final activation height approved
 
 ## Execution Steps
-1. Set activation constant in code to approved height.
-2. Build and tag release.
-3. Publish upgrade notice (operators/miners/community).
-4. Operators upgrade binaries before activation height.
-5. Observe activation at chain height without env changes.
+1. Follow `docs/htlcv1_activation_commit_workflow.md` for the dedicated activation commit process.
+2. Set activation constant in code to approved height.
+3. Build and tag release.
+4. Publish upgrade notice (operators/miners/community).
+5. Operators upgrade binaries before activation height.
+6. Observe activation at chain height without env changes.
 
 ## Non-Mainnet Testing
 - `IRIUM_HTLCV1_ACTIVATION_HEIGHT` may be used for testnet/devnet only.
