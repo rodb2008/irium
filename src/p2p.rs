@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use chrono::Utc;
@@ -37,6 +38,146 @@ use sha2::{Digest, Sha256};
 const DEFAULT_MAX_PEERS: usize = 100;
 const MAX_MSGS_PER_SEC: u32 = 200;
 const MAX_BULK_MSGS_PER_SEC: u32 = 2000;
+
+
+fn recent_block_cache_ttl() -> Duration {
+    let secs = std::env::var("IRIUM_P2P_RECENT_BLOCK_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30)
+        .clamp(5, 300);
+    Duration::from_secs(secs)
+}
+
+fn recent_block_cache_limit() -> usize {
+    std::env::var("IRIUM_P2P_RECENT_BLOCK_CACHE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(256)
+        .clamp(32, 4096)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RelayTelemetrySnapshot {
+    pub new_tip_announced_count: u64,
+    pub block_announce_peers_count_total: u64,
+    pub block_request_count: u64,
+    pub duplicate_block_suppressed_count: u64,
+    pub avg_block_processing_ms: u64,
+    pub avg_block_announce_delay_ms: u64,
+}
+
+#[derive(Debug)]
+struct RecentHashCache {
+    ttl: Duration,
+    limit: usize,
+    seen_at: HashMap<[u8; 32], Instant>,
+    order: VecDeque<([u8; 32], Instant)>,
+}
+
+fn block_request_cache_key(ip: IpAddr, start_hash: &[u8], count: u32) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"block-request");
+    match ip {
+        IpAddr::V4(v4) => {
+            hasher.update([4u8]);
+            hasher.update(v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            hasher.update([6u8]);
+            hasher.update(v6.octets());
+        }
+    }
+    hasher.update(count.to_le_bytes());
+    hasher.update(start_hash);
+    let digest = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&digest);
+    key
+}
+
+impl RecentHashCache {
+    fn new(ttl: Duration, limit: usize) -> Self {
+        Self {
+            ttl,
+            limit,
+            seen_at: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some((hash, seen)) = self.order.front().copied() {
+            let expired = now.duration_since(seen) > self.ttl;
+            let over_limit = self.order.len() > self.limit;
+            if !expired && !over_limit {
+                break;
+            }
+            self.order.pop_front();
+            if self.seen_at.get(&hash).copied() == Some(seen) {
+                self.seen_at.remove(&hash);
+            }
+        }
+    }
+
+    fn record_at(&mut self, hash: [u8; 32], now: Instant) -> bool {
+        self.prune(now);
+        if self.seen_at.contains_key(&hash) {
+            return false;
+        }
+        self.seen_at.insert(hash, now);
+        self.order.push_back((hash, now));
+        self.prune(now);
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.seen_at.len()
+    }
+}
+
+static NEW_TIP_ANNOUNCED_COUNT: AtomicU64 = AtomicU64::new(0);
+static BLOCK_ANNOUNCE_PEERS_COUNT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BLOCK_REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static DUPLICATE_BLOCK_SUPPRESSED_COUNT: AtomicU64 = AtomicU64::new(0);
+static BLOCK_PROCESSING_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BLOCK_PROCESSING_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static BLOCK_ANNOUNCE_DELAY_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BLOCK_ANNOUNCE_DELAY_SAMPLES: AtomicU64 = AtomicU64::new(0);
+
+fn record_block_processing_ms(ms: u64) {
+    BLOCK_PROCESSING_MS_TOTAL.fetch_add(ms, Ordering::Relaxed);
+    BLOCK_PROCESSING_SAMPLES.fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_block_announce_delay_ms(ms: u64) {
+    BLOCK_ANNOUNCE_DELAY_MS_TOTAL.fetch_add(ms, Ordering::Relaxed);
+    BLOCK_ANNOUNCE_DELAY_SAMPLES.fetch_add(1, Ordering::Relaxed);
+}
+
+fn average_counter(total: &AtomicU64, samples: &AtomicU64) -> u64 {
+    let s = samples.load(Ordering::Relaxed);
+    if s == 0 {
+        0
+    } else {
+        total.load(Ordering::Relaxed) / s
+    }
+}
+
+fn recent_announced_blocks() -> Arc<Mutex<RecentHashCache>> {
+    static VAL: OnceLock<Arc<Mutex<RecentHashCache>>> = OnceLock::new();
+    VAL.get_or_init(|| Arc::new(Mutex::new(RecentHashCache::new(recent_block_cache_ttl(), recent_block_cache_limit())))).clone()
+}
+
+fn recent_requested_blocks() -> Arc<Mutex<RecentHashCache>> {
+    static VAL: OnceLock<Arc<Mutex<RecentHashCache>>> = OnceLock::new();
+    VAL.get_or_init(|| Arc::new(Mutex::new(RecentHashCache::new(recent_block_cache_ttl(), recent_block_cache_limit())))).clone()
+}
+
+fn recent_relayed_blocks() -> Arc<Mutex<RecentHashCache>> {
+    static VAL: OnceLock<Arc<Mutex<RecentHashCache>>> = OnceLock::new();
+    VAL.get_or_init(|| Arc::new(Mutex::new(RecentHashCache::new(recent_block_cache_ttl(), recent_block_cache_limit())))).clone()
+}
 
 fn p2p_blocking_concurrency() -> usize {
     std::env::var("IRIUM_P2P_BLOCKING_CONCURRENCY")
@@ -940,12 +1081,32 @@ async fn sync_block_request_allowed_for(
         }
     }
 
+    let request_key = block_request_cache_key(ip, start_hash, count);
+    {
+        let cache = recent_requested_blocks();
+        let mut cache_guard = cache.lock().await;
+        cache_guard.prune(now);
+        if cache_guard.seen_at.contains_key(&request_key) {
+            DUPLICATE_BLOCK_SUPPRESSED_COUNT.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    }
+
     if !claim_block_range_owner(ip, start_hash, count).await {
         return false;
     }
 
     guard.insert(ip, now);
     true
+}
+
+async fn record_block_request_sent(ip: IpAddr, start_hash: &[u8], count: u32) {
+    let now = Instant::now();
+    let request_key = block_request_cache_key(ip, start_hash, count);
+    let cache = recent_requested_blocks();
+    let mut cache_guard = cache.lock().await;
+    let _ = cache_guard.record_at(request_key, now);
+    BLOCK_REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 fn headers_request_cooldown() -> Duration {
@@ -2991,14 +3152,75 @@ impl P2PNode {
         guard.contains(&ip)
     }
 
+    pub fn relay_telemetry_snapshot() -> RelayTelemetrySnapshot {
+        RelayTelemetrySnapshot {
+            new_tip_announced_count: NEW_TIP_ANNOUNCED_COUNT.load(Ordering::Relaxed),
+            block_announce_peers_count_total: BLOCK_ANNOUNCE_PEERS_COUNT_TOTAL
+                .load(Ordering::Relaxed),
+            block_request_count: BLOCK_REQUEST_COUNT.load(Ordering::Relaxed),
+            duplicate_block_suppressed_count: DUPLICATE_BLOCK_SUPPRESSED_COUNT
+                .load(Ordering::Relaxed),
+            avg_block_processing_ms: average_counter(
+                &BLOCK_PROCESSING_MS_TOTAL,
+                &BLOCK_PROCESSING_SAMPLES,
+            ),
+            avg_block_announce_delay_ms: average_counter(
+                &BLOCK_ANNOUNCE_DELAY_MS_TOTAL,
+                &BLOCK_ANNOUNCE_DELAY_SAMPLES,
+            ),
+        }
+    }
+
     pub async fn broadcast_block(&self, block_bytes: &[u8]) -> Result<(), String> {
+        let (block, _) = Block::deserialize(block_bytes)?;
+        let block_hash = block.header.hash();
+        let now = Instant::now();
+
+        {
+            let cache = recent_relayed_blocks();
+            let mut guard = cache.lock().await;
+            if !guard.record_at(block_hash, now) {
+                DUPLICATE_BLOCK_SUPPRESSED_COUNT.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+
+        let should_announce_headers = {
+            let cache = recent_announced_blocks();
+            let mut guard = cache.lock().await;
+            guard.record_at(block_hash, now)
+        };
+        let header_peers = if should_announce_headers {
+            let header_msg = HeadersPayload {
+                headers: block.header.serialize(),
+            }
+            .to_message();
+            broadcast_raw(&self.peers, &header_msg.serialize()).await
+        } else {
+            0
+        };
+
         let msg = BlockPayload {
             block_data: block_bytes.to_vec(),
         }
         .to_message();
         let serialized = msg.serialize();
+        let block_peers = broadcast_raw(&self.peers, &serialized).await;
+        let announced_peers = header_peers.max(block_peers) as u64;
 
-        let _ = broadcast_raw(&self.peers, &serialized).await;
+        NEW_TIP_ANNOUNCED_COUNT.fetch_add(1, Ordering::Relaxed);
+        BLOCK_ANNOUNCE_PEERS_COUNT_TOTAL.fetch_add(announced_peers, Ordering::Relaxed);
+        record_block_announce_delay_ms(now.elapsed().as_millis() as u64);
+
+        P2PNode::log_event(
+            "info",
+            "relay",
+            format!(
+                "P2P relay: announced block {} to {} peers (headers_first=true, full_block_fallback=true)",
+                short_hash(block_hash),
+                announced_peers
+            ),
+        );
         Ok(())
     }
 
@@ -4439,6 +4661,7 @@ impl P2PNode {
                                     {
                                         if let Ok(msg) = get_blocks.to_message() {
                                             send_message_detached(&writer, msg, addr);
+                                            record_block_request_sent(addr.ip(), &start_hash, count).await;
                                         }
                                     }
                                 } else if peer_height > local_height || header_count > 0 {
@@ -4738,6 +4961,7 @@ impl P2PNode {
                                             enqueue_persist_block(height, h, b).await;
                                         }
                                         sync_perf_record(decode_ms, precheck_ms, connect_ms, 0);
+                                        record_block_processing_ms(connect_ms as u64);
                                         if let Some(prev_hash) = orphan_prev {
                                             request_orphan_headers(
                                                 &writer,
@@ -6471,6 +6695,7 @@ async fn handle_incoming_with_sybil(
                                     if let Ok(msg) = get_blocks.to_message() {
                                         if let Some(writer) = writer_weak.upgrade() {
                                             send_message_detached(&writer, msg, addr2);
+                                            record_block_request_sent(addr2.ip(), &start_hash, count).await;
                                         }
                                     }
                                 }
@@ -6951,7 +7176,9 @@ async fn handle_incoming_with_sybil(
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_orphan_header_chain, orphan_headers_map, store_orphan_header};
+    use super::{attach_orphan_header_chain, block_request_cache_key, orphan_headers_map, store_orphan_header, RecentHashCache};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::{Duration, Instant};
     use crate::block::BlockHeader;
     use crate::chain::{block_from_locked, ChainParams, ChainState};
     use crate::genesis::load_locked_genesis;
@@ -7018,5 +7245,62 @@ mod tests {
             .header_path_to_known(child.hash())
             .expect("path from known to child");
         assert_eq!(path, vec![parent.hash(), child.hash()]);
+    }
+
+    #[test]
+    fn recent_hash_cache_suppresses_duplicates_within_ttl() {
+        let now = Instant::now();
+        let mut cache = RecentHashCache::new(Duration::from_secs(30), 8);
+        let hash = [1u8; 32];
+        assert!(cache.record_at(hash, now));
+        assert!(!cache.record_at(hash, now + Duration::from_secs(5)));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn recent_hash_cache_expires_after_ttl() {
+        let now = Instant::now();
+        let mut cache = RecentHashCache::new(Duration::from_secs(10), 8);
+        let hash = [2u8; 32];
+        assert!(cache.record_at(hash, now));
+        assert!(cache.record_at(hash, now + Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn recent_hash_cache_stays_bounded() {
+        let now = Instant::now();
+        let mut cache = RecentHashCache::new(Duration::from_secs(60), 2);
+        assert!(cache.record_at([1u8; 32], now));
+        assert!(cache.record_at([2u8; 32], now + Duration::from_secs(1)));
+        assert!(cache.record_at([3u8; 32], now + Duration::from_secs(2)));
+        assert!(cache.len() <= 2);
+    }
+
+    #[test]
+    fn block_request_cache_key_distinguishes_peers() {
+        let start_hash = [9u8; 32];
+        let a = block_request_cache_key(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &start_hash, 128);
+        let b = block_request_cache_key(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), &start_hash, 128);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn block_request_cache_key_distinguishes_windows() {
+        let start_hash = [7u8; 32];
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 1, 1, 9));
+        let a = block_request_cache_key(ip, &start_hash, 64);
+        let b = block_request_cache_key(ip, &start_hash, 128);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn recent_hash_cache_allows_retry_for_different_block_request_key() {
+        let now = Instant::now();
+        let mut cache = RecentHashCache::new(Duration::from_secs(30), 8);
+        let start_hash = [5u8; 32];
+        let first = block_request_cache_key(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), &start_hash, 128);
+        let retry_other_peer = block_request_cache_key(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), &start_hash, 128);
+        assert!(cache.record_at(first, now));
+        assert!(cache.record_at(retry_other_peer, now + Duration::from_secs(1)));
     }
 }

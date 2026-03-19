@@ -6,6 +6,7 @@ pub mod constants;
 pub mod genesis;
 pub mod mempool;
 pub mod network;
+pub mod network_era;
 pub mod p2p;
 pub mod pow;
 pub mod protocol;

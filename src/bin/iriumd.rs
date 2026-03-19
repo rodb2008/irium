@@ -43,6 +43,7 @@ use irium_node_rs::constants::{block_reward, COINBASE_MATURITY};
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::MempoolManager;
 use irium_node_rs::network::SeedlistManager;
+use irium_node_rs::network_era::network_era;
 use irium_node_rs::p2p::P2PNode;
 use irium_node_rs::pow::{meets_target, sha256d, Target};
 use irium_node_rs::rate_limiter::RateLimiter;
@@ -108,6 +109,10 @@ struct BestHeaderTipResponse {
 struct StatusResponse {
     height: u64,
     genesis_hash: String,
+    network_era: String,
+    network_era_description: String,
+    network_era_tagline: Option<String>,
+    early_participation_signal: bool,
     anchors_digest: Option<String>,
     peer_count: usize,
     anchor_loaded: bool,
@@ -145,6 +150,10 @@ struct NetworkHashrateQuery {
 #[derive(Serialize)]
 struct NetworkHashrateResponse {
     tip_height: u64,
+    current_network_era: String,
+    current_network_era_description: String,
+    current_network_era_tagline: Option<String>,
+    early_participation_signal: bool,
     difficulty: f64,
     hashrate: Option<f64>,
     avg_block_time: Option<f64>,
@@ -169,6 +178,10 @@ struct MiningMetricsPoint {
 struct MiningMetricsResponse {
     tip_height: u64,
     tip_time: u64,
+    current_network_era: String,
+    current_network_era_description: String,
+    current_network_era_tagline: Option<String>,
+    early_participation_signal: bool,
 
     difficulty: f64,
     hashrate: Option<f64>,
@@ -1901,8 +1914,14 @@ async fn network_hashrate(
         }
     };
 
+    let era = network_era(tip_height);
+
     Ok(Json(NetworkHashrateResponse {
         tip_height,
+        current_network_era: era.era_name.to_string(),
+        current_network_era_description: era.era_description.to_string(),
+        current_network_era_tagline: era.era_tagline.map(str::to_string),
+        early_participation_signal: era.early_participation_signal,
         difficulty,
         hashrate,
         avg_block_time,
@@ -2037,9 +2056,15 @@ async fn mining_metrics(
         )
     };
 
+    let era = network_era(tip_height);
+
     Ok(Json(MiningMetricsResponse {
         tip_height,
         tip_time: tip_time as u64,
+        current_network_era: era.era_name.to_string(),
+        current_network_era_description: era.era_description.to_string(),
+        current_network_era_tagline: era.era_tagline.map(str::to_string),
+        early_participation_signal: era.early_participation_signal,
         difficulty,
         hashrate,
         avg_block_time,
@@ -2158,6 +2183,8 @@ async fn status(
         }
     };
 
+    let era = network_era(height);
+
     let persisted_height = storage::persisted_height();
     state
         .status_persisted_height_cache
@@ -2206,6 +2233,10 @@ async fn status(
     Ok(Json(StatusResponse {
         height,
         genesis_hash: state.genesis_hash.clone(),
+        network_era: era.era_name.to_string(),
+        network_era_description: era.era_description.to_string(),
+        network_era_tagline: era.era_tagline.map(str::to_string),
+        early_participation_signal: era.early_participation_signal,
         anchors_digest,
         peer_count,
         anchor_loaded: state.anchors.is_some(),
@@ -2271,6 +2302,8 @@ async fn metrics(
             .unwrap_or_default();
         (g.tip_height(), state.anchors.is_some(), tip_hash, digest)
     };
+    let era = network_era(height);
+    let relay = P2PNode::relay_telemetry_snapshot();
     let (peer_count, node_id_hex, sybil_diff) = match state.p2p {
         Some(ref p2p) => {
             let peers = p2p.peer_count().await;
@@ -2296,6 +2329,13 @@ irium_anchor_digest {}
 irium_node_id {}
 irium_sybil_difficulty {}
 irium_seed_count {}
+irium_early_participation_signal {}
+irium_new_tip_announced_count {}
+irium_block_announce_peers_count_total {}
+irium_block_request_count {}
+irium_duplicate_block_suppressed_count {}
+irium_avg_block_processing_ms {}
+irium_avg_block_announce_delay_ms {}
 ",
         height,
         peer_count,
@@ -2305,7 +2345,14 @@ irium_seed_count {}
         anchor_digest,
         node_id_hex,
         sybil_diff,
-        seeds.len()
+        seeds.len(),
+        era.early_participation_signal as u8,
+        relay.new_tip_announced_count,
+        relay.block_announce_peers_count_total,
+        relay.block_request_count,
+        relay.duplicate_block_suppressed_count,
+        relay.avg_block_processing_ms,
+        relay.avg_block_announce_delay_ms
     ))
 }
 
@@ -4195,6 +4242,14 @@ async fn main() {
         load_persisted_blocks(&mut state, &genesis_hash_lc);
     }
     let shared_state = Arc::new(Mutex::new(state));
+    {
+        let guard = shared_state.lock().unwrap_or_else(|e| e.into_inner());
+        let era = network_era(guard.tip_height());
+        println!(
+            "[Irium] Network Era: {} — {}",
+            era.era_name, era.era_description
+        );
+    }
     let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));
     let limiter = Arc::new(Mutex::new(rate_limiter()));
     let wallet = Arc::new(Mutex::new(
