@@ -1,13 +1,61 @@
 use anyhow::{anyhow, Result};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde_json::{json, Value};
+use std::net::{IpAddr, Ipv4Addr};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BtcClient {
     pub rpc_url: Option<String>,
     pub rpc_user: Option<String>,
     pub rpc_pass: Option<String>,
     pub min_confirmations: u32,
+}
+
+fn allow_remote_rpc() -> bool {
+    std::env::var("COORDINATOR_ALLOW_REMOTE_RPC")
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn is_allowed_rpc_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4 == Ipv4Addr::new(0, 0, 0, 0)
+        }
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unspecified(),
+    }
+}
+
+fn sanitize_rpc_url(raw: &str) -> Result<String> {
+    let url = Url::parse(raw).map_err(|_| anyhow!("btc_rpc_invalid_url"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => return Err(anyhow!("btc_rpc_invalid_scheme")),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(anyhow!("btc_rpc_embedded_credentials_forbidden"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(anyhow!("btc_rpc_invalid_url_components"));
+    }
+    if !allow_remote_rpc() {
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow!("btc_rpc_missing_host"))?;
+        if host != "localhost" {
+            let ip = host
+                .parse::<IpAddr>()
+                .map_err(|_| anyhow!("btc_rpc_host_must_be_local_or_private"))?;
+            if !is_allowed_rpc_ip(ip) {
+                return Err(anyhow!("btc_rpc_host_must_be_local_or_private"));
+            }
+        }
+    }
+    Ok(url.to_string())
 }
 
 impl BtcClient {
@@ -25,13 +73,13 @@ impl BtcClient {
         rpc_user: Option<String>,
         rpc_pass: Option<String>,
         min_confirmations: u32,
-    ) -> Self {
-        Self {
-            rpc_url: Some(rpc_url),
+    ) -> Result<Self> {
+        Ok(Self {
+            rpc_url: Some(sanitize_rpc_url(&rpc_url)?),
             rpc_user,
             rpc_pass,
             min_confirmations,
-        }
+        })
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -134,5 +182,41 @@ impl BtcClient {
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn btc_rpc_rejects_public_hostname_by_default() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("COORDINATOR_ALLOW_REMOTE_RPC");
+        let err = BtcClient::enabled("https://example.com".to_string(), None, None, 1).unwrap_err();
+        assert!(err.to_string().contains("local_or_private") || err.to_string().contains("host_must_be"));
+    }
+
+    #[test]
+    fn btc_rpc_allows_loopback_url() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("COORDINATOR_ALLOW_REMOTE_RPC");
+        let cli = BtcClient::enabled("http://127.0.0.1:8332".to_string(), None, None, 1).unwrap();
+        assert_eq!(cli.rpc_url.as_deref(), Some("http://127.0.0.1:8332/"));
+    }
+
+    #[test]
+    fn btc_rpc_can_allow_remote_when_explicitly_enabled() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("COORDINATOR_ALLOW_REMOTE_RPC", "1");
+        let cli = BtcClient::enabled("https://example.com".to_string(), None, None, 1).unwrap();
+        assert_eq!(cli.rpc_url.as_deref(), Some("https://example.com/"));
+        std::env::remove_var("COORDINATOR_ALLOW_REMOTE_RPC");
     }
 }

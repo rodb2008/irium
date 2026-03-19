@@ -80,14 +80,20 @@ async fn main() -> Result<()> {
     let paused = storage.intake_paused().unwrap_or(false);
 
     let btc = if let Ok(url) = std::env::var("BTC_RPC_URL") {
-        BtcClient::enabled(
+        match BtcClient::enabled(
             url,
             std::env::var("BTC_RPC_USER").ok(),
             std::env::var("BTC_RPC_PASS")
                 .ok()
                 .or_else(|| std::env::var("BTC_RPC_PASSWORD").ok()),
             btc_min_confirmations,
-        )
+        ) {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::warn!("BTC RPC disabled: {err}");
+                BtcClient::disabled(btc_min_confirmations)
+            }
+        }
     } else {
         BtcClient::disabled(btc_min_confirmations)
     };

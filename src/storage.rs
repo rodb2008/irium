@@ -544,6 +544,18 @@ fn validate_block_quarantine_path(path: &Path, height: u64) -> std::io::Result<(
     Ok(())
 }
 
+fn ensure_path_is_not_symlink(path: &Path) -> std::io::Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "symlinked block path is not allowed",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn block_json_path_for_height(height: u64) -> std::io::Result<PathBuf> {
     if height > 100_000_000 {
         return Err(std::io::Error::new(
@@ -555,20 +567,36 @@ fn block_json_path_for_height(height: u64) -> std::io::Result<PathBuf> {
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("block_{}.json", height));
     validate_block_data_path(&path, height)?;
+    ensure_path_is_not_symlink(&path)?;
     Ok(path)
+}
+
+fn read_block_json_string(height: u64) -> std::io::Result<Option<String>> {
+    let path = block_json_path_for_height(height)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(fs::read_to_string(path)?))
+}
+
+fn write_block_json_string(height: u64, json: &str) -> std::io::Result<()> {
+    let path = block_json_path_for_height(height)?;
+    fs::write(path, json)
+}
+
+fn rename_block_json_to(height: u64, dest: &Path) -> std::io::Result<()> {
+    let path = block_json_path_for_height(height)?;
+    validate_block_quarantine_path(dest, height)?;
+    ensure_path_is_not_symlink(dest)?;
+    fs::rename(path, dest)
 }
 
 fn maybe_quarantine_existing_block(height: u64, new_hash: &str) -> std::io::Result<()> {
     let path = block_json_path_for_height(height)?;
 
-    if !path.exists() {
-        return Ok(());
-    }
-
-    validate_block_data_path(&path, height)?;
-
-    let existing = match fs::read_to_string(&path) {
-        Ok(v) => v,
+    let existing = match read_block_json_string(height) {
+        Ok(Some(v)) => v,
+        Ok(None) => return Ok(()),
         Err(_) => return Ok(()),
     };
 
@@ -610,9 +638,7 @@ fn maybe_quarantine_existing_block(height: u64, new_hash: &str) -> std::io::Resu
 
     // Best-effort quarantine; if rename fails, keep the existing file.
     let _ = (|| -> std::io::Result<()> {
-        validate_block_data_path(&path, height)?;
-        validate_block_quarantine_path(&dest, height)?;
-        fs::rename(path, dest)?;
+        rename_block_json_to(height, &dest)?;
         Ok(())
     })();
     Ok(())
@@ -661,8 +687,7 @@ fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
     };
 
     let json = serde_json::to_string_pretty(&jb)?;
-    validate_block_data_path(&path, height)?;
-    fs::write(&path, json)?;
+    write_block_json_string(height, &json)?;
     set_persisted_height(height);
     set_persisted_max_height_on_disk(height);
     maybe_advance_contiguous(&dir, height);
@@ -674,29 +699,24 @@ pub fn write_block_json_with_source(
     block: &Block,
     submit_source: Option<&str>,
 ) -> std::io::Result<()> {
-    let path = block_json_path_for_height(height)?;
-    let mut value = if path.exists() {
-        let raw = fs::read_to_string(&path)?;
-        serde_json::from_str::<serde_json::Value>(&raw)
-            .unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
+    let mut value = match read_block_json_string(height)? {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        None => serde_json::json!({}),
     };
 
     if let Some(src) = submit_source {
         value["submit_source"] = serde_json::Value::String(src.to_string());
     }
 
-    validate_block_data_path(&path, height)?;
     let json = serde_json::to_string_pretty(&value)?;
-    fs::write(&path, json)?;
+    write_block_json_string(height, &json)?;
     let _ = block;
     Ok(())
 }
 
 pub fn read_block_submit_source(height: u64) -> Option<String> {
-    let path = block_json_path_for_height(height).ok()?;
-    let raw = fs::read_to_string(path).ok()?;
+    let raw = read_block_json_string(height).ok().flatten()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     value
         .get("submit_source")
@@ -727,4 +747,62 @@ pub fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
         }
     }
     write_block_json_sync(height, block)
+}
+
+
+#[cfg(test)]
+mod storage_security_tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn temp_blocks_dir() -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        os_home_dir().join(format!(".irium-storage-test-{stamp}"))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn block_json_path_rejects_symlink_leaf() {
+        let _guard = env_lock().lock().unwrap();
+        let base = temp_blocks_dir();
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        std::env::set_var("IRIUM_BLOCKS_DIR", &base);
+        let path = base.join("block_7.json");
+        symlink("/etc/passwd", &path).unwrap();
+
+        let err = block_json_path_for_height(7).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        std::env::remove_var("IRIUM_BLOCKS_DIR");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_write_block_json_string_round_trip() {
+        let _guard = env_lock().lock().unwrap();
+        let base = temp_blocks_dir();
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        std::env::set_var("IRIUM_BLOCKS_DIR", &base);
+
+        write_block_json_string(9, r#"{"ok":true}"#).unwrap();
+        let raw = read_block_json_string(9).unwrap().unwrap();
+        assert!(raw.contains("ok"));
+
+        std::env::remove_var("IRIUM_BLOCKS_DIR");
+        let _ = fs::remove_dir_all(&base);
+    }
 }
