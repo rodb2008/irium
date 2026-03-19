@@ -15,7 +15,7 @@ Irium is a **production-only Proof-of-Work blockchain** for the IRM asset.
 The network launches with:
 
 - No testnet
-- No DNS seeds
+- No DNS dependency (signed seedlist bootstrap)
 - Locked genesis enforcing founder vesting
 - Fixed **100,000,000 IRM** supply cap
 
@@ -27,7 +27,7 @@ This repository contains the **Rust implementation of the full node, miner, wall
 
 - Algorithm: SHA-256d
 - Block target: 600 seconds
-- Difficulty retarget: 2016 blocks
+- Difficulty retarget: 2016 blocks until LWMA activation at height 16,462, then LWMA
 - Starting subsidy: 50 IRM
 - Halving interval: 210,000 blocks
 - Coinbase maturity: 100 blocks
@@ -57,10 +57,10 @@ Peer discovery uses:
 • Extremely early Proof-of-Work network  
 • Independent Rust blockchain (not a fork)  
 • DNS-free peer discovery architecture  
-• Fair launch distribution — no premine, presale, or airdrop  
+• Transparent launch distribution — no ICO, no presale, no airdrop; 3.5M IRM genesis vesting is locked on-chain  
 • Direct mining supported with the official Irium miner
 
-Coins are distributed exclusively through Proof-of-Work mining.
+Network issuance beyond the genesis vesting allocation is distributed through Proof-of-Work mining.
 
 ---
 

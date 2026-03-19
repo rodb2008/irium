@@ -7,7 +7,7 @@
 - `irium-wallet-api.service`: wallet API
 - `irium-stratum.service` (pool host only): public Stratum endpoint (`:3333`)
 
-Do not run `irium-ckpool`/`irium-pool-shim` together with `irium-stratum` on the same host.
+Do not run legacy `irium-ckpool` services together with `irium-stratum` on the same host. `irium-pool-shim` may remain active where the deployed pool stack depends on it.
 
 ## Required Ports
 - `38291/tcp` public: P2P

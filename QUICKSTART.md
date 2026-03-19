@@ -10,6 +10,8 @@
 - Safe resync procedure: delete ONLY `~/.irium/state`, keep `~/.irium/blocks`.
 - Sync reliability improvements include stall recovery + reduced repeated seed/dial noise.
 - CPU mining is built-in; Stratum client mode is supported; native GPU/OpenCL/CUDA miner is not bundled.
+- Node status and mining RPC now expose `network_era`, `network_era_description`, `network_era_tagline`, and `early_participation_signal`.
+- The official `irium-miner` does not require code changes for these status and telemetry additions.
 
 ## Super Simple Start (No Tech)
 Follow these steps in order. Keep the node running while you mine.
