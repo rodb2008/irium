@@ -7,8 +7,10 @@ mod genesis;
 mod pow;
 mod tx;
 
-use crate::activation::{network_kind_from_env, resolved_htlcv1_activation_height};
-use crate::chain::{block_from_locked, ChainParams, ChainState};
+use crate::activation::{
+    network_kind_from_env, resolved_htlcv1_activation_height, resolved_lwma_activation_height,
+};
+use crate::chain::{block_from_locked, ChainParams, ChainState, LwmaParams};
 use crate::genesis::load_locked_genesis;
 use crate::pow::Target;
 
@@ -29,10 +31,12 @@ fn main() {
         }
     };
     let pow_limit = Target { bits: 0x1d00_ffff };
+    let network = network_kind_from_env();
     let params = ChainParams {
         genesis_block: block,
         pow_limit,
-        htlcv1_activation_height: resolved_htlcv1_activation_height(network_kind_from_env()),
+        htlcv1_activation_height: resolved_htlcv1_activation_height(network),
+        lwma: LwmaParams::new(resolved_lwma_activation_height(network), pow_limit),
     };
 
     let state = ChainState::new(params);

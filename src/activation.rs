@@ -6,6 +6,12 @@ use std::env;
 /// `None` keeps HTLCv1 disabled on mainnet.
 pub const MAINNET_HTLCV1_ACTIVATION_HEIGHT: Option<u64> = Some(18677);
 
+/// Mainnet LWMA difficulty activation height source-of-truth.
+///
+/// Coordinated mainnet activation height: observed mainnet height 15,962 plus a 500-block safety buffer.
+/// This must remain a future height until the network upgrade is coordinated.
+pub const MAINNET_LWMA_ACTIVATION_HEIGHT: Option<u64> = Some(16_462);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkKind {
     Mainnet,
@@ -35,6 +41,12 @@ pub fn runtime_htlcv1_env_override() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
+pub fn runtime_lwma_env_override() -> Option<u64> {
+    env::var("IRIUM_LWMA_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 pub fn resolved_htlcv1_activation_height(network: NetworkKind) -> Option<u64> {
     match network {
         NetworkKind::Mainnet => MAINNET_HTLCV1_ACTIVATION_HEIGHT,
@@ -42,12 +54,26 @@ pub fn resolved_htlcv1_activation_height(network: NetworkKind) -> Option<u64> {
     }
 }
 
+pub fn resolved_lwma_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_LWMA_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_lwma_env_override(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
-    fn mainnet_ignores_env_override() {
+    fn mainnet_ignores_htlc_env_override() {
+        let _guard = env_lock().lock().unwrap();
         std::env::set_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT", "42");
         let resolved = resolved_htlcv1_activation_height(NetworkKind::Mainnet);
         std::env::remove_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT");
@@ -55,7 +81,8 @@ mod tests {
     }
 
     #[test]
-    fn non_mainnet_uses_env_override() {
+    fn non_mainnet_uses_htlc_env_override() {
+        let _guard = env_lock().lock().unwrap();
         std::env::set_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT", "42");
         assert_eq!(
             resolved_htlcv1_activation_height(NetworkKind::Devnet),
@@ -66,5 +93,29 @@ mod tests {
             Some(42)
         );
         std::env::remove_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn mainnet_ignores_lwma_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_LWMA_ACTIVATION_HEIGHT", "42");
+        let resolved = resolved_lwma_activation_height(NetworkKind::Mainnet);
+        std::env::remove_var("IRIUM_LWMA_ACTIVATION_HEIGHT");
+        assert_eq!(resolved, MAINNET_LWMA_ACTIVATION_HEIGHT);
+    }
+
+    #[test]
+    fn non_mainnet_uses_lwma_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_LWMA_ACTIVATION_HEIGHT", "42");
+        assert_eq!(
+            resolved_lwma_activation_height(NetworkKind::Devnet),
+            Some(42)
+        );
+        assert_eq!(
+            resolved_lwma_activation_height(NetworkKind::Testnet),
+            Some(42)
+        );
+        std::env::remove_var("IRIUM_LWMA_ACTIVATION_HEIGHT");
     }
 }

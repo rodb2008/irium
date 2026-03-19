@@ -6,6 +6,11 @@ pub const BLOCK_TARGET_INTERVAL: u64 = 600; // seconds
 pub const DIFFICULTY_RETARGET_INTERVAL: u64 = 2016; // blocks
 pub const MAX_FUTURE_BLOCK_TIME: i64 = 7200; // 2 hours
 pub const COINBASE_MATURITY: u64 = 100; // blocks
+pub const LWMA_WINDOW: u64 = 60; // blocks
+pub const LWMA_SOLVETIME_CLAMP_FACTOR: u64 = 6; // clamp to [1, 6T]
+pub const LWMA_MAX_TARGET_UP_FACTOR: u64 = 2; // target may ease by at most 2x per block
+pub const LWMA_MAX_TARGET_DOWN_FACTOR: u64 = 2; // target may tighten by at most 2x per block
+pub const LWMA_MIN_DIFFICULTY_FLOOR: u64 = 1; // 1 disables any stricter post-activation max-target cap
 
 #[allow(dead_code)]
 const INITIAL_SUBSIDY: u64 = 50 * 100_000_000; // 50 IRM in sat-equivalent

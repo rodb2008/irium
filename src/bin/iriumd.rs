@@ -31,12 +31,14 @@ use tower_http::cors::{Any, CorsLayer};
 use bs58;
 use get_if_addrs::get_if_addrs;
 use irium_node_rs::activation::{
-    network_kind_from_env, resolved_htlcv1_activation_height, runtime_htlcv1_env_override,
-    NetworkKind,
+    network_kind_from_env, resolved_htlcv1_activation_height, resolved_lwma_activation_height,
+    runtime_htlcv1_env_override, runtime_lwma_env_override, NetworkKind,
 };
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
-use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, HeaderWork, OutPoint};
+use irium_node_rs::chain::{
+    block_from_locked, ChainParams, ChainState, HeaderWork, LwmaParams, OutPoint,
+};
 use irium_node_rs::constants::{block_reward, COINBASE_MATURITY};
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::MempoolManager;
@@ -4153,7 +4155,9 @@ async fn main() {
     let pow_limit = Target { bits: 0x1d00_ffff };
     let network = network_kind_from_env();
     let env_override = runtime_htlcv1_env_override();
+    let lwma_env_override = runtime_lwma_env_override();
     let htlc_activation = resolved_htlcv1_activation_height(network);
+    let lwma_activation = resolved_lwma_activation_height(network);
     match (network, htlc_activation) {
         (NetworkKind::Mainnet, Some(h)) => {
             println!("HTLCv1 mainnet activation height (code-defined): {}", h)
@@ -4164,13 +4168,27 @@ async fn main() {
         (_, Some(h)) => println!("HTLCv1 non-mainnet activation height from env: {}", h),
         (_, None) => println!("HTLCv1 non-mainnet activation unset (env not provided)"),
     }
+    match (network, lwma_activation) {
+        (NetworkKind::Mainnet, Some(h)) => {
+            println!("LWMA mainnet activation height (code-defined, coordinated): {}", h)
+        }
+        (NetworkKind::Mainnet, None) => {
+            println!("LWMA mainnet activation disabled in code (no activation height set)")
+        }
+        (_, Some(h)) => println!("LWMA non-mainnet activation height from env: {}", h),
+        (_, None) => println!("LWMA non-mainnet activation unset (env not provided)"),
+    }
     if network == NetworkKind::Mainnet && env_override.is_some() {
         eprintln!("[warn] Ignoring IRIUM_HTLCV1_ACTIVATION_HEIGHT on mainnet; activation source is code-defined");
+    }
+    if network == NetworkKind::Mainnet && lwma_env_override.is_some() {
+        eprintln!("[warn] Ignoring IRIUM_LWMA_ACTIVATION_HEIGHT on mainnet; activation source is code-defined");
     }
     let params = ChainParams {
         genesis_block: genesis_block.clone(),
         pow_limit,
         htlcv1_activation_height: htlc_activation,
+        lwma: LwmaParams::new(lwma_activation, pow_limit),
     };
     let mut state = ChainState::new(params);
     if load_persisted {
@@ -5075,10 +5093,12 @@ mod tests {
 
         let locked = load_locked_genesis().expect("locked genesis");
         let genesis_block = block_from_locked(&locked).expect("genesis block");
+        let pow_limit = genesis_block.header.target();
         let params = ChainParams {
-            pow_limit: genesis_block.header.target(),
+            pow_limit,
             genesis_block,
             htlcv1_activation_height: activation,
+            lwma: LwmaParams::new(None, pow_limit),
         };
         let chain = Arc::new(Mutex::new(ChainState::new(params)));
 
@@ -5546,10 +5566,12 @@ mod tests {
     fn status_best_header_tip_hash_non_empty_when_height_positive() {
         let locked = load_locked_genesis().expect("locked genesis");
         let genesis_block = block_from_locked(&locked).expect("genesis block");
+        let pow_limit = genesis_block.header.target();
         let params = ChainParams {
-            pow_limit: genesis_block.header.target(),
+            pow_limit,
             genesis_block,
             htlcv1_activation_height: None,
+            lwma: LwmaParams::new(None, pow_limit),
         };
         let chain = ChainState::new(params);
         let genesis_hash = hex::encode(chain.tip_hash());

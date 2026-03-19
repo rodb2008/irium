@@ -20,10 +20,15 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use irium_node_rs::activation::{network_kind_from_env, resolved_htlcv1_activation_height};
+use irium_node_rs::activation::{
+    network_kind_from_env, resolved_htlcv1_activation_height, resolved_lwma_activation_height,
+    runtime_lwma_env_override,
+};
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
-use irium_node_rs::chain::{block_from_locked, decode_compact_tx, ChainParams, ChainState};
+use irium_node_rs::chain::{
+    block_from_locked, decode_compact_tx, ChainParams, ChainState, LwmaParams,
+};
 use irium_node_rs::constants::block_reward;
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::MempoolManager;
@@ -2009,15 +2014,31 @@ fn main() {
     let pow_limit = Target { bits: 0x1d00_ffff };
     let network = network_kind_from_env();
     let htlc_activation = resolved_htlcv1_activation_height(network);
+    let lwma_env_override = runtime_lwma_env_override();
+    let lwma_activation = resolved_lwma_activation_height(network);
+    match (network, lwma_activation) {
+        (irium_node_rs::activation::NetworkKind::Mainnet, Some(h)) => {
+            println!("LWMA mainnet activation height (code-defined, coordinated): {}", h)
+        }
+        (irium_node_rs::activation::NetworkKind::Mainnet, None) => {
+            println!("LWMA mainnet activation disabled in code (no activation height set)")
+        }
+        (_, Some(h)) => println!("LWMA non-mainnet activation height from env: {}", h),
+        (_, None) => println!("LWMA non-mainnet activation unset (env not provided)"),
+    }
     if network == irium_node_rs::activation::NetworkKind::Mainnet
         && env::var("IRIUM_HTLCV1_ACTIVATION_HEIGHT").is_ok()
     {
         eprintln!("[warn] Ignoring IRIUM_HTLCV1_ACTIVATION_HEIGHT on mainnet; activation source is code-defined");
     }
+    if network == irium_node_rs::activation::NetworkKind::Mainnet && lwma_env_override.is_some() {
+        eprintln!("[warn] Ignoring IRIUM_LWMA_ACTIVATION_HEIGHT on mainnet; activation source is code-defined");
+    }
     let params = ChainParams {
         genesis_block: block,
         pow_limit,
         htlcv1_activation_height: htlc_activation,
+        lwma: LwmaParams::new(lwma_activation, pow_limit),
     };
 
     let mut state = ChainState::new(params.clone());

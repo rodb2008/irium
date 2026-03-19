@@ -30,11 +30,9 @@ impl Target {
             return Target { bits: 0 };
         }
 
-        // Number of bytes required to represent the value (big-endian, no leading zeros).
         let value_bytes = value.to_bytes_be();
         let mut exponent = value_bytes.len() as u32;
 
-        // Normalize so that mantissa fits in 3 bytes, like Bitcoin-style compact format.
         let mantissa_big = if exponent <= 3 {
             let shift_bytes = 3 - exponent;
             value << (8 * shift_bytes)
@@ -45,11 +43,9 @@ impl Target {
 
         let mut mantissa_bytes = mantissa_big.to_bytes_be();
         if mantissa_bytes.len() > 3 {
-            // Keep the most significant 3 bytes.
             let start = mantissa_bytes.len() - 3;
             mantissa_bytes = mantissa_bytes[start..].to_vec();
         } else if mantissa_bytes.len() < 3 {
-            // Left-pad with zeros to exactly 3 bytes.
             let mut padded = vec![0u8; 3 - mantissa_bytes.len()];
             padded.extend_from_slice(&mantissa_bytes);
             mantissa_bytes = padded;
@@ -59,7 +55,6 @@ impl Target {
             | ((mantissa_bytes[1] as u32) << 8)
             | (mantissa_bytes[2] as u32);
 
-        // If mantissa's top bit is set, shift down and bump exponent, matching Python's logic.
         if mantissa & 0x0080_0000 != 0 {
             mantissa >>= 8;
             exponent += 1;
@@ -68,6 +63,27 @@ impl Target {
         let bits = (exponent << 24) | (mantissa & 0x00ff_ffff);
         Target { bits }
     }
+}
+
+/// Convert a consensus difficulty floor into its maximum target representation.
+///
+/// The effective post-activation maximum target is:
+/// `pow_limit_target / min_difficulty_floor`.
+///
+/// A floor of `1` disables any extra cap and leaves the PoW limit unchanged.
+/// Larger values tighten the maximum target deterministically using integer
+/// math only.
+pub fn min_difficulty_target(pow_limit: Target, min_difficulty: u64) -> Target {
+    if min_difficulty <= 1 {
+        return pow_limit;
+    }
+
+    let mut target = pow_limit.to_target();
+    target /= BigUint::from(min_difficulty);
+    if target.is_zero() {
+        target = BigUint::from(1u8);
+    }
+    Target::from_target(&target)
 }
 
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
@@ -89,4 +105,37 @@ pub fn header_hash(parts: &[&[u8]]) -> [u8; 32] {
 pub fn meets_target(hash: &[u8; 32], target: Target) -> bool {
     let value = BigUint::from_bytes_be(hash);
     value <= target.to_target()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_roundtrip_for_canonical_targets() {
+        for bits in [0x1d00ffff, 0x1f00ffff, 0x207fffff, 0x1b0404cb] {
+            let target = Target { bits };
+            assert_eq!(Target::from_target(&target.to_target()).bits, bits);
+        }
+    }
+
+    #[test]
+    fn min_difficulty_target_scales_pow_limit() {
+        let pow_limit = Target { bits: 0x207fffff };
+        let floored = min_difficulty_target(pow_limit, 2);
+        assert!(floored.to_target() < pow_limit.to_target());
+
+        let mut expected = pow_limit.to_target();
+        expected /= BigUint::from(2u8);
+        assert_eq!(
+            floored.to_target(),
+            Target::from_target(&expected).to_target()
+        );
+    }
+
+    #[test]
+    fn min_difficulty_target_one_preserves_pow_limit() {
+        let pow_limit = Target { bits: 0x1d00ffff };
+        assert_eq!(min_difficulty_target(pow_limit, 1), pow_limit);
+    }
 }

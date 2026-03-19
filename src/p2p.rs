@@ -6972,10 +6972,12 @@ mod tests {
     fn attaches_out_of_order_orphan_headers() {
         let locked = load_locked_genesis().expect("load locked genesis");
         let genesis = block_from_locked(&locked).expect("build genesis block");
+        let pow_limit = crate::pow::Target { bits: 0x207fffff };
         let params = ChainParams {
             genesis_block: genesis,
-            pow_limit: crate::pow::Target { bits: 0x207fffff },
+            pow_limit,
             htlcv1_activation_height: None,
+            lwma: crate::chain::LwmaParams::new(None, pow_limit),
         };
         let mut chain = ChainState::new(params);
 

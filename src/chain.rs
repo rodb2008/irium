@@ -14,14 +14,15 @@ use sha2::{Digest, Sha256};
 use crate::block::{Block, BlockHeader};
 use crate::constants::{
     block_reward, BLOCK_TARGET_INTERVAL, COINBASE_MATURITY, DIFFICULTY_RETARGET_INTERVAL,
-    MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
+    LWMA_MAX_TARGET_DOWN_FACTOR, LWMA_MAX_TARGET_UP_FACTOR, LWMA_MIN_DIFFICULTY_FLOOR,
+    LWMA_SOLVETIME_CLAMP_FACTOR, LWMA_WINDOW, MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
 };
 use crate::genesis::LockedGenesis;
-use crate::pow::{meets_target, sha256d, Target};
+use crate::pow::{meets_target, min_difficulty_target, sha256d, Target};
 use crate::tx::{
     decode_hex, encode_htlcv1_script, parse_htlcv1_script, parse_input_witness,
-    parse_output_encumbrance, InputWitness, OutputEncumbrance, Transaction,
-    TxInput, TxOutput, HTLC_V1_SCRIPT_TAG,
+    parse_output_encumbrance, InputWitness, OutputEncumbrance, Transaction, TxInput, TxOutput,
+    HTLC_V1_SCRIPT_TAG,
 };
 
 const MAX_ORPHAN_BLOCKS: usize = 100;
@@ -43,11 +44,37 @@ fn block_store_window() -> u64 {
 }
 
 /// Chain parameters for the Irium mainnet.
+#[derive(Debug, Clone, Copy)]
+pub struct LwmaParams {
+    pub activation_height: Option<u64>,
+    pub window: u64,
+    pub min_solvetime: u64,
+    pub max_solvetime: u64,
+    pub max_target_up_factor: u64,
+    pub max_target_down_factor: u64,
+    pub max_target: Target,
+}
+
+impl LwmaParams {
+    pub fn new(activation_height: Option<u64>, pow_limit: Target) -> Self {
+        Self {
+            activation_height,
+            window: LWMA_WINDOW,
+            min_solvetime: 1,
+            max_solvetime: BLOCK_TARGET_INTERVAL.saturating_mul(LWMA_SOLVETIME_CLAMP_FACTOR),
+            max_target_up_factor: LWMA_MAX_TARGET_UP_FACTOR,
+            max_target_down_factor: LWMA_MAX_TARGET_DOWN_FACTOR,
+            max_target: min_difficulty_target(pow_limit, LWMA_MIN_DIFFICULTY_FLOOR),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChainParams {
     pub genesis_block: Block,
     pub pow_limit: Target,
     pub htlcv1_activation_height: Option<u64>,
+    pub lwma: LwmaParams,
 }
 
 /// Reference to a specific transaction output.
@@ -151,6 +178,26 @@ impl ChainState {
             .unwrap_or(false)
     }
 
+    fn lwma_active_at(&self, height: u64) -> bool {
+        self.params
+            .lwma
+            .activation_height
+            .map(|h| height >= h)
+            .unwrap_or(false)
+    }
+
+    fn lwma_trace_enabled() -> bool {
+        env::var("IRIUM_TRACE_LWMA")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+
     fn orphan_pool_size(&self) -> usize {
         self.orphan_pool.values().map(|v| v.len()).sum()
     }
@@ -227,7 +274,7 @@ impl ChainState {
         self.chain.get(height as usize).cloned()
     }
 
-    pub fn target_for_height(&self, height: u64) -> Target {
+    fn legacy_target_for_height(&self, height: u64) -> Target {
         if height == 0 {
             return self.params.genesis_block.header.target();
         }
@@ -236,17 +283,13 @@ impl ChainState {
             .last()
             .expect("chain should have at least genesis when querying target");
 
-        // For heights before the first retarget interval, or non-retarget heights,
-        // keep the previous difficulty (same behaviour as the Python implementation).
+        // Pre-activation consensus path. Historical blocks must remain unchanged.
         if height < DIFFICULTY_RETARGET_INTERVAL || height % DIFFICULTY_RETARGET_INTERVAL != 0 {
             return last_block.header.target();
         }
 
-        // Mirror Python's retarget: look back DIFFICULTY_RETARGET_INTERVAL blocks
-        // and adjust based on actual vs expected elapsed time, clamped to [0.25x, 4x].
         let interval = DIFFICULTY_RETARGET_INTERVAL as usize;
         if self.chain.len() <= interval {
-            // Not enough history to retarget; fall back to last target.
             return last_block.header.target();
         }
 
@@ -259,10 +302,7 @@ impl ChainState {
             expected_time = 1;
         }
 
-        // Start from the raw ratio actual/expected and clamp within [0.25, 4.0],
-        // using integer arithmetic to stay deterministic.
         let mut adj_num = if actual_time <= 0 {
-            // If clocks misbehave, treat as "too fast" and clamp to minimum.
             expected_time / 4
         } else {
             actual_time
@@ -280,6 +320,110 @@ impl ChainState {
         new_target /= BigUint::from(adj_den as u64);
 
         Target::from_target(&new_target)
+    }
+
+    /// Deterministic LWMA next-work calculation used at and after activation.
+    ///
+    /// Formula in target space:
+    /// 1. For the last `N` solved blocks, clamp each solvetime to `[1, 6*T]`.
+    /// 2. Compute `weighted_solvetimes = sum_i(i * solvetime_i)` for weights `i = 1..N`.
+    /// 3. Compute `avg_target = sum(target_i) / N` over the same window.
+    /// 4. Compute `expected = T * sum_i(i)`.
+    /// 5. Compute `next_target = avg_target * weighted_solvetimes / expected`.
+    /// 6. Clamp `next_target` against the previous target so it cannot tighten
+    ///    or ease by more than the configured per-block step factor.
+    /// 7. Cap `next_target` by `min(pow_limit, lwma.max_target)`.
+    ///
+    /// All arithmetic is integer-only and deterministic. Compact bits encoding
+    /// is used only at the boundaries.
+    fn lwma_target_for_height(&self) -> Target {
+        let last_block = self
+            .chain
+            .last()
+            .expect("chain should have at least genesis when querying target");
+        let sample_count = std::cmp::min(
+            self.params.lwma.window as usize,
+            self.chain.len().saturating_sub(1),
+        );
+        if sample_count == 0 {
+            return last_block.header.target();
+        }
+
+        let start = self.chain.len() - sample_count;
+        let mut weighted_solvetimes = 0u128;
+        let mut weight_total = 0u128;
+        let mut target_sum = BigUint::zero();
+
+        for (offset, idx) in (start..self.chain.len()).enumerate() {
+            let current = &self.chain[idx];
+            let previous = &self.chain[idx - 1];
+            let raw_solvetime = current
+                .header
+                .time
+                .saturating_sub(previous.header.time)
+                .max(self.params.lwma.min_solvetime as u32) as u64;
+            let solvetime = raw_solvetime.min(self.params.lwma.max_solvetime);
+            let weight = (offset as u128) + 1;
+            weighted_solvetimes += weight * u128::from(solvetime);
+            weight_total += weight;
+            target_sum += current.header.target().to_target();
+        }
+
+        let mut avg_target = target_sum / BigUint::from(sample_count as u64);
+        if avg_target.is_zero() {
+            avg_target = BigUint::from(1u8);
+        }
+
+        let observed = BigUint::from(weighted_solvetimes.max(1));
+        let expected = BigUint::from((BLOCK_TARGET_INTERVAL as u128) * weight_total);
+        let mut next_target = avg_target * observed;
+        next_target /= expected;
+        if next_target.is_zero() {
+            next_target = BigUint::from(1u8);
+        }
+
+        let previous_target = last_block.header.target().to_target();
+        let mut min_step_target = previous_target.clone();
+        min_step_target /= BigUint::from(self.params.lwma.max_target_down_factor.max(1));
+        if min_step_target.is_zero() {
+            min_step_target = BigUint::from(1u8);
+        }
+        let max_step_target =
+            &previous_target * BigUint::from(self.params.lwma.max_target_up_factor.max(1));
+
+        if next_target < min_step_target {
+            next_target = min_step_target;
+        }
+        if next_target > max_step_target {
+            next_target = max_step_target;
+        }
+
+        let mut hard_max_target = self.params.pow_limit.to_target();
+        let lwma_max_target = self.params.lwma.max_target.to_target();
+        if lwma_max_target < hard_max_target {
+            hard_max_target = lwma_max_target;
+        }
+        if next_target > hard_max_target {
+            next_target = hard_max_target;
+        }
+
+        Target::from_target(&next_target)
+    }
+
+    pub fn target_for_height(&self, height: u64) -> Target {
+        let legacy_target = self.legacy_target_for_height(height);
+        if !self.lwma_active_at(height) {
+            return legacy_target;
+        }
+
+        let lwma_target = self.lwma_target_for_height();
+        if Self::lwma_trace_enabled() {
+            eprintln!(
+                "[trace][lwma] height={} old_bits={:08x} lwma_bits={:08x} selected_bits={:08x}",
+                height, legacy_target.bits, lwma_target.bits, lwma_target.bits
+            );
+        }
+        lwma_target
     }
     /// Attach an anchor manager for checkpoint enforcement.
     pub fn set_anchors(&mut self, anchors: AnchorManager) {
@@ -306,13 +450,14 @@ impl ChainState {
         self.validate_block_header(&block, expected_height, previous)?;
 
         let reward = block_reward(expected_height);
-        let (_fees, _coinbase_total, subsidy_created, undo) = self.validate_and_apply_transactions(
-            &block,
-            reward,
-            expected_height,
-            true,
-            Some(MAX_MONEY - self.issued),
-        )?;
+        let (_fees, _coinbase_total, subsidy_created, undo) = self
+            .validate_and_apply_transactions(
+                &block,
+                reward,
+                expected_height,
+                true,
+                Some(MAX_MONEY - self.issued),
+            )?;
 
         let new_supply = self
             .issued
@@ -382,7 +527,11 @@ impl ChainState {
 
         self.chain.pop();
         self.height = self.chain.len() as u64;
-        self.best_tip = self.chain.last().map(|b| b.header.hash()).unwrap_or([0u8; 32]);
+        self.best_tip = self
+            .chain
+            .last()
+            .map(|b| b.header.hash())
+            .unwrap_or([0u8; 32]);
         Ok(tip_block)
     }
 
@@ -892,7 +1041,6 @@ impl ChainState {
     }
 
     fn validate_transaction_internal(
-
         &self,
         tx: &Transaction,
         height: u64,
@@ -1005,7 +1153,13 @@ fn signature_digest(tx: &Transaction, input_index: usize, script_pubkey: &[u8]) 
     sha256d(&data)
 }
 
-fn verify_sig_with_pubkey(tx: &Transaction, input_index: usize, script_pubkey: &[u8], sig: &[u8], pubkey: &[u8]) -> bool {
+fn verify_sig_with_pubkey(
+    tx: &Transaction,
+    input_index: usize,
+    script_pubkey: &[u8],
+    sig: &[u8],
+    pubkey: &[u8],
+) -> bool {
     use k256::ecdsa::signature::hazmat::PrehashVerifier;
     use k256::ecdsa::{Signature, VerifyingKey};
 
@@ -1236,10 +1390,12 @@ mod tests {
     fn base_chain(activation: Option<u64>) -> ChainState {
         let locked = load_locked_genesis().expect("locked genesis");
         let genesis = block_from_locked(&locked).expect("genesis block");
+        let pow_limit = Target { bits: 0x1f00ffff };
         let params = ChainParams {
             genesis_block: genesis,
-            pow_limit: Target { bits: 0x1f00ffff },
+            pow_limit,
             htlcv1_activation_height: activation,
+            lwma: LwmaParams::new(None, pow_limit),
         };
         ChainState::new(params)
     }
@@ -1255,13 +1411,22 @@ mod tests {
         hash160(pubkey.as_bytes())
     }
 
-    fn p2pkh_witness(tx: &Transaction, input_index: usize, script: &[u8], sk: &SigningKey) -> Vec<u8> {
+    fn p2pkh_witness(
+        tx: &Transaction,
+        input_index: usize,
+        script: &[u8],
+        sk: &SigningKey,
+    ) -> Vec<u8> {
         let digest = signature_digest(tx, input_index, script);
         let sig: Signature = sk.sign_prehash(&digest).expect("sign");
         let sig = sig.normalize_s().unwrap_or(sig);
         let mut sig_bytes = sig.to_der().as_bytes().to_vec();
         sig_bytes.push(0x01);
-        let pubkey = sk.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+        let pubkey = sk
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
 
         let mut out = Vec::with_capacity(1 + sig_bytes.len() + 1 + pubkey.len());
         out.push(sig_bytes.len() as u8);
@@ -1289,6 +1454,76 @@ mod tests {
             },
         );
         op
+    }
+
+    fn difficulty_chain(lwma_activation: Option<u64>, pow_limit_bits: u32) -> ChainState {
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let pow_limit = Target {
+            bits: pow_limit_bits,
+        };
+        let params = ChainParams {
+            genesis_block: genesis,
+            pow_limit,
+            htlcv1_activation_height: None,
+            lwma: LwmaParams::new(lwma_activation, pow_limit),
+        };
+        ChainState::new(params)
+    }
+
+    fn push_synthetic_block(chain: &mut ChainState, time: u32, bits: u32) {
+        let prev_hash = chain.chain.last().expect("prev block").header.hash();
+        chain.chain.push(Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash,
+                merkle_root: [chain.chain.len() as u8; 32],
+                time,
+                bits,
+                nonce: chain.chain.len() as u32,
+            },
+            transactions: Vec::new(),
+        });
+        chain.height = chain.chain.len() as u64;
+    }
+
+    fn synthetic_working_bits(chain: &ChainState) -> u32 {
+        let target = chain.params.lwma.max_target.to_target() / BigUint::from(2u8);
+        Target::from_target(&target).bits
+    }
+
+    fn manual_legacy_target(chain: &ChainState, height: u64) -> Target {
+        if height == 0 {
+            return chain.params.genesis_block.header.target();
+        }
+        let last_block = chain.chain.last().expect("last block");
+        if height < DIFFICULTY_RETARGET_INTERVAL || height % DIFFICULTY_RETARGET_INTERVAL != 0 {
+            return last_block.header.target();
+        }
+        let interval = DIFFICULTY_RETARGET_INTERVAL as usize;
+        if chain.chain.len() <= interval {
+            return last_block.header.target();
+        }
+        let prev_block = &chain.chain[chain.chain.len() - interval];
+        let actual_time = (last_block.header.time as i64) - (prev_block.header.time as i64);
+        let mut expected_time = (DIFFICULTY_RETARGET_INTERVAL * BLOCK_TARGET_INTERVAL) as i64;
+        if expected_time <= 0 {
+            expected_time = 1;
+        }
+        let mut adj_num = if actual_time <= 0 {
+            expected_time / 4
+        } else {
+            actual_time
+        };
+        let adj_den = expected_time;
+        if adj_num * 4 < adj_den {
+            adj_num = adj_den / 4;
+        } else if adj_num > adj_den * 4 {
+            adj_num = adj_den * 4;
+        }
+        let mut new_target = last_block.header.target().to_target() * BigUint::from(adj_num as u64);
+        new_target /= BigUint::from(adj_den as u64);
+        Target::from_target(&new_target)
     }
 
     #[test]
@@ -1370,7 +1605,9 @@ mod tests {
         let utxo_script = chain.utxos.get(&prev).unwrap().output.script_pubkey.clone();
         tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, &sender);
 
-        let err = chain.validate_transaction(&tx).expect_err("must reject pre-activation");
+        let err = chain
+            .validate_transaction(&tx)
+            .expect_err("must reject pre-activation");
         assert!(err.contains("HTLCv1 output before activation"));
     }
 
@@ -1449,7 +1686,8 @@ mod tests {
         let mut expected_hash = [0u8; 32];
         expected_hash.copy_from_slice(&Sha256::digest(preimage));
 
-        let (prev, htlc) = add_htlc_utxo(&mut chain, 10_000, &recipient, &refund, expected_hash, 60);
+        let (prev, htlc) =
+            add_htlc_utxo(&mut chain, 10_000, &recipient, &refund, expected_hash, 60);
 
         let out_script = p2pkh_script(&key_hash(&recipient));
         let mut tx = Transaction {
@@ -1473,9 +1711,13 @@ mod tests {
         let sig = sig.normalize_s().unwrap_or(sig);
         let mut sig_bytes = sig.to_der().as_bytes().to_vec();
         sig_bytes.push(0x01);
-        let pubkey = recipient.verifying_key().to_encoded_point(true).as_bytes().to_vec();
-        tx.inputs[0].script_sig = encode_htlcv1_claim_witness(&sig_bytes, &pubkey, preimage)
-            .expect("claim witness");
+        let pubkey = recipient
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        tx.inputs[0].script_sig =
+            encode_htlcv1_claim_witness(&sig_bytes, &pubkey, preimage).expect("claim witness");
 
         assert!(chain.validate_transaction(&tx).is_ok());
 
@@ -1514,9 +1756,13 @@ mod tests {
         let sig = sig.normalize_s().unwrap_or(sig);
         let mut sig_bytes = sig.to_der().as_bytes().to_vec();
         sig_bytes.push(0x01);
-        let pubkey = refund.verifying_key().to_encoded_point(true).as_bytes().to_vec();
-        tx.inputs[0].script_sig = encode_htlcv1_refund_witness(&sig_bytes, &pubkey)
-            .expect("refund witness");
+        let pubkey = refund
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        tx.inputs[0].script_sig =
+            encode_htlcv1_refund_witness(&sig_bytes, &pubkey).expect("refund witness");
 
         chain.height = 119;
         assert!(chain.validate_transaction(&tx).is_err());
@@ -1564,7 +1810,8 @@ mod tests {
         let mut expected_hash = [0u8; 32];
         expected_hash.copy_from_slice(&Sha256::digest(b"ok-secret"));
 
-        let (prev, htlc) = add_htlc_utxo(&mut chain, 10_000, &recipient, &refund, expected_hash, 80);
+        let (prev, htlc) =
+            add_htlc_utxo(&mut chain, 10_000, &recipient, &refund, expected_hash, 80);
         let mut tx = Transaction {
             version: 1,
             inputs: vec![TxInput {
@@ -1586,9 +1833,13 @@ mod tests {
         let sig = sig.normalize_s().unwrap_or(sig);
         let mut sig_bytes = sig.to_der().as_bytes().to_vec();
         sig_bytes.push(0x01);
-        let pubkey = wrong.verifying_key().to_encoded_point(true).as_bytes().to_vec();
-        tx.inputs[0].script_sig = encode_htlcv1_claim_witness(&sig_bytes, &pubkey, b"ok-secret")
-            .expect("claim witness");
+        let pubkey = wrong
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        tx.inputs[0].script_sig =
+            encode_htlcv1_claim_witness(&sig_bytes, &pubkey, b"ok-secret").expect("claim witness");
 
         assert!(chain.validate_transaction(&tx).is_err());
     }
@@ -1623,11 +1874,244 @@ mod tests {
         let sig = sig.normalize_s().unwrap_or(sig);
         let mut sig_bytes = sig.to_der().as_bytes().to_vec();
         sig_bytes.push(0x01);
-        let pubkey = wrong.verifying_key().to_encoded_point(true).as_bytes().to_vec();
-        tx.inputs[0].script_sig = encode_htlcv1_refund_witness(&sig_bytes, &pubkey)
-            .expect("refund witness");
+        let pubkey = wrong
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        tx.inputs[0].script_sig =
+            encode_htlcv1_refund_witness(&sig_bytes, &pubkey).expect("refund witness");
 
         assert!(chain.validate_transaction(&tx).is_err());
+    }
+
+    #[test]
+    fn pre_activation_uses_legacy_retarget_exactly() {
+        let mut chain = difficulty_chain(Some(30_000), 0x207fffff);
+        let mut time = chain.chain[0].header.time;
+        for _ in 1..DIFFICULTY_RETARGET_INTERVAL {
+            time += (BLOCK_TARGET_INTERVAL * 2) as u32;
+            push_synthetic_block(&mut chain, time, 0x207fffff);
+        }
+
+        let expected = manual_legacy_target(&chain, DIFFICULTY_RETARGET_INTERVAL);
+        assert_eq!(
+            chain.target_for_height(DIFFICULTY_RETARGET_INTERVAL),
+            expected
+        );
+    }
+
+    #[test]
+    fn activation_boundary_switches_to_lwma() {
+        let activation = 70;
+        let mut chain = difficulty_chain(Some(activation), 0x207fffff);
+        let mut time = chain.chain[0].header.time;
+        for i in 1..activation {
+            time += if i < 60 {
+                BLOCK_TARGET_INTERVAL as u32
+            } else {
+                60
+            };
+            push_synthetic_block(&mut chain, time, 0x207fffff);
+        }
+
+        assert_eq!(
+            chain.target_for_height(activation - 1),
+            chain.legacy_target_for_height(activation - 1)
+        );
+        assert_eq!(
+            chain.target_for_height(activation),
+            chain.lwma_target_for_height()
+        );
+    }
+
+    #[test]
+    fn lwma_is_deterministic_for_same_headers() {
+        let activation = 70;
+        let mut chain_a = difficulty_chain(Some(activation), 0x207fffff);
+        let mut chain_b = difficulty_chain(Some(activation), 0x207fffff);
+        let mut time = chain_a.chain[0].header.time;
+        for i in 1..activation {
+            time += if i % 2 == 0 { 300 } else { 900 };
+            push_synthetic_block(&mut chain_a, time, 0x207fffff);
+            push_synthetic_block(&mut chain_b, time, 0x207fffff);
+        }
+
+        let first = chain_a.target_for_height(activation);
+        let second = chain_a.target_for_height(activation);
+        let repeated = chain_b.target_for_height(activation);
+        assert_eq!(first, second);
+        assert_eq!(first, repeated);
+    }
+
+    #[test]
+    fn lwma_recovers_from_hashrate_increase_with_step_clamp() {
+        let activation = 70;
+        let mut chain = difficulty_chain(Some(activation), 0x207fffff);
+        let test_bits = synthetic_working_bits(&chain);
+        let mut time = chain.chain[0].header.time;
+        for i in 1..activation {
+            time += if i < 40 { 600 } else { 60 };
+            push_synthetic_block(&mut chain, time, test_bits);
+        }
+
+        let prev_target = chain.chain.last().unwrap().header.target().to_target();
+        let next_target = chain.target_for_height(activation).to_target();
+        let min_step_target =
+            Target::from_target(&(prev_target.clone() / BigUint::from(2u8))).to_target();
+        assert!(
+            next_target < prev_target,
+            "difficulty should rise after faster blocks"
+        );
+        assert!(
+            next_target >= min_step_target,
+            "hardening must respect 2x step clamp"
+        );
+    }
+
+    #[test]
+    fn lwma_recovers_from_hashrate_drop_with_step_clamp() {
+        let activation = 70;
+        let mut chain = difficulty_chain(Some(activation), 0x207fffff);
+        let test_bits = synthetic_working_bits(&chain);
+        let mut time = chain.chain[0].header.time;
+        for i in 1..activation {
+            time += if i < 40 { 600 } else { 1800 };
+            push_synthetic_block(&mut chain, time, test_bits);
+        }
+
+        let prev_target = chain.chain.last().unwrap().header.target().to_target();
+        let next_target = chain.target_for_height(activation).to_target();
+        let max_step_target =
+            Target::from_target(&(prev_target.clone() * BigUint::from(2u8))).to_target();
+        assert!(
+            next_target > prev_target,
+            "difficulty should ease after slower blocks"
+        );
+        assert!(
+            next_target <= max_step_target,
+            "easing must respect 2x step clamp"
+        );
+        assert!(next_target <= chain.params.lwma.max_target.to_target());
+    }
+
+    #[test]
+    fn lwma_clamps_forward_timestamp_spikes() {
+        let activation = 70;
+        let mut clamped = difficulty_chain(Some(activation), 0x207fffff);
+        let mut time_a = clamped.chain[0].header.time;
+        for i in 1..activation {
+            time_a += if i == activation - 1 {
+                (BLOCK_TARGET_INTERVAL * 6) as u32
+            } else {
+                BLOCK_TARGET_INTERVAL as u32
+            };
+            push_synthetic_block(&mut clamped, time_a, 0x207fffff);
+        }
+
+        let mut spiked = difficulty_chain(Some(activation), 0x207fffff);
+        let mut time_b = spiked.chain[0].header.time;
+        for i in 1..activation {
+            time_b += if i == activation - 1 {
+                200_000
+            } else {
+                BLOCK_TARGET_INTERVAL as u32
+            };
+            push_synthetic_block(&mut spiked, time_b, 0x207fffff);
+        }
+
+        assert_eq!(
+            spiked.target_for_height(activation),
+            clamped.target_for_height(activation)
+        );
+    }
+
+    #[test]
+    fn lwma_clamps_non_monotonic_timestamps_to_one_second() {
+        let activation = 70;
+        let mut monotonic = difficulty_chain(Some(activation), 0x207fffff);
+        let mut time_a = monotonic.chain[0].header.time;
+        for i in 1..activation {
+            time_a += if i == activation - 1 {
+                1
+            } else {
+                BLOCK_TARGET_INTERVAL as u32
+            };
+            push_synthetic_block(&mut monotonic, time_a, 0x207fffff);
+        }
+
+        let mut non_monotonic = difficulty_chain(Some(activation), 0x207fffff);
+        let mut time_b = non_monotonic.chain[0].header.time;
+        for i in 1..activation {
+            if i == activation - 1 {
+                time_b = time_b.saturating_sub(500);
+            } else {
+                time_b += BLOCK_TARGET_INTERVAL as u32;
+            }
+            push_synthetic_block(&mut non_monotonic, time_b, 0x207fffff);
+        }
+
+        assert_eq!(
+            non_monotonic.target_for_height(activation),
+            monotonic.target_for_height(activation)
+        );
+    }
+
+    #[test]
+    fn lwma_respects_post_activation_max_target_floor() {
+        let activation = 70;
+        let mut chain = difficulty_chain(Some(activation), 0x207fffff);
+        let mut time = chain.chain[0].header.time;
+        for _ in 1..activation {
+            time += 3600;
+            push_synthetic_block(&mut chain, time, 0x207fffff);
+        }
+
+        let next = chain.target_for_height(activation).to_target();
+        assert_eq!(next, chain.params.lwma.max_target.to_target());
+        assert!(next <= chain.params.pow_limit.to_target());
+    }
+
+    #[test]
+    fn activation_future_does_not_rewrite_historical_targets() {
+        let mut future = difficulty_chain(Some(30_000), 0x207fffff);
+        let mut disabled = difficulty_chain(None, 0x207fffff);
+        let mut time = future.chain[0].header.time;
+        for _ in 1..DIFFICULTY_RETARGET_INTERVAL {
+            time += 1200;
+            push_synthetic_block(&mut future, time, 0x207fffff);
+            push_synthetic_block(&mut disabled, time, 0x207fffff);
+        }
+
+        assert_eq!(
+            future.target_for_height(DIFFICULTY_RETARGET_INTERVAL),
+            disabled.target_for_height(DIFFICULTY_RETARGET_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn reorg_across_activation_boundary_recomputes_safely() {
+        let activation = 70;
+        let mut chain = difficulty_chain(Some(activation), 0x207fffff);
+        let mut time = chain.chain[0].header.time;
+        for i in 1..activation {
+            time += if i < 60 { 600 } else { 120 };
+            push_synthetic_block(&mut chain, time, 0x207fffff);
+        }
+        let target_at_activation = chain.target_for_height(activation);
+
+        time += 120;
+        push_synthetic_block(&mut chain, time, target_at_activation.bits);
+        let _post_activation_target = chain.target_for_height(activation + 1);
+
+        chain.chain.pop();
+        chain.height = chain.chain.len() as u64;
+
+        assert_eq!(chain.target_for_height(activation), target_at_activation);
+        assert_eq!(
+            chain.target_for_height(activation - 1),
+            chain.legacy_target_for_height(activation - 1)
+        );
     }
 
     #[test]
