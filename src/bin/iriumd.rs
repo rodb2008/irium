@@ -4709,9 +4709,10 @@ async fn main() {
                 let next_height = local_height.saturating_add(1);
                 let peer_height = best_peer_height.unwrap_or(0);
                 let sync_target_height = best_header_height.max(local_height);
-                // Report validated local chain height in heartbeat to avoid misleading
-                // peer-advertised heights during fork/header-spam conditions.
-                let chain_height = local_height;
+                // Keep local height authoritative for validation, but expose the
+                // best known header height separately in heartbeat logs so sync
+                // lag is visible instead of being flattened into local height.
+                let chain_height = sync_target_height;
 
                 hb_ticks = hb_ticks.wrapping_add(1);
 
@@ -4881,7 +4882,7 @@ async fn main() {
                 } else {
                     let short_tip = tip_hash.chars().take(12).collect::<String>();
                     eprintln!(
-                        "[{}] ❤️ heartbeat Irium chain height={} 🏠 local height={} 🧱 next height={} ⛏ tip={} 👥 peers={} 🌱 seedlist={} 🧺 mempool={}",
+                        "[{}] ❤️ heartbeat Irium best height={} 🏠 local height={} 🧱 next height={} ⛏ tip={} 👥 peers={} 🌱 seedlist={} 🧺 mempool={}",
                         Utc::now().format("%H:%M:%S"),
                         chain_height,
                         local_height,
