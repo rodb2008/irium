@@ -1,10 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::PathBuf;
+use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::storage;
+
+const REPUTATION_PRUNE_AFTER_SECS: f64 = 30.0 * 24.0 * 60.0 * 60.0;
+const REPUTATION_LOW_ACTIVITY_THRESHOLD: u32 = 3;
 
 fn now_secs() -> f64 {
     SystemTime::now()
@@ -77,6 +82,24 @@ impl PeerReputation {
     pub fn is_banned(&self) -> bool {
         self.score < 20
     }
+
+    pub fn total_activity(&self) -> u32 {
+        self.successful_connections
+            .saturating_add(self.failed_connections)
+            .saturating_add(self.blocks_received)
+            .saturating_add(self.invalid_blocks)
+            .saturating_add(self.uptime_proofs)
+    }
+
+    pub fn should_prune(&self, now: f64) -> bool {
+        if self.last_seen <= 0.0 || now <= self.last_seen {
+            return false;
+        }
+        let age = now - self.last_seen;
+        age >= REPUTATION_PRUNE_AFTER_SECS
+            && (self.successful_connections == 0
+                || self.total_activity() <= REPUTATION_LOW_ACTIVITY_THRESHOLD)
+    }
 }
 
 #[derive(Debug)]
@@ -113,6 +136,8 @@ impl ReputationManager {
             Some(m) => m,
             None => return,
         };
+        let now = now_secs();
+        let mut pruned_any = false;
         for (peer_id, value) in map {
             if let Some(obj) = value.as_object() {
                 let mut rep = PeerReputation::new(peer_id.clone());
@@ -142,8 +167,15 @@ impl ReputationManager {
                     .and_then(|v| v.as_f64())
                     .unwrap_or_else(now_secs);
                 rep.update_score();
+                if rep.should_prune(now) {
+                    pruned_any = true;
+                    continue;
+                }
                 self.reputations.insert(peer_id.clone(), rep);
             }
+        }
+        if pruned_any {
+            self.save();
         }
     }
 
@@ -167,9 +199,17 @@ impl ReputationManager {
             );
         }
         let value = serde_json::Value::Object(map);
-        if let Ok(text) = serde_json::to_string_pretty(&value) {
-            let _ = fs::write(&self.path, text);
+        let Ok(text) = serde_json::to_string_pretty(&value) else {
+            return;
+        };
+        let tmp = self.path.with_extension(format!("json.tmp.{}", process::id()));
+        if let Ok(mut file) = File::create(&tmp) {
+            if file.write_all(text.as_bytes()).is_ok() && file.sync_all().is_ok() {
+                let _ = fs::rename(&tmp, &self.path);
+                return;
+            }
         }
+        let _ = fs::remove_file(&tmp);
     }
 
     pub fn get_reputation(&mut self, peer_id: &str) -> &mut PeerReputation {
@@ -229,5 +269,32 @@ impl ReputationManager {
         rep.last_seen = now_secs();
         rep.update_score();
         self.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prunes_old_low_activity_entries() {
+        let now = now_secs();
+        let mut rep = PeerReputation::new("1.2.3.4:38291".to_string());
+        rep.last_seen = now - (REPUTATION_PRUNE_AFTER_SECS + 60.0);
+        rep.failed_connections = 1;
+        rep.update_score();
+        assert!(rep.should_prune(now));
+    }
+
+    #[test]
+    fn keeps_old_successful_entries() {
+        let now = now_secs();
+        let mut rep = PeerReputation::new("1.2.3.4:38291".to_string());
+        rep.last_seen = now - (REPUTATION_PRUNE_AFTER_SECS + 60.0);
+        rep.successful_connections = 2;
+        rep.failed_connections = 5;
+        rep.blocks_received = 2;
+        rep.update_score();
+        assert!(!rep.should_prune(now));
     }
 }

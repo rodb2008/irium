@@ -39,7 +39,6 @@ const DEFAULT_MAX_PEERS: usize = 100;
 const MAX_MSGS_PER_SEC: u32 = 200;
 const MAX_BULK_MSGS_PER_SEC: u32 = 2000;
 
-
 fn recent_block_cache_ttl() -> Duration {
     let secs = std::env::var("IRIUM_P2P_RECENT_BLOCK_TTL_SECS")
         .ok()
@@ -65,6 +64,26 @@ pub struct RelayTelemetrySnapshot {
     pub duplicate_block_suppressed_count: u64,
     pub avg_block_processing_ms: u64,
     pub avg_block_announce_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PeerTelemetrySnapshot {
+    pub outbound_dial_attempts_total: u64,
+    pub outbound_dial_success_total: u64,
+    pub outbound_dial_failure_total: u64,
+    pub outbound_dial_failure_timeout_total: u64,
+    pub outbound_dial_failure_refused_total: u64,
+    pub outbound_dial_failure_no_route_total: u64,
+    pub outbound_dial_failure_banned_total: u64,
+    pub outbound_dial_failure_backoff_total: u64,
+    pub outbound_dial_failure_other_total: u64,
+    pub inbound_accepted_total: u64,
+    pub handshake_failures_total: u64,
+    pub temp_bans_total: u64,
+    pub active_peers: u64,
+    pub unique_connected_peer_ips: u64,
+    pub attempted_peer_ips: u64,
+    pub banned_peers: u64,
 }
 
 #[derive(Debug)]
@@ -144,6 +163,18 @@ static BLOCK_PROCESSING_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BLOCK_PROCESSING_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static BLOCK_ANNOUNCE_DELAY_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BLOCK_ANNOUNCE_DELAY_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static OUTBOUND_DIAL_ATTEMPTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OUTBOUND_DIAL_SUCCESS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OUTBOUND_DIAL_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OUTBOUND_DIAL_FAILURE_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OUTBOUND_DIAL_FAILURE_REFUSED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OUTBOUND_DIAL_FAILURE_NO_ROUTE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OUTBOUND_DIAL_FAILURE_BANNED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OUTBOUND_DIAL_FAILURE_BACKOFF_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OUTBOUND_DIAL_FAILURE_OTHER_TOTAL: AtomicU64 = AtomicU64::new(0);
+static INBOUND_ACCEPTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HANDSHAKE_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TEMP_BAN_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 fn record_block_processing_ms(ms: u64) {
     BLOCK_PROCESSING_MS_TOTAL.fetch_add(ms, Ordering::Relaxed);
@@ -164,19 +195,54 @@ fn average_counter(total: &AtomicU64, samples: &AtomicU64) -> u64 {
     }
 }
 
+fn classify_outbound_dial_failure(err: &str) -> &'static str {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("dial backoff") || lower.contains("dial in progress") {
+        "backoff"
+    } else if lower.contains("timeout") {
+        "timeout"
+    } else if lower.contains("connection refused") || lower.contains("refused") {
+        "refused"
+    } else if lower.contains("no route to host") {
+        "no_route"
+    } else if lower.contains("banned") {
+        "banned"
+    } else {
+        "other"
+    }
+}
+
 fn recent_announced_blocks() -> Arc<Mutex<RecentHashCache>> {
     static VAL: OnceLock<Arc<Mutex<RecentHashCache>>> = OnceLock::new();
-    VAL.get_or_init(|| Arc::new(Mutex::new(RecentHashCache::new(recent_block_cache_ttl(), recent_block_cache_limit())))).clone()
+    VAL.get_or_init(|| {
+        Arc::new(Mutex::new(RecentHashCache::new(
+            recent_block_cache_ttl(),
+            recent_block_cache_limit(),
+        )))
+    })
+    .clone()
 }
 
 fn recent_requested_blocks() -> Arc<Mutex<RecentHashCache>> {
     static VAL: OnceLock<Arc<Mutex<RecentHashCache>>> = OnceLock::new();
-    VAL.get_or_init(|| Arc::new(Mutex::new(RecentHashCache::new(recent_block_cache_ttl(), recent_block_cache_limit())))).clone()
+    VAL.get_or_init(|| {
+        Arc::new(Mutex::new(RecentHashCache::new(
+            recent_block_cache_ttl(),
+            recent_block_cache_limit(),
+        )))
+    })
+    .clone()
 }
 
 fn recent_relayed_blocks() -> Arc<Mutex<RecentHashCache>> {
     static VAL: OnceLock<Arc<Mutex<RecentHashCache>>> = OnceLock::new();
-    VAL.get_or_init(|| Arc::new(Mutex::new(RecentHashCache::new(recent_block_cache_ttl(), recent_block_cache_limit())))).clone()
+    VAL.get_or_init(|| {
+        Arc::new(Mutex::new(RecentHashCache::new(
+            recent_block_cache_ttl(),
+            recent_block_cache_limit(),
+        )))
+    })
+    .clone()
 }
 
 fn p2p_blocking_concurrency() -> usize {
@@ -377,8 +443,56 @@ fn outbound_dial_banned_secs() -> u64 {
     std::env::var("IRIUM_SEED_DIAL_BANNED_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(600)
-        .clamp(60, 7200)
+        .unwrap_or(120)
+        .clamp(30, 7200)
+}
+
+fn dynamic_ban_secs() -> u64 {
+    std::env::var("IRIUM_P2P_TEMP_BAN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120)
+        .clamp(30, 3600)
+}
+
+fn small_network_peer_floor() -> usize {
+    std::env::var("IRIUM_P2P_SMALL_NETWORK_PEERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(12)
+        .clamp(2, 64)
+}
+
+fn small_network_handshake_fail_threshold() -> u32 {
+    std::env::var("IRIUM_P2P_SMALL_NETWORK_HANDSHAKE_FAIL_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(10)
+        .clamp(5, 50)
+}
+
+fn outbound_candidate_max_idle_hours() -> f64 {
+    std::env::var("IRIUM_P2P_CANDIDATE_MAX_IDLE_HOURS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(72.0)
+        .clamp(1.0, 24.0 * 30.0)
+}
+
+fn connect_known_peer_scan_limit_ahead() -> usize {
+    std::env::var("IRIUM_P2P_KNOWN_PEER_AHEAD_SCAN_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(128)
+        .clamp(8, 1024)
+}
+
+fn connect_known_peer_scan_limit_fallback() -> usize {
+    std::env::var("IRIUM_P2P_KNOWN_PEER_FALLBACK_SCAN_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64)
+        .clamp(8, 1024)
 }
 
 fn inbound_banned_log_cooldown_secs() -> u64 {
@@ -478,7 +592,6 @@ fn headers_new_false_log_cooldown_secs() -> u64 {
             .unwrap_or(30)
     })
 }
-
 
 fn locator_recovery_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
@@ -621,6 +734,14 @@ fn trusted_seed_should_dial(local_ip: IpAddr, remote_ip: IpAddr) -> bool {
         (IpAddr::V4(a), IpAddr::V4(b)) => u32::from(a) < u32::from(b),
         // Fall back to a stable textual order for non-IPv4 (shouldn't happen for mainnet seeds).
         (a, b) => a.to_string() < b.to_string(),
+    }
+}
+
+fn trusted_anchor_peer_id(addr: SocketAddr, trusted_seed: bool) -> String {
+    if trusted_seed {
+        addr.ip().to_string()
+    } else {
+        addr.to_string()
     }
 }
 
@@ -832,7 +953,6 @@ async fn penalize_rejecting_header_peer(ip: IpAddr, streak: u32) {
         peer_mark_header_event(ip, false, 1).await;
     }
 }
-
 
 fn normalize_reason_hint(reason_hint: &str, local_h: u64, best_h: u64) -> Option<String> {
     if reason_hint.is_empty() {
@@ -2056,7 +2176,9 @@ async fn record_handshake_failure(
     dynamic_bans: &Arc<StdMutex<HashMap<IpAddr, Instant>>>,
     ip: IpAddr,
     trusted_seed: bool,
+    connected_peers: usize,
 ) -> (u32, bool) {
+    HANDSHAKE_FAILURE_TOTAL.fetch_add(1, Ordering::Relaxed);
     let now = Instant::now();
     let window = handshake_fail_window();
     let count = {
@@ -2075,14 +2197,20 @@ async fn record_handshake_failure(
             1
         }
     };
+    let threshold = if connected_peers < small_network_peer_floor() {
+        small_network_handshake_fail_threshold()
+    } else {
+        handshake_fail_threshold()
+    };
     let mut banned = false;
-    if !trusted_seed && count >= handshake_fail_threshold() {
+    if !trusted_seed && count >= threshold {
         {
             let mut guard = dynamic_bans.lock().unwrap_or_else(|e| e.into_inner());
-            guard.insert(ip, Instant::now());
+            guard.insert(ip, Instant::now() + Duration::from_secs(dynamic_ban_secs()));
         }
         let mut guard = failures.lock().await;
         guard.remove(&ip);
+        TEMP_BAN_TOTAL.fetch_add(1, Ordering::Relaxed);
         banned = true;
     }
     (count, banned)
@@ -2452,9 +2580,9 @@ impl P2PNode {
             return true;
         }
         let mut guard = dynamic_bans.lock().unwrap_or_else(|e| e.into_inner());
-        let expire = Duration::from_secs(600);
-        if let Some(ts) = guard.get(ip) {
-            if ts.elapsed() < expire {
+        let now = Instant::now();
+        if let Some(until) = guard.get(ip).copied() {
+            if now < until {
                 return true;
             }
             guard.remove(ip);
@@ -2493,10 +2621,14 @@ impl P2PNode {
     }
 
     fn load_trusted_seed_ips() -> Arc<HashSet<IpAddr>> {
-        // Trusted seeds are bootstrap endpoints we should not temporarily ban due to transient handshake noise.
+        // Trusted/static peers are preserved bootstrap endpoints we should not temporarily ban due to transient handshake noise.
         // Static bans still apply.
         let mut ips: HashSet<IpAddr> = HashSet::new();
-        for path in ["bootstrap/seedlist.txt", "bootstrap/seedlist.extra"] {
+        for path in [
+            "bootstrap/seedlist.txt",
+            "bootstrap/seedlist.extra",
+            "bootstrap/static_peers.txt",
+        ] {
             let data = match fs::read_to_string(path) {
                 Ok(d) => d,
                 Err(_) => continue,
@@ -2507,6 +2639,21 @@ impl P2PNode {
                     continue;
                 }
                 let token = line.split_whitespace().next().unwrap_or("");
+                if let Ok(ip) = token.parse::<IpAddr>() {
+                    ips.insert(ip);
+                    continue;
+                }
+                if let Ok(sa) = token.parse::<SocketAddr>() {
+                    ips.insert(sa.ip());
+                }
+            }
+        }
+        if let Ok(raw) = std::env::var("IRIUM_STATIC_PEERS") {
+            for token in raw.split([',', ' ', '\n', '\t']) {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
+                }
                 if let Ok(ip) = token.parse::<IpAddr>() {
                     ips.insert(ip);
                     continue;
@@ -2751,11 +2898,14 @@ impl P2PNode {
                             )
                             .await
                             {
+                                let connected_peers_for_handshake =
+                                    connected_inner.lock().await.len();
                                 let (count, banned) = record_handshake_failure(
                                     &handshake_failures_for_handshake,
                                     &dynamic_bans_for_handshake,
                                     addr.ip(),
                                     trusted,
+                                    connected_peers_for_handshake,
                                 )
                                 .await;
                                 if banned {
@@ -2827,6 +2977,68 @@ impl P2PNode {
         }
     }
 
+    pub async fn peer_telemetry_snapshot(&self) -> PeerTelemetrySnapshot {
+        let active_peers = self.peers.lock().await.len() as u64;
+        let unique_connected_peer_ips = {
+            let guard = self.connected.lock().await;
+            guard
+                .iter()
+                .map(|addr| addr.ip())
+                .collect::<HashSet<_>>()
+                .len() as u64
+        };
+        let attempted_peer_ips = {
+            let inflight = {
+                let guard = self
+                    .outbound_dial_inflight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.len() as u64
+            };
+            let backoff = {
+                let now = Instant::now();
+                let mut guard = self.outbound_dial_backoff.lock().await;
+                guard.retain(|_, (_, until)| now < *until);
+                guard.len() as u64
+            };
+            inflight + backoff
+        };
+        let dynamic_bans = {
+            let now = Instant::now();
+            let mut guard = self.dynamic_bans.lock().unwrap_or_else(|e| e.into_inner());
+            guard.retain(|_, until| now < *until);
+            guard.len() as u64
+        };
+        let reputation_bans = {
+            let rep = self.reputation.lock().await;
+            rep.banned_count() as u64
+        };
+        PeerTelemetrySnapshot {
+            outbound_dial_attempts_total: OUTBOUND_DIAL_ATTEMPTS_TOTAL.load(Ordering::Relaxed),
+            outbound_dial_success_total: OUTBOUND_DIAL_SUCCESS_TOTAL.load(Ordering::Relaxed),
+            outbound_dial_failure_total: OUTBOUND_DIAL_FAILURE_TOTAL.load(Ordering::Relaxed),
+            outbound_dial_failure_timeout_total: OUTBOUND_DIAL_FAILURE_TIMEOUT_TOTAL
+                .load(Ordering::Relaxed),
+            outbound_dial_failure_refused_total: OUTBOUND_DIAL_FAILURE_REFUSED_TOTAL
+                .load(Ordering::Relaxed),
+            outbound_dial_failure_no_route_total: OUTBOUND_DIAL_FAILURE_NO_ROUTE_TOTAL
+                .load(Ordering::Relaxed),
+            outbound_dial_failure_banned_total: OUTBOUND_DIAL_FAILURE_BANNED_TOTAL
+                .load(Ordering::Relaxed),
+            outbound_dial_failure_backoff_total: OUTBOUND_DIAL_FAILURE_BACKOFF_TOTAL
+                .load(Ordering::Relaxed),
+            outbound_dial_failure_other_total: OUTBOUND_DIAL_FAILURE_OTHER_TOTAL
+                .load(Ordering::Relaxed),
+            inbound_accepted_total: INBOUND_ACCEPTED_TOTAL.load(Ordering::Relaxed),
+            handshake_failures_total: HANDSHAKE_FAILURE_TOTAL.load(Ordering::Relaxed),
+            temp_bans_total: TEMP_BAN_TOTAL.load(Ordering::Relaxed),
+            active_peers,
+            unique_connected_peer_ips,
+            attempted_peer_ips,
+            banned_peers: dynamic_bans + reputation_bans,
+        }
+    }
+
     pub async fn clear_sync_throttles(&self) {
         self.sync_requests.lock().await.clear();
         self.block_requests.lock().await.clear();
@@ -2890,7 +3102,7 @@ impl P2PNode {
 
     /// Force a refresh of the runtime seedlist based on current peer directory.
     pub async fn refresh_seedlist(&self) {
-        let dir = self.peers_directory.lock().await;
+        let mut dir = self.peers_directory.lock().await;
         dir.refresh_seedlist_with_policy();
     }
 
@@ -2985,11 +3197,21 @@ impl P2PNode {
     }
 
     async fn record_outbound_dial_success(&self, ip: IpAddr) {
+        OUTBOUND_DIAL_SUCCESS_TOTAL.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.outbound_dial_backoff.lock().await;
         guard.remove(&ip);
     }
 
     async fn record_outbound_dial_failure(&self, ip: IpAddr, err: &str) {
+        OUTBOUND_DIAL_FAILURE_TOTAL.fetch_add(1, Ordering::Relaxed);
+        match classify_outbound_dial_failure(err) {
+            "timeout" => OUTBOUND_DIAL_FAILURE_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed),
+            "refused" => OUTBOUND_DIAL_FAILURE_REFUSED_TOTAL.fetch_add(1, Ordering::Relaxed),
+            "no_route" => OUTBOUND_DIAL_FAILURE_NO_ROUTE_TOTAL.fetch_add(1, Ordering::Relaxed),
+            "banned" => OUTBOUND_DIAL_FAILURE_BANNED_TOTAL.fetch_add(1, Ordering::Relaxed),
+            "backoff" => OUTBOUND_DIAL_FAILURE_BACKOFF_TOTAL.fetch_add(1, Ordering::Relaxed),
+            _ => OUTBOUND_DIAL_FAILURE_OTHER_TOTAL.fetch_add(1, Ordering::Relaxed),
+        };
         let base_secs = outbound_dial_base_secs();
         let max_secs = outbound_dial_max_secs();
         let banned_secs = outbound_dial_banned_secs();
@@ -3018,18 +3240,45 @@ impl P2PNode {
             let dir = self.peers_directory.lock().await;
             dir.peers()
         };
-        peers.sort_by_key(|p| std::cmp::Reverse(p.last_height.unwrap_or(0)));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
+        peers.sort_by(|a, b| {
+            let score = |record: &PeerRecord| {
+                let trusted = Self::parse_multiaddr(&record.multiaddr)
+                    .map(|addr| self.trusted_seed_ips.contains(&addr.ip()))
+                    .unwrap_or(false);
+                let ahead = record.last_height.unwrap_or(0) > local_height;
+                let idle_hours =
+                    ((now - record.last_seen.max(record.first_seen)).max(0.0)) / 3600.0;
+                let freshness = if idle_hours <= 1.0 {
+                    3u8
+                } else if idle_hours <= 24.0 {
+                    2u8
+                } else if idle_hours <= outbound_candidate_max_idle_hours() {
+                    1u8
+                } else {
+                    0u8
+                };
+                (
+                    trusted as u8,
+                    record.dialable as u8,
+                    ahead as u8,
+                    freshness,
+                    record.last_height.unwrap_or(0),
+                    record.last_seen as u64,
+                )
+            };
+            score(b).cmp(&score(a))
+        });
         let mut scanned = 0usize;
         let mut attempted_ahead = false;
         let mut attempted_ips: HashSet<IpAddr> = HashSet::new();
 
         for record in peers.iter() {
             scanned += 1;
-            if scanned > 50 {
+            if scanned > connect_known_peer_scan_limit_ahead() {
                 break;
             }
             if current + added >= max_peers() || added >= max_new {
@@ -3040,11 +3289,16 @@ impl P2PNode {
                 continue;
             }
             attempted_ahead = true;
-            // Skip peers we just connected to recently.
-            if now > record.last_seen && (now - record.last_seen) < 30.0 {
-                continue;
-            }
             if let Some(addr) = Self::parse_multiaddr(&record.multiaddr) {
+                let trusted = self.trusted_seed_ips.contains(&addr.ip());
+                let idle_hours =
+                    ((now - record.last_seen.max(record.first_seen)).max(0.0)) / 3600.0;
+                if !trusted && idle_hours > outbound_candidate_max_idle_hours() {
+                    continue;
+                }
+                if !trusted && now > record.last_seen && (now - record.last_seen) < 15.0 {
+                    continue;
+                }
                 if !attempted_ips.insert(addr.ip()) {
                     continue;
                 }
@@ -3072,23 +3326,32 @@ impl P2PNode {
             }
         }
 
-        if attempted_ahead {
+        if current + added >= max_peers() || added >= max_new {
             return;
         }
 
         scanned = 0;
         for record in peers {
             scanned += 1;
-            if scanned > 10 {
+            if scanned > connect_known_peer_scan_limit_fallback() {
                 break;
             }
             if current + added >= max_peers() || added >= max_new {
                 break;
             }
-            if now > record.last_seen && (now - record.last_seen) < 30.0 {
-                continue;
-            }
             if let Some(addr) = Self::parse_multiaddr(&record.multiaddr) {
+                let trusted = self.trusted_seed_ips.contains(&addr.ip());
+                let idle_hours =
+                    ((now - record.last_seen.max(record.first_seen)).max(0.0)) / 3600.0;
+                if !trusted && idle_hours > outbound_candidate_max_idle_hours() {
+                    continue;
+                }
+                if attempted_ahead && !trusted && record.last_height.unwrap_or(0) <= local_height {
+                    continue;
+                }
+                if !trusted && now > record.last_seen && (now - record.last_seen) < 15.0 {
+                    continue;
+                }
                 if !attempted_ips.insert(addr.ip()) {
                     continue;
                 }
@@ -3273,6 +3536,7 @@ impl P2PNode {
         }
         let ip = addr.ip();
         let _dial_guard = self.begin_outbound_dial(ip).await?;
+        OUTBOUND_DIAL_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
         // Simple jittered delay before connecting to avoid thundering herd.
         let jitter_ms = (rand_core::OsRng.next_u32() % 5000) as u64;
         tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
@@ -3314,9 +3578,9 @@ impl P2PNode {
 
         // Check reputation before keeping a long-lived connection.
         {
-            let peer_id = addr.to_string();
+            let peer_id = trusted_anchor_peer_id(addr, trusted_seed);
             let mut rep = self.reputation.lock().await;
-            if rep.is_banned(&peer_id) {
+            if !trusted_seed && rep.is_banned(&peer_id) {
                 return Err(format!("peer {} is banned", peer_id));
             }
             rep.record_success(&peer_id);
@@ -3334,20 +3598,20 @@ impl P2PNode {
                 Err(e) => {
                     self.record_outbound_dial_failure(ip, &e).await;
                     let mut rep = self.reputation.lock().await;
-                    rep.record_failure(&addr.to_string());
+                    rep.record_failure(&trusted_anchor_peer_id(addr, trusted_seed));
                     return Err(e);
                 }
             };
         if challenge_msg.msg_type != MessageType::SybilChallenge {
             let mut rep = self.reputation.lock().await;
-            rep.record_failure(&addr.to_string());
+            rep.record_failure(&trusted_anchor_peer_id(addr, trusted_seed));
             return Err("expected sybil challenge from peer".to_string());
         }
         let challenge = match SybilChallenge::from_bytes(&challenge_msg.payload) {
             Some(c) => c,
             None => {
                 let mut rep = self.reputation.lock().await;
-                rep.record_failure(&addr.to_string());
+                rep.record_failure(&trusted_anchor_peer_id(addr, trusted_seed));
                 return Err("invalid sybil challenge payload".to_string());
             }
         };
@@ -3589,7 +3853,8 @@ impl P2PNode {
                     } else {
                         current_height
                     };
-                    let net_height = trusted_remote_height(net_height_raw, best_header_height, current_height);
+                    let net_height =
+                        trusted_remote_height(net_height_raw, best_header_height, current_height);
                     let ahead_delta = sync_stall_ahead_delta();
                     if best_header_height >= current_height.saturating_add(ahead_delta)
                         && net_height >= current_height.saturating_add(ahead_delta)
@@ -3704,7 +3969,7 @@ impl P2PNode {
                     Err(e) => {
                         Self::log_err(format!("P2P outbound {}: closing read loop: {}", addr, e));
                         let mut rep = reputation.lock().await;
-                        rep.record_failure(&addr.to_string());
+                        rep.record_failure(&trusted_anchor_peer_id(addr, trusted_seed));
                         break;
                     }
                 };
@@ -4169,7 +4434,7 @@ impl P2PNode {
                                         );
                                         if expected == payload.hmac {
                                             let mut rep = reputation.lock().await;
-                                            rep.record_uptime_proof(&addr.to_string());
+                                            rep.record_uptime_proof(&trusted_anchor_peer_id(addr, trusted_seed));
                                             let mut guard = peer_state.lock().await;
                                             guard.last_uptime_challenge = None;
                                         }
@@ -4387,7 +4652,8 @@ impl P2PNode {
                                         let mut st = peer_state.lock().await;
                                         let now = Instant::now();
                                         let at_tip = {
-                                            let g = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                            let g =
+                                                chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                             let local_h = g.tip_height();
                                             let best_hash = g.best_header_hash();
                                             let best_h = g
@@ -4401,7 +4667,12 @@ impl P2PNode {
                                         let noisy = header_count >= 2000 && (!added_any || at_tip);
                                         let allow = if noisy {
                                             st.last_headers_batch_log
-                                                .map(|t| now.duration_since(t) > Duration::from_secs(headers_batch_log_cooldown_secs()))
+                                                .map(|t| {
+                                                    now.duration_since(t)
+                                                        > Duration::from_secs(
+                                                            headers_batch_log_cooldown_secs(),
+                                                        )
+                                                })
                                                 .unwrap_or(true)
                                         } else {
                                             true
@@ -4511,7 +4782,11 @@ impl P2PNode {
                                         .height
                                         .unwrap_or(last_handshake_height.unwrap_or(local_height))
                                         .max(last_handshake_height.unwrap_or(local_height));
-                                    trusted_remote_height(advertised, best_header_height, local_height)
+                                    trusted_remote_height(
+                                        advertised,
+                                        best_header_height,
+                                        local_height,
+                                    )
                                 };
                                 if header_count >= 2000 && best_header_height <= local_height {
                                     peer_mark_header_event(addr.ip(), false, 1).await;
@@ -4582,7 +4857,9 @@ impl P2PNode {
                                                     .get(first_hash)
                                                     .map(|hw| hw.header.prev_hash)
                                                     .unwrap_or([0u8; 32]);
-                                                if start_hash != [0u8; 32] && !guard.heights.contains_key(&start_hash) {
+                                                if start_hash != [0u8; 32]
+                                                    && !guard.heights.contains_key(&start_hash)
+                                                {
                                                     start_hash = guard
                                                         .chain
                                                         .last()
@@ -4661,7 +4938,12 @@ impl P2PNode {
                                     {
                                         if let Ok(msg) = get_blocks.to_message() {
                                             send_message_detached(&writer, msg, addr);
-                                            record_block_request_sent(addr.ip(), &start_hash, count).await;
+                                            record_block_request_sent(
+                                                addr.ip(),
+                                                &start_hash,
+                                                count,
+                                            )
+                                            .await;
                                         }
                                     }
                                 } else if peer_height > local_height || header_count > 0 {
@@ -4994,7 +5276,7 @@ impl P2PNode {
                                         .await;
                                         if let Some(ok) = record_verdict {
                                             let mut rep = reputation.lock().await;
-                                            rep.record_block(&addr.to_string(), ok);
+                                            rep.record_block(&trusted_anchor_peer_id(addr, trusted_seed), ok);
                                         }
                                     }
                                     Err(e) => {
@@ -5003,7 +5285,7 @@ impl P2PNode {
                                             addr, e
                                         );
                                         let mut rep = reputation.lock().await;
-                                        rep.record_decode_error(&addr.to_string());
+                                        rep.record_decode_error(&trusted_anchor_peer_id(addr, trusted_seed));
                                     }
                                 }
                             }
@@ -5490,7 +5772,7 @@ async fn handle_incoming_with_sybil(
         Ok(m) => m,
         Err(e) => {
             if e.contains("early eof") {
-                let peer_id = addr.to_string();
+                let peer_id = trusted_anchor_peer_id(addr, trusted_seed);
                 let mut rep = reputation.lock().await;
                 for _ in 0..5 {
                     rep.record_failure(&peer_id);
@@ -5512,14 +5794,14 @@ async fn handle_incoming_with_sybil(
     if !proof_ok {
         {
             let mut rep = reputation.lock().await;
-            rep.record_failure(&addr.to_string());
+            rep.record_failure(&trusted_anchor_peer_id(addr, trusted_seed));
         }
         return Err("sybil proof verification failed".to_string());
     }
 
     {
         let mut rep = reputation.lock().await;
-        rep.record_success(&addr.to_string());
+        rep.record_success(&trusted_anchor_peer_id(addr, trusted_seed));
     }
     {
         let mut guard = connected.lock().await;
@@ -5717,7 +5999,7 @@ async fn handle_incoming_with_sybil(
                     format!("P2P inbound {}: closing read loop: {}", addr, e),
                 );
                 let mut rep = reputation.lock().await;
-                rep.record_failure(&addr.to_string());
+                rep.record_failure(&trusted_anchor_peer_id(addr, trusted_seed));
                 break;
             }
         };
@@ -6165,7 +6447,7 @@ async fn handle_incoming_with_sybil(
                                     compute_uptime_hmac(&key, &payload.nonce, payload.timestamp);
                                 if expected == payload.hmac {
                                     let mut rep = reputation.lock().await;
-                                    rep.record_uptime_proof(&addr.to_string());
+                                    rep.record_uptime_proof(&trusted_anchor_peer_id(addr, trusted_seed));
                                     let mut guard = peer_state.lock().await;
                                     guard.last_uptime_challenge = None;
                                 }
@@ -6410,7 +6692,9 @@ async fn handle_incoming_with_sybil(
                                     let mut st = peer_state2.lock().await;
                                     let now = Instant::now();
                                     let at_tip = {
-                                        let g = chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
+                                        let g = chain_arc_for_tip
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner());
                                         let local_h = g.tip_height();
                                         let best_hash = g.best_header_hash();
                                         let best_h = g
@@ -6424,7 +6708,12 @@ async fn handle_incoming_with_sybil(
                                     let noisy = header_count >= 2000 && (!added_any || at_tip);
                                     let allow = if noisy {
                                         st.last_headers_batch_log
-                                            .map(|t| now.duration_since(t) > Duration::from_secs(headers_batch_log_cooldown_secs()))
+                                            .map(|t| {
+                                                now.duration_since(t)
+                                                    > Duration::from_secs(
+                                                        headers_batch_log_cooldown_secs(),
+                                                    )
+                                            })
                                             .unwrap_or(true)
                                     } else {
                                         true
@@ -6621,7 +6910,9 @@ async fn handle_incoming_with_sybil(
                                                 .get(first_hash)
                                                 .map(|hw| hw.header.prev_hash)
                                                 .unwrap_or([0u8; 32]);
-                                            if start_hash != [0u8; 32] && !guard.heights.contains_key(&start_hash) {
+                                            if start_hash != [0u8; 32]
+                                                && !guard.heights.contains_key(&start_hash)
+                                            {
                                                 start_hash = guard
                                                     .chain
                                                     .last()
@@ -6695,7 +6986,12 @@ async fn handle_incoming_with_sybil(
                                     if let Ok(msg) = get_blocks.to_message() {
                                         if let Some(writer) = writer_weak.upgrade() {
                                             send_message_detached(&writer, msg, addr2);
-                                            record_block_request_sent(addr2.ip(), &start_hash, count).await;
+                                            record_block_request_sent(
+                                                addr2.ip(),
+                                                &start_hash,
+                                                count,
+                                            )
+                                            .await;
                                         }
                                     }
                                 }
@@ -7176,13 +7472,19 @@ async fn handle_incoming_with_sybil(
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_orphan_header_chain, block_request_cache_key, orphan_headers_map, store_orphan_header, RecentHashCache};
-    use std::net::{IpAddr, Ipv4Addr};
-    use std::time::{Duration, Instant};
+    use super::{
+        attach_orphan_header_chain, block_request_cache_key, classify_outbound_dial_failure,
+        orphan_headers_map, record_handshake_failure, store_orphan_header, RecentHashCache,
+    };
     use crate::block::BlockHeader;
     use crate::chain::{block_from_locked, ChainParams, ChainState};
     use crate::genesis::load_locked_genesis;
     use crate::pow::meets_target;
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::{Duration, Instant};
+    use tokio::sync::Mutex;
 
     fn mine_header(mut header: BlockHeader) -> BlockHeader {
         for nonce in 0u32..u32::MAX {
@@ -7298,9 +7600,49 @@ mod tests {
         let now = Instant::now();
         let mut cache = RecentHashCache::new(Duration::from_secs(30), 8);
         let start_hash = [5u8; 32];
-        let first = block_request_cache_key(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), &start_hash, 128);
-        let retry_other_peer = block_request_cache_key(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), &start_hash, 128);
+        let first =
+            block_request_cache_key(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), &start_hash, 128);
+        let retry_other_peer =
+            block_request_cache_key(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), &start_hash, 128);
         assert!(cache.record_at(first, now));
         assert!(cache.record_at(retry_other_peer, now + Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn small_network_temp_ban_is_less_aggressive() {
+        let failures = Arc::new(Mutex::new(HashMap::new()));
+        let bans = Arc::new(StdMutex::new(HashMap::new()));
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        for _ in 0..5 {
+            let (_, banned) = record_handshake_failure(&failures, &bans, ip, false, 4).await;
+            assert!(!banned);
+        }
+        for _ in 0..5 {
+            let (_, banned) = record_handshake_failure(&failures, &bans, ip, false, 4).await;
+            if banned {
+                return;
+            }
+        }
+        panic!("expected small-network temp ban after extended failures");
+    }
+
+    #[test]
+    fn outbound_failure_classifier_maps_common_reasons() {
+        assert_eq!(
+            classify_outbound_dial_failure("connect timeout after 8s"),
+            "timeout"
+        );
+        assert_eq!(
+            classify_outbound_dial_failure("Connection refused (os error 111)"),
+            "refused"
+        );
+        assert_eq!(
+            classify_outbound_dial_failure("No route to host (os error 113)"),
+            "no_route"
+        );
+        assert_eq!(
+            classify_outbound_dial_failure("peer 1.2.3.4 is banned"),
+            "banned"
+        );
     }
 }

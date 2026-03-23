@@ -693,6 +693,25 @@ fn load_extra_seeds() -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn load_static_seeds() -> Vec<String> {
+    let path = std::path::Path::new("bootstrap/static_peers.txt");
+    let mut seeds = std::fs::read_to_string(path)
+        .map(|raw| parse_seed_lines(&raw))
+        .unwrap_or_default();
+    if let Ok(raw) = std::env::var("IRIUM_STATIC_PEERS") {
+        for token in raw.split([',', ' ', '\n', '\t']) {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if !seeds.iter().any(|s| s == token) {
+                seeds.push(token.to_string());
+            }
+        }
+    }
+    seeds
+}
+
 #[derive(Clone, Copy)]
 struct SeedDialInfo {
     total: usize,
@@ -753,12 +772,19 @@ fn build_seed_addrs(
     local_ips: &HashSet<IpAddr>,
 ) -> (Vec<std::net::SocketAddr>, SeedDialInfo) {
     let mut seeds_raw: Vec<String> = Vec::new();
-    seeds_raw.extend(config_seeds.iter().cloned());
-    seeds_raw.extend(signed_seeds.iter().cloned());
-    seeds_raw.extend(load_extra_seeds());
-    seeds_raw.extend(load_runtime_seeds());
-    seeds_raw.sort();
-    seeds_raw.dedup();
+    let mut seen = std::collections::HashSet::new();
+    for seed in config_seeds
+        .iter()
+        .cloned()
+        .chain(load_static_seeds().into_iter())
+        .chain(load_runtime_seeds().into_iter())
+        .chain(load_extra_seeds().into_iter())
+        .chain(signed_seeds.iter().cloned())
+    {
+        if seen.insert(seed.clone()) {
+            seeds_raw.push(seed);
+        }
+    }
 
     let mut info = SeedDialInfo {
         total: seeds_raw.len(),
@@ -2304,14 +2330,15 @@ async fn metrics(
     };
     let era = network_era(height);
     let relay = P2PNode::relay_telemetry_snapshot();
-    let (peer_count, node_id_hex, sybil_diff) = match state.p2p {
+    let (peer_count, node_id_hex, sybil_diff, peer_telemetry) = match state.p2p {
         Some(ref p2p) => {
             let peers = p2p.peer_count().await;
             let node_id = p2p.node_id_hex();
             let diff = p2p.current_sybil_difficulty().await;
-            (peers, node_id, diff)
+            let peer_telemetry = p2p.peer_telemetry_snapshot().await;
+            (peers, node_id, diff, peer_telemetry)
         }
-        None => (0usize, String::new(), 0u8),
+        None => (0usize, String::new(), 0u8, Default::default()),
     };
     let seeds = SeedlistManager::new(128).merged_seedlist();
     let mempool_sz = state
@@ -2336,6 +2363,21 @@ irium_block_request_count {}
 irium_duplicate_block_suppressed_count {}
 irium_avg_block_processing_ms {}
 irium_avg_block_announce_delay_ms {}
+irium_outbound_dial_attempts_total {}
+irium_outbound_dial_success_total {}
+irium_outbound_dial_failure_total {}
+irium_outbound_dial_failure_timeout_total {}
+irium_outbound_dial_failure_refused_total {}
+irium_outbound_dial_failure_no_route_total {}
+irium_outbound_dial_failure_banned_total {}
+irium_outbound_dial_failure_backoff_total {}
+irium_outbound_dial_failure_other_total {}
+irium_inbound_accepted_total {}
+irium_handshake_failures_total {}
+irium_temp_bans_total {}
+irium_unique_connected_peer_ips {}
+irium_attempted_peer_ips {}
+irium_banned_peers {}
 ",
         height,
         peer_count,
@@ -2352,7 +2394,22 @@ irium_avg_block_announce_delay_ms {}
         relay.block_request_count,
         relay.duplicate_block_suppressed_count,
         relay.avg_block_processing_ms,
-        relay.avg_block_announce_delay_ms
+        relay.avg_block_announce_delay_ms,
+        peer_telemetry.outbound_dial_attempts_total,
+        peer_telemetry.outbound_dial_success_total,
+        peer_telemetry.outbound_dial_failure_total,
+        peer_telemetry.outbound_dial_failure_timeout_total,
+        peer_telemetry.outbound_dial_failure_refused_total,
+        peer_telemetry.outbound_dial_failure_no_route_total,
+        peer_telemetry.outbound_dial_failure_banned_total,
+        peer_telemetry.outbound_dial_failure_backoff_total,
+        peer_telemetry.outbound_dial_failure_other_total,
+        peer_telemetry.inbound_accepted_total,
+        peer_telemetry.handshake_failures_total,
+        peer_telemetry.temp_bans_total,
+        peer_telemetry.unique_connected_peer_ips,
+        peer_telemetry.attempted_peer_ips,
+        peer_telemetry.banned_peers
     ))
 }
 
@@ -4217,7 +4274,10 @@ async fn main() {
     }
     match (network, lwma_activation) {
         (NetworkKind::Mainnet, Some(h)) => {
-            println!("LWMA mainnet activation height (code-defined, coordinated): {}", h)
+            println!(
+                "LWMA mainnet activation height (code-defined, coordinated): {}",
+                h
+            )
         }
         (NetworkKind::Mainnet, None) => {
             println!("LWMA mainnet activation disabled in code (no activation height set)")
@@ -4528,6 +4588,7 @@ async fn main() {
             let mut last_best_header_height: u64 = 0;
             let mut last_sync_burst_at: Option<std::time::Instant> = None;
             let mut last_mempool_size: usize = 0;
+            let mut last_peer_summary = None;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let peers = tokio::time::timeout(
@@ -4655,6 +4716,8 @@ async fn main() {
                 hb_ticks = hb_ticks.wrapping_add(1);
 
                 let dbg = node_clone.sync_debug_snapshot().await;
+                let peer_dbg = node_clone.peer_telemetry_snapshot().await;
+                let seed_count = seed_mgr.merged_seedlist().len();
 
                 // Use validated best-header progress for sync decisions (peer-advertised
                 // heights are untrusted and can cause false stall churn).
@@ -4690,6 +4753,64 @@ async fn main() {
                         dbg.getblocks_inflight,
                         dbg.handshake_failures
                     );
+                }
+
+                if hb_ticks % 12 == 0 {
+                    let prev = last_peer_summary.unwrap_or(peer_dbg);
+                    let delta_attempts = peer_dbg
+                        .outbound_dial_attempts_total
+                        .saturating_sub(prev.outbound_dial_attempts_total);
+                    let delta_success = peer_dbg
+                        .outbound_dial_success_total
+                        .saturating_sub(prev.outbound_dial_success_total);
+                    let delta_fail = peer_dbg
+                        .outbound_dial_failure_total
+                        .saturating_sub(prev.outbound_dial_failure_total);
+                    let delta_timeout = peer_dbg
+                        .outbound_dial_failure_timeout_total
+                        .saturating_sub(prev.outbound_dial_failure_timeout_total);
+                    let delta_refused = peer_dbg
+                        .outbound_dial_failure_refused_total
+                        .saturating_sub(prev.outbound_dial_failure_refused_total);
+                    let delta_no_route = peer_dbg
+                        .outbound_dial_failure_no_route_total
+                        .saturating_sub(prev.outbound_dial_failure_no_route_total);
+                    let delta_banned = peer_dbg
+                        .outbound_dial_failure_banned_total
+                        .saturating_sub(prev.outbound_dial_failure_banned_total);
+                    let delta_other = peer_dbg
+                        .outbound_dial_failure_other_total
+                        .saturating_sub(prev.outbound_dial_failure_other_total);
+                    let delta_handshake = peer_dbg
+                        .handshake_failures_total
+                        .saturating_sub(prev.handshake_failures_total);
+                    let delta_temp_bans = peer_dbg
+                        .temp_bans_total
+                        .saturating_sub(prev.temp_bans_total);
+                    let delta_inbound = peer_dbg
+                        .inbound_accepted_total
+                        .saturating_sub(prev.inbound_accepted_total);
+                    eprintln!(
+                        "[{}] [peer_mgr] summary peers={} unique_ips={} attempted={} outbound_attempts={} success={} failure={} timeout={} refused={} no_route={} banned={} other={} inbound_accepted={} handshake_failures={} temp_bans={} banned_peers={} seedlist={}",
+                        Utc::now().format("%H:%M:%S"),
+                        current_peer_count,
+                        peer_dbg.unique_connected_peer_ips,
+                        peer_dbg.attempted_peer_ips,
+                        delta_attempts,
+                        delta_success,
+                        delta_fail,
+                        delta_timeout,
+                        delta_refused,
+                        delta_no_route,
+                        delta_banned,
+                        delta_other,
+                        delta_inbound,
+                        delta_handshake,
+                        delta_temp_bans,
+                        peer_dbg.banned_peers,
+                        seed_count,
+                    );
+                    last_peer_summary = Some(peer_dbg);
                 }
 
                 // If we're behind OR stuck in header-only mode and not making progress, clear

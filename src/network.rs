@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::net::IpAddr;
@@ -15,6 +15,7 @@ use crate::storage;
 const DEFAULT_SEEDLIST_BASELINE: &str = "bootstrap/seedlist.txt";
 const DEFAULT_SEEDLIST_EXTRA: &str = "bootstrap/seedlist.extra";
 const DEFAULT_SEEDLIST_RUNTIME: &str = "bootstrap/seedlist.runtime";
+const DEFAULT_SEEDLIST_STATIC: &str = "bootstrap/static_peers.txt";
 const DEFAULT_PEER_DB: &str = "state/peers.json";
 
 fn now_secs() -> f64 {
@@ -250,6 +251,44 @@ impl SeedlistManager {
         self.load_seed_entries(&self.extra)
     }
 
+    fn load_static_entries(&self) -> Vec<String> {
+        let mut entries = self.load_seed_entries(&repo_root().join(DEFAULT_SEEDLIST_STATIC));
+        if let Ok(raw) = std::env::var("IRIUM_STATIC_PEERS") {
+            for token in raw.split([',', ' ', '\n', '\t']) {
+                if let Some(ip) = normalize_seed(token) {
+                    if !entries.contains(&ip) {
+                        entries.push(ip);
+                    }
+                }
+            }
+        }
+        entries
+    }
+
+    fn runtime_seed_min_count() -> usize {
+        std::env::var("IRIUM_RUNTIME_SEED_MIN_COUNT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(1, 64)
+    }
+
+    fn stale_dialable_prune_hours() -> f64 {
+        std::env::var("IRIUM_PEER_STALE_DIALABLE_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(24.0 * 14.0)
+            .clamp(24.0, 24.0 * 60.0)
+    }
+
+    fn stale_undialable_prune_hours() -> f64 {
+        std::env::var("IRIUM_PEER_STALE_UNDIALABLE_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(24.0)
+            .clamp(1.0, 24.0 * 14.0)
+    }
+
     pub fn write_runtime_entries<I>(&self, entries: I)
     where
         I: IntoIterator<Item = String>,
@@ -276,6 +315,11 @@ impl SeedlistManager {
 
     pub fn merged_seedlist(&self) -> Vec<String> {
         let mut combined = Vec::new();
+        for ip in self.load_static_entries() {
+            if !combined.contains(&ip) {
+                combined.push(ip);
+            }
+        }
         let baseline_entries = if self.verify_seedlist_signature() {
             self.load_seed_entries(&self.baseline)
         } else if Self::allow_unsigned_seedlist() {
@@ -352,6 +396,7 @@ impl PeerDirectory {
             suppressed_learned_rate_limited: 0,
         };
         dir.load();
+        dir.prune_stale_records();
         dir
     }
 
@@ -470,7 +515,12 @@ impl PeerDirectory {
         if Self::is_private_or_unroutable(&ip) {
             return Err("private");
         }
-        if self.records.contains_key(&multiaddr) {
+        if self.records.contains_key(&multiaddr)
+            || self
+                .records
+                .keys()
+                .any(|existing| normalize_seed(existing).as_deref() == Some(normalized.as_str()))
+        {
             return Ok(false);
         }
         let t = now_secs();
@@ -544,6 +594,10 @@ impl PeerDirectory {
             if let Some(id) = &rec.node_id {
                 obj.insert("node_id".to_string(), serde_json::Value::String(id.clone()));
             }
+            obj.insert(
+                "dialable".to_string(),
+                serde_json::Value::Bool(rec.dialable),
+            );
             map.insert(addr.clone(), serde_json::Value::Object(obj));
         }
         let value = serde_json::Value::Object(map);
@@ -608,8 +662,10 @@ impl PeerDirectory {
         if suppressible_burst {
             self.suppressed_learned_bursts = self.suppressed_learned_bursts.saturating_add(1);
             self.suppressed_learned_total = self.suppressed_learned_total.saturating_add(total);
-            self.suppressed_learned_private = self.suppressed_learned_private.saturating_add(private);
-            self.suppressed_learned_duplicate = self.suppressed_learned_duplicate.saturating_add(duplicate);
+            self.suppressed_learned_private =
+                self.suppressed_learned_private.saturating_add(private);
+            self.suppressed_learned_duplicate =
+                self.suppressed_learned_duplicate.saturating_add(duplicate);
             self.flush_suppressed_learned_summary(false);
         } else {
             self.flush_suppressed_learned_summary(true);
@@ -664,15 +720,50 @@ impl PeerDirectory {
             .and_then(|r| r.relay_address.clone())
     }
 
+    fn static_seed_set(&self) -> HashSet<String> {
+        self.seed_manager
+            .load_static_entries()
+            .into_iter()
+            .collect()
+    }
+
+    fn prune_stale_records(&mut self) {
+        let now = now_secs();
+        let protected = self.static_seed_set();
+        let dialable_cutoff = SeedlistManager::stale_dialable_prune_hours();
+        let undialable_cutoff = SeedlistManager::stale_undialable_prune_hours();
+        self.records.retain(|addr, rec| {
+            if normalize_seed(addr)
+                .as_ref()
+                .map(|ip| protected.contains(ip))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            let last_touch = if rec.last_seen > 0.0 {
+                rec.last_seen
+            } else {
+                rec.first_seen
+            };
+            let idle_hours = ((now - last_touch).max(0.0)) / 3600.0;
+            if rec.dialable {
+                idle_hours <= dialable_cutoff
+            } else {
+                idle_hours <= undialable_cutoff
+            }
+        });
+    }
+
     /// Apply seedlist policy: promote peers active for 7 consecutive days,
     /// drop peers idle > 24h. Baseline seeds remain in the static seedlist file.
-    pub fn refresh_seedlist_with_policy(&self) {
+    pub fn refresh_seedlist_with_policy(&mut self) {
+        self.prune_stale_records();
         let now = now_secs();
         let today = now_day();
         let min_days = SeedlistManager::runtime_seed_min_days();
         let max_idle = SeedlistManager::runtime_seed_max_idle_hours();
         let start_day = today.saturating_sub(min_days.saturating_sub(1));
-        let mut seeds = Vec::new();
+        let mut seeds = self.seed_manager.load_static_entries();
 
         for rec in self.records.values() {
             let idle_hours = (now - rec.last_seen) / 3600.0;
@@ -704,7 +795,7 @@ impl PeerDirectory {
 
         // Do not aggressively collapse runtime seeds after short churn windows.
         // Keep a minimum warm set by carrying forward previous runtime entries.
-        let min_runtime = 8usize;
+        let min_runtime = SeedlistManager::runtime_seed_min_count();
         if seeds.len() < min_runtime {
             for prev in self.seed_manager.load_runtime_entries() {
                 if !seeds.contains(&prev) {
