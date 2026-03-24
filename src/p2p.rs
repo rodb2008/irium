@@ -3158,9 +3158,11 @@ impl P2PNode {
             };
             let backoff = {
                 let now = Instant::now();
-                let mut guard = self.outbound_dial_backoff.lock().await;
-                guard.retain(|_, (_, until)| now < *until);
-                guard.len() as u64
+                let guard = self.outbound_dial_backoff.lock().await;
+                guard
+                    .values()
+                    .filter(|(_, until)| now < *until)
+                    .count() as u64
             };
             inflight + backoff
         };
@@ -6276,6 +6278,9 @@ async fn handle_incoming_with_sybil(
                             payload.relay_address.clone(),
                             payload.node_id.clone(),
                         );
+                        // A peer that completed an inbound handshake and advertised a listen
+                        // port is a viable runtime-seed candidate for later outbound refresh.
+                        dir.mark_dialable(&multiaddr);
                     }
 
                     let parsed_tip = payload
@@ -7638,14 +7643,14 @@ mod tests {
     use super::{
         attach_orphan_header_chain, block_request_cache_key, classify_outbound_dial_failure,
         orphan_headers_map, recent_orphan_header_hashes, record_handshake_failure,
-        store_orphan_header, take_orphan_header_children, RecentHashCache,
+        store_orphan_header, take_orphan_header_children, P2PNode, RecentHashCache,
     };
     use crate::block::BlockHeader;
     use crate::chain::{block_from_locked, ChainParams, ChainState};
     use crate::genesis::load_locked_genesis;
     use crate::pow::meets_target;
     use std::collections::HashMap;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant};
     use tokio::sync::Mutex;
@@ -7874,6 +7879,29 @@ mod tests {
             }
         }
         panic!("expected small-network temp ban after extended failures");
+    }
+
+    #[test]
+    fn peer_telemetry_snapshot_keeps_backoff_history_after_expiry() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let node = P2PNode::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 38291),
+                "test-agent".to_string(),
+                None,
+                None,
+                None,
+            );
+            let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+            {
+                let mut guard = node.outbound_dial_backoff.lock().await;
+                guard.insert(ip, (7, Instant::now() - Duration::from_secs(1)));
+            }
+            let snapshot = node.peer_telemetry_snapshot().await;
+            assert_eq!(snapshot.attempted_peer_ips, 0);
+            let guard = node.outbound_dial_backoff.lock().await;
+            assert_eq!(guard.get(&ip).map(|(fails, _)| *fails), Some(7));
+        });
     }
 
     #[test]
