@@ -4745,7 +4745,7 @@ impl P2PNode {
                                                 .unwrap_or(local_h);
                                             best_h <= local_h
                                         };
-                                        let noisy = header_count >= 2000 && (!added_any || at_tip);
+                                        let noisy = (!added_any && header_count >= 16) || (at_tip && header_count >= 32) || header_count >= 2000;
                                         let allow = if noisy {
                                             st.last_headers_batch_log
                                                 .map(|t| {
@@ -6788,7 +6788,7 @@ async fn handle_incoming_with_sybil(
                                             .unwrap_or(local_h);
                                         best_h <= local_h
                                     };
-                                    let noisy = header_count >= 2000 && (!added_any || at_tip);
+                                    let noisy = (!added_any && header_count >= 16) || (at_tip && header_count >= 32) || header_count >= 2000;
                                     let allow = if noisy {
                                         st.last_headers_batch_log
                                             .map(|t| {
