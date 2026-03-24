@@ -1561,6 +1561,16 @@ fn orphan_headers_map() -> &'static StdMutex<HashMap<[u8; 32], Vec<OrphanHeaderE
     MAP.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
+fn recent_orphan_header_hashes() -> &'static StdMutex<RecentHashCache> {
+    static CACHE: OnceLock<StdMutex<RecentHashCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        StdMutex::new(RecentHashCache::new(
+            orphan_headers_ttl(),
+            orphan_headers_limit().saturating_mul(2),
+        ))
+    })
+}
+
 fn orphan_headers_count_locked(m: &HashMap<[u8; 32], Vec<OrphanHeaderEntry>>) -> usize {
     m.values().map(|v| v.len()).sum()
 }
@@ -1602,18 +1612,31 @@ fn orphan_headers_count() -> usize {
 }
 
 fn store_orphan_header(header: BlockHeader) -> (usize, bool) {
+    let header_hash = header.hash();
+    let now = Instant::now();
+    {
+        let mut recent = recent_orphan_header_hashes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !recent.record_at(header_hash, now) {
+            let guard = orphan_headers_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            return (orphan_headers_count_locked(&guard), false);
+        }
+    }
+
     let mut guard = orphan_headers_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     prune_orphan_headers_locked(&mut guard);
     let entries = guard.entry(header.prev_hash).or_default();
-    let header_hash = header.hash();
     if entries.iter().any(|e| e.header.hash() == header_hash) {
         return (orphan_headers_count_locked(&guard), false);
     }
     entries.push(OrphanHeaderEntry {
         header,
-        inserted_at: Instant::now(),
+        inserted_at: now,
     });
     (orphan_headers_count_locked(&guard), true)
 }
@@ -7519,7 +7542,8 @@ async fn handle_incoming_with_sybil(
 mod tests {
     use super::{
         attach_orphan_header_chain, block_request_cache_key, classify_outbound_dial_failure,
-        orphan_headers_map, record_handshake_failure, store_orphan_header, RecentHashCache,
+        orphan_headers_map, recent_orphan_header_hashes, record_handshake_failure,
+        store_orphan_header, take_orphan_header_children, RecentHashCache,
     };
     use crate::block::BlockHeader;
     use crate::chain::{block_from_locked, ChainParams, ChainState};
@@ -7631,6 +7655,53 @@ mod tests {
         assert!(!inserted2);
         assert_eq!(count1, 1);
         assert_eq!(count2, 1);
+    }
+
+    #[test]
+    fn orphan_reinsert_after_removal_is_suppressed_within_ttl() {
+        let locked = load_locked_genesis().expect("load locked genesis");
+        let genesis = block_from_locked(&locked).expect("build genesis block");
+        let pow_limit = crate::pow::Target { bits: 0x207fffff };
+        let params = ChainParams {
+            genesis_block: genesis,
+            pow_limit,
+            htlcv1_activation_height: None,
+            lwma: crate::chain::LwmaParams::new(None, pow_limit),
+        };
+        let chain = ChainState::new(params);
+
+        {
+            let mut guard = orphan_headers_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.clear();
+        }
+        {
+            let mut recent = recent_orphan_header_hashes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *recent = RecentHashCache::new(Duration::from_secs(600), 32);
+        }
+
+        let tip = chain.tip_hash();
+        let orphan = mine_header(BlockHeader {
+            version: 1,
+            prev_hash: tip,
+            merkle_root: [10u8; 32],
+            time: 1_900_000_011,
+            bits: 0x207fffff,
+            nonce: 0,
+        });
+
+        let (count1, inserted1) = store_orphan_header(orphan.clone());
+        let removed = take_orphan_header_children(tip);
+        let (count2, inserted2) = store_orphan_header(orphan);
+
+        assert!(inserted1);
+        assert_eq!(removed.len(), 1);
+        assert!(!inserted2);
+        assert_eq!(count1, 1);
+        assert_eq!(count2, 0);
     }
 
     #[test]
