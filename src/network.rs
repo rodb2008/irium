@@ -657,7 +657,6 @@ impl PeerDirectory {
         let suppressible_burst = accepted == 0
             && invalid == 0
             && total >= 64
-            && private <= 8
             && private + duplicate == total;
         if suppressible_burst {
             self.suppressed_learned_bursts = self.suppressed_learned_bursts.saturating_add(1);
