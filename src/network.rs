@@ -490,7 +490,7 @@ impl PeerDirectory {
             return;
         }
         let now = now_secs();
-        if !force && self.last_learned_log_at > 0.0 && now - self.last_learned_log_at < 60.0 {
+        if !force && self.last_learned_log_at > 0.0 && now - self.last_learned_log_at < 180.0 {
             return;
         }
         eprintln!(

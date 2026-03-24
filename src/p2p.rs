@@ -567,7 +567,7 @@ fn no_getblocks_log_cooldown_secs() -> u64 {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|v| v.max(1).min(3600))
-            .unwrap_or(60)
+            .unwrap_or(180)
     })
 }
 
@@ -600,7 +600,7 @@ fn headers_new_true_log_cooldown_secs() -> u64 {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|v| v.max(1).min(3600))
-            .unwrap_or(60)
+            .unwrap_or(120)
     })
 }
 
@@ -2423,6 +2423,19 @@ impl P2PNode {
             let end = rest.find(" headers")?;
             rest[..end].trim().parse::<u32>().ok()
         };
+        let extract_block_span = |line: &str, marker: &str| -> Option<(u32, u64, u64)> {
+            let idx = line.find(marker)?;
+            let rest = &line[idx + marker.len()..];
+            let end_count = rest.find(" blocks [")?;
+            let count = rest[..end_count].trim().parse::<u32>().ok()?;
+            let range = &rest[end_count + 9..];
+            let end_range = range.find(']')?;
+            let range = &range[..end_range];
+            let mut parts = range.split('-');
+            let start = parts.next()?.trim().parse::<u64>().ok()?;
+            let end = parts.next()?.trim().parse::<u64>().ok()?;
+            Some((count, start, end))
+        };
 
         let mut rl_spec: Option<(String, u64)> = None;
 
@@ -2467,16 +2480,31 @@ impl P2PNode {
                     && reason_key.as_deref() == Some("no_block_download_needed_at_tip")
                 {
                     rl_spec = Some(("sync:header_state:no_block_download_needed_at_tip".to_string(), cooldown));
+                } else if kind == "no_getblocks" {
+                    if let Some((count, start, end)) = extract_block_span(msg_ref, "pushing ") {
+                        let shared = count <= 32 || end.saturating_sub(start) <= 64;
+                        let key = if shared {
+                            format!("sync:{}:count:{}:range:{}-{}", kind, count, start, end)
+                        } else if let Some(ip) = extract_ip_from_p2p_line(msg_ref) {
+                            format!("sync:{}:{}:count:{}", kind, ip, count)
+                        } else {
+                            format!("sync:{}:count:{}", kind, count)
+                        };
+                        rl_spec = Some((key, cooldown.max(180)));
+                    }
                 } else if kind.starts_with("headers_new_") {
                     if let Some(count) = headers_count {
-                        let key = if count <= 64 {
+                        let key = if count >= 2000 {
+                            format!("sync:{}:count:2000plus", kind)
+                        } else if count <= 64 {
                             format!("sync:{}:count:{}", kind, count)
                         } else if let Some(ip) = extract_ip_from_p2p_line(msg_ref) {
                             format!("sync:{}:{}:count:{}", kind, ip, count)
                         } else {
                             format!("sync:{}:count:{}", kind, count)
                         };
-                        rl_spec = Some((key, cooldown));
+                        let adjusted = if count >= 2000 { cooldown.max(180) } else { cooldown };
+                        rl_spec = Some((key, adjusted));
                     }
                 } else if let Some(ip) = extract_ip_from_p2p_line(msg_ref)
                     .or_else(|| extract_ip_from_prefix(msg_ref, "header-state peer=", " local_tip="))
@@ -2519,12 +2547,22 @@ impl P2PNode {
                         ));
                     }
                 }
-            } else if msg_ref.contains("sending 512 blocks [0-511]") {
-                if let Some(ip) = extract_ip_from_p2p_line(msg_ref) {
-                    rl_spec = Some((
-                        format!("p2p:send_genesis_512:{}", ip),
-                        send_blocks_log_cooldown_secs(),
-                    ));
+            } else if msg_ref.contains(": sending ") && msg_ref.contains(" blocks [") {
+                if let Some((count, start, end)) = extract_block_span(msg_ref, "sending ") {
+                    let cooldown = send_blocks_log_cooldown_secs();
+                    if count <= 16 {
+                        rl_spec = Some((
+                            format!("p2p:send_blocks_small:{}:{}-{}", count, start, end),
+                            cooldown.max(120),
+                        ));
+                    } else if count == 512 && start == 0 && end == 511 {
+                        rl_spec = Some((
+                            "p2p:send_genesis_512".to_string(),
+                            cooldown.max(120),
+                        ));
+                    } else if let Some(ip) = extract_ip_from_p2p_line(msg_ref) {
+                        rl_spec = Some((format!("p2p:send_blocks:{}:{}", ip, count), cooldown));
+                    }
                 }
             } else if msg_ref.contains("P2P handshake error from ") {
                 if let Some(ip) = extract_ip_from_prefix(msg_ref, "P2P handshake error from ", ": ")
@@ -4814,14 +4852,13 @@ impl P2PNode {
                                                 hex.get(0..12).unwrap_or(&hex).to_string()
                                             })
                                             .unwrap_or_else(|| "-".to_string());
-                                        P2PNode::log_event(
-                                            "info",
-                                            "sync",
-                                            format!(
-                                                "P2P {}: received {} headers (new={}) last={}",
-                                                addr, header_count, added_any, last_short
-                                            ),
+                                        let msg = format!(
+                                            "P2P {}: received {} headers (new={}) last={}",
+                                            addr, header_count, added_any, last_short
                                         );
+                                        if header_count < 2000 {
+                                            P2PNode::log_event("info", "sync", msg);
+                                        }
                                     }
                                 }
 
@@ -6857,14 +6894,13 @@ async fn handle_incoming_with_sybil(
                                             hex.get(0..12).unwrap_or(&hex).to_string()
                                         })
                                         .unwrap_or_else(|| "-".to_string());
-                                    P2PNode::log_event(
-                                        "info",
-                                        "sync",
-                                        format!(
-                                            "P2P {}: received {} headers (new={}) last={}",
-                                            addr2, header_count, added_any, last_short
-                                        ),
+                                    let msg = format!(
+                                        "P2P {}: received {} headers (new={}) last={}",
+                                        addr2, header_count, added_any, last_short
                                     );
+                                    if header_count < 2000 {
+                                        P2PNode::log_event("info", "sync", msg);
+                                    }
                                 }
                             }
 
