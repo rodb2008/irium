@@ -589,7 +589,7 @@ fn headers_new_false_log_cooldown_secs() -> u64 {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|v| v.max(1).min(3600))
-            .unwrap_or(30)
+            .unwrap_or(90)
     })
 }
 
@@ -600,7 +600,7 @@ fn headers_new_true_log_cooldown_secs() -> u64 {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|v| v.max(1).min(3600))
-            .unwrap_or(15)
+            .unwrap_or(60)
     })
 }
 
@@ -611,7 +611,7 @@ fn header_state_log_cooldown_secs() -> u64 {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(|v| v.max(1).min(3600))
-            .unwrap_or(20)
+            .unwrap_or(60)
     })
 }
 
@@ -2406,11 +2406,18 @@ impl P2PNode {
                 let end = rest.find(suffix_marker)?;
                 extract_sock(&rest[..end]).map(|s| s.ip())
             };
+        let extract_headers_count = |line: &str| -> Option<u32> {
+            let idx = line.find("received ")?;
+            let rest = &line[idx + 9..];
+            let end = rest.find(" headers")?;
+            rest[..end].trim().parse::<u32>().ok()
+        };
 
         let mut rl_spec: Option<(String, u64)> = None;
 
         if Self::log_rate_limit_enabled() && category == "sync" {
             let mut reason_key: Option<String> = None;
+            let headers_count = extract_headers_count(msg_ref);
             let (kind, cooldown) = if msg_ref.contains("no getblocks after headers") {
                 ("no_getblocks", no_getblocks_log_cooldown_secs())
             } else if msg_ref.contains("unknown start hash") {
@@ -2425,7 +2432,12 @@ impl P2PNode {
                     let end = rest.find(' ').unwrap_or(rest.len());
                     reason_key = Some(rest[..end].to_string());
                 }
-                ("header_state", header_state_log_cooldown_secs())
+                let cooldown = if reason_key.as_deref() == Some("no_block_download_needed_at_tip") {
+                    header_state_log_cooldown_secs().max(180)
+                } else {
+                    header_state_log_cooldown_secs()
+                };
+                ("header_state", cooldown)
             } else if msg_ref.starts_with("stored orphan header: ") {
                 ("orphan_header", orphan_header_log_cooldown_secs())
             } else {
@@ -2434,6 +2446,21 @@ impl P2PNode {
             if cooldown > 0 {
                 if kind == "orphan_header" {
                     rl_spec = Some(("sync:orphan_header".to_string(), cooldown));
+                } else if kind == "header_state"
+                    && reason_key.as_deref() == Some("no_block_download_needed_at_tip")
+                {
+                    rl_spec = Some(("sync:header_state:no_block_download_needed_at_tip".to_string(), cooldown));
+                } else if kind.starts_with("headers_new_") {
+                    if let Some(count) = headers_count {
+                        let key = if count <= 64 {
+                            format!("sync:{}:count:{}", kind, count)
+                        } else if let Some(ip) = extract_ip_from_p2p_line(msg_ref) {
+                            format!("sync:{}:{}:count:{}", kind, ip, count)
+                        } else {
+                            format!("sync:{}:count:{}", kind, count)
+                        };
+                        rl_spec = Some((key, cooldown));
+                    }
                 } else if let Some(ip) = extract_ip_from_p2p_line(msg_ref)
                     .or_else(|| extract_ip_from_prefix(msg_ref, "header-state peer=", " local_tip="))
                 {
