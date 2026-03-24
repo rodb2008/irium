@@ -4275,7 +4275,7 @@ async fn main() {
     match (network, lwma_activation) {
         (NetworkKind::Mainnet, Some(h)) => {
             println!(
-                "LWMA mainnet activation height (code-defined, coordinated): {}",
+                "LWMA active on mainnet since height {}",
                 h
             )
         }
