@@ -1601,19 +1601,21 @@ fn orphan_headers_count() -> usize {
     orphan_headers_count_locked(&guard)
 }
 
-fn store_orphan_header(header: BlockHeader) -> usize {
+fn store_orphan_header(header: BlockHeader) -> (usize, bool) {
     let mut guard = orphan_headers_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     prune_orphan_headers_locked(&mut guard);
-    guard
-        .entry(header.prev_hash)
-        .or_default()
-        .push(OrphanHeaderEntry {
-            header,
-            inserted_at: Instant::now(),
-        });
-    orphan_headers_count_locked(&guard)
+    let entries = guard.entry(header.prev_hash).or_default();
+    let header_hash = header.hash();
+    if entries.iter().any(|e| e.header.hash() == header_hash) {
+        return (orphan_headers_count_locked(&guard), false);
+    }
+    entries.push(OrphanHeaderEntry {
+        header,
+        inserted_at: Instant::now(),
+    });
+    (orphan_headers_count_locked(&guard), true)
 }
 
 fn take_orphan_header_children(parent_hash: [u8; 32]) -> Vec<BlockHeader> {
@@ -4633,17 +4635,19 @@ impl P2PNode {
                                                     first_unknown_prev = Some(header.prev_hash);
                                                 }
                                                 reject_reason.get_or_insert_with(|| classify_header_reject_reason(&e));
-                                                let orphan_n = store_orphan_header(header.clone());
-                                                P2PNode::log_event(
-                                                    "info",
-                                                    "sync",
-                                                    format!(
-                                                        "stored orphan header: hash={} prev={} orphan_headers={}",
-                                                        short_hash(header_hash),
-                                                        short_hash(header.prev_hash),
-                                                        orphan_n
-                                                    ),
-                                                );
+                                                let (orphan_n, inserted) = store_orphan_header(header.clone());
+                                                if inserted {
+                                                    P2PNode::log_event(
+                                                        "info",
+                                                        "sync",
+                                                        format!(
+                                                            "stored orphan header: hash={} prev={} orphan_headers={}",
+                                                            short_hash(header_hash),
+                                                            short_hash(header.prev_hash),
+                                                            orphan_n
+                                                        ),
+                                                    );
+                                                }
                                                 if let Some(peer_height) = peer_height_hint {
                                                     let local_height = guard.tip_height();
                                                     if peer_height > local_height {
@@ -6673,17 +6677,19 @@ async fn handle_incoming_with_sybil(
                                                     first_unknown_prev = Some(header.prev_hash);
                                                 }
                                                 reject_reason.get_or_insert_with(|| classify_header_reject_reason(&e));
-                                                let orphan_n = store_orphan_header(header.clone());
-                                                P2PNode::log_event(
-                                                    "info",
-                                                    "sync",
-                                                    format!(
-                                                        "stored orphan header: hash={} prev={} orphan_headers={}",
-                                                        short_hash(header_hash),
-                                                        short_hash(header.prev_hash),
-                                                        orphan_n
-                                                    ),
-                                                );
+                                                let (orphan_n, inserted) = store_orphan_header(header.clone());
+                                                if inserted {
+                                                    P2PNode::log_event(
+                                                        "info",
+                                                        "sync",
+                                                        format!(
+                                                            "stored orphan header: hash={} prev={} orphan_headers={}",
+                                                            short_hash(header_hash),
+                                                            short_hash(header.prev_hash),
+                                                            orphan_n
+                                                        ),
+                                                    );
+                                                }
                                                 if let Some(peer_height) = peer_height_hint {
                                                     let local_height = guard.tip_height();
                                                     if peer_height > local_height {
@@ -7574,7 +7580,8 @@ mod tests {
             nonce: 0,
         });
 
-        let orphan_count = store_orphan_header(child.clone());
+        let (orphan_count, inserted) = store_orphan_header(child.clone());
+        assert!(inserted);
         assert!(orphan_count >= 1);
 
         chain.add_header(parent.clone()).expect("add parent header");
@@ -7586,6 +7593,44 @@ mod tests {
             .header_path_to_known(child.hash())
             .expect("path from known to child");
         assert_eq!(path, vec![parent.hash(), child.hash()]);
+    }
+
+    #[test]
+    fn duplicate_orphan_headers_are_not_reinserted() {
+        let locked = load_locked_genesis().expect("load locked genesis");
+        let genesis = block_from_locked(&locked).expect("build genesis block");
+        let pow_limit = crate::pow::Target { bits: 0x207fffff };
+        let params = ChainParams {
+            genesis_block: genesis,
+            pow_limit,
+            htlcv1_activation_height: None,
+            lwma: crate::chain::LwmaParams::new(None, pow_limit),
+        };
+        let chain = ChainState::new(params);
+
+        {
+            let mut guard = orphan_headers_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.clear();
+        }
+
+        let tip = chain.tip_hash();
+        let orphan = mine_header(BlockHeader {
+            version: 1,
+            prev_hash: tip,
+            merkle_root: [9u8; 32],
+            time: 1_900_000_010,
+            bits: 0x207fffff,
+            nonce: 0,
+        });
+        let (count1, inserted1) = store_orphan_header(orphan.clone());
+        let (count2, inserted2) = store_orphan_header(orphan);
+
+        assert!(inserted1);
+        assert!(!inserted2);
+        assert_eq!(count1, 1);
+        assert_eq!(count2, 1);
     }
 
     #[test]
