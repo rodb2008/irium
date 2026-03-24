@@ -615,6 +615,17 @@ fn header_state_log_cooldown_secs() -> u64 {
     })
 }
 
+fn orphan_header_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_ORPHAN_HEADER_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(30)
+    })
+}
+
 fn locator_recovery_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -2415,11 +2426,15 @@ impl P2PNode {
                     reason_key = Some(rest[..end].to_string());
                 }
                 ("header_state", header_state_log_cooldown_secs())
+            } else if msg_ref.starts_with("stored orphan header: ") {
+                ("orphan_header", orphan_header_log_cooldown_secs())
             } else {
                 ("", 0)
             };
             if cooldown > 0 {
-                if let Some(ip) = extract_ip_from_p2p_line(msg_ref)
+                if kind == "orphan_header" {
+                    rl_spec = Some(("sync:orphan_header".to_string(), cooldown));
+                } else if let Some(ip) = extract_ip_from_p2p_line(msg_ref)
                     .or_else(|| extract_ip_from_prefix(msg_ref, "header-state peer=", " local_tip="))
                 {
                     let key = if let Some(reason) = reason_key {
