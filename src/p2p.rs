@@ -593,6 +593,28 @@ fn headers_new_false_log_cooldown_secs() -> u64 {
     })
 }
 
+fn headers_new_true_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_HEADERS_NEW_TRUE_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(15)
+    })
+}
+
+fn header_state_log_cooldown_secs() -> u64 {
+    static VAL: OnceLock<u64> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("IRIUM_P2P_HEADER_STATE_LOG_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(1).min(3600))
+            .unwrap_or(20)
+    })
+}
+
 fn locator_recovery_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -2313,7 +2335,7 @@ impl P2PNode {
             std::env::var("IRIUM_P2P_LOG_RATE_LIMIT")
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false)
+                .unwrap_or(true)
         })
     }
 
@@ -2352,18 +2374,35 @@ impl P2PNode {
         let mut rl_spec: Option<(String, u64)> = None;
 
         if Self::log_rate_limit_enabled() && category == "sync" {
+            let mut reason_key: Option<String> = None;
             let (kind, cooldown) = if msg_ref.contains("no getblocks after headers") {
                 ("no_getblocks", no_getblocks_log_cooldown_secs())
             } else if msg_ref.contains("unknown start hash") {
                 ("unknown_start", unknown_start_log_cooldown_secs())
-            } else if msg_ref.contains("headers (new=false)") {
+            } else if msg_ref.contains("received ") && msg_ref.contains(" headers (new=false)") {
                 ("headers_new_false", headers_new_false_log_cooldown_secs())
+            } else if msg_ref.contains("received ") && msg_ref.contains(" headers (new=true)") {
+                ("headers_new_true", headers_new_true_log_cooldown_secs())
+            } else if msg_ref.starts_with("header-state peer=") {
+                if let Some(idx) = msg_ref.find(" reason=") {
+                    let rest = &msg_ref[idx + 8..];
+                    let end = rest.find(' ').unwrap_or(rest.len());
+                    reason_key = Some(rest[..end].to_string());
+                }
+                ("header_state", header_state_log_cooldown_secs())
             } else {
                 ("", 0)
             };
             if cooldown > 0 {
-                if let Some(ip) = extract_ip_from_p2p_line(msg_ref) {
-                    rl_spec = Some((format!("sync:{}:{}", kind, ip), cooldown));
+                if let Some(ip) = extract_ip_from_p2p_line(msg_ref)
+                    .or_else(|| extract_ip_from_prefix(msg_ref, "header-state peer=", " local_tip="))
+                {
+                    let key = if let Some(reason) = reason_key {
+                        format!("sync:{}:{}:{}", kind, ip, reason)
+                    } else {
+                        format!("sync:{}:{}", kind, ip)
+                    };
+                    rl_spec = Some((key, cooldown));
                 }
             }
         } else if Self::log_rate_limit_enabled() && category == "p2p" {
