@@ -14,7 +14,7 @@ use axum::{
 use irium_node_rs::constants::{block_reward, COINBASE_MATURITY};
 use irium_node_rs::rate_limiter::RateLimiter;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tokio::time::Instant;
@@ -22,11 +22,14 @@ use tokio::time::Instant;
 #[derive(Clone)]
 struct AppState {
     client: Client,
+    status_client: Client,
     node_base: String,
     limiter: Arc<Mutex<RateLimiter>>,
     api_token: Option<String>,
     rpc_token: Option<String>,
     miners_cache: Arc<RwLock<MinersCache>>,
+    network_cache: Arc<RwLock<NetworkStatusCache>>,
+    network_config: NetworkStatusConfig,
     stratum_metrics_url: Option<String>,
 }
 
@@ -39,11 +42,187 @@ struct MinersCache {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct NetworkStatusSourceConfig {
+    name: String,
+    url: String,
+}
+
+#[derive(Debug, Clone)]
+struct NetworkStatusConfig {
+    sources: Vec<NetworkStatusSourceConfig>,
+    poll_interval: Duration,
+    stale_secs: u64,
+    outlier_blocks: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct NetworkSourceSnapshot {
+    name: String,
+    url: String,
+    healthy: bool,
+    stale: bool,
+    health: String,
+    local_height: Option<u64>,
+    raw_height: Option<u64>,
+    persisted_contiguous_height: Option<u64>,
+    best_peer_height: Option<u64>,
+    best_observed_height: Option<u64>,
+    peer_count: Option<u64>,
+    latency_ms: Option<u64>,
+    updated_at_unix: Option<u64>,
+    last_success_at_unix: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NetworkStatusAggregate {
+    network_height: Option<u64>,
+    explorer_indexed_height: u64,
+    best_observed_height: Option<u64>,
+    confidence: String,
+    updated_at_unix: u64,
+    last_updated_secs_ago: u64,
+    healthy_sources: usize,
+    total_sources: usize,
+    sources: Vec<NetworkSourceSnapshot>,
+    notes: Vec<String>,
+}
+
+impl Default for NetworkStatusAggregate {
+    fn default() -> Self {
+        Self {
+            network_height: None,
+            explorer_indexed_height: 0,
+            best_observed_height: None,
+            confidence: "low".to_string(),
+            updated_at_unix: 0,
+            last_updated_secs_ago: 0,
+            healthy_sources: 0,
+            total_sources: 0,
+            sources: Vec::new(),
+            notes: vec!["network status warming up".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct NetworkStatusCache {
+    aggregate: NetworkStatusAggregate,
+    sources: HashMap<String, NetworkSourceSnapshot>,
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs()
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn value_u64(v: Option<&Value>) -> Option<u64> {
+    match v {
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn default_status_source_name(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|host| host.to_string()))
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| url.to_string())
+}
+
+fn normalize_status_source_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(mut url) = reqwest::Url::parse(trimmed) {
+        if url.path().is_empty() || url.path() == "/" {
+            url.set_path("/status");
+        }
+        return url.to_string();
+    }
+    trimmed.to_string()
+}
+
+fn parse_status_sources(default_base: &str) -> Vec<NetworkStatusSourceConfig> {
+    let raw = env::var("IRIUM_STATUS_SOURCES").unwrap_or_default();
+    let mut sources = Vec::new();
+
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (name, url) = if let Some((name, url)) = item.split_once('=') {
+            (name.trim().to_string(), normalize_status_source_url(url))
+        } else {
+            let url = normalize_status_source_url(item);
+            (default_status_source_name(&url), url)
+        };
+        if !name.is_empty() && !url.is_empty() {
+            sources.push(NetworkStatusSourceConfig { name, url });
+        }
+    }
+
+    if sources.is_empty() {
+        sources.push(NetworkStatusSourceConfig {
+            name: "local".to_string(),
+            url: node_url(default_base, "/status"),
+        });
+    }
+
+    sources
+}
+
+fn persisted_height(status: &Value) -> Option<u64> {
+    value_u64(status.get("persisted_contiguous_height"))
+}
+
+fn raw_chain_height(status: &Value) -> Option<u64> {
+    value_u64(status.get("height"))
+}
+
+fn local_validated_height(status: &Value) -> Option<u64> {
+    persisted_height(status).or_else(|| raw_chain_height(status))
+}
+
+fn best_peer_height(status: &Value) -> Option<u64> {
+    value_u64(status.get("best_peer_height"))
+        .or_else(|| value_u64(status.get("best_observed_height")))
+        .or_else(|| value_u64(status.get("best_header_tip").and_then(|v| v.get("height"))))
+        .or_else(|| value_u64(status.get("best_header").and_then(|v| v.get("height"))))
+}
+
+fn peer_count_from_status(status: &Value) -> Option<u64> {
+    value_u64(status.get("peer_count")).or_else(|| value_u64(status.get("peers_connected")))
+}
+
+fn median_height(values: &[u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    Some(sorted[sorted.len() / 2])
 }
 
 #[derive(Deserialize)]
@@ -74,21 +253,15 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-fn build_client(node_base: &str) -> Result<Client, String> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(10));
+fn build_client(node_base: &str, timeout: Duration) -> Result<Client, String> {
+    let mut builder = Client::builder().timeout(timeout);
     if let Ok(path) = env::var("IRIUM_RPC_CA") {
         let pem = std::fs::read(&path).map_err(|e| format!("read CA {path}: {e}"))?;
         let cert =
             reqwest::Certificate::from_pem(&pem).map_err(|e| format!("invalid CA {path}: {e}"))?;
         builder = builder.add_root_certificate(cert);
     }
-    let insecure = env::var("IRIUM_RPC_INSECURE")
-        .ok()
-        .map(|v| {
-            let v = v.to_lowercase();
-            v == "1" || v == "true" || v == "yes"
-        })
-        .unwrap_or(false);
+    let insecure = env_flag("IRIUM_RPC_INSECURE");
     if insecure {
         let url = reqwest::Url::parse(node_base)
             .map_err(|e| format!("invalid RPC URL {node_base}: {e}"))?;
@@ -312,6 +485,281 @@ async fn miners_refresher_task(state: AppState, window_blocks: u64, interval: Du
         tokio::time::sleep(interval).await;
     }
 }
+
+async fn fetch_network_source_snapshot(
+    client: &Client,
+    source: &NetworkStatusSourceConfig,
+    rpc_token: &Option<String>,
+) -> Result<NetworkSourceSnapshot, String> {
+    let started = Instant::now();
+    let mut req = client.get(&source.url);
+    if let Some(token) = rpc_token {
+        if !token.is_empty() {
+            req = req.bearer_auth(token);
+        }
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status_code = resp.status();
+    if !status_code.is_success() {
+        return Err(format!("HTTP {}", status_code));
+    }
+    let payload = resp
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("invalid JSON: {e}"))?;
+
+    let fetched_at = now_unix();
+    let local_height = local_validated_height(&payload)
+        .ok_or_else(|| "missing local validated height".to_string())?;
+    let raw_height = raw_chain_height(&payload);
+    let persisted = persisted_height(&payload);
+    let best_peer = best_peer_height(&payload);
+    let best_observed = best_peer.map(|h| h.max(local_height)).or(Some(local_height));
+    let peer_count = peer_count_from_status(&payload);
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    println!(
+        "[network-status] fetched source={} local_height={} best_peer_height={:?} peers={:?} latency_ms={}",
+        source.name, local_height, best_peer, peer_count, latency_ms
+    );
+
+    Ok(NetworkSourceSnapshot {
+        name: source.name.clone(),
+        url: source.url.clone(),
+        healthy: true,
+        stale: false,
+        health: "healthy".to_string(),
+        local_height: Some(local_height),
+        raw_height,
+        persisted_contiguous_height: persisted,
+        best_peer_height: best_peer,
+        best_observed_height: best_observed,
+        peer_count,
+        latency_ms: Some(latency_ms),
+        updated_at_unix: Some(fetched_at),
+        last_success_at_unix: Some(fetched_at),
+        error: None,
+    })
+}
+
+fn fallback_source_snapshot(
+    source: &NetworkStatusSourceConfig,
+    previous: Option<&NetworkSourceSnapshot>,
+    error: String,
+    stale_secs: u64,
+) -> NetworkSourceSnapshot {
+    let now = now_unix();
+    if let Some(prev) = previous {
+        let mut snapshot = prev.clone();
+        let age = prev
+            .last_success_at_unix
+            .map(|ts| now.saturating_sub(ts))
+            .unwrap_or(u64::MAX);
+        let stale = age <= stale_secs;
+        snapshot.name = source.name.clone();
+        snapshot.url = source.url.clone();
+        snapshot.healthy = false;
+        snapshot.stale = stale;
+        snapshot.health = if stale { "stale" } else { "failed" }.to_string();
+        snapshot.updated_at_unix = Some(now);
+        snapshot.error = Some(error);
+        return snapshot;
+    }
+
+    NetworkSourceSnapshot {
+        name: source.name.clone(),
+        url: source.url.clone(),
+        healthy: false,
+        stale: false,
+        health: "failed".to_string(),
+        local_height: None,
+        raw_height: None,
+        persisted_contiguous_height: None,
+        best_peer_height: None,
+        best_observed_height: None,
+        peer_count: None,
+        latency_ms: None,
+        updated_at_unix: Some(now),
+        last_success_at_unix: None,
+        error: Some(error),
+    }
+}
+
+fn compute_network_status_aggregate(
+    explorer_status: Option<&Value>,
+    sources: &[NetworkSourceSnapshot],
+    config: &NetworkStatusConfig,
+) -> NetworkStatusAggregate {
+    let now = now_unix();
+    let explorer_indexed_height = explorer_status
+        .and_then(local_validated_height)
+        .unwrap_or(0);
+
+    let mut notes = Vec::new();
+    let healthy: Vec<&NetworkSourceSnapshot> = sources
+        .iter()
+        .filter(|s| s.healthy && s.local_height.is_some())
+        .collect();
+    let local_heights: Vec<u64> = healthy.iter().filter_map(|s| s.local_height).collect();
+
+    let mut agreed_locals: Vec<u64> = Vec::new();
+    let mut rejected_names: Vec<String> = Vec::new();
+    let mut confidence = "low".to_string();
+    let mut network_height = None;
+
+    if local_heights.is_empty() {
+        notes.push("no healthy trusted sources available".to_string());
+    } else if local_heights.len() == 1 {
+        network_height = local_heights.first().copied();
+        agreed_locals = local_heights.clone();
+        confidence = "medium".to_string();
+        notes.push("using single healthy trusted source".to_string());
+    } else if let Some(median) = median_height(&local_heights) {
+        for source in &healthy {
+            if let Some(height) = source.local_height {
+                let delta = height.max(median) - height.min(median);
+                if delta <= config.outlier_blocks {
+                    agreed_locals.push(height);
+                } else {
+                    rejected_names.push(source.name.clone());
+                }
+            }
+        }
+        if !rejected_names.is_empty() {
+            println!(
+                "[network-status] rejected outlier sources around median {}: {}",
+                median,
+                rejected_names.join(", ")
+            );
+            notes.push(format!(
+                "rejected outlier sources: {}",
+                rejected_names.join(", ")
+            ));
+        }
+        if !agreed_locals.is_empty() {
+            network_height = agreed_locals.iter().copied().max();
+            confidence = if agreed_locals.len() >= 2 {
+                "high".to_string()
+            } else {
+                notes.push("sources disagree beyond threshold".to_string());
+                "low".to_string()
+            };
+        }
+    }
+
+    let baseline = network_height.or_else(|| local_heights.iter().copied().max());
+    let mut best_observed_candidates = agreed_locals.clone();
+    if let Some(base) = baseline {
+        let ceiling = base.saturating_add(config.outlier_blocks);
+        for source in &healthy {
+            if let Some(observed) = source.best_observed_height.or(source.best_peer_height) {
+                if observed <= ceiling {
+                    best_observed_candidates.push(observed.max(base));
+                }
+            }
+        }
+    }
+    let best_observed_height = best_observed_candidates.iter().copied().max().or(baseline);
+
+    let latest_update = sources
+        .iter()
+        .filter_map(|s| s.last_success_at_unix)
+        .max()
+        .unwrap_or(now);
+
+    println!(
+        "[network-status] aggregate network_height={:?} explorer_indexed_height={} best_observed_height={:?} confidence={} healthy_sources={}/{}",
+        network_height,
+        explorer_indexed_height,
+        best_observed_height,
+        confidence,
+        healthy.len(),
+        sources.len()
+    );
+
+    NetworkStatusAggregate {
+        network_height,
+        explorer_indexed_height,
+        best_observed_height,
+        confidence,
+        updated_at_unix: latest_update,
+        last_updated_secs_ago: now.saturating_sub(latest_update),
+        healthy_sources: healthy.len(),
+        total_sources: sources.len(),
+        sources: sources.to_vec(),
+        notes,
+    }
+}
+
+async fn network_status_refresher_task(state: AppState) {
+    loop {
+        let previous_sources = {
+            let cache = state.network_cache.read().await;
+            cache.sources.clone()
+        };
+
+        let explorer_status = match proxy_value(&state, "/status").await {
+            Ok(value) => Some(value),
+            Err(err) => {
+                println!("[network-status] local explorer status fetch failed: {err}");
+                None
+            }
+        };
+
+        let mut snapshots = Vec::new();
+        let mut snapshot_map = HashMap::new();
+        for source in &state.network_config.sources {
+            let snapshot = match fetch_network_source_snapshot(
+                &state.status_client,
+                source,
+                &state.rpc_token,
+            )
+            .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    println!("[network-status] failed source={} error={}", source.name, err);
+                    fallback_source_snapshot(
+                        source,
+                        previous_sources.get(&source.name),
+                        err,
+                        state.network_config.stale_secs,
+                    )
+                }
+            };
+            snapshot_map.insert(source.name.clone(), snapshot.clone());
+            snapshots.push(snapshot);
+        }
+
+        let aggregate = compute_network_status_aggregate(
+            explorer_status.as_ref(),
+            &snapshots,
+            &state.network_config,
+        );
+
+        let mut cache = state.network_cache.write().await;
+        cache.aggregate = aggregate;
+        cache.sources = snapshot_map;
+
+        tokio::time::sleep(state.network_config.poll_interval).await;
+    }
+}
+
+async fn network_status(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate(&state, &addr, &headers)?;
+    let aggregate = state.network_cache.read().await.aggregate.clone();
+    let payload = serde_json::to_value(&aggregate).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(payload))
+}
+
 
 async fn status(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -989,7 +1437,7 @@ async fn pool_account(
 async fn main() {
     let node_base =
         env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string());
-    let client = match build_client(&node_base) {
+    let client = match build_client(&node_base, Duration::from_secs(10)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to init HTTP client: {e}");
@@ -1017,8 +1465,31 @@ async fn main() {
         .map(|v| v.trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty());
 
+    let status_sources = parse_status_sources(&node_base);
+    let status_timeout_secs = env_u64("IRIUM_STATUS_TIMEOUT_SECS", 4).clamp(2, 15);
+    let status_client = match build_client(
+        &status_sources
+            .first()
+            .map(|s| s.url.as_str())
+            .unwrap_or(node_base.as_str()),
+        Duration::from_secs(status_timeout_secs),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to init network status client: {e}");
+            std::process::exit(1);
+        }
+    };
+    let network_config = NetworkStatusConfig {
+        sources: status_sources,
+        poll_interval: Duration::from_secs(env_u64("IRIUM_STATUS_POLL_SECS", 15).clamp(10, 30)),
+        stale_secs: env_u64("IRIUM_STATUS_STALE_SECS", 60).max(15),
+        outlier_blocks: env_u64("IRIUM_STATUS_OUTLIER_BLOCKS", 3).max(1),
+    };
+
     let state = AppState {
         client,
+        status_client,
         node_base: node_base.trim_end_matches('/').to_string(),
         limiter: Arc::new(Mutex::new(RateLimiter::new(rate))),
         api_token,
@@ -1027,6 +1498,8 @@ async fn main() {
             window_blocks: miners_window_blocks,
             ..Default::default()
         })),
+        network_cache: Arc::new(RwLock::new(NetworkStatusCache::default())),
+        network_config,
         stratum_metrics_url,
     };
 
@@ -1036,6 +1509,7 @@ async fn main() {
         miners_window_blocks,
         Duration::from_secs(miners_refresh_secs.max(3)),
     ));
+    tokio::spawn(network_status_refresher_task(state.clone()));
 
     let app = Router::new()
         .route("/health", get(status))
@@ -1043,6 +1517,8 @@ async fn main() {
         .route("/api/status", get(status))
         .route("/stats", get(stats))
         .route("/api/stats", get(stats))
+        .route("/network/status", get(network_status))
+        .route("/api/network/status", get(network_status))
         .route("/blocks", get(blocks))
         .route("/api/blocks", get(blocks))
         .route("/peers", get(peers))
