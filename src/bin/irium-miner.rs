@@ -2018,12 +2018,12 @@ fn main() {
     let lwma_activation = resolved_lwma_activation_height(network);
     match (network, lwma_activation) {
         (irium_node_rs::activation::NetworkKind::Mainnet, Some(h)) => {
-            println!("LWMA mainnet activation height (code-defined, coordinated): {}", h)
+            println!("LWMA mainnet active since height {}", h)
         }
         (irium_node_rs::activation::NetworkKind::Mainnet, None) => {
             println!("LWMA mainnet activation disabled in code (no activation height set)")
         }
-        (_, Some(h)) => println!("LWMA non-mainnet activation height from env: {}", h),
+        (_, Some(h)) => println!("LWMA non-mainnet active since height {} (from env)", h),
         (_, None) => println!("LWMA non-mainnet activation unset (env not provided)"),
     }
     if network == irium_node_rs::activation::NetworkKind::Mainnet

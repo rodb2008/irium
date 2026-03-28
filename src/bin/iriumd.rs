@@ -4280,9 +4280,9 @@ async fn main() {
             )
         }
         (NetworkKind::Mainnet, None) => {
-            println!("LWMA mainnet activation disabled in code (no activation height set)")
+            println!("LWMA mainnet is not active in code")
         }
-        (_, Some(h)) => println!("LWMA non-mainnet activation height from env: {}", h),
+        (_, Some(h)) => println!("LWMA non-mainnet active since height {} (from env)", h),
         (_, None) => println!("LWMA non-mainnet activation unset (env not provided)"),
     }
     if network == NetworkKind::Mainnet && env_override.is_some() {

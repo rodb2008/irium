@@ -8,8 +8,8 @@ pub const MAINNET_HTLCV1_ACTIVATION_HEIGHT: Option<u64> = Some(18677);
 
 /// Mainnet LWMA difficulty activation height source-of-truth.
 ///
-/// Coordinated mainnet activation height: observed mainnet height 15,962 plus a 500-block safety buffer.
-/// This must remain a future height until the network upgrade is coordinated.
+/// Mainnet LWMA has been active since block height 16,462.
+/// Historical consensus from that height onward must remain unchanged.
 pub const MAINNET_LWMA_ACTIVATION_HEIGHT: Option<u64> = Some(16_462);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
