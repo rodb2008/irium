@@ -1,8 +1,2 @@
-# Unsigned extra bootstrap seeds (merged with signed baseline).
-# Keep this short and only include currently reachable peers.
-
-207.244.247.86
-157.173.116.134
-185.36.141.215
-82.67.166.108
-152.53.229.206
+# Unsigned extra bootstrap seeds.
+# Keep committed entries official-only; use runtime/local sources for learned peers.
