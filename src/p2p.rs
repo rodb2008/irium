@@ -2782,34 +2782,10 @@ impl P2PNode {
     }
 
     fn load_trusted_seed_ips() -> Arc<HashSet<IpAddr>> {
-        // Trusted/static peers are preserved bootstrap endpoints we should not temporarily ban due to transient handshake noise.
-        // Static bans still apply.
+        // Trusted peers are an explicit local operator override only.
+        // Bootstrap sources must not implicitly bypass normal peer handling.
         let mut ips: HashSet<IpAddr> = HashSet::new();
-        for path in [
-            "bootstrap/seedlist.txt",
-            "bootstrap/seedlist.extra",
-            "bootstrap/static_peers.txt",
-        ] {
-            let data = match fs::read_to_string(path) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            for line in data.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let token = line.split_whitespace().next().unwrap_or("");
-                if let Ok(ip) = token.parse::<IpAddr>() {
-                    ips.insert(ip);
-                    continue;
-                }
-                if let Ok(sa) = token.parse::<SocketAddr>() {
-                    ips.insert(sa.ip());
-                }
-            }
-        }
-        if let Ok(raw) = std::env::var("IRIUM_STATIC_PEERS") {
+        if let Ok(raw) = std::env::var("IRIUM_TRUSTED_PEERS") {
             for token in raw.split([',', ' ', '\n', '\t']) {
                 let token = token.trim();
                 if token.is_empty() {

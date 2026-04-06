@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -544,6 +544,9 @@ struct NodeConfig {
     /// Optional list of seed peers, e.g. ["seed.example.org:38291"].
     #[serde(default)]
     p2p_seeds: Vec<String>,
+    /// Optional DNS seed hosts.
+    #[serde(default)]
+    p2p_dns_seeds: Vec<String>,
     /// Optional relay payout address to advertise to peers.
     #[serde(default)]
     relay_address: Option<String>,
@@ -686,6 +689,99 @@ fn load_runtime_seeds() -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn load_persisted_startup_seeds(
+    peers: &[irium_node_rs::network::PeerRecord],
+    default_seed_port: u16,
+) -> Vec<String> {
+    let mut seeds = Vec::new();
+    let mut persisted_records: Vec<irium_node_rs::network::PeerRecord> = Vec::new();
+    let path = storage::state_dir().join("peers.json");
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(map) = value.as_object() {
+                for (multiaddr, entry) in map {
+                    if let Some(obj) = entry.as_object() {
+                        let dialable = obj
+                            .get("dialable")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let last_seen = obj
+                            .get("last_seen")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let first_seen = obj
+                            .get("first_seen")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        persisted_records.push(irium_node_rs::network::PeerRecord {
+                            multiaddr: multiaddr.clone(),
+                            agent: None,
+                            last_seen,
+                            first_seen,
+                            seen_days: Vec::new(),
+                            relay_address: None,
+                            last_height: obj.get("last_height").and_then(|v| v.as_u64()),
+                            node_id: None,
+                            dialable,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    persisted_records.extend_from_slice(peers);
+    for peer in persisted_records {
+        if !peer.dialable {
+            continue;
+        }
+        let parts: Vec<&str> = peer
+            .multiaddr
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.len() < 4 || parts[2] != "tcp" {
+            continue;
+        }
+        let Some(port) = parts[3].parse::<u16>().ok().filter(|port| *port > 0) else {
+            continue;
+        };
+        let seed = format!("{}:{}", parts[1], port);
+        if !seeds.iter().any(|existing| existing == &seed) {
+            seeds.push(seed);
+        }
+    }
+    for seed in load_runtime_seeds() {
+        let normalized = match parse_seed_to_socketaddr(&seed, default_seed_port) {
+            Ok(addr) => addr.to_string(),
+            Err(_) => seed,
+        };
+        if !seeds.iter().any(|existing| existing == &normalized) {
+            seeds.push(normalized);
+        }
+    }
+    seeds
+}
+
+fn load_manual_seeds(node_cfg: Option<&NodeConfig>) -> Vec<String> {
+    let mut seeds = node_cfg
+        .map(|cfg| cfg.p2p_seeds.clone())
+        .unwrap_or_default();
+    for env_name in ["IRIUM_ADDNODE", "IRIUM_MANUAL_PEERS"] {
+        if let Ok(raw) = std::env::var(env_name) {
+            for token in raw.split([',', ' ', '\n', '\t']) {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
+                }
+                if !seeds.iter().any(|s| s == token) {
+                    seeds.push(token.to_string());
+                }
+            }
+        }
+    }
+    seeds
+}
+
 fn load_extra_seeds() -> Vec<String> {
     let path = std::path::Path::new("bootstrap/seedlist.extra");
     std::fs::read_to_string(path)
@@ -712,10 +808,73 @@ fn load_static_seeds() -> Vec<String> {
     seeds
 }
 
+fn load_builtin_fallback_seeds() -> Vec<String> {
+    let mut seeds = load_static_seeds();
+    for seed in load_extra_seeds() {
+        if !seeds.iter().any(|existing| existing == &seed) {
+            seeds.push(seed);
+        }
+    }
+    seeds
+}
+
+fn load_dns_seed_hosts(node_cfg: Option<&NodeConfig>) -> Vec<String> {
+    let mut hosts = node_cfg
+        .map(|cfg| cfg.p2p_dns_seeds.clone())
+        .unwrap_or_default();
+    if let Ok(raw) = std::env::var("IRIUM_DNS_SEEDS") {
+        for token in raw.split([',', ' ', '\n', '\t']) {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if !hosts.iter().any(|host| host == token) {
+                hosts.push(token.to_string());
+            }
+        }
+    }
+    hosts
+}
+
+fn resolve_dns_seed_addrs(
+    hosts: &[String],
+    default_seed_port: u16,
+    local_ips: &HashSet<IpAddr>,
+) -> (Vec<std::net::SocketAddr>, usize) {
+    let mut addrs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut filtered_local = 0usize;
+    for host in hosts {
+        match (host.as_str(), default_seed_port).to_socket_addrs() {
+            Ok(iter) => {
+                for addr in iter {
+                    if local_ips.contains(&addr.ip()) {
+                        filtered_local += 1;
+                        continue;
+                    }
+                    if seen.insert(addr) {
+                        addrs.push(addr);
+                    }
+                }
+            }
+            Err(err) => eprintln!(
+                "[warn] bootstrap dns seed {} resolution failed: {}",
+                host, err
+            ),
+        }
+    }
+    (addrs, filtered_local)
+}
+
 #[derive(Clone, Copy)]
 struct SeedDialInfo {
     total: usize,
     filtered_local: usize,
+    persisted: usize,
+    manual: usize,
+    fallback: usize,
+    dns: usize,
+    signed: usize,
 }
 
 fn load_signed_seeds() -> Vec<String> {
@@ -726,6 +885,10 @@ fn load_signed_seeds() -> Vec<String> {
     let sig_path = std::path::Path::new("bootstrap/seedlist.txt.sig");
     let allowed = std::path::Path::new("bootstrap/trust/allowed_signers");
     let Ok(seed_data) = std::fs::read_to_string(seed_path) else {
+        eprintln!(
+            "[warn] bootstrap signed seedlist missing: {}",
+            seed_path.display()
+        );
         return Vec::new();
     };
 
@@ -746,73 +909,116 @@ fn load_signed_seeds() -> Vec<String> {
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(err) => {
+            eprintln!(
+                "[warn] bootstrap signed seed verification unavailable: {}",
+                err
+            );
+            return Vec::new();
+        }
     };
 
     if let Some(stdin) = child.stdin.as_mut() {
         if stdin.write_all(seed_data.as_bytes()).is_err() {
+            eprintln!("[warn] bootstrap signed seed verification input failed");
             return Vec::new();
         }
     }
     let status = match child.wait() {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(err) => {
+            eprintln!("[warn] bootstrap signed seed verification failed: {}", err);
+            return Vec::new();
+        }
     };
     if status.success() {
         parse_seed_lines(&seed_data)
     } else {
+        eprintln!("[warn] bootstrap signed seedlist signature invalid; continuing without it");
         Vec::new()
     }
 }
 
 fn build_seed_addrs(
-    config_seeds: &[String],
+    persisted_seeds: &[String],
+    manual_seeds: &[String],
+    fallback_seeds: &[String],
+    dns_seed_addrs: &[std::net::SocketAddr],
     signed_seeds: &[String],
     default_seed_port: u16,
     local_ips: &HashSet<IpAddr>,
 ) -> (Vec<std::net::SocketAddr>, SeedDialInfo) {
-    let mut seeds_raw: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for seed in config_seeds
-        .iter()
-        .cloned()
-        .chain(load_static_seeds().into_iter())
-        .chain(load_runtime_seeds().into_iter())
-        .chain(load_extra_seeds().into_iter())
-        .chain(signed_seeds.iter().cloned())
-    {
-        if seen.insert(seed.clone()) {
-            seeds_raw.push(seed);
-        }
-    }
-
-    let mut info = SeedDialInfo {
-        total: seeds_raw.len(),
-        filtered_local: 0,
-    };
     let mut seeds: Vec<std::net::SocketAddr> = Vec::new();
-    for seed in seeds_raw.iter() {
+    let mut seen = std::collections::HashSet::new();
+    let mut filtered_local = 0usize;
+
+    for seed in persisted_seeds
+        .iter()
+        .chain(fallback_seeds.iter())
+        .chain(signed_seeds.iter())
+    {
         match parse_seed_to_socketaddr(seed, default_seed_port) {
             Ok(addr) => {
                 if local_ips.contains(&addr.ip()) {
-                    info.filtered_local += 1;
+                    filtered_local += 1;
                     continue;
                 }
-                seeds.push(addr)
+                if seen.insert(addr) {
+                    seeds.push(addr);
+                }
             }
             Err(e) => eprintln!("Invalid P2P seed {}: {}", seed, e),
         }
     }
-    // If everything was filtered as local, only fall back when explicitly allowed.
-    if seeds.is_empty() {
+    for addr in dns_seed_addrs {
+        if local_ips.contains(&addr.ip()) {
+            filtered_local += 1;
+            continue;
+        }
+        if seen.insert(*addr) {
+            seeds.push(*addr);
+        }
+    }
+    for seed in manual_seeds {
+        match parse_seed_to_socketaddr(seed, default_seed_port) {
+            Ok(addr) => {
+                if local_ips.contains(&addr.ip()) {
+                    filtered_local += 1;
+                    continue;
+                }
+                if seen.insert(addr) {
+                    seeds.push(addr);
+                }
+            }
+            Err(e) => eprintln!("Invalid P2P seed {}: {}", seed, e),
+        }
+    }
+
+    let mut info = SeedDialInfo {
+        total: seeds.len(),
+        filtered_local,
+        persisted: persisted_seeds.len(),
+        manual: manual_seeds.len(),
+        fallback: fallback_seeds.len(),
+        dns: dns_seed_addrs.len(),
+        signed: signed_seeds.len(),
+    };
+
+    if seeds.is_empty() && filtered_local > 0 {
         let allow = std::env::var("IRIUM_ALLOW_LOCAL_SEED_FALLBACK")
             .ok()
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
         if allow {
-            if let Some(first) = seeds_raw.first() {
-                if let Ok(addr) = parse_seed_to_socketaddr(first, default_seed_port) {
+            for seed in persisted_seeds
+                .iter()
+                .chain(fallback_seeds.iter())
+                .chain(signed_seeds.iter())
+            {
+                if let Ok(addr) = parse_seed_to_socketaddr(seed, default_seed_port) {
                     seeds.push(addr);
+                    info.total = seeds.len();
+                    break;
                 }
             }
         }
@@ -4280,9 +4486,9 @@ async fn main() {
             )
         }
         (NetworkKind::Mainnet, None) => {
-            println!("LWMA mainnet is not active in code")
+            println!("LWMA mainnet activation disabled in code (no activation height set)")
         }
-        (_, Some(h)) => println!("LWMA non-mainnet active since height {} (from env)", h),
+        (_, Some(h)) => println!("LWMA non-mainnet activation height from env: {}", h),
         (_, None) => println!("LWMA non-mainnet activation unset (env not provided)"),
     }
     if network == NetworkKind::Mainnet && env_override.is_some() {
@@ -4405,10 +4611,9 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(38291);
 
-    let config_seeds: Vec<String> = node_cfg
-        .as_ref()
-        .map(|cfg| cfg.p2p_seeds.clone())
-        .unwrap_or_default();
+    let manual_seeds = load_manual_seeds(node_cfg.as_ref());
+    let fallback_seeds = load_builtin_fallback_seeds();
+    let dns_seed_hosts = load_dns_seed_hosts(node_cfg.as_ref());
     let signed_seeds = load_signed_seeds();
     let local_ips = local_ip_set(node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.as_ref()));
 
@@ -4416,7 +4621,9 @@ async fn main() {
 
     // Connect to seed peers using a basic handshake and keep retrying in background.
     if let Some(node) = p2p.clone() {
-        let config_seeds = config_seeds.clone();
+        let manual_seeds = manual_seeds.clone();
+        let fallback_seeds = fallback_seeds.clone();
+        let dns_seed_hosts = dns_seed_hosts.clone();
         let signed_seeds = signed_seeds.clone();
         let local_ips = local_ips.clone();
         let agent_clone = agent_string.clone();
@@ -4425,22 +4632,50 @@ async fn main() {
             let node = node;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             let mut no_seed_logged = false;
+            let mut bootstrap_logged = false;
 
             loop {
-                let (seeds, seed_info) =
-                    build_seed_addrs(&config_seeds, &signed_seeds, default_seed_port, &local_ips);
+                let persisted_peers = node.peers_snapshot().await;
+                let persisted_seeds =
+                    load_persisted_startup_seeds(&persisted_peers, default_seed_port);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    node.connect_known_peers(5),
+                )
+                .await;
+                let (dns_seed_addrs, dns_filtered_local) =
+                    resolve_dns_seed_addrs(&dns_seed_hosts, default_seed_port, &local_ips);
+                let (seeds, mut seed_info) = build_seed_addrs(
+                    &persisted_seeds,
+                    &manual_seeds,
+                    &fallback_seeds,
+                    &dns_seed_addrs,
+                    &signed_seeds,
+                    default_seed_port,
+                    &local_ips,
+                );
+                seed_info.filtered_local += dns_filtered_local;
+                if !bootstrap_logged {
+                    eprintln!(
+                        "[{}] [bootstrap] persisted={} manual={} fallback={} dns_hosts={} dns_addrs={} signed={} filtered_local={}",
+                        Utc::now().format("%H:%M:%S"),
+                        seed_info.persisted,
+                        seed_info.manual,
+                        seed_info.fallback,
+                        dns_seed_hosts.len(),
+                        seed_info.dns,
+                        seed_info.signed,
+                        seed_info.filtered_local,
+                    );
+                    bootstrap_logged = true;
+                }
                 if seeds.is_empty() {
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        node.connect_known_peers(5),
-                    )
-                    .await;
                     if !no_seed_logged {
-                        if seed_info.total > 0 && seed_info.filtered_local == seed_info.total {
-                            // All seeds are local; wait for inbound peers quietly.
+                        if seed_info.filtered_local > 0 {
+                            // All configured bootstrap targets resolved to local addresses.
                         } else {
                             println!(
-                                "[{}] no seeds configured; trying peer cache",
+                                "[{}] no bootstrap seeds resolved; continuing with persisted peers and inbound discovery",
                                 Utc::now().format("%H:%M:%S")
                             );
                         }
