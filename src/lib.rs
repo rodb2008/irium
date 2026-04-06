@@ -14,6 +14,7 @@ pub mod qr;
 pub mod rate_limiter;
 pub mod relay;
 pub mod reputation;
+pub mod settlement;
 pub mod spv;
 pub mod storage;
 pub mod sybil;

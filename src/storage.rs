@@ -749,7 +749,6 @@ pub fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
     write_block_json_sync(height, block)
 }
 
-
 #[cfg(test)]
 mod storage_security_tests {
     use super::*;

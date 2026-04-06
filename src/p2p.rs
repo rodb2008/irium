@@ -2465,7 +2465,10 @@ impl P2PNode {
             } else if msg_ref.starts_with("stored orphan header: ") {
                 ("orphan_header", orphan_header_log_cooldown_secs())
             } else if msg_ref.contains(": inbound block ") {
-                ("inbound_block_trace", inbound_block_trace_log_cooldown_secs())
+                (
+                    "inbound_block_trace",
+                    inbound_block_trace_log_cooldown_secs(),
+                )
             } else {
                 ("", 0)
             };
@@ -2479,7 +2482,10 @@ impl P2PNode {
                 } else if kind == "header_state"
                     && reason_key.as_deref() == Some("no_block_download_needed_at_tip")
                 {
-                    rl_spec = Some(("sync:header_state:no_block_download_needed_at_tip".to_string(), cooldown));
+                    rl_spec = Some((
+                        "sync:header_state:no_block_download_needed_at_tip".to_string(),
+                        cooldown,
+                    ));
                 } else if kind == "no_getblocks" {
                     if let Some((count, start, end)) = extract_block_span(msg_ref, "pushing ") {
                         let shared = count <= 32 || end.saturating_sub(start) <= 64;
@@ -2503,12 +2509,16 @@ impl P2PNode {
                         } else {
                             format!("sync:{}:count:{}", kind, count)
                         };
-                        let adjusted = if count >= 2000 { cooldown.max(180) } else { cooldown };
+                        let adjusted = if count >= 2000 {
+                            cooldown.max(180)
+                        } else {
+                            cooldown
+                        };
                         rl_spec = Some((key, adjusted));
                     }
-                } else if let Some(ip) = extract_ip_from_p2p_line(msg_ref)
-                    .or_else(|| extract_ip_from_prefix(msg_ref, "header-state peer=", " local_tip="))
-                {
+                } else if let Some(ip) = extract_ip_from_p2p_line(msg_ref).or_else(|| {
+                    extract_ip_from_prefix(msg_ref, "header-state peer=", " local_tip=")
+                }) {
                     let key = if let Some(reason) = reason_key {
                         format!("sync:{}:{}:{}", kind, ip, reason)
                     } else {
@@ -2556,10 +2566,7 @@ impl P2PNode {
                             cooldown.max(120),
                         ));
                     } else if count == 512 && start == 0 && end == 511 {
-                        rl_spec = Some((
-                            "p2p:send_genesis_512".to_string(),
-                            cooldown.max(120),
-                        ));
+                        rl_spec = Some(("p2p:send_genesis_512".to_string(), cooldown.max(120)));
                     } else if let Some(ip) = extract_ip_from_p2p_line(msg_ref) {
                         rl_spec = Some((format!("p2p:send_blocks:{}:{}", ip, count), cooldown));
                     }
@@ -3135,10 +3142,7 @@ impl P2PNode {
             let backoff = {
                 let now = Instant::now();
                 let guard = self.outbound_dial_backoff.lock().await;
-                guard
-                    .values()
-                    .filter(|(_, until)| now < *until)
-                    .count() as u64
+                guard.values().filter(|(_, until)| now < *until).count() as u64
             };
             inflight + backoff
         };
@@ -4573,7 +4577,10 @@ impl P2PNode {
                                         );
                                         if expected == payload.hmac {
                                             let mut rep = reputation.lock().await;
-                                            rep.record_uptime_proof(&trusted_anchor_peer_id(addr, trusted_seed));
+                                            rep.record_uptime_proof(&trusted_anchor_peer_id(
+                                                addr,
+                                                trusted_seed,
+                                            ));
                                             let mut guard = peer_state.lock().await;
                                             guard.last_uptime_challenge = None;
                                         }
@@ -4805,7 +4812,9 @@ impl P2PNode {
                                                 .unwrap_or(local_h);
                                             best_h <= local_h
                                         };
-                                        let noisy = (!added_any && header_count >= 16) || (at_tip && header_count >= 32) || header_count >= 2000;
+                                        let noisy = (!added_any && header_count >= 16)
+                                            || (at_tip && header_count >= 32)
+                                            || header_count >= 2000;
                                         let allow = if noisy {
                                             st.last_headers_batch_log
                                                 .map(|t| {
@@ -5416,7 +5425,10 @@ impl P2PNode {
                                         .await;
                                         if let Some(ok) = record_verdict {
                                             let mut rep = reputation.lock().await;
-                                            rep.record_block(&trusted_anchor_peer_id(addr, trusted_seed), ok);
+                                            rep.record_block(
+                                                &trusted_anchor_peer_id(addr, trusted_seed),
+                                                ok,
+                                            );
                                         }
                                     }
                                     Err(e) => {
@@ -5425,7 +5437,10 @@ impl P2PNode {
                                             addr, e
                                         );
                                         let mut rep = reputation.lock().await;
-                                        rep.record_decode_error(&trusted_anchor_peer_id(addr, trusted_seed));
+                                        rep.record_decode_error(&trusted_anchor_peer_id(
+                                            addr,
+                                            trusted_seed,
+                                        ));
                                     }
                                 }
                             }
@@ -6590,7 +6605,10 @@ async fn handle_incoming_with_sybil(
                                     compute_uptime_hmac(&key, &payload.nonce, payload.timestamp);
                                 if expected == payload.hmac {
                                     let mut rep = reputation.lock().await;
-                                    rep.record_uptime_proof(&trusted_anchor_peer_id(addr, trusted_seed));
+                                    rep.record_uptime_proof(&trusted_anchor_peer_id(
+                                        addr,
+                                        trusted_seed,
+                                    ));
                                     let mut guard = peer_state.lock().await;
                                     guard.last_uptime_challenge = None;
                                 }
@@ -6850,7 +6868,9 @@ async fn handle_incoming_with_sybil(
                                             .unwrap_or(local_h);
                                         best_h <= local_h
                                     };
-                                    let noisy = (!added_any && header_count >= 16) || (at_tip && header_count >= 32) || header_count >= 2000;
+                                    let noisy = (!added_any && header_count >= 16)
+                                        || (at_tip && header_count >= 32)
+                                        || header_count >= 2000;
                                     let allow = if noisy {
                                         st.last_headers_batch_log
                                             .map(|t| {

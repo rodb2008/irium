@@ -57,8 +57,17 @@ mod tests {
     fn serializes_era_fields_cleanly() {
         let era = network_era(12_345);
         let value = serde_json::to_value(era).expect("serialize era");
-        assert_eq!(value.get("era_name"), Some(&Value::String("Early Miner Era".to_string())));
-        assert_eq!(value.get("early_participation_signal"), Some(&Value::Bool(true)));
-        assert!(value.get("era_description").and_then(Value::as_str).is_some());
+        assert_eq!(
+            value.get("era_name"),
+            Some(&Value::String("Early Miner Era".to_string()))
+        );
+        assert_eq!(
+            value.get("early_participation_signal"),
+            Some(&Value::Bool(true))
+        );
+        assert!(value
+            .get("era_description")
+            .and_then(Value::as_str)
+            .is_some());
     }
 }

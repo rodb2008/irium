@@ -62,6 +62,8 @@ fn normalize_seed(addr: &str) -> Option<String> {
 pub struct PeerRecord {
     pub multiaddr: String,
     pub agent: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
     pub last_seen: f64,
     pub first_seen: f64,
     #[serde(default)]
@@ -71,6 +73,10 @@ pub struct PeerRecord {
     pub node_id: Option<String>,
     #[serde(default)]
     pub dialable: bool,
+    #[serde(default)]
+    pub last_successful_connect: Option<f64>,
+    #[serde(default)]
+    pub last_successful_handshake: Option<f64>,
 }
 
 impl PeerRecord {
@@ -80,6 +86,7 @@ impl PeerRecord {
         PeerRecord {
             multiaddr,
             agent,
+            source: None,
             last_seen: t,
             first_seen: t,
             seen_days: vec![day],
@@ -87,6 +94,8 @@ impl PeerRecord {
             last_height: None,
             node_id: None,
             dialable: false,
+            last_successful_connect: None,
+            last_successful_handshake: None,
         }
     }
 
@@ -441,15 +450,25 @@ impl PeerDirectory {
                     .get("node_id")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let source = obj
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let dialable = obj
                     .get("dialable")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let last_successful_connect =
+                    obj.get("last_successful_connect").and_then(|v| v.as_f64());
+                let last_successful_handshake = obj
+                    .get("last_successful_handshake")
+                    .and_then(|v| v.as_f64());
                 self.records.insert(
                     addr.clone(),
                     PeerRecord {
                         multiaddr: addr.clone(),
                         agent,
+                        source,
                         first_seen,
                         last_seen,
                         seen_days,
@@ -457,6 +476,8 @@ impl PeerDirectory {
                         last_height,
                         node_id,
                         dialable,
+                        last_successful_connect,
+                        last_successful_handshake,
                     },
                 );
             }
@@ -529,6 +550,7 @@ impl PeerDirectory {
             PeerRecord {
                 multiaddr,
                 agent: None,
+                source: Some("peer_exchange".to_string()),
                 last_seen: 0.0,
                 first_seen: t,
                 seen_days: Vec::new(),
@@ -536,6 +558,8 @@ impl PeerDirectory {
                 last_height: None,
                 node_id: None,
                 dialable: false,
+                last_successful_connect: None,
+                last_successful_handshake: None,
             },
         );
         Ok(true)
@@ -555,6 +579,12 @@ impl PeerDirectory {
                 obj.insert(
                     "agent".to_string(),
                     serde_json::Value::String(agent.clone()),
+                );
+            }
+            if let Some(source) = &rec.source {
+                obj.insert(
+                    "source".to_string(),
+                    serde_json::Value::String(source.clone()),
                 );
             }
             if let Some(relay) = &rec.relay_address {
@@ -598,6 +628,24 @@ impl PeerDirectory {
                 "dialable".to_string(),
                 serde_json::Value::Bool(rec.dialable),
             );
+            if let Some(ts) = rec.last_successful_connect {
+                obj.insert(
+                    "last_successful_connect".to_string(),
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(ts)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    ),
+                );
+            }
+            if let Some(ts) = rec.last_successful_handshake {
+                obj.insert(
+                    "last_successful_handshake".to_string(),
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(ts)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    ),
+                );
+            }
             map.insert(addr.clone(), serde_json::Value::Object(obj));
         }
         let value = serde_json::Value::Object(map);
@@ -621,8 +669,14 @@ impl PeerDirectory {
             .entry(multiaddr.clone())
             .or_insert_with(|| PeerRecord::new(multiaddr.clone(), agent.clone()));
         entry.agent = agent;
+        if entry.source.is_none() {
+            entry.source = Some("live".to_string());
+        }
         entry.relay_address = relay_address.or(entry.relay_address.clone());
         entry.node_id = node_id.or(entry.node_id.clone());
+        let now = now_secs();
+        entry.last_successful_connect = Some(now);
+        entry.last_successful_handshake = Some(now);
         entry.touch();
 
         self.flush();
@@ -654,10 +708,8 @@ impl PeerDirectory {
         if total == 0 {
             return;
         }
-        let suppressible_burst = accepted == 0
-            && invalid == 0
-            && total >= 64
-            && private + duplicate == total;
+        let suppressible_burst =
+            accepted == 0 && invalid == 0 && total >= 64 && private + duplicate == total;
         if suppressible_burst {
             self.suppressed_learned_bursts = self.suppressed_learned_bursts.saturating_add(1);
             self.suppressed_learned_total = self.suppressed_learned_total.saturating_add(total);
@@ -690,9 +742,18 @@ impl PeerDirectory {
     /// Mark a peer as seen without changing its metadata.
     pub fn mark_dialable(&mut self, multiaddr: &str) {
         if let Some(rec) = self.records.get_mut(multiaddr) {
+            let now = now_secs();
+            let mut changed = false;
             if !rec.dialable {
                 rec.dialable = true;
-                rec.touch();
+                changed = true;
+            }
+            if rec.last_successful_handshake.is_none() {
+                rec.last_successful_handshake = Some(now);
+                changed = true;
+            }
+            rec.touch();
+            if changed {
                 self.flush();
             }
         }
@@ -753,8 +814,8 @@ impl PeerDirectory {
         });
     }
 
-    /// Apply seedlist policy: promote peers active for 7 consecutive days,
-    /// drop peers idle > 24h. Baseline seeds remain in the static seedlist file.
+    /// Promote recently dialable learned peers into the runtime seedlist with
+    /// scoring/aging, while keeping static seeds as a baseline.
     pub fn refresh_seedlist_with_policy(&mut self) {
         self.prune_stale_records();
         let now = now_secs();
@@ -765,8 +826,11 @@ impl PeerDirectory {
         let mut seeds = self.seed_manager.load_static_entries();
 
         for rec in self.records.values() {
+            if rec.dialable == false {
+                continue;
+            }
             let idle_hours = (now - rec.last_seen) / 3600.0;
-            if !rec.dialable {
+            if idle_hours > max_idle {
                 continue;
             }
             let mut active_days = 0;
@@ -775,10 +839,7 @@ impl PeerDirectory {
                     active_days += 1;
                 }
             }
-            // For runtime seeds we only publish peers we have successfully dialed (dialable=true).
-            // Once dialable, we do not require multi-day stability before publishing; this keeps
-            // the runtime seedlist fresh and avoids churn on dead/NAT-only addresses.
-            if active_days >= 1 && idle_hours <= max_idle {
+            if active_days >= 1 {
                 if let Some(ip) = normalize_seed(&rec.multiaddr) {
                     seeds.push(ip);
                 }
@@ -788,12 +849,9 @@ impl PeerDirectory {
         seeds.sort();
         seeds.dedup();
         if seeds.is_empty() {
-            // Keep the previous runtime seedlist until we have at least one dialable peer.
             return;
         }
 
-        // Do not aggressively collapse runtime seeds after short churn windows.
-        // Keep a minimum warm set by carrying forward previous runtime entries.
         let min_runtime = SeedlistManager::runtime_seed_min_count();
         if seeds.len() < min_runtime {
             for prev in self.seed_manager.load_runtime_entries() {
@@ -805,7 +863,6 @@ impl PeerDirectory {
                 }
             }
         }
-
         self.seed_manager.write_runtime_entries(seeds);
     }
 

@@ -202,7 +202,9 @@ impl ReputationManager {
         let Ok(text) = serde_json::to_string_pretty(&value) else {
             return;
         };
-        let tmp = self.path.with_extension(format!("json.tmp.{}", process::id()));
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp.{}", process::id()));
         if let Ok(mut file) = File::create(&tmp) {
             if file.write_all(text.as_bytes()).is_ok() && file.sync_all().is_ok() {
                 let _ = fs::rename(&tmp, &self.path);

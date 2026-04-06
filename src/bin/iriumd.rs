@@ -48,6 +48,15 @@ use irium_node_rs::p2p::P2PNode;
 use irium_node_rs::pow::{meets_target, sha256d, Target};
 use irium_node_rs::rate_limiter::RateLimiter;
 use irium_node_rs::reputation::ReputationManager;
+use irium_node_rs::settlement::{
+    build_agreement_activity_timeline, build_agreement_anchor_output, build_agreement_audit_record,
+    build_funding_legs, compute_agreement_hash_hex, derive_lifecycle,
+    discover_agreement_funding_leg_candidates, extract_agreement_funding_leg_refs_from_tx,
+    parse_agreement_anchor, verify_agreement_bundle, AgreementActivityEvent, AgreementAnchor,
+    AgreementAnchorRole, AgreementAuditFundingLegRecord, AgreementAuditRecord, AgreementBundle,
+    AgreementFundingLegRef, AgreementLifecycleView, AgreementLinkedTx, AgreementMilestoneStatus,
+    AgreementObject, AgreementSummary,
+};
 use irium_node_rs::storage;
 use irium_node_rs::tx::{
     decode_full_tx, encode_htlcv1_claim_witness, encode_htlcv1_refund_witness,
@@ -60,6 +69,11 @@ use k256::ecdsa::{Signature, SigningKey};
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
 const MAX_SUBMIT_BLOCK_TXS: usize = 10_000;
+const BUILTIN_FALLBACK_PEERS: &[&str] = &[
+    "157.173.116.134:38291",
+    "46.224.159.183:38291",
+    "207.244.247.86:38291",
+];
 
 #[derive(Clone)]
 struct AppState {
@@ -90,8 +104,11 @@ struct AppState {
 struct PeerInfo {
     multiaddr: String,
     agent: Option<String>,
+    source: Option<String>,
     height: Option<u64>,
     last_seen: f64,
+    dialable: bool,
+    last_successful_handshake: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -466,6 +483,177 @@ struct InspectHtlcResponse {
     refund_address: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct AgreementRequest {
+    agreement: AgreementObject,
+}
+
+#[derive(Deserialize)]
+struct FundAgreementRequest {
+    agreement: AgreementObject,
+    fee_per_byte: Option<u64>,
+    broadcast: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct AgreementHashResponse {
+    agreement_hash: String,
+}
+
+#[derive(Serialize)]
+struct AgreementInspectResponse {
+    agreement_hash: String,
+    summary: AgreementSummary,
+}
+
+#[derive(Serialize)]
+struct AgreementTxsResponse {
+    agreement_hash: String,
+    txs: Vec<AgreementLinkedTx>,
+}
+
+#[derive(Serialize)]
+struct AgreementStatusResponse {
+    agreement_hash: String,
+    lifecycle: AgreementLifecycleView,
+}
+
+#[derive(Serialize)]
+struct AgreementMilestonesResponse {
+    agreement_hash: String,
+    state: String,
+    milestones: Vec<AgreementMilestoneStatus>,
+}
+
+#[derive(Deserialize)]
+struct AgreementContextRequest {
+    agreement: AgreementObject,
+    #[serde(default)]
+    bundle: Option<AgreementBundle>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AgreementFundingLegCandidateResponse {
+    agreement_hash: String,
+    funding_txid: String,
+    htlc_vout: u32,
+    anchor_vout: u32,
+    role: AgreementAnchorRole,
+    milestone_id: Option<String>,
+    amount: u64,
+    htlc_backed: bool,
+    timeout_height: u64,
+    recipient_address: String,
+    refund_address: String,
+    source_notes: Vec<String>,
+    release_eligible: bool,
+    release_reasons: Vec<String>,
+    refund_eligible: bool,
+    refund_reasons: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AgreementFundingLegsResponse {
+    agreement_hash: String,
+    selection_required: bool,
+    candidates: Vec<AgreementFundingLegCandidateResponse>,
+    trust_model_note: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AgreementTimelineResponse {
+    agreement_hash: String,
+    lifecycle: AgreementLifecycleView,
+    events: Vec<AgreementActivityEvent>,
+    trust_model_note: String,
+}
+
+#[derive(Deserialize)]
+struct VerifyAgreementLinkRequest {
+    agreement_hash: String,
+    tx_hex: String,
+}
+
+#[derive(Serialize)]
+struct VerifyAgreementLinkResponse {
+    agreement_hash: String,
+    matched: bool,
+    anchors: Vec<AgreementAnchor>,
+}
+
+#[derive(Serialize)]
+struct AgreementFundingOutput {
+    vout: u32,
+    role: AgreementAnchorRole,
+    milestone_id: Option<String>,
+    amount: u64,
+}
+
+#[derive(Serialize)]
+struct FundAgreementResponse {
+    agreement_hash: String,
+    txid: String,
+    accepted: bool,
+    raw_tx_hex: String,
+    outputs: Vec<AgreementFundingOutput>,
+    fee: u64,
+}
+
+#[derive(Deserialize)]
+struct AgreementSpendRequest {
+    agreement: AgreementObject,
+    funding_txid: String,
+    htlc_vout: Option<u32>,
+    milestone_id: Option<String>,
+    destination_address: Option<String>,
+    fee_per_byte: Option<u64>,
+    broadcast: Option<bool>,
+    secret_hex: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AgreementSpendEligibilityResponse {
+    agreement_hash: String,
+    agreement_id: String,
+    funding_txid: String,
+    htlc_vout: Option<u32>,
+    anchor_vout: Option<u32>,
+    role: Option<AgreementAnchorRole>,
+    milestone_id: Option<String>,
+    amount: Option<u64>,
+    branch: String,
+    htlc_backed: bool,
+    funded: bool,
+    unspent: bool,
+    preimage_required: bool,
+    timeout_height: Option<u64>,
+    timeout_reached: bool,
+    destination_address: Option<String>,
+    expected_hash: Option<String>,
+    recipient_address: Option<String>,
+    refund_address: Option<String>,
+    eligible: bool,
+    reasons: Vec<String>,
+    trust_model_note: String,
+}
+
+#[derive(Serialize)]
+struct AgreementBuildSpendResponse {
+    agreement_hash: String,
+    agreement_id: String,
+    funding_txid: String,
+    htlc_vout: u32,
+    role: AgreementAnchorRole,
+    milestone_id: Option<String>,
+    branch: String,
+    destination_address: String,
+    txid: String,
+    accepted: bool,
+    raw_tx_hex: String,
+    fee: u64,
+    trust_model_note: String,
+}
+
 #[derive(Serialize)]
 struct WalletExportWifResponse {
     address: String,
@@ -541,7 +729,7 @@ struct NodeConfig {
     /// Optional P2P bind address, e.g. "0.0.0.0:38291".
     #[serde(default)]
     p2p_bind: Option<String>,
-    /// Optional list of seed peers, e.g. ["seed.example.org:38291"].
+    /// Optional list of manual peers, e.g. ["seed.example.org:38291"].
     #[serde(default)]
     p2p_seeds: Vec<String>,
     /// Optional DNS seed hosts.
@@ -716,6 +904,10 @@ fn load_persisted_startup_seeds(
                         persisted_records.push(irium_node_rs::network::PeerRecord {
                             multiaddr: multiaddr.clone(),
                             agent: None,
+                            source: obj
+                                .get("source")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                             last_seen,
                             first_seen,
                             seen_days: Vec::new(),
@@ -723,6 +915,12 @@ fn load_persisted_startup_seeds(
                             last_height: obj.get("last_height").and_then(|v| v.as_u64()),
                             node_id: None,
                             dialable,
+                            last_successful_connect: obj
+                                .get("last_successful_connect")
+                                .and_then(|v| v.as_f64()),
+                            last_successful_handshake: obj
+                                .get("last_successful_handshake")
+                                .and_then(|v| v.as_f64()),
                         });
                     }
                 }
@@ -2505,8 +2703,11 @@ async fn peers(
             .map(|p| PeerInfo {
                 multiaddr: p.multiaddr,
                 agent: p.agent,
+                source: p.source,
                 height: p.last_height,
                 last_seen: p.last_seen,
+                dialable: p.dialable,
+                last_successful_handshake: p.last_successful_handshake,
             })
             .collect();
         Ok(Json(PeersResponse { peers: list }))
@@ -2743,6 +2944,955 @@ async fn get_utxos(
         pkh: hex::encode(pkh_arr),
         height,
         utxos,
+    }))
+}
+
+fn agreement_party_address<'a>(
+    agreement: &'a AgreementObject,
+    party_id: &str,
+) -> Result<&'a str, StatusCode> {
+    agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == party_id)
+        .map(|p| p.address.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)
+}
+
+fn agreement_anchor_value(
+    agreement: &AgreementObject,
+    role: AgreementAnchorRole,
+    milestone_id: Option<&str>,
+) -> u64 {
+    if let Some(mid) = milestone_id {
+        if let Some(ms) = agreement.milestones.iter().find(|m| m.milestone_id == mid) {
+            return ms.amount;
+        }
+    }
+    match role {
+        AgreementAnchorRole::DepositLock | AgreementAnchorRole::CollateralLock => agreement
+            .deposit_rule
+            .as_ref()
+            .map(|r| r.amount)
+            .unwrap_or(agreement.total_amount),
+        _ => agreement.total_amount,
+    }
+}
+
+fn scan_agreement_linked_txs(
+    chain: &ChainState,
+    agreement: &AgreementObject,
+    agreement_hash: &str,
+) -> Vec<AgreementLinkedTx> {
+    let mut txs = Vec::new();
+    for (height, block) in chain.chain.iter().enumerate() {
+        for tx in &block.transactions {
+            let txid = hex::encode(tx.txid());
+            for output in &tx.outputs {
+                if let Some(anchor) = parse_agreement_anchor(&output.script_pubkey) {
+                    if anchor.agreement_hash == agreement_hash {
+                        txs.push(AgreementLinkedTx {
+                            txid: txid.clone(),
+                            role: anchor.role,
+                            milestone_id: anchor.milestone_id.clone(),
+                            height: Some(height as u64),
+                            confirmed: true,
+                            value: agreement_anchor_value(
+                                agreement,
+                                anchor.role,
+                                anchor.milestone_id.as_deref(),
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    txs.sort_by(|a, b| {
+        b.height
+            .cmp(&a.height)
+            .then_with(|| a.txid.cmp(&b.txid))
+            .then_with(|| a.milestone_id.cmp(&b.milestone_id))
+    });
+    txs
+}
+
+fn find_confirmed_tx_by_id(chain: &ChainState, txid_hex: &str) -> Result<Transaction, String> {
+    let target = hex_to_32(txid_hex.trim()).map_err(|e| format!("invalid funding_txid: {e}"))?;
+    for block in &chain.chain {
+        for tx in &block.transactions {
+            if tx.txid() == target {
+                return Ok(tx.clone());
+            }
+        }
+    }
+    Err("funding_tx_not_found_on_chain".to_string())
+}
+
+fn resolve_agreement_leg_ref(
+    chain: &ChainState,
+    agreement: &AgreementObject,
+    agreement_hash: &str,
+    funding_txid: &str,
+    htlc_vout: Option<u32>,
+    milestone_id: Option<&str>,
+) -> Result<AgreementFundingLegRef, String> {
+    let tx = find_confirmed_tx_by_id(chain, funding_txid)?;
+    let mut refs = extract_agreement_funding_leg_refs_from_tx(&tx, agreement_hash);
+    refs.retain(|r| {
+        matches!(
+            r.role,
+            AgreementAnchorRole::Funding
+                | AgreementAnchorRole::DepositLock
+                | AgreementAnchorRole::OtcSettlement
+                | AgreementAnchorRole::MerchantSettlement
+        )
+    });
+    if let Some(vout) = htlc_vout {
+        refs.retain(|r| r.htlc_vout == vout);
+    }
+    if let Some(mid) = milestone_id {
+        refs.retain(|r| r.milestone_id.as_deref() == Some(mid));
+    }
+    if refs.is_empty() {
+        return Err("agreement_funding_leg_not_found_or_not_htlc_backed".to_string());
+    }
+    if refs.len() > 1 {
+        return Err("agreement_funding_leg_ambiguous".to_string());
+    }
+    let resolved = refs.remove(0);
+    let expected_amount = if let Some(mid) = resolved.milestone_id.as_deref() {
+        agreement
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == mid)
+            .map(|m| m.amount)
+            .unwrap_or(agreement.total_amount)
+    } else {
+        match resolved.role {
+            AgreementAnchorRole::DepositLock | AgreementAnchorRole::CollateralLock => agreement
+                .deposit_rule
+                .as_ref()
+                .map(|r| r.amount)
+                .unwrap_or(agreement.total_amount),
+            _ => agreement.total_amount,
+        }
+    };
+    if resolved.amount != expected_amount {
+        return Err("agreement_leg_amount_mismatch".to_string());
+    }
+    Ok(resolved)
+}
+
+fn agreement_observation_trust_note() -> String {
+    "Phase 1 agreement funding leg discovery and activity timelines are reconstructed from the supplied canonical agreement object, optional local bundle hints, on-chain anchor observations, and HTLCv1 branch checks. They do not create native consensus agreement state.".to_string()
+}
+
+fn verify_agreement_context_bundle(
+    agreement: &AgreementObject,
+    bundle: Option<&AgreementBundle>,
+    agreement_hash: &str,
+) -> Result<Option<AgreementBundle>, String> {
+    let Some(bundle) = bundle else {
+        return Ok(None);
+    };
+    verify_agreement_bundle(bundle)?;
+    if bundle.agreement_hash != agreement_hash {
+        return Err("bundle agreement hash does not match supplied agreement".to_string());
+    }
+    if bundle.agreement != *agreement {
+        return Err("bundle agreement object does not match supplied agreement".to_string());
+    }
+    Ok(Some(bundle.clone()))
+}
+
+fn collect_agreement_funding_leg_refs(
+    chain: &ChainState,
+    agreement: &AgreementObject,
+    agreement_hash: &str,
+) -> Vec<AgreementFundingLegRef> {
+    let linked = scan_agreement_linked_txs(chain, agreement, agreement_hash);
+    let mut refs = Vec::new();
+    let mut seen = Vec::<String>::new();
+    for tx in linked.iter().filter(|tx| {
+        matches!(
+            tx.role,
+            AgreementAnchorRole::Funding
+                | AgreementAnchorRole::DepositLock
+                | AgreementAnchorRole::OtcSettlement
+                | AgreementAnchorRole::MerchantSettlement
+        )
+    }) {
+        if seen.iter().any(|existing| existing == &tx.txid) {
+            continue;
+        }
+        seen.push(tx.txid.clone());
+        if let Ok(observed_tx) = find_confirmed_tx_by_id(chain, &tx.txid) {
+            refs.extend(extract_agreement_funding_leg_refs_from_tx(
+                &observed_tx,
+                agreement_hash,
+            ));
+        }
+    }
+    refs.sort_by(|a, b| {
+        a.milestone_id
+            .cmp(&b.milestone_id)
+            .then_with(|| a.funding_txid.cmp(&b.funding_txid))
+            .then_with(|| a.htlc_vout.cmp(&b.htlc_vout))
+    });
+    refs
+}
+
+fn build_agreement_funding_leg_candidate_views(
+    chain: &ChainState,
+    agreement: &AgreementObject,
+    agreement_hash: &str,
+    bundle: Option<&AgreementBundle>,
+) -> Result<Vec<AgreementFundingLegCandidateResponse>, String> {
+    let linked = scan_agreement_linked_txs(chain, agreement, agreement_hash);
+    let refs = collect_agreement_funding_leg_refs(chain, agreement, agreement_hash);
+    let candidates = discover_agreement_funding_leg_candidates(
+        agreement_hash,
+        &linked,
+        &refs,
+        bundle.map(|b| &b.metadata),
+    )?;
+    let mut out = Vec::new();
+    for candidate in candidates {
+        let release_eval = evaluate_agreement_spend_eligibility(
+            true,
+            chain,
+            agreement,
+            &AgreementSpendRequest {
+                agreement: agreement.clone(),
+                funding_txid: candidate.funding_txid.clone(),
+                htlc_vout: Some(candidate.htlc_vout),
+                milestone_id: candidate.milestone_id.clone(),
+                destination_address: None,
+                fee_per_byte: None,
+                broadcast: Some(false),
+                secret_hex: None,
+            },
+        )?;
+        let refund_eval = evaluate_agreement_spend_eligibility(
+            false,
+            chain,
+            agreement,
+            &AgreementSpendRequest {
+                agreement: agreement.clone(),
+                funding_txid: candidate.funding_txid.clone(),
+                htlc_vout: Some(candidate.htlc_vout),
+                milestone_id: candidate.milestone_id.clone(),
+                destination_address: None,
+                fee_per_byte: None,
+                broadcast: Some(false),
+                secret_hex: None,
+            },
+        )?;
+        out.push(AgreementFundingLegCandidateResponse {
+            agreement_hash: candidate.agreement_hash,
+            funding_txid: candidate.funding_txid,
+            htlc_vout: candidate.htlc_vout,
+            anchor_vout: candidate.anchor_vout,
+            role: candidate.role,
+            milestone_id: candidate.milestone_id,
+            amount: candidate.amount,
+            htlc_backed: candidate.htlc_backed,
+            timeout_height: candidate.timeout_height,
+            recipient_address: candidate.recipient_address,
+            refund_address: candidate.refund_address,
+            source_notes: candidate.source_notes,
+            release_eligible: release_eval.eligible,
+            release_reasons: release_eval.reasons,
+            refund_eligible: refund_eval.eligible,
+            refund_reasons: refund_eval.reasons,
+        });
+    }
+    Ok(out)
+}
+
+fn agreement_spend_trust_note() -> String {
+    "Phase 1 agreement release/refund uses existing HTLCv1 spend rules only. Agreement lifecycle, milestone meaning, and settlement context remain metadata/indexed and require off-chain agreement exchange.".to_string()
+}
+
+fn evaluate_agreement_spend_eligibility(
+    claim: bool,
+    chain: &ChainState,
+    agreement: &AgreementObject,
+    req: &AgreementSpendRequest,
+) -> Result<AgreementSpendEligibilityResponse, String> {
+    agreement.validate()?;
+    let agreement_hash = compute_agreement_hash_hex(agreement)?;
+    let leg = resolve_agreement_leg_ref(
+        chain,
+        agreement,
+        &agreement_hash,
+        &req.funding_txid,
+        req.htlc_vout,
+        req.milestone_id.as_deref(),
+    )?;
+    let outpoint = OutPoint {
+        txid: hex_to_32(req.funding_txid.trim())
+            .map_err(|e| format!("invalid funding_txid: {e}"))?,
+        index: leg.htlc_vout,
+    };
+    let maybe_utxo = chain.utxos.get(&outpoint).cloned();
+    let unspent = maybe_utxo.is_some();
+    let tip_height = chain.tip_height();
+    let timeout_reached = tip_height >= leg.timeout_height;
+    let mut reasons = Vec::new();
+    let preimage_required = claim;
+    if !unspent {
+        reasons.push("funding_leg_already_spent_or_missing".to_string());
+    }
+    if claim {
+        match req.secret_hex.as_deref() {
+            Some(secret_hex) => {
+                let preimage = hex::decode(secret_hex.trim())
+                    .map_err(|_| "secret_hex_invalid_hex".to_string())?;
+                let digest = sha256d(&preimage)[..32].to_vec();
+                if hex::encode(digest) != leg.expected_hash {
+                    reasons.push("secret_hash_mismatch".to_string());
+                }
+            }
+            None => reasons.push("secret_hex_required_for_release".to_string()),
+        }
+    } else if !timeout_reached {
+        reasons.push("refund_timeout_not_reached".to_string());
+    }
+    let destination_address = req.destination_address.clone().or_else(|| {
+        if claim {
+            Some(leg.recipient_address.clone())
+        } else {
+            Some(leg.refund_address.clone())
+        }
+    });
+    let eligible = reasons.is_empty() && destination_address.is_some();
+    Ok(AgreementSpendEligibilityResponse {
+        agreement_hash,
+        agreement_id: agreement.agreement_id.clone(),
+        funding_txid: req.funding_txid.clone(),
+        htlc_vout: Some(leg.htlc_vout),
+        anchor_vout: Some(leg.anchor_vout),
+        role: Some(leg.role),
+        milestone_id: leg.milestone_id.clone(),
+        amount: Some(leg.amount),
+        branch: if claim {
+            "release".to_string()
+        } else {
+            "refund".to_string()
+        },
+        htlc_backed: true,
+        funded: true,
+        unspent,
+        preimage_required,
+        timeout_height: Some(leg.timeout_height),
+        timeout_reached,
+        destination_address,
+        expected_hash: Some(leg.expected_hash.clone()),
+        recipient_address: Some(leg.recipient_address.clone()),
+        refund_address: Some(leg.refund_address.clone()),
+        eligible,
+        reasons,
+        trust_model_note: agreement_spend_trust_note(),
+    })
+}
+
+fn spend_htlc_from_params(
+    claim: bool,
+    state: &AppState,
+    funding_txid: &str,
+    vout: u32,
+    destination_address: &str,
+    fee_per_byte: Option<u64>,
+    broadcast: Option<bool>,
+    secret_hex: Option<&str>,
+) -> Result<SpendHtlcResponse, StatusCode> {
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .htlcv1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    let txid_arr = hex_to_32(funding_txid.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (funding_out, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let key = OutPoint {
+            txid: txid_arr,
+            index: vout,
+        };
+        let utxo = chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        (utxo, chain.tip_height())
+    };
+    let htlc =
+        parse_htlcv1_script(&funding_out.output.script_pubkey).ok_or(StatusCode::BAD_REQUEST)?;
+    let signer_pkh = if claim {
+        htlc.recipient_pkh
+    } else {
+        htlc.refund_pkh
+    };
+    if !claim && tip_height < htlc.timeout_height {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let keys = wallet.keys().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut key: Option<WalletKey> = None;
+    for k in keys {
+        let b = hex::decode(&k.pkh).map_err(|_| StatusCode::BAD_REQUEST)?;
+        if b.len() != 20 {
+            continue;
+        }
+        let mut pkh = [0u8; 20];
+        pkh.copy_from_slice(&b);
+        if pkh == signer_pkh {
+            key = Some(k);
+            break;
+        }
+    }
+    let key = key.ok_or(StatusCode::FORBIDDEN)?;
+    let dest = base58_p2pkh_to_hash(destination_address).ok_or(StatusCode::BAD_REQUEST)?;
+    if dest.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut dest_pkh = [0u8; 20];
+    dest_pkh.copy_from_slice(&dest);
+    let fee_per_byte = fee_per_byte.unwrap_or(1).max(1);
+    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    if funding_out.output.value <= fee {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: txid_arr,
+            prev_index: vout,
+            script_sig: Vec::new(),
+            sequence: 0xffff_fffe,
+        }],
+        outputs: vec![TxOutput {
+            value: funding_out.output.value - fee,
+            script_pubkey: p2pkh_script(&dest_pkh),
+        }],
+        locktime: 0,
+    };
+    let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+    let priv_bytes = hex::decode(&key.privkey).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if priv_bytes.len() != 32 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(&priv_bytes);
+    let signing_key =
+        SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let sig: Signature = signing_key
+        .sign_prehash(&digest)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let sig = sig.normalize_s().unwrap_or(sig);
+    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+    sig_bytes.push(0x01);
+    let pubkey = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+    tx.inputs[0].script_sig = if claim {
+        let secret_hex = secret_hex.ok_or(StatusCode::BAD_REQUEST)?;
+        let preimage = hex::decode(secret_hex.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+        encode_htlcv1_claim_witness(&sig_bytes, &pubkey, &preimage)
+            .ok_or(StatusCode::BAD_REQUEST)?
+    } else {
+        encode_htlcv1_refund_witness(&sig_bytes, &pubkey).ok_or(StatusCode::BAD_REQUEST)?
+    };
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+    let raw = tx.serialize();
+    let txid = tx.txid();
+    let txid_hex = hex::encode(txid);
+    let mut accepted = false;
+    if broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid) {
+            accepted = mempool
+                .add_transaction(tx, raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+    Ok(SpendHtlcResponse {
+        txid: txid_hex,
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    })
+}
+
+async fn create_agreement(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementRequest>,
+) -> Result<Json<AgreementInspectResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let summary = req
+        .agreement
+        .summary()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(AgreementInspectResponse {
+        agreement_hash: summary.agreement_hash.clone(),
+        summary,
+    }))
+}
+
+async fn inspect_agreement(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementRequest>,
+) -> Result<Json<AgreementInspectResponse>, StatusCode> {
+    create_agreement(ConnectInfo(addr), State(state), headers, AxumJson(req)).await
+}
+
+async fn compute_agreement_hash_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementRequest>,
+) -> Result<Json<AgreementHashResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(AgreementHashResponse { agreement_hash }))
+}
+
+async fn list_agreement_txs(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementRequest>,
+) -> Result<Json<AgreementTxsResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let txs = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        scan_agreement_linked_txs(&chain, &req.agreement, &agreement_hash)
+    };
+    Ok(Json(AgreementTxsResponse {
+        agreement_hash,
+        txs,
+    }))
+}
+
+async fn agreement_funding_legs(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementContextRequest>,
+) -> Result<Json<AgreementFundingLegsResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let bundle =
+        verify_agreement_context_bundle(&req.agreement, req.bundle.as_ref(), &agreement_hash)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let candidates = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        build_agreement_funding_leg_candidate_views(
+            &chain,
+            &req.agreement,
+            &agreement_hash,
+            bundle.as_ref(),
+        )
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+    Ok(Json(AgreementFundingLegsResponse {
+        agreement_hash,
+        selection_required: candidates.len() != 1,
+        candidates,
+        trust_model_note: agreement_observation_trust_note(),
+    }))
+}
+
+async fn agreement_timeline(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementContextRequest>,
+) -> Result<Json<AgreementTimelineResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let bundle =
+        verify_agreement_context_bundle(&req.agreement, req.bundle.as_ref(), &agreement_hash)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (lifecycle, events) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let linked = scan_agreement_linked_txs(&chain, &req.agreement, &agreement_hash);
+        let lifecycle = derive_lifecycle(
+            &req.agreement,
+            &agreement_hash,
+            linked.clone(),
+            chain.tip_height(),
+        );
+        let refs = collect_agreement_funding_leg_refs(&chain, &req.agreement, &agreement_hash);
+        let candidates = discover_agreement_funding_leg_candidates(
+            &agreement_hash,
+            &linked,
+            &refs,
+            bundle.as_ref().map(|b| &b.metadata),
+        )
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let candidate_views = build_agreement_funding_leg_candidate_views(
+            &chain,
+            &req.agreement,
+            &agreement_hash,
+            bundle.as_ref(),
+        )
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let mut events = build_agreement_activity_timeline(
+            &agreement_hash,
+            &lifecycle,
+            &linked,
+            &candidates,
+            bundle.as_ref(),
+        );
+        for candidate in &candidate_views {
+            if candidate.release_eligible {
+                events.push(AgreementActivityEvent {
+                    event_type: "release_eligible".to_string(),
+                    source: irium_node_rs::settlement::AgreementActivitySource::HtlcEligibility,
+                    txid: Some(candidate.funding_txid.clone()),
+                    height: None,
+                    timestamp: None,
+                    milestone_id: candidate.milestone_id.clone(),
+                    note: Some(
+                        "HTLC release branch is currently eligible with the provided default context"
+                            .to_string(),
+                    ),
+                });
+            }
+            if candidate.refund_eligible {
+                events.push(AgreementActivityEvent {
+                    event_type: "refund_eligible".to_string(),
+                    source: irium_node_rs::settlement::AgreementActivitySource::HtlcEligibility,
+                    txid: Some(candidate.funding_txid.clone()),
+                    height: None,
+                    timestamp: None,
+                    milestone_id: candidate.milestone_id.clone(),
+                    note: Some(
+                        "HTLC refund branch is currently eligible with the observed timeout state"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
+        (lifecycle, events)
+    };
+    Ok(Json(AgreementTimelineResponse {
+        agreement_hash,
+        lifecycle,
+        events,
+        trust_model_note: agreement_observation_trust_note(),
+    }))
+}
+
+async fn agreement_status(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementRequest>,
+) -> Result<Json<AgreementStatusResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let lifecycle = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let linked = scan_agreement_linked_txs(&chain, &req.agreement, &agreement_hash);
+        derive_lifecycle(&req.agreement, &agreement_hash, linked, chain.tip_height())
+    };
+    Ok(Json(AgreementStatusResponse {
+        agreement_hash,
+        lifecycle,
+    }))
+}
+
+async fn agreement_milestones(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementRequest>,
+) -> Result<Json<AgreementMilestonesResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let lifecycle = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let linked = scan_agreement_linked_txs(&chain, &req.agreement, &agreement_hash);
+        derive_lifecycle(&req.agreement, &agreement_hash, linked, chain.tip_height())
+    };
+    Ok(Json(AgreementMilestonesResponse {
+        agreement_hash,
+        state: format!("{:?}", lifecycle.state).to_lowercase(),
+        milestones: lifecycle.milestones,
+    }))
+}
+
+async fn verify_agreement_link(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<VerifyAgreementLinkRequest>,
+) -> Result<Json<VerifyAgreementLinkResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let raw = hex::decode(req.tx_hex.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let tx = decode_full_tx(&raw).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let anchors: Vec<AgreementAnchor> = tx
+        .outputs
+        .iter()
+        .filter_map(|o| parse_agreement_anchor(&o.script_pubkey))
+        .filter(|a| a.agreement_hash == req.agreement_hash)
+        .collect();
+    Ok(Json(VerifyAgreementLinkResponse {
+        agreement_hash: req.agreement_hash,
+        matched: !anchors.is_empty(),
+        anchors,
+    }))
+}
+
+async fn fund_agreement(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<FundAgreementRequest>,
+) -> Result<Json<FundAgreementResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .htlcv1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err(bad("htlcv1_not_active_at_current_height"));
+        }
+    }
+
+    req.agreement
+        .validate()
+        .map_err(|_| bad("agreement_invalid"))?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| bad("agreement_hash_failed"))?;
+    let payer_addr = agreement_party_address(&req.agreement, &req.agreement.payer)
+        .map_err(|_| bad("payer_party_missing"))?;
+    let payee_addr = agreement_party_address(&req.agreement, &req.agreement.payee)
+        .map_err(|_| bad("payee_party_missing"))?;
+    let payer_vec =
+        base58_p2pkh_to_hash(payer_addr).ok_or_else(|| bad("payer_address_decode_failed"))?;
+    let payee_vec =
+        base58_p2pkh_to_hash(payee_addr).ok_or_else(|| bad("payee_address_decode_failed"))?;
+    if payer_vec.len() != 20 || payee_vec.len() != 20 {
+        return Err(bad("party_address_hash_len_invalid"));
+    }
+    let mut payer_pkh = [0u8; 20];
+    payer_pkh.copy_from_slice(&payer_vec);
+    let mut payee_pkh = [0u8; 20];
+    payee_pkh.copy_from_slice(&payee_vec);
+    let legs = build_funding_legs(&req.agreement, payer_pkh, payee_pkh)
+        .map_err(|_| bad("build_funding_legs_failed"))?;
+    if legs.is_empty() {
+        return Err(bad("agreement_has_no_funding_legs"));
+    }
+
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        for key in keys {
+            let bytes = hex::decode(&key.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            key_map.insert(arr, key);
+        }
+    }
+    if key_map.is_empty() {
+        return Err(bad("wallet_key_map_empty"));
+    }
+
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if key_map.contains_key(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+    if utxos.is_empty() {
+        return Err(bad("wallet_utxo_set_empty"));
+    }
+    utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
+
+    let total_required: u64 = legs.iter().map(|l| l.amount).sum();
+    let mut fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    if fee_per_byte == 0 {
+        fee_per_byte = 1;
+    }
+
+    let mut selected: Vec<WalletUtxo> = Vec::new();
+    let mut total = 0u64;
+    let mut fee = 0u64;
+    let base_outputs = legs.len().saturating_mul(2);
+    for utxo in &utxos {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+            continue;
+        }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.output.value);
+        fee = estimate_tx_size(selected.len(), base_outputs + 1).saturating_mul(fee_per_byte);
+        if total >= total_required.saturating_add(fee) {
+            break;
+        }
+    }
+    if total < total_required.saturating_add(fee) {
+        return Err(bad("insufficient_spendable_funds_or_immature_coinbase"));
+    }
+
+    let inputs: Vec<TxInput> = selected
+        .iter()
+        .map(|u| TxInput {
+            prev_txid: u.outpoint.txid,
+            prev_index: u.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        })
+        .collect();
+
+    let mut outputs = Vec::new();
+    let mut funding_outputs = Vec::new();
+    for leg in &legs {
+        let vout = outputs.len() as u32;
+        outputs.push(leg.output.clone());
+        outputs.push(
+            build_agreement_anchor_output(&AgreementAnchor {
+                agreement_hash: agreement_hash.clone(),
+                role: leg.role,
+                milestone_id: leg.milestone_id.clone(),
+            })
+            .map_err(|_| bad("build_agreement_anchor_failed"))?,
+        );
+        funding_outputs.push(AgreementFundingOutput {
+            vout,
+            role: leg.role,
+            milestone_id: leg.milestone_id.clone(),
+            amount: leg.amount,
+        });
+    }
+
+    let change_script = selected
+        .first()
+        .map(|u| p2pkh_script(&u.pkh))
+        .ok_or_else(|| bad("change_output_missing_selected_input"))?;
+    let mut change = total.saturating_sub(total_required).saturating_sub(fee);
+    if change > 0 {
+        outputs.push(TxOutput {
+            value: change,
+            script_pubkey: change_script.clone(),
+        });
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+    for _ in 0..2 {
+        sign_wallet_inputs(&mut tx, &selected, &key_map)
+            .map_err(|_| bad("sign_wallet_inputs_failed"))?;
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if change >= extra {
+                fee = needed_fee;
+                change = change.saturating_sub(extra);
+                if let Some(last) = tx.outputs.last_mut() {
+                    if p2pkh_hash_from_script(&last.script_pubkey).is_some() {
+                        last.value = change;
+                    }
+                }
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_change"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("chain_fee_calculation_failed"))?
+    };
+
+    let raw = tx.serialize();
+    let txid = tx.txid();
+    let txid_hex = hex::encode(txid);
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid) {
+            accepted = mempool
+                .add_transaction(tx.clone(), raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+
+    Ok(Json(FundAgreementResponse {
+        agreement_hash,
+        txid: txid_hex,
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        outputs: funding_outputs,
+        fee: fee_checked,
     }))
 }
 
@@ -3612,6 +4762,228 @@ async fn refund_htlc(
     spend_htlc_internal(false, addr, state, headers, req).await
 }
 
+async fn agreement_audit(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementContextRequest>,
+) -> Result<Json<AgreementAuditRecord>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let bundle =
+        verify_agreement_context_bundle(&req.agreement, req.bundle.as_ref(), &agreement_hash)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let record = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let linked = scan_agreement_linked_txs(&chain, &req.agreement, &agreement_hash);
+        let lifecycle = derive_lifecycle(
+            &req.agreement,
+            &agreement_hash,
+            linked.clone(),
+            chain.tip_height(),
+        );
+        let refs = collect_agreement_funding_leg_refs(&chain, &req.agreement, &agreement_hash);
+        let candidates = discover_agreement_funding_leg_candidates(
+            &agreement_hash,
+            &linked,
+            &refs,
+            bundle.as_ref().map(|b| &b.metadata),
+        )
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let candidate_views = build_agreement_funding_leg_candidate_views(
+            &chain,
+            &req.agreement,
+            &agreement_hash,
+            bundle.as_ref(),
+        )
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let mut events = build_agreement_activity_timeline(
+            &agreement_hash,
+            &lifecycle,
+            &linked,
+            &candidates,
+            bundle.as_ref(),
+        );
+        for candidate in &candidate_views {
+            if candidate.release_eligible {
+                events.push(AgreementActivityEvent {
+                    event_type: "release_eligible".to_string(),
+                    source: irium_node_rs::settlement::AgreementActivitySource::HtlcEligibility,
+                    txid: Some(candidate.funding_txid.clone()),
+                    height: None,
+                    timestamp: None,
+                    milestone_id: candidate.milestone_id.clone(),
+                    note: Some(
+                        "HTLC release branch is currently eligible with the provided default context"
+                            .to_string(),
+                    ),
+                });
+            }
+            if candidate.refund_eligible {
+                events.push(AgreementActivityEvent {
+                    event_type: "refund_eligible".to_string(),
+                    source: irium_node_rs::settlement::AgreementActivitySource::HtlcEligibility,
+                    txid: Some(candidate.funding_txid.clone()),
+                    height: None,
+                    timestamp: None,
+                    milestone_id: candidate.milestone_id.clone(),
+                    note: Some(
+                        "HTLC refund branch is currently eligible with the observed timeout state"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
+        let funding_legs = candidate_views
+            .iter()
+            .map(|candidate| AgreementAuditFundingLegRecord {
+                funding_txid: candidate.funding_txid.clone(),
+                htlc_vout: candidate.htlc_vout,
+                anchor_vout: candidate.anchor_vout,
+                role: candidate.role,
+                milestone_id: candidate.milestone_id.clone(),
+                amount: candidate.amount,
+                htlc_backed: candidate.htlc_backed,
+                timeout_height: candidate.timeout_height,
+                recipient_address: candidate.recipient_address.clone(),
+                refund_address: candidate.refund_address.clone(),
+                source_notes: candidate.source_notes.clone(),
+                release_eligible: Some(candidate.release_eligible),
+                release_reasons: candidate.release_reasons.clone(),
+                refund_eligible: Some(candidate.refund_eligible),
+                refund_reasons: candidate.refund_reasons.clone(),
+            })
+            .collect::<Vec<_>>();
+        let selected_leg = if funding_legs.len() == 1 {
+            funding_legs.first()
+        } else {
+            None
+        };
+        build_agreement_audit_record(
+            &req.agreement,
+            &agreement_hash,
+            bundle.as_ref(),
+            &lifecycle,
+            &linked,
+            &funding_legs,
+            selected_leg,
+            &events,
+            Utc::now().timestamp().max(0) as u64,
+            "iriumd_rpc",
+        )
+    };
+    Ok(Json(record))
+}
+
+async fn agreement_release_eligibility(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementSpendRequest>,
+) -> Result<Json<AgreementSpendEligibilityResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let resp = evaluate_agreement_spend_eligibility(true, &chain, &req.agreement, &req)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(resp))
+}
+
+async fn agreement_refund_eligibility(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementSpendRequest>,
+) -> Result<Json<AgreementSpendEligibilityResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let resp = evaluate_agreement_spend_eligibility(false, &chain, &req.agreement, &req)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(resp))
+}
+
+async fn build_agreement_release(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementSpendRequest>,
+) -> Result<Json<AgreementBuildSpendResponse>, (StatusCode, String)> {
+    build_agreement_spend_internal(true, addr, state, headers, req).await
+}
+
+async fn build_agreement_refund(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AgreementSpendRequest>,
+) -> Result<Json<AgreementBuildSpendResponse>, (StatusCode, String)> {
+    build_agreement_spend_internal(false, addr, state, headers, req).await
+}
+
+async fn build_agreement_spend_internal(
+    claim: bool,
+    addr: SocketAddr,
+    state: AppState,
+    headers: HeaderMap,
+    req: AgreementSpendRequest,
+) -> Result<Json<AgreementBuildSpendResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let eligibility = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        evaluate_agreement_spend_eligibility(claim, &chain, &req.agreement, &req)
+            .map_err(|e| bad(&e))?
+    };
+    if !eligibility.eligible {
+        return Err(bad(&format!(
+            "ineligible:{}",
+            eligibility.reasons.join(",")
+        )));
+    }
+    let dest = eligibility
+        .destination_address
+        .clone()
+        .ok_or_else(|| bad("destination_address_missing"))?;
+    let spend = spend_htlc_from_params(
+        claim,
+        &state,
+        &req.funding_txid,
+        eligibility
+            .htlc_vout
+            .ok_or_else(|| bad("htlc_vout_missing"))?,
+        &dest,
+        req.fee_per_byte,
+        req.broadcast,
+        req.secret_hex.as_deref(),
+    )
+    .map_err(|_| bad("build_htlc_spend_failed"))?;
+    Ok(Json(AgreementBuildSpendResponse {
+        agreement_hash: eligibility.agreement_hash,
+        agreement_id: req.agreement.agreement_id,
+        funding_txid: req.funding_txid,
+        htlc_vout: eligibility.htlc_vout.unwrap_or(0),
+        role: eligibility.role.unwrap_or(AgreementAnchorRole::Funding),
+        milestone_id: eligibility.milestone_id,
+        branch: if claim {
+            "release".to_string()
+        } else {
+            "refund".to_string()
+        },
+        destination_address: dest,
+        txid: spend.txid,
+        accepted: spend.accepted,
+        raw_tx_hex: spend.raw_tx_hex,
+        fee: spend.fee,
+        trust_model_note: agreement_spend_trust_note(),
+    }))
+}
+
 async fn spend_htlc_internal(
     claim: bool,
     addr: SocketAddr,
@@ -3621,151 +4993,17 @@ async fn spend_htlc_internal(
 ) -> Result<Json<SpendHtlcResponse>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
-
-    {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let active = chain
-            .params
-            .htlcv1_activation_height
-            .map(|h| chain.height >= h)
-            .unwrap_or(false);
-        if !active {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    }
-
-    let txid_arr = hex_to_32(req.funding_txid.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let (funding_out, tip_height) = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let key = OutPoint {
-            txid: txid_arr,
-            index: req.vout,
-        };
-        let utxo = chain
-            .utxos
-            .get(&key)
-            .cloned()
-            .ok_or(StatusCode::BAD_REQUEST)?;
-        (utxo, chain.tip_height())
-    };
-
-    let htlc = match parse_htlcv1_script(&funding_out.output.script_pubkey) {
-        Some(v) => v,
-        None => return Err(StatusCode::BAD_REQUEST),
-    };
-
-    let signer_pkh = if claim {
-        htlc.recipient_pkh
-    } else {
-        htlc.refund_pkh
-    };
-    if !claim && tip_height < htlc.timeout_height {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-    let keys = wallet.keys().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let mut key: Option<WalletKey> = None;
-    for k in keys {
-        let b = hex::decode(&k.pkh).map_err(|_| StatusCode::BAD_REQUEST)?;
-        if b.len() != 20 {
-            continue;
-        }
-        let mut pkh = [0u8; 20];
-        pkh.copy_from_slice(&b);
-        if pkh == signer_pkh {
-            key = Some(k);
-            break;
-        }
-    }
-    let key = key.ok_or(StatusCode::FORBIDDEN)?;
-
-    let dest = base58_p2pkh_to_hash(&req.destination_address).ok_or(StatusCode::BAD_REQUEST)?;
-    if dest.len() != 20 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let mut dest_pkh = [0u8; 20];
-    dest_pkh.copy_from_slice(&dest);
-
-    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
-    if funding_out.output.value <= fee {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let mut tx = Transaction {
-        version: 1,
-        inputs: vec![TxInput {
-            prev_txid: txid_arr,
-            prev_index: req.vout,
-            script_sig: Vec::new(),
-            sequence: 0xffff_fffe,
-        }],
-        outputs: vec![TxOutput {
-            value: funding_out.output.value - fee,
-            script_pubkey: p2pkh_script(&dest_pkh),
-        }],
-        locktime: 0,
-    };
-
-    let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
-    let priv_bytes = hex::decode(&key.privkey).map_err(|_| StatusCode::BAD_REQUEST)?;
-    if priv_bytes.len() != 32 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let mut sk_bytes = [0u8; 32];
-    sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key =
-        SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
-    let pubkey = signing_key
-        .verifying_key()
-        .to_encoded_point(true)
-        .as_bytes()
-        .to_vec();
-
-    tx.inputs[0].script_sig = if claim {
-        let secret_hex = req.secret_hex.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
-        let preimage = hex::decode(secret_hex.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
-        encode_htlcv1_claim_witness(&sig_bytes, &pubkey, &preimage)
-            .ok_or(StatusCode::BAD_REQUEST)?
-    } else {
-        encode_htlcv1_refund_witness(&sig_bytes, &pubkey).ok_or(StatusCode::BAD_REQUEST)?
-    };
-
-    let fee_checked = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .calculate_fees(&tx)
-            .map_err(|_| StatusCode::BAD_REQUEST)?
-    };
-
-    let raw = tx.serialize();
-    let txid = tx.txid();
-    let txid_hex = hex::encode(txid);
-
-    let mut accepted = false;
-    if req.broadcast.unwrap_or(false) {
-        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        if !mempool.contains(&txid) {
-            accepted = mempool
-                .add_transaction(tx, raw.clone(), fee_checked)
-                .is_ok();
-        }
-    }
-
-    Ok(Json(SpendHtlcResponse {
-        txid: txid_hex,
-        accepted,
-        raw_tx_hex: hex::encode(raw),
-        fee: fee_checked,
-    }))
+    let resp = spend_htlc_from_params(
+        claim,
+        &state,
+        &req.funding_txid,
+        req.vout,
+        &req.destination_address,
+        req.fee_per_byte,
+        req.broadcast,
+        req.secret_hex.as_deref(),
+    )?;
+    Ok(Json(resp))
 }
 
 async fn inspect_htlc(
@@ -4480,10 +5718,7 @@ async fn main() {
     }
     match (network, lwma_activation) {
         (NetworkKind::Mainnet, Some(h)) => {
-            println!(
-                "LWMA active on mainnet since height {}",
-                h
-            )
+            println!("LWMA active on mainnet since height {}", h)
         }
         (NetworkKind::Mainnet, None) => {
             println!("LWMA mainnet activation disabled in code (no activation height set)")
@@ -5351,6 +6586,30 @@ async fn main() {
         .route("/rpc/tx", get(get_tx))
         .route("/rpc/submit_block", post(submit_block))
         .route("/rpc/submit_tx", post(submit_tx))
+        .route("/rpc/createagreement", post(create_agreement))
+        .route("/rpc/inspectagreement", post(inspect_agreement))
+        .route(
+            "/rpc/computeagreementhash",
+            post(compute_agreement_hash_rpc),
+        )
+        .route("/rpc/fundagreement", post(fund_agreement))
+        .route("/rpc/listagreementtxs", post(list_agreement_txs))
+        .route("/rpc/agreementfundinglegs", post(agreement_funding_legs))
+        .route("/rpc/agreementtimeline", post(agreement_timeline))
+        .route("/rpc/agreementaudit", post(agreement_audit))
+        .route("/rpc/agreementstatus", post(agreement_status))
+        .route("/rpc/agreementmilestones", post(agreement_milestones))
+        .route("/rpc/verifyagreementlink", post(verify_agreement_link))
+        .route(
+            "/rpc/agreementreleaseeligibility",
+            post(agreement_release_eligibility),
+        )
+        .route(
+            "/rpc/agreementrefundeligibility",
+            post(agreement_refund_eligibility),
+        )
+        .route("/rpc/buildagreementrelease", post(build_agreement_release))
+        .route("/rpc/buildagreementrefund", post(build_agreement_refund))
         .route("/rpc/createhtlc", post(create_htlc))
         .route("/rpc/decodehtlc", post(decode_htlc))
         .route("/rpc/claimhtlc", post(claim_htlc))
@@ -5471,6 +6730,10 @@ mod tests {
     use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, OutPoint, UtxoEntry};
     use irium_node_rs::genesis::load_locked_genesis;
     use irium_node_rs::mempool::MempoolManager;
+    use irium_node_rs::settlement::{
+        AgreementDeadlines, AgreementMilestone, AgreementObject, AgreementParty,
+        AgreementRefundCondition, AgreementReleaseCondition, AgreementTemplateType,
+    };
     use irium_node_rs::wallet_store::WalletManager;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
@@ -5972,6 +7235,423 @@ mod tests {
 
         assert!(!decode.found);
         assert_eq!(decode.output_type, "p2pkh");
+    }
+
+    fn confirm_tx_for_agreement_scan(state: &AppState, tx: &Transaction) {
+        let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(block) = chain.chain.last_mut() {
+            block.transactions.push(tx.clone());
+        }
+    }
+
+    fn sample_agreement_for_test(
+        payer_address: &str,
+        payee_address: &str,
+        secret_hash_hex: String,
+        timeout_height: u64,
+    ) -> AgreementObject {
+        AgreementObject {
+            schema_id: Some(irium_node_rs::settlement::AGREEMENT_SCHEMA_ID_V1.to_string()),
+            agreement_id: "agr-node-1".to_string(),
+            version: 1,
+            template_type: AgreementTemplateType::SimpleReleaseRefund,
+            parties: vec![
+                AgreementParty {
+                    party_id: "payer".to_string(),
+                    display_name: "Payer".to_string(),
+                    address: payer_address.to_string(),
+                    role: Some("payer".to_string()),
+                },
+                AgreementParty {
+                    party_id: "payee".to_string(),
+                    display_name: "Payee".to_string(),
+                    address: payee_address.to_string(),
+                    role: Some("payee".to_string()),
+                },
+            ],
+            payer: "payer".to_string(),
+            payee: "payee".to_string(),
+            mediator_reference: None,
+            total_amount: 500_000_000,
+            network_marker: "IRIUM".to_string(),
+            creation_time: 1_700_000_000,
+            deadlines: AgreementDeadlines {
+                settlement_deadline: Some(timeout_height.saturating_sub(10)),
+                refund_deadline: Some(timeout_height),
+                dispute_window: None,
+            },
+            release_conditions: vec![AgreementReleaseCondition {
+                mode: "secret_preimage".to_string(),
+                secret_hash_hex: Some(secret_hash_hex),
+                release_authorizer: Some("payer".to_string()),
+                notes: None,
+            }],
+            refund_conditions: vec![AgreementRefundCondition {
+                refund_address: payer_address.to_string(),
+                timeout_height,
+                notes: None,
+            }],
+            milestones: vec![],
+            deposit_rule: None,
+            proof_policy_reference: Some("phase2-placeholder".to_string()),
+            document_hash: "22".repeat(32),
+            metadata_hash: None,
+            invoice_reference: None,
+            external_reference: None,
+            disputed_metadata_only: false,
+            asset_reference: None,
+            payment_reference: None,
+            purpose_reference: None,
+            release_summary: Some("Release when the payer reveals the preimage".to_string()),
+            refund_summary: Some("Refund after timeout to the payer".to_string()),
+            attestor_reference: None,
+            resolver_reference: None,
+            notes: Some("fixture".to_string()),
+        }
+    }
+
+    fn milestone_agreement_for_test(
+        payer_address: &str,
+        payee_address: &str,
+        timeout_height: u64,
+    ) -> (AgreementObject, Vec<Vec<u8>>) {
+        let s1 = b"milestone-one".to_vec();
+        let s2 = b"milestone-two".to_vec();
+        let agreement = AgreementObject {
+            schema_id: Some(irium_node_rs::settlement::AGREEMENT_SCHEMA_ID_V1.to_string()),
+            agreement_id: "agr-node-ms".to_string(),
+            version: 1,
+            template_type: AgreementTemplateType::MilestoneSettlement,
+            parties: vec![
+                AgreementParty {
+                    party_id: "payer".to_string(),
+                    display_name: "Payer".to_string(),
+                    address: payer_address.to_string(),
+                    role: Some("payer".to_string()),
+                },
+                AgreementParty {
+                    party_id: "payee".to_string(),
+                    display_name: "Payee".to_string(),
+                    address: payee_address.to_string(),
+                    role: Some("payee".to_string()),
+                },
+            ],
+            payer: "payer".to_string(),
+            payee: "payee".to_string(),
+            mediator_reference: None,
+            total_amount: 700_000_000,
+            network_marker: "IRIUM".to_string(),
+            creation_time: 1_700_000_000,
+            deadlines: AgreementDeadlines {
+                settlement_deadline: Some(timeout_height.saturating_sub(10)),
+                refund_deadline: Some(timeout_height),
+                dispute_window: None,
+            },
+            release_conditions: vec![AgreementReleaseCondition {
+                mode: "secret_preimage".to_string(),
+                secret_hash_hex: Some(hex::encode(sha256d(&s1))),
+                release_authorizer: Some("payer".to_string()),
+                notes: None,
+            }],
+            refund_conditions: vec![AgreementRefundCondition {
+                refund_address: payer_address.to_string(),
+                timeout_height,
+                notes: None,
+            }],
+            milestones: vec![
+                AgreementMilestone {
+                    milestone_id: "ms1".to_string(),
+                    title: "Kickoff".to_string(),
+                    amount: 300_000_000,
+                    recipient_address: payee_address.to_string(),
+                    refund_address: payer_address.to_string(),
+                    secret_hash_hex: hex::encode(sha256d(&s1)),
+                    timeout_height,
+                    metadata_hash: None,
+                },
+                AgreementMilestone {
+                    milestone_id: "ms2".to_string(),
+                    title: "Delivery".to_string(),
+                    amount: 400_000_000,
+                    recipient_address: payee_address.to_string(),
+                    refund_address: payer_address.to_string(),
+                    secret_hash_hex: hex::encode(sha256d(&s2)),
+                    timeout_height: timeout_height + 5,
+                    metadata_hash: None,
+                },
+            ],
+            deposit_rule: None,
+            proof_policy_reference: Some("phase2-placeholder".to_string()),
+            document_hash: "22".repeat(32),
+            metadata_hash: None,
+            invoice_reference: None,
+            external_reference: None,
+            disputed_metadata_only: false,
+            asset_reference: None,
+            payment_reference: None,
+            purpose_reference: None,
+            release_summary: Some("Milestone releases remain off-chain coordination unless a specific HTLC branch is exercised".to_string()),
+            refund_summary: Some("Refund each milestone after its timeout back to the payer".to_string()),
+            attestor_reference: None,
+            resolver_reference: None,
+            notes: Some("fixture".to_string()),
+        };
+        (agreement, vec![s1, s2])
+    }
+
+    async fn fund_agreement_for_test(
+        state: AppState,
+        agreement: AgreementObject,
+    ) -> FundAgreementResponse {
+        fund_agreement(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(FundAgreementRequest {
+                agreement,
+                fee_per_byte: Some(1),
+                broadcast: Some(false),
+            }),
+        )
+        .await
+        .expect("fund agreement")
+        .0
+    }
+
+    #[tokio::test]
+    async fn agreement_release_eligibility_when_preimage_available() {
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        add_wallet_utxo(&state, &sender, 20_000_000_000);
+        let (agreement, secrets) = milestone_agreement_for_test(&sender, &recipient, 120);
+        let funded = fund_agreement_for_test(state.clone(), agreement.clone()).await;
+        let funding_tx = decode_full_tx(&hex::decode(&funded.raw_tx_hex).unwrap()).unwrap();
+        apply_tx_to_chain_for_test(&state, &funding_tx);
+        confirm_tx_for_agreement_scan(&state, &funding_tx);
+        let target = funded
+            .outputs
+            .iter()
+            .find(|o| o.milestone_id.as_deref() == Some("ms1"))
+            .expect("ms1 output")
+            .vout;
+        let resp = agreement_release_eligibility(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(AgreementSpendRequest {
+                agreement,
+                funding_txid: funded.txid,
+                htlc_vout: Some(target),
+                milestone_id: Some("ms1".to_string()),
+                destination_address: Some(recipient),
+                fee_per_byte: None,
+                broadcast: Some(false),
+                secret_hex: Some(hex::encode(&secrets[0])),
+            }),
+        )
+        .await
+        .expect("eligibility")
+        .0;
+        assert!(resp.eligible);
+        assert!(resp.preimage_required);
+        assert_eq!(resp.branch, "release");
+    }
+
+    #[tokio::test]
+    async fn agreement_release_ineligible_without_required_preimage() {
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        add_wallet_utxo(&state, &sender, 20_000_000_000);
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 120);
+        let funded = fund_agreement_for_test(state.clone(), agreement.clone()).await;
+        let funding_tx = decode_full_tx(&hex::decode(&funded.raw_tx_hex).unwrap()).unwrap();
+        apply_tx_to_chain_for_test(&state, &funding_tx);
+        confirm_tx_for_agreement_scan(&state, &funding_tx);
+        let target = funded
+            .outputs
+            .iter()
+            .find(|o| o.milestone_id.as_deref() == Some("ms1"))
+            .expect("ms1 output")
+            .vout;
+        let resp = agreement_release_eligibility(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(AgreementSpendRequest {
+                agreement,
+                funding_txid: funded.txid,
+                htlc_vout: Some(target),
+                milestone_id: Some("ms1".to_string()),
+                destination_address: Some(recipient),
+                fee_per_byte: None,
+                broadcast: Some(false),
+                secret_hex: None,
+            }),
+        )
+        .await
+        .expect("eligibility")
+        .0;
+        assert!(!resp.eligible);
+        assert!(resp
+            .reasons
+            .iter()
+            .any(|r| r == "secret_hex_required_for_release"));
+    }
+
+    #[tokio::test]
+    async fn agreement_refund_eligibility_when_timeout_matured() {
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        add_wallet_utxo(&state, &sender, 20_000_000_000);
+        {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.height = 140;
+        }
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 120);
+        let funded = fund_agreement_for_test(state.clone(), agreement.clone()).await;
+        let funding_tx = decode_full_tx(&hex::decode(&funded.raw_tx_hex).unwrap()).unwrap();
+        apply_tx_to_chain_for_test(&state, &funding_tx);
+        confirm_tx_for_agreement_scan(&state, &funding_tx);
+        let target = funded
+            .outputs
+            .iter()
+            .find(|o| o.milestone_id.as_deref() == Some("ms1"))
+            .expect("ms1 output")
+            .vout;
+        let resp = agreement_refund_eligibility(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(AgreementSpendRequest {
+                agreement,
+                funding_txid: funded.txid,
+                htlc_vout: Some(target),
+                milestone_id: Some("ms1".to_string()),
+                destination_address: Some(sender),
+                fee_per_byte: None,
+                broadcast: Some(false),
+                secret_hex: None,
+            }),
+        )
+        .await
+        .expect("eligibility")
+        .0;
+        assert!(resp.eligible);
+        assert!(resp.timeout_reached);
+        assert_eq!(resp.branch, "refund");
+    }
+
+    #[tokio::test]
+    async fn agreement_refund_ineligible_before_timeout() {
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        add_wallet_utxo(&state, &sender, 20_000_000_000);
+        {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.height = 100;
+        }
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 120);
+        let funded = fund_agreement_for_test(state.clone(), agreement.clone()).await;
+        let funding_tx = decode_full_tx(&hex::decode(&funded.raw_tx_hex).unwrap()).unwrap();
+        apply_tx_to_chain_for_test(&state, &funding_tx);
+        confirm_tx_for_agreement_scan(&state, &funding_tx);
+        let target = funded
+            .outputs
+            .iter()
+            .find(|o| o.milestone_id.as_deref() == Some("ms1"))
+            .expect("ms1 output")
+            .vout;
+        let resp = agreement_refund_eligibility(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(AgreementSpendRequest {
+                agreement,
+                funding_txid: funded.txid,
+                htlc_vout: Some(target),
+                milestone_id: Some("ms1".to_string()),
+                destination_address: Some(sender),
+                fee_per_byte: None,
+                broadcast: Some(false),
+                secret_hex: None,
+            }),
+        )
+        .await
+        .expect("eligibility")
+        .0;
+        assert!(!resp.eligible);
+        assert!(resp
+            .reasons
+            .iter()
+            .any(|r| r == "refund_timeout_not_reached"));
+    }
+
+    #[tokio::test]
+    async fn agreement_release_rejects_non_htlc_backed_funding_path() {
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let plain_tx = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value: 5_000_000,
+                script_pubkey: p2pkh_script(&[9u8; 20]),
+            }],
+            locktime: 0,
+        };
+        confirm_tx_for_agreement_scan(&state, &plain_tx);
+        let agreement =
+            sample_agreement_for_test(&sender, &recipient, hex::encode(sha256d(b"x")), 120);
+        let res = agreement_release_eligibility(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(AgreementSpendRequest {
+                agreement,
+                funding_txid: hex::encode(plain_tx.txid()),
+                htlc_vout: Some(0),
+                milestone_id: None,
+                destination_address: Some(sender),
+                fee_per_byte: None,
+                broadcast: Some(false),
+                secret_hex: Some(hex::encode(b"x")),
+            }),
+        )
+        .await;
+        assert!(matches!(res, Err(StatusCode::BAD_REQUEST)));
+    }
+
+    #[tokio::test]
+    async fn agreement_release_eligibility_resolves_requested_milestone_leg() {
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        add_wallet_utxo(&state, &sender, 30_000_000_000);
+        let (agreement, secrets) = milestone_agreement_for_test(&sender, &recipient, 140);
+        let funded = fund_agreement_for_test(state.clone(), agreement.clone()).await;
+        let funding_tx = decode_full_tx(&hex::decode(&funded.raw_tx_hex).unwrap()).unwrap();
+        apply_tx_to_chain_for_test(&state, &funding_tx);
+        confirm_tx_for_agreement_scan(&state, &funding_tx);
+        let target = funded
+            .outputs
+            .iter()
+            .find(|o| o.milestone_id.as_deref() == Some("ms2"))
+            .expect("ms2 output")
+            .vout;
+        let resp = agreement_release_eligibility(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(AgreementSpendRequest {
+                agreement,
+                funding_txid: funded.txid,
+                htlc_vout: Some(target),
+                milestone_id: Some("ms2".to_string()),
+                destination_address: Some(recipient),
+                fee_per_byte: None,
+                broadcast: Some(false),
+                secret_hex: Some(hex::encode(&secrets[1])),
+            }),
+        )
+        .await
+        .expect("eligibility")
+        .0;
+        assert!(resp.eligible);
+        assert_eq!(resp.milestone_id.as_deref(), Some("ms2"));
+        assert_eq!(resp.htlc_vout, Some(target));
     }
 
     #[test]

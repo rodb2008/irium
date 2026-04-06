@@ -95,13 +95,19 @@ pub enum OutputEncumbrance {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputWitness {
-    P2pkh { sig: Vec<u8>, pubkey: Vec<u8> },
+    P2pkh {
+        sig: Vec<u8>,
+        pubkey: Vec<u8>,
+    },
     HtlcClaim {
         sig: Vec<u8>,
         pubkey: Vec<u8>,
         preimage: Vec<u8>,
     },
-    HtlcRefund { sig: Vec<u8>, pubkey: Vec<u8> },
+    HtlcRefund {
+        sig: Vec<u8>,
+        pubkey: Vec<u8>,
+    },
     Unknown,
 }
 
@@ -207,7 +213,13 @@ fn parse_legacy_p2pkh_witness(script_sig: &[u8]) -> Option<InputWitness> {
 }
 
 pub fn encode_htlcv1_claim_witness(sig: &[u8], pubkey: &[u8], preimage: &[u8]) -> Option<Vec<u8>> {
-    if sig.is_empty() || sig.len() > 255 || pubkey.is_empty() || pubkey.len() > 255 || preimage.is_empty() || preimage.len() > 255 {
+    if sig.is_empty()
+        || sig.len() > 255
+        || pubkey.is_empty()
+        || pubkey.len() > 255
+        || preimage.is_empty()
+        || preimage.len() > 255
+    {
         return None;
     }
     let mut out = Vec::with_capacity(4 + sig.len() + pubkey.len() + preimage.len());

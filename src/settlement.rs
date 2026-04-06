@@ -1,0 +1,4656 @@
+use crate::tx::{encode_htlcv1_script, parse_htlcv1_script, HtlcV1Output, Transaction, TxOutput};
+use k256::ecdsa::signature::hazmat::PrehashVerifier;
+use k256::ecdsa::{Signature, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+
+pub const AGREEMENT_OBJECT_VERSION: u32 = 1;
+pub const AGREEMENT_AUDIT_RECORD_VERSION: u32 = 1;
+pub const AGREEMENT_STATEMENT_VERSION: u32 = 1;
+pub const AGREEMENT_ARTIFACT_VERIFICATION_VERSION: u32 = 1;
+pub const AGREEMENT_SHARE_PACKAGE_VERSION: u32 = 1;
+pub const AGREEMENT_SHARE_PACKAGE_VERIFICATION_VERSION: u32 = 1;
+pub const AGREEMENT_BUNDLE_VERSION: u32 = 1;
+pub const AGREEMENT_SIGNATURE_VERSION: u32 = 1;
+pub const AGREEMENT_AUDIT_CSV_SCHEMA: &str = "agreement_audit_csv_v1";
+pub const AGREEMENT_NETWORK_MARKER: &str = "IRIUM";
+pub const AGREEMENT_SCHEMA_ID_V1: &str = "irium.phase1.canonical.v1";
+pub const AGREEMENT_BUNDLE_SCHEMA_ID_V1: &str = "irium.phase1.bundle.v1";
+pub const AGREEMENT_SHARE_PACKAGE_SCHEMA_ID_V1: &str = "irium.phase1.share_package.v1";
+pub const AGREEMENT_SIGNATURE_TYPE_SECP256K1: &str = "secp256k1_ecdsa_sha256";
+pub const AGREEMENT_ANCHOR_PREFIX: &str = "agr1:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgreementTemplateType {
+    SimpleReleaseRefund,
+    MilestoneSettlement,
+    RefundableDeposit,
+    OtcSettlement,
+    MerchantDelayedSettlement,
+    ContractorMilestone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgreementLifecycleState {
+    Draft,
+    Proposed,
+    Funded,
+    PartiallyReleased,
+    Released,
+    Refunded,
+    Expired,
+    Cancelled,
+    DisputedMetadataOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgreementAnchorRole {
+    Funding,
+    Release,
+    Refund,
+    MilestoneRelease,
+    DepositLock,
+    CollateralLock,
+    OtcSettlement,
+    MerchantSettlement,
+}
+
+impl AgreementAnchorRole {
+    pub fn short_code(self) -> &'static str {
+        match self {
+            Self::Funding => "f",
+            Self::Release => "l",
+            Self::Refund => "r",
+            Self::MilestoneRelease => "m",
+            Self::DepositLock => "d",
+            Self::CollateralLock => "c",
+            Self::OtcSettlement => "o",
+            Self::MerchantSettlement => "t",
+        }
+    }
+
+    pub fn from_short_code(v: &str) -> Option<Self> {
+        match v {
+            "f" => Some(Self::Funding),
+            "l" => Some(Self::Release),
+            "r" => Some(Self::Refund),
+            "m" => Some(Self::MilestoneRelease),
+            "d" => Some(Self::DepositLock),
+            "c" => Some(Self::CollateralLock),
+            "o" => Some(Self::OtcSettlement),
+            "t" => Some(Self::MerchantSettlement),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementParty {
+    pub party_id: String,
+    pub display_name: String,
+    pub address: String,
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementDeadlines {
+    #[serde(default)]
+    pub settlement_deadline: Option<u64>,
+    #[serde(default)]
+    pub refund_deadline: Option<u64>,
+    #[serde(default)]
+    pub dispute_window: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementReleaseCondition {
+    pub mode: String,
+    #[serde(default)]
+    pub secret_hash_hex: Option<String>,
+    #[serde(default)]
+    pub release_authorizer: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementRefundCondition {
+    pub refund_address: String,
+    pub timeout_height: u64,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementMilestone {
+    pub milestone_id: String,
+    pub title: String,
+    pub amount: u64,
+    pub recipient_address: String,
+    pub refund_address: String,
+    pub secret_hash_hex: String,
+    pub timeout_height: u64,
+    #[serde(default)]
+    pub metadata_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementDepositRule {
+    pub amount: u64,
+    pub beneficiary_address: String,
+    pub refund_address: String,
+    pub timeout_height: u64,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgreementBundleChainObservationSnapshot {
+    #[serde(default)]
+    pub observed_at: Option<u64>,
+    #[serde(default)]
+    pub linked_transactions: Vec<AgreementLinkedTx>,
+    #[serde(default)]
+    pub funding_txids: Vec<String>,
+    #[serde(default)]
+    pub linked_tx_count: usize,
+    #[serde(default)]
+    pub anchor_notice: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgreementBundleArtifacts {
+    #[serde(default)]
+    pub metadata_summary: Option<String>,
+    #[serde(default)]
+    pub audit: Option<Value>,
+    #[serde(default)]
+    pub statement: Option<Value>,
+    #[serde(default)]
+    pub chain_observation_snapshot: Option<AgreementBundleChainObservationSnapshot>,
+    #[serde(default)]
+    pub external_document_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementObject {
+    pub agreement_id: String,
+    #[serde(default = "default_agreement_version")]
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_id: Option<String>,
+    pub template_type: AgreementTemplateType,
+    pub parties: Vec<AgreementParty>,
+    pub payer: String,
+    pub payee: String,
+    #[serde(default)]
+    pub mediator_reference: Option<String>,
+    pub total_amount: u64,
+    #[serde(default = "default_network_marker")]
+    pub network_marker: String,
+    pub creation_time: u64,
+    pub deadlines: AgreementDeadlines,
+    pub release_conditions: Vec<AgreementReleaseCondition>,
+    pub refund_conditions: Vec<AgreementRefundCondition>,
+    #[serde(default)]
+    pub milestones: Vec<AgreementMilestone>,
+    #[serde(default)]
+    pub deposit_rule: Option<AgreementDepositRule>,
+    #[serde(default)]
+    pub proof_policy_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refund_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestor_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    pub document_hash: String,
+    #[serde(default)]
+    pub metadata_hash: Option<String>,
+    #[serde(default)]
+    pub invoice_reference: Option<String>,
+    #[serde(default)]
+    pub external_reference: Option<String>,
+    #[serde(default)]
+    pub disputed_metadata_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementSummary {
+    pub agreement_hash: String,
+    pub total_amount: u64,
+    pub template_type: AgreementTemplateType,
+    pub milestone_count: usize,
+    pub uses_htlc_timeout: bool,
+    pub has_deposit_rule: bool,
+    pub canonical_json: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAnchor {
+    pub agreement_hash: String,
+    pub role: AgreementAnchorRole,
+    #[serde(default)]
+    pub milestone_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementLinkedTx {
+    pub txid: String,
+    pub role: AgreementAnchorRole,
+    #[serde(default)]
+    pub milestone_id: Option<String>,
+    #[serde(default)]
+    pub height: Option<u64>,
+    pub confirmed: bool,
+    #[serde(default)]
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementMilestoneStatus {
+    pub milestone_id: String,
+    pub title: String,
+    pub amount: u64,
+    pub funded: bool,
+    pub released: bool,
+    pub refunded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementLifecycleView {
+    pub state: AgreementLifecycleState,
+    pub agreement_hash: String,
+    pub funded_amount: u64,
+    pub released_amount: u64,
+    pub refunded_amount: u64,
+    pub milestones: Vec<AgreementMilestoneStatus>,
+    pub linked_txs: Vec<AgreementLinkedTx>,
+    pub trust_model_note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementFundingLeg {
+    pub role: AgreementAnchorRole,
+    pub milestone_id: Option<String>,
+    pub amount: u64,
+    pub output: TxOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementFundingLegRef {
+    pub funding_txid: String,
+    pub htlc_vout: u32,
+    pub anchor_vout: u32,
+    pub role: AgreementAnchorRole,
+    pub milestone_id: Option<String>,
+    pub amount: u64,
+    pub timeout_height: u64,
+    pub expected_hash: String,
+    pub recipient_address: String,
+    pub refund_address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgreementActivitySource {
+    LocalBundle,
+    ChainObserved,
+    DerivedIndexed,
+    HtlcEligibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementFundingLegCandidate {
+    pub agreement_hash: String,
+    pub funding_txid: String,
+    pub htlc_vout: u32,
+    pub anchor_vout: u32,
+    pub role: AgreementAnchorRole,
+    #[serde(default)]
+    pub milestone_id: Option<String>,
+    pub amount: u64,
+    pub htlc_backed: bool,
+    pub timeout_height: u64,
+    pub recipient_address: String,
+    pub refund_address: String,
+    #[serde(default)]
+    pub source_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementActivityEvent {
+    pub event_type: String,
+    pub source: AgreementActivitySource,
+    #[serde(default)]
+    pub txid: Option<String>,
+    #[serde(default)]
+    pub height: Option<u64>,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
+    #[serde(default)]
+    pub milestone_id: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgreementBundleMilestoneHint {
+    pub milestone_id: String,
+    #[serde(default)]
+    pub funding_txid: Option<String>,
+    #[serde(default)]
+    pub htlc_vout: Option<u32>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgreementBundleMetadata {
+    #[serde(default)]
+    pub saved_at: u64,
+    #[serde(default)]
+    pub source_label: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub linked_funding_txids: Vec<String>,
+    #[serde(default)]
+    pub milestone_hints: Vec<AgreementBundleMilestoneHint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgreementSignatureTargetType {
+    Agreement,
+    Bundle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementSignatureEnvelope {
+    #[serde(default = "default_agreement_signature_version")]
+    pub version: u32,
+    pub target_type: AgreementSignatureTargetType,
+    pub target_hash: String,
+    pub signer_public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_address: Option<String>,
+    pub signature_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_role: Option<String>,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementBundle {
+    #[serde(default = "default_agreement_bundle_version")]
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_schema_id: Option<String>,
+    pub agreement_id: String,
+    pub agreement_hash: String,
+    pub agreement: AgreementObject,
+    #[serde(default)]
+    pub metadata: AgreementBundleMetadata,
+    #[serde(default)]
+    pub artifacts: AgreementBundleArtifacts,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<AgreementSignatureEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementSharePackage {
+    #[serde(default = "default_agreement_share_package_version")]
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_schema_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_note: Option<String>,
+    #[serde(default)]
+    pub included_artifact_types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<AgreementSharePackageManifest>,
+    pub trust_notice: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agreement: Option<AgreementObject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<AgreementBundle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit: Option<AgreementAuditRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<AgreementStatement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detached_agreement_signatures: Vec<AgreementSignatureEnvelope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detached_bundle_signatures: Vec<AgreementSignatureEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementSharePackageManifest {
+    pub package_profile: String,
+    #[serde(default)]
+    pub included_artifact_types: Vec<String>,
+    #[serde(default)]
+    pub omitted_artifact_types: Vec<String>,
+    pub verification_notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementSignatureVerification {
+    pub target_type: AgreementSignatureTargetType,
+    pub target_hash: String,
+    pub signer_public_key: String,
+    #[serde(default)]
+    pub signer_address: Option<String>,
+    #[serde(default)]
+    pub signer_role: Option<String>,
+    pub signature_type: String,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
+    pub valid: bool,
+    pub matches_expected_target: bool,
+    pub authenticity_note: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAuditMilestoneSummary {
+    pub milestone_id: String,
+    pub title: String,
+    pub amount: u64,
+    pub timeout_height: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAuditMetadata {
+    #[serde(default = "default_agreement_audit_record_version")]
+    pub version: u32,
+    pub generated_at: u64,
+    pub generator_surface: String,
+    pub trust_model_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAuditAgreementSummary {
+    pub agreement_id: String,
+    pub agreement_hash: String,
+    pub template_type: AgreementTemplateType,
+    pub network_marker: String,
+    pub payer: String,
+    pub payee: String,
+    pub parties: Vec<AgreementParty>,
+    pub total_amount: u64,
+    pub milestone_count: usize,
+    pub milestones: Vec<AgreementAuditMilestoneSummary>,
+    #[serde(default)]
+    pub settlement_deadline: Option<u64>,
+    #[serde(default)]
+    pub refund_deadline: Option<u64>,
+    #[serde(default)]
+    pub dispute_window: Option<u64>,
+    pub document_hash: String,
+    #[serde(default)]
+    pub metadata_hash: Option<String>,
+    #[serde(default)]
+    pub invoice_reference: Option<String>,
+    #[serde(default)]
+    pub external_reference: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAuditBundleContext {
+    pub bundle_used: bool,
+    pub verification_ok: bool,
+    #[serde(default)]
+    pub saved_at: Option<u64>,
+    #[serde(default)]
+    pub source_label: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub linked_funding_txids: Vec<String>,
+    #[serde(default)]
+    pub milestone_hints: Vec<AgreementBundleMilestoneHint>,
+    pub local_only_notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAuditChainObservedContext {
+    pub linked_transactions: Vec<AgreementLinkedTx>,
+    pub linked_transaction_count: usize,
+    pub anchor_observation_notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAuditFundingLegRecord {
+    pub funding_txid: String,
+    pub htlc_vout: u32,
+    pub anchor_vout: u32,
+    pub role: AgreementAnchorRole,
+    #[serde(default)]
+    pub milestone_id: Option<String>,
+    pub amount: u64,
+    pub htlc_backed: bool,
+    pub timeout_height: u64,
+    pub recipient_address: String,
+    pub refund_address: String,
+    #[serde(default)]
+    pub source_notes: Vec<String>,
+    #[serde(default)]
+    pub release_eligible: Option<bool>,
+    #[serde(default)]
+    pub release_reasons: Vec<String>,
+    #[serde(default)]
+    pub refund_eligible: Option<bool>,
+    #[serde(default)]
+    pub refund_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAuditFundingLegSummary {
+    pub candidate_count: usize,
+    pub selection_required: bool,
+    #[serde(default)]
+    pub selected_leg: Option<AgreementAuditFundingLegRecord>,
+    #[serde(default)]
+    pub ambiguity_warning: Option<String>,
+    pub candidates: Vec<AgreementAuditFundingLegRecord>,
+    pub notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAuditTimelineSummary {
+    pub reconstructed: bool,
+    pub event_count: usize,
+    pub events: Vec<AgreementActivityEvent>,
+    pub notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAuditSettlementStateSummary {
+    pub lifecycle_state: AgreementLifecycleState,
+    pub derived_state_label: String,
+    pub selection_required: bool,
+    pub funded_amount: u64,
+    pub released_amount: u64,
+    pub refunded_amount: u64,
+    pub summary_note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAuditTrustBoundaries {
+    pub consensus_enforced: Vec<String>,
+    pub htlc_enforced: Vec<String>,
+    pub metadata_indexed: Vec<String>,
+    pub local_bundle_only: Vec<String>,
+    pub off_chain_required: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAuditRecord {
+    pub metadata: AgreementAuditMetadata,
+    pub agreement: AgreementAuditAgreementSummary,
+    pub local_bundle: AgreementAuditBundleContext,
+    pub chain_observed: AgreementAuditChainObservedContext,
+    pub funding_legs: AgreementAuditFundingLegSummary,
+    pub timeline: AgreementAuditTimelineSummary,
+    pub settlement_state: AgreementAuditSettlementStateSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticity: Option<AgreementAuthenticitySummary>,
+    pub trust_boundaries: AgreementAuditTrustBoundaries,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementStatementMetadata {
+    #[serde(default = "default_agreement_statement_version")]
+    pub version: u32,
+    pub generated_at: u64,
+    pub derived_notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementStatementIdentity {
+    pub agreement_id: String,
+    pub agreement_hash: String,
+    pub template_type: AgreementTemplateType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementStatementCounterparties {
+    pub payer: String,
+    pub payee: String,
+    pub parties_summary: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementStatementCommercialSummary {
+    pub total_amount: u64,
+    pub milestone_summary: String,
+    #[serde(default)]
+    pub settlement_deadline: Option<u64>,
+    #[serde(default)]
+    pub refund_deadline: Option<u64>,
+    pub release_path_summary: String,
+    pub refund_path_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementStatementObservedSummary {
+    pub funding_observed: bool,
+    pub release_observed: bool,
+    pub refund_observed: bool,
+    #[serde(default)]
+    pub ambiguity_warning: Option<String>,
+    pub linked_txids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementStatementDerivedSummary {
+    pub derived_state_label: String,
+    pub funded_amount: u64,
+    pub released_amount: u64,
+    pub refunded_amount: u64,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementStatementTrustNotice {
+    pub consensus_visible: Vec<String>,
+    pub htlc_enforced: Vec<String>,
+    pub derived_indexed: Vec<String>,
+    pub local_off_chain: Vec<String>,
+    pub canonical_notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementStatementReferences {
+    pub linked_txids: Vec<String>,
+    #[serde(default)]
+    pub selected_funding_txid: Option<String>,
+    pub canonical_agreement_notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementAuthenticitySummary {
+    pub detached_agreement_signatures_supplied: usize,
+    pub detached_bundle_signatures_supplied: usize,
+    pub embedded_bundle_signatures_supplied: usize,
+    pub valid_signatures: usize,
+    pub invalid_signatures: usize,
+    pub unverifiable_signatures: usize,
+    #[serde(default)]
+    pub signer_summaries: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub authenticity_notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementStatementAuthenticitySummary {
+    pub valid_signatures: usize,
+    pub invalid_signatures: usize,
+    pub unverifiable_signatures: usize,
+    pub compact_summary: String,
+    pub authenticity_notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementStatement {
+    pub metadata: AgreementStatementMetadata,
+    pub identity: AgreementStatementIdentity,
+    pub counterparties: AgreementStatementCounterparties,
+    pub commercial: AgreementStatementCommercialSummary,
+    pub observed: AgreementStatementObservedSummary,
+    pub derived: AgreementStatementDerivedSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticity: Option<AgreementStatementAuthenticitySummary>,
+    pub trust_notice: AgreementStatementTrustNotice,
+    pub references: AgreementStatementReferences,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementArtifactVerificationMetadata {
+    #[serde(default = "default_agreement_artifact_verification_version")]
+    pub version: u32,
+    pub generated_at: u64,
+    pub derived_notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementArtifactVerificationInputSummary {
+    pub supplied_artifact_types: Vec<String>,
+    pub canonical_agreement_present: bool,
+    pub extracted_from_bundle: bool,
+    #[serde(default)]
+    pub claimed_agreement_id: Vec<String>,
+    #[serde(default)]
+    pub claimed_agreement_hash: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementArtifactCanonicalVerification {
+    pub canonical_agreement_present: bool,
+    #[serde(default)]
+    pub computed_agreement_hash: Option<String>,
+    #[serde(default)]
+    pub computed_agreement_id: Option<String>,
+    #[serde(default)]
+    pub bundle_hash_match: Option<bool>,
+    #[serde(default)]
+    pub audit_identity_match: Option<bool>,
+    #[serde(default)]
+    pub statement_identity_match: Option<bool>,
+    #[serde(default)]
+    pub matches: Vec<String>,
+    #[serde(default)]
+    pub mismatches: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementArtifactConsistencyVerification {
+    #[serde(default)]
+    pub bundle_matches_canonical: Option<bool>,
+    #[serde(default)]
+    pub audit_matches_canonical: Option<bool>,
+    #[serde(default)]
+    pub statement_matches_canonical: Option<bool>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementArtifactChainVerification {
+    pub linked_tx_references_found: bool,
+    pub anchor_observations_found: bool,
+    #[serde(default)]
+    pub checked_txids: Vec<String>,
+    #[serde(default)]
+    pub audit_chain_match: Option<bool>,
+    #[serde(default)]
+    pub statement_chain_match: Option<bool>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementArtifactDerivedVerification {
+    #[serde(default)]
+    pub audit_derived_match: Option<bool>,
+    #[serde(default)]
+    pub statement_derived_match: Option<bool>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementArtifactAuthenticityVerification {
+    pub detached_agreement_signatures_supplied: usize,
+    pub detached_bundle_signatures_supplied: usize,
+    pub embedded_bundle_signatures_supplied: usize,
+    pub valid_signatures: usize,
+    pub invalid_signatures: usize,
+    pub unverifiable_signatures: usize,
+    #[serde(default)]
+    pub signer_summaries: Vec<String>,
+    pub verifications: Vec<AgreementSignatureVerification>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub authenticity_notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementArtifactVerificationTrustSummary {
+    pub consensus_visible: Vec<String>,
+    pub htlc_enforced: Vec<String>,
+    pub derived_indexed: Vec<String>,
+    pub local_artifact_only: Vec<String>,
+    pub unverifiable_from_chain_alone: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementArtifactVerificationResult {
+    pub metadata: AgreementArtifactVerificationMetadata,
+    pub input_summary: AgreementArtifactVerificationInputSummary,
+    pub canonical_verification: AgreementArtifactCanonicalVerification,
+    pub artifact_consistency: AgreementArtifactConsistencyVerification,
+    pub chain_verification: AgreementArtifactChainVerification,
+    pub derived_verification: AgreementArtifactDerivedVerification,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticity: Option<AgreementArtifactAuthenticityVerification>,
+    pub trust_summary: AgreementArtifactVerificationTrustSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementSharePackageInspection {
+    pub version: u32,
+    pub package_schema_id: Option<String>,
+    pub created_at: Option<u64>,
+    pub sender_label: Option<String>,
+    pub package_note: Option<String>,
+    pub package_profile: String,
+    pub included_artifact_types: Vec<String>,
+    pub omitted_artifact_types: Vec<String>,
+    pub agreement_present: bool,
+    pub bundle_present: bool,
+    pub audit_present: bool,
+    pub statement_present: bool,
+    pub detached_agreement_signature_count: usize,
+    pub detached_bundle_signature_count: usize,
+    pub verification_notice: String,
+    pub canonical_agreement_id: Option<String>,
+    pub canonical_agreement_hash: Option<String>,
+    pub bundle_hash: Option<String>,
+    pub trust_notice: String,
+    pub informational_notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementSharePackageVerificationMetadata {
+    #[serde(default = "default_agreement_share_package_verification_version")]
+    pub version: u32,
+    pub generated_at: u64,
+    pub derived_notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementSharePackageVerificationResult {
+    pub metadata: AgreementSharePackageVerificationMetadata,
+    pub package: AgreementSharePackageInspection,
+    pub artifact_verification: AgreementArtifactVerificationResult,
+    #[serde(default)]
+    pub informational_notices: Vec<String>,
+}
+
+fn default_agreement_version() -> u32 {
+    AGREEMENT_OBJECT_VERSION
+}
+
+fn default_agreement_artifact_verification_version() -> u32 {
+    AGREEMENT_ARTIFACT_VERIFICATION_VERSION
+}
+
+fn default_agreement_share_package_version() -> u32 {
+    AGREEMENT_SHARE_PACKAGE_VERSION
+}
+
+fn default_agreement_share_package_verification_version() -> u32 {
+    AGREEMENT_SHARE_PACKAGE_VERIFICATION_VERSION
+}
+
+fn default_agreement_bundle_version() -> u32 {
+    AGREEMENT_BUNDLE_VERSION
+}
+
+fn default_agreement_signature_version() -> u32 {
+    AGREEMENT_SIGNATURE_VERSION
+}
+
+fn default_agreement_audit_record_version() -> u32 {
+    AGREEMENT_AUDIT_RECORD_VERSION
+}
+
+fn default_agreement_statement_version() -> u32 {
+    AGREEMENT_STATEMENT_VERSION
+}
+
+fn default_network_marker() -> String {
+    AGREEMENT_NETWORK_MARKER.to_string()
+}
+
+fn validate_optional_text_field(name: &str, value: &Option<String>) -> Result<(), String> {
+    if let Some(value) = value {
+        if value.trim().is_empty() {
+            return Err(format!("{name} must not be empty when provided"));
+        }
+    }
+    Ok(())
+}
+
+fn sort_json(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<_> = map.keys().cloned().collect();
+            keys.sort();
+            let mut out = Map::new();
+            for key in keys {
+                if let Some(v) = map.get(&key) {
+                    out.insert(key, sort_json(v.clone()));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sort_json).collect()),
+        other => other,
+    }
+}
+
+pub fn agreement_canonical_value(agreement: &AgreementObject) -> Result<Value, String> {
+    let value = serde_json::to_value(agreement).map_err(|e| format!("agreement to json: {e}"))?;
+    Ok(sort_json(value))
+}
+
+pub fn agreement_canonical_bytes(agreement: &AgreementObject) -> Result<Vec<u8>, String> {
+    let value = agreement_canonical_value(agreement)?;
+    serde_json::to_vec(&value).map_err(|e| format!("canonical serialize: {e}"))
+}
+
+pub fn canonical_serialization_rules() -> Vec<&'static str> {
+    vec![
+        "Canonical agreement JSON is UTF-8 encoded with lexicographically sorted object keys.",
+        "Fields with Option::None and vectors marked empty via skip rules are omitted.",
+        "Array ordering is preserved exactly as supplied by the canonical agreement object.",
+        "The canonical agreement hash is sha256(canonical_json_bytes).",
+        "Legacy agreements without schema_id remain valid; Phase 1.5 templates set schema_id explicitly.",
+    ]
+}
+
+pub fn compute_agreement_hash(agreement: &AgreementObject) -> Result<[u8; 32], String> {
+    agreement.validate()?;
+    let bytes = agreement_canonical_bytes(agreement)?;
+    let digest = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+pub fn compute_agreement_hash_hex(agreement: &AgreementObject) -> Result<String, String> {
+    Ok(hex::encode(compute_agreement_hash(agreement)?))
+}
+
+pub fn build_simple_settlement_agreement(
+    agreement_id: String,
+    creation_time: u64,
+    party_a: AgreementParty,
+    party_b: AgreementParty,
+    total_amount: u64,
+    settlement_deadline: Option<u64>,
+    refund_timeout_height: u64,
+    secret_hash_hex: String,
+    document_hash: String,
+    metadata_hash: Option<String>,
+    release_summary: Option<String>,
+    refund_summary: Option<String>,
+    notes: Option<String>,
+) -> Result<AgreementObject, String> {
+    let party_a_id = party_a.party_id.clone();
+    let party_b_id = party_b.party_id.clone();
+    let agreement = AgreementObject {
+        agreement_id,
+        version: AGREEMENT_OBJECT_VERSION,
+        schema_id: Some(AGREEMENT_SCHEMA_ID_V1.to_string()),
+        template_type: AgreementTemplateType::SimpleReleaseRefund,
+        parties: vec![party_a.clone(), party_b.clone()],
+        payer: party_a_id,
+        payee: party_b_id,
+        mediator_reference: None,
+        total_amount,
+        network_marker: AGREEMENT_NETWORK_MARKER.to_string(),
+        creation_time,
+        deadlines: AgreementDeadlines {
+            settlement_deadline,
+            refund_deadline: Some(refund_timeout_height),
+            dispute_window: None,
+        },
+        release_conditions: vec![AgreementReleaseCondition {
+            mode: "secret_preimage".to_string(),
+            secret_hash_hex: Some(secret_hash_hex),
+            release_authorizer: Some("payer".to_string()),
+            notes: release_summary.clone(),
+        }],
+        refund_conditions: vec![AgreementRefundCondition {
+            refund_address: party_a.address.clone(),
+            timeout_height: refund_timeout_height,
+            notes: refund_summary.clone(),
+        }],
+        milestones: vec![],
+        deposit_rule: None,
+        proof_policy_reference: None,
+        asset_reference: None,
+        payment_reference: None,
+        purpose_reference: None,
+        release_summary,
+        refund_summary,
+        attestor_reference: None,
+        resolver_reference: None,
+        notes,
+        document_hash,
+        metadata_hash,
+        invoice_reference: None,
+        external_reference: None,
+        disputed_metadata_only: false,
+    };
+    agreement.validate()?;
+    Ok(agreement)
+}
+
+pub fn build_deposit_agreement(
+    agreement_id: String,
+    creation_time: u64,
+    payer: AgreementParty,
+    payee: AgreementParty,
+    deposit_amount: u64,
+    purpose_reference: String,
+    refundable_conditions_summary: String,
+    refund_timeout_height: u64,
+    secret_hash_hex: String,
+    document_hash: String,
+    metadata_hash: Option<String>,
+    notes: Option<String>,
+) -> Result<AgreementObject, String> {
+    let payer_id = payer.party_id.clone();
+    let payee_id = payee.party_id.clone();
+    let agreement = AgreementObject {
+        agreement_id,
+        version: AGREEMENT_OBJECT_VERSION,
+        schema_id: Some(AGREEMENT_SCHEMA_ID_V1.to_string()),
+        template_type: AgreementTemplateType::RefundableDeposit,
+        parties: vec![payer.clone(), payee.clone()],
+        payer: payer_id,
+        payee: payee_id,
+        mediator_reference: None,
+        total_amount: deposit_amount,
+        network_marker: AGREEMENT_NETWORK_MARKER.to_string(),
+        creation_time,
+        deadlines: AgreementDeadlines {
+            settlement_deadline: None,
+            refund_deadline: Some(refund_timeout_height),
+            dispute_window: None,
+        },
+        release_conditions: vec![AgreementReleaseCondition {
+            mode: "secret_preimage".to_string(),
+            secret_hash_hex: Some(secret_hash_hex),
+            release_authorizer: Some("payer".to_string()),
+            notes: Some("Deposit release requires the agreed HTLC release path".to_string()),
+        }],
+        refund_conditions: vec![AgreementRefundCondition {
+            refund_address: payer.address.clone(),
+            timeout_height: refund_timeout_height,
+            notes: Some(refundable_conditions_summary.clone()),
+        }],
+        milestones: vec![],
+        deposit_rule: Some(AgreementDepositRule {
+            amount: deposit_amount,
+            beneficiary_address: payee.address.clone(),
+            refund_address: payer.address.clone(),
+            timeout_height: refund_timeout_height,
+            notes: Some(refundable_conditions_summary.clone()),
+        }),
+        proof_policy_reference: None,
+        asset_reference: None,
+        payment_reference: None,
+        purpose_reference: Some(purpose_reference),
+        release_summary: Some("HTLC-backed deposit release path".to_string()),
+        refund_summary: Some(refundable_conditions_summary),
+        attestor_reference: None,
+        resolver_reference: None,
+        notes,
+        document_hash,
+        metadata_hash,
+        invoice_reference: None,
+        external_reference: None,
+        disputed_metadata_only: false,
+    };
+    agreement.validate()?;
+    Ok(agreement)
+}
+
+pub fn build_otc_agreement(
+    agreement_id: String,
+    creation_time: u64,
+    buyer: AgreementParty,
+    seller: AgreementParty,
+    total_amount: u64,
+    asset_reference: String,
+    payment_reference: String,
+    refund_timeout_height: u64,
+    secret_hash_hex: String,
+    document_hash: String,
+    metadata_hash: Option<String>,
+    notes: Option<String>,
+) -> Result<AgreementObject, String> {
+    let buyer_id = buyer.party_id.clone();
+    let seller_id = seller.party_id.clone();
+    let agreement = AgreementObject {
+        agreement_id,
+        version: AGREEMENT_OBJECT_VERSION,
+        schema_id: Some(AGREEMENT_SCHEMA_ID_V1.to_string()),
+        template_type: AgreementTemplateType::OtcSettlement,
+        parties: vec![buyer.clone(), seller.clone()],
+        payer: buyer_id,
+        payee: seller_id,
+        mediator_reference: None,
+        total_amount,
+        network_marker: AGREEMENT_NETWORK_MARKER.to_string(),
+        creation_time,
+        deadlines: AgreementDeadlines {
+            settlement_deadline: None,
+            refund_deadline: Some(refund_timeout_height),
+            dispute_window: None,
+        },
+        release_conditions: vec![AgreementReleaseCondition {
+            mode: "secret_preimage".to_string(),
+            secret_hash_hex: Some(secret_hash_hex),
+            release_authorizer: Some("buyer".to_string()),
+            notes: Some(
+                "OTC release path requires the agreed HTLC branch or off-chain coordination"
+                    .to_string(),
+            ),
+        }],
+        refund_conditions: vec![AgreementRefundCondition {
+            refund_address: buyer.address.clone(),
+            timeout_height: refund_timeout_height,
+            notes: Some(
+                "Refund remains an HTLC timeout path when the funding leg uses HTLCv1".to_string(),
+            ),
+        }],
+        milestones: vec![],
+        deposit_rule: None,
+        proof_policy_reference: None,
+        asset_reference: Some(asset_reference),
+        payment_reference: Some(payment_reference),
+        purpose_reference: None,
+        release_summary: Some("HTLC-backed OTC release path".to_string()),
+        refund_summary: Some("Timeout refund path for the OTC funding leg".to_string()),
+        attestor_reference: None,
+        resolver_reference: None,
+        notes,
+        document_hash,
+        metadata_hash,
+        invoice_reference: None,
+        external_reference: None,
+        disputed_metadata_only: false,
+    };
+    agreement.validate()?;
+    Ok(agreement)
+}
+
+pub fn build_milestone_agreement(
+    agreement_id: String,
+    creation_time: u64,
+    payer: AgreementParty,
+    payee: AgreementParty,
+    milestones: Vec<AgreementMilestone>,
+    refund_deadline: u64,
+    document_hash: String,
+    metadata_hash: Option<String>,
+    notes: Option<String>,
+) -> Result<AgreementObject, String> {
+    let total_amount: u64 = milestones.iter().map(|m| m.amount).sum();
+    let payer_id = payer.party_id.clone();
+    let payee_id = payee.party_id.clone();
+    let agreement = AgreementObject {
+        agreement_id,
+        version: AGREEMENT_OBJECT_VERSION,
+        schema_id: Some(AGREEMENT_SCHEMA_ID_V1.to_string()),
+        template_type: AgreementTemplateType::MilestoneSettlement,
+        parties: vec![payer.clone(), payee.clone()],
+        payer: payer_id,
+        payee: payee_id,
+        mediator_reference: None,
+        total_amount,
+        network_marker: AGREEMENT_NETWORK_MARKER.to_string(),
+        creation_time,
+        deadlines: AgreementDeadlines {
+            settlement_deadline: milestones.iter().map(|m| m.timeout_height).max(),
+            refund_deadline: Some(refund_deadline),
+            dispute_window: None,
+        },
+        release_conditions: vec![AgreementReleaseCondition {
+            mode: "secret_preimage".to_string(),
+            secret_hash_hex: milestones.first().map(|m| m.secret_hash_hex.clone()),
+            release_authorizer: Some("payer".to_string()),
+            notes: Some("Milestone completion is off-chain agreement context; HTLC branches enforce only the funded leg paths".to_string()),
+        }],
+        refund_conditions: vec![AgreementRefundCondition {
+            refund_address: payer.address.clone(),
+            timeout_height: refund_deadline,
+            notes: Some("Fallback refund applies when milestone legs remain unspent until timeout".to_string()),
+        }],
+        milestones,
+        deposit_rule: None,
+        proof_policy_reference: None,
+        asset_reference: None,
+        payment_reference: None,
+        purpose_reference: Some("Milestone settlement schedule".to_string()),
+        release_summary: Some("Each milestone leg may use its own HTLC-backed release branch".to_string()),
+        refund_summary: Some("Each milestone leg may use its own timeout refund branch".to_string()),
+        attestor_reference: None,
+        resolver_reference: None,
+        notes,
+        document_hash,
+        metadata_hash,
+        invoice_reference: None,
+        external_reference: None,
+        disputed_metadata_only: false,
+    };
+    agreement.validate()?;
+    Ok(agreement)
+}
+
+pub fn build_agreement_bundle_with_artifacts(
+    agreement: &AgreementObject,
+    saved_at: u64,
+    source_label: Option<String>,
+    note: Option<String>,
+    linked_funding_txids: Vec<String>,
+    milestone_hints: Vec<AgreementBundleMilestoneHint>,
+    artifacts: AgreementBundleArtifacts,
+) -> Result<AgreementBundle, String> {
+    let agreement_hash = compute_agreement_hash_hex(agreement)?;
+    Ok(AgreementBundle {
+        version: AGREEMENT_BUNDLE_VERSION,
+        bundle_schema_id: Some(AGREEMENT_BUNDLE_SCHEMA_ID_V1.to_string()),
+        agreement_id: agreement.agreement_id.clone(),
+        agreement_hash,
+        agreement: agreement.clone(),
+        metadata: AgreementBundleMetadata {
+            saved_at,
+            source_label,
+            note,
+            linked_funding_txids,
+            milestone_hints,
+        },
+        artifacts,
+        signatures: Vec::new(),
+    })
+}
+
+pub fn build_agreement_bundle(
+    agreement: &AgreementObject,
+    saved_at: u64,
+    source_label: Option<String>,
+    note: Option<String>,
+    linked_funding_txids: Vec<String>,
+    milestone_hints: Vec<AgreementBundleMilestoneHint>,
+) -> Result<AgreementBundle, String> {
+    build_agreement_bundle_with_artifacts(
+        agreement,
+        saved_at,
+        source_label,
+        note,
+        linked_funding_txids,
+        milestone_hints,
+        AgreementBundleArtifacts::default(),
+    )
+}
+
+pub fn agreement_bundle_canonical_value(bundle: &AgreementBundle) -> Result<Value, String> {
+    let mut canonical = bundle.clone();
+    canonical.signatures.clear();
+    let value = serde_json::to_value(canonical).map_err(|e| format!("bundle to json: {e}"))?;
+    Ok(sort_json(value))
+}
+
+pub fn agreement_share_package_included_artifact_types(
+    package: &AgreementSharePackage,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if package.agreement.is_some() {
+        out.push("agreement".to_string());
+    }
+    if package.bundle.is_some() {
+        out.push("bundle".to_string());
+    }
+    if package.audit.is_some() {
+        out.push("audit".to_string());
+    }
+    if package.statement.is_some() {
+        out.push("statement".to_string());
+    }
+    if !package.detached_agreement_signatures.is_empty() {
+        out.push("agreement_signatures".to_string());
+    }
+    if !package.detached_bundle_signatures.is_empty() {
+        out.push("bundle_signatures".to_string());
+    }
+    out
+}
+
+pub fn agreement_share_package_all_artifact_types() -> Vec<String> {
+    vec![
+        "agreement".to_string(),
+        "bundle".to_string(),
+        "audit".to_string(),
+        "statement".to_string(),
+        "agreement_signatures".to_string(),
+        "bundle_signatures".to_string(),
+    ]
+}
+
+fn infer_agreement_share_package_profile(package: &AgreementSharePackage) -> String {
+    let has_review = package.audit.is_some() || package.statement.is_some();
+    let has_signatures = !package.detached_agreement_signatures.is_empty()
+        || !package.detached_bundle_signatures.is_empty();
+    if has_review && has_signatures && package.bundle.is_some() {
+        "full_informational_package".to_string()
+    } else if has_signatures {
+        "verification_package".to_string()
+    } else if has_review {
+        "review_package".to_string()
+    } else {
+        "minimal_agreement_handoff".to_string()
+    }
+}
+
+fn build_agreement_share_package_manifest(
+    package: &AgreementSharePackage,
+) -> AgreementSharePackageManifest {
+    let included_artifact_types = agreement_share_package_included_artifact_types(package);
+    let omitted_artifact_types = agreement_share_package_all_artifact_types()
+        .into_iter()
+        .filter(|item| {
+            !included_artifact_types
+                .iter()
+                .any(|included| included == item)
+        })
+        .collect::<Vec<_>>();
+    AgreementSharePackageManifest {
+        package_profile: infer_agreement_share_package_profile(package),
+        included_artifact_types,
+        omitted_artifact_types,
+        verification_notice: "Manifest is descriptive only. Verify included artifacts against canonical agreement or bundle hashes, detached signatures, and derived verification output before relying on them.".to_string(),
+    }
+}
+
+pub fn build_agreement_share_package(
+    created_at: Option<u64>,
+    sender_label: Option<String>,
+    package_note: Option<String>,
+    agreement: Option<AgreementObject>,
+    bundle: Option<AgreementBundle>,
+    audit: Option<AgreementAuditRecord>,
+    statement: Option<AgreementStatement>,
+    detached_agreement_signatures: Vec<AgreementSignatureEnvelope>,
+    detached_bundle_signatures: Vec<AgreementSignatureEnvelope>,
+) -> Result<AgreementSharePackage, String> {
+    let mut package = AgreementSharePackage {
+        version: AGREEMENT_SHARE_PACKAGE_VERSION,
+        package_schema_id: Some(AGREEMENT_SHARE_PACKAGE_SCHEMA_ID_V1.to_string()),
+        created_at,
+        sender_label,
+        package_note,
+        included_artifact_types: Vec::new(),
+        manifest: None,
+        trust_notice: "Share package contents are supplied off-chain artifacts for handoff and re-verification. Authenticity must still be checked against canonical agreement or bundle hashes and any supplied signatures. Derived audit and statement content remains informational only and is not native consensus contract state.".to_string(),
+        agreement,
+        bundle,
+        audit,
+        statement,
+        detached_agreement_signatures,
+        detached_bundle_signatures,
+    };
+    package.included_artifact_types = agreement_share_package_included_artifact_types(&package);
+    package.manifest = Some(build_agreement_share_package_manifest(&package));
+    verify_agreement_share_package(&package)?;
+    Ok(package)
+}
+
+pub fn compute_agreement_bundle_hash_hex(bundle: &AgreementBundle) -> Result<String, String> {
+    verify_agreement_bundle(bundle)?;
+    let bytes = serde_json::to_vec(&agreement_bundle_canonical_value(bundle)?)
+        .map_err(|e| format!("bundle canonical serialize: {e}"))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+pub fn verify_agreement_bundle(bundle: &AgreementBundle) -> Result<(), String> {
+    if bundle.version != AGREEMENT_BUNDLE_VERSION {
+        return Err(format!(
+            "unsupported agreement bundle version {}",
+            bundle.version
+        ));
+    }
+    if let Some(schema_id) = &bundle.bundle_schema_id {
+        if schema_id != AGREEMENT_BUNDLE_SCHEMA_ID_V1 {
+            return Err(format!(
+                "unsupported agreement bundle schema_id {}",
+                schema_id
+            ));
+        }
+    }
+    bundle.agreement.validate()?;
+    if bundle.agreement_id != bundle.agreement.agreement_id {
+        return Err("bundle agreement_id does not match contained agreement".to_string());
+    }
+    let expected_hash = compute_agreement_hash_hex(&bundle.agreement)?;
+    if bundle.agreement_hash != expected_hash {
+        return Err("bundle agreement_hash does not match contained agreement".to_string());
+    }
+    for txid in &bundle.metadata.linked_funding_txids {
+        let bytes = hex::decode(txid)
+            .map_err(|_| "bundle linked funding txid must be 32-byte hex".to_string())?;
+        if bytes.len() != 32 {
+            return Err("bundle linked funding txid must be 32-byte hex".to_string());
+        }
+    }
+    for hint in &bundle.metadata.milestone_hints {
+        if hint.milestone_id.trim().is_empty() {
+            return Err("bundle milestone hint milestone_id required".to_string());
+        }
+        if !bundle
+            .agreement
+            .milestones
+            .iter()
+            .any(|m| m.milestone_id == hint.milestone_id)
+        {
+            return Err(format!(
+                "bundle milestone hint references unknown milestone_id {}",
+                hint.milestone_id
+            ));
+        }
+        if let Some(txid) = &hint.funding_txid {
+            let bytes = hex::decode(txid).map_err(|_| {
+                "bundle milestone hint funding_txid must be 32-byte hex".to_string()
+            })?;
+            if bytes.len() != 32 {
+                return Err("bundle milestone hint funding_txid must be 32-byte hex".to_string());
+            }
+        }
+    }
+    for hash in &bundle.artifacts.external_document_hashes {
+        if hash.len() != 64 || hex::decode(hash).is_err() {
+            return Err("bundle external_document_hashes entries must be 32-byte hex".to_string());
+        }
+    }
+    if let Some(audit_value) = &bundle.artifacts.audit {
+        let audit: AgreementAuditRecord = serde_json::from_value(audit_value.clone())
+            .map_err(|e| format!("bundle audit artifact invalid: {e}"))?;
+        if audit.agreement.agreement_hash != bundle.agreement_hash {
+            return Err("bundle audit artifact agreement_hash does not match bundle".to_string());
+        }
+    }
+    if let Some(statement_value) = &bundle.artifacts.statement {
+        let statement: AgreementStatement = serde_json::from_value(statement_value.clone())
+            .map_err(|e| format!("bundle statement artifact invalid: {e}"))?;
+        if statement.identity.agreement_hash != bundle.agreement_hash {
+            return Err(
+                "bundle statement artifact agreement_hash does not match bundle".to_string(),
+            );
+        }
+    }
+    let expected_bundle_hash = {
+        let bytes = serde_json::to_vec(&agreement_bundle_canonical_value(bundle)?)
+            .map_err(|e| format!("bundle canonical serialize: {e}"))?;
+        hex::encode(Sha256::digest(bytes))
+    };
+    for signature in &bundle.signatures {
+        validate_agreement_signature_envelope(signature)?;
+        match signature.target_type {
+            AgreementSignatureTargetType::Agreement => {
+                if signature.target_hash != bundle.agreement_hash {
+                    return Err(
+                        "bundle signature target_hash does not match contained agreement hash"
+                            .to_string(),
+                    );
+                }
+            }
+            AgreementSignatureTargetType::Bundle => {
+                if signature.target_hash != expected_bundle_hash {
+                    return Err(
+                        "bundle signature target_hash does not match contained bundle hash"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_hex_len(name: &str, value: &str, bytes_len: usize) -> Result<(), String> {
+    let raw = hex::decode(value).map_err(|_| format!("{name} must be {}-byte hex", bytes_len))?;
+    if raw.len() != bytes_len {
+        return Err(format!("{name} must be {}-byte hex", bytes_len));
+    }
+    Ok(())
+}
+
+fn validate_agreement_signature_envelope_inner(
+    signature: &AgreementSignatureEnvelope,
+    require_signature: bool,
+) -> Result<(), String> {
+    if signature.version != AGREEMENT_SIGNATURE_VERSION {
+        return Err(format!(
+            "unsupported agreement signature version {}",
+            signature.version
+        ));
+    }
+    validate_hex_len("signature target_hash", &signature.target_hash, 32)?;
+    validate_optional_text_field("signer_address", &signature.signer_address)?;
+    validate_optional_text_field("signer_role", &signature.signer_role)?;
+    if signature.signature_type != AGREEMENT_SIGNATURE_TYPE_SECP256K1 {
+        return Err(format!(
+            "unsupported signature_type {}",
+            signature.signature_type
+        ));
+    }
+    let pubkey_bytes = hex::decode(&signature.signer_public_key)
+        .map_err(|_| "signer_public_key must be hex-encoded SEC1 bytes".to_string())?;
+    VerifyingKey::from_sec1_bytes(&pubkey_bytes)
+        .map_err(|_| "signer_public_key must be a valid secp256k1 SEC1 public key".to_string())?;
+    if require_signature {
+        let sig_bytes = hex::decode(&signature.signature)
+            .map_err(|_| "signature must be 64-byte hex".to_string())?;
+        Signature::from_slice(&sig_bytes)
+            .map_err(|_| "signature must be 64-byte hex".to_string())?;
+    }
+    Ok(())
+}
+
+pub fn validate_agreement_signature_envelope(
+    signature: &AgreementSignatureEnvelope,
+) -> Result<(), String> {
+    validate_agreement_signature_envelope_inner(signature, true)
+}
+
+pub fn agreement_signature_canonical_value(
+    signature: &AgreementSignatureEnvelope,
+) -> Result<Value, String> {
+    let mut unsigned = signature.clone();
+    unsigned.signature.clear();
+    let value = serde_json::to_value(unsigned).map_err(|e| format!("signature to json: {e}"))?;
+    Ok(sort_json(value))
+}
+
+pub fn agreement_signature_canonical_bytes(
+    signature: &AgreementSignatureEnvelope,
+) -> Result<Vec<u8>, String> {
+    let value = agreement_signature_canonical_value(signature)?;
+    serde_json::to_vec(&value).map_err(|e| format!("signature canonical serialize: {e}"))
+}
+
+pub fn compute_agreement_signature_payload_hash(
+    signature: &AgreementSignatureEnvelope,
+) -> Result<[u8; 32], String> {
+    validate_agreement_signature_envelope_inner(signature, false)?;
+    let bytes = agreement_signature_canonical_bytes(signature)?;
+    let digest = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+pub fn verify_agreement_signature_envelope(
+    signature: &AgreementSignatureEnvelope,
+) -> Result<(), String> {
+    validate_agreement_signature_envelope(signature)?;
+    let digest = compute_agreement_signature_payload_hash(signature)?;
+    let pubkey_bytes = hex::decode(&signature.signer_public_key)
+        .map_err(|_| "signer_public_key must be hex-encoded SEC1 bytes".to_string())?;
+    let verifying_key = VerifyingKey::from_sec1_bytes(&pubkey_bytes)
+        .map_err(|_| "signer_public_key must be a valid secp256k1 SEC1 public key".to_string())?;
+    let sig_bytes = hex::decode(&signature.signature)
+        .map_err(|_| "signature must be 64-byte hex".to_string())?;
+    let parsed = Signature::from_slice(&sig_bytes)
+        .map_err(|_| "signature must be 64-byte hex".to_string())?;
+    verifying_key
+        .verify_prehash(&digest, &parsed)
+        .map_err(|_| "signature verification failed".to_string())
+}
+
+pub fn inspect_agreement_signature(
+    signature: &AgreementSignatureEnvelope,
+    expected_agreement_hash: Option<&str>,
+    expected_bundle_hash: Option<&str>,
+) -> AgreementSignatureVerification {
+    let mut warnings = Vec::new();
+    let valid = match verify_agreement_signature_envelope(signature) {
+        Ok(()) => true,
+        Err(err) => {
+            warnings.push(err);
+            false
+        }
+    };
+    let expected = match signature.target_type {
+        AgreementSignatureTargetType::Agreement => expected_agreement_hash,
+        AgreementSignatureTargetType::Bundle => expected_bundle_hash,
+    };
+    let matches_expected_target = expected
+        .map(|value| value.eq_ignore_ascii_case(&signature.target_hash))
+        .unwrap_or(false);
+    if expected.is_some() && !matches_expected_target {
+        warnings.push("signature target hash did not match the supplied artifact".to_string());
+    }
+    let authenticity_note = if valid {
+        "Signature authenticity is valid for the signed target hash. This proves authorship or intent only, not correctness of the agreement.".to_string()
+    } else {
+        "Signature authenticity could not be verified for the supplied target hash.".to_string()
+    };
+    AgreementSignatureVerification {
+        target_type: signature.target_type,
+        target_hash: signature.target_hash.clone(),
+        signer_public_key: signature.signer_public_key.clone(),
+        signer_address: signature.signer_address.clone(),
+        signer_role: signature.signer_role.clone(),
+        signature_type: signature.signature_type.clone(),
+        timestamp: signature.timestamp,
+        valid,
+        matches_expected_target,
+        authenticity_note,
+        warnings,
+    }
+}
+
+pub fn verify_bundle_signatures(bundle: &AgreementBundle) -> Vec<AgreementSignatureVerification> {
+    let bundle_hash = compute_agreement_bundle_hash_hex(bundle).ok();
+    bundle
+        .signatures
+        .iter()
+        .map(|signature| {
+            inspect_agreement_signature(
+                signature,
+                Some(&bundle.agreement_hash),
+                bundle_hash.as_deref(),
+            )
+        })
+        .collect()
+}
+
+pub fn verify_agreement_share_package(package: &AgreementSharePackage) -> Result<(), String> {
+    if package.version != AGREEMENT_SHARE_PACKAGE_VERSION {
+        return Err(format!(
+            "unsupported agreement share package version {}",
+            package.version
+        ));
+    }
+    if let Some(schema_id) = &package.package_schema_id {
+        if schema_id != AGREEMENT_SHARE_PACKAGE_SCHEMA_ID_V1 {
+            return Err(format!(
+                "unsupported agreement share package schema_id {}",
+                schema_id
+            ));
+        }
+    }
+    validate_optional_text_field("share package sender_label", &package.sender_label)?;
+    validate_optional_text_field("share package package_note", &package.package_note)?;
+    if package.trust_notice.trim().is_empty() {
+        return Err("share package trust_notice required".to_string());
+    }
+    let expected_types = agreement_share_package_included_artifact_types(package);
+    if package.included_artifact_types != expected_types {
+        return Err(
+            "share package included_artifact_types did not match supplied contents".to_string(),
+        );
+    }
+    if let Some(manifest) = &package.manifest {
+        let expected_manifest = build_agreement_share_package_manifest(package);
+        if manifest != &expected_manifest {
+            return Err("share package manifest did not match supplied contents".to_string());
+        }
+    }
+    if let Some(agreement) = &package.agreement {
+        agreement.validate()?;
+    }
+    if let Some(bundle) = &package.bundle {
+        verify_agreement_bundle(bundle)?;
+    }
+    if let Some(audit) = &package.audit {
+        if audit.metadata.version != AGREEMENT_AUDIT_RECORD_VERSION {
+            return Err(format!(
+                "unsupported agreement audit record version {}",
+                audit.metadata.version
+            ));
+        }
+    }
+    if let Some(statement) = &package.statement {
+        if statement.metadata.version != AGREEMENT_STATEMENT_VERSION {
+            return Err(format!(
+                "unsupported agreement statement version {}",
+                statement.metadata.version
+            ));
+        }
+    }
+    for signature in &package.detached_agreement_signatures {
+        validate_agreement_signature_envelope(signature)?;
+    }
+    for signature in &package.detached_bundle_signatures {
+        validate_agreement_signature_envelope(signature)?;
+    }
+    Ok(())
+}
+
+pub fn inspect_agreement_share_package(
+    package: &AgreementSharePackage,
+) -> Result<AgreementSharePackageInspection, String> {
+    verify_agreement_share_package(package)?;
+    let canonical = package
+        .agreement
+        .as_ref()
+        .or_else(|| package.bundle.as_ref().map(|b| &b.agreement));
+    let canonical_agreement_hash = canonical
+        .map(compute_agreement_hash_hex)
+        .transpose()?
+        .or_else(|| package.bundle.as_ref().map(|b| b.agreement_hash.clone()));
+    let bundle_hash = package
+        .bundle
+        .as_ref()
+        .map(compute_agreement_bundle_hash_hex)
+        .transpose()?;
+    let manifest = package
+        .manifest
+        .clone()
+        .unwrap_or_else(|| build_agreement_share_package_manifest(package));
+    Ok(AgreementSharePackageInspection {
+        version: package.version,
+        package_schema_id: package.package_schema_id.clone(),
+        created_at: package.created_at,
+        sender_label: package.sender_label.clone(),
+        package_note: package.package_note.clone(),
+        package_profile: manifest.package_profile,
+        included_artifact_types: manifest.included_artifact_types,
+        omitted_artifact_types: manifest.omitted_artifact_types,
+        agreement_present: package.agreement.is_some(),
+        bundle_present: package.bundle.is_some(),
+        audit_present: package.audit.is_some(),
+        statement_present: package.statement.is_some(),
+        detached_agreement_signature_count: package.detached_agreement_signatures.len(),
+        detached_bundle_signature_count: package.detached_bundle_signatures.len(),
+        verification_notice: manifest.verification_notice,
+        canonical_agreement_id: canonical.map(|agreement| agreement.agreement_id.clone()),
+        canonical_agreement_hash,
+        bundle_hash,
+        trust_notice: package.trust_notice.clone(),
+        informational_notice: "Share packages are handoff artifacts only. They help counterparties exchange canonical agreement, bundle, audit, statement, and detached signature files together, but they do not create a new trust root or native agreement state. Omitted artifacts are not treated as proof that such artifacts do not exist elsewhere.".to_string(),
+    })
+}
+
+fn agreement_signature_status_label(
+    verification: &AgreementSignatureVerification,
+    expected_target_known: bool,
+) -> &'static str {
+    if verification.valid && verification.matches_expected_target {
+        "valid"
+    } else if verification.valid && !expected_target_known {
+        "unverifiable"
+    } else {
+        "invalid"
+    }
+}
+
+fn agreement_signature_signer_summary(
+    verification: &AgreementSignatureVerification,
+    expected_target_known: bool,
+) -> String {
+    format!(
+        "{} {} role {} target {} status {}",
+        serde_json::to_string(&verification.target_type)
+            .unwrap_or_else(|_| "\"unknown\"".to_string())
+            .trim_matches('"'),
+        verification
+            .signer_address
+            .as_deref()
+            .unwrap_or(verification.signer_public_key.as_str()),
+        verification.signer_role.as_deref().unwrap_or("unspecified"),
+        verification.target_hash,
+        agreement_signature_status_label(verification, expected_target_known),
+    )
+}
+
+pub fn build_agreement_artifact_authenticity_verification(
+    agreement: Option<&AgreementObject>,
+    bundle: Option<&AgreementBundle>,
+    detached_agreement_signatures: &[AgreementSignatureEnvelope],
+    detached_bundle_signatures: &[AgreementSignatureEnvelope],
+) -> Option<AgreementArtifactAuthenticityVerification> {
+    let agreement_hash = agreement
+        .map(compute_agreement_hash_hex)
+        .transpose()
+        .ok()
+        .flatten()
+        .or_else(|| bundle.map(|value| value.agreement_hash.clone()));
+    let bundle_hash = bundle
+        .map(compute_agreement_bundle_hash_hex)
+        .transpose()
+        .ok()
+        .flatten();
+    let mut verifications = Vec::new();
+    let mut warnings = Vec::new();
+
+    for signature in detached_agreement_signatures {
+        let mut verification =
+            inspect_agreement_signature(signature, agreement_hash.as_deref(), None);
+        if signature.target_type != AgreementSignatureTargetType::Agreement {
+            verification
+                .warnings
+                .push("detached agreement signature target_type was not agreement".to_string());
+        }
+        if agreement_hash.is_none() {
+            verification.warnings.push(
+                "no canonical agreement hash was available; detached agreement signature target match could not be checked"
+                    .to_string(),
+            );
+        }
+        verifications.push(verification);
+    }
+    for signature in detached_bundle_signatures {
+        let mut verification = inspect_agreement_signature(signature, None, bundle_hash.as_deref());
+        if signature.target_type != AgreementSignatureTargetType::Bundle {
+            verification
+                .warnings
+                .push("detached bundle signature target_type was not bundle".to_string());
+        }
+        if bundle_hash.is_none() {
+            verification.warnings.push(
+                "no canonical bundle hash was available; detached bundle signature target match could not be checked"
+                    .to_string(),
+            );
+        }
+        verifications.push(verification);
+    }
+    if let Some(bundle) = bundle {
+        verifications.extend(verify_bundle_signatures(bundle));
+    }
+    if verifications.is_empty() {
+        return None;
+    }
+
+    let mut valid_signatures = 0usize;
+    let mut invalid_signatures = 0usize;
+    let mut unverifiable_signatures = 0usize;
+    let mut signer_summaries = Vec::new();
+    for verification in &verifications {
+        let expected_target_known = match verification.target_type {
+            AgreementSignatureTargetType::Agreement => agreement_hash.is_some(),
+            AgreementSignatureTargetType::Bundle => bundle_hash.is_some(),
+        };
+        match agreement_signature_status_label(verification, expected_target_known) {
+            "valid" => valid_signatures += 1,
+            "unverifiable" => unverifiable_signatures += 1,
+            _ => invalid_signatures += 1,
+        }
+        signer_summaries.push(agreement_signature_signer_summary(
+            verification,
+            expected_target_known,
+        ));
+        warnings.extend(verification.warnings.clone());
+    }
+    if invalid_signatures > 0 {
+        warnings.push(
+            "one or more supplied signatures were invalid or targeted a different artifact hash"
+                .to_string(),
+        );
+    }
+    Some(AgreementArtifactAuthenticityVerification {
+        detached_agreement_signatures_supplied: detached_agreement_signatures.len(),
+        detached_bundle_signatures_supplied: detached_bundle_signatures.len(),
+        embedded_bundle_signatures_supplied: bundle.map(|value| value.signatures.len()).unwrap_or(0),
+        valid_signatures,
+        invalid_signatures,
+        unverifiable_signatures,
+        signer_summaries,
+        verifications,
+        warnings,
+        authenticity_notice: "Signature validity is an authenticity layer only. It shows which supplied key signed which supplied hash target. It does not prove agreement truth, fairness, authorization, or settlement enforceability.".to_string(),
+    })
+}
+
+pub fn summarize_agreement_authenticity(
+    authenticity: &AgreementArtifactAuthenticityVerification,
+) -> AgreementAuthenticitySummary {
+    AgreementAuthenticitySummary {
+        detached_agreement_signatures_supplied: authenticity.detached_agreement_signatures_supplied,
+        detached_bundle_signatures_supplied: authenticity.detached_bundle_signatures_supplied,
+        embedded_bundle_signatures_supplied: authenticity.embedded_bundle_signatures_supplied,
+        valid_signatures: authenticity.valid_signatures,
+        invalid_signatures: authenticity.invalid_signatures,
+        unverifiable_signatures: authenticity.unverifiable_signatures,
+        signer_summaries: authenticity.signer_summaries.clone(),
+        warnings: authenticity.warnings.clone(),
+        authenticity_notice: authenticity.authenticity_notice.clone(),
+    }
+}
+
+impl AgreementObject {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != AGREEMENT_OBJECT_VERSION {
+            return Err(format!("unsupported agreement version {}", self.version));
+        }
+        if let Some(schema_id) = &self.schema_id {
+            if schema_id != AGREEMENT_SCHEMA_ID_V1 {
+                return Err(format!("unsupported agreement schema_id {}", schema_id));
+            }
+        }
+        if self.network_marker.trim() != AGREEMENT_NETWORK_MARKER {
+            return Err("network_marker must be IRIUM".to_string());
+        }
+        if self.agreement_id.trim().is_empty() {
+            return Err("agreement_id required".to_string());
+        }
+        if self.total_amount == 0 {
+            return Err("total_amount must be > 0".to_string());
+        }
+        if self.parties.len() < 2 {
+            return Err("at least two parties required".to_string());
+        }
+        let mut party_ids = std::collections::HashSet::new();
+        for party in &self.parties {
+            if party.party_id.trim().is_empty() {
+                return Err("party_id required".to_string());
+            }
+            if party.display_name.trim().is_empty() {
+                return Err(format!("display_name required for {}", party.party_id));
+            }
+            if party.address.trim().is_empty() {
+                return Err(format!("address required for {}", party.party_id));
+            }
+            if !party_ids.insert(party.party_id.as_str()) {
+                return Err(format!("duplicate party_id {}", party.party_id));
+            }
+        }
+        if self.payer == self.payee {
+            return Err("payer and payee must differ".to_string());
+        }
+        if !self.parties.iter().any(|p| p.party_id == self.payer) {
+            return Err("payer must reference a declared party".to_string());
+        }
+        if !self.parties.iter().any(|p| p.party_id == self.payee) {
+            return Err("payee must reference a declared party".to_string());
+        }
+        validate_optional_text_field("asset_reference", &self.asset_reference)?;
+        validate_optional_text_field("payment_reference", &self.payment_reference)?;
+        validate_optional_text_field("purpose_reference", &self.purpose_reference)?;
+        validate_optional_text_field("release_summary", &self.release_summary)?;
+        validate_optional_text_field("refund_summary", &self.refund_summary)?;
+        validate_optional_text_field("attestor_reference", &self.attestor_reference)?;
+        validate_optional_text_field("resolver_reference", &self.resolver_reference)?;
+        validate_optional_text_field("notes", &self.notes)?;
+        if self.document_hash.len() != 64 || hex::decode(&self.document_hash).is_err() {
+            return Err("document_hash must be 32-byte hex".to_string());
+        }
+        if let Some(metadata_hash) = &self.metadata_hash {
+            if metadata_hash.len() != 64 || hex::decode(metadata_hash).is_err() {
+                return Err("metadata_hash must be 32-byte hex".to_string());
+            }
+        }
+        if self.release_conditions.is_empty() {
+            return Err("at least one release condition required".to_string());
+        }
+        if self.refund_conditions.is_empty() {
+            return Err("at least one refund condition required".to_string());
+        }
+        if let (Some(settlement_deadline), Some(refund_deadline)) = (
+            self.deadlines.settlement_deadline,
+            self.deadlines.refund_deadline,
+        ) {
+            if settlement_deadline > refund_deadline {
+                return Err("settlement_deadline must be <= refund_deadline".to_string());
+            }
+        }
+        let mut milestone_ids = std::collections::HashSet::new();
+        match self.template_type {
+            AgreementTemplateType::MilestoneSettlement
+            | AgreementTemplateType::ContractorMilestone => {
+                if self.milestones.is_empty() {
+                    return Err("milestone template requires milestones".to_string());
+                }
+                let sum: u64 = self.milestones.iter().map(|m| m.amount).sum();
+                if sum != self.total_amount {
+                    return Err("milestone amounts must sum to total_amount".to_string());
+                }
+            }
+            _ => {
+                if !self.milestones.is_empty() {
+                    let sum: u64 = self.milestones.iter().map(|m| m.amount).sum();
+                    if sum != self.total_amount {
+                        return Err(
+                            "milestone amounts must sum to total_amount when present".to_string()
+                        );
+                    }
+                }
+            }
+        }
+        for cond in &self.release_conditions {
+            if cond.mode.trim().is_empty() {
+                return Err("release condition mode required".to_string());
+            }
+            if cond.mode == "secret_preimage" {
+                let secret_hash_hex = cond.secret_hash_hex.as_ref().ok_or_else(|| {
+                    "secret_preimage release condition requires secret_hash_hex".to_string()
+                })?;
+                if secret_hash_hex.len() != 64 || hex::decode(secret_hash_hex).is_err() {
+                    return Err("release secret_hash_hex must be 32-byte hex".to_string());
+                }
+            }
+        }
+        for cond in &self.refund_conditions {
+            if cond.refund_address.trim().is_empty() {
+                return Err("refund address required".to_string());
+            }
+            if cond.timeout_height == 0 {
+                return Err("refund timeout_height must be > 0".to_string());
+            }
+        }
+        for milestone in &self.milestones {
+            if milestone.milestone_id.trim().is_empty() {
+                return Err("milestone_id required".to_string());
+            }
+            if !milestone_ids.insert(milestone.milestone_id.as_str()) {
+                return Err(format!("duplicate milestone_id {}", milestone.milestone_id));
+            }
+            if milestone.title.trim().is_empty() {
+                return Err(format!(
+                    "milestone title required for {}",
+                    milestone.milestone_id
+                ));
+            }
+            if milestone.amount == 0 {
+                return Err("milestone amount must be > 0".to_string());
+            }
+            if milestone.recipient_address.trim().is_empty() {
+                return Err(format!(
+                    "milestone recipient_address required for {}",
+                    milestone.milestone_id
+                ));
+            }
+            if milestone.refund_address.trim().is_empty() {
+                return Err(format!(
+                    "milestone refund_address required for {}",
+                    milestone.milestone_id
+                ));
+            }
+            if milestone.secret_hash_hex.len() != 64
+                || hex::decode(&milestone.secret_hash_hex).is_err()
+            {
+                return Err(format!(
+                    "invalid milestone secret_hash_hex for {}",
+                    milestone.milestone_id
+                ));
+            }
+            if milestone.timeout_height == 0 {
+                return Err(format!(
+                    "milestone timeout_height must be > 0 for {}",
+                    milestone.milestone_id
+                ));
+            }
+        }
+        if let Some(rule) = &self.deposit_rule {
+            if rule.amount == 0 {
+                return Err("deposit amount must be > 0".to_string());
+            }
+            if rule.beneficiary_address.trim().is_empty() {
+                return Err("deposit beneficiary_address required".to_string());
+            }
+            if rule.refund_address.trim().is_empty() {
+                return Err("deposit refund_address required".to_string());
+            }
+            if rule.timeout_height == 0 {
+                return Err("deposit timeout_height must be > 0".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn summary(&self) -> Result<AgreementSummary, String> {
+        Ok(AgreementSummary {
+            agreement_hash: compute_agreement_hash_hex(self)?,
+            total_amount: self.total_amount,
+            template_type: self.template_type,
+            milestone_count: self.milestones.len(),
+            uses_htlc_timeout: true,
+            has_deposit_rule: self.deposit_rule.is_some(),
+            canonical_json: agreement_canonical_value(self)?,
+        })
+    }
+}
+
+pub fn build_agreement_anchor_payload(anchor: &AgreementAnchor) -> Result<Vec<u8>, String> {
+    if anchor.agreement_hash.len() != 64 || hex::decode(&anchor.agreement_hash).is_err() {
+        return Err("agreement hash must be 32-byte hex".to_string());
+    }
+    let mut payload = format!(
+        "{}{}:{}",
+        AGREEMENT_ANCHOR_PREFIX,
+        anchor.agreement_hash,
+        anchor.role.short_code()
+    );
+    if let Some(m) = &anchor.milestone_id {
+        payload.push(':');
+        payload.push_str(m);
+    }
+    if payload.len() > 75 {
+        return Err("agreement anchor payload too large".to_string());
+    }
+    Ok(payload.into_bytes())
+}
+
+pub fn build_agreement_anchor_output(anchor: &AgreementAnchor) -> Result<TxOutput, String> {
+    let payload = build_agreement_anchor_payload(anchor)?;
+    let mut script = Vec::with_capacity(2 + payload.len());
+    script.push(0x6a);
+    script.push(payload.len() as u8);
+    script.extend_from_slice(&payload);
+    Ok(TxOutput {
+        value: 0,
+        script_pubkey: script,
+    })
+}
+
+pub fn parse_agreement_anchor(script_pubkey: &[u8]) -> Option<AgreementAnchor> {
+    if script_pubkey.len() < 2 || script_pubkey[0] != 0x6a {
+        return None;
+    }
+    let len = script_pubkey[1] as usize;
+    if script_pubkey.len() != len + 2 {
+        return None;
+    }
+    let payload = std::str::from_utf8(&script_pubkey[2..]).ok()?;
+    let rest = payload.strip_prefix(AGREEMENT_ANCHOR_PREFIX)?;
+    let mut parts = rest.split(':');
+    let agreement_hash = parts.next()?.to_string();
+    let role = AgreementAnchorRole::from_short_code(parts.next()?)?;
+    let milestone_id = parts.next().map(|v| v.to_string());
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(AgreementAnchor {
+        agreement_hash,
+        role,
+        milestone_id,
+    })
+}
+
+pub fn extract_agreement_funding_leg_refs_from_tx(
+    tx: &Transaction,
+    agreement_hash: &str,
+) -> Vec<AgreementFundingLegRef> {
+    let funding_txid = hex::encode(tx.txid());
+    let mut out = Vec::new();
+    for (idx, output) in tx.outputs.iter().enumerate() {
+        let Some(htlc) = parse_htlcv1_script(&output.script_pubkey) else {
+            continue;
+        };
+        let anchor_vout = idx + 1;
+        let Some(anchor_output) = tx.outputs.get(anchor_vout) else {
+            continue;
+        };
+        let Some(anchor) = parse_agreement_anchor(&anchor_output.script_pubkey) else {
+            continue;
+        };
+        if anchor.agreement_hash != agreement_hash {
+            continue;
+        }
+        out.push(AgreementFundingLegRef {
+            funding_txid: funding_txid.clone(),
+            htlc_vout: idx as u32,
+            anchor_vout: anchor_vout as u32,
+            role: anchor.role,
+            milestone_id: anchor.milestone_id,
+            amount: output.value,
+            timeout_height: htlc.timeout_height,
+            expected_hash: hex::encode(htlc.expected_hash),
+            recipient_address: bs58::encode({
+                let mut body = Vec::with_capacity(1 + 20 + 4);
+                body.push(0x00);
+                body.extend_from_slice(&htlc.recipient_pkh);
+                let first = sha2::Sha256::digest(&body);
+                let second = sha2::Sha256::digest(&first);
+                body.extend_from_slice(&second[0..4]);
+                body
+            })
+            .into_string(),
+            refund_address: bs58::encode({
+                let mut body = Vec::with_capacity(1 + 20 + 4);
+                body.push(0x00);
+                body.extend_from_slice(&htlc.refund_pkh);
+                let first = sha2::Sha256::digest(&body);
+                let second = sha2::Sha256::digest(&first);
+                body.extend_from_slice(&second[0..4]);
+                body
+            })
+            .into_string(),
+        });
+    }
+    out
+}
+
+pub fn build_funding_legs(
+    agreement: &AgreementObject,
+    payer_pkh: [u8; 20],
+    payee_pkh: [u8; 20],
+) -> Result<Vec<SettlementFundingLeg>, String> {
+    agreement.validate()?;
+    let mut legs = Vec::new();
+    match agreement.template_type {
+        AgreementTemplateType::MilestoneSettlement | AgreementTemplateType::ContractorMilestone => {
+            for milestone in &agreement.milestones {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(
+                    &hex::decode(&milestone.secret_hash_hex)
+                        .map_err(|_| "invalid milestone secret hash".to_string())?,
+                );
+                let output = HtlcV1Output {
+                    expected_hash: hash,
+                    recipient_pkh: payee_pkh,
+                    refund_pkh: payer_pkh,
+                    timeout_height: milestone.timeout_height,
+                };
+                legs.push(SettlementFundingLeg {
+                    role: AgreementAnchorRole::Funding,
+                    milestone_id: Some(milestone.milestone_id.clone()),
+                    amount: milestone.amount,
+                    output: TxOutput {
+                        value: milestone.amount,
+                        script_pubkey: encode_htlcv1_script(&output),
+                    },
+                });
+            }
+        }
+        _ => {
+            let release = agreement
+                .release_conditions
+                .iter()
+                .find(|c| c.mode == "secret_preimage")
+                .ok_or_else(|| {
+                    "simple agreement requires secret_preimage release condition".to_string()
+                })?;
+            let secret_hash_hex = release.secret_hash_hex.as_ref().ok_or_else(|| {
+                "secret_preimage release condition requires secret_hash_hex".to_string()
+            })?;
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(
+                &hex::decode(secret_hash_hex).map_err(|_| "invalid secret_hash_hex".to_string())?,
+            );
+            let refund = agreement
+                .refund_conditions
+                .first()
+                .ok_or_else(|| "refund condition required".to_string())?;
+            let output = HtlcV1Output {
+                expected_hash: hash,
+                recipient_pkh: payee_pkh,
+                refund_pkh: payer_pkh,
+                timeout_height: refund.timeout_height,
+            };
+            let role = match agreement.template_type {
+                AgreementTemplateType::RefundableDeposit => AgreementAnchorRole::DepositLock,
+                AgreementTemplateType::OtcSettlement => AgreementAnchorRole::OtcSettlement,
+                AgreementTemplateType::MerchantDelayedSettlement => {
+                    AgreementAnchorRole::MerchantSettlement
+                }
+                _ => AgreementAnchorRole::Funding,
+            };
+            legs.push(SettlementFundingLeg {
+                role,
+                milestone_id: None,
+                amount: agreement.total_amount,
+                output: TxOutput {
+                    value: agreement.total_amount,
+                    script_pubkey: encode_htlcv1_script(&output),
+                },
+            });
+        }
+    }
+    Ok(legs)
+}
+
+fn is_funding_leg_role(role: AgreementAnchorRole) -> bool {
+    matches!(
+        role,
+        AgreementAnchorRole::Funding
+            | AgreementAnchorRole::DepositLock
+            | AgreementAnchorRole::OtcSettlement
+            | AgreementAnchorRole::MerchantSettlement
+    )
+}
+
+pub fn discover_agreement_funding_leg_candidates(
+    agreement_hash: &str,
+    linked_txs: &[AgreementLinkedTx],
+    observed_refs: &[AgreementFundingLegRef],
+    bundle_metadata: Option<&AgreementBundleMetadata>,
+) -> Result<Vec<AgreementFundingLegCandidate>, String> {
+    let mut candidates = Vec::new();
+    for leg in observed_refs {
+        if !is_funding_leg_role(leg.role) {
+            continue;
+        }
+        let mut source_notes = vec!["direct_anchor_match".to_string()];
+        if linked_txs.iter().any(|tx| {
+            tx.txid == leg.funding_txid
+                && tx.role == leg.role
+                && tx.milestone_id == leg.milestone_id
+        }) {
+            source_notes.push("linked_tx_observed".to_string());
+        }
+        if let Some(meta) = bundle_metadata {
+            if meta
+                .linked_funding_txids
+                .iter()
+                .any(|txid| txid.eq_ignore_ascii_case(&leg.funding_txid))
+            {
+                source_notes.push("bundle_linked_funding_txid".to_string());
+            }
+            if let Some(mid) = leg.milestone_id.as_deref() {
+                let milestone_hint_match = meta.milestone_hints.iter().any(|hint| {
+                    hint.milestone_id == mid
+                        && hint
+                            .funding_txid
+                            .as_deref()
+                            .map(|txid| txid.eq_ignore_ascii_case(&leg.funding_txid))
+                            .unwrap_or(true)
+                        && hint
+                            .htlc_vout
+                            .map(|vout| vout == leg.htlc_vout)
+                            .unwrap_or(true)
+                });
+                if milestone_hint_match {
+                    source_notes.push("bundle_milestone_hint".to_string());
+                }
+            }
+        }
+        candidates.push(AgreementFundingLegCandidate {
+            agreement_hash: agreement_hash.to_string(),
+            funding_txid: leg.funding_txid.clone(),
+            htlc_vout: leg.htlc_vout,
+            anchor_vout: leg.anchor_vout,
+            role: leg.role,
+            milestone_id: leg.milestone_id.clone(),
+            amount: leg.amount,
+            htlc_backed: true,
+            timeout_height: leg.timeout_height,
+            recipient_address: leg.recipient_address.clone(),
+            refund_address: leg.refund_address.clone(),
+            source_notes,
+        });
+    }
+    if let Some(meta) = bundle_metadata {
+        for txid in &meta.linked_funding_txids {
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.funding_txid.eq_ignore_ascii_case(txid))
+            {
+                return Err(format!(
+                    "bundle linked funding txid {} not found in observed agreement funding legs",
+                    txid
+                ));
+            }
+        }
+        for hint in &meta.milestone_hints {
+            let matches = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.milestone_id.as_deref() == Some(hint.milestone_id.as_str())
+                })
+                .filter(|candidate| {
+                    hint.funding_txid
+                        .as_deref()
+                        .map(|txid| candidate.funding_txid.eq_ignore_ascii_case(txid))
+                        .unwrap_or(true)
+                })
+                .filter(|candidate| {
+                    hint.htlc_vout
+                        .map(|v| candidate.htlc_vout == v)
+                        .unwrap_or(true)
+                })
+                .count();
+            if matches == 0 {
+                return Err(format!(
+                    "bundle milestone hint for {} conflicts with observed agreement funding legs",
+                    hint.milestone_id
+                ));
+            }
+        }
+    }
+    candidates.sort_by(|a, b| {
+        a.milestone_id
+            .cmp(&b.milestone_id)
+            .then_with(|| a.funding_txid.cmp(&b.funding_txid))
+            .then_with(|| a.htlc_vout.cmp(&b.htlc_vout))
+    });
+    Ok(candidates)
+}
+
+pub fn build_agreement_activity_timeline(
+    agreement_hash: &str,
+    lifecycle: &AgreementLifecycleView,
+    linked_txs: &[AgreementLinkedTx],
+    funding_legs: &[AgreementFundingLegCandidate],
+    bundle: Option<&AgreementBundle>,
+) -> Vec<AgreementActivityEvent> {
+    let mut events = Vec::new();
+    events.push(AgreementActivityEvent {
+        event_type: "agreement_hash_computed".to_string(),
+        source: AgreementActivitySource::DerivedIndexed,
+        txid: None,
+        height: None,
+        timestamp: None,
+        milestone_id: None,
+        note: Some(format!(
+            "canonical agreement hash {} verified from supplied agreement object",
+            agreement_hash
+        )),
+    });
+    if let Some(bundle) = bundle {
+        events.push(AgreementActivityEvent {
+            event_type: "bundle_hash_verified".to_string(),
+            source: AgreementActivitySource::LocalBundle,
+            txid: None,
+            height: None,
+            timestamp: Some(bundle.metadata.saved_at),
+            milestone_id: None,
+            note: Some(
+                "saved agreement bundle matches the contained canonical agreement object"
+                    .to_string(),
+            ),
+        });
+        if bundle.metadata.saved_at > 0 {
+            events.push(AgreementActivityEvent {
+                event_type: "agreement_saved_local".to_string(),
+                source: AgreementActivitySource::LocalBundle,
+                txid: None,
+                height: None,
+                timestamp: Some(bundle.metadata.saved_at),
+                milestone_id: None,
+                note: Some("agreement bundle saved in the local Phase 1 bundle store".to_string()),
+            });
+        }
+    }
+    let mut ordered_linked = linked_txs.to_vec();
+    ordered_linked.sort_by(|a, b| {
+        a.height
+            .cmp(&b.height)
+            .then_with(|| a.txid.cmp(&b.txid))
+            .then_with(|| a.milestone_id.cmp(&b.milestone_id))
+    });
+    for tx in ordered_linked {
+        let event_type = match tx.role {
+            AgreementAnchorRole::Funding
+            | AgreementAnchorRole::DepositLock
+            | AgreementAnchorRole::OtcSettlement
+            | AgreementAnchorRole::MerchantSettlement => "funding_tx_observed",
+            AgreementAnchorRole::Release | AgreementAnchorRole::MilestoneRelease => {
+                "release_tx_observed"
+            }
+            AgreementAnchorRole::Refund => "refund_tx_observed",
+            AgreementAnchorRole::CollateralLock => "linked_tx_observed",
+        };
+        events.push(AgreementActivityEvent {
+            event_type: event_type.to_string(),
+            source: AgreementActivitySource::ChainObserved,
+            txid: Some(tx.txid.clone()),
+            height: tx.height,
+            timestamp: None,
+            milestone_id: tx.milestone_id.clone(),
+            note: Some(format!(
+                "linked transaction observed with anchor role {:?}",
+                tx.role
+            )),
+        });
+    }
+    for leg in funding_legs {
+        events.push(AgreementActivityEvent {
+            event_type: "funding_leg_discovered".to_string(),
+            source: AgreementActivitySource::DerivedIndexed,
+            txid: Some(leg.funding_txid.clone()),
+            height: linked_txs
+                .iter()
+                .find(|tx| {
+                    tx.txid == leg.funding_txid
+                        && tx.role == leg.role
+                        && tx.milestone_id == leg.milestone_id
+                })
+                .and_then(|tx| tx.height),
+            timestamp: None,
+            milestone_id: leg.milestone_id.clone(),
+            note: Some(format!(
+                "candidate HTLC-backed funding leg discovered from anchor role {:?}",
+                leg.role
+            )),
+        });
+        if leg.milestone_id.is_some() {
+            events.push(AgreementActivityEvent {
+                event_type: "milestone_linked".to_string(),
+                source: AgreementActivitySource::DerivedIndexed,
+                txid: Some(leg.funding_txid.clone()),
+                height: linked_txs
+                    .iter()
+                    .find(|tx| {
+                        tx.txid == leg.funding_txid
+                            && tx.role == leg.role
+                            && tx.milestone_id == leg.milestone_id
+                    })
+                    .and_then(|tx| tx.height),
+                timestamp: None,
+                milestone_id: leg.milestone_id.clone(),
+                note: Some("funding leg tied to a specific agreement milestone".to_string()),
+            });
+        }
+    }
+    if funding_legs.len() > 1 {
+        events.push(AgreementActivityEvent {
+            event_type: "ambiguous_funding_leg_detected".to_string(),
+            source: AgreementActivitySource::DerivedIndexed,
+            txid: None,
+            height: None,
+            timestamp: None,
+            milestone_id: None,
+            note: Some(
+                "multiple candidate funding legs were discovered; explicit operator selection may be required"
+                    .to_string(),
+            ),
+        });
+    }
+    if lifecycle.state == AgreementLifecycleState::Expired {
+        events.push(AgreementActivityEvent {
+            event_type: "agreement_expired".to_string(),
+            source: AgreementActivitySource::DerivedIndexed,
+            txid: None,
+            height: None,
+            timestamp: None,
+            milestone_id: None,
+            note: Some(
+                "refund timeout has been reached according to the reconstructed lifecycle view"
+                    .to_string(),
+            ),
+        });
+    }
+    events
+}
+
+fn agreement_lifecycle_state_label(state: AgreementLifecycleState) -> String {
+    match state {
+        AgreementLifecycleState::Draft => "draft",
+        AgreementLifecycleState::Proposed => "proposed",
+        AgreementLifecycleState::Funded => "funded",
+        AgreementLifecycleState::PartiallyReleased => "partially_released",
+        AgreementLifecycleState::Released => "released",
+        AgreementLifecycleState::Refunded => "refunded",
+        AgreementLifecycleState::Expired => "expired",
+        AgreementLifecycleState::Cancelled => "cancelled",
+        AgreementLifecycleState::DisputedMetadataOnly => "disputed_metadata_only",
+    }
+    .to_string()
+}
+
+fn csv_escape(value: &str) -> String {
+    let escaped = value.replace('"', "\"\"");
+    format!("\"{}\"", escaped)
+}
+
+fn csv_bool(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn csv_opt_bool(value: Option<bool>) -> String {
+    value.map(|v| csv_bool(v).to_string()).unwrap_or_default()
+}
+
+fn csv_template_name(template: AgreementTemplateType) -> String {
+    serde_json::to_string(&template)
+        .unwrap_or_else(|_| "\"unknown\"".to_string())
+        .trim_matches('"')
+        .to_string()
+}
+
+fn csv_push_row(out: &mut String, cols: &[String]) {
+    out.push_str(
+        &cols
+            .iter()
+            .map(|v| csv_escape(v))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    out.push('\n');
+}
+
+pub fn render_agreement_audit_csv(record: &AgreementAuditRecord) -> String {
+    let mut out = String::new();
+    csv_push_row(
+        &mut out,
+        &[
+            "record_version".to_string(),
+            "csv_schema".to_string(),
+            "section".to_string(),
+            "row_index".to_string(),
+            "data_source".to_string(),
+            "trust_boundary".to_string(),
+            "agreement_id".to_string(),
+            "agreement_hash".to_string(),
+            "template_type".to_string(),
+            "payer".to_string(),
+            "payee".to_string(),
+            "total_amount".to_string(),
+            "derived_state".to_string(),
+            "bundle_used".to_string(),
+            "selection_required".to_string(),
+            "ambiguity_flag".to_string(),
+            "txid".to_string(),
+            "vout".to_string(),
+            "anchor_vout".to_string(),
+            "anchor_role".to_string(),
+            "milestone_id".to_string(),
+            "amount".to_string(),
+            "height".to_string(),
+            "confirmed".to_string(),
+            "htlc_backed".to_string(),
+            "release_eligible".to_string(),
+            "refund_eligible".to_string(),
+            "event_type".to_string(),
+            "timestamp".to_string(),
+            "detail".to_string(),
+            "note".to_string(),
+        ],
+    );
+
+    csv_push_row(
+        &mut out,
+        &[
+            record.metadata.version.to_string(),
+            AGREEMENT_AUDIT_CSV_SCHEMA.to_string(),
+            "summary".to_string(),
+            "0".to_string(),
+            "derived_report".to_string(),
+            "derived_indexed".to_string(),
+            record.agreement.agreement_id.clone(),
+            record.agreement.agreement_hash.clone(),
+            csv_template_name(record.agreement.template_type),
+            record.agreement.payer.clone(),
+            record.agreement.payee.clone(),
+            record.agreement.total_amount.to_string(),
+            record.settlement_state.derived_state_label.clone(),
+            csv_bool(record.local_bundle.bundle_used).to_string(),
+            csv_bool(record.funding_legs.selection_required).to_string(),
+            csv_bool(record.funding_legs.ambiguity_warning.is_some()).to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            format!(
+                "derived_report=true; linked_tx_count={}; timeline_events={}; trust_model={}",
+                record.chain_observed.linked_transaction_count,
+                record.timeline.event_count,
+                record.metadata.trust_model_summary
+            ),
+            record.settlement_state.summary_note.clone(),
+        ],
+    );
+
+    for (idx, tx) in record.chain_observed.linked_transactions.iter().enumerate() {
+        csv_push_row(
+            &mut out,
+            &[
+                record.metadata.version.to_string(),
+                AGREEMENT_AUDIT_CSV_SCHEMA.to_string(),
+                "linked_tx".to_string(),
+                idx.to_string(),
+                "chain_observed".to_string(),
+                "consensus_visible_anchor_or_tx".to_string(),
+                record.agreement.agreement_id.clone(),
+                record.agreement.agreement_hash.clone(),
+                csv_template_name(record.agreement.template_type),
+                record.agreement.payer.clone(),
+                record.agreement.payee.clone(),
+                record.agreement.total_amount.to_string(),
+                record.settlement_state.derived_state_label.clone(),
+                csv_bool(record.local_bundle.bundle_used).to_string(),
+                csv_bool(record.funding_legs.selection_required).to_string(),
+                csv_bool(record.funding_legs.ambiguity_warning.is_some()).to_string(),
+                tx.txid.clone(),
+                String::new(),
+                serde_json::to_string(&tx.role)
+                    .unwrap_or_else(|_| "\"unknown\"".to_string())
+                    .trim_matches('"')
+                    .to_string(),
+                tx.milestone_id.clone().unwrap_or_default(),
+                tx.value.to_string(),
+                tx.height.map(|v| v.to_string()).unwrap_or_default(),
+                csv_bool(tx.confirmed).to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                record.chain_observed.anchor_observation_notice.clone(),
+                String::new(),
+            ],
+        );
+    }
+
+    for (idx, leg) in record.funding_legs.candidates.iter().enumerate() {
+        let selected = record
+            .funding_legs
+            .selected_leg
+            .as_ref()
+            .map(|sel| sel.funding_txid == leg.funding_txid && sel.htlc_vout == leg.htlc_vout)
+            .unwrap_or(false);
+        csv_push_row(
+            &mut out,
+            &[
+                record.metadata.version.to_string(),
+                AGREEMENT_AUDIT_CSV_SCHEMA.to_string(),
+                "funding_leg".to_string(),
+                idx.to_string(),
+                "derived_funding_leg".to_string(),
+                if leg.htlc_backed {
+                    "htlc_enforced_branch_candidate".to_string()
+                } else {
+                    "derived_non_htlc_candidate".to_string()
+                },
+                record.agreement.agreement_id.clone(),
+                record.agreement.agreement_hash.clone(),
+                csv_template_name(record.agreement.template_type),
+                record.agreement.payer.clone(),
+                record.agreement.payee.clone(),
+                record.agreement.total_amount.to_string(),
+                record.settlement_state.derived_state_label.clone(),
+                csv_bool(record.local_bundle.bundle_used).to_string(),
+                csv_bool(record.funding_legs.selection_required).to_string(),
+                csv_bool(record.funding_legs.ambiguity_warning.is_some()).to_string(),
+                leg.funding_txid.clone(),
+                leg.htlc_vout.to_string(),
+                leg.anchor_vout.to_string(),
+                serde_json::to_string(&leg.role)
+                    .unwrap_or_else(|_| "\"unknown\"".to_string())
+                    .trim_matches('"')
+                    .to_string(),
+                leg.milestone_id.clone().unwrap_or_default(),
+                leg.amount.to_string(),
+                leg.timeout_height.to_string(),
+                String::new(),
+                csv_bool(leg.htlc_backed).to_string(),
+                csv_opt_bool(leg.release_eligible),
+                csv_opt_bool(leg.refund_eligible),
+                String::new(),
+                String::new(),
+                format!(
+                    "selected_candidate={}; source_notes={}",
+                    csv_bool(selected),
+                    leg.source_notes.join(" | ")
+                ),
+                record.funding_legs.notice.clone(),
+            ],
+        );
+    }
+
+    for (idx, event) in record.timeline.events.iter().enumerate() {
+        let (data_source, trust_boundary) = match event.source {
+            AgreementActivitySource::LocalBundle => ("local_bundle", "local_bundle_only"),
+            AgreementActivitySource::ChainObserved => {
+                ("chain_observed", "consensus_visible_anchor_or_tx")
+            }
+            AgreementActivitySource::DerivedIndexed => ("derived_indexed", "derived_indexed"),
+            AgreementActivitySource::HtlcEligibility => {
+                ("htlc_eligibility", "htlc_enforced_branch_candidate")
+            }
+        };
+        csv_push_row(
+            &mut out,
+            &[
+                record.metadata.version.to_string(),
+                AGREEMENT_AUDIT_CSV_SCHEMA.to_string(),
+                "timeline_event".to_string(),
+                idx.to_string(),
+                data_source.to_string(),
+                trust_boundary.to_string(),
+                record.agreement.agreement_id.clone(),
+                record.agreement.agreement_hash.clone(),
+                csv_template_name(record.agreement.template_type),
+                record.agreement.payer.clone(),
+                record.agreement.payee.clone(),
+                record.agreement.total_amount.to_string(),
+                record.settlement_state.derived_state_label.clone(),
+                csv_bool(record.local_bundle.bundle_used).to_string(),
+                csv_bool(record.funding_legs.selection_required).to_string(),
+                csv_bool(record.funding_legs.ambiguity_warning.is_some()).to_string(),
+                event.txid.clone().unwrap_or_default(),
+                String::new(),
+                String::new(),
+                String::new(),
+                event.milestone_id.clone().unwrap_or_default(),
+                String::new(),
+                event.height.map(|v| v.to_string()).unwrap_or_default(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                event.event_type.clone(),
+                event.timestamp.map(|v| v.to_string()).unwrap_or_default(),
+                event.note.clone().unwrap_or_default(),
+                record.timeline.notice.clone(),
+            ],
+        );
+    }
+
+    let trust_sections = [
+        (
+            "consensus_enforced",
+            &record.trust_boundaries.consensus_enforced,
+        ),
+        ("htlc_enforced", &record.trust_boundaries.htlc_enforced),
+        (
+            "metadata_indexed",
+            &record.trust_boundaries.metadata_indexed,
+        ),
+        (
+            "local_bundle_only",
+            &record.trust_boundaries.local_bundle_only,
+        ),
+        (
+            "off_chain_required",
+            &record.trust_boundaries.off_chain_required,
+        ),
+    ];
+    for (section_idx, (section, items)) in trust_sections.iter().enumerate() {
+        for (item_idx, item) in items.iter().enumerate() {
+            csv_push_row(
+                &mut out,
+                &[
+                    record.metadata.version.to_string(),
+                    AGREEMENT_AUDIT_CSV_SCHEMA.to_string(),
+                    "trust_boundary".to_string(),
+                    format!("{}.{}", section_idx, item_idx),
+                    "trust_boundary_summary".to_string(),
+                    (*section).to_string(),
+                    record.agreement.agreement_id.clone(),
+                    record.agreement.agreement_hash.clone(),
+                    csv_template_name(record.agreement.template_type),
+                    record.agreement.payer.clone(),
+                    record.agreement.payee.clone(),
+                    record.agreement.total_amount.to_string(),
+                    record.settlement_state.derived_state_label.clone(),
+                    csv_bool(record.local_bundle.bundle_used).to_string(),
+                    csv_bool(record.funding_legs.selection_required).to_string(),
+                    csv_bool(record.funding_legs.ambiguity_warning.is_some()).to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    item.clone(),
+                    String::new(),
+                ],
+            );
+        }
+    }
+
+    out
+}
+
+fn build_agreement_statement_authenticity(
+    authenticity: Option<&AgreementAuthenticitySummary>,
+) -> Option<AgreementStatementAuthenticitySummary> {
+    authenticity.map(|authenticity| AgreementStatementAuthenticitySummary {
+        valid_signatures: authenticity.valid_signatures,
+        invalid_signatures: authenticity.invalid_signatures,
+        unverifiable_signatures: authenticity.unverifiable_signatures,
+        compact_summary: format!(
+            "Agreement authenticity summary: {} valid, {} invalid, {} unverifiable signature(s)",
+            authenticity.valid_signatures,
+            authenticity.invalid_signatures,
+            authenticity.unverifiable_signatures
+        ),
+        authenticity_notice: authenticity.authenticity_notice.clone(),
+    })
+}
+
+pub fn build_agreement_statement(record: &AgreementAuditRecord) -> AgreementStatement {
+    let parties_summary = record
+        .agreement
+        .parties
+        .iter()
+        .map(|party| {
+            let role = party.role.as_deref().unwrap_or("party");
+            format!("{}: {} <{}>", role, party.display_name, party.address)
+        })
+        .collect::<Vec<_>>();
+    let milestone_summary = if record.agreement.milestones.is_empty() {
+        "No milestone schedule in the supplied agreement".to_string()
+    } else {
+        format!(
+            "{} milestone(s) totaling {} smallest units",
+            record.agreement.milestones.len(),
+            record
+                .agreement
+                .milestones
+                .iter()
+                .map(|m| m.amount)
+                .sum::<u64>()
+        )
+    };
+    let release_path_summary = if record
+        .funding_legs
+        .selected_leg
+        .as_ref()
+        .map(|leg| leg.htlc_backed)
+        .unwrap_or(false)
+        || record
+            .funding_legs
+            .candidates
+            .iter()
+            .any(|leg| leg.htlc_backed)
+    {
+        "HTLC-backed release spend may be available for observed funding legs; release still depends on the correct spend path and may require off-chain coordination.".to_string()
+    } else {
+        "No HTLC-backed release leg has been confirmed from the supplied agreement data and observed chain links.".to_string()
+    };
+    let refund_path_summary = if record
+        .funding_legs
+        .selected_leg
+        .as_ref()
+        .map(|leg| leg.htlc_backed)
+        .unwrap_or(false)
+        || record
+            .funding_legs
+            .candidates
+            .iter()
+            .any(|leg| leg.htlc_backed)
+    {
+        "HTLC-backed timeout refund may be available where a funded leg reaches its timeout; refund still requires the correct spend path.".to_string()
+    } else {
+        "No HTLC-backed refund leg has been confirmed from the supplied agreement data and observed chain links.".to_string()
+    };
+    let funding_observed = record
+        .chain_observed
+        .linked_transactions
+        .iter()
+        .any(|tx| tx.role == AgreementAnchorRole::Funding);
+    let release_observed = record.chain_observed.linked_transactions.iter().any(|tx| {
+        matches!(
+            tx.role,
+            AgreementAnchorRole::Release | AgreementAnchorRole::MilestoneRelease
+        )
+    });
+    let refund_observed = record
+        .chain_observed
+        .linked_transactions
+        .iter()
+        .any(|tx| tx.role == AgreementAnchorRole::Refund);
+    let linked_txids = record
+        .chain_observed
+        .linked_transactions
+        .iter()
+        .map(|tx| tx.txid.clone())
+        .collect::<Vec<_>>();
+    AgreementStatement {
+        metadata: AgreementStatementMetadata {
+            version: AGREEMENT_STATEMENT_VERSION,
+            generated_at: record.metadata.generated_at,
+            derived_notice: "Derived settlement statement from supplied agreement data plus observed chain activity. This is not native consensus contract state.".to_string(),
+        },
+        identity: AgreementStatementIdentity {
+            agreement_id: record.agreement.agreement_id.clone(),
+            agreement_hash: record.agreement.agreement_hash.clone(),
+            template_type: record.agreement.template_type,
+        },
+        counterparties: AgreementStatementCounterparties {
+            payer: record.agreement.payer.clone(),
+            payee: record.agreement.payee.clone(),
+            parties_summary,
+        },
+        commercial: AgreementStatementCommercialSummary {
+            total_amount: record.agreement.total_amount,
+            milestone_summary,
+            settlement_deadline: record.agreement.settlement_deadline,
+            refund_deadline: record.agreement.refund_deadline,
+            release_path_summary,
+            refund_path_summary,
+        },
+        observed: AgreementStatementObservedSummary {
+            funding_observed,
+            release_observed,
+            refund_observed,
+            ambiguity_warning: record.funding_legs.ambiguity_warning.clone(),
+            linked_txids: linked_txids.clone(),
+        },
+        derived: AgreementStatementDerivedSummary {
+            derived_state_label: record.settlement_state.derived_state_label.clone(),
+            funded_amount: record.settlement_state.funded_amount,
+            released_amount: record.settlement_state.released_amount,
+            refunded_amount: record.settlement_state.refunded_amount,
+            note: record.settlement_state.summary_note.clone(),
+        },
+        authenticity: build_agreement_statement_authenticity(record.authenticity.as_ref()),
+        trust_notice: AgreementStatementTrustNotice {
+            consensus_visible: record.trust_boundaries.consensus_enforced.clone(),
+            htlc_enforced: record.trust_boundaries.htlc_enforced.clone(),
+            derived_indexed: record.trust_boundaries.metadata_indexed.clone(),
+            local_off_chain: record
+                .trust_boundaries
+                .local_bundle_only
+                .iter()
+                .cloned()
+                .chain(record.trust_boundaries.off_chain_required.iter().cloned())
+                .collect(),
+            canonical_notice: "Canonical agreement JSON remains the source of truth for agreement terms. This statement is a shorter derived report artifact.".to_string(),
+        },
+        references: AgreementStatementReferences {
+            linked_txids,
+            selected_funding_txid: record
+                .funding_legs
+                .selected_leg
+                .as_ref()
+                .map(|leg| leg.funding_txid.clone()),
+            canonical_agreement_notice: "Canonical agreement JSON remains required for full agreement context; chain data alone cannot recover the full agreement object.".to_string(),
+        },
+    }
+}
+
+fn same_linked_transactions(a: &[AgreementLinkedTx], b: &[AgreementLinkedTx]) -> bool {
+    a == b
+}
+
+fn same_audit_funding_view(
+    a: &AgreementAuditFundingLegSummary,
+    b: &AgreementAuditFundingLegSummary,
+) -> bool {
+    a.candidate_count == b.candidate_count
+        && a.selection_required == b.selection_required
+        && a.selected_leg == b.selected_leg
+        && a.candidates == b.candidates
+}
+
+fn same_timeline_view(
+    a: &AgreementAuditTimelineSummary,
+    b: &AgreementAuditTimelineSummary,
+) -> bool {
+    a.reconstructed == b.reconstructed && a.events == b.events
+}
+
+pub fn build_agreement_artifact_verification(
+    agreement: Option<&AgreementObject>,
+    bundle: Option<&AgreementBundle>,
+    supplied_audit: Option<&AgreementAuditRecord>,
+    supplied_statement: Option<&AgreementStatement>,
+    detached_agreement_signatures: &[AgreementSignatureEnvelope],
+    detached_bundle_signatures: &[AgreementSignatureEnvelope],
+    recomputed_audit: Option<&AgreementAuditRecord>,
+    generated_at: u64,
+) -> AgreementArtifactVerificationResult {
+    let canonical = agreement.or_else(|| bundle.map(|b| &b.agreement));
+    let computed_hash = canonical.and_then(|agreement| compute_agreement_hash_hex(agreement).ok());
+    let computed_id = canonical.map(|agreement| agreement.agreement_id.clone());
+
+    let mut supplied_types = Vec::new();
+    let mut claimed_ids = Vec::new();
+    let mut claimed_hashes = Vec::new();
+    if agreement.is_some() {
+        supplied_types.push("agreement".to_string());
+    }
+    if let Some(bundle) = bundle {
+        supplied_types.push("bundle".to_string());
+        claimed_ids.push(bundle.agreement_id.clone());
+        claimed_hashes.push(bundle.agreement_hash.clone());
+    }
+    if let Some(audit) = supplied_audit {
+        supplied_types.push("audit".to_string());
+        claimed_ids.push(audit.agreement.agreement_id.clone());
+        claimed_hashes.push(audit.agreement.agreement_hash.clone());
+    }
+    if let Some(statement) = supplied_statement {
+        supplied_types.push("statement".to_string());
+        claimed_ids.push(statement.identity.agreement_id.clone());
+        claimed_hashes.push(statement.identity.agreement_hash.clone());
+    }
+    if !detached_agreement_signatures.is_empty() {
+        supplied_types.push("agreement_signature".to_string());
+    }
+    if !detached_bundle_signatures.is_empty() {
+        supplied_types.push("bundle_signature".to_string());
+    }
+
+    let mut canonical_matches = Vec::new();
+    let mut canonical_mismatches = Vec::new();
+    let mut canonical_warnings = Vec::new();
+
+    let bundle_hash_match = match (bundle, computed_hash.as_ref()) {
+        (Some(bundle), Some(hash)) => {
+            let ok = bundle.agreement_hash.eq_ignore_ascii_case(hash)
+                && bundle.agreement_id == bundle.agreement.agreement_id;
+            if ok {
+                canonical_matches.push("Bundle matches canonical agreement hash".to_string());
+            } else {
+                canonical_mismatches
+                    .push("Bundle does not match canonical agreement hash or id".to_string());
+            }
+            Some(ok)
+        }
+        (Some(_), None) => {
+            canonical_warnings.push(
+                "Bundle was supplied, but no canonical agreement could be recomputed".to_string(),
+            );
+            None
+        }
+        _ => None,
+    };
+
+    let audit_identity_match = match (supplied_audit, computed_hash.as_ref(), computed_id.as_ref())
+    {
+        (Some(audit), Some(hash), Some(agreement_id)) => {
+            let ok = audit.agreement.agreement_hash.eq_ignore_ascii_case(hash)
+                && audit.agreement.agreement_id == *agreement_id;
+            if ok {
+                canonical_matches.push("Audit identity matches canonical agreement".to_string());
+            } else {
+                canonical_mismatches
+                    .push("Audit identity does not match canonical agreement".to_string());
+            }
+            Some(ok)
+        }
+        (Some(_), _, _) => {
+            canonical_warnings.push(
+                "Audit was supplied without canonical agreement context; identity match is limited"
+                    .to_string(),
+            );
+            None
+        }
+        _ => None,
+    };
+
+    let statement_identity_match = match (
+        supplied_statement,
+        computed_hash.as_ref(),
+        computed_id.as_ref(),
+    ) {
+        (Some(statement), Some(hash), Some(agreement_id)) => {
+            let ok = statement.identity.agreement_hash.eq_ignore_ascii_case(hash)
+                && statement.identity.agreement_id == *agreement_id;
+            if ok {
+                canonical_matches
+                    .push("Statement identity matches canonical agreement".to_string());
+            } else {
+                canonical_mismatches
+                    .push("Statement identity does not match canonical agreement".to_string());
+            }
+            Some(ok)
+        }
+        (Some(_), _, _) => {
+            canonical_warnings.push("Statement was supplied without canonical agreement context; identity match is limited".to_string());
+            None
+        }
+        _ => None,
+    };
+
+    let mut consistency_warnings = Vec::new();
+    if agreement.is_none() && bundle.is_none() {
+        consistency_warnings.push(
+            "No canonical agreement or bundle was supplied; full verification is not possible"
+                .to_string(),
+        );
+    }
+
+    let mut chain_warnings = Vec::new();
+    let mut checked_txids = Vec::new();
+    let linked_tx_references_found = recomputed_audit
+        .map(|audit| !audit.chain_observed.linked_transactions.is_empty())
+        .unwrap_or(false);
+    let anchor_observations_found = recomputed_audit
+        .map(|audit| audit.chain_observed.linked_transaction_count > 0)
+        .unwrap_or(false);
+    if let Some(audit) = recomputed_audit {
+        checked_txids = audit
+            .chain_observed
+            .linked_transactions
+            .iter()
+            .map(|tx| tx.txid.clone())
+            .collect();
+    } else {
+        chain_warnings.push(
+            "No recomputed audit context was available; chain-observed checks are limited"
+                .to_string(),
+        );
+    }
+
+    let audit_chain_match = match (supplied_audit, recomputed_audit) {
+        (Some(supplied), Some(recomputed)) => {
+            let ok = same_linked_transactions(
+                &supplied.chain_observed.linked_transactions,
+                &recomputed.chain_observed.linked_transactions,
+            );
+            if !ok {
+                chain_warnings.push("Supplied audit linked transaction set differs from current chain-observed view".to_string());
+            }
+            Some(ok)
+        }
+        _ => None,
+    };
+
+    let statement_chain_match = match (supplied_statement, recomputed_audit) {
+        (Some(statement), Some(recomputed)) => {
+            let expected = build_agreement_statement(recomputed);
+            let ok = statement.references.linked_txids == expected.references.linked_txids;
+            if !ok {
+                chain_warnings.push("Supplied statement linked transaction references differ from current chain-observed view".to_string());
+            }
+            Some(ok)
+        }
+        _ => None,
+    };
+
+    let mut derived_warnings = Vec::new();
+    let audit_derived_match = match (supplied_audit, recomputed_audit) {
+        (Some(supplied), Some(recomputed)) => {
+            let ok = same_audit_funding_view(&supplied.funding_legs, &recomputed.funding_legs)
+                && same_timeline_view(&supplied.timeline, &recomputed.timeline)
+                && supplied.settlement_state == recomputed.settlement_state;
+            if !ok {
+                derived_warnings.push("Supplied audit derived funding, timeline, or settlement summary differs from current recomputation".to_string());
+            }
+            Some(ok)
+        }
+        _ => None,
+    };
+
+    let statement_derived_match = match (supplied_statement, recomputed_audit) {
+        (Some(statement), Some(recomputed)) => {
+            let expected = build_agreement_statement(recomputed);
+            let ok = statement.identity == expected.identity
+                && statement.observed == expected.observed
+                && statement.derived == expected.derived
+                && statement.references == expected.references;
+            if !ok {
+                derived_warnings.push("Supplied statement observed or derived sections differ from current recomputation".to_string());
+            }
+            Some(ok)
+        }
+        _ => None,
+    };
+
+    let authenticity = build_agreement_artifact_authenticity_verification(
+        canonical,
+        bundle,
+        detached_agreement_signatures,
+        detached_bundle_signatures,
+    );
+    if let Some(authenticity) = authenticity.as_ref() {
+        consistency_warnings.extend(authenticity.warnings.iter().cloned());
+    }
+
+    let trust_summary = if let Some(audit) = recomputed_audit {
+        AgreementArtifactVerificationTrustSummary {
+            consensus_visible: audit.trust_boundaries.consensus_enforced.clone(),
+            htlc_enforced: audit.trust_boundaries.htlc_enforced.clone(),
+            derived_indexed: audit.trust_boundaries.metadata_indexed.clone(),
+            local_artifact_only: audit.trust_boundaries.local_bundle_only.clone(),
+            unverifiable_from_chain_alone: vec![
+                "Full agreement terms cannot be reconstructed from chain data alone".to_string(),
+                "Derived lifecycle, timeline, and statement sections remain informational"
+                    .to_string(),
+            ],
+        }
+    } else {
+        AgreementArtifactVerificationTrustSummary {
+            consensus_visible: vec!["Only ordinary transaction validity and visible anchors are independently consensus-checkable".to_string()],
+            htlc_enforced: vec!["Existing HTLCv1 release/refund branches remain objective when present".to_string()],
+            derived_indexed: vec!["Audit, statement, funding-leg, and timeline views are derived software outputs".to_string()],
+            local_artifact_only: vec!["Bundle metadata and shared artifact files are off-chain artifacts".to_string()],
+            unverifiable_from_chain_alone: vec!["Full agreement terms cannot be reconstructed from chain data alone".to_string()],
+        }
+    };
+
+    AgreementArtifactVerificationResult {
+        metadata: AgreementArtifactVerificationMetadata {
+            version: AGREEMENT_ARTIFACT_VERIFICATION_VERSION,
+            generated_at,
+            derived_notice: "Derived verification result built from supplied artifacts plus canonical hashing and observed chain data where available".to_string(),
+        },
+        input_summary: AgreementArtifactVerificationInputSummary {
+            supplied_artifact_types: supplied_types,
+            canonical_agreement_present: canonical.is_some(),
+            extracted_from_bundle: agreement.is_none() && bundle.is_some(),
+            claimed_agreement_id: claimed_ids,
+            claimed_agreement_hash: claimed_hashes,
+        },
+        canonical_verification: AgreementArtifactCanonicalVerification {
+            canonical_agreement_present: canonical.is_some(),
+            computed_agreement_hash: computed_hash,
+            computed_agreement_id: computed_id,
+            bundle_hash_match,
+            audit_identity_match,
+            statement_identity_match,
+            matches: canonical_matches,
+            mismatches: canonical_mismatches,
+            warnings: canonical_warnings,
+        },
+        artifact_consistency: AgreementArtifactConsistencyVerification {
+            bundle_matches_canonical: bundle_hash_match,
+            audit_matches_canonical: audit_identity_match,
+            statement_matches_canonical: statement_identity_match,
+            warnings: consistency_warnings,
+        },
+        chain_verification: AgreementArtifactChainVerification {
+            linked_tx_references_found,
+            anchor_observations_found,
+            checked_txids,
+            audit_chain_match,
+            statement_chain_match,
+            warnings: chain_warnings,
+        },
+        derived_verification: AgreementArtifactDerivedVerification {
+            audit_derived_match,
+            statement_derived_match,
+            warnings: derived_warnings,
+        },
+        authenticity,
+        trust_summary,
+    }
+}
+
+pub fn build_agreement_share_package_verification(
+    package: &AgreementSharePackage,
+    recomputed_audit: Option<&AgreementAuditRecord>,
+    generated_at: u64,
+) -> Result<AgreementSharePackageVerificationResult, String> {
+    let inspection = inspect_agreement_share_package(package)?;
+    let artifact_verification = build_agreement_artifact_verification(
+        package.agreement.as_ref(),
+        package.bundle.as_ref(),
+        package.audit.as_ref(),
+        package.statement.as_ref(),
+        &package.detached_agreement_signatures,
+        &package.detached_bundle_signatures,
+        recomputed_audit,
+        generated_at,
+    );
+    let mut informational_notices = vec![
+        "Share package contents are supplied handoff artifacts. Verification results remain derived from the package contents plus canonical hashing and observed chain data where available.".to_string(),
+    ];
+    if package.audit.is_some() {
+        informational_notices.push(
+            "Embedded audit content is informational and derived; it is not native consensus contract state.".to_string(),
+        );
+    }
+    if package.statement.is_some() {
+        informational_notices.push(
+            "Embedded statement content is informational and derived; it is not native consensus contract state.".to_string(),
+        );
+    }
+    if !inspection.omitted_artifact_types.is_empty() {
+        informational_notices.push(
+            "Omitted artifacts are absent from this handoff package only. Recipients should not treat omissions as proof that no additional off-chain artifacts or signatures exist elsewhere.".to_string(),
+        );
+    }
+    Ok(AgreementSharePackageVerificationResult {
+        metadata: AgreementSharePackageVerificationMetadata {
+            version: AGREEMENT_SHARE_PACKAGE_VERIFICATION_VERSION,
+            generated_at,
+            derived_notice: "Derived share-package verification result built from supplied package contents plus canonical hashing and observed chain data where available".to_string(),
+        },
+        package: inspection,
+        artifact_verification,
+        informational_notices,
+    })
+}
+
+pub fn build_agreement_audit_record(
+    agreement: &AgreementObject,
+    agreement_hash: &str,
+    bundle: Option<&AgreementBundle>,
+    lifecycle: &AgreementLifecycleView,
+    linked_txs: &[AgreementLinkedTx],
+    funding_legs: &[AgreementAuditFundingLegRecord],
+    selected_leg: Option<&AgreementAuditFundingLegRecord>,
+    events: &[AgreementActivityEvent],
+    generated_at: u64,
+    generator_surface: &str,
+) -> AgreementAuditRecord {
+    let selection_required = funding_legs.len() != 1;
+    let ambiguity_warning = if selection_required && !funding_legs.is_empty() {
+        Some(
+            "multiple candidate funding legs remain; this derived report does not pick one silently"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    let derived_state_label = if selection_required && !funding_legs.is_empty() {
+        "ambiguous".to_string()
+    } else {
+        agreement_lifecycle_state_label(lifecycle.state)
+    };
+    AgreementAuditRecord {
+        metadata: AgreementAuditMetadata {
+            version: AGREEMENT_AUDIT_RECORD_VERSION,
+            generated_at,
+            generator_surface: generator_surface.to_string(),
+            trust_model_summary: "This Phase 1 audit record is a derived report built from the supplied canonical agreement object, optional local bundle metadata, observed linked transactions, HTLCv1 branch checks, and reconstructed timeline data. It is not native consensus contract state.".to_string(),
+        },
+        agreement: AgreementAuditAgreementSummary {
+            agreement_id: agreement.agreement_id.clone(),
+            agreement_hash: agreement_hash.to_string(),
+            template_type: agreement.template_type,
+            network_marker: agreement.network_marker.clone(),
+            payer: agreement.payer.clone(),
+            payee: agreement.payee.clone(),
+            parties: agreement.parties.clone(),
+            total_amount: agreement.total_amount,
+            milestone_count: agreement.milestones.len(),
+            milestones: agreement
+                .milestones
+                .iter()
+                .map(|m| AgreementAuditMilestoneSummary {
+                    milestone_id: m.milestone_id.clone(),
+                    title: m.title.clone(),
+                    amount: m.amount,
+                    timeout_height: m.timeout_height,
+                })
+                .collect(),
+            settlement_deadline: agreement.deadlines.settlement_deadline,
+            refund_deadline: agreement.deadlines.refund_deadline,
+            dispute_window: agreement.deadlines.dispute_window,
+            document_hash: agreement.document_hash.clone(),
+            metadata_hash: agreement.metadata_hash.clone(),
+            invoice_reference: agreement.invoice_reference.clone(),
+            external_reference: agreement.external_reference.clone(),
+        },
+        local_bundle: AgreementAuditBundleContext {
+            bundle_used: bundle.is_some(),
+            verification_ok: bundle.is_some(),
+            saved_at: bundle.and_then(|b| (b.metadata.saved_at > 0).then_some(b.metadata.saved_at)),
+            source_label: bundle.and_then(|b| b.metadata.source_label.clone()),
+            note: bundle.and_then(|b| b.metadata.note.clone()),
+            linked_funding_txids: bundle
+                .map(|b| b.metadata.linked_funding_txids.clone())
+                .unwrap_or_default(),
+            milestone_hints: bundle
+                .map(|b| b.metadata.milestone_hints.clone())
+                .unwrap_or_default(),
+            local_only_notice: "Bundle metadata is local/off-chain convenience only. It can assist wallet and explorer flows, but it does not create consensus-native agreement state and cannot override canonical agreement hashing.".to_string(),
+        },
+        chain_observed: AgreementAuditChainObservedContext {
+            linked_transactions: linked_txs.to_vec(),
+            linked_transaction_count: linked_txs.len(),
+            anchor_observation_notice: "Linked transactions and anchor roles are chain-observed facts only when present. They still do not reconstruct the full agreement object without supplied canonical agreement JSON or a verified local bundle.".to_string(),
+        },
+        funding_legs: AgreementAuditFundingLegSummary {
+            candidate_count: funding_legs.len(),
+            selection_required,
+            selected_leg: selected_leg.cloned(),
+            ambiguity_warning,
+            candidates: funding_legs.to_vec(),
+            notice: "Funding legs are derived convenience candidates from agreement anchors, observed transactions, and optional bundle hints. They are not native agreement UTXO state.".to_string(),
+        },
+        timeline: AgreementAuditTimelineSummary {
+            reconstructed: true,
+            event_count: events.len(),
+            events: events.to_vec(),
+            notice: "Timeline events are reconstructed/indexed software output from supplied agreement data plus observed chain activity. They are useful for audit and review, but not consensus-native contract state.".to_string(),
+        },
+        settlement_state: AgreementAuditSettlementStateSummary {
+            lifecycle_state: lifecycle.state,
+            derived_state_label,
+            selection_required,
+            funded_amount: lifecycle.funded_amount,
+            released_amount: lifecycle.released_amount,
+            refunded_amount: lifecycle.refunded_amount,
+            summary_note: "Settlement state here is a conservative derived summary based on linked transaction observation, milestone metadata, and HTLC context. It is not native consensus contract state.".to_string(),
+        },
+        authenticity: None,
+        trust_boundaries: AgreementAuditTrustBoundaries {
+            consensus_enforced: vec![
+                "Standard transaction validity and OP_RETURN anchor visibility on chain".to_string(),
+            ],
+            htlc_enforced: vec![
+                "Existing HTLCv1 preimage release and timeout refund branches when a discovered leg is actually HTLC-backed".to_string(),
+            ],
+            metadata_indexed: vec![
+                "Agreement lifecycle reconstruction, milestone meaning, funding-leg discovery, and timeline events".to_string(),
+                "Document and metadata hash references carried by the canonical agreement object".to_string(),
+            ],
+            local_bundle_only: vec![
+                "Saved bundle labels, notes, linked funding tx hints, and milestone hints".to_string(),
+            ],
+            off_chain_required: vec![
+                "Exchange of the canonical agreement object".to_string(),
+                "Interpretation of milestone/business intent beyond objectively encoded HTLC conditions".to_string(),
+                "Operator choice when multiple candidate funding legs remain ambiguous".to_string(),
+            ],
+        },
+    }
+}
+
+pub fn derive_lifecycle(
+    agreement: &AgreementObject,
+    agreement_hash: &str,
+    linked_txs: Vec<AgreementLinkedTx>,
+    tip_height: u64,
+) -> AgreementLifecycleView {
+    let funded_amount: u64 = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Funding
+                    | AgreementAnchorRole::DepositLock
+                    | AgreementAnchorRole::OtcSettlement
+                    | AgreementAnchorRole::MerchantSettlement
+            )
+        })
+        .map(|t| t.value)
+        .sum();
+    let released_amount: u64 = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Release | AgreementAnchorRole::MilestoneRelease
+            )
+        })
+        .map(|t| t.value)
+        .sum();
+    let refunded_amount: u64 = linked_txs
+        .iter()
+        .filter(|t| matches!(t.role, AgreementAnchorRole::Refund))
+        .map(|t| t.value)
+        .sum();
+    let mut milestones = Vec::new();
+    for milestone in &agreement.milestones {
+        let funded = linked_txs.iter().any(|t| {
+            t.role == AgreementAnchorRole::Funding
+                && t.milestone_id.as_deref() == Some(milestone.milestone_id.as_str())
+        });
+        let released = linked_txs.iter().any(|t| {
+            t.role == AgreementAnchorRole::MilestoneRelease
+                && t.milestone_id.as_deref() == Some(milestone.milestone_id.as_str())
+        });
+        let refunded = linked_txs.iter().any(|t| {
+            t.role == AgreementAnchorRole::Refund
+                && t.milestone_id.as_deref() == Some(milestone.milestone_id.as_str())
+        });
+        milestones.push(AgreementMilestoneStatus {
+            milestone_id: milestone.milestone_id.clone(),
+            title: milestone.title.clone(),
+            amount: milestone.amount,
+            funded,
+            released,
+            refunded,
+        });
+    }
+    let state = if agreement.disputed_metadata_only {
+        AgreementLifecycleState::DisputedMetadataOnly
+    } else if refunded_amount > 0
+        || linked_txs
+            .iter()
+            .any(|t| t.role == AgreementAnchorRole::Refund)
+    {
+        AgreementLifecycleState::Refunded
+    } else if released_amount >= agreement.total_amount && released_amount > 0 {
+        AgreementLifecycleState::Released
+    } else if released_amount > 0 {
+        AgreementLifecycleState::PartiallyReleased
+    } else if funded_amount > 0 {
+        let refund_timeout = agreement
+            .refund_conditions
+            .iter()
+            .map(|c| c.timeout_height)
+            .min()
+            .unwrap_or(u64::MAX);
+        if tip_height >= refund_timeout {
+            AgreementLifecycleState::Expired
+        } else {
+            AgreementLifecycleState::Funded
+        }
+    } else if agreement
+        .deadlines
+        .settlement_deadline
+        .map(|d| tip_height >= d)
+        .unwrap_or(false)
+    {
+        AgreementLifecycleState::Expired
+    } else {
+        AgreementLifecycleState::Proposed
+    };
+    AgreementLifecycleView {
+        state,
+        agreement_hash: agreement_hash.to_string(),
+        funded_amount,
+        released_amount,
+        refunded_amount,
+        milestones,
+        linked_txs,
+        trust_model_note: "Phase 1 lifecycle is derived from observable on-chain links plus agreement metadata. Release authorization and milestone completion remain off-chain coordination unless explicitly expressed by existing HTLC timeout/preimage primitives.".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    use k256::ecdsa::SigningKey;
+
+    fn sample_signing_key() -> SigningKey {
+        SigningKey::from_bytes((&[7u8; 32]).into()).expect("static signing key")
+    }
+
+    fn signed_test_envelope(
+        target_type: AgreementSignatureTargetType,
+        target_hash: String,
+        signer_role: Option<&str>,
+        timestamp: Option<u64>,
+    ) -> AgreementSignatureEnvelope {
+        let signing_key = sample_signing_key();
+        let mut envelope = AgreementSignatureEnvelope {
+            version: AGREEMENT_SIGNATURE_VERSION,
+            target_type,
+            target_hash,
+            signer_public_key: hex::encode(
+                signing_key
+                    .verifying_key()
+                    .to_encoded_point(true)
+                    .as_bytes(),
+            ),
+            signer_address: Some("Qsigtest".to_string()),
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            timestamp,
+            signer_role: signer_role.map(|value| value.to_string()),
+            signature: String::new(),
+        };
+        let digest = compute_agreement_signature_payload_hash(&envelope).expect("payload hash");
+        let signature: Signature = signing_key.sign_prehash(&digest).expect("sign prehash");
+        envelope.signature = hex::encode(signature.to_bytes());
+        envelope
+    }
+
+    fn sample_agreement() -> AgreementObject {
+        AgreementObject {
+            schema_id: Some(AGREEMENT_SCHEMA_ID_V1.to_string()),
+            agreement_id: "agr-001".to_string(),
+            version: AGREEMENT_OBJECT_VERSION,
+            template_type: AgreementTemplateType::SimpleReleaseRefund,
+            parties: vec![
+                AgreementParty {
+                    party_id: "payer".to_string(),
+                    display_name: "Payer".to_string(),
+                    address: "Qpayer".to_string(),
+                    role: Some("payer".to_string()),
+                },
+                AgreementParty {
+                    party_id: "payee".to_string(),
+                    display_name: "Payee".to_string(),
+                    address: "Qpayee".to_string(),
+                    role: Some("payee".to_string()),
+                },
+            ],
+            payer: "payer".to_string(),
+            payee: "payee".to_string(),
+            mediator_reference: Some("meta-only".to_string()),
+            total_amount: 50_000_000,
+            network_marker: AGREEMENT_NETWORK_MARKER.to_string(),
+            creation_time: 1_700_000_000,
+            deadlines: AgreementDeadlines {
+                settlement_deadline: Some(100),
+                refund_deadline: Some(120),
+                dispute_window: Some(10),
+            },
+            release_conditions: vec![AgreementReleaseCondition {
+                mode: "secret_preimage".to_string(),
+                secret_hash_hex: Some("11".repeat(32)),
+                release_authorizer: Some("payer".to_string()),
+                notes: None,
+            }],
+            refund_conditions: vec![AgreementRefundCondition {
+                refund_address: "Qpayer".to_string(),
+                timeout_height: 120,
+                notes: None,
+            }],
+            milestones: vec![],
+            deposit_rule: None,
+            proof_policy_reference: Some("phase2-placeholder".to_string()),
+            asset_reference: None,
+            payment_reference: None,
+            purpose_reference: None,
+            release_summary: Some("Release follows the agreed HTLC path".to_string()),
+            refund_summary: Some("Refund follows the agreed timeout path".to_string()),
+            attestor_reference: None,
+            resolver_reference: None,
+            notes: Some("fixture".to_string()),
+            document_hash: "22".repeat(32),
+            metadata_hash: Some("33".repeat(32)),
+            invoice_reference: Some("INV-1".to_string()),
+            external_reference: Some("PO-9".to_string()),
+            disputed_metadata_only: false,
+        }
+    }
+
+    #[test]
+    fn canonical_serialization_rules_reference_phase15_schema() {
+        let rules = canonical_serialization_rules();
+        assert!(rules.iter().any(|rule| rule.contains("schema_id")));
+        assert!(rules
+            .iter()
+            .any(|rule| rule.contains("lexicographically sorted object keys")));
+    }
+
+    #[test]
+    fn phase15_template_builders_set_schema_and_hash_deterministically() {
+        let payer = AgreementParty {
+            party_id: "payer".to_string(),
+            display_name: "Payer".to_string(),
+            address: "Qpayer".to_string(),
+            role: Some("payer".to_string()),
+        };
+        let payee = AgreementParty {
+            party_id: "payee".to_string(),
+            display_name: "Payee".to_string(),
+            address: "Qpayee".to_string(),
+            role: Some("payee".to_string()),
+        };
+        let first = build_simple_settlement_agreement(
+            "agr-template-1".to_string(),
+            1_700_000_000,
+            payer.clone(),
+            payee.clone(),
+            50_000_000,
+            Some(100),
+            120,
+            "11".repeat(32),
+            "22".repeat(32),
+            None,
+            Some("Release by HTLC branch".to_string()),
+            Some("Refund after timeout".to_string()),
+            Some("notes".to_string()),
+        )
+        .unwrap();
+        let second = build_simple_settlement_agreement(
+            "agr-template-1".to_string(),
+            1_700_000_000,
+            payer,
+            payee,
+            50_000_000,
+            Some(100),
+            120,
+            "11".repeat(32),
+            "22".repeat(32),
+            None,
+            Some("Release by HTLC branch".to_string()),
+            Some("Refund after timeout".to_string()),
+            Some("notes".to_string()),
+        )
+        .unwrap();
+        assert_eq!(first.schema_id.as_deref(), Some(AGREEMENT_SCHEMA_ID_V1));
+        assert_eq!(
+            compute_agreement_hash_hex(&first).unwrap(),
+            compute_agreement_hash_hex(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn agreement_bundle_hash_is_deterministic_with_artifacts() {
+        let agreement = sample_agreement();
+        let bundle_a = build_agreement_bundle_with_artifacts(
+            &agreement,
+            1_710_000_000,
+            Some("wallet".to_string()),
+            Some("note".to_string()),
+            vec!["aa".repeat(32)],
+            vec![],
+            AgreementBundleArtifacts {
+                metadata_summary: Some("summary".to_string()),
+                external_document_hashes: vec![agreement.document_hash.clone()],
+                ..AgreementBundleArtifacts::default()
+            },
+        )
+        .unwrap();
+        let bundle_b = build_agreement_bundle_with_artifacts(
+            &agreement,
+            1_710_000_000,
+            Some("wallet".to_string()),
+            Some("note".to_string()),
+            vec!["aa".repeat(32)],
+            vec![],
+            AgreementBundleArtifacts {
+                metadata_summary: Some("summary".to_string()),
+                external_document_hashes: vec![agreement.document_hash.clone()],
+                ..AgreementBundleArtifacts::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            compute_agreement_bundle_hash_hex(&bundle_a).unwrap(),
+            compute_agreement_bundle_hash_hex(&bundle_b).unwrap()
+        );
+    }
+
+    #[test]
+    fn agreement_hash_is_deterministic() {
+        let a = sample_agreement();
+        let b = sample_agreement();
+        assert_eq!(
+            compute_agreement_hash_hex(&a).unwrap(),
+            compute_agreement_hash_hex(&b).unwrap()
+        );
+    }
+
+    #[test]
+    fn agreement_anchor_roundtrip() {
+        let anchor = AgreementAnchor {
+            agreement_hash: "aa".repeat(32),
+            role: AgreementAnchorRole::MilestoneRelease,
+            milestone_id: Some("ms1".to_string()),
+        };
+        let out = build_agreement_anchor_output(&anchor).unwrap();
+        let parsed = parse_agreement_anchor(&out.script_pubkey).unwrap();
+        assert_eq!(parsed, anchor);
+    }
+
+    #[test]
+    fn lifecycle_prefers_release_and_refund_events() {
+        let agreement = sample_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let view = derive_lifecycle(
+            &agreement,
+            &hash,
+            vec![AgreementLinkedTx {
+                txid: "01".repeat(32),
+                role: AgreementAnchorRole::Funding,
+                milestone_id: None,
+                height: Some(10),
+                confirmed: true,
+                value: agreement.total_amount,
+            }],
+            50,
+        );
+        assert_eq!(view.state, AgreementLifecycleState::Funded);
+        let view2 = derive_lifecycle(
+            &agreement,
+            &hash,
+            vec![AgreementLinkedTx {
+                txid: "02".repeat(32),
+                role: AgreementAnchorRole::Release,
+                milestone_id: None,
+                height: Some(11),
+                confirmed: true,
+                value: agreement.total_amount,
+            }],
+            50,
+        );
+        assert_eq!(view2.state, AgreementLifecycleState::Released);
+        let view3 = derive_lifecycle(
+            &agreement,
+            &hash,
+            vec![AgreementLinkedTx {
+                txid: "03".repeat(32),
+                role: AgreementAnchorRole::Refund,
+                milestone_id: None,
+                height: Some(12),
+                confirmed: true,
+                value: agreement.total_amount,
+            }],
+            130,
+        );
+        assert_eq!(view3.state, AgreementLifecycleState::Refunded);
+        let view4 = derive_lifecycle(&agreement, &hash, vec![], 121);
+        assert_eq!(view4.state, AgreementLifecycleState::Expired);
+    }
+
+    #[test]
+    fn malformed_agreement_rejected() {
+        let mut agreement = sample_agreement();
+        agreement.document_hash = "zz".to_string();
+        assert!(agreement.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_milestone_accounting_rejected() {
+        let mut agreement = sample_agreement();
+        agreement.template_type = AgreementTemplateType::MilestoneSettlement;
+        agreement.milestones = vec![AgreementMilestone {
+            milestone_id: "m1".to_string(),
+            title: "Kickoff".to_string(),
+            amount: 10,
+            recipient_address: "Qpayee".to_string(),
+            refund_address: "Qpayer".to_string(),
+            secret_hash_hex: "11".repeat(32),
+            timeout_height: 100,
+            metadata_hash: None,
+        }];
+        assert!(agreement.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_deadline_ordering_rejected() {
+        let mut agreement = sample_agreement();
+        agreement.deadlines.settlement_deadline = Some(200);
+        agreement.deadlines.refund_deadline = Some(100);
+        assert!(agreement.validate().is_err());
+    }
+
+    #[test]
+    fn funding_builder_output_sanity() {
+        let agreement = sample_agreement();
+        let legs = build_funding_legs(&agreement, [1u8; 20], [2u8; 20]).unwrap();
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].amount, agreement.total_amount);
+        assert!(!legs[0].output.script_pubkey.is_empty());
+    }
+
+    #[test]
+    fn funding_leg_refs_follow_htlc_anchor_pairs() {
+        let agreement = sample_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let legs = build_funding_legs(&agreement, [1u8; 20], [2u8; 20]).unwrap();
+        let mut outputs = Vec::new();
+        for leg in &legs {
+            outputs.push(leg.output.clone());
+            outputs.push(
+                build_agreement_anchor_output(&AgreementAnchor {
+                    agreement_hash: hash.clone(),
+                    role: leg.role,
+                    milestone_id: leg.milestone_id.clone(),
+                })
+                .unwrap(),
+            );
+        }
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs,
+            locktime: 0,
+        };
+        let refs = extract_agreement_funding_leg_refs_from_tx(&tx, &hash);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].htlc_vout, 0);
+        assert_eq!(refs[0].anchor_vout, 1);
+        assert_eq!(refs[0].amount, agreement.total_amount);
+    }
+
+    #[test]
+    fn agreement_bundle_roundtrip_and_verification() {
+        let agreement = sample_agreement();
+        let bundle = build_agreement_bundle(
+            &agreement,
+            1_710_000_000,
+            Some("local-test".to_string()),
+            Some("saved for reuse".to_string()),
+            vec!["aa".repeat(32)],
+            vec![],
+        )
+        .unwrap();
+        verify_agreement_bundle(&bundle).unwrap();
+
+        let raw = serde_json::to_vec_pretty(&bundle).unwrap();
+        let parsed: AgreementBundle = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(parsed, bundle);
+    }
+
+    #[test]
+    fn agreement_bundle_tamper_detection() {
+        let agreement = sample_agreement();
+        let mut bundle =
+            build_agreement_bundle(&agreement, 1_710_000_000, None, None, vec![], vec![]).unwrap();
+        bundle.metadata.linked_funding_txids.push("01".repeat(31));
+        assert!(verify_agreement_bundle(&bundle).is_err());
+
+        let mut bundle =
+            build_agreement_bundle(&agreement, 1_710_000_000, None, None, vec![], vec![]).unwrap();
+        bundle.agreement_hash = "ff".repeat(32);
+        assert!(verify_agreement_bundle(&bundle).is_err());
+    }
+
+    #[test]
+    fn discovered_funding_legs_respect_bundle_hints() {
+        let agreement = sample_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let observed = vec![AgreementFundingLegRef {
+            funding_txid: "aa".repeat(32),
+            htlc_vout: 0,
+            anchor_vout: 1,
+            role: AgreementAnchorRole::Funding,
+            milestone_id: None,
+            amount: agreement.total_amount,
+            timeout_height: 120,
+            expected_hash: "11".repeat(32),
+            recipient_address: "Qpayee".to_string(),
+            refund_address: "Qpayer".to_string(),
+        }];
+        let linked = vec![AgreementLinkedTx {
+            txid: "aa".repeat(32),
+            role: AgreementAnchorRole::Funding,
+            milestone_id: None,
+            height: Some(10),
+            confirmed: true,
+            value: agreement.total_amount,
+        }];
+        let bundle = build_agreement_bundle(
+            &agreement,
+            1_710_000_000,
+            Some("local-test".to_string()),
+            None,
+            vec!["aa".repeat(32)],
+            vec![],
+        )
+        .unwrap();
+        let candidates = discover_agreement_funding_leg_candidates(
+            &hash,
+            &linked,
+            &observed,
+            Some(&bundle.metadata),
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0]
+            .source_notes
+            .iter()
+            .any(|note| note == "bundle_linked_funding_txid"));
+    }
+
+    #[test]
+    fn agreement_activity_timeline_marks_local_and_derived_sources() {
+        let agreement = sample_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let linked = vec![AgreementLinkedTx {
+            txid: "aa".repeat(32),
+            role: AgreementAnchorRole::Funding,
+            milestone_id: None,
+            height: Some(10),
+            confirmed: true,
+            value: agreement.total_amount,
+        }];
+        let lifecycle = derive_lifecycle(&agreement, &hash, linked.clone(), 10);
+        let bundle =
+            build_agreement_bundle(&agreement, 1_710_000_000, None, None, vec![], vec![]).unwrap();
+        let legs = vec![AgreementFundingLegCandidate {
+            agreement_hash: hash.clone(),
+            funding_txid: "aa".repeat(32),
+            htlc_vout: 0,
+            anchor_vout: 1,
+            role: AgreementAnchorRole::Funding,
+            milestone_id: None,
+            amount: agreement.total_amount,
+            htlc_backed: true,
+            timeout_height: 120,
+            recipient_address: "Qpayee".to_string(),
+            refund_address: "Qpayer".to_string(),
+            source_notes: vec!["direct_anchor_match".to_string()],
+        }];
+        let timeline =
+            build_agreement_activity_timeline(&hash, &lifecycle, &linked, &legs, Some(&bundle));
+        assert!(timeline
+            .iter()
+            .any(|event| event.event_type == "agreement_saved_local"));
+        assert!(timeline
+            .iter()
+            .any(|event| event.event_type == "funding_leg_discovered"));
+        assert!(timeline
+            .iter()
+            .any(|event| event.event_type == "funding_tx_observed"));
+    }
+
+    #[test]
+    fn agreement_audit_record_includes_bundle_chain_and_derived_sections() {
+        let agreement = sample_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let linked = vec![AgreementLinkedTx {
+            txid: "aa".repeat(32),
+            role: AgreementAnchorRole::Funding,
+            milestone_id: None,
+            height: Some(10),
+            confirmed: true,
+            value: agreement.total_amount,
+        }];
+        let lifecycle = derive_lifecycle(&agreement, &hash, linked.clone(), 10);
+        let bundle = build_agreement_bundle(
+            &agreement,
+            1_710_000_000,
+            Some("test-bundle".to_string()),
+            Some("saved locally".to_string()),
+            vec!["aa".repeat(32)],
+            vec![],
+        )
+        .unwrap();
+        let legs = vec![AgreementAuditFundingLegRecord {
+            funding_txid: "aa".repeat(32),
+            htlc_vout: 0,
+            anchor_vout: 1,
+            role: AgreementAnchorRole::Funding,
+            milestone_id: None,
+            amount: agreement.total_amount,
+            htlc_backed: true,
+            timeout_height: 120,
+            recipient_address: "Qpayee".to_string(),
+            refund_address: "Qpayer".to_string(),
+            source_notes: vec!["direct_anchor_match".to_string()],
+            release_eligible: Some(false),
+            release_reasons: vec!["secret_hex_required_for_release".to_string()],
+            refund_eligible: Some(false),
+            refund_reasons: vec!["refund_timeout_not_reached".to_string()],
+        }];
+        let discovery_legs = vec![AgreementFundingLegCandidate {
+            agreement_hash: hash.clone(),
+            funding_txid: "aa".repeat(32),
+            htlc_vout: 0,
+            anchor_vout: 1,
+            role: AgreementAnchorRole::Funding,
+            milestone_id: None,
+            amount: agreement.total_amount,
+            htlc_backed: true,
+            timeout_height: 120,
+            recipient_address: "Qpayee".to_string(),
+            refund_address: "Qpayer".to_string(),
+            source_notes: vec!["direct_anchor_match".to_string()],
+        }];
+        let timeline = build_agreement_activity_timeline(
+            &hash,
+            &lifecycle,
+            &linked,
+            &discovery_legs,
+            Some(&bundle),
+        );
+        let record = build_agreement_audit_record(
+            &agreement,
+            &hash,
+            Some(&bundle),
+            &lifecycle,
+            &linked,
+            &legs,
+            Some(&legs[0]),
+            &timeline,
+            1_710_000_123,
+            "settlement_test",
+        );
+        assert_eq!(record.metadata.version, AGREEMENT_AUDIT_RECORD_VERSION);
+        assert!(record.local_bundle.bundle_used);
+        assert_eq!(record.chain_observed.linked_transaction_count, 1);
+        assert_eq!(record.funding_legs.candidate_count, 1);
+        assert_eq!(record.settlement_state.derived_state_label, "funded");
+        assert!(record.timeline.reconstructed);
+    }
+
+    #[test]
+    fn agreement_audit_record_marks_ambiguous_selection_requirements() {
+        let agreement = sample_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = derive_lifecycle(&agreement, &hash, vec![], 0);
+        let legs = vec![
+            AgreementAuditFundingLegRecord {
+                funding_txid: "aa".repeat(32),
+                htlc_vout: 0,
+                anchor_vout: 1,
+                role: AgreementAnchorRole::Funding,
+                milestone_id: Some("m1".to_string()),
+                amount: 1,
+                htlc_backed: true,
+                timeout_height: 100,
+                recipient_address: "Qpayee".to_string(),
+                refund_address: "Qpayer".to_string(),
+                source_notes: vec!["direct_anchor_match".to_string()],
+                release_eligible: Some(false),
+                release_reasons: vec![],
+                refund_eligible: Some(false),
+                refund_reasons: vec![],
+            },
+            AgreementAuditFundingLegRecord {
+                funding_txid: "bb".repeat(32),
+                htlc_vout: 0,
+                anchor_vout: 1,
+                role: AgreementAnchorRole::Funding,
+                milestone_id: Some("m2".to_string()),
+                amount: 1,
+                htlc_backed: true,
+                timeout_height: 100,
+                recipient_address: "Qpayee".to_string(),
+                refund_address: "Qpayer".to_string(),
+                source_notes: vec!["direct_anchor_match".to_string()],
+                release_eligible: Some(false),
+                release_reasons: vec![],
+                refund_eligible: Some(false),
+                refund_reasons: vec![],
+            },
+        ];
+        let record = build_agreement_audit_record(
+            &agreement,
+            &hash,
+            None,
+            &lifecycle,
+            &[],
+            &legs,
+            None,
+            &[],
+            1_710_000_123,
+            "settlement_test",
+        );
+        assert!(record.funding_legs.selection_required);
+        assert_eq!(record.settlement_state.derived_state_label, "ambiguous");
+        assert!(record.funding_legs.ambiguity_warning.is_some());
+    }
+    #[test]
+    fn agreement_statement_generation_is_stable() {
+        let agreement = sample_agreement();
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = derive_lifecycle(&agreement, &agreement_hash, vec![], 10);
+        let record = build_agreement_audit_record(
+            &agreement,
+            &agreement_hash,
+            None,
+            &lifecycle,
+            &[],
+            &[],
+            None,
+            &[],
+            1_710_000_123,
+            "test",
+        );
+        let statement = build_agreement_statement(&record);
+        assert_eq!(statement.metadata.version, AGREEMENT_STATEMENT_VERSION);
+        assert_eq!(statement.identity.agreement_id, agreement.agreement_id);
+        assert!(statement
+            .metadata
+            .derived_notice
+            .contains("not native consensus contract state"));
+        assert!(statement
+            .trust_notice
+            .canonical_notice
+            .contains("source of truth"));
+    }
+
+    #[test]
+    fn agreement_artifact_verification_detects_bundle_tamper() {
+        let agreement = sample_agreement();
+        let bundle = build_agreement_bundle(&agreement, 1, None, None, vec![], vec![]).unwrap();
+        let mut tampered_bundle = bundle.clone();
+        tampered_bundle.agreement_hash = "00".repeat(32);
+        let result = build_agreement_artifact_verification(
+            Some(&agreement),
+            Some(&tampered_bundle),
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            1,
+        );
+        assert_eq!(result.canonical_verification.bundle_hash_match, Some(false));
+        assert!(!result.canonical_verification.mismatches.is_empty());
+    }
+
+    #[test]
+    fn agreement_artifact_verification_reports_statement_mismatch() {
+        let agreement = sample_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = derive_lifecycle(&agreement, &hash, vec![], 10);
+        let audit = build_agreement_audit_record(
+            &agreement,
+            &hash,
+            None,
+            &lifecycle,
+            &[],
+            &[],
+            None,
+            &[],
+            1,
+            "test",
+        );
+        let mut statement = build_agreement_statement(&audit);
+        statement.identity.agreement_hash = "ff".repeat(32);
+        let result = build_agreement_artifact_verification(
+            Some(&agreement),
+            None,
+            Some(&audit),
+            Some(&statement),
+            &[],
+            &[],
+            Some(&audit),
+            2,
+        );
+        assert_eq!(
+            result.canonical_verification.statement_identity_match,
+            Some(false)
+        );
+        assert_eq!(result.chain_verification.statement_chain_match, Some(true));
+    }
+    #[test]
+    fn agreement_signature_payload_hash_and_verification_are_deterministic() {
+        let agreement = sample_agreement();
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let first = signed_test_envelope(
+            AgreementSignatureTargetType::Agreement,
+            agreement_hash.clone(),
+            Some("payer"),
+            Some(1_710_000_555),
+        );
+        let second = signed_test_envelope(
+            AgreementSignatureTargetType::Agreement,
+            agreement_hash,
+            Some("payer"),
+            Some(1_710_000_555),
+        );
+        assert_eq!(first.signature, second.signature);
+        assert_eq!(
+            compute_agreement_signature_payload_hash(&first).unwrap(),
+            compute_agreement_signature_payload_hash(&second).unwrap()
+        );
+        let inspected = inspect_agreement_signature(
+            &first,
+            Some(&compute_agreement_hash_hex(&agreement).unwrap()),
+            None,
+        );
+        assert!(inspected.valid);
+        assert!(inspected.matches_expected_target);
+        assert!(inspected.authenticity_note.contains("authenticity"));
+    }
+
+    #[test]
+    fn agreement_signature_verification_detects_invalid_signature_and_target_mismatch() {
+        let agreement = sample_agreement();
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let mut envelope = signed_test_envelope(
+            AgreementSignatureTargetType::Agreement,
+            agreement_hash.clone(),
+            Some("payee"),
+            None,
+        );
+        envelope.signature.replace_range(0..2, "00");
+        let inspected = inspect_agreement_signature(&envelope, Some(&agreement_hash), None);
+        assert!(!inspected.valid);
+        let mismatched = inspect_agreement_signature(&envelope, Some(&"ff".repeat(32)), None);
+        assert!(!mismatched.matches_expected_target);
+        assert!(mismatched
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("target hash")));
+    }
+
+    #[test]
+    fn bundle_hash_excludes_embedded_signatures_and_multiple_signatures_verify() {
+        let agreement = sample_agreement();
+        let mut bundle = build_agreement_bundle(
+            &agreement,
+            1_710_000_000,
+            Some("bundle-sig-test".to_string()),
+            None,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let bundle_hash = compute_agreement_bundle_hash_hex(&bundle).unwrap();
+        let agreement_sig = signed_test_envelope(
+            AgreementSignatureTargetType::Agreement,
+            bundle.agreement_hash.clone(),
+            Some("payer"),
+            Some(1_710_000_600),
+        );
+        let bundle_sig = signed_test_envelope(
+            AgreementSignatureTargetType::Bundle,
+            bundle_hash.clone(),
+            Some("payee"),
+            Some(1_710_000_601),
+        );
+        bundle.signatures.push(agreement_sig);
+        bundle.signatures.push(bundle_sig);
+        verify_agreement_bundle(&bundle).unwrap();
+        assert_eq!(
+            compute_agreement_bundle_hash_hex(&bundle).unwrap(),
+            bundle_hash
+        );
+        let verifications = verify_bundle_signatures(&bundle);
+        assert_eq!(verifications.len(), 2);
+        assert!(verifications.iter().all(|item| item.valid));
+        assert!(verifications
+            .iter()
+            .all(|item| item.matches_expected_target));
+    }
+    #[test]
+    fn agreement_artifact_verification_includes_authenticity_for_matching_signature() {
+        let agreement = sample_agreement();
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let signature = signed_test_envelope(
+            AgreementSignatureTargetType::Agreement,
+            agreement_hash,
+            Some("payer"),
+            Some(1_710_000_900),
+        );
+        let detached_agreement_signatures = vec![signature];
+        let result = build_agreement_artifact_verification(
+            Some(&agreement),
+            None,
+            None,
+            None,
+            &detached_agreement_signatures,
+            &[],
+            None,
+            3,
+        );
+        let authenticity = result.authenticity.expect("authenticity");
+        assert_eq!(authenticity.valid_signatures, 1);
+        assert_eq!(authenticity.invalid_signatures, 0);
+        assert!(authenticity
+            .authenticity_notice
+            .contains("authenticity layer only"));
+    }
+
+    #[test]
+    fn agreement_statement_includes_compact_authenticity_summary_when_present() {
+        let agreement = sample_agreement();
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = derive_lifecycle(&agreement, &agreement_hash, vec![], 10);
+        let mut audit = build_agreement_audit_record(
+            &agreement,
+            &agreement_hash,
+            None,
+            &lifecycle,
+            &[],
+            &[],
+            None,
+            &[],
+            4,
+            "test",
+        );
+        audit.authenticity = Some(AgreementAuthenticitySummary {
+            detached_agreement_signatures_supplied: 1,
+            detached_bundle_signatures_supplied: 0,
+            embedded_bundle_signatures_supplied: 0,
+            valid_signatures: 1,
+            invalid_signatures: 0,
+            unverifiable_signatures: 0,
+            signer_summaries: vec![
+                "agreement Qpayer role payer target hash status valid".to_string()
+            ],
+            warnings: vec![],
+            authenticity_notice: "Authenticity only; signatures do not enforce settlement"
+                .to_string(),
+        });
+        let statement = build_agreement_statement(&audit);
+        let authenticity = statement.authenticity.expect("statement authenticity");
+        assert_eq!(authenticity.valid_signatures, 1);
+        assert!(authenticity.compact_summary.contains("1 valid"));
+        assert!(authenticity
+            .authenticity_notice
+            .contains("do not enforce settlement"));
+    }
+    #[test]
+    fn agreement_share_package_roundtrip_and_verification_are_stable() {
+        let agreement = sample_agreement();
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let bundle = build_agreement_bundle(
+            &agreement,
+            1_710_001_000,
+            Some("share-test".to_string()),
+            Some("handoff".to_string()),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let lifecycle = derive_lifecycle(&agreement, &agreement_hash, vec![], 10);
+        let audit = build_agreement_audit_record(
+            &agreement,
+            &agreement_hash,
+            Some(&bundle),
+            &lifecycle,
+            &[],
+            &[],
+            None,
+            &[],
+            12,
+            "test",
+        );
+        let statement = build_agreement_statement(&audit);
+        let package = build_agreement_share_package(
+            Some(1_710_001_001),
+            Some("counterparty-a".to_string()),
+            Some("handoff".to_string()),
+            Some(agreement.clone()),
+            Some(bundle.clone()),
+            Some(audit.clone()),
+            Some(statement),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let encoded = serde_json::to_string_pretty(&package).unwrap();
+        let decoded: AgreementSharePackage = serde_json::from_str(&encoded).unwrap();
+        verify_agreement_share_package(&decoded).unwrap();
+        let inspection = inspect_agreement_share_package(&decoded).unwrap();
+        assert_eq!(inspection.canonical_agreement_hash, Some(agreement_hash));
+        assert!(inspection
+            .included_artifact_types
+            .contains(&"agreement".to_string()));
+        assert!(inspection
+            .included_artifact_types
+            .contains(&"bundle".to_string()));
+        let verification =
+            build_agreement_share_package_verification(&decoded, Some(&audit), 13).unwrap();
+        assert_eq!(
+            verification
+                .artifact_verification
+                .canonical_verification
+                .bundle_hash_match,
+            Some(true)
+        );
+        assert_eq!(
+            verification
+                .artifact_verification
+                .canonical_verification
+                .statement_identity_match,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn agreement_share_package_manifest_summary_is_stable() {
+        let agreement = sample_agreement();
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = derive_lifecycle(&agreement, &agreement_hash, vec![], 10);
+        let audit = build_agreement_audit_record(
+            &agreement,
+            &agreement_hash,
+            None,
+            &lifecycle,
+            &[],
+            &[],
+            None,
+            &[],
+            12,
+            "test",
+        );
+        let package = build_agreement_share_package(
+            Some(1_710_001_111),
+            Some("counterparty-c".to_string()),
+            Some("review handoff".to_string()),
+            Some(agreement),
+            None,
+            None,
+            Some(build_agreement_statement(&audit)),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let inspection = inspect_agreement_share_package(&package).unwrap();
+        assert_eq!(inspection.package_profile, "review_package");
+        assert!(inspection
+            .included_artifact_types
+            .contains(&"agreement".to_string()));
+        assert!(inspection
+            .omitted_artifact_types
+            .contains(&"bundle".to_string()));
+        assert!(inspection.verification_notice.contains("descriptive only"));
+    }
+
+    #[test]
+    fn agreement_share_package_verification_detects_mismatches_and_invalid_signature() {
+        let agreement = sample_agreement();
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = derive_lifecycle(&agreement, &agreement_hash, vec![], 10);
+        let audit = build_agreement_audit_record(
+            &agreement,
+            &agreement_hash,
+            None,
+            &lifecycle,
+            &[],
+            &[],
+            None,
+            &[],
+            14,
+            "test",
+        );
+        let mut statement = build_agreement_statement(&audit);
+        statement.identity.agreement_hash = "ff".repeat(32);
+        let mut signature = signed_test_envelope(
+            AgreementSignatureTargetType::Agreement,
+            agreement_hash,
+            Some("payer"),
+            Some(1_710_001_200),
+        );
+        signature.signature.replace_range(0..2, "00");
+        let package = build_agreement_share_package(
+            Some(1_710_001_201),
+            Some("counterparty-b".to_string()),
+            None,
+            Some(agreement),
+            None,
+            Some(audit),
+            Some(statement),
+            vec![signature],
+            vec![],
+        )
+        .unwrap();
+        let verification = build_agreement_share_package_verification(&package, None, 15).unwrap();
+        assert_eq!(
+            verification
+                .artifact_verification
+                .canonical_verification
+                .statement_identity_match,
+            Some(false)
+        );
+        let authenticity = verification
+            .artifact_verification
+            .authenticity
+            .expect("authenticity");
+        assert_eq!(authenticity.invalid_signatures, 1);
+        assert!(verification
+            .informational_notices
+            .iter()
+            .any(|note| note.contains("informational")));
+    }
+}

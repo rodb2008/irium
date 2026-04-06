@@ -254,7 +254,8 @@ impl WalletManager {
             .ok_or_else(|| "wallet locked".to_string())?;
 
         let (secret, compressed) = wif_to_secret_and_compression(wif.trim())?;
-        let secret_key = SecretKey::from_slice(&secret).map_err(|_| "invalid WIF secret".to_string())?;
+        let secret_key =
+            SecretKey::from_slice(&secret).map_err(|_| "invalid WIF secret".to_string())?;
         let key = key_from_secret(&secret_key, compressed);
 
         if let Some(ref mut plain) = self.state.unlocked {
