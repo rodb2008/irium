@@ -59,6 +59,7 @@ use irium_node_rs::settlement::{
     evaluate_policy,
     ProofPolicy,
     SettlementProof,
+    ProofStore,
 };
 use irium_node_rs::storage;
 use irium_node_rs::tx::{
@@ -95,6 +96,7 @@ struct AppState {
     status_expected_hash_coverage_in_window_cache: Arc<AtomicU64>,
     status_expected_hash_window_span_cache: Arc<AtomicU64>,
     status_best_header_hash_cache: Arc<Mutex<String>>,
+    proof_store: Arc<Mutex<ProofStore>>,
 }
 
 #[derive(Serialize)]
@@ -651,6 +653,32 @@ struct AgreementBuildSpendResponse {
     trust_model_note: String,
 }
 
+
+#[derive(Deserialize)]
+struct SubmitProofRequest {
+    proof: SettlementProof,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitProofResponse {
+    proof_id: String,
+    agreement_hash: String,
+    accepted: bool,
+    duplicate: bool,
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct ListProofsRequest {
+    agreement_hash: String,
+}
+
+#[derive(Serialize)]
+struct ListProofsResponse {
+    agreement_hash: String,
+    count: usize,
+    proofs: Vec<SettlementProof>,
+}
 
 #[derive(Deserialize)]
 struct CheckPolicyRequest {
@@ -4923,6 +4951,51 @@ async fn agreement_refund_eligibility(
 }
 
 
+
+async fn submit_proof_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<SubmitProofRequest>,
+) -> Result<Json<SubmitProofResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| (StatusCode::BAD_REQUEST, reason.to_string());
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let mut store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+    let outcome = store.submit(req.proof).map_err(|e| bad(&e))?;
+    Ok(Json(SubmitProofResponse {
+        proof_id: outcome.proof_id,
+        agreement_hash: outcome.agreement_hash,
+        accepted: outcome.accepted,
+        duplicate: outcome.duplicate,
+        message: outcome.message,
+    }))
+}
+
+async fn list_proofs_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<ListProofsRequest>,
+) -> Result<Json<ListProofsResponse>, (StatusCode, String)> {
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+    let proofs: Vec<SettlementProof> = store
+        .list_by_agreement(&req.agreement_hash)
+        .into_iter()
+        .cloned()
+        .collect();
+    let count = proofs.len();
+    Ok(Json(ListProofsResponse {
+        agreement_hash: req.agreement_hash,
+        count,
+        proofs,
+    }))
+}
+
 async fn check_policy_rpc(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -6586,6 +6659,9 @@ async fn main() {
         status_expected_hash_coverage_in_window_cache,
         status_expected_hash_window_span_cache,
         status_best_header_hash_cache,
+        proof_store: Arc::new(Mutex::new(ProofStore::new(
+            storage::state_dir().join("proofs.json"),
+        ))),
     };
 
     let persist_drain_secs = std::env::var("IRIUM_PERSIST_DRAIN_SECS")
@@ -6658,6 +6734,8 @@ async fn main() {
         .route("/rpc/buildagreementrelease", post(build_agreement_release))
         .route("/rpc/buildagreementrefund", post(build_agreement_refund))
         .route("/rpc/checkpolicy", post(check_policy_rpc))
+        .route("/rpc/submitproof", post(submit_proof_rpc))
+        .route("/rpc/listproofs", post(list_proofs_rpc))
         .route("/rpc/createhtlc", post(create_htlc))
         .route("/rpc/decodehtlc", post(decode_htlc))
         .route("/rpc/claimhtlc", post(claim_htlc))
@@ -6872,6 +6950,9 @@ mod tests {
             status_expected_hash_coverage_in_window_cache: Arc::new(AtomicU64::new(0)),
             status_expected_hash_window_span_cache: Arc::new(AtomicU64::new(0)),
             status_best_header_hash_cache: Arc::new(Mutex::new(String::new())),
+            proof_store: Arc::new(Mutex::new(ProofStore::new(
+                unique_path("irium_proofs", "json"),
+            ))),
         };
 
         (state, sender, recipient, refund)
@@ -7923,5 +8004,134 @@ mod tests {
             resp.reason
         );
     }
+
+
+    // ---- Phase 2 proof store RPC tests ----
+
+    fn make_signed_proof_for_rpc(agreement_hash: &str, signing_key: &SigningKey) -> SettlementProof {
+        use irium_node_rs::settlement::{
+            settlement_proof_payload_bytes, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+            SETTLEMENT_PROOF_SCHEMA_ID,
+        };
+        let pubkey_hex = hex::encode(signing_key.verifying_key().to_encoded_point(false).as_bytes());
+        let mut proof = SettlementProof {
+            proof_id: "rpc-store-prf-001".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: agreement_hash.to_string(),
+            milestone_id: None,
+            attested_by: "att-node-test".to_string(),
+            attestation_time: 1_700_200_000,
+            evidence_hash: None,
+            evidence_summary: Some("rpc store test".to_string()),
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pubkey_hex.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+        };
+        let payload = settlement_proof_payload_bytes(&proof).unwrap();
+        let digest = sha2::Sha256::digest(&payload);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: k256::ecdsa::Signature = signing_key.sign_prehash(&arr).unwrap();
+        proof.signature.signature_hex = hex::encode(sig.to_bytes());
+        proof.signature.payload_hash = hex::encode(digest);
+        proof
+    }
+
+    #[tokio::test]
+    async fn submit_proof_rpc_accepts_valid_proof() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[17u8; 32]).into()).unwrap();
+        let proof = make_signed_proof_for_rpc("cafecafe", &sk);
+        let resp = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit must succeed")
+        .0;
+        assert!(resp.accepted);
+        assert!(!resp.duplicate);
+        assert_eq!(resp.proof_id, "rpc-store-prf-001");
+    }
+
+    #[tokio::test]
+    async fn submit_proof_rpc_rejects_invalid_signature() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[17u8; 32]).into()).unwrap();
+        let mut proof = make_signed_proof_for_rpc("cafecafe", &sk);
+        proof.signature.signature_hex = "00".repeat(64);
+        let result = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await;
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn submit_proof_rpc_deduplicates() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[17u8; 32]).into()).unwrap();
+        let proof = make_signed_proof_for_rpc("cafecafe", &sk);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof: proof.clone() }),
+        )
+        .await
+        .expect("first submit")
+        .0;
+        let second = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("second submit")
+        .0;
+        assert!(!second.accepted);
+        assert!(second.duplicate);
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_returns_submitted_proofs() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[17u8; 32]).into()).unwrap();
+        let proof = make_signed_proof_for_rpc("listtest", &sk);
+        let _ = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit");
+        let list_resp = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest {
+                agreement_hash: "listtest".to_string(),
+            }),
+        )
+        .await
+        .expect("list")
+        .0;
+        assert_eq!(list_resp.count, 1);
+        assert_eq!(list_resp.proofs[0].proof_id, "rpc-store-prf-001");
+    }
+
 
 }

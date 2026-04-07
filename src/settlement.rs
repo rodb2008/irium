@@ -3899,6 +3899,138 @@ pub fn evaluate_policy(
 }
 
 
+
+// ---- Proof storage ----
+
+#[derive(Debug)]
+pub struct SubmitProofOutcome {
+    pub proof_id: String,
+    pub agreement_hash: String,
+    pub accepted: bool,
+    pub duplicate: bool,
+    pub message: String,
+}
+
+pub fn verify_settlement_proof_signature_only(proof: &SettlementProof) -> Result<(), String> {
+    if proof.signature.signature_type != AGREEMENT_SIGNATURE_TYPE_SECP256K1 {
+        return Err(format!(
+            "unsupported signature type: {}",
+            proof.signature.signature_type
+        ));
+    }
+    if proof.proof_id.trim().is_empty() {
+        return Err("proof_id must not be empty".to_string());
+    }
+    if proof.agreement_hash.trim().is_empty() {
+        return Err("agreement_hash must not be empty".to_string());
+    }
+    let digest = compute_settlement_proof_payload_hash(proof)?;
+    let pubkey_bytes = hex::decode(&proof.signature.pubkey_hex)
+        .map_err(|_| "pubkey_hex must be hex-encoded SEC1 bytes".to_string())?;
+    let verifying_key = VerifyingKey::from_sec1_bytes(&pubkey_bytes)
+        .map_err(|_| "pubkey_hex must be a valid secp256k1 SEC1 public key".to_string())?;
+    let sig_bytes = hex::decode(&proof.signature.signature_hex)
+        .map_err(|_| "signature_hex must be 64-byte hex".to_string())?;
+    let parsed = Signature::from_slice(&sig_bytes)
+        .map_err(|_| "signature_hex must be valid compact secp256k1 bytes".to_string())?;
+    verifying_key
+        .verify_prehash(&digest, &parsed)
+        .map_err(|_| "proof signature verification failed".to_string())
+}
+
+pub struct ProofStore {
+    proofs: std::collections::HashMap<String, SettlementProof>,
+    path: std::path::PathBuf,
+}
+
+impl ProofStore {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        let mut store = Self {
+            proofs: std::collections::HashMap::new(),
+            path,
+        };
+        store.load_from_disk();
+        store
+    }
+
+    fn load_from_disk(&mut self) {
+        let data = match std::fs::read_to_string(&self.path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let parsed: Vec<SettlementProof> = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "Failed to parse proof store {}: {e}",
+                    self.path.display()
+                );
+                return;
+            }
+        };
+        for proof in parsed {
+            self.proofs.insert(proof.proof_id.clone(), proof);
+        }
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut proofs: Vec<&SettlementProof> = self.proofs.values().collect();
+        proofs.sort_by(|a, b| a.proof_id.cmp(&b.proof_id));
+        let json = serde_json::to_string_pretty(&proofs).map_err(|e| e.to_string())?;
+        std::fs::write(&self.path, json).map_err(|e| e.to_string())
+    }
+
+    pub fn submit(&mut self, proof: SettlementProof) -> Result<SubmitProofOutcome, String> {
+        if proof.schema_id != SETTLEMENT_PROOF_SCHEMA_ID {
+            return Err(format!(
+                "proof schema_id must be {SETTLEMENT_PROOF_SCHEMA_ID}"
+            ));
+        }
+        verify_settlement_proof_signature_only(&proof)?;
+        let agreement_hash = proof.agreement_hash.clone();
+        let proof_id = proof.proof_id.clone();
+        if self.proofs.contains_key(&proof_id) {
+            return Ok(SubmitProofOutcome {
+                proof_id,
+                agreement_hash,
+                accepted: false,
+                duplicate: true,
+                message: "proof already stored".to_string(),
+            });
+        }
+        self.proofs.insert(proof_id.clone(), proof);
+        if let Err(e) = self.persist() {
+            eprintln!("proof store persist error: {e}");
+        }
+        Ok(SubmitProofOutcome {
+            proof_id,
+            agreement_hash,
+            accepted: true,
+            duplicate: false,
+            message: "proof accepted".to_string(),
+        })
+    }
+
+    pub fn list_by_agreement(&self, agreement_hash: &str) -> Vec<&SettlementProof> {
+        let lower = agreement_hash.to_lowercase();
+        let mut proofs: Vec<&SettlementProof> = self
+            .proofs
+            .values()
+            .filter(|p| p.agreement_hash.to_lowercase() == lower)
+            .collect();
+        proofs.sort_by(|a, b| a.proof_id.cmp(&b.proof_id));
+        proofs
+    }
+
+    pub fn count(&self) -> usize {
+        self.proofs.len()
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5122,6 +5254,149 @@ mod tests {
         let policy = make_test_policy("000000wrong_hash", &pubkey_hex, "attestor-a");
         let err = evaluate_policy(&agreement, &policy, &[], 0).unwrap_err();
         assert!(err.contains("does not match"), "must mention mismatch: {err}");
+    }
+
+
+
+    // ---- ProofStore tests ----
+
+    fn make_proof_store() -> ProofStore {
+        let path = std::env::temp_dir().join(format!(
+            "irium_test_proofs_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        ProofStore::new(path)
+    }
+
+    fn build_signed_proof(
+        agreement_hash: &str,
+        attestor_id: &str,
+        signing_key: &SigningKey,
+    ) -> SettlementProof {
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let mut proof = SettlementProof {
+            proof_id: format!("prf-store-{}-{}", attestor_id, agreement_hash),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: agreement_hash.to_string(),
+            milestone_id: None,
+            attested_by: attestor_id.to_string(),
+            attestation_time: 1_700_100_000,
+            evidence_hash: None,
+            evidence_summary: Some("store test delivery".to_string()),
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pubkey_hex.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+        };
+        let payload = settlement_proof_payload_bytes(&proof).unwrap();
+        let digest = sha2::Sha256::digest(&payload);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: k256::ecdsa::Signature = signing_key.sign_prehash(&arr).unwrap();
+        proof.signature.signature_hex = hex::encode(sig.to_bytes());
+        proof.signature.payload_hash = hex::encode(digest);
+        proof
+    }
+
+    #[test]
+    fn proof_store_accepts_valid_proof() {
+        let mut store = make_proof_store();
+        let sk = SigningKey::from_bytes((&[13u8; 32]).into()).unwrap();
+        let proof = build_signed_proof("aabbcc", "att-1", &sk);
+        let outcome = store.submit(proof).unwrap();
+        assert!(outcome.accepted);
+        assert!(!outcome.duplicate);
+        assert_eq!(outcome.proof_id, "prf-store-att-1-aabbcc");
+        assert_eq!(store.count(), 1);
+    }
+
+    #[test]
+    fn proof_store_rejects_invalid_signature() {
+        let mut store = make_proof_store();
+        let sk = SigningKey::from_bytes((&[13u8; 32]).into()).unwrap();
+        let mut proof = build_signed_proof("aabbcc", "att-1", &sk);
+        // Corrupt the signature
+        proof.signature.signature_hex = "ff".repeat(64);
+        let err = store.submit(proof).unwrap_err();
+        assert!(err.contains("verification failed") || err.contains("secp256k1"), "got: {err}");
+        assert_eq!(store.count(), 0);
+    }
+
+    #[test]
+    fn proof_store_deduplicates_by_proof_id() {
+        let mut store = make_proof_store();
+        let sk = SigningKey::from_bytes((&[13u8; 32]).into()).unwrap();
+        let proof = build_signed_proof("aabbcc", "att-1", &sk);
+        let first = store.submit(proof.clone()).unwrap();
+        let second = store.submit(proof).unwrap();
+        assert!(first.accepted);
+        assert!(!second.accepted);
+        assert!(second.duplicate);
+        assert_eq!(store.count(), 1);
+    }
+
+    #[test]
+    fn proof_store_lists_by_agreement_hash() {
+        let mut store = make_proof_store();
+        let sk1 = SigningKey::from_bytes((&[13u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[14u8; 32]).into()).unwrap();
+        let p1 = build_signed_proof("target-hash", "att-1", &sk1);
+        let p2 = build_signed_proof("target-hash", "att-2", &sk2);
+        let p3 = build_signed_proof("other-hash", "att-1", &sk1);
+        store.submit(p1).unwrap();
+        store.submit(p2).unwrap();
+        store.submit(p3).unwrap();
+        let listed = store.list_by_agreement("target-hash");
+        assert_eq!(listed.len(), 2);
+        let other = store.list_by_agreement("other-hash");
+        assert_eq!(other.len(), 1);
+        let none = store.list_by_agreement("nonexistent");
+        assert_eq!(none.len(), 0);
+    }
+
+    #[test]
+    fn proof_store_rejects_wrong_schema_id() {
+        let mut store = make_proof_store();
+        let sk = SigningKey::from_bytes((&[13u8; 32]).into()).unwrap();
+        let mut proof = build_signed_proof("aabbcc", "att-1", &sk);
+        proof.schema_id = "wrong.schema".to_string();
+        let err = store.submit(proof).unwrap_err();
+        assert!(err.contains("schema_id"), "got: {err}");
+    }
+
+    #[test]
+    fn proof_store_roundtrip_persist_and_reload() {
+        let path = std::env::temp_dir().join(format!(
+            "irium_test_roundtrip_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let sk = SigningKey::from_bytes((&[13u8; 32]).into()).unwrap();
+        {
+            let mut store = ProofStore::new(path.clone());
+            let proof = build_signed_proof("persist-hash", "att-1", &sk);
+            store.submit(proof).unwrap();
+            assert_eq!(store.count(), 1);
+        }
+        // Reload from disk
+        let store2 = ProofStore::new(path.clone());
+        assert_eq!(store2.count(), 1);
+        let listed = store2.list_by_agreement("persist-hash");
+        assert_eq!(listed.len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 
 

@@ -267,6 +267,167 @@ on the request. If the node requires authentication, set this variable.
 
 ---
 
+---
+
+## POST /rpc/submitproof
+
+Submits a settlement proof for storage at the node. The node validates the proof's
+cryptographic signature and stores it if valid. Attestor authorization (policy
+membership) is **not** checked at submission time — policy evaluation happens at
+`/rpc/checkpolicy`.
+
+### Authentication
+
+Requires `Authorization: Bearer <IRIUM_RPC_TOKEN>`. Rate-limited.
+
+### Request
+
+```
+POST /rpc/submitproof
+Content-Type: application/json
+Authorization: Bearer <token>
+```
+
+```json
+{
+  "proof": { ... }
+}
+```
+
+- `proof`: a full `SettlementProof` object (see SettlementProof JSON shape above).
+
+### Response (200 OK)
+
+```json
+{
+  "proof_id": "prf-001",
+  "agreement_hash": "<64-char hex>",
+  "accepted": true,
+  "duplicate": false,
+  "message": "proof accepted"
+}
+```
+
+- `accepted`: true if the proof was newly stored.
+- `duplicate`: true if a proof with the same `proof_id` was already present.
+- If `accepted` is false and `duplicate` is false, an error occurred (returned as 400).
+
+### Error responses
+
+- `400 Bad Request` — proof schema_id mismatch, invalid signature, or empty
+  `proof_id`/`agreement_hash`.
+- `401 Unauthorized` — missing or invalid RPC token.
+- `429 Too Many Requests` — rate limit exceeded.
+
+### Storage semantics
+
+- Proofs are keyed by `proof_id`. Submitting the same `proof_id` twice returns
+  `duplicate: true` without modifying stored state.
+- Proofs are persisted to `<state_dir>/proofs.json` immediately on acceptance.
+- The node does not evict proofs. Storage is unbounded.
+- Proofs are not validated against any agreement or policy at submission time.
+  Use `/rpc/checkpolicy` with `proofs` from `/rpc/listproofs` to evaluate eligibility.
+
+---
+
+## POST /rpc/listproofs
+
+Returns all stored proofs for a given agreement hash.
+
+### Authentication
+
+Requires `Authorization: Bearer <IRIUM_RPC_TOKEN>`. Rate-limited.
+
+### Request
+
+```json
+{
+  "agreement_hash": "<64-char hex>"
+}
+```
+
+### Response (200 OK)
+
+```json
+{
+  "agreement_hash": "<64-char hex>",
+  "count": 1,
+  "proofs": [
+    { ... }
+  ]
+}
+```
+
+- `proofs`: array of `SettlementProof` objects sorted by `proof_id`.
+- Returns an empty array if no proofs are stored for the given hash.
+
+---
+
+## irium-wallet agreement-proof-submit
+
+```
+irium-wallet agreement-proof-submit \
+  --proof <proof.json|-> \
+  [--rpc <url>] \
+  [--json]
+```
+
+### Arguments
+
+| Flag | Required | Description |
+|---|---|---|
+| `--proof <path\|->` | yes | Path to settlement proof JSON, or `-` for stdin |
+| `--rpc <url>` | no | Node RPC base URL |
+| `--json` | no | Output raw JSON response |
+
+### Default output
+
+```
+proof_id prf-001
+agreement_hash <64-char hex>
+accepted true
+duplicate false
+message proof accepted
+```
+
+### Exit codes
+
+- `0`: proof was accepted or duplicate.
+- `1`: proof was rejected, RPC call failed, or input parsing failed.
+
+---
+
+## irium-wallet agreement-proof-list
+
+```
+irium-wallet agreement-proof-list \
+  --agreement-hash <hex> \
+  [--rpc <url>] \
+  [--json]
+```
+
+### Arguments
+
+| Flag | Required | Description |
+|---|---|---|
+| `--agreement-hash <hex>` | yes | SHA-256 hex of the agreement to query |
+| `--rpc <url>` | no | Node RPC base URL |
+| `--json` | no | Output raw JSON response |
+
+### Default output
+
+```
+agreement_hash <64-char hex>
+count 1
+  proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation
+```
+
+### Exit codes
+
+- `0` always (listing an empty set is not an error).
+
+
+
 ## Current limitations
 
 The following items are defined in the type layer but not yet evaluated or exposed:
@@ -278,8 +439,7 @@ The following items are defined in the type layer but not yet evaluated or expos
   through JSON but is not checked during evaluation.
 - **Milestone scoping**: `milestone_id` on requirements and rules is stored but
   evaluation does not filter or scope by milestone.
-- **Proof persistence**: the node does not store proofs. Proofs must be supplied by
-  the caller on every request.
+- **Proof persistence**: implemented via  and . ~~The node does not store proofs.~~
 - **Attestor registry**: there is no persistent on-node attestor registry. Attestors
   are defined inline in each `ProofPolicy` object.
 - **Explorer routes**: no `/agreement/policy*` routes exist in `irium-explorer` yet.

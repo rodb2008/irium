@@ -413,6 +413,47 @@ struct AgreementSpendEligibilityResponse {
 }
 
 
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SubmitProofRpcRequest {
+    proof: SettlementProof,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SubmitProofRpcResponse {
+    proof_id: String,
+    agreement_hash: String,
+    accepted: bool,
+    duplicate: bool,
+    message: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ListProofsRpcRequest {
+    agreement_hash: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ListProofsRpcResponse {
+    agreement_hash: String,
+    count: usize,
+    proofs: Vec<SettlementProof>,
+}
+
+#[derive(Debug, Clone)]
+struct ProofSubmitCliOptions {
+    proof_path: String,
+    rpc_url: String,
+    json_mode: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProofListCliOptions {
+    agreement_hash: String,
+    rpc_url: String,
+    json_mode: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct CheckPolicyRpcRequest {
     agreement: AgreementObject,
@@ -1634,6 +1675,8 @@ fn usage() {
     eprintln!("  irium-wallet agreement-release-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-refund-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-policy-check --agreement <agreement.json|-> --policy <policy.json|-> [--proof <proof.json>]... [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-proof-list --agreement-hash <hex> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-release-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
     eprintln!("  irium-wallet agreement-refund-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
     eprintln!("  irium-wallet agreement-release-send <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
@@ -4335,6 +4378,104 @@ fn render_bundle_summary(bundle: &AgreementBundle, source: &str) -> String {
     )
 }
 
+
+
+fn parse_proof_submit_cli(args: &[String]) -> Result<ProofSubmitCliOptions, String> {
+    let mut proof_path: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--proof" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--proof requires a value".to_string());
+                }
+                proof_path = Some(args[i].clone());
+            }
+            "--rpc" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--rpc requires a value".to_string());
+                }
+                rpc_url = args[i].clone();
+            }
+            "--json" => {
+                json_mode = true;
+            }
+            other => {
+                return Err(format!("unknown argument: {}", other));
+            }
+        }
+        i += 1;
+    }
+    Ok(ProofSubmitCliOptions {
+        proof_path: proof_path.ok_or_else(|| "--proof is required".to_string())?,
+        rpc_url,
+        json_mode,
+    })
+}
+
+fn parse_proof_list_cli(args: &[String]) -> Result<ProofListCliOptions, String> {
+    let mut agreement_hash: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement-hash" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--agreement-hash requires a value".to_string());
+                }
+                agreement_hash = Some(args[i].clone());
+            }
+            "--rpc" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--rpc requires a value".to_string());
+                }
+                rpc_url = args[i].clone();
+            }
+            "--json" => {
+                json_mode = true;
+            }
+            other => {
+                return Err(format!("unknown argument: {}", other));
+            }
+        }
+        i += 1;
+    }
+    Ok(ProofListCliOptions {
+        agreement_hash: agreement_hash.ok_or_else(|| "--agreement-hash is required".to_string())?,
+        rpc_url,
+        json_mode,
+    })
+}
+
+fn render_proof_submit_summary(resp: &SubmitProofRpcResponse) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("proof_id {}", resp.proof_id));
+    lines.push(format!("agreement_hash {}", resp.agreement_hash));
+    lines.push(format!("accepted {}", resp.accepted));
+    lines.push(format!("duplicate {}", resp.duplicate));
+    lines.push(format!("message {}", resp.message));
+    lines.join("\n")
+}
+
+fn render_proof_list_summary(resp: &ListProofsRpcResponse) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("agreement_hash {}", resp.agreement_hash));
+    lines.push(format!("count {}", resp.count));
+    for proof in &resp.proofs {
+        lines.push(format!(
+            "  proof_id={} attested_by={} proof_type={}",
+            proof.proof_id, proof.attested_by, proof.proof_type
+        ));
+    }
+    lines.join("\n")
+}
 
 fn parse_policy_check_cli(args: &[String]) -> Result<PolicyCheckCliOptions, String> {
     let mut agreement_path: Option<String> = None;
@@ -7703,6 +7844,148 @@ mod tests {
         assert!(out.contains("no release or refund"));
     }
 
+
+    // ---- Phase 2 proof submit/list wallet CLI tests ----
+
+    #[test]
+    fn proof_submit_cli_parses_required_args() {
+        let args: Vec<String> = vec!["--proof".to_string(), "prf.json".to_string()];
+        let opts = parse_proof_submit_cli(&args).expect("must parse");
+        assert_eq!(opts.proof_path, "prf.json");
+        assert!(!opts.json_mode);
+    }
+
+    #[test]
+    fn proof_submit_cli_parses_all_flags() {
+        let args: Vec<String> = vec![
+            "--proof".to_string(), "prf.json".to_string(),
+            "--rpc".to_string(), "http://localhost:9090".to_string(),
+            "--json".to_string(),
+        ];
+        let opts = parse_proof_submit_cli(&args).expect("must parse");
+        assert_eq!(opts.proof_path, "prf.json");
+        assert_eq!(opts.rpc_url, "http://localhost:9090");
+        assert!(opts.json_mode);
+    }
+
+    #[test]
+    fn proof_submit_cli_rejects_missing_proof() {
+        let args: Vec<String> = vec!["--json".to_string()];
+        let err = parse_proof_submit_cli(&args).unwrap_err();
+        assert!(err.contains("--proof"), "got: {err}");
+    }
+
+    #[test]
+    fn proof_submit_cli_rejects_unknown_flag() {
+        let args: Vec<String> = vec![
+            "--proof".to_string(), "prf.json".to_string(),
+            "--unknown".to_string(),
+        ];
+        let err = parse_proof_submit_cli(&args).unwrap_err();
+        assert!(err.contains("unknown"), "got: {err}");
+    }
+
+    #[test]
+    fn proof_list_cli_parses_required_args() {
+        let args: Vec<String> = vec!["--agreement-hash".to_string(), "aabbcc".to_string()];
+        let opts = parse_proof_list_cli(&args).expect("must parse");
+        assert_eq!(opts.agreement_hash, "aabbcc");
+        assert!(!opts.json_mode);
+    }
+
+    #[test]
+    fn proof_list_cli_parses_all_flags() {
+        let args: Vec<String> = vec![
+            "--agreement-hash".to_string(), "aabbcc".to_string(),
+            "--rpc".to_string(), "http://localhost:9090".to_string(),
+            "--json".to_string(),
+        ];
+        let opts = parse_proof_list_cli(&args).expect("must parse");
+        assert_eq!(opts.agreement_hash, "aabbcc");
+        assert!(opts.json_mode);
+    }
+
+    #[test]
+    fn proof_list_cli_rejects_missing_agreement_hash() {
+        let args: Vec<String> = vec!["--json".to_string()];
+        let err = parse_proof_list_cli(&args).unwrap_err();
+        assert!(err.contains("--agreement-hash"), "got: {err}");
+    }
+
+    #[test]
+    fn render_proof_submit_summary_accepted() {
+        let resp = SubmitProofRpcResponse {
+            proof_id: "prf-001".to_string(),
+            agreement_hash: "aabbcc".to_string(),
+            accepted: true,
+            duplicate: false,
+            message: "proof accepted".to_string(),
+        };
+        let out = render_proof_submit_summary(&resp);
+        assert!(out.contains("proof_id prf-001"), "got: {out}");
+        assert!(out.contains("accepted true"), "got: {out}");
+        assert!(out.contains("duplicate false"), "got: {out}");
+        assert!(out.contains("proof accepted"), "got: {out}");
+    }
+
+    #[test]
+    fn render_proof_submit_summary_duplicate() {
+        let resp = SubmitProofRpcResponse {
+            proof_id: "prf-001".to_string(),
+            agreement_hash: "aabbcc".to_string(),
+            accepted: false,
+            duplicate: true,
+            message: "duplicate: proof already stored".to_string(),
+        };
+        let out = render_proof_submit_summary(&resp);
+        assert!(out.contains("accepted false"));
+        assert!(out.contains("duplicate true"));
+    }
+
+    #[test]
+    fn render_proof_list_summary_with_proofs() {
+        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        let proof = SettlementProof {
+            proof_id: "prf-list-001".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: "aabbcc".to_string(),
+            milestone_id: None,
+            attested_by: "att-1".to_string(),
+            attestation_time: 1700000000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: String::new(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+        };
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "aabbcc".to_string(),
+            count: 1,
+            proofs: vec![proof],
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("agreement_hash aabbcc"), "got: {out}");
+        assert!(out.contains("count 1"), "got: {out}");
+        assert!(out.contains("prf-list-001"), "got: {out}");
+        assert!(out.contains("att-1"), "got: {out}");
+    }
+
+    #[test]
+    fn render_proof_list_summary_empty() {
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "deadbeef".to_string(),
+            count: 0,
+            proofs: vec![],
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("count 0"));
+        assert!(out.contains("deadbeef"));
+    }
+
 }
 
 fn main() {
@@ -10535,6 +10818,100 @@ fn main() {
             }
             if !resp.eligible {
                 std::process::exit(1);
+            }
+        }
+        "agreement-proof-submit" => {
+            let opts = match parse_proof_submit_cli(&args[1..]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    usage();
+                    std::process::exit(1);
+                }
+            };
+            let proof: SettlementProof = {
+                let data = match read_text_from_path_or_stdin(
+                    Path::new(&opts.proof_path),
+                    "proof json",
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                };
+                match serde_json::from_str(&data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("parse proof json: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            };
+            let base = opts.rpc_url.trim_end_matches('/');
+            let client = match rpc_client(base) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let req = SubmitProofRpcRequest { proof };
+            let resp: SubmitProofRpcResponse =
+                match rpc_post_json(&client, base, "/rpc/submitproof", &req) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                };
+            if opts.json_mode {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap()
+                );
+            } else {
+                println!("{}", render_proof_submit_summary(&resp));
+            }
+            if !resp.accepted && !resp.duplicate {
+                std::process::exit(1);
+            }
+        }
+        "agreement-proof-list" => {
+            let opts = match parse_proof_list_cli(&args[1..]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    usage();
+                    std::process::exit(1);
+                }
+            };
+            let base = opts.rpc_url.trim_end_matches('/');
+            let client = match rpc_client(base) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let req = ListProofsRpcRequest {
+                agreement_hash: opts.agreement_hash,
+            };
+            let resp: ListProofsRpcResponse =
+                match rpc_post_json(&client, base, "/rpc/listproofs", &req) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                };
+            if opts.json_mode {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap()
+                );
+            } else {
+                println!("{}", render_proof_list_summary(&resp));
             }
         }
         "agreement-policy-check" => {
