@@ -3644,6 +3644,261 @@ pub fn derive_lifecycle(
     }
 }
 
+
+
+// ============================================================
+// Phase 2: Proof-Based Objective Automation — Foundation Types
+// ============================================================
+
+pub const AGREEMENT_SCHEMA_ID_V2: &str = "irium.phase2.canonical.v1";
+pub const PROOF_POLICY_SCHEMA_ID: &str = "irium.phase2.proof_policy.v1";
+pub const SETTLEMENT_PROOF_SCHEMA_ID: &str = "irium.phase2.settlement_proof.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofResolution {
+    Release,
+    Refund,
+    MilestoneRelease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoResponseTrigger {
+    FundedAndNoRelease,
+    DisputedAndNoResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoResponseRule {
+    pub rule_id: String,
+    pub deadline_height: u64,
+    pub trigger: NoResponseTrigger,
+    pub resolution: ProofResolution,
+    pub milestone_id: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovedAttestor {
+    pub attestor_id: String,
+    pub pubkey_hex: String,
+    pub display_name: Option<String>,
+    pub domain: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofRequirement {
+    pub requirement_id: String,
+    pub proof_type: String,
+    pub required_by: Option<u64>,
+    pub required_attestor_ids: Vec<String>,
+    pub resolution: ProofResolution,
+    pub milestone_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofPolicy {
+    pub policy_id: String,
+    pub schema_id: String,
+    pub agreement_hash: String,
+    pub required_proofs: Vec<ProofRequirement>,
+    pub no_response_rules: Vec<NoResponseRule>,
+    pub attestors: Vec<ApprovedAttestor>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofSignatureEnvelope {
+    pub signature_type: String,
+    pub pubkey_hex: String,
+    pub signature_hex: String,
+    pub payload_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettlementProof {
+    pub proof_id: String,
+    pub schema_id: String,
+    pub proof_type: String,
+    pub agreement_hash: String,
+    pub milestone_id: Option<String>,
+    pub attested_by: String,
+    pub attestation_time: u64,
+    pub evidence_hash: Option<String>,
+    pub evidence_summary: Option<String>,
+    pub signature: ProofSignatureEnvelope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyEvaluationResult {
+    pub release_eligible: bool,
+    pub refund_eligible: bool,
+    pub reason: String,
+    pub evaluated_rules: Vec<String>,
+}
+
+fn proof_policy_canonical_bytes(policy: &ProofPolicy) -> Result<Vec<u8>, String> {
+    let value = serde_json::to_value(policy)
+        .map_err(|e| format!("proof policy to json: {e}"))?;
+    let sorted = sort_json(value);
+    serde_json::to_vec(&sorted).map_err(|e| format!("canonical serialize: {e}"))
+}
+
+pub fn compute_proof_policy_hash(policy: &ProofPolicy) -> Result<String, String> {
+    let bytes = proof_policy_canonical_bytes(policy)?;
+    let digest = Sha256::digest(&bytes);
+    Ok(hex::encode(digest))
+}
+
+fn settlement_proof_payload_bytes(proof: &SettlementProof) -> Result<Vec<u8>, String> {
+    let value = serde_json::json!({
+        "proof_id": proof.proof_id,
+        "schema_id": proof.schema_id,
+        "proof_type": proof.proof_type,
+        "agreement_hash": proof.agreement_hash,
+        "milestone_id": proof.milestone_id,
+        "attested_by": proof.attested_by,
+        "attestation_time": proof.attestation_time,
+        "evidence_hash": proof.evidence_hash,
+        "evidence_summary": proof.evidence_summary,
+    });
+    let sorted = sort_json(value);
+    serde_json::to_vec(&sorted).map_err(|e| format!("canonical serialize: {e}"))
+}
+
+fn compute_settlement_proof_payload_hash(proof: &SettlementProof) -> Result<[u8; 32], String> {
+    let bytes = settlement_proof_payload_bytes(proof)?;
+    let digest = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+pub fn verify_settlement_proof(
+    proof: &SettlementProof,
+    policy: &ProofPolicy,
+) -> Result<(), String> {
+    if proof.signature.signature_type != AGREEMENT_SIGNATURE_TYPE_SECP256K1 {
+        return Err(format!(
+            "unsupported signature type: {}",
+            proof.signature.signature_type
+        ));
+    }
+    let approved = policy
+        .attestors
+        .iter()
+        .any(|a| a.attestor_id == proof.attested_by && a.pubkey_hex == proof.signature.pubkey_hex);
+    if !approved {
+        return Err(format!(
+            "attestor '{}' is not approved in this policy",
+            proof.attested_by
+        ));
+    }
+    let digest = compute_settlement_proof_payload_hash(proof)?;
+    let pubkey_bytes = hex::decode(&proof.signature.pubkey_hex)
+        .map_err(|_| "pubkey_hex must be hex-encoded SEC1 bytes".to_string())?;
+    let verifying_key = VerifyingKey::from_sec1_bytes(&pubkey_bytes)
+        .map_err(|_| "pubkey_hex must be a valid secp256k1 SEC1 public key".to_string())?;
+    let sig_bytes = hex::decode(&proof.signature.signature_hex)
+        .map_err(|_| "signature_hex must be 64-byte hex".to_string())?;
+    let parsed = Signature::from_slice(&sig_bytes)
+        .map_err(|_| "signature_hex must be valid compact secp256k1 bytes".to_string())?;
+    verifying_key
+        .verify_prehash(&digest, &parsed)
+        .map_err(|_| "proof signature verification failed".to_string())
+}
+
+pub fn evaluate_policy(
+    agreement: &AgreementObject,
+    policy: &ProofPolicy,
+    proofs: &[SettlementProof],
+    tip_height: u64,
+) -> Result<PolicyEvaluationResult, String> {
+    let agreement_hash = {
+        let bytes = agreement_canonical_bytes(agreement)?;
+        let digest = Sha256::digest(&bytes);
+        hex::encode(digest)
+    };
+    if !policy.agreement_hash.eq_ignore_ascii_case(&agreement_hash) {
+        return Err(format!(
+            "policy agreement_hash '{}' does not match the supplied agreement '{}'",
+            policy.agreement_hash, agreement_hash
+        ));
+    }
+
+    let mut evaluated_rules: Vec<String> = Vec::new();
+
+    for rule in &policy.no_response_rules {
+        if tip_height >= rule.deadline_height {
+            let label = format!(
+                "no_response_rule '{}' deadline {} reached at tip {}",
+                rule.rule_id, rule.deadline_height, tip_height
+            );
+            evaluated_rules.push(label.clone());
+            let (release, refund) = match rule.resolution {
+                ProofResolution::Release | ProofResolution::MilestoneRelease => (true, false),
+                ProofResolution::Refund => (false, true),
+            };
+            return Ok(PolicyEvaluationResult {
+                release_eligible: release,
+                refund_eligible: refund,
+                reason: label,
+                evaluated_rules,
+            });
+        }
+    }
+
+    let mut satisfied: Vec<String> = Vec::new();
+    for proof in proofs {
+        match verify_settlement_proof(proof, policy) {
+            Ok(()) => {
+                evaluated_rules.push(format!("proof '{}' verified ok", proof.proof_id));
+                satisfied.push(proof.proof_id.clone());
+            }
+            Err(e) => {
+                evaluated_rules.push(format!("proof '{}' rejected: {}", proof.proof_id, e));
+            }
+        }
+    }
+
+    let release_requirements: Vec<&ProofRequirement> = policy
+        .required_proofs
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.resolution,
+                ProofResolution::Release | ProofResolution::MilestoneRelease
+            )
+        })
+        .collect();
+
+    let all_release_met = release_requirements.iter().all(|req| {
+        proofs.iter().any(|p| {
+            satisfied.contains(&p.proof_id)
+                && p.proof_type == req.proof_type
+                && req.required_attestor_ids.contains(&p.attested_by)
+        })
+    });
+
+    if all_release_met && !release_requirements.is_empty() {
+        return Ok(PolicyEvaluationResult {
+            release_eligible: true,
+            refund_eligible: false,
+            reason: "all release requirements satisfied by verified proofs".to_string(),
+            evaluated_rules,
+        });
+    }
+
+    Ok(PolicyEvaluationResult {
+        release_eligible: false,
+        refund_eligible: false,
+        reason: "no release or refund condition was met".to_string(),
+        evaluated_rules,
+    })
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4653,4 +4908,221 @@ mod tests {
             .iter()
             .any(|note| note.contains("informational")));
     }
+
+    // ---- Phase 2 tests ----
+
+    fn make_test_policy(agreement_hash: &str, pubkey_hex: &str, attestor_id: &str) -> ProofPolicy {
+        ProofPolicy {
+            policy_id: "pol-001".to_string(),
+            schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+            agreement_hash: agreement_hash.to_string(),
+            required_proofs: vec![ProofRequirement {
+                requirement_id: "req-001".to_string(),
+                proof_type: "delivery_confirmation".to_string(),
+                required_by: None,
+                required_attestor_ids: vec![attestor_id.to_string()],
+                resolution: ProofResolution::Release,
+                milestone_id: None,
+            }],
+            no_response_rules: vec![],
+            attestors: vec![ApprovedAttestor {
+                attestor_id: attestor_id.to_string(),
+                pubkey_hex: pubkey_hex.to_string(),
+                display_name: None,
+                domain: None,
+            }],
+            notes: None,
+        }
+    }
+
+    fn sign_proof(proof: &SettlementProof, signing_key: &SigningKey) -> ProofSignatureEnvelope {
+        let payload_bytes = settlement_proof_payload_bytes(proof).unwrap();
+        let digest = Sha256::digest(&payload_bytes);
+        let mut digest_arr = [0u8; 32];
+        digest_arr.copy_from_slice(&digest);
+        let sig: k256::ecdsa::Signature = signing_key.sign_prehash(&digest_arr).unwrap();
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        ProofSignatureEnvelope {
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            pubkey_hex,
+            signature_hex: hex::encode(sig.to_bytes()),
+            payload_hash: hex::encode(digest),
+        }
+    }
+
+    fn make_test_proof(
+        agreement_hash: &str,
+        attestor_id: &str,
+        signing_key: &SigningKey,
+    ) -> SettlementProof {
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let mut proof = SettlementProof {
+            proof_id: "prf-001".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: agreement_hash.to_string(),
+            milestone_id: None,
+            attested_by: attestor_id.to_string(),
+            attestation_time: 1_700_000_000,
+            evidence_hash: None,
+            evidence_summary: Some("goods delivered and received".to_string()),
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pubkey_hex.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+        };
+        proof.signature = sign_proof(&proof, signing_key);
+        proof
+    }
+
+    #[test]
+    fn proof_policy_hash_is_deterministic() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let policy = make_test_policy("deadbeef", &pubkey_hex, "attestor-a");
+        let h1 = compute_proof_policy_hash(&policy).unwrap();
+        let h2 = compute_proof_policy_hash(&policy).unwrap();
+        assert_eq!(h1, h2, "hash must be deterministic");
+        assert_eq!(h1.len(), 64, "must be 64-char hex SHA-256");
+    }
+
+    #[test]
+    fn verify_settlement_proof_accepts_valid_signature() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let policy = make_test_policy("cafebabe", &pubkey_hex, "attestor-a");
+        let proof = make_test_proof("cafebabe", "attestor-a", &signing_key);
+        assert!(
+            verify_settlement_proof(&proof, &policy).is_ok(),
+            "valid proof must verify"
+        );
+    }
+
+    #[test]
+    fn verify_settlement_proof_rejects_wrong_pubkey() {
+        let signing_key = sample_signing_key();
+        let wrong_key = SigningKey::from_bytes((&[9u8; 32]).into()).unwrap();
+        let wrong_pubkey_hex = hex::encode(
+            wrong_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let policy = make_test_policy("cafebabe", &wrong_pubkey_hex, "attestor-a");
+        let proof = make_test_proof("cafebabe", "attestor-a", &signing_key);
+        assert!(
+            verify_settlement_proof(&proof, &policy).is_err(),
+            "proof signed with wrong key must be rejected"
+        );
+    }
+
+    #[test]
+    fn unapproved_attestor_rejected() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let policy = make_test_policy("cafebabe", &pubkey_hex, "attestor-approved");
+        let proof = make_test_proof("cafebabe", "attestor-unknown", &signing_key);
+        let err = verify_settlement_proof(&proof, &policy).unwrap_err();
+        assert!(err.contains("not approved"), "must mention approval: {err}");
+    }
+
+    #[test]
+    fn no_response_rule_triggers_at_deadline() {
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-refund-200".to_string(),
+            deadline_height: 200,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        });
+
+        let result = evaluate_policy(&agreement, &policy, &[], 200).unwrap();
+        assert!(result.refund_eligible, "refund must trigger at deadline");
+        assert!(!result.release_eligible);
+    }
+
+    #[test]
+    fn no_response_rule_not_triggered_before_deadline() {
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-refund-200".to_string(),
+            deadline_height: 200,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        });
+
+        let result = evaluate_policy(&agreement, &policy, &[], 199).unwrap();
+        assert!(!result.refund_eligible);
+        assert!(!result.release_eligible);
+    }
+
+    #[test]
+    fn policy_hash_mismatch_rejected() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let policy = make_test_policy("000000wrong_hash", &pubkey_hex, "attestor-a");
+        let err = evaluate_policy(&agreement, &policy, &[], 0).unwrap_err();
+        assert!(err.contains("does not match"), "must mention mismatch: {err}");
+    }
+
+
 }
