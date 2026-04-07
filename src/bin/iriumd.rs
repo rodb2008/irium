@@ -69,12 +69,6 @@ use k256::ecdsa::{Signature, SigningKey};
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
 const MAX_SUBMIT_BLOCK_TXS: usize = 10_000;
-const BUILTIN_FALLBACK_PEERS: &[&str] = &[
-    "157.173.116.134:38291",
-    "46.224.159.183:38291",
-    "207.244.247.86:38291",
-];
-
 #[derive(Clone)]
 struct AppState {
     chain: Arc<Mutex<ChainState>>,
