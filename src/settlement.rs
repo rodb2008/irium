@@ -3751,7 +3751,7 @@ pub fn compute_proof_policy_hash(policy: &ProofPolicy) -> Result<String, String>
     Ok(hex::encode(digest))
 }
 
-fn settlement_proof_payload_bytes(proof: &SettlementProof) -> Result<Vec<u8>, String> {
+pub fn settlement_proof_payload_bytes(proof: &SettlementProof) -> Result<Vec<u8>, String> {
     let value = serde_json::json!({
         "proof_id": proof.proof_id,
         "schema_id": proof.schema_id,

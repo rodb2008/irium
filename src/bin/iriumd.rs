@@ -56,6 +56,9 @@ use irium_node_rs::settlement::{
     AgreementAnchorRole, AgreementAuditFundingLegRecord, AgreementAuditRecord, AgreementBundle,
     AgreementFundingLegRef, AgreementLifecycleView, AgreementLinkedTx, AgreementMilestoneStatus,
     AgreementObject, AgreementSummary,
+    evaluate_policy,
+    ProofPolicy,
+    SettlementProof,
 };
 use irium_node_rs::storage;
 use irium_node_rs::tx::{
@@ -646,6 +649,26 @@ struct AgreementBuildSpendResponse {
     raw_tx_hex: String,
     fee: u64,
     trust_model_note: String,
+}
+
+
+#[derive(Deserialize)]
+struct CheckPolicyRequest {
+    agreement: AgreementObject,
+    policy: ProofPolicy,
+    #[serde(default)]
+    proofs: Vec<SettlementProof>,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckPolicyResponse {
+    agreement_hash: String,
+    policy_id: String,
+    tip_height: u64,
+    release_eligible: bool,
+    refund_eligible: bool,
+    reason: String,
+    evaluated_rules: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -4899,6 +4922,36 @@ async fn agreement_refund_eligibility(
     Ok(Json(resp))
 }
 
+
+async fn check_policy_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<CheckPolicyRequest>,
+) -> Result<Json<CheckPolicyResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| (StatusCode::BAD_REQUEST, reason.to_string());
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let tip_height = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.tip_height()
+    };
+    let agreement_hash = compute_agreement_hash_hex(&req.agreement)
+        .map_err(|e| bad(&format!("agreement_hash_failed:{e}")))?;
+    let result = evaluate_policy(&req.agreement, &req.policy, &req.proofs, tip_height)
+        .map_err(|e| bad(&format!("policy_eval_failed:{e}")))?;
+    Ok(Json(CheckPolicyResponse {
+        agreement_hash,
+        policy_id: req.policy.policy_id.clone(),
+        tip_height,
+        release_eligible: result.release_eligible,
+        refund_eligible: result.refund_eligible,
+        reason: result.reason,
+        evaluated_rules: result.evaluated_rules,
+    }))
+}
+
 async fn build_agreement_release(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -6604,6 +6657,7 @@ async fn main() {
         )
         .route("/rpc/buildagreementrelease", post(build_agreement_release))
         .route("/rpc/buildagreementrefund", post(build_agreement_refund))
+        .route("/rpc/checkpolicy", post(check_policy_rpc))
         .route("/rpc/createhtlc", post(create_htlc))
         .route("/rpc/decodehtlc", post(decode_htlc))
         .route("/rpc/claimhtlc", post(claim_htlc))
@@ -6727,6 +6781,11 @@ mod tests {
     use irium_node_rs::settlement::{
         AgreementDeadlines, AgreementMilestone, AgreementObject, AgreementParty,
         AgreementRefundCondition, AgreementReleaseCondition, AgreementTemplateType,
+        AGREEMENT_SIGNATURE_TYPE_SECP256K1, ApprovedAttestor,
+        NoResponseRule, NoResponseTrigger, ProofPolicy, ProofRequirement,
+        ProofResolution, ProofSignatureEnvelope, PROOF_POLICY_SCHEMA_ID,
+        SETTLEMENT_PROOF_SCHEMA_ID, SettlementProof,
+        settlement_proof_payload_bytes,
     };
     use irium_node_rs::wallet_store::WalletManager;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -7672,4 +7731,197 @@ mod tests {
         );
         assert_eq!(fallback.height, 1);
     }
+
+    // ---- Phase 2 RPC tests ----
+
+    fn make_rpc_policy(agreement_hash: &str, pubkey_hex: &str) -> ProofPolicy {
+        ProofPolicy {
+            policy_id: "rpc-pol-001".to_string(),
+            schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+            agreement_hash: agreement_hash.to_string(),
+            required_proofs: vec![ProofRequirement {
+                requirement_id: "req-rpc-001".to_string(),
+                proof_type: "delivery_confirmation".to_string(),
+                required_by: None,
+                required_attestor_ids: vec!["rpc-attestor".to_string()],
+                resolution: ProofResolution::Release,
+                milestone_id: None,
+            }],
+            no_response_rules: vec![],
+            attestors: vec![ApprovedAttestor {
+                attestor_id: "rpc-attestor".to_string(),
+                pubkey_hex: pubkey_hex.to_string(),
+                display_name: None,
+                domain: None,
+            }],
+            notes: None,
+        }
+    }
+
+    fn rpc_signing_key() -> SigningKey {
+        SigningKey::from_bytes((&[11u8; 32]).into()).expect("static signing key")
+    }
+
+    fn rpc_pubkey_hex(sk: &SigningKey) -> String {
+        hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes())
+    }
+
+    fn sign_rpc_proof(
+        proof: &SettlementProof,
+        sk: &SigningKey,
+    ) -> ProofSignatureEnvelope {
+        use sha2::{Digest, Sha256};
+        let payload = settlement_proof_payload_bytes(proof).unwrap();
+        let digest = Sha256::digest(&payload);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: k256::ecdsa::Signature = sk.sign_prehash(&arr).unwrap();
+        ProofSignatureEnvelope {
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            pubkey_hex: rpc_pubkey_hex(sk),
+            signature_hex: hex::encode(sig.to_bytes()),
+            payload_hash: hex::encode(digest),
+        }
+    }
+
+    fn make_rpc_proof(
+        agreement_hash: &str,
+        sk: &SigningKey,
+    ) -> SettlementProof {
+        let mut proof = SettlementProof {
+            proof_id: "rpc-prf-001".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: agreement_hash.to_string(),
+            milestone_id: None,
+            attested_by: "rpc-attestor".to_string(),
+            attestation_time: 1_700_000_000,
+            evidence_hash: None,
+            evidence_summary: Some("rpc test delivery".to_string()),
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: rpc_pubkey_hex(sk),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+        };
+        proof.signature = sign_rpc_proof(&proof, sk);
+        proof
+    }
+
+    #[tokio::test]
+    async fn check_policy_returns_release_eligible_when_requirements_met() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        let proof = make_rpc_proof(&agreement_hash, &sk);
+
+        let req = CheckPolicyRequest {
+            agreement,
+            policy,
+            proofs: vec![proof],
+        };
+
+        let resp = check_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(req),
+        )
+        .await
+        .expect("check_policy_rpc must succeed")
+        .0;
+
+        assert!(resp.release_eligible, "valid proof must yield release_eligible");
+        assert!(!resp.refund_eligible);
+        assert_eq!(resp.policy_id, "rpc-pol-001");
+        assert_eq!(resp.agreement_hash, agreement_hash);
+    }
+
+    #[tokio::test]
+    async fn check_policy_rejects_agreement_hash_mismatch() {
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        // policy references a wrong hash
+        let policy = make_rpc_policy("deadbeef_wrong", &pubkey_hex);
+
+        let req = CheckPolicyRequest {
+            agreement,
+            policy,
+            proofs: vec![],
+        };
+
+        let result = check_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(req),
+        )
+        .await;
+
+        assert!(result.is_err(), "mismatched hash must return error");
+        let (status, body) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("policy_eval_failed"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn check_policy_no_proofs_with_no_response_rule_at_tip() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        // deadline at height 0, so tip (0) >= deadline (0) → triggers immediately
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rpc-rule-refund-0".to_string(),
+            deadline_height: 0,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        });
+        // remove required proofs so the only path is no-response
+        policy.required_proofs.clear();
+
+        let req = CheckPolicyRequest {
+            agreement,
+            policy,
+            proofs: vec![],
+        };
+
+        let resp = check_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(req),
+        )
+        .await
+        .expect("check_policy_rpc must succeed")
+        .0;
+
+        assert!(resp.refund_eligible, "no-response rule must yield refund_eligible");
+        assert!(!resp.release_eligible);
+        assert!(
+            resp.reason.contains("rpc-rule-refund-0"),
+            "reason must mention rule: {}",
+            resp.reason
+        );
+    }
+
 }
