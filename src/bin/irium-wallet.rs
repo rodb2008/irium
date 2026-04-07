@@ -18,6 +18,7 @@ use irium_node_rs::settlement::{
     AgreementSignatureEnvelope, AgreementSignatureTargetType, AgreementSignatureVerification,
     AgreementStatement, AgreementSummary, AgreementTemplateType,
     AGREEMENT_SIGNATURE_TYPE_SECP256K1, AGREEMENT_SIGNATURE_VERSION,
+    ProofPolicy, SettlementProof,
 };
 use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
 use k256::ecdsa::signature::hazmat::PrehashSigner;
@@ -409,6 +410,35 @@ struct AgreementSpendEligibilityResponse {
     eligible: bool,
     reasons: Vec<String>,
     trust_model_note: String,
+}
+
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct CheckPolicyRpcRequest {
+    agreement: AgreementObject,
+    policy: ProofPolicy,
+    #[serde(default)]
+    proofs: Vec<SettlementProof>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct CheckPolicyRpcResponse {
+    agreement_hash: String,
+    policy_id: String,
+    tip_height: u64,
+    release_eligible: bool,
+    refund_eligible: bool,
+    reason: String,
+    evaluated_rules: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PolicyCheckCliOptions {
+    agreement_path: String,
+    policy_path: String,
+    proof_paths: Vec<String>,
+    rpc_url: String,
+    json_mode: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1603,6 +1633,7 @@ fn usage() {
     eprintln!("  irium-wallet agreement-verify-artifacts [--agreement <agreement.json>] [--bundle <bundle.json>] [--audit <audit.json>] [--statement <statement.json>] [--agreement-signature <sig.json>] [--bundle-signature <sig.json>] [--rpc <url>] [--json] [--out <file>]");
     eprintln!("  irium-wallet agreement-release-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-refund-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-policy-check --agreement <agreement.json|-> --policy <policy.json|-> [--proof <proof.json>]... [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-release-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
     eprintln!("  irium-wallet agreement-refund-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
     eprintln!("  irium-wallet agreement-release-send <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
@@ -4302,6 +4333,81 @@ fn render_bundle_summary(bundle: &AgreementBundle, source: &str) -> String {
         "
 ",
     )
+}
+
+
+fn parse_policy_check_cli(args: &[String]) -> Result<PolicyCheckCliOptions, String> {
+    let mut agreement_path: Option<String> = None;
+    let mut policy_path: Option<String> = None;
+    let mut proof_paths: Vec<String> = Vec::new();
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--agreement requires a value".to_string());
+                }
+                agreement_path = Some(args[i].clone());
+            }
+            "--policy" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--policy requires a value".to_string());
+                }
+                policy_path = Some(args[i].clone());
+            }
+            "--proof" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--proof requires a value".to_string());
+                }
+                proof_paths.push(args[i].clone());
+            }
+            "--rpc" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--rpc requires a value".to_string());
+                }
+                rpc_url = args[i].clone();
+            }
+            "--json" => {
+                json_mode = true;
+            }
+            other => {
+                return Err(format!("unknown argument: {}", other));
+            }
+        }
+        i += 1;
+    }
+    Ok(PolicyCheckCliOptions {
+        agreement_path: agreement_path
+            .ok_or_else(|| "--agreement is required".to_string())?,
+        policy_path: policy_path
+            .ok_or_else(|| "--policy is required".to_string())?,
+        proof_paths,
+        rpc_url,
+        json_mode,
+    })
+}
+
+fn render_policy_check_summary(resp: &CheckPolicyRpcResponse) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("agreement_hash {}", resp.agreement_hash));
+    lines.push(format!("policy_id {}", resp.policy_id));
+    lines.push(format!("tip_height {}", resp.tip_height));
+    lines.push(format!("release_eligible {}", resp.release_eligible));
+    lines.push(format!("refund_eligible {}", resp.refund_eligible));
+    lines.push(format!("reason {}", resp.reason));
+    if !resp.evaluated_rules.is_empty() {
+        lines.push("evaluated_rules".to_string());
+        for rule in &resp.evaluated_rules {
+            lines.push(format!("  {}", rule));
+        }
+    }
+    lines.join("\n")
 }
 
 fn parse_agreement_spend_cli(args: &[String]) -> Result<AgreementSpendCliOptions, String> {
@@ -7485,6 +7591,118 @@ mod tests {
         assert!(rendered.contains("valid=false"));
         assert!(rendered.contains("expected_match=false"));
     }
+
+    // ---- Phase 2 wallet CLI tests ----
+
+    #[test]
+    fn policy_check_cli_parses_required_args() {
+        let args: Vec<String> = vec![
+            "--agreement".to_string(), "agr.json".to_string(),
+            "--policy".to_string(), "pol.json".to_string(),
+        ];
+        let opts = parse_policy_check_cli(&args).expect("must parse");
+        assert_eq!(opts.agreement_path, "agr.json");
+        assert_eq!(opts.policy_path, "pol.json");
+        assert!(opts.proof_paths.is_empty());
+        assert!(!opts.json_mode);
+    }
+
+    #[test]
+    fn policy_check_cli_parses_all_flags() {
+        let args: Vec<String> = vec![
+            "--agreement".to_string(), "agr.json".to_string(),
+            "--policy".to_string(), "pol.json".to_string(),
+            "--proof".to_string(), "prf1.json".to_string(),
+            "--proof".to_string(), "prf2.json".to_string(),
+            "--rpc".to_string(), "http://localhost:9090".to_string(),
+            "--json".to_string(),
+        ];
+        let opts = parse_policy_check_cli(&args).expect("must parse");
+        assert_eq!(opts.proof_paths.len(), 2);
+        assert_eq!(opts.proof_paths[0], "prf1.json");
+        assert_eq!(opts.rpc_url, "http://localhost:9090");
+        assert!(opts.json_mode);
+    }
+
+    #[test]
+    fn policy_check_cli_rejects_missing_agreement() {
+        let args: Vec<String> = vec!["--policy".to_string(), "pol.json".to_string()];
+        let err = parse_policy_check_cli(&args).unwrap_err();
+        assert!(err.contains("--agreement"), "got: {err}");
+    }
+
+    #[test]
+    fn policy_check_cli_rejects_missing_policy() {
+        let args: Vec<String> = vec!["--agreement".to_string(), "agr.json".to_string()];
+        let err = parse_policy_check_cli(&args).unwrap_err();
+        assert!(err.contains("--policy"), "got: {err}");
+    }
+
+    #[test]
+    fn policy_check_cli_rejects_unknown_flag() {
+        let args: Vec<String> = vec![
+            "--agreement".to_string(), "agr.json".to_string(),
+            "--policy".to_string(), "pol.json".to_string(),
+            "--unknown-flag".to_string(),
+        ];
+        let err = parse_policy_check_cli(&args).unwrap_err();
+        assert!(err.contains("unknown"), "got: {err}");
+    }
+
+    #[test]
+    fn render_policy_check_summary_release_eligible() {
+        let resp = CheckPolicyRpcResponse {
+            agreement_hash: "aabbcc".to_string(),
+            policy_id: "pol-render-001".to_string(),
+            tip_height: 500,
+            release_eligible: true,
+            refund_eligible: false,
+            reason: "all release requirements satisfied".to_string(),
+            evaluated_rules: vec!["proof 'prf-1' verified ok".to_string()],
+        };
+        let out = render_policy_check_summary(&resp);
+        assert!(out.contains("agreement_hash aabbcc"), "missing hash: {out}");
+        assert!(out.contains("policy_id pol-render-001"), "missing policy_id: {out}");
+        assert!(out.contains("tip_height 500"), "missing height: {out}");
+        assert!(out.contains("release_eligible true"), "must show release: {out}");
+        assert!(out.contains("refund_eligible false"), "must show refund: {out}");
+        assert!(out.contains("prf-1"), "must show evaluated rule: {out}");
+    }
+
+    #[test]
+    fn render_policy_check_summary_refund_eligible() {
+        let resp = CheckPolicyRpcResponse {
+            agreement_hash: "ddeeff".to_string(),
+            policy_id: "pol-render-002".to_string(),
+            tip_height: 1000,
+            release_eligible: false,
+            refund_eligible: true,
+            reason: "no-response rule deadline reached".to_string(),
+            evaluated_rules: vec![],
+        };
+        let out = render_policy_check_summary(&resp);
+        assert!(out.contains("refund_eligible true"), "must show refund: {out}");
+        assert!(out.contains("release_eligible false"), "must show release: {out}");
+        assert!(out.contains("no-response"), "must show reason: {out}");
+    }
+
+    #[test]
+    fn render_policy_check_summary_not_eligible() {
+        let resp = CheckPolicyRpcResponse {
+            agreement_hash: "001122".to_string(),
+            policy_id: "pol-render-003".to_string(),
+            tip_height: 10,
+            release_eligible: false,
+            refund_eligible: false,
+            reason: "no release or refund condition was met".to_string(),
+            evaluated_rules: vec!["requirement 'req-001': unsatisfied".to_string()],
+        };
+        let out = render_policy_check_summary(&resp);
+        assert!(out.contains("release_eligible false"));
+        assert!(out.contains("refund_eligible false"));
+        assert!(out.contains("no release or refund"));
+    }
+
 }
 
 fn main() {
@@ -10316,6 +10534,91 @@ fn main() {
                 println!("{}", render_agreement_spend_eligibility_summary(&resp));
             }
             if !resp.eligible {
+                std::process::exit(1);
+            }
+        }
+        "agreement-policy-check" => {
+            let opts = match parse_policy_check_cli(&args[1..]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    usage();
+                    std::process::exit(1);
+                }
+            };
+            let agreement = match load_agreement_json_from_path(Path::new(&opts.agreement_path)) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let policy: ProofPolicy = {
+                let data = match read_text_from_path_or_stdin(
+                    Path::new(&opts.policy_path),
+                    "policy json",
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                };
+                match serde_json::from_str(&data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("parse policy json: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            };
+            let mut proofs: Vec<SettlementProof> = Vec::new();
+            for path in &opts.proof_paths {
+                let data = match read_text_from_path_or_stdin(Path::new(path), "proof json") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                };
+                match serde_json::from_str::<SettlementProof>(&data) {
+                    Ok(p) => proofs.push(p),
+                    Err(e) => {
+                        eprintln!("parse proof json {}: {}", path, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let base = opts.rpc_url.trim_end_matches('/');
+            let client = match rpc_client(base) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let req = CheckPolicyRpcRequest {
+                agreement,
+                policy,
+                proofs,
+            };
+            let resp: CheckPolicyRpcResponse =
+                match rpc_post_json(&client, base, "/rpc/checkpolicy", &req) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                };
+            if opts.json_mode {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap()
+                );
+            } else {
+                println!("{}", render_policy_check_summary(&resp));
+            }
+            if !resp.release_eligible && !resp.refund_eligible {
                 std::process::exit(1);
             }
         }
