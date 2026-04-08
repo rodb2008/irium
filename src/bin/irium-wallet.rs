@@ -18,7 +18,8 @@ use irium_node_rs::settlement::{
     AgreementSignatureEnvelope, AgreementSignatureTargetType, AgreementSignatureVerification,
     AgreementStatement, AgreementSummary, AgreementTemplateType,
     AGREEMENT_SIGNATURE_TYPE_SECP256K1, AGREEMENT_SIGNATURE_VERSION,
-    ProofPolicy, SettlementProof,
+    ProofPolicy, ProofSignatureEnvelope, SettlementProof, SETTLEMENT_PROOF_SCHEMA_ID,
+    settlement_proof_payload_bytes,
 };
 use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
 use k256::ecdsa::signature::hazmat::PrehashSigner;
@@ -451,6 +452,21 @@ struct ProofSubmitCliOptions {
 struct ProofListCliOptions {
     agreement_hash: String,
     rpc_url: String,
+    json_mode: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProofCreateCliOptions {
+    agreement_hash: String,
+    proof_type: String,
+    attested_by: String,
+    address: String,
+    milestone_id: Option<String>,
+    evidence_summary: Option<String>,
+    evidence_hash: Option<String>,
+    proof_id: Option<String>,
+    timestamp: Option<u64>,
+    out_path: Option<String>,
     json_mode: bool,
 }
 
@@ -1675,6 +1691,7 @@ fn usage() {
     eprintln!("  irium-wallet agreement-release-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-refund-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-policy-check --agreement <agreement.json|-> --policy <policy.json|-> [--proof <proof.json>]... [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <unix>] [--out <path>] [--json]");
     eprintln!("  irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-list --agreement-hash <hex> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-release-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
@@ -2488,6 +2505,63 @@ fn sign_target_hash(
         .map_err(|e| format!("sign target hash: {e}"))?;
     envelope.signature = hex::encode(signature.to_bytes());
     Ok(envelope)
+}
+
+fn create_settlement_proof_signed(opts: &ProofCreateCliOptions) -> Result<SettlementProof, String> {
+    let (key, signing_key) = signer_material_from_wallet(&opts.address)?;
+
+    let attestation_time = match opts.timestamp {
+        Some(t) => t,
+        None => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    };
+
+    // Generate a deterministic proof_id from (proof_type, agreement_hash, timestamp) if not provided.
+    let proof_id = match &opts.proof_id {
+        Some(id) => id.clone(),
+        None => {
+            let mut seed_data = opts.proof_type.clone();
+            seed_data.push_str(&opts.agreement_hash);
+            seed_data.push_str(&attestation_time.to_string());
+            let digest = Sha256::digest(seed_data.as_bytes());
+            format!("prf-{}", hex::encode(&digest[..8]))
+        }
+    };
+
+    // Build the proof without a signature first so we can compute the payload hash.
+    let mut proof = SettlementProof {
+        proof_id,
+        schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+        proof_type: opts.proof_type.clone(),
+        agreement_hash: opts.agreement_hash.clone(),
+        milestone_id: opts.milestone_id.clone(),
+        attested_by: opts.attested_by.clone(),
+        attestation_time,
+        evidence_hash: opts.evidence_hash.clone(),
+        evidence_summary: opts.evidence_summary.clone(),
+        signature: ProofSignatureEnvelope {
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            pubkey_hex: key.pubkey.clone(),
+            signature_hex: String::new(),
+            payload_hash: String::new(),
+        },
+    };
+
+    let payload_bytes = settlement_proof_payload_bytes(&proof)
+        .map_err(|e| format!("compute proof payload bytes: {e}"))?;
+    let payload_digest = Sha256::digest(&payload_bytes);
+    let payload_hash_hex = hex::encode(&payload_digest);
+
+    let sig: Signature = signing_key
+        .sign_prehash(&payload_digest)
+        .map_err(|e| format!("sign proof payload: {e}"))?;
+
+    proof.signature.signature_hex = hex::encode(sig.to_bytes());
+    proof.signature.payload_hash = payload_hash_hex;
+
+    Ok(proof)
 }
 
 fn share_package_receipt_id(imported_at: u64, agreement_hash: Option<&str>) -> String {
@@ -4454,6 +4528,119 @@ fn parse_proof_list_cli(args: &[String]) -> Result<ProofListCliOptions, String> 
     })
 }
 
+fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, String> {
+    let mut agreement_hash: Option<String> = None;
+    let mut proof_type: Option<String> = None;
+    let mut attested_by: Option<String> = None;
+    let mut address: Option<String> = None;
+    let mut milestone_id: Option<String> = None;
+    let mut evidence_summary: Option<String> = None;
+    let mut evidence_hash: Option<String> = None;
+    let mut proof_id: Option<String> = None;
+    let mut timestamp: Option<u64> = None;
+    let mut out_path: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement-hash" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--agreement-hash requires a value".to_string());
+                }
+                agreement_hash = Some(args[i].clone());
+            }
+            "--proof-type" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--proof-type requires a value".to_string());
+                }
+                proof_type = Some(args[i].clone());
+            }
+            "--attested-by" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--attested-by requires a value".to_string());
+                }
+                attested_by = Some(args[i].clone());
+            }
+            "--address" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--address requires a value".to_string());
+                }
+                address = Some(args[i].clone());
+            }
+            "--milestone-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--milestone-id requires a value".to_string());
+                }
+                milestone_id = Some(args[i].clone());
+            }
+            "--evidence-summary" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--evidence-summary requires a value".to_string());
+                }
+                evidence_summary = Some(args[i].clone());
+            }
+            "--evidence-hash" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--evidence-hash requires a value".to_string());
+                }
+                evidence_hash = Some(args[i].clone());
+            }
+            "--proof-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--proof-id requires a value".to_string());
+                }
+                proof_id = Some(args[i].clone());
+            }
+            "--timestamp" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--timestamp requires a value".to_string());
+                }
+                let v: u64 = args[i]
+                    .parse()
+                    .map_err(|_| "--timestamp must be a non-negative integer".to_string())?;
+                timestamp = Some(v);
+            }
+            "--out" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--out requires a value".to_string());
+                }
+                out_path = Some(args[i].clone());
+            }
+            "--json" => {
+                json_mode = true;
+            }
+            other => {
+                return Err(format!("unknown argument: {}", other));
+            }
+        }
+        i += 1;
+    }
+    Ok(ProofCreateCliOptions {
+        agreement_hash: agreement_hash
+            .ok_or_else(|| "--agreement-hash is required".to_string())?,
+        proof_type: proof_type.ok_or_else(|| "--proof-type is required".to_string())?,
+        attested_by: attested_by.ok_or_else(|| "--attested-by is required".to_string())?,
+        address: address.ok_or_else(|| "--address is required".to_string())?,
+        milestone_id,
+        evidence_summary,
+        evidence_hash,
+        proof_id,
+        timestamp,
+        out_path,
+        json_mode,
+    })
+}
+
 fn render_proof_submit_summary(resp: &SubmitProofRpcResponse) -> String {
     let mut lines = Vec::new();
     lines.push(format!("proof_id {}", resp.proof_id));
@@ -4475,6 +4662,29 @@ fn render_proof_list_summary(resp: &ListProofsRpcResponse) -> String {
         ));
     }
     lines.join("\n")
+}
+
+fn render_proof_create_summary(proof: &SettlementProof) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("proof_id {}", proof.proof_id));
+    lines.push(format!("schema_id {}", proof.schema_id));
+    lines.push(format!("proof_type {}", proof.proof_type));
+    lines.push(format!("agreement_hash {}", proof.agreement_hash));
+    if let Some(ref mid) = proof.milestone_id {
+        lines.push(format!("milestone_id {}", mid));
+    }
+    lines.push(format!("attested_by {}", proof.attested_by));
+    lines.push(format!("attestation_time {}", proof.attestation_time));
+    if let Some(ref es) = proof.evidence_summary {
+        lines.push(format!("evidence_summary {}", es));
+    }
+    if let Some(ref eh) = proof.evidence_hash {
+        lines.push(format!("evidence_hash {}", eh));
+    }
+    lines.push(format!("payload_hash {}", proof.signature.payload_hash));
+    lines.push(format!("pubkey_hex {}", proof.signature.pubkey_hex));
+    lines.join("
+")
 }
 
 fn parse_policy_check_cli(args: &[String]) -> Result<PolicyCheckCliOptions, String> {
@@ -7986,6 +8196,288 @@ mod tests {
         assert!(out.contains("deadbeef"));
     }
 
+    // ---- Phase 2 proof create CLI tests ----
+
+    #[test]
+    fn proof_create_cli_parses_required_args() {
+        let args: Vec<String> = vec![
+            "--agreement-hash".to_string(), "aabbcc".to_string(),
+            "--proof-type".to_string(), "delivery_confirmation".to_string(),
+            "--attested-by".to_string(), "attestor-a".to_string(),
+            "--address".to_string(), "Iabc123".to_string(),
+        ];
+        let opts = parse_proof_create_cli(&args).expect("must parse");
+        assert_eq!(opts.agreement_hash, "aabbcc");
+        assert_eq!(opts.proof_type, "delivery_confirmation");
+        assert_eq!(opts.attested_by, "attestor-a");
+        assert_eq!(opts.address, "Iabc123");
+        assert!(opts.milestone_id.is_none());
+        assert!(opts.evidence_summary.is_none());
+        assert!(opts.evidence_hash.is_none());
+        assert!(opts.proof_id.is_none());
+        assert!(opts.timestamp.is_none());
+        assert!(opts.out_path.is_none());
+        assert!(!opts.json_mode);
+    }
+
+    #[test]
+    fn proof_create_cli_parses_all_optional_args() {
+        let args: Vec<String> = vec![
+            "--agreement-hash".to_string(), "deadbeef".to_string(),
+            "--proof-type".to_string(), "acceptance".to_string(),
+            "--attested-by".to_string(), "att-b".to_string(),
+            "--address".to_string(), "Ixyz".to_string(),
+            "--milestone-id".to_string(), "ms-1".to_string(),
+            "--evidence-summary".to_string(), "goods received".to_string(),
+            "--evidence-hash".to_string(), "cafebabe".to_string(),
+            "--proof-id".to_string(), "prf-custom".to_string(),
+            "--timestamp".to_string(), "1700000000".to_string(),
+            "--out".to_string(), "/tmp/proof.json".to_string(),
+            "--json".to_string(),
+        ];
+        let opts = parse_proof_create_cli(&args).expect("must parse");
+        assert_eq!(opts.milestone_id.as_deref(), Some("ms-1"));
+        assert_eq!(opts.evidence_summary.as_deref(), Some("goods received"));
+        assert_eq!(opts.evidence_hash.as_deref(), Some("cafebabe"));
+        assert_eq!(opts.proof_id.as_deref(), Some("prf-custom"));
+        assert_eq!(opts.timestamp, Some(1700000000));
+        assert_eq!(opts.out_path.as_deref(), Some("/tmp/proof.json"));
+        assert!(opts.json_mode);
+    }
+
+    #[test]
+    fn proof_create_cli_rejects_missing_agreement_hash() {
+        let args: Vec<String> = vec![
+            "--proof-type".to_string(), "t".to_string(),
+            "--attested-by".to_string(), "a".to_string(),
+            "--address".to_string(), "x".to_string(),
+        ];
+        let err = parse_proof_create_cli(&args).unwrap_err();
+        assert!(err.contains("--agreement-hash"), "got: {err}");
+    }
+
+    #[test]
+    fn proof_create_cli_rejects_missing_proof_type() {
+        let args: Vec<String> = vec![
+            "--agreement-hash".to_string(), "aa".to_string(),
+            "--attested-by".to_string(), "a".to_string(),
+            "--address".to_string(), "x".to_string(),
+        ];
+        let err = parse_proof_create_cli(&args).unwrap_err();
+        assert!(err.contains("--proof-type"), "got: {err}");
+    }
+
+    #[test]
+    fn proof_create_cli_rejects_missing_attested_by() {
+        let args: Vec<String> = vec![
+            "--agreement-hash".to_string(), "aa".to_string(),
+            "--proof-type".to_string(), "t".to_string(),
+            "--address".to_string(), "x".to_string(),
+        ];
+        let err = parse_proof_create_cli(&args).unwrap_err();
+        assert!(err.contains("--attested-by"), "got: {err}");
+    }
+
+    #[test]
+    fn proof_create_cli_rejects_missing_address() {
+        let args: Vec<String> = vec![
+            "--agreement-hash".to_string(), "aa".to_string(),
+            "--proof-type".to_string(), "t".to_string(),
+            "--attested-by".to_string(), "a".to_string(),
+        ];
+        let err = parse_proof_create_cli(&args).unwrap_err();
+        assert!(err.contains("--address"), "got: {err}");
+    }
+
+    #[test]
+    fn proof_create_cli_rejects_bad_timestamp() {
+        let args: Vec<String> = vec![
+            "--agreement-hash".to_string(), "aa".to_string(),
+            "--proof-type".to_string(), "t".to_string(),
+            "--attested-by".to_string(), "a".to_string(),
+            "--address".to_string(), "x".to_string(),
+            "--timestamp".to_string(), "not-a-number".to_string(),
+        ];
+        let err = parse_proof_create_cli(&args).unwrap_err();
+        assert!(err.contains("--timestamp"), "got: {err}");
+    }
+
+    #[test]
+    fn proof_create_cli_rejects_unknown_flag() {
+        let args: Vec<String> = vec![
+            "--agreement-hash".to_string(), "aa".to_string(),
+            "--proof-type".to_string(), "t".to_string(),
+            "--attested-by".to_string(), "a".to_string(),
+            "--address".to_string(), "x".to_string(),
+            "--unknown".to_string(),
+        ];
+        let err = parse_proof_create_cli(&args).unwrap_err();
+        assert!(err.contains("unknown"), "got: {err}");
+    }
+
+    #[test]
+    fn create_settlement_proof_signed_produces_valid_signature() {
+        use irium_node_rs::settlement::{
+            verify_settlement_proof_signature_only, SETTLEMENT_PROOF_SCHEMA_ID,
+        };
+        use k256::SecretKey as K256SecretKey;
+
+        let raw = [7u8; 32];
+        let secret = K256SecretKey::from_slice(&raw).unwrap();
+        let pubkey_hex = hex::encode(secret.public_key().to_encoded_point(true).as_bytes());
+
+        let tmp_dir = std::env::temp_dir();
+        let wallet_path_buf = tmp_dir.join(format!("test_wallet_{}.json", std::process::id()));
+        let address = {
+            use sha2::{Digest as _, Sha256 as Sha256Inner};
+            use ripemd::Ripemd160;
+            let pk_bytes = secret.public_key().to_encoded_point(true);
+            let sha = Sha256Inner::digest(pk_bytes.as_bytes());
+            let pkh = Ripemd160::digest(&sha);
+            let mut payload = vec![0x00u8];
+            payload.extend_from_slice(&pkh);
+            let c1 = Sha256Inner::digest(&payload);
+            let c2 = Sha256Inner::digest(&c1);
+            let mut full = payload.clone();
+            full.extend_from_slice(&c2[..4]);
+            bs58::encode(full).into_string()
+        };
+        let wallet_json = serde_json::json!({
+            "version": 1,
+            "keys": [{
+                "address": address,
+                "pkh": "",
+                "pubkey": pubkey_hex,
+                "privkey": hex::encode(raw),
+            }]
+        });
+        std::fs::write(&wallet_path_buf, serde_json::to_string(&wallet_json).unwrap()).unwrap();
+        std::env::set_var("IRIUM_WALLET_FILE", wallet_path_buf.to_str().unwrap());
+
+        let opts = ProofCreateCliOptions {
+            agreement_hash: "abcd1234".repeat(8),
+            proof_type: "test_proof".to_string(),
+            attested_by: "test-attestor".to_string(),
+            address: address.clone(),
+            milestone_id: None,
+            evidence_summary: Some("unit test evidence".to_string()),
+            evidence_hash: None,
+            proof_id: Some("prf-unit-001".to_string()),
+            timestamp: Some(1700000000),
+            out_path: None,
+            json_mode: false,
+        };
+
+        let proof = create_settlement_proof_signed(&opts).expect("must create proof");
+
+        assert_eq!(proof.proof_id, "prf-unit-001");
+        assert_eq!(proof.schema_id, SETTLEMENT_PROOF_SCHEMA_ID);
+        assert_eq!(proof.proof_type, "test_proof");
+        assert_eq!(proof.attested_by, "test-attestor");
+        assert_eq!(proof.attestation_time, 1700000000);
+        assert_eq!(proof.signature.pubkey_hex, pubkey_hex);
+        assert!(!proof.signature.signature_hex.is_empty());
+        assert!(!proof.signature.payload_hash.is_empty());
+
+        verify_settlement_proof_signature_only(&proof).expect("signature must verify");
+
+        let _ = std::fs::remove_file(&wallet_path_buf);
+        std::env::remove_var("IRIUM_WALLET_FILE");
+    }
+
+    #[test]
+    fn render_proof_create_summary_contains_key_fields() {
+        use irium_node_rs::settlement::{
+            ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+        };
+        let proof = SettlementProof {
+            proof_id: "prf-render-001".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "acceptance".to_string(),
+            agreement_hash: "deadbeef".to_string(),
+            milestone_id: Some("ms-1".to_string()),
+            attested_by: "att-x".to_string(),
+            attestation_time: 1700000001,
+            evidence_hash: Some("evhash".to_string()),
+            evidence_summary: Some("goods ok".to_string()),
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: "pubkey123".to_string(),
+                signature_hex: "sig456".to_string(),
+                payload_hash: "ph789".to_string(),
+            },
+        };
+        let out = render_proof_create_summary(&proof);
+        assert!(out.contains("proof_id prf-render-001"), "got: {out}");
+        assert!(out.contains("proof_type acceptance"), "got: {out}");
+        assert!(out.contains("agreement_hash deadbeef"), "got: {out}");
+        assert!(out.contains("milestone_id ms-1"), "got: {out}");
+        assert!(out.contains("attested_by att-x"), "got: {out}");
+        assert!(out.contains("evidence_summary goods ok"), "got: {out}");
+        assert!(out.contains("evidence_hash evhash"), "got: {out}");
+        assert!(out.contains("payload_hash ph789"), "got: {out}");
+    }
+
+    #[test]
+    fn proof_create_auto_generates_proof_id() {
+        use irium_node_rs::settlement::verify_settlement_proof_signature_only;
+        use k256::SecretKey as K256SecretKey;
+
+        let raw = [11u8; 32];
+        let secret = K256SecretKey::from_slice(&raw).unwrap();
+        let pubkey_hex = hex::encode(secret.public_key().to_encoded_point(true).as_bytes());
+
+        let tmp_dir = std::env::temp_dir();
+        let wallet_path_buf = tmp_dir.join(format!("test_wallet2_{}.json", std::process::id()));
+        let address = {
+            use sha2::{Digest as _, Sha256 as Sha256Inner};
+            use ripemd::Ripemd160;
+            let pk_bytes = secret.public_key().to_encoded_point(true);
+            let sha = Sha256Inner::digest(pk_bytes.as_bytes());
+            let pkh = Ripemd160::digest(&sha);
+            let mut payload = vec![0x00u8];
+            payload.extend_from_slice(&pkh);
+            let c1 = Sha256Inner::digest(&payload);
+            let c2 = Sha256Inner::digest(&c1);
+            let mut full = payload.clone();
+            full.extend_from_slice(&c2[..4]);
+            bs58::encode(full).into_string()
+        };
+        let wallet_json = serde_json::json!({
+            "version": 1,
+            "keys": [{
+                "address": address,
+                "pkh": "",
+                "pubkey": pubkey_hex,
+                "privkey": hex::encode(raw),
+            }]
+        });
+        std::fs::write(&wallet_path_buf, serde_json::to_string(&wallet_json).unwrap()).unwrap();
+        std::env::set_var("IRIUM_WALLET_FILE", wallet_path_buf.to_str().unwrap());
+
+        let opts = ProofCreateCliOptions {
+            agreement_hash: "cafebabe".repeat(8),
+            proof_type: "auto_id_proof".to_string(),
+            attested_by: "att-auto".to_string(),
+            address: address.clone(),
+            milestone_id: None,
+            evidence_summary: None,
+            evidence_hash: None,
+            proof_id: None,
+            timestamp: Some(1700001234),
+            out_path: None,
+            json_mode: false,
+        };
+
+        let proof = create_settlement_proof_signed(&opts).expect("must create proof");
+        assert!(proof.proof_id.starts_with("prf-"), "got: {}", proof.proof_id);
+        assert_eq!(proof.proof_id.len(), 4 + 16, "got: {}", proof.proof_id);
+        verify_settlement_proof_signature_only(&proof).expect("signature must verify");
+
+        let _ = std::fs::remove_file(&wallet_path_buf);
+        std::env::remove_var("IRIUM_WALLET_FILE");
+    }
+
 }
 
 fn main() {
@@ -10818,6 +11310,43 @@ fn main() {
             }
             if !resp.eligible {
                 std::process::exit(1);
+            }
+        }
+        "agreement-proof-create" => {
+            let opts = match parse_proof_create_cli(&args[1..]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    usage();
+                    std::process::exit(1);
+                }
+            };
+            let proof = match create_settlement_proof_signed(&opts) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let proof_json = match serde_json::to_string_pretty(&proof) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("serialize proof: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            if let Some(ref out_path) = opts.out_path {
+                if let Err(e) = fs::write(out_path, &proof_json) {
+                    eprintln!("write proof to {}: {}", out_path, e);
+                    std::process::exit(1);
+                }
+            }
+            if opts.json_mode {
+                println!("{}", proof_json);
+            } else if opts.out_path.is_none() {
+                println!("{}", proof_json);
+            } else {
+                println!("{}", render_proof_create_summary(&proof));
             }
         }
         "agreement-proof-submit" => {
