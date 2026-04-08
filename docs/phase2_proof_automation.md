@@ -560,8 +560,8 @@ irium-wallet agreement-policy-set \
 
 ### Storage behavior
 
-The node persists all policies to `$IRIUM_DATA_DIR/policies.json` (default
-`~/.irium/policies.json`). One policy is stored per `agreement_hash`; a second
+The node persists all policies to `$IRIUM_DATA_DIR/state/policies.json` (default
+`~/.irium/state/policies.json`). One policy is stored per `agreement_hash`; a second
 `agreement-policy-set` for the same hash with a different `policy_id` overwrites
 the previous entry. Storing the exact same `policy_id` again is a no-op (reported
 as `status duplicate`).
@@ -617,6 +617,98 @@ Response: `{ agreement_hash, found, policy }` where `policy` is `null` when not 
 
 ---
 
+
+## agreement-policy-evaluate
+
+Evaluates an agreement against its stored policy and stored proofs using a single
+command, without supplying policy JSON or proof JSON manually. The node looks up both
+artifacts by the `agreement_hash` derived from the supplied agreement.
+
+```
+irium-wallet agreement-policy-evaluate \
+  --agreement <agreement.json|-> \
+  [--rpc <url>] \
+  [--json]
+```
+
+| Flag | Required | Description |
+|---|---|---|
+| `--agreement <path\|->` | yes | Path to an `AgreementObject` JSON file, or `-` to read from stdin |
+| `--rpc <url>` | no | Node RPC base URL. Defaults to `IRIUM_RPC_URL` or `http://127.0.0.1:38300` |
+| `--json` | no | Print the full response JSON to stdout |
+
+### Evaluation flow
+
+1. The wallet sends the agreement object to `/rpc/evaluatepolicy`.
+2. The node computes `agreement_hash` from the object.
+3. The node fetches the stored `ProofPolicy` for that hash. If none is found, it
+   returns `policy_found: false` with `release_eligible: false`.
+4. The node fetches all stored `SettlementProof` entries for that hash.
+5. The node runs `evaluate_policy(agreement, stored_policy, stored_proofs, tip_height)`
+   and returns the result.
+
+The agreement-hash binding check introduced in `e2853a3` is enforced at the store
+lookup level: proofs stored for a different agreement hash are never fetched.
+
+### Default output (policy found, eligible)
+
+```
+agreement_hash <64-char hex>
+policy_id pol-<id>
+policy_found true
+tip_height <n>
+proof_count <n>
+release_eligible true
+refund_eligible false
+reason all release requirements satisfied by verified proofs
+evaluated_rules
+  proof '<id>' verified ok
+```
+
+### Default output (policy not found)
+
+```
+agreement_hash <64-char hex>
+policy_id none
+policy_found false
+tip_height <n>
+proof_count 0
+release_eligible false
+refund_eligible false
+reason no policy stored for this agreement
+```
+
+Exits with code `1` when neither `release_eligible` nor `refund_eligible` is true
+(covers both not-found and not-satisfied cases).
+
+### Node RPC
+
+`POST /rpc/evaluatepolicy` — body: `{ "agreement": <AgreementObject> }`.
+Response:
+```json
+{
+  "agreement_hash": "<hex>",
+  "policy_found": true,
+  "policy_id": "<id>",
+  "tip_height": <n>,
+  "proof_count": <n>,
+  "release_eligible": true,
+  "refund_eligible": false,
+  "reason": "<string>",
+  "evaluated_rules": ["..."]
+}
+```
+`policy_id` is `null` when no policy is stored.
+
+### Relationship to agreement-policy-check
+
+`agreement-policy-check` accepts explicit policy and proof JSON and is the right tool
+when the operator wants to evaluate hypothetical or offline-constructed artifacts.
+`agreement-policy-evaluate` is the convenience path for on-node artifacts — it uses
+whatever the node has persisted, nothing more.
+
+---
+
 ## Current limitations
 
 The following items are defined in the type layer but not yet evaluated or exposed:
@@ -628,8 +720,8 @@ The following items are defined in the type layer but not yet evaluated or expos
   through JSON but is not checked during evaluation.
 - **Milestone scoping**: `milestone_id` on requirements and rules is stored but
   evaluation does not filter or scope by milestone.
-- **Policy persistence**: implemented via `PolicyStore` / `/rpc/storepolicy` / `/rpc/getpolicy`.
-- **Proof persistence**: implemented via `ProofStore` / `/rpc/submitproof` / `/rpc/listproofs`.
+- **Policy persistence**: implemented via `PolicyStore` (`state/policies.json`) / `/rpc/storepolicy` / `/rpc/getpolicy` / `/rpc/evaluatepolicy`.
+- **Proof persistence**: implemented via `ProofStore` (`state/proofs.json`) / `/rpc/submitproof` / `/rpc/listproofs`.
 - **Attestor registry**: there is no persistent on-node attestor registry. Attestors
   are defined inline in each `ProofPolicy` object.
 - **Explorer routes**: no `/agreement/policy*` routes exist in `irium-explorer` yet.
