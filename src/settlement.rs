@@ -3851,6 +3851,13 @@ pub fn evaluate_policy(
 
     let mut satisfied: Vec<String> = Vec::new();
     for proof in proofs {
+        if !proof.agreement_hash.eq_ignore_ascii_case(&agreement_hash) {
+            evaluated_rules.push(format!(
+                "proof '{}' rejected: agreement_hash mismatch (proof={}, expected={})",
+                proof.proof_id, proof.agreement_hash, agreement_hash
+            ));
+            continue;
+        }
         match verify_settlement_proof(proof, policy) {
             Ok(()) => {
                 evaluated_rules.push(format!("proof '{}' verified ok", proof.proof_id));
@@ -5256,6 +5263,130 @@ mod tests {
         assert!(err.contains("does not match"), "must mention mismatch: {err}");
     }
 
+
+    #[test]
+    fn cross_agreement_proof_rejected_in_evaluate_policy() {
+        // A proof signed for agreement_A must be rejected when evaluating against agreement_B,
+        // even when the attestor is approved in the policy for agreement_B and the signature is valid.
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+
+        // Two different agreements with distinct hashes
+        let agreement_a = sample_agreement();
+        let bytes_a = agreement_canonical_bytes(&agreement_a).unwrap();
+        let hash_a = hex::encode(Sha256::digest(&bytes_a));
+
+        // Construct a minimal distinct agreement (different total_amount so hash differs)
+        let mut agreement_b = sample_agreement();
+        agreement_b.total_amount = agreement_a.total_amount + 1;
+        let bytes_b = agreement_canonical_bytes(&agreement_b).unwrap();
+        let hash_b = hex::encode(Sha256::digest(&bytes_b));
+        assert_ne!(hash_a, hash_b, "test requires two distinct agreement hashes");
+
+        // Proof is correctly signed for agreement_A
+        let proof_for_a = make_test_proof(&hash_a, "attestor-a", &signing_key);
+        assert_eq!(proof_for_a.agreement_hash, hash_a);
+
+        // Policy is for agreement_B but uses the same attestor
+        let policy_b = make_test_policy(&hash_b, &pubkey_hex, "attestor-a");
+
+        // Evaluate: proof_for_a must be rejected for policy_b
+        let result = evaluate_policy(&agreement_b, &policy_b, &[proof_for_a], 0).unwrap();
+        assert!(!result.release_eligible, "cross-agreement proof must not grant release");
+        assert!(!result.refund_eligible);
+        assert!(
+            result.evaluated_rules.iter().any(|r| r.contains("agreement_hash mismatch")),
+            "evaluated_rules must record the mismatch; got: {:?}",
+            result.evaluated_rules
+        );
+    }
+
+    #[test]
+    fn same_agreement_proof_still_accepted_in_evaluate_policy() {
+        // A proof for the correct agreement must still be accepted after the fix.
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.required_proofs.push(ProofRequirement {
+            requirement_id: "req-001".to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            required_by: None,
+            required_attestor_ids: vec!["attestor-a".to_string()],
+            resolution: ProofResolution::Release,
+            milestone_id: None,
+        });
+
+        let proof = make_test_proof(&agreement_hash, "attestor-a", &signing_key);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert!(result.release_eligible, "correct proof must grant release");
+        assert!(!result.refund_eligible);
+        assert!(
+            result.evaluated_rules.iter().any(|r| r.contains("verified ok")),
+            "evaluated_rules must record verification; got: {:?}",
+            result.evaluated_rules
+        );
+    }
+
+    #[test]
+    fn cross_agreement_proof_rejected_does_not_satisfy_release_requirement() {
+        // Even if a cross-agreement proof passes all other checks (attestor approved,
+        // correct proof_type, valid signature), it must not satisfy a release requirement.
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+
+        let agreement_a = sample_agreement();
+        let bytes_a = agreement_canonical_bytes(&agreement_a).unwrap();
+        let hash_a = hex::encode(Sha256::digest(&bytes_a));
+
+        let mut agreement_b = sample_agreement();
+        agreement_b.total_amount = agreement_a.total_amount + 99;
+        let bytes_b = agreement_canonical_bytes(&agreement_b).unwrap();
+        let hash_b = hex::encode(Sha256::digest(&bytes_b));
+        assert_ne!(hash_a, hash_b);
+
+        let proof_for_a = make_test_proof(&hash_a, "attestor-a", &signing_key);
+
+        let mut policy_b = make_test_policy(&hash_b, &pubkey_hex, "attestor-a");
+        policy_b.required_proofs.push(ProofRequirement {
+            requirement_id: "req-001".to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            required_by: None,
+            required_attestor_ids: vec!["attestor-a".to_string()],
+            resolution: ProofResolution::Release,
+            milestone_id: None,
+        });
+
+        let result = evaluate_policy(&agreement_b, &policy_b, &[proof_for_a], 0).unwrap();
+        assert!(!result.release_eligible,
+            "cross-agreement proof must not satisfy release requirement");
+        let mismatch_logged = result
+            .evaluated_rules
+            .iter()
+            .any(|r| r.contains("agreement_hash mismatch"));
+        assert!(mismatch_logged,
+            "mismatch must appear in evaluated_rules; got: {:?}",
+            result.evaluated_rules);
+    }
 
 
     // ---- ProofStore tests ----
