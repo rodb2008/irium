@@ -709,6 +709,55 @@ whatever the node has persisted, nothing more.
 
 ---
 
+
+## agreement-policy-list
+
+Lists all stored policies on the node. Useful for operators who need to discover
+what policies are registered without knowing specific agreement hashes.
+
+```
+irium-wallet agreement-policy-list \
+  [--rpc <url>] \
+  [--json]
+```
+
+| Flag | Required | Description |
+|---|---|---|
+| `--rpc <url>` | no | Node RPC base URL. Defaults to `IRIUM_RPC_URL` or `http://127.0.0.1:38300` |
+| `--json` | no | Print the full response JSON to stdout |
+
+### Default output
+
+```
+count <n>
+  agreement_hash <hex> policy_id <id> required_proofs <n> attestors <n>
+  agreement_hash <hex> policy_id <id> required_proofs <n> attestors <n>
+  ...
+```
+
+Entries are sorted by `agreement_hash`. Each line shows a summary projection;
+use `agreement-policy-get --agreement-hash <hex>` to retrieve the full policy JSON.
+
+### Node RPC
+
+`POST /rpc/listpolicies` — body: `{}`.
+Response:
+```json
+{
+  "count": 2,
+  "policies": [
+    {
+      "agreement_hash": "<hex>",
+      "policy_id": "<id>",
+      "required_proofs": 1,
+      "attestors": 1
+    }
+  ]
+}
+```
+
+---
+
 ## Current limitations
 
 The following items are defined in the type layer but not yet evaluated or exposed:
@@ -720,7 +769,7 @@ The following items are defined in the type layer but not yet evaluated or expos
   through JSON but is not checked during evaluation.
 - **Milestone scoping**: `milestone_id` on requirements and rules is stored but
   evaluation does not filter or scope by milestone.
-- **Policy persistence**: implemented via `PolicyStore` (`state/policies.json`) / `/rpc/storepolicy` / `/rpc/getpolicy` / `/rpc/evaluatepolicy`.
+- **Policy persistence**: implemented via `PolicyStore` (`state/policies.json`) / `/rpc/storepolicy` / `/rpc/getpolicy` / `/rpc/evaluatepolicy` / `/rpc/listpolicies`.
 - **Proof persistence**: implemented via `ProofStore` (`state/proofs.json`) / `/rpc/submitproof` / `/rpc/listproofs`.
 - **Attestor registry**: there is no persistent on-node attestor registry. Attestors
   are defined inline in each `ProofPolicy` object.

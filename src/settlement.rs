@@ -4139,6 +4139,12 @@ impl PolicyStore {
     pub fn count(&self) -> usize {
         self.policies.len()
     }
+
+    pub fn list_all(&self) -> Vec<&ProofPolicy> {
+        let mut policies: Vec<&ProofPolicy> = self.policies.values().collect();
+        policies.sort_by(|a, b| a.agreement_hash.cmp(&b.agreement_hash));
+        policies
+    }
 }
 
 

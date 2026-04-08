@@ -672,6 +672,23 @@ struct SubmitProofResponse {
 }
 
 #[derive(Deserialize)]
+struct ListPoliciesRequest {}
+
+#[derive(Debug, Serialize)]
+struct PolicySummary {
+    agreement_hash: String,
+    policy_id: String,
+    required_proofs: usize,
+    attestors: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ListPoliciesResponse {
+    count: usize,
+    policies: Vec<PolicySummary>,
+}
+
+#[derive(Deserialize)]
 struct ListProofsRequest {
     agreement_hash: String,
 }
@@ -5020,6 +5037,32 @@ async fn submit_proof_rpc(
     }))
 }
 
+async fn list_policies_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(_req): AxumJson<ListPoliciesRequest>,
+) -> Result<Json<ListPoliciesResponse>, (StatusCode, String)> {
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let policies = {
+        let store = state.policy_store.lock().unwrap_or_else(|e| e.into_inner());
+        store
+            .list_all()
+            .into_iter()
+            .map(|p| PolicySummary {
+                agreement_hash: p.agreement_hash.clone(),
+                policy_id: p.policy_id.clone(),
+                required_proofs: p.required_proofs.len(),
+                attestors: p.attestors.len(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let count = policies.len();
+    Ok(Json(ListPoliciesResponse { count, policies }))
+}
+
 async fn list_proofs_rpc(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -6890,6 +6933,7 @@ async fn main() {
         .route("/rpc/storepolicy", post(store_policy_rpc))
         .route("/rpc/getpolicy", post(get_policy_rpc))
         .route("/rpc/evaluatepolicy", post(evaluate_policy_rpc))
+        .route("/rpc/listpolicies", post(list_policies_rpc))
         .route("/rpc/createhtlc", post(create_htlc))
         .route("/rpc/decodehtlc", post(decode_htlc))
         .route("/rpc/claimhtlc", post(claim_htlc))
@@ -8540,6 +8584,118 @@ mod tests {
         assert!(resp.policy_found);
         assert_eq!(resp.proof_count, 0, "proof for A must not be fetched for B");
         assert!(!resp.release_eligible);
+    }
+
+
+
+    #[tokio::test]
+    async fn list_policies_rpc_empty_returns_count_zero() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let resp = list_policies_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListPoliciesRequest {}),
+        )
+        .await
+        .expect("list must succeed")
+        .0;
+        assert_eq!(resp.count, 0);
+        assert!(resp.policies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_policies_rpc_returns_stored_policies() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+
+        // Store two policies with different agreement hashes
+        let (agreement_a, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes_a = agreement_canonical_bytes(&agreement_a).unwrap();
+        let hash_a = hex::encode(Sha256::digest(&bytes_a));
+
+        let (agreement_b, _) = milestone_agreement_for_test(&sender, &recipient, 300);
+        let bytes_b = agreement_canonical_bytes(&agreement_b).unwrap();
+        let hash_b = hex::encode(Sha256::digest(&bytes_b));
+
+        let policy_a = make_rpc_policy(&hash_a, &pubkey_hex);
+        store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy: policy_a }),
+        )
+        .await
+        .expect("store policy a");
+
+        let policy_b = make_rpc_policy(&hash_b, &pubkey_hex);
+        store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy: policy_b }),
+        )
+        .await
+        .expect("store policy b");
+
+        let resp = list_policies_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListPoliciesRequest {}),
+        )
+        .await
+        .expect("list must succeed")
+        .0;
+
+        assert_eq!(resp.count, 2);
+        assert_eq!(resp.policies.len(), 2);
+        // Sorted by agreement_hash
+        assert!(resp.policies[0].agreement_hash <= resp.policies[1].agreement_hash);
+        for p in &resp.policies {
+            assert_eq!(p.policy_id, "rpc-pol-001");
+            assert_eq!(p.required_proofs, 1);
+            assert_eq!(p.attestors, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_policies_rpc_summary_fields_match_stored_policy() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy }),
+        )
+        .await
+        .expect("store policy");
+
+        let resp = list_policies_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListPoliciesRequest {}),
+        )
+        .await
+        .expect("list must succeed")
+        .0;
+
+        assert_eq!(resp.count, 1);
+        let summary = &resp.policies[0];
+        assert_eq!(summary.agreement_hash, agreement_hash);
+        assert_eq!(summary.policy_id, "rpc-pol-001");
+        assert_eq!(summary.required_proofs, 1);
+        assert_eq!(summary.attestors, 1);
     }
 
 

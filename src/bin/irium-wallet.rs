@@ -430,6 +430,23 @@ struct SubmitProofRpcResponse {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+struct ListPoliciesRpcRequest {}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PolicySummaryItem {
+    agreement_hash: String,
+    policy_id: String,
+    required_proofs: usize,
+    attestors: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ListPoliciesRpcResponse {
+    count: usize,
+    policies: Vec<PolicySummaryItem>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct ListProofsRpcRequest {
     agreement_hash: String,
 }
@@ -531,6 +548,12 @@ struct EvaluatePolicyRpcResponse {
     refund_eligible: bool,
     reason: String,
     evaluated_rules: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PolicyListCliOptions {
+    rpc_url: String,
+    json_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1759,6 +1782,7 @@ fn usage() {
   eprintln!("  irium-wallet agreement-policy-set --policy <policy.json|-> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-get --agreement-hash <hex> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-evaluate --agreement <agreement.json|-> [--rpc <url>] [--json]");
+  eprintln!("  irium-wallet agreement-policy-list [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <unix>] [--out <path>] [--json]");
     eprintln!("  irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-list --agreement-hash <hex> [--rpc <url>] [--json]");
@@ -4805,6 +4829,43 @@ fn parse_policy_get_cli(args: &[String]) -> Result<PolicyGetCliOptions, String> 
         rpc_url,
         json_mode,
     })
+}
+
+fn parse_policy_list_cli(args: &[String]) -> Result<PolicyListCliOptions, String> {
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--rpc" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--rpc requires a value".to_string());
+                }
+                rpc_url = args[i].clone();
+            }
+            "--json" => {
+                json_mode = true;
+            }
+            other => {
+                return Err(format!("unknown argument: {}", other));
+            }
+        }
+        i += 1;
+    }
+    Ok(PolicyListCliOptions { rpc_url, json_mode })
+}
+
+fn render_policy_list_summary(resp: &ListPoliciesRpcResponse) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("count {}", resp.count));
+    for p in &resp.policies {
+        lines.push(format!(
+            "  agreement_hash {} policy_id {} required_proofs {} attestors {}",
+            p.agreement_hash, p.policy_id, p.required_proofs, p.attestors
+        ));
+    }
+    lines.join("\n")
 }
 
 fn parse_policy_evaluate_cli(args: &[String]) -> Result<PolicyEvaluateCliOptions, String> {
@@ -8900,6 +8961,66 @@ mod tests {
         assert!(out.contains("release_eligible false"), "got: {out}");
     }
 
+    #[test]
+    fn parse_policy_list_cli_defaults() {
+        let args: Vec<String> = vec![];
+        let opts = parse_policy_list_cli(&args).expect("must parse");
+        assert!(!opts.json_mode);
+    }
+
+    #[test]
+    fn parse_policy_list_cli_json_flag() {
+        let args: Vec<String> = vec!["--json".to_string()];
+        let opts = parse_policy_list_cli(&args).expect("must parse");
+        assert!(opts.json_mode);
+    }
+
+    #[test]
+    fn parse_policy_list_cli_rejects_unknown_flag() {
+        let args: Vec<String> = vec!["--unknown".to_string()];
+        let err = parse_policy_list_cli(&args).unwrap_err();
+        assert!(err.contains("unknown"), "got: {err}");
+    }
+
+    #[test]
+    fn render_policy_list_summary_empty() {
+        let resp = ListPoliciesRpcResponse {
+            count: 0,
+            policies: vec![],
+        };
+        let out = render_policy_list_summary(&resp);
+        assert!(out.contains("count 0"), "got: {out}");
+    }
+
+    #[test]
+    fn render_policy_list_summary_with_policies() {
+        let resp = ListPoliciesRpcResponse {
+            count: 2,
+            policies: vec![
+                PolicySummaryItem {
+                    agreement_hash: "aabbcc".to_string(),
+                    policy_id: "pol-001".to_string(),
+                    required_proofs: 1,
+                    attestors: 2,
+                },
+                PolicySummaryItem {
+                    agreement_hash: "ddeeff".to_string(),
+                    policy_id: "pol-002".to_string(),
+                    required_proofs: 2,
+                    attestors: 1,
+                },
+            ],
+        };
+        let out = render_policy_list_summary(&resp);
+        assert!(out.contains("count 2"), "got: {out}");
+        assert!(out.contains("agreement_hash aabbcc"), "got: {out}");
+        assert!(out.contains("policy_id pol-001"), "got: {out}");
+        assert!(out.contains("required_proofs 1"), "got: {out}");
+        assert!(out.contains("attestors 2"), "got: {out}");
+        assert!(out.contains("agreement_hash ddeeff"), "got: {out}");
+        assert!(out.contains("policy_id pol-002"), "got: {out}");
+    }
+
 
 }
 fn main() {
@@ -12087,6 +12208,41 @@ fn main() {
             }
             if !resp.release_eligible && !resp.refund_eligible {
                 std::process::exit(1);
+            }
+        }
+        "agreement-policy-list" => {
+            let opts = match parse_policy_list_cli(&args[1..]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    usage();
+                    std::process::exit(1);
+                }
+            };
+            let base = opts.rpc_url.trim_end_matches('/');
+            let client = match rpc_client(base) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let req = ListPoliciesRpcRequest {};
+            let resp: ListPoliciesRpcResponse =
+                match rpc_post_json(&client, base, "/rpc/listpolicies", &req) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                };
+            if opts.json_mode {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap()
+                );
+            } else {
+                println!("{}", render_policy_list_summary(&resp));
             }
         }
         "agreement-release-build" | "agreement-release-send" | "agreement-release" => {
