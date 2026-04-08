@@ -8699,4 +8699,128 @@ mod tests {
     }
 
 
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_refund_when_required_by_deadline_passed() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+
+        // Build a policy with a refund requirement that expires at height 100
+        let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        policy.required_proofs = vec![
+            irium_node_rs::settlement::ProofRequirement {
+                requirement_id: "req-refund-100".to_string(),
+                proof_type: "delivery_confirmation".to_string(),
+                required_by: Some(100),
+                required_attestor_ids: vec!["rpc-attestor".to_string()],
+                resolution: irium_node_rs::settlement::ProofResolution::Refund,
+                milestone_id: None,
+            },
+        ];
+        store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy }),
+        )
+        .await
+        .expect("store policy");
+
+        // Advance chain past the deadline
+        {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.height = 150;
+        }
+
+        // No proof submitted — refund deadline has passed
+        let resp = evaluate_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement }),
+        )
+        .await
+        .expect("evaluate must not error")
+        .0;
+
+        assert!(resp.policy_found);
+        assert_eq!(resp.proof_count, 0);
+        assert!(resp.refund_eligible, "refund must be triggered by required_by deadline");
+        assert!(!resp.release_eligible);
+        assert!(
+            resp.evaluated_rules.iter().any(|r| r.contains("refund deadline") && r.contains("no satisfying proof")),
+            "evaluated_rules must record the deadline miss; got: {:?}", resp.evaluated_rules
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_no_response_rule_suppressed_by_release() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+
+        // Policy with release requirement + no-response refund rule at height 10
+        let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        policy.no_response_rules.push(irium_node_rs::settlement::NoResponseRule {
+            rule_id: "rule-refund-10".to_string(),
+            deadline_height: 10,
+            trigger: irium_node_rs::settlement::NoResponseTrigger::FundedAndNoRelease,
+            resolution: irium_node_rs::settlement::ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        });
+        store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy }),
+        )
+        .await
+        .expect("store policy");
+
+        // Submit a valid proof
+        let proof = make_rpc_proof(&agreement_hash, &sk);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit proof");
+
+        // Advance chain past the no-response rule deadline
+        {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.height = 100;
+        }
+
+        let resp = evaluate_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement }),
+        )
+        .await
+        .expect("evaluate must not error")
+        .0;
+
+        assert!(resp.policy_found);
+        assert_eq!(resp.proof_count, 1);
+        assert!(resp.release_eligible, "release must be granted; no-response rule must be suppressed");
+        assert!(!resp.refund_eligible);
+    }
+
+
 }

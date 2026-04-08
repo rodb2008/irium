@@ -758,6 +758,75 @@ Response:
 
 ---
 
+
+## Evaluation semantics
+
+Policy evaluation (`evaluate_policy` / `/rpc/evaluatepolicy` / `agreement-policy-check`)
+follows a deterministic, ordered sequence:
+
+### 1. Agreement-hash binding
+
+The `agreement_hash` in the stored policy must match the hash derived from the
+supplied `AgreementObject`. If it does not, evaluation fails immediately with an error.
+
+### 2. Proof verification
+
+All supplied proofs are verified before any deadline or rule checks:
+
+- Proofs whose `agreement_hash` does not match the policy's hash are rejected with a
+  mismatch note in `evaluated_rules`.
+- Proofs that fail signature or attestor-approval checks are rejected with the rejection
+  reason in `evaluated_rules`.
+- Proofs that pass both checks are added to the satisfied set.
+
+### 3. Release requirements
+
+If **all** release requirements (`resolution: release` or `milestone_release`) are satisfied
+by verified proofs, the result is `release_eligible: true`. No-response rules are suppressed
+when release is already achieved — a `funded_and_no_release` rule will not override a valid
+release.
+
+### 4. No-response rules
+
+If release has not been achieved, no-response rules are evaluated in order. The first rule
+whose `deadline_height <= tip_height` fires immediately and determines the result.
+
+- `funded_and_no_release` — fires when the deadline is reached and release has not been
+  granted. In Phase 2 this is the only trigger condition checked.
+- `disputed_and_no_response` — treated identically to `funded_and_no_release` in Phase 2
+  (fires at deadline when release is not met).
+
+The trigger label appears in `evaluated_rules` for observability.
+
+### 5. Refund-requirement deadlines (`required_by`)
+
+For each proof requirement with `resolution: refund` and a `required_by` height set,
+if `tip_height >= required_by` and no verified proof satisfies the requirement, the result
+is `refund_eligible: true`.
+
+If the refund requirement **is** satisfied by a verified proof (even past its deadline),
+the result is recorded in `evaluated_rules` but does not trigger a refund.
+
+### 6. Release-requirement deadline recording
+
+If a release requirement has `required_by` set and its deadline has passed with no
+satisfying proof, this is recorded in `evaluated_rules` as a missed deadline. It does not
+prevent release if the proof later arrives — `required_by` on a release requirement is an
+informational deadline, not a hard acceptance cutoff.
+
+### Summary table
+
+| Condition | Result |
+|---|---|
+| All release requirements satisfied by verified proofs | `release_eligible: true` |
+| No-response rule fires (release not met, deadline passed) | rule resolution applied |
+| Refund requirement `required_by` passed, no proof | `refund_eligible: true` |
+| Refund requirement `required_by` passed, proof present | `evaluated_rules` note only |
+| Release requirement `required_by` passed, proof present | `release_eligible: true` |
+| None of the above | not eligible |
+
+---
+
 ## Current limitations
 
 The following items are defined in the type layer but not yet evaluated or exposed:

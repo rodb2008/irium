@@ -3829,26 +3829,7 @@ pub fn evaluate_policy(
 
     let mut evaluated_rules: Vec<String> = Vec::new();
 
-    for rule in &policy.no_response_rules {
-        if tip_height >= rule.deadline_height {
-            let label = format!(
-                "no_response_rule '{}' deadline {} reached at tip {}",
-                rule.rule_id, rule.deadline_height, tip_height
-            );
-            evaluated_rules.push(label.clone());
-            let (release, refund) = match rule.resolution {
-                ProofResolution::Release | ProofResolution::MilestoneRelease => (true, false),
-                ProofResolution::Refund => (false, true),
-            };
-            return Ok(PolicyEvaluationResult {
-                release_eligible: release,
-                refund_eligible: refund,
-                reason: label,
-                evaluated_rules,
-            });
-        }
-    }
-
+    // Step 1: evaluate all submitted proofs before any deadline/rule checks.
     let mut satisfied: Vec<String> = Vec::new();
     for proof in proofs {
         if !proof.agreement_hash.eq_ignore_ascii_case(&agreement_hash) {
@@ -3869,6 +3850,15 @@ pub fn evaluate_policy(
         }
     }
 
+    // Closure: does any verified proof satisfy the given requirement?
+    let req_satisfied = |req: &ProofRequirement| -> bool {
+        proofs.iter().any(|p| {
+            satisfied.contains(&p.proof_id)
+                && p.proof_type == req.proof_type
+                && req.required_attestor_ids.contains(&p.attested_by)
+        })
+    };
+
     let release_requirements: Vec<&ProofRequirement> = policy
         .required_proofs
         .iter()
@@ -3880,21 +3870,93 @@ pub fn evaluate_policy(
         })
         .collect();
 
-    let all_release_met = release_requirements.iter().all(|req| {
-        proofs.iter().any(|p| {
-            satisfied.contains(&p.proof_id)
-                && p.proof_type == req.proof_type
-                && req.required_attestor_ids.contains(&p.attested_by)
-        })
-    });
+    let refund_requirements: Vec<&ProofRequirement> = policy
+        .required_proofs
+        .iter()
+        .filter(|r| matches!(r.resolution, ProofResolution::Refund))
+        .collect();
 
-    if all_release_met && !release_requirements.is_empty() {
+    // Step 2: if all release requirements are already satisfied, return release.
+    // No-response rules are suppressed when release is already achieved.
+    let all_release_met = !release_requirements.is_empty()
+        && release_requirements.iter().all(|req| req_satisfied(*req));
+
+    if all_release_met {
         return Ok(PolicyEvaluationResult {
             release_eligible: true,
             refund_eligible: false,
             reason: "all release requirements satisfied by verified proofs".to_string(),
             evaluated_rules,
         });
+    }
+
+    // Step 3: check no-response rules.
+    // Both FundedAndNoRelease and DisputedAndNoResponse fire only when release
+    // has not been achieved. Since all_release_met is false here, all triggered
+    // rules fire unconditionally.
+    for rule in &policy.no_response_rules {
+        if tip_height >= rule.deadline_height {
+            let trigger_label = match rule.trigger {
+                NoResponseTrigger::FundedAndNoRelease => "funded_and_no_release",
+                NoResponseTrigger::DisputedAndNoResponse => "disputed_and_no_response",
+            };
+            let label = format!(
+                "no_response_rule '{}' deadline {} reached at tip {} trigger {}",
+                rule.rule_id, rule.deadline_height, tip_height, trigger_label
+            );
+            evaluated_rules.push(label.clone());
+            let (release, refund) = match rule.resolution {
+                ProofResolution::Release | ProofResolution::MilestoneRelease => (true, false),
+                ProofResolution::Refund => (false, true),
+            };
+            return Ok(PolicyEvaluationResult {
+                release_eligible: release,
+                refund_eligible: refund,
+                reason: label,
+                evaluated_rules,
+            });
+        }
+    }
+
+    // Step 4: check required_by deadlines on refund requirements.
+    // If the deadline has passed with no satisfying proof, trigger refund.
+    for req in refund_requirements {
+        if let Some(deadline) = req.required_by {
+            if tip_height >= deadline {
+                if req_satisfied(req) {
+                    evaluated_rules.push(format!(
+                        "requirement '{}' refund deadline {} reached but satisfied",
+                        req.requirement_id, deadline
+                    ));
+                } else {
+                    let label = format!(
+                        "requirement '{}' refund deadline {} reached at tip {} with no satisfying proof",
+                        req.requirement_id, deadline, tip_height
+                    );
+                    evaluated_rules.push(label.clone());
+                    return Ok(PolicyEvaluationResult {
+                        release_eligible: false,
+                        refund_eligible: true,
+                        reason: label,
+                        evaluated_rules,
+                    });
+                }
+            }
+        }
+    }
+
+    // Step 5: record missed release deadlines for observability.
+    // A late proof is still accepted; required_by on a release requirement
+    // is not a hard acceptance cutoff.
+    for req in release_requirements {
+        if let Some(deadline) = req.required_by {
+            if tip_height >= deadline && !req_satisfied(req) {
+                evaluated_rules.push(format!(
+                    "requirement '{}' release deadline {} missed at tip {}",
+                    req.requirement_id, deadline, tip_height
+                ));
+            }
+        }
     }
 
     Ok(PolicyEvaluationResult {
@@ -5744,6 +5806,178 @@ mod tests {
         let found = store2.get("persist-hash").expect("must find after reload");
         assert_eq!(found.agreement_hash, "persist-hash");
         let _ = std::fs::remove_file(&path);
+    }
+
+
+
+    #[test]
+    fn required_by_refund_triggers_when_deadline_passed_and_no_proof() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        // Replace the default release requirement with a refund requirement that has a deadline
+        policy.required_proofs = vec![ProofRequirement {
+            requirement_id: "req-refund-100".to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            required_by: Some(100),
+            required_attestor_ids: vec!["attestor-a".to_string()],
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+        }];
+
+        // At tip == deadline: refund triggered
+        let result = evaluate_policy(&agreement, &policy, &[], 100).unwrap();
+        assert!(result.refund_eligible, "refund must trigger at required_by deadline");
+        assert!(!result.release_eligible);
+        assert!(
+            result.evaluated_rules.iter().any(|r| r.contains("refund deadline") && r.contains("no satisfying proof")),
+            "evaluated_rules must record the deadline miss; got: {:?}", result.evaluated_rules
+        );
+    }
+
+    #[test]
+    fn required_by_refund_not_triggered_before_deadline() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.required_proofs = vec![ProofRequirement {
+            requirement_id: "req-refund-100".to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            required_by: Some(100),
+            required_attestor_ids: vec!["attestor-a".to_string()],
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+        }];
+
+        // One block before deadline: no trigger
+        let result = evaluate_policy(&agreement, &policy, &[], 99).unwrap();
+        assert!(!result.refund_eligible);
+        assert!(!result.release_eligible);
+    }
+
+    #[test]
+    fn required_by_refund_requirement_satisfied_no_trigger() {
+        // If the refund requirement is satisfied (proof present), no refund, even past deadline.
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.required_proofs = vec![ProofRequirement {
+            requirement_id: "req-refund-100".to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            required_by: Some(100),
+            required_attestor_ids: vec!["attestor-a".to_string()],
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+        }];
+
+        let proof = make_test_proof(&agreement_hash, "attestor-a", &signing_key);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 200).unwrap();
+        assert!(!result.refund_eligible, "satisfied refund requirement must not trigger refund");
+        assert!(!result.release_eligible, "no release requirement present");
+        assert!(
+            result.evaluated_rules.iter().any(|r| r.contains("refund deadline") && r.contains("but satisfied")),
+            "must record that refund deadline was reached but satisfied; got: {:?}", result.evaluated_rules
+        );
+    }
+
+    #[test]
+    fn required_by_release_deadline_missed_still_grants_release_when_proof_present() {
+        // A proof arriving after required_by deadline must still satisfy the release requirement.
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        // Set a required_by deadline in the past on the release requirement
+        policy.required_proofs[0].required_by = Some(50);
+
+        // Tip is well past the deadline, but proof is present
+        let proof = make_test_proof(&agreement_hash, "attestor-a", &signing_key);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 200).unwrap();
+        assert!(result.release_eligible, "late proof must still satisfy release requirement");
+        assert!(!result.refund_eligible);
+    }
+
+    #[test]
+    fn no_response_rule_suppressed_when_release_already_met() {
+        // If all release requirements are satisfied, a no-response rule with
+        // FundedAndNoRelease trigger at a passed deadline must NOT fire.
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-refund-at-100".to_string(),
+            deadline_height: 100,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        });
+
+        // Tip is past the no-response deadline, but a valid proof satisfies release
+        let proof = make_test_proof(&agreement_hash, "attestor-a", &signing_key);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 200).unwrap();
+        assert!(result.release_eligible, "release must be granted when proofs satisfy requirements");
+        assert!(!result.refund_eligible, "no-response rule must be suppressed when release is met");
+    }
+
+    #[test]
+    fn no_response_rule_triggers_when_release_not_met() {
+        // With no valid proofs, the no-response rule fires at its deadline.
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-refund-at-100".to_string(),
+            deadline_height: 100,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        });
+
+        // No proofs submitted, tip past deadline
+        let result = evaluate_policy(&agreement, &policy, &[], 100).unwrap();
+        assert!(result.refund_eligible, "no-response rule must fire when release not met");
+        assert!(!result.release_eligible);
+        assert!(
+            result.evaluated_rules.iter().any(|r| r.contains("rule-refund-at-100") && r.contains("funded_and_no_release")),
+            "trigger label must appear in evaluated_rules; got: {:?}", result.evaluated_rules
+        );
     }
 
 
