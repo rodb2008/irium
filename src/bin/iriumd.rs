@@ -740,6 +740,8 @@ struct EvaluatePolicyResponse {
 #[derive(Deserialize)]
 struct StorePolicyRequest {
     policy: ProofPolicy,
+    #[serde(default)]
+    replace: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -5097,7 +5099,7 @@ async fn store_policy_rpc(
         .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
     require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
     let mut store = state.policy_store.lock().unwrap_or_else(|e| e.into_inner());
-    let outcome = store.store(req.policy).map_err(|e| bad(&e))?;
+    let outcome = store.store(req.policy, req.replace).map_err(|e| bad(&e))?;
     Ok(Json(StorePolicyResponse {
         policy_id: outcome.policy_id,
         agreement_hash: outcome.agreement_hash,
@@ -8342,7 +8344,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(StorePolicyRequest { policy }),
+            Json(StorePolicyRequest { policy, replace: false }),
         )
         .await
         .expect("must accept")
@@ -8362,7 +8364,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(StorePolicyRequest { policy }),
+            Json(StorePolicyRequest { policy, replace: false }),
         )
         .await;
         assert!(result.is_err(), "must reject empty agreement_hash");
@@ -8376,9 +8378,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(StorePolicyRequest {
-                policy: policy.clone(),
-            }),
+            Json(StorePolicyRequest { policy: policy.clone(), replace: false }),
         )
         .await
         .expect("store must succeed");
@@ -8435,7 +8435,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(StorePolicyRequest { policy }),
+            Json(StorePolicyRequest { policy, replace: false }),
         )
         .await
         .expect("store policy");
@@ -8516,7 +8516,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(StorePolicyRequest { policy }),
+            Json(StorePolicyRequest { policy, replace: false }),
         )
         .await
         .expect("store policy");
@@ -8552,7 +8552,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(StorePolicyRequest { policy: policy_b }),
+            Json(StorePolicyRequest { policy: policy_b, replace: false }),
         )
         .await
         .expect("store policy b");
@@ -8625,7 +8625,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(StorePolicyRequest { policy: policy_a }),
+            Json(StorePolicyRequest { policy: policy_a, replace: false }),
         )
         .await
         .expect("store policy a");
@@ -8635,7 +8635,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(StorePolicyRequest { policy: policy_b }),
+            Json(StorePolicyRequest { policy: policy_b, replace: false }),
         )
         .await
         .expect("store policy b");
@@ -8675,7 +8675,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(StorePolicyRequest { policy }),
+            Json(StorePolicyRequest { policy, replace: false }),
         )
         .await
         .expect("store policy");
@@ -8727,7 +8727,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(StorePolicyRequest { policy }),
+            Json(StorePolicyRequest { policy, replace: false }),
         )
         .await
         .expect("store policy");
@@ -8784,7 +8784,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(StorePolicyRequest { policy }),
+            Json(StorePolicyRequest { policy, replace: false }),
         )
         .await
         .expect("store policy");
@@ -8820,6 +8820,74 @@ mod tests {
         assert_eq!(resp.proof_count, 1);
         assert!(resp.release_eligible, "release must be granted; no-response rule must be suppressed");
         assert!(!resp.refund_eligible);
+    }
+
+
+
+    #[tokio::test]
+    async fn store_policy_rpc_rejects_overwrite_without_replace() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let policy_a = make_rpc_policy("overwrite-hash-01", "pk-a");
+        store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy: policy_a, replace: false }),
+        )
+        .await
+        .expect("first store");
+
+        // Different policy_id, same agreement_hash, replace=false => rejected
+        let mut policy_b = make_rpc_policy("overwrite-hash-01", "pk-a");
+        policy_b.policy_id = "pol-rpc-002".to_string();
+        let resp = store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy: policy_b, replace: false }),
+        )
+        .await
+        .expect("must not error")
+        .0;
+        assert!(!resp.accepted, "must reject overwrite without replace flag");
+        assert!(!resp.updated);
+        assert!(
+            resp.message.contains("already exists") && resp.message.contains("--replace"),
+            "message must explain --replace; got: {}", resp.message
+        );
+    }
+
+    #[tokio::test]
+    async fn store_policy_rpc_replaces_with_flag() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let policy_a = make_rpc_policy("overwrite-hash-02", "pk-b");
+        store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy: policy_a, replace: false }),
+        )
+        .await
+        .expect("first store");
+
+        // Different policy_id, replace=true => accepted + updated
+        let mut policy_b = make_rpc_policy("overwrite-hash-02", "pk-b");
+        policy_b.policy_id = "pol-rpc-003".to_string();
+        let resp = store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy: policy_b, replace: true }),
+        )
+        .await
+        .expect("must not error")
+        .0;
+        assert!(resp.accepted, "must accept with replace=true");
+        assert!(resp.updated, "must be marked updated");
+        assert!(
+            resp.message.contains("replaced"),
+            "message must say replaced; got: {}", resp.message
+        );
     }
 
 

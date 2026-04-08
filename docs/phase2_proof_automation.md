@@ -557,6 +557,7 @@ irium-wallet agreement-policy-set \
 | `--policy <path\|->` | yes | Path to a `ProofPolicy` JSON file, or `-` to read from stdin |
 | `--rpc <url>` | no | Node RPC base URL. Defaults to `IRIUM_RPC_URL` or `http://127.0.0.1:38300` |
 | `--json` | no | Print the full response JSON to stdout |
+| `--replace` | no | Overwrite an existing policy for the same agreement hash |
 
 ### Storage behavior
 
@@ -564,7 +565,7 @@ The node persists all policies to `$IRIUM_DATA_DIR/state/policies.json` (default
 `~/.irium/state/policies.json`). One policy is stored per `agreement_hash`; a second
 `agreement-policy-set` for the same hash with a different `policy_id` overwrites
 the previous entry. Storing the exact same `policy_id` again is a no-op (reported
-as `status duplicate`).
+as `status rejected`). Pass `--replace` to overwrite a different `policy_id`.
 
 ### Default output
 
@@ -576,7 +577,7 @@ status accepted
 
 ### Node RPC
 
-`POST /rpc/storepolicy` — body: `{ "policy": <ProofPolicy> }`.
+`POST /rpc/storepolicy` — body: `{ "policy": <ProofPolicy>, "replace": false }`.
 Response: `{ policy_id, agreement_hash, accepted, updated, message }`.
 
 ---

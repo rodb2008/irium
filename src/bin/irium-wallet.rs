@@ -509,6 +509,7 @@ struct CheckPolicyRpcResponse {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct StorePolicyRpcRequest {
     policy: ProofPolicy,
+    replace: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -568,6 +569,7 @@ struct PolicySetCliOptions {
     policy_path: String,
     rpc_url: String,
     json_mode: bool,
+    replace: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1779,7 +1781,7 @@ fn usage() {
     eprintln!("  irium-wallet agreement-release-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-refund-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-policy-check --agreement <agreement.json|-> --policy <policy.json|-> [--proof <proof.json>]... [--rpc <url>] [--json]");
-  eprintln!("  irium-wallet agreement-policy-set --policy <policy.json|-> [--rpc <url>] [--json]");
+  eprintln!("  irium-wallet agreement-policy-set --policy <policy.json|-> [--rpc <url>] [--json] [--replace]");
   eprintln!("  irium-wallet agreement-policy-get --agreement-hash <hex> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-evaluate --agreement <agreement.json|-> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-list [--rpc <url>] [--json]");
@@ -4760,6 +4762,7 @@ fn parse_policy_set_cli(args: &[String]) -> Result<PolicySetCliOptions, String> 
     let mut policy_path: Option<String> = None;
     let mut rpc_url = default_rpc_url();
     let mut json_mode = false;
+    let mut replace = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -4780,6 +4783,9 @@ fn parse_policy_set_cli(args: &[String]) -> Result<PolicySetCliOptions, String> 
             "--json" => {
                 json_mode = true;
             }
+            "--replace" => {
+                replace = true;
+            }
             other => {
                 return Err(format!("unknown argument: {}", other));
             }
@@ -4790,6 +4796,7 @@ fn parse_policy_set_cli(args: &[String]) -> Result<PolicySetCliOptions, String> 
         policy_path: policy_path.ok_or_else(|| "--policy is required".to_string())?,
         rpc_url,
         json_mode,
+        replace,
     })
 }
 
@@ -4931,13 +4938,13 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
 
 fn render_policy_set_summary(resp: &StorePolicyRpcResponse) -> String {
     let status = if resp.accepted {
-        if resp.updated { "updated" } else { "accepted" }
+        if resp.updated { "replaced" } else { "accepted" }
     } else {
-        "duplicate"
+        "rejected"
     };
     format!(
-        "policy_id {}\nagreement_hash {}\nstatus {}",
-        resp.policy_id, resp.agreement_hash, status
+        "policy_id {}\nagreement_hash {}\nstatus {}\nmessage {}",
+        resp.policy_id, resp.agreement_hash, status, resp.message
     )
 }
 
@@ -8817,16 +8824,16 @@ mod tests {
     }
 
     #[test]
-    fn render_policy_set_summary_updated() {
+    fn render_policy_set_summary_replaced() {
         let resp = StorePolicyRpcResponse {
             policy_id: "pol-002".to_string(),
             agreement_hash: "ddeeff".to_string(),
             accepted: true,
             updated: true,
-            message: "policy updated".to_string(),
+            message: "policy replaced".to_string(),
         };
         let out = render_policy_set_summary(&resp);
-        assert!(out.contains("updated"), "got: {out}");
+        assert!(out.contains("replaced"), "got: {out}");
     }
 
     #[test]
@@ -9019,6 +9026,41 @@ mod tests {
         assert!(out.contains("attestors 2"), "got: {out}");
         assert!(out.contains("agreement_hash ddeeff"), "got: {out}");
         assert!(out.contains("policy_id pol-002"), "got: {out}");
+    }
+
+
+    #[test]
+    fn policy_set_cli_parses_replace_flag() {
+        let args: Vec<String> = vec![
+            "--policy".to_string(), "p.json".to_string(),
+            "--replace".to_string(),
+        ];
+        let opts = parse_policy_set_cli(&args).expect("must parse");
+        assert!(opts.replace, "replace must be true when --replace is given");
+        assert!(!opts.json_mode);
+    }
+
+    #[test]
+    fn policy_set_cli_replace_defaults_false() {
+        let args: Vec<String> = vec![
+            "--policy".to_string(), "p.json".to_string(),
+        ];
+        let opts = parse_policy_set_cli(&args).expect("must parse");
+        assert!(!opts.replace, "replace must default to false");
+    }
+
+    #[test]
+    fn render_policy_set_summary_rejected() {
+        let resp = StorePolicyRpcResponse {
+            policy_id: "pol-003".to_string(),
+            agreement_hash: "ff0011".to_string(),
+            accepted: false,
+            updated: false,
+            message: "a policy 'pol-001' already exists for this agreement; use --replace to overwrite".to_string(),
+        };
+        let out = render_policy_set_summary(&resp);
+        assert!(out.contains("rejected"), "got: {out}");
+        assert!(out.contains("--replace"), "message must propagate; got: {out}");
     }
 
 
@@ -12107,7 +12149,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let req = StorePolicyRpcRequest { policy };
+            let req = StorePolicyRpcRequest { policy, replace: opts.replace };
             let resp: StorePolicyRpcResponse =
                 match rpc_post_json(&client, base, "/rpc/storepolicy", &req) {
                     Ok(v) => v,

@@ -4158,7 +4158,7 @@ impl PolicyStore {
         std::fs::write(&self.path, json).map_err(|e| e.to_string())
     }
 
-    pub fn store(&mut self, policy: ProofPolicy) -> Result<StorePolicyOutcome, String> {
+    pub fn store(&mut self, policy: ProofPolicy, replace: bool) -> Result<StorePolicyOutcome, String> {
         if policy.agreement_hash.trim().is_empty() {
             return Err("policy.agreement_hash must not be empty".to_string());
         }
@@ -4172,7 +4172,19 @@ impl PolicyStore {
                     agreement_hash,
                     accepted: false,
                     updated: false,
-                    message: "policy already stored".to_string(),
+                    message: "policy already stored (same policy_id)".to_string(),
+                });
+            }
+            if !replace {
+                return Ok(StorePolicyOutcome {
+                    policy_id,
+                    agreement_hash,
+                    accepted: false,
+                    updated: false,
+                    message: format!(
+                        "a policy '{}' already exists for this agreement; use --replace to overwrite",
+                        existing.policy_id
+                    ),
                 });
             }
         }
@@ -4187,7 +4199,7 @@ impl PolicyStore {
             accepted: true,
             updated,
             message: if updated {
-                "policy updated".to_string()
+                "policy replaced".to_string()
             } else {
                 "policy accepted".to_string()
             },
@@ -5720,7 +5732,7 @@ mod tests {
     fn policy_store_accepts_valid_policy() {
         let mut store = make_policy_store();
         let policy = make_test_policy("abc123", "pubkey", "att-1");
-        let outcome = store.store(policy).expect("must accept");
+        let outcome = store.store(policy, false).expect("must accept");
         assert!(outcome.accepted);
         assert!(!outcome.updated);
         assert_eq!(outcome.agreement_hash, "abc123");
@@ -5732,7 +5744,7 @@ mod tests {
         let mut store = make_policy_store();
         let mut policy = make_test_policy("abc123", "pubkey", "att-1");
         policy.agreement_hash = "".to_string();
-        let err = store.store(policy).unwrap_err();
+        let err = store.store(policy, false).unwrap_err();
         assert!(err.contains("agreement_hash"), "got: {err}");
     }
 
@@ -5740,7 +5752,7 @@ mod tests {
     fn policy_store_get_existing_policy() {
         let mut store = make_policy_store();
         let policy = make_test_policy("deadbeef", "pk1", "att-a");
-        store.store(policy.clone()).expect("must accept");
+        store.store(policy.clone(), false).expect("must accept");
         let found = store.get("deadbeef").expect("must find");
         assert_eq!(found.policy_id, policy.policy_id);
         assert_eq!(found.agreement_hash, "deadbeef");
@@ -5756,9 +5768,9 @@ mod tests {
     fn policy_store_duplicate_same_policy_id() {
         let mut store = make_policy_store();
         let policy = make_test_policy("cafebabe", "pk1", "att-1");
-        let first = store.store(policy.clone()).expect("first");
+        let first = store.store(policy.clone(), false).expect("first");
         assert!(first.accepted);
-        let second = store.store(policy).expect("second");
+        let second = store.store(policy, false).expect("second");
         assert!(!second.accepted);
         assert!(!second.updated);
         assert!(
@@ -5774,11 +5786,11 @@ mod tests {
         let mut store = make_policy_store();
         let mut policy_a = make_test_policy("aabbcc", "pk1", "att-1");
         policy_a.policy_id = "pol-001".to_string();
-        store.store(policy_a).expect("first");
+        store.store(policy_a, false).expect("first");
 
         let mut policy_b = make_test_policy("aabbcc", "pk2", "att-2");
         policy_b.policy_id = "pol-002".to_string();
-        let outcome = store.store(policy_b).expect("second");
+        let outcome = store.store(policy_b, true).expect("second");
         assert!(outcome.accepted);
         assert!(outcome.updated);
         assert_eq!(store.count(), 1);
@@ -5798,7 +5810,7 @@ mod tests {
         {
             let mut store = PolicyStore::new(path.clone());
             let policy = make_test_policy("persist-hash", "pk1", "att-1");
-            store.store(policy).expect("must accept");
+            store.store(policy, false).expect("must accept");
             assert_eq!(store.count(), 1);
         }
         let store2 = PolicyStore::new(path.clone());
@@ -5977,6 +5989,77 @@ mod tests {
         assert!(
             result.evaluated_rules.iter().any(|r| r.contains("rule-refund-at-100") && r.contains("funded_and_no_release")),
             "trigger label must appear in evaluated_rules; got: {:?}", result.evaluated_rules
+        );
+    }
+
+
+
+    #[test]
+    fn policy_store_rejects_overwrite_without_replace_flag() {
+        let mut store = make_policy_store();
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let policy_a = make_test_policy("aabbcc", &pubkey_hex, "att-a");
+        store.store(policy_a, false).expect("first store must succeed");
+
+        // Different policy_id, same agreement_hash, replace=false -> rejected
+        let mut policy_b = make_test_policy("aabbcc", &pubkey_hex, "att-a");
+        policy_b.policy_id = "pol-002".to_string();
+        let outcome = store.store(policy_b, false).expect("must not error");
+        assert!(!outcome.accepted, "must not accept overwrite without replace flag");
+        assert!(!outcome.updated);
+        assert!(
+            outcome.message.contains("already exists") && outcome.message.contains("--replace"),
+            "message must explain how to replace; got: {}", outcome.message
+        );
+        // Original policy must still be in place
+        let stored = store.get("aabbcc").unwrap();
+        assert_eq!(stored.policy_id, "pol-001", "original policy must not be replaced");
+    }
+
+    #[test]
+    fn policy_store_allows_replace_with_flag() {
+        let mut store = make_policy_store();
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let policy_a = make_test_policy("aabbcc", &pubkey_hex, "att-a");
+        store.store(policy_a, false).expect("first store must succeed");
+
+        // Different policy_id, replace=true -> accepted, updated
+        let mut policy_b = make_test_policy("aabbcc", &pubkey_hex, "att-a");
+        policy_b.policy_id = "pol-002".to_string();
+        let outcome = store.store(policy_b, true).expect("must not error");
+        assert!(outcome.accepted, "must accept with replace flag");
+        assert!(outcome.updated, "must be marked as updated");
+        assert!(
+            outcome.message.contains("replaced"),
+            "message must say replaced; got: {}", outcome.message
+        );
+        // New policy must be in place
+        let stored = store.get("aabbcc").unwrap();
+        assert_eq!(stored.policy_id, "pol-002", "new policy must replace old");
+    }
+
+    #[test]
+    fn policy_store_duplicate_same_policy_id_with_replace_is_still_no_op() {
+        // Even with replace=true, same policy_id is a no-op
+        let mut store = make_policy_store();
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let policy = make_test_policy("aabbcc", &pubkey_hex, "att-a");
+        store.store(policy.clone(), false).expect("first store");
+        let outcome = store.store(policy, true).expect("second store");
+        assert!(!outcome.accepted, "same policy_id with replace=true must still be no-op");
+        assert!(!outcome.updated);
+        assert!(
+            outcome.message.contains("same policy_id"),
+            "message must mention same policy_id; got: {}", outcome.message
         );
     }
 
