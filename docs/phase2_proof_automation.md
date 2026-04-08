@@ -428,6 +428,116 @@ count 1
 
 
 
+
+## irium-wallet agreement-proof-create
+
+Creates and signs a `SettlementProof` using a key from the local wallet. The output
+is a signed proof JSON ready to submit via `agreement-proof-submit`.
+
+```
+irium-wallet agreement-proof-create \
+  --agreement-hash <hex> \
+  --proof-type <string> \
+  --attested-by <attestor-id> \
+  --address <wallet-address> \
+  [--milestone-id <id>] \
+  [--evidence-summary <text>] \
+  [--evidence-hash <hex>] \
+  [--proof-id <id>] \
+  [--timestamp <unix-seconds>] \
+  [--out <path>] \
+  [--json]
+```
+
+### Arguments
+
+| Flag | Required | Description |
+|---|---|---|
+| `--agreement-hash <hex>` | yes | SHA-256 hex of the agreement this proof attests to |
+| `--proof-type <string>` | yes | Proof type label matching a `ProofRequirement.proof_type` in the policy |
+| `--attested-by <id>` | yes | Attestor ID to embed in the proof; must match an entry in the policy `attestors` list |
+| `--address <addr>` | yes | Wallet address whose private key signs the proof |
+| `--milestone-id <id>` | no | Milestone scope for milestone-specific proofs |
+| `--evidence-summary <text>` | no | Free-text description of the supporting evidence |
+| `--evidence-hash <hex>` | no | Hex hash of an external evidence artifact |
+| `--proof-id <id>` | no | Explicit proof ID. Defaults to `prf-<16-char hex>` derived from proof_type, agreement_hash, and timestamp |
+| `--timestamp <unix>` | no | Attestation time as Unix seconds. Defaults to current time |
+| `--out <path>` | no | Write the proof JSON to this file path in addition to stdout |
+| `--json` | no | Also print the full proof JSON to stdout (always printed when `--out` is not given) |
+
+### Signing flow
+
+1. The wallet key for `--address` is loaded from the local wallet file
+   (`IRIUM_WALLET_FILE` env var or `~/.irium/wallet.json`).
+2. The proof payload is computed by `settlement_proof_payload_bytes`: a canonical
+   JSON of all proof fields except the `signature` envelope, sorted lexicographically
+   and SHA-256 hashed.
+3. The 32-byte digest is signed with `secp256k1_ecdsa_sha256` using the wallet key.
+4. The resulting `SettlementProof` JSON is printed to stdout (and written to `--out`
+   if specified).
+
+### Default output (when `--out` is given without `--json`)
+
+```
+proof_id prf-<16-char hex>
+schema_id irium.phase2.settlement_proof.v1
+proof_type delivery_confirmation
+agreement_hash <64-char hex>
+attested_by attestor-a
+attestation_time 1700000000
+payload_hash <64-char hex>
+pubkey_hex <compressed secp256k1 public key hex>
+```
+
+### Output when `--out` is not given
+
+The full proof JSON is printed to stdout regardless of `--json`. This allows piping:
+
+```
+irium-wallet agreement-proof-create \
+  --agreement-hash <hex> --proof-type delivery_confirmation \
+  --attested-by attestor-a --address <addr> > proof.json
+```
+
+### Notes on pubkey_hex
+
+The wallet stores compressed secp256k1 keys (33 bytes, 66 hex chars). The
+`pubkey_hex` in the generated proof uses this compressed format. The node
+verification code (`VerifyingKey::from_sec1_bytes`) accepts both compressed
+and uncompressed keys, so no conversion is needed. However, the `ApprovedAttestor`
+entry in the `ProofPolicy` must use the same `pubkey_hex` value as the generated
+proof for verification to succeed.
+
+### Typical workflow
+
+```sh
+# 1. Get the wallet address that will act as attestor
+irium-wallet list-addresses
+
+# 2. Create the proof
+irium-wallet agreement-proof-create \
+  --agreement-hash <64-char hex> \
+  --proof-type delivery_confirmation \
+  --attested-by attestor-a \
+  --address <addr> \
+  --evidence-summary "Goods delivered and signed for." \
+  --out proof.json
+
+# 3. Submit to the node
+irium-wallet agreement-proof-submit --proof proof.json
+
+# 4. Check policy eligibility
+irium-wallet agreement-policy-check \
+  --agreement agreement.json \
+  --policy policy.json \
+  --proof proof.json
+```
+
+### Exit codes
+
+- `0`: proof was created and written successfully.
+- `1`: wallet key not found, signing failed, serialization failed, or file write error.
+
 ## Current limitations
 
 The following items are defined in the type layer but not yet evaluated or exposed:
@@ -446,9 +556,6 @@ The following items are defined in the type layer but not yet evaluated or expos
 - **`AGREEMENT_SCHEMA_ID_V2`**: the constant `"irium.phase2.canonical.v1"` is defined
   but no code validates it against incoming agreement objects. Phase 2 agreements
   are validated by the existing Phase 1 `AgreementObject::validate()` path.
-- **Proof creation tooling**: there is no `irium-wallet` command to create or sign
-  a `SettlementProof`. Proofs must be constructed and signed externally using the
-  canonical payload bytes from `settlement_proof_payload_bytes`.
 
 ---
 
