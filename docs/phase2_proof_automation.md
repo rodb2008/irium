@@ -538,6 +538,85 @@ irium-wallet agreement-policy-check \
 - `0`: proof was created and written successfully.
 - `1`: wallet key not found, signing failed, serialization failed, or file write error.
 
+
+## agreement-policy-set
+
+Stores a `ProofPolicy` on the node, associating it with the `agreement_hash` embedded
+in the policy. If a policy for that agreement hash already exists with a different
+`policy_id`, it is replaced.
+
+```
+irium-wallet agreement-policy-set \
+  --policy <policy.json|-> \
+  [--rpc <url>] \
+  [--json]
+```
+
+| Flag | Required | Description |
+|---|---|---|
+| `--policy <path\|->` | yes | Path to a `ProofPolicy` JSON file, or `-` to read from stdin |
+| `--rpc <url>` | no | Node RPC base URL. Defaults to `IRIUM_RPC_URL` or `http://127.0.0.1:38300` |
+| `--json` | no | Print the full response JSON to stdout |
+
+### Storage behavior
+
+The node persists all policies to `$IRIUM_DATA_DIR/policies.json` (default
+`~/.irium/policies.json`). One policy is stored per `agreement_hash`; a second
+`agreement-policy-set` for the same hash with a different `policy_id` overwrites
+the previous entry. Storing the exact same `policy_id` again is a no-op (reported
+as `status duplicate`).
+
+### Default output
+
+```
+policy_id pol-<id>
+agreement_hash <64-char hex>
+status accepted
+```
+
+### Node RPC
+
+`POST /rpc/storepolicy` — body: `{ "policy": <ProofPolicy> }`.
+Response: `{ policy_id, agreement_hash, accepted, updated, message }`.
+
+---
+
+## agreement-policy-get
+
+Retrieves the stored `ProofPolicy` for a given agreement hash from the node.
+
+```
+irium-wallet agreement-policy-get \
+  --agreement-hash <hex> \
+  [--rpc <url>] \
+  [--json]
+```
+
+| Flag | Required | Description |
+|---|---|---|
+| `--agreement-hash <hex>` | yes | SHA-256 hex of the agreement whose policy to fetch |
+| `--rpc <url>` | no | Node RPC base URL |
+| `--json` | no | Print the full response JSON (including the policy object) to stdout |
+
+### Default output (when found)
+
+```
+policy_id pol-<id>
+agreement_hash <64-char hex>
+required_proofs <count>
+attestors <count>
+found true
+```
+
+Exits with code `1` when no policy is stored for the requested hash.
+
+### Node RPC
+
+`POST /rpc/getpolicy` — body: `{ "agreement_hash": "<hex>" }`.
+Response: `{ agreement_hash, found, policy }` where `policy` is `null` when not found.
+
+---
+
 ## Current limitations
 
 The following items are defined in the type layer but not yet evaluated or exposed:
@@ -549,7 +628,8 @@ The following items are defined in the type layer but not yet evaluated or expos
   through JSON but is not checked during evaluation.
 - **Milestone scoping**: `milestone_id` on requirements and rules is stored but
   evaluation does not filter or scope by milestone.
-- **Proof persistence**: implemented via  and . ~~The node does not store proofs.~~
+- **Policy persistence**: implemented via `PolicyStore` / `/rpc/storepolicy` / `/rpc/getpolicy`.
+- **Proof persistence**: implemented via `ProofStore` / `/rpc/submitproof` / `/rpc/listproofs`.
 - **Attestor registry**: there is no persistent on-node attestor registry. Attestors
   are defined inline in each `ProofPolicy` object.
 - **Explorer routes**: no `/agreement/policy*` routes exist in `irium-explorer` yet.
