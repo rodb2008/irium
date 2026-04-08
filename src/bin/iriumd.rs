@@ -60,6 +60,8 @@ use irium_node_rs::settlement::{
     ProofPolicy,
     SettlementProof,
     ProofStore,
+    PolicyStore,
+    StorePolicyOutcome,
 };
 use irium_node_rs::storage;
 use irium_node_rs::tx::{
@@ -97,6 +99,7 @@ struct AppState {
     status_expected_hash_window_span_cache: Arc<AtomicU64>,
     status_best_header_hash_cache: Arc<Mutex<String>>,
     proof_store: Arc<Mutex<ProofStore>>,
+    policy_store: Arc<Mutex<PolicyStore>>,
 }
 
 #[derive(Serialize)]
@@ -697,6 +700,32 @@ struct CheckPolicyResponse {
     refund_eligible: bool,
     reason: String,
     evaluated_rules: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct StorePolicyRequest {
+    policy: ProofPolicy,
+}
+
+#[derive(Debug, Serialize)]
+struct StorePolicyResponse {
+    policy_id: String,
+    agreement_hash: String,
+    accepted: bool,
+    updated: bool,
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct GetPolicyRequest {
+    agreement_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GetPolicyResponse {
+    agreement_hash: String,
+    found: bool,
+    policy: Option<ProofPolicy>,
 }
 
 #[derive(Serialize)]
@@ -4996,6 +5025,46 @@ async fn list_proofs_rpc(
     }))
 }
 
+async fn store_policy_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<StorePolicyRequest>,
+) -> Result<Json<StorePolicyResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| (StatusCode::BAD_REQUEST, reason.to_string());
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let mut store = state.policy_store.lock().unwrap_or_else(|e| e.into_inner());
+    let outcome = store.store(req.policy).map_err(|e| bad(&e))?;
+    Ok(Json(StorePolicyResponse {
+        policy_id: outcome.policy_id,
+        agreement_hash: outcome.agreement_hash,
+        accepted: outcome.accepted,
+        updated: outcome.updated,
+        message: outcome.message,
+    }))
+}
+
+async fn get_policy_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<GetPolicyRequest>,
+) -> Result<Json<GetPolicyResponse>, (StatusCode, String)> {
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let store = state.policy_store.lock().unwrap_or_else(|e| e.into_inner());
+    let policy = store.get(&req.agreement_hash).cloned();
+    let found = policy.is_some();
+    Ok(Json(GetPolicyResponse {
+        agreement_hash: req.agreement_hash,
+        found,
+        policy,
+    }))
+}
+
 async fn check_policy_rpc(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -6662,6 +6731,9 @@ async fn main() {
         proof_store: Arc::new(Mutex::new(ProofStore::new(
             storage::state_dir().join("proofs.json"),
         ))),
+        policy_store: Arc::new(Mutex::new(PolicyStore::new(
+            storage::state_dir().join("policies.json"),
+        ))),
     };
 
     let persist_drain_secs = std::env::var("IRIUM_PERSIST_DRAIN_SECS")
@@ -6736,6 +6808,8 @@ async fn main() {
         .route("/rpc/checkpolicy", post(check_policy_rpc))
         .route("/rpc/submitproof", post(submit_proof_rpc))
         .route("/rpc/listproofs", post(list_proofs_rpc))
+        .route("/rpc/storepolicy", post(store_policy_rpc))
+        .route("/rpc/getpolicy", post(get_policy_rpc))
         .route("/rpc/createhtlc", post(create_htlc))
         .route("/rpc/decodehtlc", post(decode_htlc))
         .route("/rpc/claimhtlc", post(claim_htlc))
@@ -6952,6 +7026,9 @@ mod tests {
             status_best_header_hash_cache: Arc::new(Mutex::new(String::new())),
             proof_store: Arc::new(Mutex::new(ProofStore::new(
                 unique_path("irium_proofs", "json"),
+            ))),
+            policy_store: Arc::new(Mutex::new(PolicyStore::new(
+                unique_path("irium_policies", "json"),
             ))),
         };
 
@@ -8131,6 +8208,88 @@ mod tests {
         .0;
         assert_eq!(list_resp.count, 1);
         assert_eq!(list_resp.proofs[0].proof_id, "rpc-store-prf-001");
+    }
+
+    #[tokio::test]
+    async fn store_policy_rpc_accepts_valid_policy() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let policy = make_rpc_policy("storepol-hash", "pk-abc");
+        let resp = store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy }),
+        )
+        .await
+        .expect("must accept")
+        .0;
+        assert!(resp.accepted);
+        assert!(!resp.updated);
+        assert_eq!(resp.agreement_hash, "storepol-hash");
+        assert!(resp.message.contains("accepted"), "got: {}", resp.message);
+    }
+
+    #[tokio::test]
+    async fn store_policy_rpc_rejects_empty_agreement_hash() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let mut policy = make_rpc_policy("", "pk");
+        policy.agreement_hash = "".to_string();
+        let result = store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy }),
+        )
+        .await;
+        assert!(result.is_err(), "must reject empty agreement_hash");
+    }
+
+    #[tokio::test]
+    async fn get_policy_rpc_returns_stored_policy() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let policy = make_rpc_policy("getpol-hash-001", "pk-get");
+        store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(StorePolicyRequest {
+                policy: policy.clone(),
+            }),
+        )
+        .await
+        .expect("store must succeed");
+        let resp = get_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(GetPolicyRequest {
+                agreement_hash: "getpol-hash-001".to_string(),
+            }),
+        )
+        .await
+        .expect("get must succeed")
+        .0;
+        assert!(resp.found);
+        assert_eq!(resp.policy.as_ref().unwrap().policy_id, policy.policy_id);
+        assert_eq!(resp.policy.as_ref().unwrap().agreement_hash, "getpol-hash-001");
+    }
+
+    #[tokio::test]
+    async fn get_policy_rpc_returns_not_found_for_missing() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let resp = get_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(GetPolicyRequest {
+                agreement_hash: "nosuchpolicy".to_string(),
+            }),
+        )
+        .await
+        .expect("get must not error")
+        .0;
+        assert!(!resp.found);
+        assert!(resp.policy.is_none());
     }
 
 

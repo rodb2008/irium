@@ -4038,6 +4038,110 @@ impl ProofStore {
 }
 
 
+
+// ---- Policy storage ----
+
+#[derive(Debug)]
+pub struct StorePolicyOutcome {
+    pub policy_id: String,
+    pub agreement_hash: String,
+    pub accepted: bool,
+    pub updated: bool,
+    pub message: String,
+}
+
+pub struct PolicyStore {
+    policies: std::collections::HashMap<String, ProofPolicy>,
+    path: std::path::PathBuf,
+}
+
+impl PolicyStore {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        let mut store = Self {
+            policies: std::collections::HashMap::new(),
+            path,
+        };
+        store.load_from_disk();
+        store
+    }
+
+    fn load_from_disk(&mut self) {
+        let data = match std::fs::read_to_string(&self.path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let parsed: Vec<ProofPolicy> = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "Failed to parse policy store {}: {e}",
+                    self.path.display()
+                );
+                return;
+            }
+        };
+        for policy in parsed {
+            self.policies
+                .insert(policy.agreement_hash.to_lowercase(), policy);
+        }
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut policies: Vec<&ProofPolicy> = self.policies.values().collect();
+        policies.sort_by(|a, b| a.policy_id.cmp(&b.policy_id));
+        let json = serde_json::to_string_pretty(&policies).map_err(|e| e.to_string())?;
+        std::fs::write(&self.path, json).map_err(|e| e.to_string())
+    }
+
+    pub fn store(&mut self, policy: ProofPolicy) -> Result<StorePolicyOutcome, String> {
+        if policy.agreement_hash.trim().is_empty() {
+            return Err("policy.agreement_hash must not be empty".to_string());
+        }
+        let key = policy.agreement_hash.to_lowercase();
+        let policy_id = policy.policy_id.clone();
+        let agreement_hash = policy.agreement_hash.clone();
+        if let Some(existing) = self.policies.get(&key) {
+            if existing.policy_id == policy_id {
+                return Ok(StorePolicyOutcome {
+                    policy_id,
+                    agreement_hash,
+                    accepted: false,
+                    updated: false,
+                    message: "policy already stored".to_string(),
+                });
+            }
+        }
+        let updated = self.policies.contains_key(&key);
+        self.policies.insert(key, policy);
+        if let Err(e) = self.persist() {
+            eprintln!("policy store persist error: {e}");
+        }
+        Ok(StorePolicyOutcome {
+            policy_id,
+            agreement_hash,
+            accepted: true,
+            updated,
+            message: if updated {
+                "policy updated".to_string()
+            } else {
+                "policy accepted".to_string()
+            },
+        })
+    }
+
+    pub fn get(&self, agreement_hash: &str) -> Option<&ProofPolicy> {
+        self.policies.get(&agreement_hash.to_lowercase())
+    }
+
+    pub fn count(&self) -> usize {
+        self.policies.len()
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5527,6 +5631,112 @@ mod tests {
         assert_eq!(store2.count(), 1);
         let listed = store2.list_by_agreement("persist-hash");
         assert_eq!(listed.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+
+    // ---- PolicyStore tests ----
+
+    fn make_policy_store() -> PolicyStore {
+        let path = std::env::temp_dir().join(format!(
+            "irium_test_policies_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        PolicyStore::new(path)
+    }
+
+    #[test]
+    fn policy_store_accepts_valid_policy() {
+        let mut store = make_policy_store();
+        let policy = make_test_policy("abc123", "pubkey", "att-1");
+        let outcome = store.store(policy).expect("must accept");
+        assert!(outcome.accepted);
+        assert!(!outcome.updated);
+        assert_eq!(outcome.agreement_hash, "abc123");
+        assert_eq!(store.count(), 1);
+    }
+
+    #[test]
+    fn policy_store_rejects_empty_agreement_hash() {
+        let mut store = make_policy_store();
+        let mut policy = make_test_policy("abc123", "pubkey", "att-1");
+        policy.agreement_hash = "".to_string();
+        let err = store.store(policy).unwrap_err();
+        assert!(err.contains("agreement_hash"), "got: {err}");
+    }
+
+    #[test]
+    fn policy_store_get_existing_policy() {
+        let mut store = make_policy_store();
+        let policy = make_test_policy("deadbeef", "pk1", "att-a");
+        store.store(policy.clone()).expect("must accept");
+        let found = store.get("deadbeef").expect("must find");
+        assert_eq!(found.policy_id, policy.policy_id);
+        assert_eq!(found.agreement_hash, "deadbeef");
+    }
+
+    #[test]
+    fn policy_store_missing_policy_returns_none() {
+        let store = make_policy_store();
+        assert!(store.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn policy_store_duplicate_same_policy_id() {
+        let mut store = make_policy_store();
+        let policy = make_test_policy("cafebabe", "pk1", "att-1");
+        let first = store.store(policy.clone()).expect("first");
+        assert!(first.accepted);
+        let second = store.store(policy).expect("second");
+        assert!(!second.accepted);
+        assert!(!second.updated);
+        assert!(
+            second.message.contains("already stored"),
+            "got: {}",
+            second.message
+        );
+        assert_eq!(store.count(), 1);
+    }
+
+    #[test]
+    fn policy_store_overwrite_different_policy_id_same_hash() {
+        let mut store = make_policy_store();
+        let mut policy_a = make_test_policy("aabbcc", "pk1", "att-1");
+        policy_a.policy_id = "pol-001".to_string();
+        store.store(policy_a).expect("first");
+
+        let mut policy_b = make_test_policy("aabbcc", "pk2", "att-2");
+        policy_b.policy_id = "pol-002".to_string();
+        let outcome = store.store(policy_b).expect("second");
+        assert!(outcome.accepted);
+        assert!(outcome.updated);
+        assert_eq!(store.count(), 1);
+        let found = store.get("aabbcc").expect("must find");
+        assert_eq!(found.policy_id, "pol-002");
+    }
+
+    #[test]
+    fn policy_store_roundtrip_persist_and_reload() {
+        let path = std::env::temp_dir().join(format!(
+            "irium_test_policy_persist_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        {
+            let mut store = PolicyStore::new(path.clone());
+            let policy = make_test_policy("persist-hash", "pk1", "att-1");
+            store.store(policy).expect("must accept");
+            assert_eq!(store.count(), 1);
+        }
+        let store2 = PolicyStore::new(path.clone());
+        assert_eq!(store2.count(), 1);
+        let found = store2.get("persist-hash").expect("must find after reload");
+        assert_eq!(found.agreement_hash, "persist-hash");
         let _ = std::fs::remove_file(&path);
     }
 
