@@ -672,7 +672,12 @@ struct SubmitProofResponse {
 }
 
 #[derive(Deserialize)]
-struct ListPoliciesRequest {}
+struct ListPoliciesRequest {
+    /// When true, return only policies that are not expired at the current tip height.
+    /// Defaults to false (return all policies).
+    #[serde(default)]
+    active_only: bool,
+}
 
 #[derive(Debug, Serialize)]
 struct PolicySummary {
@@ -688,6 +693,8 @@ struct PolicySummary {
 struct ListPoliciesResponse {
     count: usize,
     policies: Vec<PolicySummary>,
+    /// Reflects the active_only filter that was applied.
+    active_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -5048,11 +5055,12 @@ async fn list_policies_rpc(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     headers: HeaderMap,
-    AxumJson(_req): AxumJson<ListPoliciesRequest>,
+    AxumJson(req): AxumJson<ListPoliciesRequest>,
 ) -> Result<Json<ListPoliciesResponse>, (StatusCode, String)> {
     check_rate_with_auth(&state, &addr, &headers)
         .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
     require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let active_only = req.active_only;
     let tip_height = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain.tip_height()
@@ -5062,21 +5070,24 @@ async fn list_policies_rpc(
         store
             .list_all()
             .into_iter()
-            .map(|p| {
+            .filter_map(|p| {
                 let expired = p.expires_at_height.map_or(false, |h| tip_height >= h);
-                PolicySummary {
+                if active_only && expired {
+                    return None;
+                }
+                Some(PolicySummary {
                     agreement_hash: p.agreement_hash.clone(),
                     policy_id: p.policy_id.clone(),
                     required_proofs: p.required_proofs.len(),
                     attestors: p.attestors.len(),
                     expires_at_height: p.expires_at_height,
                     expired,
-                }
+                })
             })
             .collect::<Vec<_>>()
     };
     let count = policies.len();
-    Ok(Json(ListPoliciesResponse { count, policies }))
+    Ok(Json(ListPoliciesResponse { count, policies, active_only }))
 }
 
 async fn list_proofs_rpc(
@@ -8699,7 +8710,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListPoliciesRequest {}),
+            Json(ListPoliciesRequest { active_only: false }),
         )
         .await
         .expect("list must succeed")
@@ -8748,7 +8759,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListPoliciesRequest {}),
+            Json(ListPoliciesRequest { active_only: false }),
         )
         .await
         .expect("list must succeed")
@@ -8788,7 +8799,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListPoliciesRequest {}),
+            Json(ListPoliciesRequest { active_only: false }),
         )
         .await
         .expect("list must succeed")
@@ -9180,7 +9191,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListPoliciesRequest {}),
+            Json(ListPoliciesRequest { active_only: false }),
         )
         .await
         .expect("list must succeed")
@@ -9234,6 +9245,134 @@ mod tests {
             !resp.reason.contains("expired"),
             "check_policy must not enforce expiry; reason: {}", resp.reason
         );
+    }
+    #[tokio::test]
+    async fn list_policies_rpc_active_only_excludes_expired() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        // active: tip=0 < 1, not expired
+        let mut active = make_rpc_policy("ao-active", "pk-ao-a");
+        active.expires_at_height = Some(1);
+        // expired: tip=0 >= 0, expired
+        let mut expired_p = make_rpc_policy("ao-expired", "pk-ao-e");
+        expired_p.expires_at_height = Some(0);
+        // no expiry: always active
+        let no_exp = make_rpc_policy("ao-none", "pk-ao-n");
+        for p in [active, expired_p, no_exp] {
+            store_policy_rpc(
+                ConnectInfo(test_socket()),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(StorePolicyRequest { policy: p, replace: false }),
+            )
+            .await
+            .expect("store must succeed");
+        }
+        let resp = list_policies_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListPoliciesRequest { active_only: true }),
+        )
+        .await
+        .expect("list must succeed")
+        .0;
+        // 2 active (ao-active with expiry=1, ao-none with no expiry); ao-expired excluded
+        assert_eq!(resp.count, 2, "active_only must exclude expired; got count={}", resp.count);
+        assert!(resp.active_only, "active_only must be reflected in response");
+        let hashes: Vec<_> = resp.policies.iter().map(|p| p.agreement_hash.as_str()).collect();
+        assert!(hashes.contains(&"ao-active"), "ao-active must be present");
+        assert!(hashes.contains(&"ao-none"), "ao-none must be present");
+        assert!(!hashes.contains(&"ao-expired"), "ao-expired must be excluded");
+        for p in &resp.policies {
+            assert!(!p.expired, "active_only result must not contain expired policies");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_policies_rpc_default_includes_all() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let mut active = make_rpc_policy("def-active", "pk-def-a");
+        active.expires_at_height = Some(1);
+        let mut expired_p = make_rpc_policy("def-expired", "pk-def-e");
+        expired_p.expires_at_height = Some(0);
+        for p in [active, expired_p] {
+            store_policy_rpc(
+                ConnectInfo(test_socket()),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(StorePolicyRequest { policy: p, replace: false }),
+            )
+            .await
+            .expect("store must succeed");
+        }
+        let resp = list_policies_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListPoliciesRequest { active_only: false }),
+        )
+        .await
+        .expect("list must succeed")
+        .0;
+        assert_eq!(resp.count, 2, "default must include all policies; got count={}", resp.count);
+        assert!(!resp.active_only, "active_only must be false in response");
+    }
+
+    #[tokio::test]
+    async fn list_policies_rpc_active_only_empty_when_all_expired() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let mut p1 = make_rpc_policy("allexp-1", "pk-ae-1");
+        p1.expires_at_height = Some(0);
+        let mut p2 = make_rpc_policy("allexp-2", "pk-ae-2");
+        p2.expires_at_height = Some(0);
+        for p in [p1, p2] {
+            store_policy_rpc(
+                ConnectInfo(test_socket()),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(StorePolicyRequest { policy: p, replace: false }),
+            )
+            .await
+            .expect("store must succeed");
+        }
+        let resp = list_policies_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListPoliciesRequest { active_only: true }),
+        )
+        .await
+        .expect("list must succeed")
+        .0;
+        assert_eq!(resp.count, 0, "active_only must be empty when all expired");
+        assert!(resp.active_only);
+    }
+
+    #[tokio::test]
+    async fn list_policies_rpc_active_only_keeps_no_expiry_policies() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let no_exp1 = make_rpc_policy("noexp-1", "pk-ne-1");
+        let no_exp2 = make_rpc_policy("noexp-2", "pk-ne-2");
+        for p in [no_exp1, no_exp2] {
+            store_policy_rpc(
+                ConnectInfo(test_socket()),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(StorePolicyRequest { policy: p, replace: false }),
+            )
+            .await
+            .expect("store must succeed");
+        }
+        let resp = list_policies_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListPoliciesRequest { active_only: true }),
+        )
+        .await
+        .expect("list must succeed")
+        .0;
+        assert_eq!(resp.count, 2, "active_only must keep no-expiry policies");
     }
 
 

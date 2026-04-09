@@ -430,7 +430,10 @@ struct SubmitProofRpcResponse {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct ListPoliciesRpcRequest {}
+struct ListPoliciesRpcRequest {
+    #[serde(default)]
+    active_only: bool,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct PolicySummaryItem {
@@ -446,6 +449,8 @@ struct PolicySummaryItem {
 struct ListPoliciesRpcResponse {
     count: usize,
     policies: Vec<PolicySummaryItem>,
+    #[serde(default)]
+    active_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -561,6 +566,7 @@ struct EvaluatePolicyRpcResponse {
 struct PolicyListCliOptions {
     rpc_url: String,
     json_mode: bool,
+    active_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1791,7 +1797,7 @@ fn usage() {
   eprintln!("  irium-wallet agreement-policy-set --policy <policy.json|-> [--rpc <url>] [--json] [--replace] [--expires-at-height <n>]");
   eprintln!("  irium-wallet agreement-policy-get --agreement-hash <hex> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-evaluate --agreement <agreement.json|-> [--rpc <url>] [--json]");
-  eprintln!("  irium-wallet agreement-policy-list [--rpc <url>] [--json]");
+  eprintln!("  irium-wallet agreement-policy-list [--active-only] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <unix>] [--out <path>] [--json]");
     eprintln!("  irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-list --agreement-hash <hex> [--rpc <url>] [--json]");
@@ -4859,6 +4865,7 @@ fn parse_policy_get_cli(args: &[String]) -> Result<PolicyGetCliOptions, String> 
 fn parse_policy_list_cli(args: &[String]) -> Result<PolicyListCliOptions, String> {
     let mut rpc_url = default_rpc_url();
     let mut json_mode = false;
+    let mut active_only = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -4872,17 +4879,23 @@ fn parse_policy_list_cli(args: &[String]) -> Result<PolicyListCliOptions, String
             "--json" => {
                 json_mode = true;
             }
+            "--active-only" => {
+                active_only = true;
+            }
             other => {
                 return Err(format!("unknown argument: {}", other));
             }
         }
         i += 1;
     }
-    Ok(PolicyListCliOptions { rpc_url, json_mode })
+    Ok(PolicyListCliOptions { rpc_url, json_mode, active_only })
 }
 
 fn render_policy_list_summary(resp: &ListPoliciesRpcResponse) -> String {
     let mut lines = Vec::new();
+    if resp.active_only {
+        lines.push("filter active_only true".to_string());
+    }
     lines.push(format!("count {}", resp.count));
     for p in &resp.policies {
         let expiry = match p.expires_at_height {
@@ -9039,6 +9052,7 @@ mod tests {
         let resp = ListPoliciesRpcResponse {
             count: 0,
             policies: vec![],
+            active_only: false,
         };
         let out = render_policy_list_summary(&resp);
         assert!(out.contains("count 0"), "got: {out}");
@@ -9066,6 +9080,7 @@ mod tests {
                     expired: false,
                 },
             ],
+            active_only: false
         };
         let out = render_policy_list_summary(&resp);
         assert!(out.contains("count 2"), "got: {out}");
@@ -9201,6 +9216,7 @@ mod tests {
                 expires_at_height: Some(777),
                 expired: true,
             }],
+            active_only: false
         };
         let out = render_policy_list_summary(&resp);
         assert!(out.contains("777"), "must show expiry height; got: {out}");
@@ -9219,9 +9235,55 @@ mod tests {
                 expires_at_height: None,
                 expired: false,
             }],
+            active_only: false
         };
         let out = render_policy_list_summary(&resp);
         assert!(out.contains("expires_at_height none"), "must show none; got: {out}");
+    }
+
+
+    #[test]
+    fn parse_policy_list_cli_active_only_flag() {
+        let args: Vec<String> = vec!["--active-only".to_string()];
+        let opts = parse_policy_list_cli(&args).expect("must parse");
+        assert!(opts.active_only);
+    }
+
+    #[test]
+    fn parse_policy_list_cli_active_only_defaults_false() {
+        let args: Vec<String> = vec![];
+        let opts = parse_policy_list_cli(&args).expect("must parse");
+        assert!(!opts.active_only);
+    }
+
+    #[test]
+    fn render_policy_list_summary_active_only_shows_filter_header() {
+        let resp = ListPoliciesRpcResponse {
+            count: 1,
+            policies: vec![PolicySummaryItem {
+                agreement_hash: "abc123".to_string(),
+                policy_id: "pol-ao".to_string(),
+                required_proofs: 0,
+                attestors: 0,
+                expires_at_height: Some(100),
+                expired: false,
+            }],
+            active_only: true,
+        };
+        let out = render_policy_list_summary(&resp);
+        assert!(out.contains("filter active_only true"), "must show filter header; got: {out}");
+        assert!(out.contains("count 1"), "got: {out}");
+    }
+
+    #[test]
+    fn render_policy_list_summary_no_filter_header_when_false() {
+        let resp = ListPoliciesRpcResponse {
+            count: 0,
+            policies: vec![],
+            active_only: false,
+        };
+        let out = render_policy_list_summary(&resp);
+        assert!(!out.contains("filter active_only"), "must not show filter header; got: {out}");
     }
 
 
@@ -12433,7 +12495,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let req = ListPoliciesRpcRequest {};
+            let req = ListPoliciesRpcRequest { active_only: opts.active_only };
             let resp: ListPoliciesRpcResponse =
                 match rpc_post_json(&client, base, "/rpc/listpolicies", &req) {
                     Ok(v) => v,

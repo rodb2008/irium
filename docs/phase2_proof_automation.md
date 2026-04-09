@@ -736,40 +736,60 @@ what policies are registered without knowing specific agreement hashes.
 
 ```
 irium-wallet agreement-policy-list \
+  [--active-only] \
   [--rpc <url>] \
   [--json]
 ```
 
 | Flag | Required | Description |
 |---|---|---|
+| `--active-only` | no | Return only policies that are not expired at the current tip height |
 | `--rpc <url>` | no | Node RPC base URL. Defaults to `IRIUM_RPC_URL` or `http://127.0.0.1:38300` |
 | `--json` | no | Print the full response JSON to stdout |
 
 ### Default output
 
+Without `--active-only`:
+
 ```
 count <n>
-  agreement_hash <hex> policy_id <id> required_proofs <n> attestors <n>
-  agreement_hash <hex> policy_id <id> required_proofs <n> attestors <n>
+  agreement_hash <hex> policy_id <id> required_proofs <n> attestors <n> expires_at_height none
+  agreement_hash <hex> policy_id <id> required_proofs <n> attestors <n> expires_at_height <N> expired false
+  agreement_hash <hex> policy_id <id> required_proofs <n> attestors <n> expires_at_height <N> expired true
   ...
 ```
 
-Entries are sorted by `agreement_hash`. Each line shows a summary projection;
-use `agreement-policy-get --agreement-hash <hex>` to retrieve the full policy JSON.
+With `--active-only`:
+
+```
+filter active_only true
+count <n>
+  agreement_hash <hex> policy_id <id> required_proofs <n> attestors <n> expires_at_height none
+  agreement_hash <hex> policy_id <id> required_proofs <n> attestors <n> expires_at_height <N> expired false
+  ...
+```
+
+Expired policies are omitted when `--active-only` is set. The `filter active_only true` header
+is printed so operators can distinguish a filtered result from an empty store.
+Use `agreement-policy-get --agreement-hash <hex>` to retrieve the full policy JSON.
 
 ### Node RPC
 
-`POST /rpc/listpolicies` — body: `{}`.
+`POST /rpc/listpolicies` — body: `{ "active_only": false }`.
+Set `"active_only": true` to filter out expired policies.
 Response:
 ```json
 {
   "count": 2,
+  "active_only": false,
   "policies": [
     {
       "agreement_hash": "<hex>",
       "policy_id": "<id>",
       "required_proofs": 1,
-      "attestors": 1
+      "attestors": 1,
+      "expires_at_height": null,
+      "expired": false
     }
   ]
 }
