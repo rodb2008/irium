@@ -542,8 +542,8 @@ irium-wallet agreement-policy-check \
 ## agreement-policy-set
 
 Stores a `ProofPolicy` on the node, associating it with the `agreement_hash` embedded
-in the policy. If a policy for that agreement hash already exists with a different
-`policy_id`, it is replaced.
+in the policy. Each `agreement_hash` holds at most one active policy. Attempting to store
+a different `policy_id` for the same hash is rejected unless `--replace` is given.
 
 ```
 irium-wallet agreement-policy-set \
@@ -562,10 +562,14 @@ irium-wallet agreement-policy-set \
 ### Storage behavior
 
 The node persists all policies to `$IRIUM_DATA_DIR/state/policies.json` (default
-`~/.irium/state/policies.json`). One policy is stored per `agreement_hash`; a second
-`agreement-policy-set` for the same hash with a different `policy_id` overwrites
-the previous entry. Storing the exact same `policy_id` again is a no-op (reported
-as `status rejected`). Pass `--replace` to overwrite a different `policy_id`.
+`~/.irium/state/policies.json`). One policy is stored per `agreement_hash`. The four possible outcomes are:
+
+| Scenario | result |
+|---|---|
+| Fresh `agreement_hash` | accepted (`status accepted`) |
+| Same `policy_id` again | silent no-op (`status rejected`, no change) |
+| Different `policy_id`, no `--replace` | rejected (`status rejected`) with message naming the existing policy |
+| Different `policy_id` with `--replace` | overwrites previous (`status replaced`) |
 
 ### Default output
 
