@@ -3706,6 +3706,9 @@ pub struct ProofPolicy {
     pub no_response_rules: Vec<NoResponseRule>,
     pub attestors: Vec<ApprovedAttestor>,
     pub notes: Option<String>,
+    /// Block height at which this policy expires. None means the policy never expires.
+    #[serde(default)]
+    pub expires_at_height: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5255,7 +5258,14 @@ mod tests {
                 domain: None,
             }],
             notes: None,
+            expires_at_height: None,
         }
+    }
+
+    fn make_test_policy_with_expiry(agreement_hash: &str, expires_at_height: u64) -> ProofPolicy {
+        let mut p = make_test_policy(agreement_hash, "pk-expiry", "att-expiry");
+        p.expires_at_height = Some(expires_at_height);
+        p
     }
 
     fn sign_proof(proof: &SettlementProof, signing_key: &SigningKey) -> ProofSignatureEnvelope {
@@ -6061,6 +6071,45 @@ mod tests {
             outcome.message.contains("same policy_id"),
             "message must mention same policy_id; got: {}", outcome.message
         );
+    }
+
+
+
+    #[test]
+    fn proof_policy_expiry_field_roundtrips_through_store() {
+        let mut store = make_policy_store();
+        let policy = make_test_policy_with_expiry("exp-hash-001", 42);
+        store.store(policy.clone(), false).expect("must accept");
+        let got = store.get("exp-hash-001").expect("must exist");
+        assert_eq!(got.expires_at_height, Some(42), "expiry must round-trip");
+    }
+
+    #[test]
+    fn proof_policy_no_expiry_defaults_none() {
+        let mut store = make_policy_store();
+        let policy = make_test_policy("no-exp-hash", "pk-abc", "att-abc");
+        store.store(policy, false).expect("must accept");
+        let got = store.get("no-exp-hash").expect("must exist");
+        assert_eq!(got.expires_at_height, None);
+    }
+
+    #[test]
+    fn proof_policy_expiry_persists_across_reload() {
+        let path = std::env::temp_dir().join(format!(
+            "irium_test_exp_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        {
+            let mut store = PolicyStore::new(path.clone());
+            let policy = make_test_policy_with_expiry("exp-persist-hash", 9999);
+            store.store(policy, false).expect("must accept");
+        }
+        let store2 = PolicyStore::new(path);
+        let got = store2.get("exp-persist-hash").expect("must exist after reload");
+        assert_eq!(got.expires_at_height, Some(9999));
     }
 
 

@@ -438,6 +438,8 @@ struct PolicySummaryItem {
     policy_id: String,
     required_proofs: usize,
     attestors: usize,
+    expires_at_height: Option<u64>,
+    expired: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -531,6 +533,8 @@ struct GetPolicyRpcResponse {
     agreement_hash: String,
     found: bool,
     policy: Option<ProofPolicy>,
+    expires_at_height: Option<u64>,
+    expired: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -543,6 +547,8 @@ struct EvaluatePolicyRpcResponse {
     agreement_hash: String,
     policy_found: bool,
     policy_id: Option<String>,
+    #[serde(default)]
+    expired: bool,
     tip_height: u64,
     proof_count: usize,
     release_eligible: bool,
@@ -570,6 +576,7 @@ struct PolicySetCliOptions {
     rpc_url: String,
     json_mode: bool,
     replace: bool,
+    expires_at_height: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1781,7 +1788,7 @@ fn usage() {
     eprintln!("  irium-wallet agreement-release-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-refund-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-policy-check --agreement <agreement.json|-> --policy <policy.json|-> [--proof <proof.json>]... [--rpc <url>] [--json]");
-  eprintln!("  irium-wallet agreement-policy-set --policy <policy.json|-> [--rpc <url>] [--json] [--replace]");
+  eprintln!("  irium-wallet agreement-policy-set --policy <policy.json|-> [--rpc <url>] [--json] [--replace] [--expires-at-height <n>]");
   eprintln!("  irium-wallet agreement-policy-get --agreement-hash <hex> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-evaluate --agreement <agreement.json|-> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-list [--rpc <url>] [--json]");
@@ -4763,6 +4770,7 @@ fn parse_policy_set_cli(args: &[String]) -> Result<PolicySetCliOptions, String> 
     let mut rpc_url = default_rpc_url();
     let mut json_mode = false;
     let mut replace = false;
+    let mut expires_at_height: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -4786,6 +4794,15 @@ fn parse_policy_set_cli(args: &[String]) -> Result<PolicySetCliOptions, String> 
             "--replace" => {
                 replace = true;
             }
+            "--expires-at-height" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--expires-at-height requires a value".to_string());
+                }
+                expires_at_height = Some(args[i].parse::<u64>().map_err(|_| {
+                    format!("--expires-at-height must be a non-negative integer, got: {}", args[i])
+                })?);
+            }
             other => {
                 return Err(format!("unknown argument: {}", other));
             }
@@ -4797,6 +4814,7 @@ fn parse_policy_set_cli(args: &[String]) -> Result<PolicySetCliOptions, String> 
         rpc_url,
         json_mode,
         replace,
+        expires_at_height,
     })
 }
 
@@ -4867,9 +4885,13 @@ fn render_policy_list_summary(resp: &ListPoliciesRpcResponse) -> String {
     let mut lines = Vec::new();
     lines.push(format!("count {}", resp.count));
     for p in &resp.policies {
+        let expiry = match p.expires_at_height {
+            None => "expires_at_height none".to_string(),
+            Some(h) => format!("expires_at_height {} expired {}", h, p.expired),
+        };
         lines.push(format!(
-            "  agreement_hash {} policy_id {} required_proofs {} attestors {}",
-            p.agreement_hash, p.policy_id, p.required_proofs, p.attestors
+            "  agreement_hash {} policy_id {} required_proofs {} attestors {} {}",
+            p.agreement_hash, p.policy_id, p.required_proofs, p.attestors, expiry
         ));
     }
     lines.join("\n")
@@ -4924,6 +4946,7 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
     lines.push(format!("policy_found {}", resp.policy_found));
     lines.push(format!("tip_height {}", resp.tip_height));
     lines.push(format!("proof_count {}", resp.proof_count));
+    lines.push(format!("expired {}", resp.expired));
     lines.push(format!("release_eligible {}", resp.release_eligible));
     lines.push(format!("refund_eligible {}", resp.refund_eligible));
     lines.push(format!("reason {}", resp.reason));
@@ -4951,13 +4974,27 @@ fn render_policy_set_summary(resp: &StorePolicyRpcResponse) -> String {
 fn render_policy_get_summary(resp: &GetPolicyRpcResponse) -> String {
     match &resp.policy {
         None => format!("agreement_hash {}\nfound false", resp.agreement_hash),
-        Some(p) => format!(
-            "policy_id {}\nagreement_hash {}\nrequired_proofs {}\nattestors {}\nfound true",
-            p.policy_id,
-            p.agreement_hash,
-            p.required_proofs.len(),
-            p.attestors.len()
-        ),
+        Some(p) => {
+            let expiry = match resp.expires_at_height {
+                None => "none".to_string(),
+                Some(h) => format!("{}", h),
+            };
+            format!(
+                "policy_id {}
+agreement_hash {}
+required_proofs {}
+attestors {}
+expires_at_height {}
+expired {}
+found true",
+                p.policy_id,
+                p.agreement_hash,
+                p.required_proofs.len(),
+                p.attestors.len(),
+                expiry,
+                resp.expired
+            )
+        }
     }
 }
 
@@ -8862,7 +8899,10 @@ mod tests {
                     domain: None,
                 }],
                 notes: None,
+                expires_at_height: None,
             }),
+            expires_at_height: None,
+            expired: false,
         };
         let out = render_policy_get_summary(&resp);
         assert!(out.contains("pol-found"), "got: {out}");
@@ -8876,6 +8916,8 @@ mod tests {
             agreement_hash: "nothere".to_string(),
             found: false,
             policy: None,
+            expires_at_height: None,
+            expired: false,
         };
         let out = render_policy_get_summary(&resp);
         assert!(out.contains("found false"), "got: {out}");
@@ -8921,6 +8963,7 @@ mod tests {
             refund_eligible: false,
             reason: "all release requirements satisfied".to_string(),
             evaluated_rules: vec!["proof 'prf-1' verified ok".to_string()],
+            expired: false,
         };
         let out = render_policy_evaluate_summary(&resp);
         assert!(out.contains("agreement_hash aabbcc"), "got: {out}");
@@ -8943,6 +8986,7 @@ mod tests {
             refund_eligible: false,
             reason: "no policy stored for this agreement".to_string(),
             evaluated_rules: vec![],
+            expired: false,
         };
         let out = render_policy_evaluate_summary(&resp);
         assert!(out.contains("policy_found false"), "got: {out}");
@@ -8962,6 +9006,7 @@ mod tests {
             refund_eligible: false,
             reason: "no release or refund condition was met".to_string(),
             evaluated_rules: vec![],
+            expired: false,
         };
         let out = render_policy_evaluate_summary(&resp);
         assert!(out.contains("proof_count 0"), "got: {out}");
@@ -9009,12 +9054,16 @@ mod tests {
                     policy_id: "pol-001".to_string(),
                     required_proofs: 1,
                     attestors: 2,
+                    expires_at_height: None,
+                    expired: false,
                 },
                 PolicySummaryItem {
                     agreement_hash: "ddeeff".to_string(),
                     policy_id: "pol-002".to_string(),
                     required_proofs: 2,
                     attestors: 1,
+                    expires_at_height: None,
+                    expired: false,
                 },
             ],
         };
@@ -9061,6 +9110,118 @@ mod tests {
         let out = render_policy_set_summary(&resp);
         assert!(out.contains("rejected"), "got: {out}");
         assert!(out.contains("--replace"), "message must propagate; got: {out}");
+    }
+
+
+    #[test]
+    fn policy_set_cli_parses_expires_at_height() {
+        let args: Vec<String> = vec![
+            "--policy".to_string(), "p.json".to_string(),
+            "--expires-at-height".to_string(), "1000".to_string(),
+        ];
+        let opts = parse_policy_set_cli(&args).expect("must parse");
+        assert_eq!(opts.expires_at_height, Some(1000));
+    }
+
+    #[test]
+    fn policy_set_cli_expires_at_height_defaults_none() {
+        let args: Vec<String> = vec![
+            "--policy".to_string(), "p.json".to_string(),
+        ];
+        let opts = parse_policy_set_cli(&args).expect("must parse");
+        assert_eq!(opts.expires_at_height, None);
+    }
+
+    #[test]
+    fn policy_set_cli_rejects_invalid_expires_height() {
+        let args: Vec<String> = vec![
+            "--policy".to_string(), "p.json".to_string(),
+            "--expires-at-height".to_string(), "notanumber".to_string(),
+        ];
+        let err = parse_policy_set_cli(&args).unwrap_err();
+        assert!(err.contains("integer") || err.contains("expires-at-height"), "got: {err}");
+    }
+
+    #[test]
+    fn render_policy_get_summary_shows_expiry_info() {
+        use irium_node_rs::settlement::{ApprovedAttestor, ProofRequirement};
+        let resp = GetPolicyRpcResponse {
+            agreement_hash: "aabbcc".to_string(),
+            found: true,
+            policy: Some(ProofPolicy {
+                policy_id: "pol-exp".to_string(),
+                schema_id: "irium.phase2.proof_policy.v1".to_string(),
+                agreement_hash: "aabbcc".to_string(),
+                required_proofs: vec![],
+                no_response_rules: vec![],
+                attestors: vec![],
+                notes: None,
+                expires_at_height: Some(500),
+            }),
+            expires_at_height: Some(500),
+            expired: false,
+        };
+        let out = render_policy_get_summary(&resp);
+        assert!(out.contains("500"), "must show expiry height; got: {out}");
+        assert!(out.contains("expired false"), "must show expired false; got: {out}");
+    }
+
+    #[test]
+    fn render_policy_get_summary_shows_expired_true() {
+        use irium_node_rs::settlement::{ApprovedAttestor, ProofRequirement};
+        let resp = GetPolicyRpcResponse {
+            agreement_hash: "ddeeff".to_string(),
+            found: true,
+            policy: Some(ProofPolicy {
+                policy_id: "pol-exp2".to_string(),
+                schema_id: "irium.phase2.proof_policy.v1".to_string(),
+                agreement_hash: "ddeeff".to_string(),
+                required_proofs: vec![],
+                no_response_rules: vec![],
+                attestors: vec![],
+                notes: None,
+                expires_at_height: Some(10),
+            }),
+            expires_at_height: Some(10),
+            expired: true,
+        };
+        let out = render_policy_get_summary(&resp);
+        assert!(out.contains("expired true"), "must show expired true; got: {out}");
+    }
+
+    #[test]
+    fn render_policy_list_summary_shows_expiry() {
+        let resp = ListPoliciesRpcResponse {
+            count: 1,
+            policies: vec![PolicySummaryItem {
+                agreement_hash: "zzhash".to_string(),
+                policy_id: "pol-exp-list".to_string(),
+                required_proofs: 0,
+                attestors: 0,
+                expires_at_height: Some(777),
+                expired: true,
+            }],
+        };
+        let out = render_policy_list_summary(&resp);
+        assert!(out.contains("777"), "must show expiry height; got: {out}");
+        assert!(out.contains("expired true"), "must show expired; got: {out}");
+    }
+
+    #[test]
+    fn render_policy_list_summary_no_expiry_shows_none() {
+        let resp = ListPoliciesRpcResponse {
+            count: 1,
+            policies: vec![PolicySummaryItem {
+                agreement_hash: "nohash".to_string(),
+                policy_id: "pol-no-exp".to_string(),
+                required_proofs: 0,
+                attestors: 0,
+                expires_at_height: None,
+                expired: false,
+            }],
+        };
+        let out = render_policy_list_summary(&resp);
+        assert!(out.contains("expires_at_height none"), "must show none; got: {out}");
     }
 
 
@@ -12122,7 +12283,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let policy: ProofPolicy = {
+            let mut policy: ProofPolicy = {
                 let data = match read_text_from_path_or_stdin(
                     Path::new(&opts.policy_path),
                     "policy json",
@@ -12149,6 +12310,9 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            if let Some(h) = opts.expires_at_height {
+                policy.expires_at_height = Some(h);
+            }
             let req = StorePolicyRpcRequest { policy, replace: opts.replace };
             let resp: StorePolicyRpcResponse =
                 match rpc_post_json(&client, base, "/rpc/storepolicy", &req) {

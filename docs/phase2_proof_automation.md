@@ -558,6 +558,7 @@ irium-wallet agreement-policy-set \
 | `--rpc <url>` | no | Node RPC base URL. Defaults to `IRIUM_RPC_URL` or `http://127.0.0.1:38300` |
 | `--json` | no | Print the full response JSON to stdout |
 | `--replace` | no | Overwrite an existing policy for the same agreement hash |
+| `--expires-at-height <n>` | no | Block height at which this policy expires. Omit for no expiry. |
 
 ### Storage behavior
 
@@ -583,6 +584,19 @@ status accepted
 
 `POST /rpc/storepolicy` — body: `{ "policy": <ProofPolicy>, "replace": false }`.
 Response: `{ policy_id, agreement_hash, accepted, updated, message }`.
+
+### Policy expiry
+
+A policy may carry an optional `expires_at_height` field (a `u64` block height).
+
+- If `expires_at_height` is absent or `null`, the policy never expires.
+- If `tip_height >= expires_at_height`, the policy is considered expired.
+- Expiry is evaluated at query time — no automatic deletion occurs.
+- `/rpc/evaluatepolicy` returns `expired: true` and skips proof evaluation for expired policies.
+- `/rpc/checkpolicy` (manual check) does **not** enforce expiry; the caller supplies the policy directly.
+- `/rpc/getpolicy` and `/rpc/listpolicies` include `expires_at_height` and `expired` in their responses.
+
+Pass `--expires-at-height <n>` to `agreement-policy-set` to set the expiry height when storing.
 
 ---
 
