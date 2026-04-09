@@ -399,9 +399,13 @@ message proof accepted
 
 ## irium-wallet agreement-proof-list
 
+Lists settlement proofs stored on the node. When `--agreement-hash` is omitted all
+proofs in the store are returned (global listing). When provided, only proofs for
+that agreement are returned.
+
 ```
 irium-wallet agreement-proof-list \
-  --agreement-hash <hex> \
+  [--agreement-hash <hex>] \
   [--rpc <url>] \
   [--json]
 ```
@@ -410,17 +414,33 @@ irium-wallet agreement-proof-list \
 
 | Flag | Required | Description |
 |---|---|---|
-| `--agreement-hash <hex>` | yes | SHA-256 hex of the agreement to query |
+| `--agreement-hash <hex>` | no | SHA-256 hex of the agreement to filter by. Omit to list all proofs. |
 | `--rpc <url>` | no | Node RPC base URL |
 | `--json` | no | Output raw JSON response |
 
-### Default output
+### Default output (filtered)
 
 ```
 agreement_hash <64-char hex>
 count 1
-  proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation
+  agreement_hash=<64-char hex> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation
 ```
+
+### Default output (global — no filter)
+
+```
+agreement_hash * (all)
+count 3
+  agreement_hash=<hex-a> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation
+  agreement_hash=<hex-b> proof_id=prf-002 attested_by=attestor-b proof_type=payment
+  agreement_hash=<hex-c> proof_id=prf-003 attested_by=attestor-c proof_type=milestone
+```
+
+### RPC body
+
+Sends `POST /rpc/listproofs` with body:
+- `{}` when no `--agreement-hash` is given (returns all proofs; response `agreement_hash` is `"*"`)
+- `{ "agreement_hash": "<hex>" }` when a filter is provided
 
 ### Exit codes
 

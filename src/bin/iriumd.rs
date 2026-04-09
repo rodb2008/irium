@@ -699,7 +699,9 @@ struct ListPoliciesResponse {
 
 #[derive(Deserialize)]
 struct ListProofsRequest {
-    agreement_hash: String,
+    /// Filter by agreement hash. When absent, all proofs are returned.
+    #[serde(default)]
+    agreement_hash: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -5100,14 +5102,20 @@ async fn list_proofs_rpc(
         .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
     require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
     let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
-    let proofs: Vec<SettlementProof> = store
-        .list_by_agreement(&req.agreement_hash)
-        .into_iter()
-        .cloned()
-        .collect();
+    let (filter_hash, proofs): (String, Vec<SettlementProof>) =
+        match req.agreement_hash.as_deref() {
+            Some(h) => (
+                h.to_string(),
+                store.list_by_agreement(h).into_iter().cloned().collect(),
+            ),
+            None => (
+                "*".to_string(),
+                store.list_all().into_iter().cloned().collect(),
+            ),
+        };
     let count = proofs.len();
     Ok(Json(ListProofsResponse {
-        agreement_hash: req.agreement_hash,
+        agreement_hash: filter_hash,
         count,
         proofs,
     }))
@@ -8441,7 +8449,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Json(ListProofsRequest {
-                agreement_hash: "listtest".to_string(),
+                agreement_hash: Some("listtest".to_string()),
             }),
         )
         .await
@@ -9373,6 +9381,92 @@ mod tests {
         .expect("list must succeed")
         .0;
         assert_eq!(resp.count, 2, "active_only must keep no-expiry policies");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_all_returns_every_proof() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[19u8; 32]).into()).unwrap();
+        // Submit one proof; make_signed_proof_for_rpc hardcodes proof_id so only one unique proof.
+        let proof_a = make_signed_proof_for_rpc("hash-aaa", &sk);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof: proof_a }),
+        )
+        .await
+        .expect("submit");
+        // List all without filter: must return the proof with agreement_hash="*"
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None }),
+        )
+        .await
+        .expect("list all must succeed")
+        .0;
+        assert_eq!(resp.count, 1, "must return the stored proof; got count={}", resp.count);
+        assert_eq!(resp.agreement_hash, "*", "agreement_hash must be * for global list");
+        assert_eq!(resp.proofs[0].agreement_hash, "hash-aaa", "proof must carry its own agreement_hash");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_filter_still_works_with_some() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[21u8; 32]).into()).unwrap();
+        // Submit one proof for hash-filter-a.
+        let proof_a = make_signed_proof_for_rpc("hash-filter-a", &sk);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof: proof_a }),
+        )
+        .await
+        .expect("submit");
+        // Filter by hash-filter-a: must return 1 proof.
+        let resp_a = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: Some("hash-filter-a".to_string()) }),
+        )
+        .await
+        .expect("filtered list must succeed")
+        .0;
+        assert_eq!(resp_a.count, 1, "filter must return only matching proof");
+        assert_eq!(resp_a.agreement_hash, "hash-filter-a");
+        assert_eq!(resp_a.proofs[0].agreement_hash, "hash-filter-a");
+        // Filter by hash-filter-b: no proofs stored under that hash.
+        let resp_b = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: Some("hash-filter-b".to_string()) }),
+        )
+        .await
+        .expect("filter-b list must succeed")
+        .0;
+        assert_eq!(resp_b.count, 0, "filter-b must return no proofs");
+        assert_eq!(resp_b.agreement_hash, "hash-filter-b");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_all_empty_store_returns_zero() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None }),
+        )
+        .await
+        .expect("empty all list must succeed")
+        .0;
+        assert_eq!(resp.count, 0);
+        assert_eq!(resp.agreement_hash, "*");
     }
 
 

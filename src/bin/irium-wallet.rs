@@ -455,7 +455,8 @@ struct ListPoliciesRpcResponse {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ListProofsRpcRequest {
-    agreement_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agreement_hash: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -474,7 +475,7 @@ struct ProofSubmitCliOptions {
 
 #[derive(Debug, Clone)]
 struct ProofListCliOptions {
-    agreement_hash: String,
+    agreement_hash: Option<String>,
     rpc_url: String,
     json_mode: bool,
 }
@@ -1800,7 +1801,7 @@ fn usage() {
   eprintln!("  irium-wallet agreement-policy-list [--active-only] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <unix>] [--out <path>] [--json]");
     eprintln!("  irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>] [--json]");
-    eprintln!("  irium-wallet agreement-proof-list --agreement-hash <hex> [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-proof-list [--agreement-hash <hex>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-release-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
     eprintln!("  irium-wallet agreement-refund-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
     eprintln!("  irium-wallet agreement-release-send <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
@@ -4629,7 +4630,7 @@ fn parse_proof_list_cli(args: &[String]) -> Result<ProofListCliOptions, String> 
         i += 1;
     }
     Ok(ProofListCliOptions {
-        agreement_hash: agreement_hash.ok_or_else(|| "--agreement-hash is required".to_string())?,
+        agreement_hash,
         rpc_url,
         json_mode,
     })
@@ -4760,12 +4761,16 @@ fn render_proof_submit_summary(resp: &SubmitProofRpcResponse) -> String {
 
 fn render_proof_list_summary(resp: &ListProofsRpcResponse) -> String {
     let mut lines = Vec::new();
-    lines.push(format!("agreement_hash {}", resp.agreement_hash));
+    if resp.agreement_hash == "*" {
+        lines.push("agreement_hash * (all)".to_string());
+    } else {
+        lines.push(format!("agreement_hash {}", resp.agreement_hash));
+    }
     lines.push(format!("count {}", resp.count));
     for proof in &resp.proofs {
         lines.push(format!(
-            "  proof_id={} attested_by={} proof_type={}",
-            proof.proof_id, proof.attested_by, proof.proof_type
+            "  agreement_hash={} proof_id={} attested_by={} proof_type={}",
+            proof.agreement_hash, proof.proof_id, proof.attested_by, proof.proof_type
         ));
     }
     lines.join("\n")
@@ -8446,7 +8451,7 @@ mod tests {
     fn proof_list_cli_parses_required_args() {
         let args: Vec<String> = vec!["--agreement-hash".to_string(), "aabbcc".to_string()];
         let opts = parse_proof_list_cli(&args).expect("must parse");
-        assert_eq!(opts.agreement_hash, "aabbcc");
+        assert_eq!(opts.agreement_hash, Some("aabbcc".to_string()));
         assert!(!opts.json_mode);
     }
 
@@ -8458,15 +8463,15 @@ mod tests {
             "--json".to_string(),
         ];
         let opts = parse_proof_list_cli(&args).expect("must parse");
-        assert_eq!(opts.agreement_hash, "aabbcc");
+        assert_eq!(opts.agreement_hash, Some("aabbcc".to_string()));
         assert!(opts.json_mode);
     }
 
     #[test]
-    fn proof_list_cli_rejects_missing_agreement_hash() {
+    fn proof_list_cli_agreement_hash_optional() {
         let args: Vec<String> = vec!["--json".to_string()];
-        let err = parse_proof_list_cli(&args).unwrap_err();
-        assert!(err.contains("--agreement-hash"), "got: {err}");
+        let opts = parse_proof_list_cli(&args).expect("must parse without --agreement-hash");
+        assert_eq!(opts.agreement_hash, None);
     }
 
     #[test]
@@ -8529,6 +8534,7 @@ mod tests {
         assert!(out.contains("count 1"), "got: {out}");
         assert!(out.contains("prf-list-001"), "got: {out}");
         assert!(out.contains("att-1"), "got: {out}");
+        assert!(out.contains("agreement_hash=aabbcc"), "per-proof hash; got: {out}");
     }
 
     #[test]
@@ -9284,6 +9290,40 @@ mod tests {
         };
         let out = render_policy_list_summary(&resp);
         assert!(!out.contains("filter active_only"), "must not show filter header; got: {out}");
+    }
+
+
+    #[test]
+    fn proof_list_cli_agreement_hash_parsed_when_provided() {
+        let args: Vec<String> = vec![
+            "--agreement-hash".to_string(), "deadbeef".to_string(),
+        ];
+        let opts = parse_proof_list_cli(&args).expect("must parse");
+        assert_eq!(opts.agreement_hash, Some("deadbeef".to_string()));
+    }
+
+    #[test]
+    fn render_proof_list_summary_global_shows_star() {
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "*".to_string(),
+            count: 0,
+            proofs: vec![],
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("agreement_hash * (all)"), "must show global header; got: {out}");
+        assert!(out.contains("count 0"), "got: {out}");
+    }
+
+    #[test]
+    fn render_proof_list_summary_filtered_shows_hash() {
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "aabbcc".to_string(),
+            count: 0,
+            proofs: vec![],
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("agreement_hash aabbcc"), "must show filter hash; got: {out}");
+        assert!(!out.contains("(all)"), "must not show global marker; got: {out}");
     }
 
 
@@ -12232,7 +12272,7 @@ fn main() {
                 }
             };
             let req = ListProofsRpcRequest {
-                agreement_hash: opts.agreement_hash,
+                agreement_hash: opts.agreement_hash.clone(),
             };
             let resp: ListProofsRpcResponse =
                 match rpc_post_json(&client, base, "/rpc/listproofs", &req) {

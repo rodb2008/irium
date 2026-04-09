@@ -4097,6 +4097,17 @@ impl ProofStore {
         proofs
     }
 
+    /// Return all proofs in the store, sorted by agreement_hash then proof_id.
+    pub fn list_all(&self) -> Vec<&SettlementProof> {
+        let mut proofs: Vec<&SettlementProof> = self.proofs.values().collect();
+        proofs.sort_by(|a, b| {
+            a.agreement_hash
+                .cmp(&b.agreement_hash)
+                .then_with(|| a.proof_id.cmp(&b.proof_id))
+        });
+        proofs
+    }
+
     pub fn count(&self) -> usize {
         self.proofs.len()
     }
