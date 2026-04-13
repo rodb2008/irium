@@ -457,6 +457,8 @@ struct ListPoliciesRpcResponse {
 struct ListProofsRpcRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     agreement_hash: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    active_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -465,6 +467,9 @@ struct ListProofsRpcResponse {
     /// Chain tip height at query time. Used to compute expired = tip_height >= proof.expires_at_height.
     #[serde(default)]
     tip_height: u64,
+    /// Echoed from the request; true when only non-expired proofs were returned.
+    #[serde(default)]
+    active_only: bool,
     count: usize,
     proofs: Vec<SettlementProof>,
 }
@@ -479,6 +484,7 @@ struct ProofSubmitCliOptions {
 #[derive(Debug, Clone)]
 struct ProofListCliOptions {
     agreement_hash: Option<String>,
+    active_only: bool,
     rpc_url: String,
     json_mode: bool,
 }
@@ -1805,7 +1811,7 @@ fn usage() {
   eprintln!("  irium-wallet agreement-policy-list [--active-only] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--expires-at-height <n>] [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <unix>] [--out <path>] [--json]");
     eprintln!("  irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>] [--json]");
-    eprintln!("  irium-wallet agreement-proof-list [--agreement-hash <hex>] [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-proof-list [--agreement-hash <hex>] [--active-only] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-release-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
     eprintln!("  irium-wallet agreement-refund-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
     eprintln!("  irium-wallet agreement-release-send <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
@@ -4606,6 +4612,7 @@ fn parse_proof_submit_cli(args: &[String]) -> Result<ProofSubmitCliOptions, Stri
 
 fn parse_proof_list_cli(args: &[String]) -> Result<ProofListCliOptions, String> {
     let mut agreement_hash: Option<String> = None;
+    let mut active_only = false;
     let mut rpc_url = default_rpc_url();
     let mut json_mode = false;
     let mut i = 0;
@@ -4617,6 +4624,9 @@ fn parse_proof_list_cli(args: &[String]) -> Result<ProofListCliOptions, String> 
                     return Err("--agreement-hash requires a value".to_string());
                 }
                 agreement_hash = Some(args[i].clone());
+            }
+            "--active-only" => {
+                active_only = true;
             }
             "--rpc" => {
                 i += 1;
@@ -4636,6 +4646,7 @@ fn parse_proof_list_cli(args: &[String]) -> Result<ProofListCliOptions, String> 
     }
     Ok(ProofListCliOptions {
         agreement_hash,
+        active_only,
         rpc_url,
         json_mode,
     })
@@ -4778,6 +4789,9 @@ fn render_proof_submit_summary(resp: &SubmitProofRpcResponse) -> String {
 
 fn render_proof_list_summary(resp: &ListProofsRpcResponse) -> String {
     let mut lines = Vec::new();
+    if resp.active_only {
+        lines.push("filter active_only true".to_string());
+    }
     if resp.agreement_hash == "*" {
         lines.push("agreement_hash * (all)".to_string());
     } else {
@@ -8557,6 +8571,7 @@ mod tests {
         let resp = ListProofsRpcResponse {
             agreement_hash: "aabbcc".to_string(),
             tip_height: 0,
+            active_only: false,
             count: 1,
             proofs: vec![proof],
         };
@@ -8574,6 +8589,7 @@ mod tests {
         let resp = ListProofsRpcResponse {
             agreement_hash: "deadbeef".to_string(),
             tip_height: 0,
+            active_only: false,
             count: 0,
             proofs: vec![],
         };
@@ -9343,6 +9359,7 @@ mod tests {
         let resp = ListProofsRpcResponse {
             agreement_hash: "*".to_string(),
             tip_height: 0,
+            active_only: false,
             count: 0,
             proofs: vec![],
         };
@@ -9356,6 +9373,7 @@ mod tests {
         let resp = ListProofsRpcResponse {
             agreement_hash: "aabbcc".to_string(),
             tip_height: 0,
+            active_only: false,
             count: 0,
             proofs: vec![],
         };
@@ -9415,6 +9433,7 @@ mod tests {
         let resp = ListProofsRpcResponse {
             agreement_hash: "hashexp".to_string(),
             tip_height: 50,
+            active_only: false,
             count: 1,
             proofs: vec![proof],
         };
@@ -9448,6 +9467,7 @@ mod tests {
         let resp = ListProofsRpcResponse {
             agreement_hash: "hashexp2".to_string(),
             tip_height: 200,
+            active_only: false,
             count: 1,
             proofs: vec![proof],
         };
@@ -12453,6 +12473,7 @@ fn main() {
             };
             let req = ListProofsRpcRequest {
                 agreement_hash: opts.agreement_hash.clone(),
+                active_only: opts.active_only,
             };
             let resp: ListProofsRpcResponse =
                 match rpc_post_json(&client, base, "/rpc/listproofs", &req) {
@@ -13442,5 +13463,57 @@ fn main() {
             std::process::exit(1);
         }
     }
+
+    #[test]
+    fn parse_proof_list_cli_active_only_flag() {
+        let args: Vec<String> = vec!["--active-only".to_string()];
+        let opts = parse_proof_list_cli(&args).expect("must parse");
+        assert!(opts.active_only);
+    }
+
+    #[test]
+    fn parse_proof_list_cli_active_only_defaults_false() {
+        let args: Vec<String> = vec![];
+        let opts = parse_proof_list_cli(&args).expect("must parse");
+        assert!(!opts.active_only);
+    }
+
+    #[test]
+    fn render_proof_list_summary_active_only_shows_filter_header() {
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "*".to_string(),
+            tip_height: 0,
+            active_only: true,
+            count: 0,
+            proofs: vec![],
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("filter active_only true"), "must show filter header; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_list_summary_active_only_false_no_filter_header() {
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "*".to_string(),
+            tip_height: 0,
+            active_only: false,
+            count: 0,
+            proofs: vec![],
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(!out.contains("filter active_only"), "must not show filter header; got: {out}");
+    }
+
+    #[test]
+    fn parse_proof_list_cli_active_only_combined_with_agreement_hash() {
+        let args: Vec<String> = vec![
+            "--active-only".to_string(),
+            "--agreement-hash".to_string(), "deadbeef".to_string(),
+        ];
+        let opts = parse_proof_list_cli(&args).expect("must parse");
+        assert!(opts.active_only);
+        assert_eq!(opts.agreement_hash, Some("deadbeef".to_string()));
+    }
+
 
 }

@@ -401,11 +401,13 @@ message proof accepted
 
 Lists settlement proofs stored on the node. When `--agreement-hash` is omitted all
 proofs in the store are returned (global listing). When provided, only proofs for
-that agreement are returned.
+that agreement are returned. `--active-only` excludes proofs that have expired at
+the current chain tip.
 
 ```
 irium-wallet agreement-proof-list \
   [--agreement-hash <hex>] \
+  [--active-only] \
   [--rpc <url>] \
   [--json]
 ```
@@ -415,6 +417,7 @@ irium-wallet agreement-proof-list \
 | Flag | Required | Description |
 |---|---|---|
 | `--agreement-hash <hex>` | no | SHA-256 hex of the agreement to filter by. Omit to list all proofs. |
+| `--active-only` | no | Return only proofs that are not expired at the current chain tip. |
 | `--rpc <url>` | no | Node RPC base URL |
 | `--json` | no | Output raw JSON response |
 
@@ -436,11 +439,28 @@ count 3
   agreement_hash=<hex-c> proof_id=prf-003 attested_by=attestor-c proof_type=milestone expires_at_height=100 expired=true
 ```
 
+### With `--active-only`
+
+```
+filter active_only true
+agreement_hash * (all)
+count 2
+  agreement_hash=<hex-a> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation expires_at_height=none
+  agreement_hash=<hex-b> proof_id=prf-002 attested_by=attestor-b proof_type=payment expires_at_height=5000 expired=false
+```
+
+Proofs with `tip_height >= expires_at_height` are omitted. The `filter active_only true` header
+confirms the filter is active. `--active-only` and `--agreement-hash` may be combined.
+
 ### RPC body
 
 Sends `POST /rpc/listproofs` with body:
-- `{}` when no `--agreement-hash` is given (returns all proofs; response `agreement_hash` is `"*"`)
-- `{ "agreement_hash": "<hex>" }` when a filter is provided
+- `{}` — all proofs, no filter
+- `{ "agreement_hash": "<hex>" }` — filter by agreement
+- `{ "active_only": true }` — only non-expired proofs
+- `{ "agreement_hash": "<hex>", "active_only": true }` — both filters combined
+
+The response includes `"active_only": true/false` echoing the filter.
 
 ### Exit codes
 

@@ -702,6 +702,9 @@ struct ListProofsRequest {
     /// Filter by agreement hash. When absent, all proofs are returned.
     #[serde(default)]
     agreement_hash: Option<String>,
+    /// When true, only proofs that are not expired at the current tip are returned.
+    #[serde(default)]
+    active_only: bool,
 }
 
 #[derive(Serialize)]
@@ -710,6 +713,8 @@ struct ListProofsResponse {
     /// Chain tip height at the time of the query; clients use this to compute
     /// expired = tip_height >= proof.expires_at_height.
     tip_height: u64,
+    /// Echoes the active_only filter from the request.
+    active_only: bool,
     count: usize,
     proofs: Vec<SettlementProof>,
 }
@@ -5109,7 +5114,7 @@ async fn list_proofs_rpc(
         chain.tip_height()
     };
     let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
-    let (filter_hash, proofs): (String, Vec<SettlementProof>) =
+    let (filter_hash, mut proofs): (String, Vec<SettlementProof>) =
         match req.agreement_hash.as_deref() {
             Some(h) => (
                 h.to_string(),
@@ -5120,10 +5125,17 @@ async fn list_proofs_rpc(
                 store.list_all().into_iter().cloned().collect(),
             ),
         };
+    if req.active_only {
+        proofs.retain(|p| match p.expires_at_height {
+            None => true,
+            Some(h) => tip_height < h,
+        });
+    }
     let count = proofs.len();
     Ok(Json(ListProofsResponse {
         agreement_hash: filter_hash,
         tip_height,
+        active_only: req.active_only,
         count,
         proofs,
     }))
@@ -8480,6 +8492,7 @@ mod tests {
             HeaderMap::new(),
             Json(ListProofsRequest {
                 agreement_hash: Some("listtest".to_string()),
+                active_only: false,
             }),
         )
         .await
@@ -9432,7 +9445,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: None }),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false }),
         )
         .await
         .expect("list all must succeed")
@@ -9461,7 +9474,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: Some("hash-filter-a".to_string()) }),
+            Json(ListProofsRequest { agreement_hash: Some("hash-filter-a".to_string()), active_only: false }),
         )
         .await
         .expect("filtered list must succeed")
@@ -9474,7 +9487,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: Some("hash-filter-b".to_string()) }),
+            Json(ListProofsRequest { agreement_hash: Some("hash-filter-b".to_string()), active_only: false }),
         )
         .await
         .expect("filter-b list must succeed")
@@ -9490,7 +9503,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: None }),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false }),
         )
         .await
         .expect("empty all list must succeed")
@@ -9518,7 +9531,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: None }),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false }),
         )
         .await
         .expect("list")
@@ -9547,7 +9560,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: None }),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false }),
         )
         .await
         .expect("list")
@@ -9651,5 +9664,90 @@ mod tests {
         assert!(resp.release_eligible, "must be release eligible with active proof");
     }
 
+
+
+
+    #[tokio::test]
+    async fn list_proofs_rpc_active_only_excludes_expired() {
+        // tip=0; one expired proof submitted; active_only=true must return count=0.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[24u8; 32]).into()).unwrap();
+        let mut expired_proof = make_signed_proof_for_rpc("ao-expired", &sk);
+        expired_proof.expires_at_height = Some(0);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof: expired_proof }),
+        )
+        .await
+        .expect("submit expired");
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None, active_only: true }),
+        )
+        .await
+        .expect("list active_only")
+        .0;
+        assert!(resp.active_only, "active_only must be echoed true");
+        assert_eq!(resp.count, 0, "expired proof must be excluded when active_only=true");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_active_only_keeps_non_expiring_proofs() {
+        // tip=0; proof with expires_at_height=None must be included by active_only=true.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[26u8; 32]).into()).unwrap();
+        let proof = make_signed_proof_for_rpc("ao-no-expiry", &sk);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit no-expiry proof");
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None, active_only: true }),
+        )
+        .await
+        .expect("list active_only")
+        .0;
+        assert!(resp.active_only);
+        assert_eq!(resp.count, 1, "non-expiring proof must be included when active_only=true");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_active_only_false_includes_expired() {
+        // Default: active_only=false includes expired proofs unchanged.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[27u8; 32]).into()).unwrap();
+        let mut proof = make_signed_proof_for_rpc("ao-default", &sk);
+        proof.expires_at_height = Some(0);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit expired proof");
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false }),
+        )
+        .await
+        .expect("list default")
+        .0;
+        assert!(!resp.active_only);
+        assert_eq!(resp.count, 1, "expired proof must still be included when active_only=false");
+    }
 
 }
