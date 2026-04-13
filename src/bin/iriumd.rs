@@ -707,6 +707,9 @@ struct ListProofsRequest {
 #[derive(Serialize)]
 struct ListProofsResponse {
     agreement_hash: String,
+    /// Chain tip height at the time of the query; clients use this to compute
+    /// expired = tip_height >= proof.expires_at_height.
+    tip_height: u64,
     count: usize,
     proofs: Vec<SettlementProof>,
 }
@@ -5101,6 +5104,10 @@ async fn list_proofs_rpc(
     check_rate_with_auth(&state, &addr, &headers)
         .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
     require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let tip_height = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.tip_height()
+    };
     let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
     let (filter_hash, proofs): (String, Vec<SettlementProof>) =
         match req.agreement_hash.as_deref() {
@@ -5116,6 +5123,7 @@ async fn list_proofs_rpc(
     let count = proofs.len();
     Ok(Json(ListProofsResponse {
         agreement_hash: filter_hash,
+        tip_height,
         count,
         proofs,
     }))
@@ -5206,7 +5214,7 @@ async fn evaluate_policy_rpc(
         }
         Some(p) => p,
     };
-    let proofs = {
+    let all_stored_proofs = {
         let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
         store
             .list_by_agreement(&agreement_hash)
@@ -5214,8 +5222,26 @@ async fn evaluate_policy_rpc(
             .cloned()
             .collect::<Vec<_>>()
     };
-    let proof_count = proofs.len();
-    // Expiry check: stored-policy evaluation treats expired policies as inactive.
+    // Filter out proofs whose expiry height has been reached.
+    // Expired proofs are skipped in stored evaluation; they are noted in evaluated_rules.
+    let mut expiry_rules: Vec<String> = Vec::new();
+    let active_proofs: Vec<SettlementProof> = all_stored_proofs
+        .into_iter()
+        .filter(|p| {
+            if let Some(h) = p.expires_at_height {
+                if tip_height >= h {
+                    expiry_rules.push(format!(
+                        "proof '{}' skipped: expired at height {} (tip {})"
+                        , p.proof_id, h, tip_height
+                    ));
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    let proof_count = active_proofs.len();
+    // Policy expiry check: treat expired policy as inactive.
     if let Some(expires) = policy.expires_at_height {
         if tip_height >= expires {
             return Ok(Json(EvaluatePolicyResponse {
@@ -5228,13 +5254,15 @@ async fn evaluate_policy_rpc(
                 release_eligible: false,
                 refund_eligible: false,
                 reason: format!("policy expired at height {}", expires),
-                evaluated_rules: Vec::new(),
+                evaluated_rules: expiry_rules,
             }));
         }
     }
     let policy_id = policy.policy_id.clone();
-    let result = evaluate_policy(&req.agreement, &policy, &proofs, tip_height)
+    let result = evaluate_policy(&req.agreement, &policy, &active_proofs, tip_height)
         .map_err(|e| bad(&format!("policy_eval_failed:{e}")))?;
+    let mut all_rules = expiry_rules;
+    all_rules.extend(result.evaluated_rules);
     Ok(Json(EvaluatePolicyResponse {
         agreement_hash,
         policy_found: true,
@@ -5245,7 +5273,7 @@ async fn evaluate_policy_rpc(
         release_eligible: result.release_eligible,
         refund_eligible: result.refund_eligible,
         reason: result.reason,
-        evaluated_rules: result.evaluated_rules,
+        evaluated_rules: all_rules,
     }))
 }
 
@@ -8211,6 +8239,7 @@ mod tests {
                 signature_hex: String::new(),
                 payload_hash: String::new(),
             },
+            expires_at_height: None,
         };
         proof.signature = sign_rpc_proof(&proof, sk);
         proof
@@ -8356,6 +8385,7 @@ mod tests {
                 signature_hex: String::new(),
                 payload_hash: String::new(),
             },
+            expires_at_height: None,
         };
         let payload = settlement_proof_payload_bytes(&proof).unwrap();
         let digest = sha2::Sha256::digest(&payload);
@@ -9467,6 +9497,158 @@ mod tests {
         .0;
         assert_eq!(resp.count, 0);
         assert_eq!(resp.agreement_hash, "*");
+        assert_eq!(resp.tip_height, 0, "test node starts at height 0");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_includes_tip_height() {
+        // Test state always starts at height 0; verify tip_height is present in the response.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[23u8; 32]).into()).unwrap();
+        let proof = make_signed_proof_for_rpc("th-test", &sk);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit");
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None }),
+        )
+        .await
+        .expect("list")
+        .0;
+        // Test chain starts at genesis (height 0); tip_height field must be present.
+        assert_eq!(resp.tip_height, 0, "tip_height must reflect chain genesis height");
+        assert_eq!(resp.count, 1);
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_proof_carries_expiry_field() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[24u8; 32]).into()).unwrap();
+        // Build a proof with expires_at_height set.
+        let mut proof = make_signed_proof_for_rpc("exp-carry-hash", &sk);
+        proof.expires_at_height = Some(500);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit");
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None }),
+        )
+        .await
+        .expect("list")
+        .0;
+        assert_eq!(resp.proofs[0].expires_at_height, Some(500),
+            "expires_at_height must be returned in listing");
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_skips_expired_proof() {
+        // Test chain starts at genesis (height 0). Use expires_at_height=0 so that
+        // tip_height(0) >= 0 is true: proof is immediately expired.
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false }),
+        )
+        .await
+        .expect("store policy");
+        // expires_at_height=0, tip=0 => 0 >= 0 => expired immediately.
+        let mut proof = make_rpc_proof(&agreement_hash, &sk);
+        proof.expires_at_height = Some(0);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit expired proof");
+        // evaluate_policy_rpc must find 0 active proofs (the one stored is expired).
+        let resp = evaluate_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement }),
+        )
+        .await
+        .expect("evaluate")
+        .0;
+        assert!(resp.policy_found);
+        assert!(!resp.expired, "policy itself is not expired");
+        assert_eq!(resp.proof_count, 0, "expired proof must not count as active");
+        assert!(!resp.release_eligible, "must not be release eligible without active proof");
+        let skipped = resp.evaluated_rules.iter().any(|r| r.contains("skipped: expired"));
+        assert!(skipped, "evaluated_rules must note the skipped proof; got: {:?}", resp.evaluated_rules);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_uses_active_proof_before_expiry() {
+        // Test chain starts at genesis (height 0). Use expires_at_height=1 so that
+        // tip_height(0) < 1 is true: proof is not yet expired.
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false }),
+        )
+        .await
+        .expect("store policy");
+        // expires_at_height=1, tip=0 => 0 < 1 => not expired, proof is active.
+        let mut proof = make_rpc_proof(&agreement_hash, &sk);
+        proof.expires_at_height = Some(1);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit active proof");
+        let resp = evaluate_policy_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement }),
+        )
+        .await
+        .expect("evaluate")
+        .0;
+        assert!(resp.policy_found);
+        assert!(!resp.expired);
+        assert_eq!(resp.proof_count, 1, "non-expired proof must be counted as active");
+        assert!(resp.release_eligible, "must be release eligible with active proof");
     }
 
 

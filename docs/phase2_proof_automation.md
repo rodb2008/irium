@@ -423,7 +423,7 @@ irium-wallet agreement-proof-list \
 ```
 agreement_hash <64-char hex>
 count 1
-  agreement_hash=<64-char hex> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation
+  agreement_hash=<64-char hex> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation expires_at_height=none
 ```
 
 ### Default output (global — no filter)
@@ -431,9 +431,9 @@ count 1
 ```
 agreement_hash * (all)
 count 3
-  agreement_hash=<hex-a> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation
-  agreement_hash=<hex-b> proof_id=prf-002 attested_by=attestor-b proof_type=payment
-  agreement_hash=<hex-c> proof_id=prf-003 attested_by=attestor-c proof_type=milestone
+  agreement_hash=<hex-a> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation expires_at_height=none
+  agreement_hash=<hex-b> proof_id=prf-002 attested_by=attestor-b proof_type=payment expires_at_height=5000 expired=false
+  agreement_hash=<hex-c> proof_id=prf-003 attested_by=attestor-c proof_type=milestone expires_at_height=100 expired=true
 ```
 
 ### RPC body
@@ -460,6 +460,7 @@ irium-wallet agreement-proof-create \
   --proof-type <string> \
   --attested-by <attestor-id> \
   --address <wallet-address> \
+  [--expires-at-height <n>] \
   [--milestone-id <id>] \
   [--evidence-summary <text>] \
   [--evidence-hash <hex>] \
@@ -477,6 +478,7 @@ irium-wallet agreement-proof-create \
 | `--proof-type <string>` | yes | Proof type label matching a `ProofRequirement.proof_type` in the policy |
 | `--attested-by <id>` | yes | Attestor ID to embed in the proof; must match an entry in the policy `attestors` list |
 | `--address <addr>` | yes | Wallet address whose private key signs the proof |
+| `--expires-at-height <n>` | no | Block height at which this proof becomes inactive for stored evaluation. Omit for no expiry. |
 | `--milestone-id <id>` | no | Milestone scope for milestone-specific proofs |
 | `--evidence-summary <text>` | no | Free-text description of the supporting evidence |
 | `--evidence-hash <hex>` | no | Hex hash of an external evidence artifact |
@@ -505,6 +507,7 @@ proof_type delivery_confirmation
 agreement_hash <64-char hex>
 attested_by attestor-a
 attestation_time 1700000000
+expires_at_height none
 payload_hash <64-char hex>
 pubkey_hex <compressed secp256k1 public key hex>
 ```
@@ -617,6 +620,28 @@ A policy may carry an optional `expires_at_height` field (a `u64` block height).
 - `/rpc/getpolicy` and `/rpc/listpolicies` include `expires_at_height` and `expired` in their responses.
 
 Pass `--expires-at-height <n>` to `agreement-policy-set` to set the expiry height when storing.
+
+---
+
+## Proof expiry
+
+A stored proof may carry an optional `expires_at_height` field (a `u64` block height).
+
+- If `expires_at_height` is absent or `null`, the proof never expires.
+- If `tip_height >= expires_at_height`, the proof is treated as inactive for stored evaluation.
+- Expiry is evaluated at query time — no automatic deletion of expired proofs occurs.
+- `/rpc/evaluatepolicy` skips expired stored proofs; each skipped proof is noted in
+  `evaluated_rules` with the message `"proof '<id>' skipped: expired at height <H> (tip <T)"`.
+- `/rpc/checkpolicy` (manual check) does **not** enforce proof expiry; the caller supplies
+  proofs directly and is responsible for filtering.
+- `/rpc/listproofs` includes `expires_at_height` per proof and a top-level `tip_height` so
+  clients can compute `expired = tip_height >= proof.expires_at_height`.
+- The `irium-wallet agreement-proof-list` output shows `expires_at_height=<N> expired=<bool>`
+  (or `expires_at_height=none`) per proof line.
+
+Pass `--expires-at-height <n>` to `agreement-proof-create` to set the expiry height when
+creating a proof. The field is stored as plain metadata and is **not** included in the
+signature payload — the signature covers only the proof content fields, not its TTL.
 
 ---
 

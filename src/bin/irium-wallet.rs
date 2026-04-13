@@ -462,6 +462,9 @@ struct ListProofsRpcRequest {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ListProofsRpcResponse {
     agreement_hash: String,
+    /// Chain tip height at query time. Used to compute expired = tip_height >= proof.expires_at_height.
+    #[serde(default)]
+    tip_height: u64,
     count: usize,
     proofs: Vec<SettlementProof>,
 }
@@ -493,6 +496,7 @@ struct ProofCreateCliOptions {
     timestamp: Option<u64>,
     out_path: Option<String>,
     json_mode: bool,
+    expires_at_height: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1799,7 +1803,7 @@ fn usage() {
   eprintln!("  irium-wallet agreement-policy-get --agreement-hash <hex> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-evaluate --agreement <agreement.json|-> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-list [--active-only] [--rpc <url>] [--json]");
-    eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <unix>] [--out <path>] [--json]");
+    eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--expires-at-height <n>] [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <unix>] [--out <path>] [--json]");
     eprintln!("  irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-list [--agreement-hash <hex>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-release-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
@@ -2655,6 +2659,7 @@ fn create_settlement_proof_signed(opts: &ProofCreateCliOptions) -> Result<Settle
             signature_hex: String::new(),
             payload_hash: String::new(),
         },
+        expires_at_height: opts.expires_at_height,
     };
 
     let payload_bytes = settlement_proof_payload_bytes(&proof)
@@ -4648,6 +4653,7 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
     let mut timestamp: Option<u64> = None;
     let mut out_path: Option<String> = None;
     let mut json_mode = false;
+    let mut expires_at_height: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -4724,6 +4730,16 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
                 }
                 out_path = Some(args[i].clone());
             }
+            "--expires-at-height" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--expires-at-height requires a value".to_string());
+                }
+                let v: u64 = args[i].parse().map_err(|_| {
+                    format!("--expires-at-height must be a non-negative integer, got: {}", args[i])
+                })?;
+                expires_at_height = Some(v);
+            }
             "--json" => {
                 json_mode = true;
             }
@@ -4746,6 +4762,7 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
         timestamp,
         out_path,
         json_mode,
+        expires_at_height,
     })
 }
 
@@ -4768,9 +4785,17 @@ fn render_proof_list_summary(resp: &ListProofsRpcResponse) -> String {
     }
     lines.push(format!("count {}", resp.count));
     for proof in &resp.proofs {
+        let expiry_str = match proof.expires_at_height {
+            None => "expires_at_height=none".to_string(),
+            Some(h) => {
+                let expired = resp.tip_height >= h;
+                format!("expires_at_height={} expired={}", h, expired)
+            }
+        };
         lines.push(format!(
-            "  agreement_hash={} proof_id={} attested_by={} proof_type={}",
-            proof.agreement_hash, proof.proof_id, proof.attested_by, proof.proof_type
+            "  agreement_hash={} proof_id={} attested_by={} proof_type={} {}",
+            proof.agreement_hash, proof.proof_id, proof.attested_by, proof.proof_type,
+            expiry_str
         ));
     }
     lines.join("\n")
@@ -5027,6 +5052,10 @@ fn render_proof_create_summary(proof: &SettlementProof) -> String {
     }
     lines.push(format!("attested_by {}", proof.attested_by));
     lines.push(format!("attestation_time {}", proof.attestation_time));
+    match proof.expires_at_height {
+        None => lines.push("expires_at_height none".to_string()),
+        Some(h) => lines.push(format!("expires_at_height {}", h)),
+    }
     if let Some(ref es) = proof.evidence_summary {
         lines.push(format!("evidence_summary {}", es));
     }
@@ -8523,9 +8552,11 @@ mod tests {
                 signature_hex: String::new(),
                 payload_hash: String::new(),
             },
+            expires_at_height: None,
         };
         let resp = ListProofsRpcResponse {
             agreement_hash: "aabbcc".to_string(),
+            tip_height: 0,
             count: 1,
             proofs: vec![proof],
         };
@@ -8535,12 +8566,14 @@ mod tests {
         assert!(out.contains("prf-list-001"), "got: {out}");
         assert!(out.contains("att-1"), "got: {out}");
         assert!(out.contains("agreement_hash=aabbcc"), "per-proof hash; got: {out}");
+        assert!(out.contains("expires_at_height=none"), "no expiry must show none; got: {out}");
     }
 
     #[test]
     fn render_proof_list_summary_empty() {
         let resp = ListProofsRpcResponse {
             agreement_hash: "deadbeef".to_string(),
+            tip_height: 0,
             count: 0,
             proofs: vec![],
         };
@@ -8719,6 +8752,7 @@ mod tests {
             timestamp: Some(1700000000),
             out_path: None,
             json_mode: false,
+            expires_at_height: None,
         };
 
         let proof = create_settlement_proof_signed(&opts).expect("must create proof");
@@ -8759,6 +8793,7 @@ mod tests {
                 signature_hex: "sig456".to_string(),
                 payload_hash: "ph789".to_string(),
             },
+            expires_at_height: None,
         };
         let out = render_proof_create_summary(&proof);
         assert!(out.contains("proof_id prf-render-001"), "got: {out}");
@@ -8820,6 +8855,7 @@ mod tests {
             timestamp: Some(1700001234),
             out_path: None,
             json_mode: false,
+            expires_at_height: None,
         };
 
         let proof = create_settlement_proof_signed(&opts).expect("must create proof");
@@ -9306,6 +9342,7 @@ mod tests {
     fn render_proof_list_summary_global_shows_star() {
         let resp = ListProofsRpcResponse {
             agreement_hash: "*".to_string(),
+            tip_height: 0,
             count: 0,
             proofs: vec![],
         };
@@ -9318,12 +9355,155 @@ mod tests {
     fn render_proof_list_summary_filtered_shows_hash() {
         let resp = ListProofsRpcResponse {
             agreement_hash: "aabbcc".to_string(),
+            tip_height: 0,
             count: 0,
             proofs: vec![],
         };
         let out = render_proof_list_summary(&resp);
         assert!(out.contains("agreement_hash aabbcc"), "must show filter hash; got: {out}");
         assert!(!out.contains("(all)"), "must not show global marker; got: {out}");
+    }
+
+
+    #[test]
+    fn proof_create_cli_parses_expires_at_height() {
+        let args: Vec<String> = vec![
+            "--agreement-hash".to_string(), "aabbcc".to_string(),
+            "--proof-type".to_string(), "delivery_confirmation".to_string(),
+            "--attested-by".to_string(), "att-1".to_string(),
+            "--address".to_string(), "Iabc".to_string(),
+            "--expires-at-height".to_string(), "5000".to_string(),
+        ];
+        let opts = parse_proof_create_cli(&args).expect("must parse");
+        assert_eq!(opts.expires_at_height, Some(5000));
+    }
+
+    #[test]
+    fn proof_create_cli_expires_defaults_to_none() {
+        let args: Vec<String> = vec![
+            "--agreement-hash".to_string(), "aabbcc".to_string(),
+            "--proof-type".to_string(), "delivery_confirmation".to_string(),
+            "--attested-by".to_string(), "att-1".to_string(),
+            "--address".to_string(), "Iabc".to_string(),
+        ];
+        let opts = parse_proof_create_cli(&args).expect("must parse");
+        assert_eq!(opts.expires_at_height, None);
+    }
+
+    #[test]
+    fn render_proof_list_summary_shows_proof_expiry_not_expired() {
+        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        let proof = SettlementProof {
+            proof_id: "prf-exp-1".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: "hashexp".to_string(),
+            milestone_id: None,
+            attested_by: "att-exp".to_string(),
+            attestation_time: 1700000000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: String::new(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: Some(1000),
+        };
+        // tip_height=50 < expires_at_height=1000 => not expired
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "hashexp".to_string(),
+            tip_height: 50,
+            count: 1,
+            proofs: vec![proof],
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("expires_at_height=1000"), "must show expiry height; got: {out}");
+        assert!(out.contains("expired=false"), "must show not expired at tip 50; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_list_summary_shows_proof_expiry_expired() {
+        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        let proof = SettlementProof {
+            proof_id: "prf-exp-2".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: "hashexp2".to_string(),
+            milestone_id: None,
+            attested_by: "att-exp2".to_string(),
+            attestation_time: 1700000000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: String::new(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: Some(100),
+        };
+        // tip_height=200 >= expires_at_height=100 => expired
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "hashexp2".to_string(),
+            tip_height: 200,
+            count: 1,
+            proofs: vec![proof],
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("expires_at_height=100"), "must show expiry height; got: {out}");
+        assert!(out.contains("expired=true"), "must show expired at tip 200; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_create_summary_shows_expiry_when_set() {
+        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        let proof = SettlementProof {
+            proof_id: "prf-create-exp".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "payment".to_string(),
+            agreement_hash: "hashc".to_string(),
+            milestone_id: None,
+            attested_by: "att-c".to_string(),
+            attestation_time: 1700000000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: String::new(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: Some(8000),
+        };
+        let out = render_proof_create_summary(&proof);
+        assert!(out.contains("expires_at_height 8000"), "must show expiry height; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_create_summary_shows_none_when_no_expiry() {
+        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        let proof = SettlementProof {
+            proof_id: "prf-noexp".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "payment".to_string(),
+            agreement_hash: "hashd".to_string(),
+            milestone_id: None,
+            attested_by: "att-d".to_string(),
+            attestation_time: 1700000000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: String::new(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+        };
+        let out = render_proof_create_summary(&proof);
+        assert!(out.contains("expires_at_height none"), "must show none when no expiry; got: {out}");
     }
 
 

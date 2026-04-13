@@ -3731,6 +3731,11 @@ pub struct SettlementProof {
     pub evidence_hash: Option<String>,
     pub evidence_summary: Option<String>,
     pub signature: ProofSignatureEnvelope,
+    /// Height at which this proof becomes inactive for stored evaluation.
+    /// When None the proof never expires. When tip_height >= expires_at_height
+    /// the proof is skipped in evaluate_policy_rpc. Does not affect check_policy_rpc.
+    #[serde(default)]
+    pub expires_at_height: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5326,6 +5331,7 @@ mod tests {
                 signature_hex: String::new(),
                 payload_hash: String::new(),
             },
+            expires_at_height: None,
         };
         proof.signature = sign_proof(&proof, signing_key);
         proof
@@ -5634,6 +5640,7 @@ mod tests {
                 signature_hex: String::new(),
                 payload_hash: String::new(),
             },
+            expires_at_height: None,
         };
         let payload = settlement_proof_payload_bytes(&proof).unwrap();
         let digest = sha2::Sha256::digest(&payload);
@@ -5709,6 +5716,52 @@ mod tests {
         proof.schema_id = "wrong.schema".to_string();
         let err = store.submit(proof).unwrap_err();
         assert!(err.contains("schema_id"), "got: {err}");
+    }
+
+    #[test]
+    fn proof_expiry_field_roundtrips_through_store() {
+        let sk = SigningKey::from_bytes((&[41u8; 32]).into()).unwrap();
+        let mut store = make_proof_store();
+        let mut proof = build_signed_proof("expiry-hash", "att-exp", &sk);
+        // expires_at_height is not part of the signature payload;
+        // set it after signing and verify the store preserves it.
+        proof.expires_at_height = Some(999);
+        store.submit(proof).expect("submit with expiry must succeed");
+        let stored = store.list_by_agreement("expiry-hash");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].expires_at_height, Some(999), "expiry must be preserved in store");
+    }
+
+    #[test]
+    fn proof_no_expiry_field_defaults_to_none() {
+        let sk = SigningKey::from_bytes((&[42u8; 32]).into()).unwrap();
+        let mut store = make_proof_store();
+        let proof = build_signed_proof("no-expiry-hash", "att-noexp", &sk);
+        store.submit(proof).expect("submit without expiry must succeed");
+        let stored = store.list_by_agreement("no-expiry-hash");
+        assert_eq!(stored[0].expires_at_height, None, "no expiry must be None");
+    }
+
+    #[test]
+    fn proof_expiry_survives_disk_roundtrip() {
+        let path = std::env::temp_dir().join(format!(
+            "irium_test_expiry_disk_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let sk = SigningKey::from_bytes((&[43u8; 32]).into()).unwrap();
+        {
+            let mut store = ProofStore::new(path.clone());
+            let mut proof = build_signed_proof("disk-exp-hash", "att-disk", &sk);
+            proof.expires_at_height = Some(77777);
+            store.submit(proof).unwrap();
+        }
+        let store2 = ProofStore::new(path.clone());
+        let stored = store2.list_by_agreement("disk-exp-hash");
+        assert_eq!(stored[0].expires_at_height, Some(77777), "expiry must survive disk reload");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
