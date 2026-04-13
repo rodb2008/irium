@@ -304,13 +304,19 @@ Authorization: Bearer <token>
   "agreement_hash": "<64-char hex>",
   "accepted": true,
   "duplicate": false,
-  "message": "proof accepted"
+  "message": "proof accepted",
+  "tip_height": 1042,
+  "expires_at_height": 2000,
+  "expired": false
 }
 ```
 
 - `accepted`: true if the proof was newly stored.
 - `duplicate`: true if a proof with the same `proof_id` was already present.
 - If `accepted` is false and `duplicate` is false, an error occurred (returned as 400).
+- `tip_height`: chain tip height at the moment the proof was submitted.
+- `expires_at_height`: value of `expires_at_height` from the submitted proof, or `null` if the proof has no expiry.
+- `expired`: `true` when `tip_height >= expires_at_height` at submit time; always `false` when `expires_at_height` is `null`. Expiry does **not** affect acceptance — an expired proof is still stored.
 
 ### Error responses
 
@@ -388,7 +394,14 @@ agreement_hash <64-char hex>
 accepted true
 duplicate false
 message proof accepted
+tip_height 1042
+expires_at_height 2000
+expired false
 ```
+
+`expires_at_height` is shown as `none` when the proof carries no expiry. `expired` reflects
+whether `tip_height >= expires_at_height` at submit time; an expired proof is still accepted
+for storage.
 
 ### Exit codes
 

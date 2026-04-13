@@ -427,6 +427,15 @@ struct SubmitProofRpcResponse {
     accepted: bool,
     duplicate: bool,
     message: String,
+    /// Chain tip height at submit time.
+    #[serde(default)]
+    tip_height: u64,
+    /// Expiry height from the submitted proof, if any.
+    #[serde(default)]
+    expires_at_height: Option<u64>,
+    /// True when tip_height >= expires_at_height at submit time. Always false when expires_at_height is None.
+    #[serde(default)]
+    expired: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -4784,6 +4793,12 @@ fn render_proof_submit_summary(resp: &SubmitProofRpcResponse) -> String {
     lines.push(format!("accepted {}", resp.accepted));
     lines.push(format!("duplicate {}", resp.duplicate));
     lines.push(format!("message {}", resp.message));
+    lines.push(format!("tip_height {}", resp.tip_height));
+    match resp.expires_at_height {
+        None => lines.push("expires_at_height none".to_string()),
+        Some(h) => lines.push(format!("expires_at_height {}", h)),
+    }
+    lines.push(format!("expired {}", resp.expired));
     lines.join("\n")
 }
 
@@ -8525,12 +8540,18 @@ mod tests {
             accepted: true,
             duplicate: false,
             message: "proof accepted".to_string(),
+            tip_height: 0,
+            expires_at_height: None,
+            expired: false,
         };
         let out = render_proof_submit_summary(&resp);
         assert!(out.contains("proof_id prf-001"), "got: {out}");
         assert!(out.contains("accepted true"), "got: {out}");
         assert!(out.contains("duplicate false"), "got: {out}");
         assert!(out.contains("proof accepted"), "got: {out}");
+        assert!(out.contains("tip_height 0"), "got: {out}");
+        assert!(out.contains("expires_at_height none"), "got: {out}");
+        assert!(out.contains("expired false"), "got: {out}");
     }
 
     #[test]
@@ -8541,10 +8562,16 @@ mod tests {
             accepted: false,
             duplicate: true,
             message: "duplicate: proof already stored".to_string(),
+            tip_height: 10,
+            expires_at_height: Some(5),
+            expired: true,
         };
         let out = render_proof_submit_summary(&resp);
         assert!(out.contains("accepted false"));
         assert!(out.contains("duplicate true"));
+        assert!(out.contains("tip_height 10"));
+        assert!(out.contains("expires_at_height 5"));
+        assert!(out.contains("expired true"));
     }
 
     #[test]
@@ -9526,6 +9553,113 @@ mod tests {
         assert!(out.contains("expires_at_height none"), "must show none when no expiry; got: {out}");
     }
 
+
+
+    #[test]
+    fn parse_proof_list_cli_active_only_flag() {
+        let args: Vec<String> = vec!["--active-only".to_string()];
+        let opts = parse_proof_list_cli(&args).expect("must parse");
+        assert!(opts.active_only);
+    }
+
+    #[test]
+    fn parse_proof_list_cli_active_only_defaults_false() {
+        let args: Vec<String> = vec![];
+        let opts = parse_proof_list_cli(&args).expect("must parse");
+        assert!(!opts.active_only);
+    }
+
+    #[test]
+    fn render_proof_list_summary_active_only_shows_filter_header() {
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "*".to_string(),
+            tip_height: 0,
+            active_only: true,
+            count: 0,
+            proofs: vec![],
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("filter active_only true"), "must show filter header; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_list_summary_active_only_false_no_filter_header() {
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "*".to_string(),
+            tip_height: 0,
+            active_only: false,
+            count: 0,
+            proofs: vec![],
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(!out.contains("filter active_only"), "must not show filter header; got: {out}");
+    }
+
+    #[test]
+    fn parse_proof_list_cli_active_only_combined_with_agreement_hash() {
+        let args: Vec<String> = vec![
+            "--active-only".to_string(),
+            "--agreement-hash".to_string(), "deadbeef".to_string(),
+        ];
+        let opts = parse_proof_list_cli(&args).expect("must parse");
+        assert!(opts.active_only);
+        assert_eq!(opts.agreement_hash, Some("deadbeef".to_string()));
+    }
+
+
+
+    #[test]
+    fn render_proof_submit_summary_non_expiring() {
+        let resp = SubmitProofRpcResponse {
+            proof_id: "prf-ne".to_string(),
+            agreement_hash: "aabb".to_string(),
+            accepted: true,
+            duplicate: false,
+            message: "proof accepted".to_string(),
+            tip_height: 100,
+            expires_at_height: None,
+            expired: false,
+        };
+        let out = render_proof_submit_summary(&resp);
+        assert!(out.contains("expires_at_height none"), "must show none; got: {out}");
+        assert!(out.contains("expired false"), "non-expiring must show expired false; got: {out}");
+        assert!(out.contains("tip_height 100"), "must show tip; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_submit_summary_future_expiry() {
+        let resp = SubmitProofRpcResponse {
+            proof_id: "prf-fe".to_string(),
+            agreement_hash: "aabb".to_string(),
+            accepted: true,
+            duplicate: false,
+            message: "proof accepted".to_string(),
+            tip_height: 0,
+            expires_at_height: Some(1000),
+            expired: false,
+        };
+        let out = render_proof_submit_summary(&resp);
+        assert!(out.contains("expires_at_height 1000"), "must show expiry height; got: {out}");
+        assert!(out.contains("expired false"), "future expiry must show expired false; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_submit_summary_already_expired() {
+        let resp = SubmitProofRpcResponse {
+            proof_id: "prf-ae".to_string(),
+            agreement_hash: "aabb".to_string(),
+            accepted: true,
+            duplicate: false,
+            message: "proof accepted".to_string(),
+            tip_height: 50,
+            expires_at_height: Some(10),
+            expired: true,
+        };
+        let out = render_proof_submit_summary(&resp);
+        assert!(out.contains("expires_at_height 10"), "must show expiry height; got: {out}");
+        assert!(out.contains("expired true"), "must show expired true; got: {out}");
+        assert!(out.contains("tip_height 50"), "must show tip height; got: {out}");
+    }
 
 }
 fn main() {
@@ -13463,57 +13597,5 @@ fn main() {
             std::process::exit(1);
         }
     }
-
-    #[test]
-    fn parse_proof_list_cli_active_only_flag() {
-        let args: Vec<String> = vec!["--active-only".to_string()];
-        let opts = parse_proof_list_cli(&args).expect("must parse");
-        assert!(opts.active_only);
-    }
-
-    #[test]
-    fn parse_proof_list_cli_active_only_defaults_false() {
-        let args: Vec<String> = vec![];
-        let opts = parse_proof_list_cli(&args).expect("must parse");
-        assert!(!opts.active_only);
-    }
-
-    #[test]
-    fn render_proof_list_summary_active_only_shows_filter_header() {
-        let resp = ListProofsRpcResponse {
-            agreement_hash: "*".to_string(),
-            tip_height: 0,
-            active_only: true,
-            count: 0,
-            proofs: vec![],
-        };
-        let out = render_proof_list_summary(&resp);
-        assert!(out.contains("filter active_only true"), "must show filter header; got: {out}");
-    }
-
-    #[test]
-    fn render_proof_list_summary_active_only_false_no_filter_header() {
-        let resp = ListProofsRpcResponse {
-            agreement_hash: "*".to_string(),
-            tip_height: 0,
-            active_only: false,
-            count: 0,
-            proofs: vec![],
-        };
-        let out = render_proof_list_summary(&resp);
-        assert!(!out.contains("filter active_only"), "must not show filter header; got: {out}");
-    }
-
-    #[test]
-    fn parse_proof_list_cli_active_only_combined_with_agreement_hash() {
-        let args: Vec<String> = vec![
-            "--active-only".to_string(),
-            "--agreement-hash".to_string(), "deadbeef".to_string(),
-        ];
-        let opts = parse_proof_list_cli(&args).expect("must parse");
-        assert!(opts.active_only);
-        assert_eq!(opts.agreement_hash, Some("deadbeef".to_string()));
-    }
-
 
 }

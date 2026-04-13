@@ -669,6 +669,12 @@ struct SubmitProofResponse {
     accepted: bool,
     duplicate: bool,
     message: String,
+    /// Chain tip height at submit time.
+    tip_height: u64,
+    /// Expiry height carried in the submitted proof, if any.
+    expires_at_height: Option<u64>,
+    /// True when tip_height >= expires_at_height at submit time. False when expires_at_height is None.
+    expired: bool,
 }
 
 #[derive(Deserialize)]
@@ -5050,6 +5056,15 @@ async fn submit_proof_rpc(
     check_rate_with_auth(&state, &addr, &headers)
         .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
     require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let tip_height = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.tip_height()
+    };
+    let expires_at_height = req.proof.expires_at_height;
+    let expired = match expires_at_height {
+        None => false,
+        Some(h) => tip_height >= h,
+    };
     let mut store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
     let outcome = store.submit(req.proof).map_err(|e| bad(&e))?;
     Ok(Json(SubmitProofResponse {
@@ -5058,6 +5073,9 @@ async fn submit_proof_rpc(
         accepted: outcome.accepted,
         duplicate: outcome.duplicate,
         message: outcome.message,
+        tip_height,
+        expires_at_height,
+        expired,
     }))
 }
 
@@ -8426,6 +8444,9 @@ mod tests {
         assert!(resp.accepted);
         assert!(!resp.duplicate);
         assert_eq!(resp.proof_id, "rpc-store-prf-001");
+        assert_eq!(resp.tip_height, 0);
+        assert!(resp.expires_at_height.is_none());
+        assert!(!resp.expired);
     }
 
     #[tokio::test]
@@ -8471,6 +8492,9 @@ mod tests {
         .0;
         assert!(!second.accepted);
         assert!(second.duplicate);
+        assert_eq!(second.tip_height, 0);
+        assert!(second.expires_at_height.is_none());
+        assert!(!second.expired);
     }
 
     #[tokio::test]
@@ -9748,6 +9772,103 @@ mod tests {
         .0;
         assert!(!resp.active_only);
         assert_eq!(resp.count, 1, "expired proof must still be included when active_only=false");
+    }
+
+    #[tokio::test]
+    async fn submit_proof_rpc_non_expiring_response() {
+        // Proof with no expires_at_height: response must show expires_at_height=None, expired=false.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[28u8; 32]).into()).unwrap();
+        let proof = make_signed_proof_for_rpc("ne-resp-test", &sk);
+        let resp = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit")
+        .0;
+        assert!(resp.accepted);
+        assert_eq!(resp.tip_height, 0);
+        assert!(resp.expires_at_height.is_none(), "no expiry must be None");
+        assert!(!resp.expired, "non-expiring proof must not be expired");
+    }
+
+    #[tokio::test]
+    async fn submit_proof_rpc_future_expiry_response() {
+        // Proof with expires_at_height=1 at tip=0: 0 < 1, not expired.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[29u8; 32]).into()).unwrap();
+        let mut proof = make_signed_proof_for_rpc("fe-resp-test", &sk);
+        proof.expires_at_height = Some(1);
+        let resp = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit")
+        .0;
+        assert!(resp.accepted);
+        assert_eq!(resp.tip_height, 0);
+        assert_eq!(resp.expires_at_height, Some(1));
+        assert!(!resp.expired, "expires_at_height=1 at tip=0 must not be expired");
+    }
+
+    #[tokio::test]
+    async fn submit_proof_rpc_already_expired_response() {
+        // Proof with expires_at_height=0 at tip=0: 0 >= 0, expired immediately.
+        // Submission still succeeds (expiry is not an acceptance criterion).
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[30u8; 32]).into()).unwrap();
+        let mut proof = make_signed_proof_for_rpc("ae-resp-test", &sk);
+        proof.expires_at_height = Some(0);
+        let resp = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit expired proof")
+        .0;
+        assert!(resp.accepted, "expired proof must still be accepted for storage");
+        assert_eq!(resp.tip_height, 0);
+        assert_eq!(resp.expires_at_height, Some(0));
+        assert!(resp.expired, "tip=0 >= expires_at_height=0 must be reported as expired");
+    }
+
+    #[tokio::test]
+    async fn submit_proof_rpc_duplicate_carries_lifecycle_fields() {
+        // Duplicate response must also carry tip_height, expires_at_height, expired.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[31u8; 32]).into()).unwrap();
+        let mut proof = make_signed_proof_for_rpc("dup-lc-test", &sk);
+        proof.expires_at_height = Some(0);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof: proof.clone() }),
+        )
+        .await
+        .expect("first submit");
+        let dup = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("duplicate submit")
+        .0;
+        assert!(!dup.accepted);
+        assert!(dup.duplicate);
+        assert_eq!(dup.tip_height, 0);
+        assert_eq!(dup.expires_at_height, Some(0));
+        assert!(dup.expired, "lifecycle fields must be present even on duplicate response");
     }
 
 }
