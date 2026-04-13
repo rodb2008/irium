@@ -611,12 +611,12 @@ struct GpuMiner {
     batch_size:  usize,
 }
 
-// Each GpuMiner owns its own OpenCL context/queue/kernel — no shared mutable state between
-// instances.  The ocl types wrap raw CL handles which are not auto-Send/Sync, but sending
-// or sharing a GpuMiner across threads is safe as long as each instance is accessed by at
-// most one thread at a time (guaranteed by our thread-per-GPU design).
+// GpuMiner owns its own OpenCL context/queue/kernel — no shared mutable state between
+// instances.  The ocl crate uses raw CL handles which are not auto-Send; we assert Send
+// because each GpuMiner is moved into exactly one thread and never accessed concurrently.
+// Sync is intentionally NOT implemented: all mutating methods take &mut self, so the
+// compiler enforces exclusive access.
 unsafe impl Send for GpuMiner {}
-unsafe impl Sync for GpuMiner {}
 
 impl GpuMiner {
     fn new(device_idx: usize, batch_size: usize) -> Result<Self, String> {
@@ -691,7 +691,7 @@ impl GpuMiner {
 
     /// Upload a new midstate + tail + target (call once per template).
     fn update_template(
-        &self,
+        &mut self,
         midstate: &[u32; 8],
         tail: &[u32; 3],
         target: &[u32; 8],
@@ -704,13 +704,13 @@ impl GpuMiner {
     }
 
     /// Upload an updated tail only (call when timestamp changes).
-    fn update_tail(&self, tail: &[u32; 3]) -> Result<(), String> {
+    fn update_tail(&mut self, tail: &[u32; 3]) -> Result<(), String> {
         self.tail_buf.write(tail as &[u32]).enq().map_err(|e: ocl::Error| e.to_string())
     }
 
     /// Test nonces [nonce_base, nonce_base + batch_size).
     /// Returns `Some(nonce)` on a hit, `None` if no valid nonce was found.
-    fn mine_batch(&self, nonce_base: u32) -> Result<Option<u32>, String> {
+    fn mine_batch(&mut self, nonce_base: u32) -> Result<Option<u32>, String> {
         let e = |e: ocl::Error| e.to_string();
 
         // Reset result flag (only 2 words — minimal write)
@@ -719,6 +719,9 @@ impl GpuMiner {
         // Update the nonce_base scalar arg in the already-built kernel
         self.kernel.set_arg(2, nonce_base).map_err(e)?;
 
+        // Safety: the kernel was built from verified source, all buffer args are valid
+        // and alive for the duration of this call, and queue.finish() below ensures the
+        // GPU work completes before we read back results.
         unsafe { self.kernel.enq().map_err(e)?; }
         self.queue.finish().map_err(e)?;
 
@@ -980,7 +983,7 @@ fn stratum_reader(
 /// `gpu_idx` / `num_gpus` partition the 32-bit nonce space so that each GPU covers
 /// a disjoint sub-range (nonce_base starts at gpu_idx·batch_size, strides by num_gpus·batch_size).
 fn mine_stratum_job_gpu(
-    gpu: &GpuMiner,
+    gpu: &mut GpuMiner,
     gpu_idx: usize,
     num_gpus: usize,
     job: &StratumJob,
@@ -1093,7 +1096,7 @@ fn mine_stratum_job_gpu(
     }
 }
 
-fn run_stratum_gpu(gpus: &[GpuMiner]) -> Result<(), String> {
+fn run_stratum_gpu(gpus: &mut [GpuMiner]) -> Result<(), String> {
     let url = stratum_url().ok_or("IRIUM_STRATUM_URL not set")?;
     let addr = stratum_normalize_url(&url);
     let num_gpus = gpus.len();
@@ -1174,9 +1177,10 @@ fn run_stratum_gpu(gpus: &[GpuMiner]) -> Result<(), String> {
 
         // Run all GPUs in parallel; each mines its own nonce sub-range.
         // All threads exit when the job changes (job_version_ref flips).
+        // iter_mut() gives each thread exclusive (&mut GpuMiner) access — no Sync required.
         let any_error = Arc::new(AtomicBool::new(false));
         std::thread::scope(|s| {
-            for (gpu_idx, gpu) in gpus.iter().enumerate() {
+            for (gpu_idx, gpu) in gpus.iter_mut().enumerate() {
                 let job = &job;
                 let extranonce1 = extranonce1.as_str();
                 let extranonce2 = extranonce2.as_str();
@@ -1293,7 +1297,7 @@ fn main() {
         batch_size as f64 / 1_000_000.0
     );
 
-    let gpus = match init_gpus(batch_size) {
+    let mut gpus = match init_gpus(batch_size) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("[GPU] Initialisation failed: {e}");
@@ -1305,7 +1309,7 @@ fn main() {
     // If IRIUM_STRATUM_URL is set, use pool/Stratum mode; otherwise solo GBT mode.
     if stratum_url().is_some() {
         loop {
-            if let Err(e) = run_stratum_gpu(&gpus) {
+            if let Err(e) = run_stratum_gpu(&mut gpus) {
                 eprintln!("[Stratum] Disconnected: {e}. Reconnecting in 5 s…");
                 std::thread::sleep(Duration::from_secs(5));
             }
@@ -1435,7 +1439,7 @@ fn main() {
 
         // Upload the template to every GPU.
         let mut upload_ok = true;
-        for (i, gpu) in gpus.iter().enumerate() {
+        for (i, gpu) in gpus.iter_mut().enumerate() {
             if let Err(e) = gpu.update_template(&midstate, &tail_from_header(&ser), &target_words) {
                 eprintln!("[GPU {i}] update_template error: {e}");
                 upload_ok = false;
@@ -1468,8 +1472,9 @@ fn main() {
         let solo_log = Arc::new(Mutex::new(Instant::now()));
         let num_gpus = gpus.len();
 
+        // iter_mut() gives each scoped thread exclusive (&mut GpuMiner) access — no Sync required.
         std::thread::scope(|s| {
-            for (gpu_idx, gpu) in gpus.iter().enumerate() {
+            for (gpu_idx, gpu) in gpus.iter_mut().enumerate() {
                 let stop = Arc::clone(&stop);
                 let found_result = Arc::clone(&found_result);
                 let solo_hashes = Arc::clone(&solo_hashes);
