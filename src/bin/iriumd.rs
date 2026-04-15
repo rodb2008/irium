@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -1173,7 +1173,7 @@ fn load_dns_seed_hosts(node_cfg: Option<&NodeConfig>) -> Vec<String> {
     hosts
 }
 
-fn resolve_dns_seed_addrs(
+async fn resolve_dns_seed_addrs(
     hosts: &[String],
     default_seed_port: u16,
     local_ips: &HashSet<IpAddr>,
@@ -1182,8 +1182,14 @@ fn resolve_dns_seed_addrs(
     let mut seen = HashSet::new();
     let mut filtered_local = 0usize;
     for host in hosts {
-        match (host.as_str(), default_seed_port).to_socket_addrs() {
-            Ok(iter) => {
+        let host_str = format!("{}:{}", host, default_seed_port);
+        let resolved = tokio::task::spawn_blocking(move || {
+            use std::net::ToSocketAddrs;
+            host_str.to_socket_addrs().map(|iter| iter.collect::<Vec<_>>())
+        })
+        .await;
+        match resolved {
+            Ok(Ok(iter)) => {
                 for addr in iter {
                     if local_ips.contains(&addr.ip()) {
                         filtered_local += 1;
@@ -1194,9 +1200,13 @@ fn resolve_dns_seed_addrs(
                     }
                 }
             }
-            Err(err) => eprintln!(
+            Ok(Err(err)) => eprintln!(
                 "[warn] bootstrap dns seed {} resolution failed: {}",
                 host, err
+            ),
+            Err(e) => eprintln!(
+                "[warn] bootstrap dns seed {} resolution task failed: {}",
+                host, e
             ),
         }
     }
@@ -1220,7 +1230,6 @@ fn load_signed_seeds() -> Vec<String> {
 
     let seed_path = std::path::Path::new("bootstrap/seedlist.txt");
     let sig_path = std::path::Path::new("bootstrap/seedlist.txt.sig");
-    let allowed = std::path::Path::new("bootstrap/trust/allowed_signers");
     let Ok(seed_data) = std::fs::read_to_string(seed_path) else {
         eprintln!(
             "[warn] bootstrap signed seedlist missing: {}",
@@ -1229,15 +1238,26 @@ fn load_signed_seeds() -> Vec<String> {
         return Vec::new();
     };
 
+    let sig_principal = std::env::var("IRIUM_SEEDLIST_SIG_PRINCIPAL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "bootstrap-signer".to_string());
+    let sig_namespace = std::env::var("IRIUM_SEEDLIST_SIG_NAMESPACE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "file".to_string());
+    let allowed_signers_path = std::env::var("IRIUM_SEEDLIST_ALLOWED_SIGNERS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::Path::new("bootstrap/trust/allowed_signers").to_path_buf());
     let mut child = match Command::new("ssh-keygen")
         .arg("-Y")
         .arg("verify")
         .arg("-f")
-        .arg(allowed)
+        .arg(&allowed_signers_path)
         .arg("-I")
-        .arg("bootstrap-signer")
+        .arg(&sig_principal)
         .arg("-n")
-        .arg("file")
+        .arg(&sig_namespace)
         .arg("-s")
         .arg(sig_path)
         .stdin(Stdio::piped())
@@ -6310,7 +6330,7 @@ async fn main() {
                 )
                 .await;
                 let (dns_seed_addrs, dns_filtered_local) =
-                    resolve_dns_seed_addrs(&dns_seed_hosts, default_seed_port, &local_ips);
+                    resolve_dns_seed_addrs(&dns_seed_hosts, default_seed_port, &local_ips).await;
                 let (seeds, mut seed_info) = build_seed_addrs(
                     &persisted_seeds,
                     &manual_seeds,

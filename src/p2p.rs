@@ -36,8 +36,17 @@ use sha2::{Digest, Sha256};
 /// Minimal P2P node skeleton: accepts incoming connections and can
 /// broadcast raw block bytes to all connected peers.
 const DEFAULT_MAX_PEERS: usize = 100;
+/// Cap on peers returned per GetPeers response to prevent unbounded serialisation.
+const MAX_PEERS_IN_RESPONSE: usize = 50;
 const MAX_MSGS_PER_SEC: u32 = 200;
 const MAX_BULK_MSGS_PER_SEC: u32 = 2000;
+
+fn is_same_subnet_24(a: IpAddr, b: IpAddr) -> bool {
+    match (a, b) {
+        (IpAddr::V4(a4), IpAddr::V4(b4)) => a4.octets()[..3] == b4.octets()[..3],
+        _ => false,
+    }
+}
 
 fn recent_block_cache_ttl() -> Duration {
     let secs = std::env::var("IRIUM_P2P_RECENT_BLOCK_TTL_SECS")
@@ -2822,12 +2831,21 @@ impl P2PNode {
         let bump = std::env::var("IRIUM_SYBIL_BANNED_BUMP")
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
-            .unwrap_or(0);
+            // Default 2: each wave of bans bumps difficulty up to 2 extra bits.
+            .unwrap_or(2);
         if bump == 0 {
             return 0;
         }
         banned_count.min(bump)
     }
+    fn max_peers_per_subnet_24() -> usize {
+        std::env::var("IRIUM_P2P_MAX_PEERS_PER_SUBNET")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(1, 20)
+    }
+
     fn load_or_create_node_id() -> Vec<u8> {
         let path = storage::state_dir().join("node_id");
         if !path.exists() {
@@ -2994,6 +3012,16 @@ impl P2PNode {
                         if current >= max_peers() {
                             Self::log_err(format!("Rejecting inbound {}: max peers reached", addr));
                             continue;
+                        }
+                        if !trusted {
+                            let subnet_count = {
+                                let guard = connected.lock().await;
+                                guard.iter().filter(|a| is_same_subnet_24(a.ip(), ip)).count()
+                            };
+                            if subnet_count >= P2PNode::max_peers_per_subnet_24() {
+                                P2PNode::log_event("warn", "net", format!("Rejecting inbound {}: /24 subnet limit ({} peers)", addr, subnet_count));
+                                continue;
+                            }
                         }
                         if incoming_conn_log_enabled() {
                             Self::log(format!("Incoming P2P connection from {}", addr));
@@ -3459,13 +3487,12 @@ impl P2PNode {
                 if self.is_ip_connected(addr.ip()).await {
                     continue;
                 }
-                if self
-                    .connect_and_handshake(addr, local_height, &self.agent)
-                    .await
-                    .is_ok()
-                {
-                    added += 1;
-                }
+                let node_clone = self.clone();
+                let agent_clone = self.agent.clone();
+                tokio::spawn(async move {
+                    let _ = node_clone.connect_and_handshake(addr, local_height, &agent_clone).await;
+                });
+                added += 1;
             }
         }
 
@@ -3512,13 +3539,12 @@ impl P2PNode {
                 if self.is_ip_connected(addr.ip()).await {
                     continue;
                 }
-                if self
-                    .connect_and_handshake(addr, local_height, &self.agent)
-                    .await
-                    .is_ok()
-                {
-                    added += 1;
-                }
+                let node_clone = self.clone();
+                let agent_clone = self.agent.clone();
+                tokio::spawn(async move {
+                    let _ = node_clone.connect_and_handshake(addr, local_height, &agent_clone).await;
+                });
+                added += 1;
             }
         }
     }
@@ -4593,7 +4619,11 @@ impl P2PNode {
                         let peers_payload = {
                             let dir = dir.lock().await;
                             PeersPayload {
-                                peers: dir.peers().iter().map(|p| p.multiaddr.clone()).collect(),
+                                peers: dir.peers().iter()
+                                    .filter(|p| p.dialable)
+                                    .take(MAX_PEERS_IN_RESPONSE)
+                                    .map(|p| p.multiaddr.clone())
+                                    .collect(),
                             }
                         };
                         if let Ok(resp) = peers_payload.to_message() {
@@ -6221,6 +6251,19 @@ async fn handle_incoming_with_sybil(
                             );
                             break;
                         }
+                        // Fix 1: verify handshake node_id matches the sybil proof pubkey.
+                        // Binds PoW identity to protocol identity: an attacker cannot
+                        // solve with one node_id and then handshake as a different one.
+                        if let Ok(id_bytes) = hex::decode(remote_id) {
+                            if id_bytes != peer_pubkey {
+                                P2PNode::log_event(
+                                    "warn",
+                                    "net",
+                                    format!("P2P {}: handshake node_id does not match sybil pubkey, closing", addr),
+                                );
+                                break;
+                            }
+                        }
                     }
                     if let Err(reason) = verify_peer_checkpoint(&payload, &chain) {
                         if let Some(rest) = reason.strip_prefix("LOCAL_FORK:") {
@@ -6621,7 +6664,11 @@ async fn handle_incoming_with_sybil(
                 let peers_payload = {
                     let dir = directory.lock().await;
                     PeersPayload {
-                        peers: dir.peers().iter().map(|p| p.multiaddr.clone()).collect(),
+                        peers: dir.peers().iter()
+                            .filter(|p| p.dialable)
+                            .take(MAX_PEERS_IN_RESPONSE)
+                            .map(|p| p.multiaddr.clone())
+                            .collect(),
                     }
                 };
                 if let Ok(resp) = peers_payload.to_message() {

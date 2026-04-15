@@ -86,8 +86,8 @@ impl SybilProof {
             solution = solution
                 .checked_add(1)
                 .ok_or_else(|| "solution counter overflow".to_string())?;
-            if solution > 1_000_000 {
-                return Err("Could not solve challenge within 1,000,000 iterations".to_string());
+            if solution > 50_000_000 {
+                return Err("Could not solve challenge within 50,000,000 iterations".to_string());
             }
         }
     }

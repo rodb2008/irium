@@ -332,10 +332,14 @@ impl SeedlistManager {
         let baseline_entries = if self.verify_seedlist_signature() {
             self.load_seed_entries(&self.baseline)
         } else if Self::allow_unsigned_seedlist() {
-            eprintln!("Seedlist signature invalid or missing; using unsigned baseline seeds due to IRIUM_SEEDLIST_ALLOW_UNSIGNED=1");
+            eprintln!(
+                "[SECURITY WARNING] Seedlist signature invalid or missing. \nBootstrapping from unsigned peer list because IRIUM_SEEDLIST_ALLOW_UNSIGNED=1. \nThis disables seedlist integrity protection. Do not use in production without a valid signature."
+            );
             self.load_seed_entries(&self.baseline)
         } else {
-            eprintln!("Seedlist signature invalid or missing; skipping baseline seeds");
+            eprintln!(
+                "[warn] Seedlist signature invalid or missing; skipping baseline seeds. \nSet IRIUM_SEEDLIST_ALLOW_UNSIGNED=1 to override (not recommended for production)."
+            );
             Vec::new()
         };
         for ip in baseline_entries {
@@ -650,8 +654,21 @@ impl PeerDirectory {
         }
         let value = serde_json::Value::Object(map);
         if let Ok(text) = serde_json::to_string_pretty(&value) {
-            if let Err(e) = fs::write(&self.db_path, text) {
-                eprintln!("Failed to write peer db {}: {}", self.db_path.display(), e);
+            let tmp = self.db_path.with_extension(
+                format!("json.tmp.{}", std::process::id()),
+            );
+            if let Ok(mut file) = fs::File::create(&tmp) {
+                if file.write_all(text.as_bytes()).is_ok() && file.sync_all().is_ok() {
+                    if let Err(e) = fs::rename(&tmp, &self.db_path) {
+                        eprintln!("Failed to rename peer db {}: {}", self.db_path.display(), e);
+                        let _ = fs::remove_file(&tmp);
+                    }
+                } else {
+                    let _ = fs::remove_file(&tmp);
+                    eprintln!("Failed to write peer db {}", self.db_path.display());
+                }
+            } else {
+                eprintln!("Failed to create peer db tmp {}", tmp.display());
             }
         }
     }
