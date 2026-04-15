@@ -32,6 +32,15 @@ qrcode = "0.14"
 aes-gcm = "0.10"
 
 pbkdf2 = "0.12"
+ocl = { version = "0.19", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+[features]
+gpu = ["ocl"]
+
+[[bin]]
+name = "irium-miner-gpu"
+path = "src/bin/irium-miner-gpu.rs"
+required-features = ["gpu"]

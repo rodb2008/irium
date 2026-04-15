@@ -110,6 +110,11 @@ cd irium
 source ~/.cargo/env
 cargo build --release
 ```
+## Build GPU Miner
+
+```bash
+cargo build --release --features gpu --bin irium-miner-gpu
+```
 
 ---
 
