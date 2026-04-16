@@ -3695,6 +3695,10 @@ pub struct ProofRequirement {
     pub required_attestor_ids: Vec<String>,
     pub resolution: ProofResolution,
     pub milestone_id: Option<String>,
+    /// Minimum number of distinct approved attestors whose proofs must satisfy
+    /// this requirement. Defaults to 1 when absent (single-attestor behaviour).
+    #[serde(default)]
+    pub threshold: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3709,6 +3713,15 @@ pub struct ProofPolicy {
     /// Block height at which this policy expires. None means the policy never expires.
     #[serde(default)]
     pub expires_at_height: Option<u64>,
+    /// Declared milestones for tranche-based evaluation. When non-empty,
+    /// requirements and rules are grouped by their `milestone_id` field
+    /// and each milestone is evaluated independently.
+    #[serde(default)]
+    pub milestones: Vec<PolicyMilestone>,
+    /// Top-level holdback applied in the non-milestone evaluation path.
+    /// Ignored when `milestones` is non-empty (use `PolicyMilestone.holdback` instead).
+    #[serde(default)]
+    pub holdback: Option<PolicyHoldback>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3738,12 +3751,129 @@ pub struct SettlementProof {
     pub expires_at_height: Option<u64>,
 }
 
+/// Attestor threshold evaluation result for a single requirement.
+/// Only populated for requirements where `threshold` is explicitly set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequirementThresholdResult {
+    pub requirement_id: String,
+    /// Minimum distinct approved attestors required.
+    pub threshold_required: u32,
+    /// Number of distinct approved attestors whose verified proofs matched.
+    pub approved_attestor_count: usize,
+    /// IDs of the matched attestors (deduplicated, deterministic order).
+    pub matched_attestor_ids: Vec<String>,
+    /// Whether the threshold was met.
+    pub threshold_satisfied: bool,
+}
+
+/// Holdback (retention) configuration attached to a policy or milestone.
+/// `holdback_bps` basis points of the settlement amount are held until either
+/// `release_requirement_id` is satisfied or `deadline_height` is reached.
+/// At least one of the two release conditions must be supplied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyHoldback {
+    /// Basis points to hold back (1–9999; 10000 bps = 100 %).
+    pub holdback_bps: u32,
+    /// ID of an existing `ProofRequirement` whose satisfaction releases the holdback.
+    /// When `None` the holdback is released only by `deadline_height`.
+    #[serde(default)]
+    pub release_requirement_id: Option<String>,
+    /// Block height at or after which the holdback is automatically released.
+    /// When `None` the holdback is released only by `release_requirement_id`.
+    #[serde(default)]
+    pub deadline_height: Option<u64>,
+}
+
+/// Outcome of evaluating the holdback condition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldbackOutcome {
+    /// Base condition not yet satisfied; holdback not yet active.
+    Pending,
+    /// Base satisfied but neither release requirement nor deadline has been met.
+    Held,
+    /// Holdback released (by proof or deadline).
+    Released,
+}
+
+/// Result of evaluating a holdback condition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HoldbackEvaluationResult {
+    pub holdback_present: bool,
+    pub holdback_released: bool,
+    pub holdback_bps: u32,
+    /// Basis points immediately releasable (10000 - holdback_bps when holdback held; 10000 when released).
+    pub immediate_release_bps: u32,
+    pub holdback_outcome: HoldbackOutcome,
+    pub holdback_reason: String,
+}
+
+/// Declares a named milestone (tranche) within a policy.
+/// `ProofRequirement` and `NoResponseRule` entries with a matching `milestone_id`
+/// are grouped under this milestone and evaluated independently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyMilestone {
+    pub milestone_id: String,
+    /// Human-readable label shown in evaluation output.
+    pub label: Option<String>,
+    /// Optional holdback declaration for this milestone.
+    #[serde(default)]
+    pub holdback: Option<PolicyHoldback>,
+}
+
+/// Outcome of evaluating a single milestone independently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MilestoneEvaluationResult {
+    pub milestone_id: String,
+    pub label: Option<String>,
+    /// Outcome for this milestone only.
+    pub outcome: PolicyOutcome,
+    pub release_eligible: bool,
+    pub refund_eligible: bool,
+    pub matched_proof_ids: Vec<String>,
+    pub reason: String,
+    /// Holdback result for this milestone; `None` when no holdback is configured.
+    pub holdback: Option<HoldbackEvaluationResult>,
+    /// Threshold results for requirements with explicit `threshold` set; empty otherwise.
+    pub threshold_results: Vec<RequirementThresholdResult>,
+}
+
+/// Objective, deterministic outcome of a policy evaluation.
+///
+/// - `satisfied`   — all required proofs present and signature-verified.
+/// - `timeout`     — a no-response deadline or refund required_by deadline elapsed
+///                   before release was achieved; proofs absent or insufficient.
+/// - `unsatisfied` — neither condition met; proofs missing, expired, or
+///                   signature-invalid, and no deadline has elapsed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyOutcome {
+    Satisfied,
+    Timeout,
+    Unsatisfied,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyEvaluationResult {
+    /// Objective classification of this evaluation.
+    pub outcome: PolicyOutcome,
     pub release_eligible: bool,
     pub refund_eligible: bool,
     pub reason: String,
     pub evaluated_rules: Vec<String>,
+    /// Proof IDs that passed signature verification and matched the policy.
+    pub matched_proof_ids: Vec<String>,
+    /// Per-milestone results; empty when no milestones are declared.
+    pub milestone_results: Vec<MilestoneEvaluationResult>,
+    /// Number of milestones with outcome == Satisfied.
+    pub completed_milestone_count: usize,
+    /// Total declared milestones (len of policy.milestones).
+    pub total_milestone_count: usize,
+    /// Top-level holdback result; `None` when no holdback is configured or
+    /// when the policy uses milestone-level holdbacks.
+    pub holdback: Option<HoldbackEvaluationResult>,
+    /// Threshold results for requirements with explicit `threshold` set; empty otherwise.
+    pub threshold_results: Vec<RequirementThresholdResult>,
 }
 
 fn proof_policy_canonical_bytes(policy: &ProofPolicy) -> Result<Vec<u8>, String> {
@@ -3817,6 +3947,233 @@ pub fn verify_settlement_proof(
         .map_err(|_| "proof signature verification failed".to_string())
 }
 
+/// Evaluates a subset of requirements and rules against the pre-verified proof set.
+/// Used internally for per-milestone evaluation.
+/// `satisfied` lists proof_ids that passed signature verification in Step 1.
+/// Returns (outcome, release_eligible, refund_eligible, reason, matched_proof_ids).
+/// Returns true if `req` is satisfied by at least `threshold` distinct approved attestors.
+/// When `threshold` is None the effective minimum is 1 (original single-attestor behaviour).
+fn req_satisfied_threshold(
+    req: &ProofRequirement,
+    proofs: &[SettlementProof],
+    satisfied: &[String],
+) -> bool {
+    let threshold = req.threshold.unwrap_or(1).max(1) as usize;
+    if threshold == 1 {
+        return proofs.iter().any(|p| {
+            satisfied.contains(&p.proof_id)
+                && p.proof_type == req.proof_type
+                && req.required_attestor_ids.contains(&p.attested_by)
+        });
+    }
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for p in proofs {
+        if satisfied.contains(&p.proof_id)
+            && p.proof_type == req.proof_type
+            && req.required_attestor_ids.contains(&p.attested_by)
+        {
+            seen.insert(p.attested_by.as_str());
+            if seen.len() >= threshold {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Builds a `RequirementThresholdResult` for `req` if `threshold` is explicitly set.
+/// Returns `None` for requirements without a threshold (backward-compatible path).
+fn build_threshold_result(
+    req: &ProofRequirement,
+    proofs: &[SettlementProof],
+    satisfied: &[String],
+) -> Option<RequirementThresholdResult> {
+    let threshold = (req.threshold? as usize).max(1);
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut attestor_ids: Vec<String> = Vec::new();
+    for p in proofs {
+        if satisfied.contains(&p.proof_id)
+            && p.proof_type == req.proof_type
+            && req.required_attestor_ids.contains(&p.attested_by)
+            && seen.insert(p.attested_by.as_str())
+        {
+            attestor_ids.push(p.attested_by.clone());
+        }
+    }
+    let count = attestor_ids.len();
+    Some(RequirementThresholdResult {
+        requirement_id: req.requirement_id.clone(),
+        threshold_required: threshold as u32,
+        approved_attestor_count: count,
+        matched_attestor_ids: attestor_ids,
+        threshold_satisfied: count >= threshold,
+    })
+}
+
+fn eval_milestone_subset(
+    release_reqs: &[&ProofRequirement],
+    refund_reqs: &[&ProofRequirement],
+    no_response_rules: &[&NoResponseRule],
+    proofs: &[SettlementProof],
+    satisfied: &[String],
+    tip_height: u64,
+) -> (PolicyOutcome, bool, bool, String, Vec<String>, Vec<RequirementThresholdResult>) {
+    let all_release_met =
+        !release_reqs.is_empty()
+            && release_reqs
+                .iter()
+                .all(|req| req_satisfied_threshold(req, proofs, satisfied));
+    if all_release_met {
+        let matched: Vec<String> = proofs
+            .iter()
+            .filter(|p| {
+                satisfied.contains(&p.proof_id)
+                    && release_reqs.iter().any(|r| {
+                        p.proof_type == r.proof_type
+                            && r.required_attestor_ids.contains(&p.attested_by)
+                    })
+            })
+            .map(|p| p.proof_id.clone())
+            .collect();
+        let thr: Vec<RequirementThresholdResult> = release_reqs
+            .iter()
+            .chain(refund_reqs.iter())
+            .filter_map(|r| build_threshold_result(r, proofs, satisfied))
+            .collect();
+        return (
+            PolicyOutcome::Satisfied,
+            true,
+            false,
+            "all release requirements satisfied by verified proofs".to_string(),
+            matched,
+            thr,
+        );
+    }
+
+    for rule in no_response_rules {
+        if tip_height >= rule.deadline_height {
+            let trigger_label = match rule.trigger {
+                NoResponseTrigger::FundedAndNoRelease => "funded_and_no_release",
+                NoResponseTrigger::DisputedAndNoResponse => "disputed_and_no_response",
+            };
+            let label = format!(
+                "no_response_rule '{}' deadline {} reached at tip {} trigger {}",
+                rule.rule_id, rule.deadline_height, tip_height, trigger_label
+            );
+            let (release, refund) = match rule.resolution {
+                ProofResolution::Release | ProofResolution::MilestoneRelease => (true, false),
+                ProofResolution::Refund => (false, true),
+            };
+            let thr: Vec<RequirementThresholdResult> = release_reqs
+                .iter()
+                .chain(refund_reqs.iter())
+                .filter_map(|r| build_threshold_result(r, proofs, satisfied))
+                .collect();
+            return (PolicyOutcome::Timeout, release, refund, label, vec![], thr);
+        }
+    }
+
+    for req in refund_reqs {
+        if let Some(deadline) = req.required_by {
+            if !req_satisfied_threshold(req, proofs, satisfied) && tip_height >= deadline {
+                let label = format!(
+                    "requirement '{}' refund deadline {} reached at tip {} with no satisfying proof",
+                    req.requirement_id, deadline, tip_height
+                );
+                let thr: Vec<RequirementThresholdResult> = release_reqs
+                    .iter()
+                    .chain(refund_reqs.iter())
+                    .filter_map(|r| build_threshold_result(r, proofs, satisfied))
+                    .collect();
+                return (PolicyOutcome::Timeout, false, true, label, vec![], thr);
+            }
+        }
+    }
+
+    let thr: Vec<RequirementThresholdResult> = release_reqs
+        .iter()
+        .chain(refund_reqs.iter())
+        .filter_map(|r| build_threshold_result(r, proofs, satisfied))
+        .collect();
+    (
+        PolicyOutcome::Unsatisfied,
+        false,
+        false,
+        "no release or refund condition was met".to_string(),
+        vec![],
+        thr,
+    )
+}
+
+/// Evaluate a holdback condition given the base satisfaction state.
+///
+/// - If base is not satisfied: returns `Pending` (holdback not yet active).
+/// - If `release_requirement_id` is provided and satisfied: returns `Released`.
+/// - If `deadline_height` has been reached: returns `Released`.
+/// - Otherwise: returns `Held` with the split bps.
+fn evaluate_holdback(
+    holdback: &PolicyHoldback,
+    base_satisfied: bool,
+    scope_reqs: &[&ProofRequirement],
+    proofs: &[SettlementProof],
+    satisfied: &[String],
+    tip_height: u64,
+) -> HoldbackEvaluationResult {
+    if !base_satisfied {
+        return HoldbackEvaluationResult {
+            holdback_present: true,
+            holdback_released: false,
+            holdback_bps: holdback.holdback_bps,
+            immediate_release_bps: 0,
+            holdback_outcome: HoldbackOutcome::Pending,
+            holdback_reason: "base condition not yet satisfied".to_string(),
+        };
+    }
+
+    // Proof-condition release takes priority over deadline release.
+    if let Some(ref req_id) = holdback.release_requirement_id {
+        let req_met = scope_reqs.iter().any(|req| {
+            req.requirement_id == *req_id
+                && req_satisfied_threshold(*req, proofs, satisfied)
+        });
+        if req_met {
+            return HoldbackEvaluationResult {
+                holdback_present: true,
+                holdback_released: true,
+                holdback_bps: holdback.holdback_bps,
+                immediate_release_bps: 10000,
+                holdback_outcome: HoldbackOutcome::Released,
+                holdback_reason: format!("holdback released by requirement '{}'", req_id),
+            };
+        }
+    }
+
+    if let Some(deadline) = holdback.deadline_height {
+        if tip_height >= deadline {
+            return HoldbackEvaluationResult {
+                holdback_present: true,
+                holdback_released: true,
+                holdback_bps: holdback.holdback_bps,
+                immediate_release_bps: 10000,
+                holdback_outcome: HoldbackOutcome::Released,
+                holdback_reason: format!(
+                    "holdback released by deadline at height {}",
+                    deadline
+                ),
+            };
+        }
+    }
+
+    HoldbackEvaluationResult {
+        holdback_present: true,
+        holdback_released: false,
+        holdback_bps: holdback.holdback_bps,
+        immediate_release_bps: 10000u32.saturating_sub(holdback.holdback_bps),
+        holdback_outcome: HoldbackOutcome::Held,
+        holdback_reason: "base satisfied; holdback pending release condition".to_string(),
+    }
+}
+
 pub fn evaluate_policy(
     agreement: &AgreementObject,
     policy: &ProofPolicy,
@@ -3858,15 +4215,136 @@ pub fn evaluate_policy(
         }
     }
 
-    // Closure: does any verified proof satisfy the given requirement?
-    let req_satisfied = |req: &ProofRequirement| -> bool {
-        proofs.iter().any(|p| {
-            satisfied.contains(&p.proof_id)
-                && p.proof_type == req.proof_type
-                && req.required_attestor_ids.contains(&p.attested_by)
-        })
-    };
+    // ── Milestone-based evaluation ───────────────────────────────────────────
+    // When the policy declares milestones, requirements and rules are grouped
+    // by milestone_id and evaluated independently.  The overall outcome is the
+    // aggregate of all milestone outcomes.
+    if !policy.milestones.is_empty() {
+        let mut milestone_results: Vec<MilestoneEvaluationResult> = Vec::new();
 
+        for ms in &policy.milestones {
+            let mid = ms.milestone_id.as_str();
+
+            let ms_release_reqs: Vec<&ProofRequirement> = policy
+                .required_proofs
+                .iter()
+                .filter(|r| {
+                    r.milestone_id.as_deref() == Some(mid)
+                        && matches!(
+                            r.resolution,
+                            ProofResolution::Release | ProofResolution::MilestoneRelease
+                        )
+                })
+                .collect();
+
+            let ms_refund_reqs: Vec<&ProofRequirement> = policy
+                .required_proofs
+                .iter()
+                .filter(|r| {
+                    r.milestone_id.as_deref() == Some(mid)
+                        && matches!(r.resolution, ProofResolution::Refund)
+                })
+                .collect();
+
+            let ms_rules: Vec<&NoResponseRule> = policy
+                .no_response_rules
+                .iter()
+                .filter(|r| r.milestone_id.as_deref() == Some(mid))
+                .collect();
+
+            let (ms_outcome, ms_release, ms_refund, ms_reason, ms_matched, ms_thr) =
+                eval_milestone_subset(
+                    &ms_release_reqs,
+                    &ms_refund_reqs,
+                    &ms_rules,
+                    proofs,
+                    &satisfied,
+                    tip_height,
+                );
+
+            evaluated_rules.push(format!(
+                "milestone '{}' outcome {:?}",
+                mid, ms_outcome
+            ));
+
+            let ms_holdback = ms.holdback.as_ref().map(|hb| {
+                evaluate_holdback(
+                    hb,
+                    ms_outcome == PolicyOutcome::Satisfied,
+                    &ms_release_reqs,
+                    proofs,
+                    &satisfied,
+                    tip_height,
+                )
+            });
+
+            milestone_results.push(MilestoneEvaluationResult {
+                milestone_id: ms.milestone_id.clone(),
+                label: ms.label.clone(),
+                outcome: ms_outcome,
+                release_eligible: ms_release,
+                refund_eligible: ms_refund,
+                matched_proof_ids: ms_matched,
+                reason: ms_reason,
+                holdback: ms_holdback,
+                threshold_results: ms_thr,
+            });
+        }
+
+        let completed = milestone_results
+            .iter()
+            .filter(|r| r.outcome == PolicyOutcome::Satisfied)
+            .count();
+        let total = milestone_results.len();
+        // Collect all matched proof ids across milestones (deduplicated).
+        let mut seen = std::collections::HashSet::new();
+        let all_matched: Vec<String> = milestone_results
+            .iter()
+            .flat_map(|r| r.matched_proof_ids.iter().cloned())
+            .filter(|id| seen.insert(id.clone()))
+            .collect();
+
+        let (agg_outcome, agg_release, agg_refund, agg_reason) =
+            if total > 0 && completed == total {
+                (PolicyOutcome::Satisfied, true, false, "all milestones satisfied".to_string())
+            } else if let Some(to) =
+                milestone_results.iter().find(|r| r.outcome == PolicyOutcome::Timeout)
+            {
+                (
+                    PolicyOutcome::Timeout,
+                    to.release_eligible,
+                    to.refund_eligible,
+                    format!("milestone '{}' timed out: {}", to.milestone_id, to.reason),
+                )
+            } else {
+                let unsat = total - completed;
+                (
+                    PolicyOutcome::Unsatisfied,
+                    false,
+                    false,
+                    format!(
+                        "{} of {} milestones satisfied; {} unsatisfied",
+                        completed, total, unsat
+                    ),
+                )
+            };
+
+        return Ok(PolicyEvaluationResult {
+            outcome: agg_outcome,
+            release_eligible: agg_release,
+            refund_eligible: agg_refund,
+            reason: agg_reason,
+            evaluated_rules,
+            matched_proof_ids: all_matched,
+            milestone_results,
+            completed_milestone_count: completed,
+            total_milestone_count: total,
+            holdback: None,
+            threshold_results: vec![],
+        });
+    }
+
+    // ── Non-milestone (backward-compatible) evaluation ───────────────────────
     let release_requirements: Vec<&ProofRequirement> = policy
         .required_proofs
         .iter()
@@ -3887,14 +4365,38 @@ pub fn evaluate_policy(
     // Step 2: if all release requirements are already satisfied, return release.
     // No-response rules are suppressed when release is already achieved.
     let all_release_met = !release_requirements.is_empty()
-        && release_requirements.iter().all(|req| req_satisfied(*req));
+        && release_requirements
+            .iter()
+            .all(|req| req_satisfied_threshold(req, proofs, &satisfied));
 
     if all_release_met {
+        let top_holdback = policy.holdback.as_ref().map(|hb| {
+            evaluate_holdback(
+                hb,
+                true,
+                &release_requirements,
+                proofs,
+                &satisfied,
+                tip_height,
+            )
+        });
+        let top_thr: Vec<RequirementThresholdResult> = policy
+            .required_proofs
+            .iter()
+            .filter_map(|r| build_threshold_result(r, proofs, &satisfied))
+            .collect();
         return Ok(PolicyEvaluationResult {
+            outcome: PolicyOutcome::Satisfied,
             release_eligible: true,
             refund_eligible: false,
             reason: "all release requirements satisfied by verified proofs".to_string(),
             evaluated_rules,
+            matched_proof_ids: satisfied.clone(),
+            milestone_results: vec![],
+            completed_milestone_count: 0,
+            total_milestone_count: 0,
+            holdback: top_holdback,
+            threshold_results: top_thr,
         });
     }
 
@@ -3917,11 +4419,23 @@ pub fn evaluate_policy(
                 ProofResolution::Release | ProofResolution::MilestoneRelease => (true, false),
                 ProofResolution::Refund => (false, true),
             };
+            let thr: Vec<RequirementThresholdResult> = policy
+                .required_proofs
+                .iter()
+                .filter_map(|r| build_threshold_result(r, proofs, &satisfied))
+                .collect();
             return Ok(PolicyEvaluationResult {
+                outcome: PolicyOutcome::Timeout,
                 release_eligible: release,
                 refund_eligible: refund,
                 reason: label,
                 evaluated_rules,
+                matched_proof_ids: satisfied.clone(),
+                milestone_results: vec![],
+                completed_milestone_count: 0,
+                total_milestone_count: 0,
+                holdback: None,
+                threshold_results: thr,
             });
         }
     }
@@ -3931,7 +4445,7 @@ pub fn evaluate_policy(
     for req in refund_requirements {
         if let Some(deadline) = req.required_by {
             if tip_height >= deadline {
-                if req_satisfied(req) {
+                if req_satisfied_threshold(req, proofs, &satisfied) {
                     evaluated_rules.push(format!(
                         "requirement '{}' refund deadline {} reached but satisfied",
                         req.requirement_id, deadline
@@ -3942,11 +4456,23 @@ pub fn evaluate_policy(
                         req.requirement_id, deadline, tip_height
                     );
                     evaluated_rules.push(label.clone());
+                    let thr: Vec<RequirementThresholdResult> = policy
+                        .required_proofs
+                        .iter()
+                        .filter_map(|r| build_threshold_result(r, proofs, &satisfied))
+                        .collect();
                     return Ok(PolicyEvaluationResult {
+                        outcome: PolicyOutcome::Timeout,
                         release_eligible: false,
                         refund_eligible: true,
                         reason: label,
                         evaluated_rules,
+                        matched_proof_ids: satisfied.clone(),
+                        milestone_results: vec![],
+                        completed_milestone_count: 0,
+                        total_milestone_count: 0,
+                        holdback: None,
+                        threshold_results: thr,
                     });
                 }
             }
@@ -3958,7 +4484,7 @@ pub fn evaluate_policy(
     // is not a hard acceptance cutoff.
     for req in release_requirements {
         if let Some(deadline) = req.required_by {
-            if tip_height >= deadline && !req_satisfied(req) {
+            if tip_height >= deadline && !req_satisfied_threshold(req, proofs, &satisfied) {
                 evaluated_rules.push(format!(
                     "requirement '{}' release deadline {} missed at tip {}",
                     req.requirement_id, deadline, tip_height
@@ -3967,14 +4493,25 @@ pub fn evaluate_policy(
         }
     }
 
+    let top_thr: Vec<RequirementThresholdResult> = policy
+        .required_proofs
+        .iter()
+        .filter_map(|r| build_threshold_result(r, proofs, &satisfied))
+        .collect();
     Ok(PolicyEvaluationResult {
+        outcome: PolicyOutcome::Unsatisfied,
         release_eligible: false,
         refund_eligible: false,
         reason: "no release or refund condition was met".to_string(),
         evaluated_rules,
+        matched_proof_ids: satisfied,
+        milestone_results: vec![],
+        completed_milestone_count: 0,
+        total_milestone_count: 0,
+        holdback: None,
+        threshold_results: top_thr,
     })
 }
-
 
 
 // ---- Proof storage ----
@@ -4098,16 +4635,21 @@ impl ProofStore {
             .values()
             .filter(|p| p.agreement_hash.to_lowercase() == lower)
             .collect();
-        proofs.sort_by(|a, b| a.proof_id.cmp(&b.proof_id));
+        proofs.sort_by(|a, b| {
+            a.attestation_time
+                .cmp(&b.attestation_time)
+                .then_with(|| a.proof_id.cmp(&b.proof_id))
+        });
         proofs
     }
 
-    /// Return all proofs in the store, sorted by agreement_hash then proof_id.
+    /// Return all proofs in the store, sorted by attestation_time ascending then proof_id
+    /// ascending as a stable tie-breaker. This ordering is consistent with list_by_agreement.
     pub fn list_all(&self) -> Vec<&SettlementProof> {
         let mut proofs: Vec<&SettlementProof> = self.proofs.values().collect();
         proofs.sort_by(|a, b| {
-            a.agreement_hash
-                .cmp(&b.agreement_hash)
+            a.attestation_time
+                .cmp(&b.attestation_time)
                 .then_with(|| a.proof_id.cmp(&b.proof_id))
         });
         proofs
@@ -4115,6 +4657,11 @@ impl ProofStore {
 
     pub fn count(&self) -> usize {
         self.proofs.len()
+    }
+
+    /// Return the proof with the given proof_id, or None if not found.
+    pub fn get_by_id(&self, proof_id: &str) -> Option<&SettlementProof> {
+        self.proofs.get(proof_id)
     }
 }
 
@@ -4180,6 +4727,111 @@ impl PolicyStore {
     pub fn store(&mut self, policy: ProofPolicy, replace: bool) -> Result<StorePolicyOutcome, String> {
         if policy.agreement_hash.trim().is_empty() {
             return Err("policy.agreement_hash must not be empty".to_string());
+        }
+        // Validate milestone declarations: no empty or duplicate milestone_ids.
+        let mut seen_ms_ids = std::collections::HashSet::new();
+        for ms in &policy.milestones {
+            if ms.milestone_id.trim().is_empty() {
+                return Err("milestone_id must not be empty".to_string());
+            }
+            if !seen_ms_ids.insert(ms.milestone_id.as_str()) {
+                return Err(format!("duplicate milestone_id '{}'", ms.milestone_id));
+            }
+        }
+        // Validate top-level holdback (non-milestone path).
+        if let Some(ref hb) = policy.holdback {
+            if hb.holdback_bps == 0 || hb.holdback_bps >= 10000 {
+                return Err("holdback_bps must be between 1 and 9999".to_string());
+            }
+            if hb.release_requirement_id.is_none() && hb.deadline_height.is_none() {
+                return Err(
+                    "holdback must specify at least one release condition (release_requirement_id or deadline_height)"
+                        .to_string(),
+                );
+            }
+            if let Some(ref req_id) = hb.release_requirement_id {
+                if !policy.required_proofs.iter().any(|r| r.requirement_id == *req_id) {
+                    return Err(format!(
+                        "holdback release_requirement_id '{}' not found in policy requirements",
+                        req_id
+                    ));
+                }
+            }
+        }
+        // Validate per-milestone holdbacks.
+        for ms in &policy.milestones {
+            if let Some(ref hb) = ms.holdback {
+                if hb.holdback_bps == 0 || hb.holdback_bps >= 10000 {
+                    return Err(format!(
+                        "milestone '{}' holdback_bps must be between 1 and 9999",
+                        ms.milestone_id
+                    ));
+                }
+                if hb.release_requirement_id.is_none() && hb.deadline_height.is_none() {
+                    return Err(format!(
+                        "milestone '{}' holdback must specify at least one release condition",
+                        ms.milestone_id
+                    ));
+                }
+                if let Some(ref req_id) = hb.release_requirement_id {
+                    let in_scope = policy.required_proofs.iter().any(|r| {
+                        r.requirement_id == *req_id
+                            && r.milestone_id.as_deref() == Some(ms.milestone_id.as_str())
+                    });
+                    if !in_scope {
+                        return Err(format!(
+                            "milestone '{}' holdback release_requirement_id '{}' not found in milestone requirements",
+                            ms.milestone_id, req_id
+                        ));
+                    }
+                }
+            }
+        }
+        // Validate threshold declarations on requirements.
+        for req in &policy.required_proofs {
+            if let Some(thr) = req.threshold {
+                if thr == 0 {
+                    return Err(format!(
+                        "requirement '{}' threshold must be >= 1",
+                        req.requirement_id
+                    ));
+                }
+                if req.required_attestor_ids.is_empty() {
+                    return Err(format!(
+                        "requirement '{}' has threshold but no required_attestor_ids",
+                        req.requirement_id
+                    ));
+                }
+                if thr as usize > req.required_attestor_ids.len() {
+                    return Err(format!(
+                        "requirement '{}' threshold {} exceeds required_attestor_ids count {}",
+                        req.requirement_id, thr, req.required_attestor_ids.len()
+                    ));
+                }
+            }
+        }
+        // Validate threshold declarations on requirements.
+        for req in &policy.required_proofs {
+            if let Some(thr) = req.threshold {
+                if thr == 0 {
+                    return Err(format!(
+                        "requirement '{}' threshold must be >= 1",
+                        req.requirement_id
+                    ));
+                }
+                if req.required_attestor_ids.is_empty() {
+                    return Err(format!(
+                        "requirement '{}' has threshold but no required_attestor_ids",
+                        req.requirement_id
+                    ));
+                }
+                if thr as usize > req.required_attestor_ids.len() {
+                    return Err(format!(
+                        "requirement '{}' threshold {} exceeds required_attestor_ids count {}",
+                        req.requirement_id, thr, req.required_attestor_ids.len()
+                    ));
+                }
+            }
         }
         let key = policy.agreement_hash.to_lowercase();
         let policy_id = policy.policy_id.clone();
@@ -5265,6 +5917,7 @@ mod tests {
                 required_attestor_ids: vec![attestor_id.to_string()],
                 resolution: ProofResolution::Release,
                 milestone_id: None,
+                threshold: None,
             }],
             no_response_rules: vec![],
             attestors: vec![ApprovedAttestor {
@@ -5275,6 +5928,8 @@ mod tests {
             }],
             notes: None,
             expires_at_height: None,
+            milestones: vec![],
+            holdback: None,
         }
     }
 
@@ -5460,6 +6115,357 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_policy_outcome_satisfied() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        let proof = make_test_proof(&agreement_hash, "attestor-a", &signing_key);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.release_eligible);
+        assert!(!result.refund_eligible);
+    }
+
+    #[test]
+    fn evaluate_policy_outcome_unsatisfied_missing_proofs() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        let result = evaluate_policy(&agreement, &policy, &[], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Unsatisfied);
+        assert!(!result.release_eligible);
+        assert!(!result.refund_eligible);
+    }
+
+    #[test]
+    fn evaluate_policy_outcome_unsatisfied_wrong_attestor() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        let mut policy2 = policy.clone();
+        policy2.required_proofs[0].required_attestor_ids = vec!["attestor-b".to_string()];
+        let proof = make_test_proof(&agreement_hash, "attestor-a", &signing_key);
+        // proof is attested_by "attestor-a"; policy2 requires "attestor-b" -> req unsatisfied
+        let result = evaluate_policy(&agreement, &policy2, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Unsatisfied);
+        assert!(!result.release_eligible);
+    }
+
+    #[test]
+    fn evaluate_policy_outcome_timeout_no_response_rule() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-refund-100".to_string(),
+            deadline_height: 100,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        });
+        let result = evaluate_policy(&agreement, &policy, &[], 100).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Timeout);
+        assert!(result.refund_eligible);
+        assert!(!result.release_eligible);
+    }
+
+    #[test]
+    fn evaluate_policy_outcome_timeout_required_by_deadline() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.required_proofs.clear();
+        policy.required_proofs.push(ProofRequirement {
+            requirement_id: "req-refund-deadline".to_string(),
+            proof_type: "refund_proof".to_string(),
+            required_by: Some(50),
+            required_attestor_ids: vec!["attestor-a".to_string()],
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            threshold: None,
+        });
+        let result = evaluate_policy(&agreement, &policy, &[], 50).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Timeout);
+        assert!(result.refund_eligible);
+        assert!(!result.release_eligible);
+    }
+
+    #[test]
+    fn evaluate_policy_outcome_satisfied_suppresses_no_response_rule() {
+        // Proofs satisfy release; no-response rule deadline also elapsed.
+        // Satisfied takes priority; outcome must be Satisfied.
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-refund-200".to_string(),
+            deadline_height: 200,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        });
+        let proof = make_test_proof(&agreement_hash, "attestor-a", &signing_key);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 300).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.release_eligible);
+        assert!(!result.refund_eligible);
+    }
+
+    // ---- milestone-based evaluation tests ----
+
+    fn make_milestone_policy(
+        agreement_hash: &str,
+        pubkey_hex: &str,
+        attestor_id: &str,
+        milestones: Vec<(&str, Option<&str>)>, // (milestone_id, label)
+    ) -> ProofPolicy {
+        let ms_decls: Vec<PolicyMilestone> = milestones
+            .iter()
+            .map(|(id, label)| PolicyMilestone {
+                milestone_id: id.to_string(),
+                label: label.map(|l| l.to_string()),
+                holdback: None,
+            })
+            .collect();
+        let reqs: Vec<ProofRequirement> = milestones
+            .iter()
+            .map(|(id, _)| ProofRequirement {
+                requirement_id: format!("req-{}", id),
+                proof_type: format!("proof_type_{}", id),
+                required_by: None,
+                required_attestor_ids: vec![attestor_id.to_string()],
+                resolution: ProofResolution::MilestoneRelease,
+                milestone_id: Some(id.to_string()),
+                threshold: None,
+            })
+            .collect();
+        ProofPolicy {
+            policy_id: "pol-ms".to_string(),
+            schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+            agreement_hash: agreement_hash.to_string(),
+            required_proofs: reqs,
+            no_response_rules: vec![],
+            attestors: vec![ApprovedAttestor {
+                attestor_id: attestor_id.to_string(),
+                pubkey_hex: pubkey_hex.to_string(),
+                display_name: None,
+                domain: None,
+            }],
+            notes: None,
+            expires_at_height: None,
+            milestones: ms_decls,
+            holdback: None,
+        }
+    }
+
+    fn make_milestone_proof(
+        agreement_hash: &str,
+        attestor_id: &str,
+        milestone_id: &str,
+        signing_key: &SigningKey,
+    ) -> SettlementProof {
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let mut proof = SettlementProof {
+            proof_id: format!("prf-{}", milestone_id),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            // proof_type must match format!("proof_type_{}", milestone_id) from make_milestone_policy
+            proof_type: format!("proof_type_{}", milestone_id),
+            agreement_hash: agreement_hash.to_string(),
+            milestone_id: Some(milestone_id.to_string()),
+            attested_by: attestor_id.to_string(),
+            attestation_time: 1_700_000_000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pubkey_hex.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+        };
+        proof.signature = sign_proof(&proof, signing_key);
+        proof
+    }
+
+    #[test]
+    fn evaluate_policy_milestone_single_satisfied() {
+        // One milestone declared; proof satisfies it -> overall Satisfied.
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_milestone_policy(&hash, &pk, "att", vec![("ms-a", Some("Delivery"))]);
+        let proof = make_milestone_proof(&hash, "att", "ms-a", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.release_eligible);
+        assert_eq!(result.total_milestone_count, 1);
+        assert_eq!(result.completed_milestone_count, 1);
+        assert_eq!(result.milestone_results[0].milestone_id, "ms-a");
+        assert_eq!(result.milestone_results[0].outcome, PolicyOutcome::Satisfied);
+    }
+
+    #[test]
+    fn evaluate_policy_milestone_all_satisfied() {
+        // Two milestones; both proofs provided -> overall Satisfied.
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_milestone_policy(
+            &hash, &pk, "att",
+            vec![("ms-a", None), ("ms-b", None)],
+        );
+        let proof_a = make_milestone_proof(&hash, "att", "ms-a", &sk);
+        let proof_b = make_milestone_proof(&hash, "att", "ms-b", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof_a, proof_b], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert_eq!(result.total_milestone_count, 2);
+        assert_eq!(result.completed_milestone_count, 2);
+    }
+
+    #[test]
+    fn evaluate_policy_milestone_partial_unsatisfied() {
+        // Two milestones; only ms-a proof provided -> 1 of 2 satisfied -> Unsatisfied.
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_milestone_policy(
+            &hash, &pk, "att",
+            vec![("ms-a", None), ("ms-b", None)],
+        );
+        let proof_a = make_milestone_proof(&hash, "att", "ms-a", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof_a], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Unsatisfied);
+        assert!(!result.release_eligible);
+        assert_eq!(result.total_milestone_count, 2);
+        assert_eq!(result.completed_milestone_count, 1);
+        assert_eq!(result.milestone_results[0].outcome, PolicyOutcome::Satisfied);
+        assert_eq!(result.milestone_results[1].outcome, PolicyOutcome::Unsatisfied);
+    }
+
+    #[test]
+    fn evaluate_policy_milestone_timeout_on_one() {
+        // ms-b has a no_response_rule deadline at height 50.
+        // No proofs; tip = 51 -> ms-b times out -> overall Timeout.
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_milestone_policy(
+            &hash, &pk, "att",
+            vec![("ms-a", None), ("ms-b", None)],
+        );
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-ms-b-timeout".to_string(),
+            deadline_height: 50,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: Some("ms-b".to_string()),
+            notes: None,
+        });
+        let result = evaluate_policy(&agreement, &policy, &[], 51).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Timeout);
+        assert!(result.refund_eligible);
+        assert!(!result.release_eligible);
+        assert_eq!(result.total_milestone_count, 2);
+        // ms-a has no deadline so it is Unsatisfied; ms-b has timed out
+        let ms_b = result.milestone_results.iter().find(|r| r.milestone_id == "ms-b").unwrap();
+        assert_eq!(ms_b.outcome, PolicyOutcome::Timeout);
+    }
+
+    #[test]
+    fn evaluate_policy_milestone_satisfied_overrides_timeout() {
+        // ms-a satisfied, ms-b not. ms-b has no deadline -> Unsatisfied (not Timeout).
+        // Also: satisfying ms-a does NOT suppress ms-b timeout if ms-b has one.
+        // Here we test: all satisfied -> Satisfied, even if one had a deadline.
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_milestone_policy(
+            &hash, &pk, "att",
+            vec![("ms-a", None), ("ms-b", None)],
+        );
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-ms-b-dl".to_string(),
+            deadline_height: 50,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: Some("ms-b".to_string()),
+            notes: None,
+        });
+        // Provide both proofs; ms-b proof satisfies ms-b before deadline check
+        let proof_a = make_milestone_proof(&hash, "att", "ms-a", &sk);
+        let proof_b = make_milestone_proof(&hash, "att", "ms-b", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof_a, proof_b], 51).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.release_eligible);
+        assert_eq!(result.completed_milestone_count, 2);
+    }
+
+    #[test]
+    fn evaluate_policy_milestone_backward_compat_no_milestones() {
+        // Policy with no milestones declared: milestone_results must be empty.
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_test_policy(&hash, &pk, "attestor-a");
+        let proof = make_test_proof(&hash, "attestor-a", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.milestone_results.is_empty());
+        assert_eq!(result.total_milestone_count, 0);
+        assert_eq!(result.completed_milestone_count, 0);
+    }
+
+    #[test]
     fn policy_hash_mismatch_rejected() {
         let signing_key = sample_signing_key();
         let pubkey_hex = hex::encode(
@@ -5540,6 +6546,7 @@ mod tests {
             required_attestor_ids: vec!["attestor-a".to_string()],
             resolution: ProofResolution::Release,
             milestone_id: None,
+            threshold: None,
         });
 
         let proof = make_test_proof(&agreement_hash, "attestor-a", &signing_key);
@@ -5585,6 +6592,7 @@ mod tests {
             required_attestor_ids: vec!["attestor-a".to_string()],
             resolution: ProofResolution::Release,
             milestone_id: None,
+            threshold: None,
         });
 
         let result = evaluate_policy(&agreement_b, &policy_b, &[proof_for_a], 0).unwrap();
@@ -5650,6 +6658,122 @@ mod tests {
         proof.signature.signature_hex = hex::encode(sig.to_bytes());
         proof.signature.payload_hash = hex::encode(digest);
         proof
+    }
+
+    /// Variant of build_signed_proof that accepts a custom attestation_time.
+    /// Used by ordering tests to control the temporal field in the signed payload.
+    fn build_signed_proof_at_time(
+        agreement_hash: &str,
+        attestor_id: &str,
+        signing_key: &SigningKey,
+        attestation_time: u64,
+    ) -> SettlementProof {
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let mut proof = SettlementProof {
+            proof_id: format!("prf-store-{}-{}", attestor_id, agreement_hash),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: agreement_hash.to_string(),
+            milestone_id: None,
+            attested_by: attestor_id.to_string(),
+            attestation_time,
+            evidence_hash: None,
+            evidence_summary: Some("ordering test".to_string()),
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pubkey_hex.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+        };
+        let payload = settlement_proof_payload_bytes(&proof).unwrap();
+        let digest = sha2::Sha256::digest(&payload);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: k256::ecdsa::Signature = signing_key.sign_prehash(&arr).unwrap();
+        proof.signature.signature_hex = hex::encode(sig.to_bytes());
+        proof.signature.payload_hash = hex::encode(digest);
+        proof
+    }
+
+    #[test]
+    fn proof_store_list_by_agreement_orders_by_attestation_time() {
+        // Proofs submitted out of time-order must be returned oldest-first.
+        let mut store = make_proof_store();
+        let sk1 = SigningKey::from_bytes((&[50u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[51u8; 32]).into()).unwrap();
+        let sk3 = SigningKey::from_bytes((&[52u8; 32]).into()).unwrap();
+        let p_latest = build_signed_proof_at_time("ord-hash", "att-c", &sk3, 3_000);
+        let p_mid    = build_signed_proof_at_time("ord-hash", "att-b", &sk2, 2_000);
+        let p_oldest = build_signed_proof_at_time("ord-hash", "att-a", &sk1, 1_000);
+        // submit in reverse time order to rule out insertion-order artefacts
+        store.submit(p_latest).unwrap();
+        store.submit(p_mid).unwrap();
+        store.submit(p_oldest).unwrap();
+        let listed = store.list_by_agreement("ord-hash");
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].attestation_time, 1_000, "oldest must be first");
+        assert_eq!(listed[1].attestation_time, 2_000);
+        assert_eq!(listed[2].attestation_time, 3_000, "latest must be last");
+    }
+
+    #[test]
+    fn proof_store_list_all_orders_by_attestation_time() {
+        // list_all must apply the same ordering even across different agreement hashes.
+        let mut store = make_proof_store();
+        let sk1 = SigningKey::from_bytes((&[53u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[54u8; 32]).into()).unwrap();
+        let sk3 = SigningKey::from_bytes((&[55u8; 32]).into()).unwrap();
+        // different agreement hashes; p3 has smallest time, p1 largest
+        let p1 = build_signed_proof_at_time("hash-z", "att-z", &sk1, 9_000);
+        let p2 = build_signed_proof_at_time("hash-a", "att-a", &sk2, 5_000);
+        let p3 = build_signed_proof_at_time("hash-m", "att-m", &sk3, 1_000);
+        store.submit(p1).unwrap();
+        store.submit(p2).unwrap();
+        store.submit(p3).unwrap();
+        let all = store.list_all();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].attestation_time, 1_000, "oldest first regardless of agreement_hash");
+        assert_eq!(all[1].attestation_time, 5_000);
+        assert_eq!(all[2].attestation_time, 9_000, "latest last regardless of agreement_hash");
+    }
+
+    #[test]
+    fn proof_store_list_tie_breaks_by_proof_id() {
+        // Two proofs with identical attestation_time must be ordered by proof_id ascending.
+        let mut store = make_proof_store();
+        let sk1 = SigningKey::from_bytes((&[56u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[57u8; 32]).into()).unwrap();
+        let mut pa = build_signed_proof_at_time("tie-hash", "att-b", &sk1, 7_000);
+        let mut pb = build_signed_proof_at_time("tie-hash", "att-a", &sk2, 7_000);
+        // Override proof_ids so we control alphabetical order explicitly
+        pa.proof_id = "prf-zzz".to_string();
+        pb.proof_id = "prf-aaa".to_string();
+        // Re-sign after changing proof_id since proof_id is part of the payload
+        let payload_a = settlement_proof_payload_bytes(&pa).unwrap();
+        let digest_a = sha2::Sha256::digest(&payload_a);
+        let mut arr = [0u8; 32]; arr.copy_from_slice(&digest_a);
+        let sig_a: k256::ecdsa::Signature = sk1.sign_prehash(&arr).unwrap();
+        pa.signature.signature_hex = hex::encode(sig_a.to_bytes());
+        pa.signature.payload_hash = hex::encode(digest_a);
+        let payload_b = settlement_proof_payload_bytes(&pb).unwrap();
+        let digest_b = sha2::Sha256::digest(&payload_b);
+        arr.copy_from_slice(&digest_b);
+        let sig_b: k256::ecdsa::Signature = sk2.sign_prehash(&arr).unwrap();
+        pb.signature.signature_hex = hex::encode(sig_b.to_bytes());
+        pb.signature.payload_hash = hex::encode(digest_b);
+        store.submit(pa).unwrap();
+        store.submit(pb).unwrap();
+        let listed = store.list_by_agreement("tie-hash");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].proof_id, "prf-aaa", "alphabetically earlier proof_id must be first on tie");
+        assert_eq!(listed[1].proof_id, "prf-zzz");
     }
 
     #[test]
@@ -5915,6 +7039,7 @@ mod tests {
             required_attestor_ids: vec!["attestor-a".to_string()],
             resolution: ProofResolution::Refund,
             milestone_id: None,
+            threshold: None,
         }];
 
         // At tip == deadline: refund triggered
@@ -5945,6 +7070,7 @@ mod tests {
             required_attestor_ids: vec!["attestor-a".to_string()],
             resolution: ProofResolution::Refund,
             milestone_id: None,
+            threshold: None,
         }];
 
         // One block before deadline: no trigger
@@ -5972,6 +7098,7 @@ mod tests {
             required_attestor_ids: vec!["attestor-a".to_string()],
             resolution: ProofResolution::Refund,
             milestone_id: None,
+            threshold: None,
         }];
 
         let proof = make_test_proof(&agreement_hash, "attestor-a", &signing_key);
@@ -6176,5 +7303,702 @@ mod tests {
         assert_eq!(got.expires_at_height, Some(9999));
     }
 
+    #[test]
+    fn store_policy_rejects_empty_milestone_id() {
+        let mut store = make_policy_store();
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.milestones = vec![PolicyMilestone {
+            milestone_id: "  ".to_string(), // blank
+            label: None,
+            holdback: None,
+        }];
+        let err = store.store(policy, false).unwrap_err();
+        assert!(err.contains("milestone_id must not be empty"), "got: {err}");
+    }
 
+    #[test]
+    fn store_policy_rejects_duplicate_milestone_id() {
+        let mut store = make_policy_store();
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.milestones = vec![
+            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None, holdback: None },
+            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None, holdback: None },
+        ];
+        let err = store.store(policy, false).unwrap_err();
+        assert!(err.contains("duplicate milestone_id"), "got: {err}");
+        assert!(err.contains("ms-dup"), "got: {err}");
+    }
+
+    // ---- Holdback tests ----
+
+    #[test]
+    fn holdback_none_when_base_not_satisfied() {
+        // Holdback is only computed when base is satisfied (Satisfied path).
+        // When no proofs: Unsatisfied, holdback must be None.
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 2000,
+            release_requirement_id: None,
+            deadline_height: Some(500),
+        });
+        let result = evaluate_policy(&agreement, &policy, &[], 100).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Unsatisfied);
+        assert!(result.holdback.is_none(), "holdback must be None when base not satisfied");
+    }
+
+    #[test]
+    fn holdback_held_when_base_satisfied_deadline_not_reached() {
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 1000,
+            release_requirement_id: None,
+            deadline_height: Some(1000), // deadline in the future
+        });
+        let proof = make_test_proof(&hash, "att", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 100).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        let hb = result.holdback.expect("holdback must be present when base satisfied");
+        assert!(hb.holdback_present);
+        assert!(!hb.holdback_released);
+        assert_eq!(hb.holdback_outcome, HoldbackOutcome::Held);
+        assert_eq!(hb.holdback_bps, 1000);
+        assert_eq!(hb.immediate_release_bps, 9000);
+    }
+
+    #[test]
+    fn holdback_released_by_deadline() {
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 500,
+            release_requirement_id: None,
+            deadline_height: Some(200),
+        });
+        let proof = make_test_proof(&hash, "att", &sk);
+        // tip_height >= 200 → deadline fires.
+        let result = evaluate_policy(&agreement, &policy, &[proof], 200).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        let hb = result.holdback.expect("holdback must be present");
+        assert!(hb.holdback_released);
+        assert_eq!(hb.holdback_outcome, HoldbackOutcome::Released);
+        assert_eq!(hb.immediate_release_bps, 10000);
+        assert!(hb.holdback_reason.contains("deadline"), "got: {}", hb.holdback_reason);
+    }
+
+    #[test]
+    fn holdback_released_by_proof() {
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        // req-001 is both the base requirement and the holdback release requirement.
+        // When the proof satisfies req-001, holdback is also released immediately.
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 3000,
+            release_requirement_id: Some("req-001".to_string()),
+            deadline_height: Some(9999),
+        });
+        let proof = make_test_proof(&hash, "att", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 100).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        let hb = result.holdback.expect("holdback must be present");
+        assert!(hb.holdback_released);
+        assert_eq!(hb.holdback_outcome, HoldbackOutcome::Released);
+        assert_eq!(hb.immediate_release_bps, 10000);
+        assert!(hb.holdback_reason.contains("req-001"), "got: {}", hb.holdback_reason);
+    }
+
+    #[test]
+    fn holdback_absent_when_no_holdback_configured() {
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_test_policy(&hash, &pubkey_hex, "att");
+        let proof = make_test_proof(&hash, "att", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 100).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.holdback.is_none(), "holdback field must be None when not configured");
+    }
+
+    #[test]
+    fn store_policy_rejects_invalid_holdback_bps() {
+        let mut store = make_policy_store();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 0,
+            release_requirement_id: None,
+            deadline_height: Some(100),
+        });
+        let err = store.store(policy, false).unwrap_err();
+        assert!(err.contains("holdback_bps"), "got: {err}");
+    }
+
+    #[test]
+    fn store_policy_rejects_holdback_with_no_release_condition() {
+        let mut store = make_policy_store();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 1000,
+            release_requirement_id: None,
+            deadline_height: None,
+        });
+        let err = store.store(policy, false).unwrap_err();
+        assert!(err.contains("release condition"), "got: {err}");
+    }
+
+    #[test]
+    fn store_policy_rejects_holdback_with_unknown_req_id() {
+        let mut store = make_policy_store();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 500,
+            release_requirement_id: Some("no-such-req".to_string()),
+            deadline_height: None,
+        });
+        let err = store.store(policy, false).unwrap_err();
+        assert!(err.contains("no-such-req"), "got: {err}");
+    }
+
+    // ---- Threshold / multi-attestor tests ----
+
+    fn make_threshold_policy(
+        hash: &str,
+        pubkey_hex_a: &str,
+        pubkey_hex_b: &str,
+        threshold: u32,
+    ) -> ProofPolicy {
+        ProofPolicy {
+            policy_id: "pol-thr".to_string(),
+            schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+            agreement_hash: hash.to_string(),
+            required_proofs: vec![ProofRequirement {
+                requirement_id: "req-thr".to_string(),
+                proof_type: "delivery_confirmation".to_string(),
+                required_by: None,
+                required_attestor_ids: vec![
+                    "att-a".to_string(),
+                    "att-b".to_string(),
+                ],
+                resolution: ProofResolution::Release,
+                milestone_id: None,
+                threshold: Some(threshold),
+            }],
+            no_response_rules: vec![],
+            attestors: vec![
+                ApprovedAttestor {
+                    attestor_id: "att-a".to_string(),
+                    pubkey_hex: pubkey_hex_a.to_string(),
+                    display_name: None,
+                    domain: None,
+                },
+                ApprovedAttestor {
+                    attestor_id: "att-b".to_string(),
+                    pubkey_hex: pubkey_hex_b.to_string(),
+                    display_name: None,
+                    domain: None,
+                },
+            ],
+            notes: None,
+            expires_at_height: None,
+            milestones: vec![],
+            holdback: None,
+        }
+    }
+
+    fn make_threshold_proof(
+        hash: &str,
+        attestor_id: &str,
+        signing_key: &SigningKey,
+        proof_id: &str,
+    ) -> SettlementProof {
+        let pubkey_hex = hex::encode(signing_key.verifying_key().to_encoded_point(false).as_bytes());
+        let mut proof = SettlementProof {
+            proof_id: proof_id.to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: hash.to_string(),
+            milestone_id: None,
+            attested_by: attestor_id.to_string(),
+            attestation_time: 1_700_000_000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pubkey_hex.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+        };
+        proof.signature = sign_proof(&proof, signing_key);
+        proof
+    }
+
+    #[test]
+    fn threshold_single_attestor_backward_compat() {
+        // Policy with no threshold field: single valid proof satisfies release.
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_test_policy(&hash, &pubkey_hex, "att");
+        let proof = make_test_proof(&hash, "att", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.threshold_results.is_empty(), "no threshold configured -> empty");
+    }
+
+    #[test]
+    fn threshold_single_attestor_no_threshold_field() {
+        // Requirement with threshold: None uses single-attestor logic.
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_test_policy(&hash, &pubkey_hex, "att");
+        assert!(policy.required_proofs[0].threshold.is_none());
+        let proof = make_test_proof(&hash, "att", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+    }
+
+    #[test]
+    fn threshold_2_of_2_both_satisfied() {
+        // Both approved attestors submit proofs → threshold 2 met.
+        let agreement = sample_agreement();
+        let sk_a = SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+        let sk_b = SigningKey::from_bytes((&[2u8; 32]).into()).unwrap();
+        let pk_a = hex::encode(sk_a.verifying_key().to_encoded_point(false).as_bytes());
+        let pk_b = hex::encode(sk_b.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_threshold_policy(&hash, &pk_a, &pk_b, 2);
+        let proof_a = make_threshold_proof(&hash, "att-a", &sk_a, "prf-a");
+        let proof_b = make_threshold_proof(&hash, "att-b", &sk_b, "prf-b");
+        let result = evaluate_policy(&agreement, &policy, &[proof_a, proof_b], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.release_eligible);
+        assert_eq!(result.threshold_results.len(), 1);
+        let thr = &result.threshold_results[0];
+        assert_eq!(thr.requirement_id, "req-thr");
+        assert_eq!(thr.threshold_required, 2);
+        assert_eq!(thr.approved_attestor_count, 2);
+        assert!(thr.threshold_satisfied);
+        assert!(thr.matched_attestor_ids.contains(&"att-a".to_string()));
+        assert!(thr.matched_attestor_ids.contains(&"att-b".to_string()));
+    }
+
+    #[test]
+    fn threshold_2_of_2_only_one_attestor() {
+        // Only one attestor submitted → threshold 2 not met.
+        let agreement = sample_agreement();
+        let sk_a = SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+        let sk_b = SigningKey::from_bytes((&[2u8; 32]).into()).unwrap();
+        let pk_a = hex::encode(sk_a.verifying_key().to_encoded_point(false).as_bytes());
+        let pk_b = hex::encode(sk_b.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_threshold_policy(&hash, &pk_a, &pk_b, 2);
+        let proof_a = make_threshold_proof(&hash, "att-a", &sk_a, "prf-a");
+        let result = evaluate_policy(&agreement, &policy, &[proof_a], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Unsatisfied);
+        assert!(!result.release_eligible);
+        assert_eq!(result.threshold_results.len(), 1);
+        let thr = &result.threshold_results[0];
+        assert_eq!(thr.threshold_required, 2);
+        assert_eq!(thr.approved_attestor_count, 1);
+        assert!(!thr.threshold_satisfied);
+    }
+
+    #[test]
+    fn threshold_unapproved_attestor_does_not_count() {
+        // Proof from an attestor not in required_attestor_ids must not contribute.
+        let agreement = sample_agreement();
+        let sk_a = SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+        let sk_bad = SigningKey::from_bytes((&[9u8; 32]).into()).unwrap();
+        let pk_a = hex::encode(sk_a.verifying_key().to_encoded_point(false).as_bytes());
+        let pk_b_dummy = hex::encode(sk_a.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_threshold_policy(&hash, &pk_a, &pk_b_dummy, 2);
+        let proof_a = make_threshold_proof(&hash, "att-a", &sk_a, "prf-a");
+        // "att-bad" is NOT in required_attestor_ids (only att-a and att-b are)
+        // However verify_settlement_proof checks against policy.attestors.
+        // Proof from att-bad will fail signature verification (wrong pubkey).
+        // Let's use att-a's key but claim att-b to simulate unapproved scenario:
+        // Actually, build a proof claiming attested_by = "att-bad" which is not
+        // in the policy attestors list — it will fail verification in evaluate_policy
+        // step 1, so won't appear in `satisfied`.
+        let mut proof_bad = make_threshold_proof(&hash, "att-bad", &sk_bad, "prf-bad");
+        // Tweak: even if we add att-bad to attestors, it's not in required_attestor_ids
+        // For the threshold check, what matters is required_attestor_ids.contains(&p.attested_by)
+        // So even if signature verifies, att-bad won't count toward "req-thr".
+        // Force att-bad into policy attestors (bypass store) to test just the threshold filter:
+        let mut policy2 = policy.clone();
+        policy2.attestors.push(ApprovedAttestor {
+            attestor_id: "att-bad".to_string(),
+            pubkey_hex: hex::encode(sk_bad.verifying_key().to_encoded_point(false).as_bytes()),
+            display_name: None,
+            domain: None,
+        });
+        // Re-sign with the correct key (sk_bad signs as att-bad)
+        proof_bad.signature = sign_proof(&proof_bad, &sk_bad);
+        let result = evaluate_policy(&agreement, &policy2, &[proof_a, proof_bad], 0).unwrap();
+        // att-bad verified OK but NOT in required_attestor_ids → does not count toward threshold
+        assert_eq!(result.outcome, PolicyOutcome::Unsatisfied);
+        let thr = &result.threshold_results[0];
+        assert_eq!(thr.approved_attestor_count, 1, "only att-a counted, att-bad excluded");
+        assert!(!thr.threshold_satisfied);
+    }
+
+    #[test]
+    fn threshold_duplicate_proofs_from_same_attestor_count_as_one() {
+        // Two proofs from the same attestor must only count as 1 distinct attestor.
+        let agreement = sample_agreement();
+        let sk_a = SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+        let sk_b = SigningKey::from_bytes((&[2u8; 32]).into()).unwrap();
+        let pk_a = hex::encode(sk_a.verifying_key().to_encoded_point(false).as_bytes());
+        let pk_b = hex::encode(sk_b.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_threshold_policy(&hash, &pk_a, &pk_b, 2);
+        // Two proofs from att-a with different proof_ids
+        let mut proof_a2 = make_threshold_proof(&hash, "att-a", &sk_a, "prf-a2");
+        proof_a2.proof_id = "prf-a-dup".to_string();
+        proof_a2.signature = sign_proof(&proof_a2, &sk_a);
+        let proof_a = make_threshold_proof(&hash, "att-a", &sk_a, "prf-a");
+        let result = evaluate_policy(&agreement, &policy, &[proof_a, proof_a2], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Unsatisfied);
+        let thr = &result.threshold_results[0];
+        assert_eq!(thr.approved_attestor_count, 1, "two proofs same attestor = 1 distinct");
+        assert!(!thr.threshold_satisfied);
+    }
+
+    #[test]
+    fn threshold_milestone_interaction() {
+        // Threshold on a milestone-scoped requirement.
+        let agreement = sample_agreement();
+        let sk_a = SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+        let sk_b = SigningKey::from_bytes((&[2u8; 32]).into()).unwrap();
+        let pk_a = hex::encode(sk_a.verifying_key().to_encoded_point(false).as_bytes());
+        let pk_b = hex::encode(sk_b.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = ProofPolicy {
+            policy_id: "pol-ms-thr".to_string(),
+            schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+            agreement_hash: hash.clone(),
+            required_proofs: vec![ProofRequirement {
+                requirement_id: "req-ms-thr".to_string(),
+                proof_type: "ms_delivery".to_string(),
+                required_by: None,
+                required_attestor_ids: vec!["att-a".to_string(), "att-b".to_string()],
+                resolution: ProofResolution::MilestoneRelease,
+                milestone_id: Some("ms-1".to_string()),
+                threshold: Some(2),
+            }],
+            no_response_rules: vec![],
+            attestors: vec![
+                ApprovedAttestor { attestor_id: "att-a".to_string(), pubkey_hex: pk_a.clone(), display_name: None, domain: None },
+                ApprovedAttestor { attestor_id: "att-b".to_string(), pubkey_hex: pk_b.clone(), display_name: None, domain: None },
+            ],
+            notes: None,
+            expires_at_height: None,
+            milestones: vec![PolicyMilestone { milestone_id: "ms-1".to_string(), label: None, holdback: None }],
+            holdback: None,
+        };
+        // One attestor: milestone unsatisfied.
+        let mut prf_a = SettlementProof {
+            proof_id: "prf-ms-a".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "ms_delivery".to_string(),
+            agreement_hash: hash.clone(),
+            milestone_id: Some("ms-1".to_string()),
+            attested_by: "att-a".to_string(),
+            attestation_time: 1_700_000_000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pk_a.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+        };
+        prf_a.signature = sign_proof(&prf_a, &sk_a);
+        let result1 = evaluate_policy(&agreement, &policy, &[prf_a.clone()], 0).unwrap();
+        assert_eq!(result1.outcome, PolicyOutcome::Unsatisfied);
+        assert_eq!(result1.milestone_results.len(), 1);
+        let ms_thr = &result1.milestone_results[0].threshold_results;
+        assert_eq!(ms_thr.len(), 1);
+        assert_eq!(ms_thr[0].approved_attestor_count, 1);
+        assert!(!ms_thr[0].threshold_satisfied);
+        // Two attestors: milestone satisfied.
+        let mut prf_b = SettlementProof {
+            proof_id: "prf-ms-b".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "ms_delivery".to_string(),
+            agreement_hash: hash.clone(),
+            milestone_id: Some("ms-1".to_string()),
+            attested_by: "att-b".to_string(),
+            attestation_time: 1_700_000_000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pk_b.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+        };
+        prf_b.signature = sign_proof(&prf_b, &sk_b);
+        let result2 = evaluate_policy(&agreement, &policy, &[prf_a, prf_b], 0).unwrap();
+        assert_eq!(result2.outcome, PolicyOutcome::Satisfied);
+        let ms_thr2 = &result2.milestone_results[0].threshold_results;
+        assert_eq!(ms_thr2[0].approved_attestor_count, 2);
+        assert!(ms_thr2[0].threshold_satisfied);
+    }
+
+    #[test]
+    fn threshold_holdback_release_with_approved_proof() {
+        // Holdback release_requirement_id satisfied by an approved attestor.
+        let agreement = sample_agreement();
+        let sk_a = SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+        let sk_b = SigningKey::from_bytes((&[2u8; 32]).into()).unwrap();
+        let pk_a = hex::encode(sk_a.verifying_key().to_encoded_point(false).as_bytes());
+        let pk_b = hex::encode(sk_b.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        // Base requirement: threshold 2. Holdback: released by req-base itself.
+        let mut policy = make_threshold_policy(&hash, &pk_a, &pk_b, 2);
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 1000,
+            release_requirement_id: Some("req-thr".to_string()),
+            deadline_height: Some(9999),
+        });
+        let proof_a = make_threshold_proof(&hash, "att-a", &sk_a, "prf-a");
+        let proof_b = make_threshold_proof(&hash, "att-b", &sk_b, "prf-b");
+        let result = evaluate_policy(&agreement, &policy, &[proof_a, proof_b], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        let hb = result.holdback.expect("holdback present");
+        // Both attestors satisfied threshold => holdback release req is also met.
+        assert!(hb.holdback_released);
+    }
+
+    #[test]
+    fn store_policy_rejects_threshold_zero() {
+        let mut store = make_policy_store();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.required_proofs[0].threshold = Some(0);
+        let err = store.store(policy, false).unwrap_err();
+        assert!(err.contains("threshold must be >= 1"), "got: {err}");
+    }
+
+    #[test]
+    fn store_policy_rejects_threshold_exceeds_attestor_count() {
+        let mut store = make_policy_store();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        // required_attestor_ids has 1 entry, threshold=2 is invalid
+        policy.required_proofs[0].threshold = Some(2);
+        let err = store.store(policy, false).unwrap_err();
+        assert!(err.contains("threshold"), "got: {err}");
+        assert!(err.contains("exceeds"), "got: {err}");
+    }
+
+
+    // ── Audit regression tests ───────────────────────────────────────────
+
+    /// Bug1 (latent): evaluate_holdback must use req_satisfied_threshold for
+    /// its release-requirement check, not a bare single-attestor .any().
+    /// With threshold 2 and both attestors present, holdback must release.
+    /// With threshold 2 and only one attestor, base is unsatisfied → Pending.
+    #[test]
+    fn audit_holdback_release_respects_threshold() {
+        let agreement = sample_agreement();
+        let sk_a = SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+        let sk_b = SigningKey::from_bytes((&[2u8; 32]).into()).unwrap();
+        let pk_a = hex::encode(sk_a.verifying_key().to_encoded_point(false).as_bytes());
+        let pk_b = hex::encode(sk_b.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_threshold_policy(&hash, &pk_a, &pk_b, 2);
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 500,
+            release_requirement_id: Some("req-thr".to_string()),
+            deadline_height: Some(9999),
+        });
+
+        // Only att-a: base NOT satisfied (threshold 2 unmet) → holdback Pending.
+        let proof_a = make_threshold_proof(&hash, "att-a", &sk_a, "prf-a");
+        let r1 = evaluate_policy(&agreement, &policy, &[proof_a.clone()], 0).unwrap();
+        assert_eq!(r1.outcome, PolicyOutcome::Unsatisfied);
+        // holdback is None when base is Unsatisfied: evaluate_holdback is only
+        // called on the Satisfied path. Pending state is represented as None.
+        assert!(r1.holdback.is_none(),
+            "holdback not evaluated when base unsatisfied (represented as None)");
+
+        // Both att-a and att-b: base satisfied AND holdback release req met.
+        let proof_b = make_threshold_proof(&hash, "att-b", &sk_b, "prf-b");
+        let r2 = evaluate_policy(&agreement, &policy, &[proof_a, proof_b], 0).unwrap();
+        assert_eq!(r2.outcome, PolicyOutcome::Satisfied);
+        let hb2 = r2.holdback.expect("holdback field present");
+        assert_eq!(hb2.holdback_outcome, HoldbackOutcome::Released,
+            "threshold met → holdback Released");
+    }
+
+    /// Bug2 (active): no-response-rule Timeout must populate threshold_results
+    /// for requirements with explicit thresholds, consistent with Unsatisfied path.
+    #[test]
+    fn audit_timeout_noresp_populates_threshold_results() {
+        let agreement = sample_agreement();
+        let sk_a = SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+        let sk_b = SigningKey::from_bytes((&[2u8; 32]).into()).unwrap();
+        let pk_a = hex::encode(sk_a.verifying_key().to_encoded_point(false).as_bytes());
+        let pk_b = hex::encode(sk_b.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        // Policy: threshold-2 release req + no_response_rule firing at height 50.
+        let mut policy = make_threshold_policy(&hash, &pk_a, &pk_b, 2);
+        policy.no_response_rules = vec![NoResponseRule {
+            rule_id: "nr-001".to_string(),
+            deadline_height: 50,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        }];
+        // att-a submits (1 of 2 needed) — threshold not yet met.
+        let proof_a = make_threshold_proof(&hash, "att-a", &sk_a, "prf-a");
+        let result = evaluate_policy(&agreement, &policy, &[proof_a], 50).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Timeout);
+        assert!(!result.release_eligible);
+        assert!(result.refund_eligible);
+        // threshold_results must be populated even on Timeout.
+        assert_eq!(result.threshold_results.len(), 1,
+            "Timeout with threshold req must populate threshold_results");
+        let thr = &result.threshold_results[0];
+        assert_eq!(thr.requirement_id, "req-thr");
+        assert_eq!(thr.threshold_required, 2);
+        assert_eq!(thr.approved_attestor_count, 1);
+        assert!(!thr.threshold_satisfied,
+            "1 of 2 attestors → not satisfied at timeout");
+    }
+
+    /// Bug2 (active): refund-deadline Timeout must populate threshold_results
+    /// for requirements with explicit thresholds, consistent with Unsatisfied path.
+    #[test]
+    fn audit_timeout_refund_deadline_populates_threshold_results() {
+        let agreement = sample_agreement();
+        let sk_a = SigningKey::from_bytes((&[1u8; 32]).into()).unwrap();
+        let sk_b = SigningKey::from_bytes((&[2u8; 32]).into()).unwrap();
+        let pk_a = hex::encode(sk_a.verifying_key().to_encoded_point(false).as_bytes());
+        let pk_b = hex::encode(sk_b.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        // Policy: refund requirement with threshold 2 and deadline 100.
+        let policy = ProofPolicy {
+            policy_id: "pol-ref-thr".to_string(),
+            schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+            agreement_hash: hash.clone(),
+            required_proofs: vec![ProofRequirement {
+                requirement_id: "req-refund-thr".to_string(),
+                proof_type: "delivery_confirmation".to_string(),
+                required_by: Some(100),
+                required_attestor_ids: vec!["att-a".to_string(), "att-b".to_string()],
+                resolution: ProofResolution::Refund,
+                milestone_id: None,
+                threshold: Some(2),
+            }],
+            no_response_rules: vec![],
+            attestors: vec![
+                ApprovedAttestor { attestor_id: "att-a".to_string(), pubkey_hex: pk_a, display_name: None, domain: None },
+                ApprovedAttestor { attestor_id: "att-b".to_string(), pubkey_hex: pk_b, display_name: None, domain: None },
+            ],
+            notes: None,
+            expires_at_height: None,
+            milestones: vec![],
+            holdback: None,
+        };
+        // att-a submits (1 of 2) — threshold not met at deadline.
+        let proof_a = make_threshold_proof(&hash, "att-a", &sk_a, "prf-a");
+        let result = evaluate_policy(&agreement, &policy, &[proof_a], 100).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Timeout);
+        assert!(result.refund_eligible);
+        // threshold_results must reflect partial attestor progress.
+        assert_eq!(result.threshold_results.len(), 1,
+            "Timeout with threshold req must populate threshold_results");
+        let thr = &result.threshold_results[0];
+        assert_eq!(thr.requirement_id, "req-refund-thr");
+        assert_eq!(thr.threshold_required, 2);
+        assert_eq!(thr.approved_attestor_count, 1);
+        assert!(!thr.threshold_satisfied);
+        // Confirm: at height 99 (before deadline), outcome is Unsatisfied and
+        // threshold_results is also populated (consistency check).
+        let proof_a2 = make_threshold_proof(&hash, "att-a", &sk_a, "prf-a");
+        let result_pre = evaluate_policy(&agreement, &policy, &[proof_a2], 99).unwrap();
+        assert_eq!(result_pre.outcome, PolicyOutcome::Unsatisfied);
+        assert_eq!(result_pre.threshold_results.len(), 1,
+            "Unsatisfied with threshold req also populates threshold_results");
+    }
 }
