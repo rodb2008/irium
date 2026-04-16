@@ -60,7 +60,11 @@ A proof policy binds a set of requirements and timeout rules to a specific agree
       "domain": null
     }
   ],
-  "notes": null
+  "notes": null,
+  "milestones": [
+    { "milestone_id": "ms-delivery", "label": "Delivery confirmation" },
+    { "milestone_id": "ms-inspection", "label": "Inspection sign-off" }
+  ]
 }
 ```
 
@@ -79,7 +83,9 @@ A proof policy binds a set of requirements and timeout rules to a specific agree
 - `required_by` (block height deadline on a ProofRequirement) is stored but not evaluated.
 - `resolution: "refund"` on a `ProofRequirement` is stored but not evaluated. Proof-triggered
   refunds are only reachable via `no_response_rules` in the current implementation.
-- `milestone_id` scoping on requirements and rules is stored but not used in evaluation logic.
+- `milestone_id` scoping: requirements and rules with a `milestone_id` are now
+  evaluated independently per milestone when the policy declares a `milestones` array.
+  See [Milestone / tranche-based evaluation](#milestone--tranche-based-evaluation) below.
 
 ---
 
@@ -950,10 +956,24 @@ Response:
   "release_eligible": true,
   "refund_eligible": false,
   "reason": "<string>",
-  "evaluated_rules": ["..."]
+  "evaluated_rules": ["..."],
+  "milestone_results": [
+    {
+      "milestone_id": "<id>",
+      "label": "<string or null>",
+      "outcome": "satisfied",
+      "release_eligible": true,
+      "refund_eligible": false,
+      "matched_proof_ids": ["<id>"],
+      "reason": "<string>"
+    }
+  ],
+  "completed_milestone_count": <n>,
+  "total_milestone_count": <n>
 }
 ```
 `policy_id` is `null` when no policy is stored.
+`milestone_results` is an empty array when no milestones are declared.
 
 #### `outcome` field
 
@@ -987,6 +1007,58 @@ It is objective — derived purely from proof signatures, policy rules, and `tip
 
 // Only expired proofs remain (active proof_count = 0), no deadline:
 { "outcome": "unsatisfied", "proof_count": 0, "expired_proof_count": 1 }
+```
+
+#### Milestone / tranche-based evaluation
+
+A `ProofPolicy` may declare one or more **milestones** via the `milestones` array.
+When milestones are declared:
+
+- Each milestone is identified by a `milestone_id` string.
+- `ProofRequirement` entries with a matching `milestone_id` field belong to that milestone.
+- `NoResponseRule` entries with a matching `milestone_id` field belong to that milestone.
+- Each milestone is evaluated **independently** using the same 5-step logic.
+- The overall `outcome` is the **aggregate** of all milestone outcomes:
+  - All milestones `satisfied` → overall `"satisfied"`.
+  - Any milestone `timeout` (and not all satisfied) → overall `"timeout"`.
+  - Otherwise → overall `"unsatisfied"`.
+- `completed_milestone_count` and `total_milestone_count` track partial progress.
+
+**Backward compatibility:** policies without a `milestones` array are evaluated
+using the traditional flat-requirements path. `milestone_results` will be `[]` and
+both counts will be `0`.
+
+**Example policy with two milestones:**
+
+```json
+{
+  "policy_id": "pol-tranche",
+  "agreement_hash": "<hex>",
+  "required_proofs": [
+    { "requirement_id": "req-ms-a", "proof_type": "delivery_confirmation",
+      "required_attestor_ids": ["att-1"], "resolution": "milestone_release",
+      "milestone_id": "ms-a" },
+    { "requirement_id": "req-ms-b", "proof_type": "inspection_report",
+      "required_attestor_ids": ["att-1"], "resolution": "milestone_release",
+      "milestone_id": "ms-b" }
+  ],
+  "milestones": [
+    { "milestone_id": "ms-a", "label": "Delivery" },
+    { "milestone_id": "ms-b", "label": "Inspection" }
+  ],
+  "attestors": [{ "attestor_id": "att-1", "pubkey_hex": "<hex>" }]
+}
+```
+
+**Partial completion response (ms-a done, ms-b pending):**
+
+```json
+{ "outcome": "unsatisfied", "completed_milestone_count": 1, "total_milestone_count": 2,
+  "milestone_results": [
+    { "milestone_id": "ms-a", "label": "Delivery", "outcome": "satisfied", "release_eligible": true },
+    { "milestone_id": "ms-b", "label": "Inspection", "outcome": "unsatisfied", "release_eligible": false }
+  ]
+}
 ```
 
 ### Relationship to agreement-policy-check

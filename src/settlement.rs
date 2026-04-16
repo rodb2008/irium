@@ -3709,6 +3709,11 @@ pub struct ProofPolicy {
     /// Block height at which this policy expires. None means the policy never expires.
     #[serde(default)]
     pub expires_at_height: Option<u64>,
+    /// Declared milestones for tranche-based evaluation. When non-empty,
+    /// requirements and rules are grouped by their `milestone_id` field
+    /// and each milestone is evaluated independently.
+    #[serde(default)]
+    pub milestones: Vec<PolicyMilestone>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3738,6 +3743,29 @@ pub struct SettlementProof {
     pub expires_at_height: Option<u64>,
 }
 
+/// Declares a named milestone (tranche) within a policy.
+/// `ProofRequirement` and `NoResponseRule` entries with a matching `milestone_id`
+/// are grouped under this milestone and evaluated independently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyMilestone {
+    pub milestone_id: String,
+    /// Human-readable label shown in evaluation output.
+    pub label: Option<String>,
+}
+
+/// Outcome of evaluating a single milestone independently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MilestoneEvaluationResult {
+    pub milestone_id: String,
+    pub label: Option<String>,
+    /// Outcome for this milestone only.
+    pub outcome: PolicyOutcome,
+    pub release_eligible: bool,
+    pub refund_eligible: bool,
+    pub matched_proof_ids: Vec<String>,
+    pub reason: String,
+}
+
 /// Objective, deterministic outcome of a policy evaluation.
 ///
 /// - `satisfied`   — all required proofs present and signature-verified.
@@ -3763,6 +3791,12 @@ pub struct PolicyEvaluationResult {
     pub evaluated_rules: Vec<String>,
     /// Proof IDs that passed signature verification and matched the policy.
     pub matched_proof_ids: Vec<String>,
+    /// Per-milestone results; empty when no milestones are declared.
+    pub milestone_results: Vec<MilestoneEvaluationResult>,
+    /// Number of milestones with outcome == Satisfied.
+    pub completed_milestone_count: usize,
+    /// Total declared milestones (len of policy.milestones).
+    pub total_milestone_count: usize,
 }
 
 fn proof_policy_canonical_bytes(policy: &ProofPolicy) -> Result<Vec<u8>, String> {
@@ -3836,6 +3870,88 @@ pub fn verify_settlement_proof(
         .map_err(|_| "proof signature verification failed".to_string())
 }
 
+/// Evaluates a subset of requirements and rules against the pre-verified proof set.
+/// Used internally for per-milestone evaluation.
+/// `satisfied` lists proof_ids that passed signature verification in Step 1.
+/// Returns (outcome, release_eligible, refund_eligible, reason, matched_proof_ids).
+fn eval_milestone_subset(
+    release_reqs: &[&ProofRequirement],
+    refund_reqs: &[&ProofRequirement],
+    no_response_rules: &[&NoResponseRule],
+    proofs: &[SettlementProof],
+    satisfied: &[String],
+    tip_height: u64,
+) -> (PolicyOutcome, bool, bool, String, Vec<String>) {
+    let req_satisfied = |req: &ProofRequirement| -> bool {
+        proofs.iter().any(|p| {
+            satisfied.contains(&p.proof_id)
+                && p.proof_type == req.proof_type
+                && req.required_attestor_ids.contains(&p.attested_by)
+        })
+    };
+
+    let all_release_met =
+        !release_reqs.is_empty() && release_reqs.iter().all(|req| req_satisfied(*req));
+    if all_release_met {
+        let matched: Vec<String> = proofs
+            .iter()
+            .filter(|p| {
+                satisfied.contains(&p.proof_id)
+                    && release_reqs.iter().any(|r| {
+                        p.proof_type == r.proof_type
+                            && r.required_attestor_ids.contains(&p.attested_by)
+                    })
+            })
+            .map(|p| p.proof_id.clone())
+            .collect();
+        return (
+            PolicyOutcome::Satisfied,
+            true,
+            false,
+            "all release requirements satisfied by verified proofs".to_string(),
+            matched,
+        );
+    }
+
+    for rule in no_response_rules {
+        if tip_height >= rule.deadline_height {
+            let trigger_label = match rule.trigger {
+                NoResponseTrigger::FundedAndNoRelease => "funded_and_no_release",
+                NoResponseTrigger::DisputedAndNoResponse => "disputed_and_no_response",
+            };
+            let label = format!(
+                "no_response_rule '{}' deadline {} reached at tip {} trigger {}",
+                rule.rule_id, rule.deadline_height, tip_height, trigger_label
+            );
+            let (release, refund) = match rule.resolution {
+                ProofResolution::Release | ProofResolution::MilestoneRelease => (true, false),
+                ProofResolution::Refund => (false, true),
+            };
+            return (PolicyOutcome::Timeout, release, refund, label, vec![]);
+        }
+    }
+
+    for req in refund_reqs {
+        if let Some(deadline) = req.required_by {
+            if tip_height >= deadline && !req_satisfied(*req) {
+                let label = format!(
+                    "requirement '{}' refund deadline {} reached at tip {} with no satisfying proof",
+                    req.requirement_id, deadline, tip_height
+                );
+                return (PolicyOutcome::Timeout, false, true, label, vec![]);
+            }
+        }
+    }
+
+    (
+        PolicyOutcome::Unsatisfied,
+        false,
+        false,
+        "no release or refund condition was met".to_string(),
+        vec![],
+    )
+}
+
 pub fn evaluate_policy(
     agreement: &AgreementObject,
     policy: &ProofPolicy,
@@ -3877,6 +3993,121 @@ pub fn evaluate_policy(
         }
     }
 
+    // ── Milestone-based evaluation ───────────────────────────────────────────
+    // When the policy declares milestones, requirements and rules are grouped
+    // by milestone_id and evaluated independently.  The overall outcome is the
+    // aggregate of all milestone outcomes.
+    if !policy.milestones.is_empty() {
+        let mut milestone_results: Vec<MilestoneEvaluationResult> = Vec::new();
+
+        for ms in &policy.milestones {
+            let mid = ms.milestone_id.as_str();
+
+            let ms_release_reqs: Vec<&ProofRequirement> = policy
+                .required_proofs
+                .iter()
+                .filter(|r| {
+                    r.milestone_id.as_deref() == Some(mid)
+                        && matches!(
+                            r.resolution,
+                            ProofResolution::Release | ProofResolution::MilestoneRelease
+                        )
+                })
+                .collect();
+
+            let ms_refund_reqs: Vec<&ProofRequirement> = policy
+                .required_proofs
+                .iter()
+                .filter(|r| {
+                    r.milestone_id.as_deref() == Some(mid)
+                        && matches!(r.resolution, ProofResolution::Refund)
+                })
+                .collect();
+
+            let ms_rules: Vec<&NoResponseRule> = policy
+                .no_response_rules
+                .iter()
+                .filter(|r| r.milestone_id.as_deref() == Some(mid))
+                .collect();
+
+            let (ms_outcome, ms_release, ms_refund, ms_reason, ms_matched) =
+                eval_milestone_subset(
+                    &ms_release_reqs,
+                    &ms_refund_reqs,
+                    &ms_rules,
+                    proofs,
+                    &satisfied,
+                    tip_height,
+                );
+
+            evaluated_rules.push(format!(
+                "milestone '{}' outcome {:?}",
+                mid, ms_outcome
+            ));
+
+            milestone_results.push(MilestoneEvaluationResult {
+                milestone_id: ms.milestone_id.clone(),
+                label: ms.label.clone(),
+                outcome: ms_outcome,
+                release_eligible: ms_release,
+                refund_eligible: ms_refund,
+                matched_proof_ids: ms_matched,
+                reason: ms_reason,
+            });
+        }
+
+        let completed = milestone_results
+            .iter()
+            .filter(|r| r.outcome == PolicyOutcome::Satisfied)
+            .count();
+        let total = milestone_results.len();
+        // Collect all matched proof ids across milestones (deduplicated).
+        let mut seen = std::collections::HashSet::new();
+        let all_matched: Vec<String> = milestone_results
+            .iter()
+            .flat_map(|r| r.matched_proof_ids.iter().cloned())
+            .filter(|id| seen.insert(id.clone()))
+            .collect();
+
+        let (agg_outcome, agg_release, agg_refund, agg_reason) =
+            if total > 0 && completed == total {
+                (PolicyOutcome::Satisfied, true, false, "all milestones satisfied".to_string())
+            } else if let Some(to) =
+                milestone_results.iter().find(|r| r.outcome == PolicyOutcome::Timeout)
+            {
+                (
+                    PolicyOutcome::Timeout,
+                    to.release_eligible,
+                    to.refund_eligible,
+                    format!("milestone '{}' timed out: {}", to.milestone_id, to.reason),
+                )
+            } else {
+                let unsat = total - completed;
+                (
+                    PolicyOutcome::Unsatisfied,
+                    false,
+                    false,
+                    format!(
+                        "{} of {} milestones satisfied; {} unsatisfied",
+                        completed, total, unsat
+                    ),
+                )
+            };
+
+        return Ok(PolicyEvaluationResult {
+            outcome: agg_outcome,
+            release_eligible: agg_release,
+            refund_eligible: agg_refund,
+            reason: agg_reason,
+            evaluated_rules,
+            matched_proof_ids: all_matched,
+            milestone_results,
+            completed_milestone_count: completed,
+            total_milestone_count: total,
+        });
+    }
+
+    // ── Non-milestone (backward-compatible) evaluation ───────────────────────
     // Closure: does any verified proof satisfy the given requirement?
     let req_satisfied = |req: &ProofRequirement| -> bool {
         proofs.iter().any(|p| {
@@ -3916,6 +4147,9 @@ pub fn evaluate_policy(
             reason: "all release requirements satisfied by verified proofs".to_string(),
             evaluated_rules,
             matched_proof_ids: satisfied.clone(),
+            milestone_results: vec![],
+            completed_milestone_count: 0,
+            total_milestone_count: 0,
         });
     }
 
@@ -3945,6 +4179,9 @@ pub fn evaluate_policy(
                 reason: label,
                 evaluated_rules,
                 matched_proof_ids: satisfied.clone(),
+                milestone_results: vec![],
+                completed_milestone_count: 0,
+                total_milestone_count: 0,
             });
         }
     }
@@ -3972,6 +4209,9 @@ pub fn evaluate_policy(
                         reason: label,
                         evaluated_rules,
                         matched_proof_ids: satisfied.clone(),
+                        milestone_results: vec![],
+                        completed_milestone_count: 0,
+                        total_milestone_count: 0,
                     });
                 }
             }
@@ -3999,9 +4239,11 @@ pub fn evaluate_policy(
         reason: "no release or refund condition was met".to_string(),
         evaluated_rules,
         matched_proof_ids: satisfied,
+        milestone_results: vec![],
+        completed_milestone_count: 0,
+        total_milestone_count: 0,
     })
 }
-
 
 
 // ---- Proof storage ----
@@ -4217,6 +4459,16 @@ impl PolicyStore {
     pub fn store(&mut self, policy: ProofPolicy, replace: bool) -> Result<StorePolicyOutcome, String> {
         if policy.agreement_hash.trim().is_empty() {
             return Err("policy.agreement_hash must not be empty".to_string());
+        }
+        // Validate milestone declarations: no empty or duplicate milestone_ids.
+        let mut seen_ms_ids = std::collections::HashSet::new();
+        for ms in &policy.milestones {
+            if ms.milestone_id.trim().is_empty() {
+                return Err("milestone_id must not be empty".to_string());
+            }
+            if !seen_ms_ids.insert(ms.milestone_id.as_str()) {
+                return Err(format!("duplicate milestone_id '{}'", ms.milestone_id));
+            }
         }
         let key = policy.agreement_hash.to_lowercase();
         let policy_id = policy.policy_id.clone();
@@ -5312,6 +5564,7 @@ mod tests {
             }],
             notes: None,
             expires_at_height: None,
+            milestones: vec![],
         }
     }
 
@@ -5622,6 +5875,225 @@ mod tests {
         assert_eq!(result.outcome, PolicyOutcome::Satisfied);
         assert!(result.release_eligible);
         assert!(!result.refund_eligible);
+    }
+
+    // ---- milestone-based evaluation tests ----
+
+    fn make_milestone_policy(
+        agreement_hash: &str,
+        pubkey_hex: &str,
+        attestor_id: &str,
+        milestones: Vec<(&str, Option<&str>)>, // (milestone_id, label)
+    ) -> ProofPolicy {
+        let ms_decls: Vec<PolicyMilestone> = milestones
+            .iter()
+            .map(|(id, label)| PolicyMilestone {
+                milestone_id: id.to_string(),
+                label: label.map(|l| l.to_string()),
+            })
+            .collect();
+        let reqs: Vec<ProofRequirement> = milestones
+            .iter()
+            .map(|(id, _)| ProofRequirement {
+                requirement_id: format!("req-{}", id),
+                proof_type: format!("proof_type_{}", id),
+                required_by: None,
+                required_attestor_ids: vec![attestor_id.to_string()],
+                resolution: ProofResolution::MilestoneRelease,
+                milestone_id: Some(id.to_string()),
+            })
+            .collect();
+        ProofPolicy {
+            policy_id: "pol-ms".to_string(),
+            schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+            agreement_hash: agreement_hash.to_string(),
+            required_proofs: reqs,
+            no_response_rules: vec![],
+            attestors: vec![ApprovedAttestor {
+                attestor_id: attestor_id.to_string(),
+                pubkey_hex: pubkey_hex.to_string(),
+                display_name: None,
+                domain: None,
+            }],
+            notes: None,
+            expires_at_height: None,
+            milestones: ms_decls,
+        }
+    }
+
+    fn make_milestone_proof(
+        agreement_hash: &str,
+        attestor_id: &str,
+        milestone_id: &str,
+        signing_key: &SigningKey,
+    ) -> SettlementProof {
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let mut proof = SettlementProof {
+            proof_id: format!("prf-{}", milestone_id),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            // proof_type must match format!("proof_type_{}", milestone_id) from make_milestone_policy
+            proof_type: format!("proof_type_{}", milestone_id),
+            agreement_hash: agreement_hash.to_string(),
+            milestone_id: Some(milestone_id.to_string()),
+            attested_by: attestor_id.to_string(),
+            attestation_time: 1_700_000_000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pubkey_hex.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+        };
+        proof.signature = sign_proof(&proof, signing_key);
+        proof
+    }
+
+    #[test]
+    fn evaluate_policy_milestone_single_satisfied() {
+        // One milestone declared; proof satisfies it -> overall Satisfied.
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_milestone_policy(&hash, &pk, "att", vec![("ms-a", Some("Delivery"))]);
+        let proof = make_milestone_proof(&hash, "att", "ms-a", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.release_eligible);
+        assert_eq!(result.total_milestone_count, 1);
+        assert_eq!(result.completed_milestone_count, 1);
+        assert_eq!(result.milestone_results[0].milestone_id, "ms-a");
+        assert_eq!(result.milestone_results[0].outcome, PolicyOutcome::Satisfied);
+    }
+
+    #[test]
+    fn evaluate_policy_milestone_all_satisfied() {
+        // Two milestones; both proofs provided -> overall Satisfied.
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_milestone_policy(
+            &hash, &pk, "att",
+            vec![("ms-a", None), ("ms-b", None)],
+        );
+        let proof_a = make_milestone_proof(&hash, "att", "ms-a", &sk);
+        let proof_b = make_milestone_proof(&hash, "att", "ms-b", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof_a, proof_b], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert_eq!(result.total_milestone_count, 2);
+        assert_eq!(result.completed_milestone_count, 2);
+    }
+
+    #[test]
+    fn evaluate_policy_milestone_partial_unsatisfied() {
+        // Two milestones; only ms-a proof provided -> 1 of 2 satisfied -> Unsatisfied.
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_milestone_policy(
+            &hash, &pk, "att",
+            vec![("ms-a", None), ("ms-b", None)],
+        );
+        let proof_a = make_milestone_proof(&hash, "att", "ms-a", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof_a], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Unsatisfied);
+        assert!(!result.release_eligible);
+        assert_eq!(result.total_milestone_count, 2);
+        assert_eq!(result.completed_milestone_count, 1);
+        assert_eq!(result.milestone_results[0].outcome, PolicyOutcome::Satisfied);
+        assert_eq!(result.milestone_results[1].outcome, PolicyOutcome::Unsatisfied);
+    }
+
+    #[test]
+    fn evaluate_policy_milestone_timeout_on_one() {
+        // ms-b has a no_response_rule deadline at height 50.
+        // No proofs; tip = 51 -> ms-b times out -> overall Timeout.
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_milestone_policy(
+            &hash, &pk, "att",
+            vec![("ms-a", None), ("ms-b", None)],
+        );
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-ms-b-timeout".to_string(),
+            deadline_height: 50,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: Some("ms-b".to_string()),
+            notes: None,
+        });
+        let result = evaluate_policy(&agreement, &policy, &[], 51).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Timeout);
+        assert!(result.refund_eligible);
+        assert!(!result.release_eligible);
+        assert_eq!(result.total_milestone_count, 2);
+        // ms-a has no deadline so it is Unsatisfied; ms-b has timed out
+        let ms_b = result.milestone_results.iter().find(|r| r.milestone_id == "ms-b").unwrap();
+        assert_eq!(ms_b.outcome, PolicyOutcome::Timeout);
+    }
+
+    #[test]
+    fn evaluate_policy_milestone_satisfied_overrides_timeout() {
+        // ms-a satisfied, ms-b not. ms-b has no deadline -> Unsatisfied (not Timeout).
+        // Also: satisfying ms-a does NOT suppress ms-b timeout if ms-b has one.
+        // Here we test: all satisfied -> Satisfied, even if one had a deadline.
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_milestone_policy(
+            &hash, &pk, "att",
+            vec![("ms-a", None), ("ms-b", None)],
+        );
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-ms-b-dl".to_string(),
+            deadline_height: 50,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: Some("ms-b".to_string()),
+            notes: None,
+        });
+        // Provide both proofs; ms-b proof satisfies ms-b before deadline check
+        let proof_a = make_milestone_proof(&hash, "att", "ms-a", &sk);
+        let proof_b = make_milestone_proof(&hash, "att", "ms-b", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof_a, proof_b], 51).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.release_eligible);
+        assert_eq!(result.completed_milestone_count, 2);
+    }
+
+    #[test]
+    fn evaluate_policy_milestone_backward_compat_no_milestones() {
+        // Policy with no milestones declared: milestone_results must be empty.
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_test_policy(&hash, &pk, "attestor-a");
+        let proof = make_test_proof(&hash, "attestor-a", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.milestone_results.is_empty());
+        assert_eq!(result.total_milestone_count, 0);
+        assert_eq!(result.completed_milestone_count, 0);
     }
 
     #[test]
@@ -6455,6 +6927,45 @@ mod tests {
         let store2 = PolicyStore::new(path);
         let got = store2.get("exp-persist-hash").expect("must exist after reload");
         assert_eq!(got.expires_at_height, Some(9999));
+    }
+
+    #[test]
+    fn store_policy_rejects_empty_milestone_id() {
+        let mut store = make_policy_store();
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.milestones = vec![PolicyMilestone {
+            milestone_id: "  ".to_string(), // blank
+            label: None,
+        }];
+        let err = store.store(policy, false).unwrap_err();
+        assert!(err.contains("milestone_id must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn store_policy_rejects_duplicate_milestone_id() {
+        let mut store = make_policy_store();
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.milestones = vec![
+            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None },
+            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None },
+        ];
+        let err = store.store(policy, false).unwrap_err();
+        assert!(err.contains("duplicate milestone_id"), "got: {err}");
+        assert!(err.contains("ms-dup"), "got: {err}");
     }
 
 

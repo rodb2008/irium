@@ -57,6 +57,7 @@ use irium_node_rs::settlement::{
     AgreementFundingLegRef, AgreementLifecycleView, AgreementLinkedTx, AgreementMilestoneStatus,
     AgreementObject, AgreementSummary,
     evaluate_policy,
+    MilestoneEvaluationResult,
     PolicyOutcome,
     ProofPolicy,
     SettlementProof,
@@ -804,6 +805,12 @@ struct EvaluatePolicyResponse {
     refund_eligible: bool,
     reason: String,
     evaluated_rules: Vec<String>,
+    /// Per-milestone evaluation results; empty when no milestones declared.
+    milestone_results: Vec<MilestoneEvaluationResult>,
+    /// Number of milestones with outcome == Satisfied.
+    completed_milestone_count: usize,
+    /// Total declared milestones.
+    total_milestone_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -5370,6 +5377,9 @@ async fn evaluate_policy_rpc(
                 refund_eligible: false,
                 reason: "no policy stored for this agreement".to_string(),
                 evaluated_rules: Vec::new(),
+                milestone_results: vec![],
+                completed_milestone_count: 0,
+                total_milestone_count: 0,
             }));
         }
         Some(p) => p,
@@ -5420,6 +5430,9 @@ async fn evaluate_policy_rpc(
                 refund_eligible: false,
                 reason: format!("policy expired at height {}", expires),
                 evaluated_rules: expiry_rules,
+                milestone_results: vec![],
+                completed_milestone_count: 0,
+                total_milestone_count: 0,
             }));
         }
     }
@@ -5430,6 +5443,9 @@ async fn evaluate_policy_rpc(
     all_rules.extend(result.evaluated_rules);
     let matched_proof_count = result.matched_proof_ids.len();
     let matched_proof_ids = result.matched_proof_ids;
+    let completed_milestone_count = result.completed_milestone_count;
+    let total_milestone_count = result.total_milestone_count;
+    let milestone_results = result.milestone_results;
     Ok(Json(EvaluatePolicyResponse {
         outcome: result.outcome,
         agreement_hash,
@@ -5445,6 +5461,9 @@ async fn evaluate_policy_rpc(
         refund_eligible: result.refund_eligible,
         reason: result.reason,
         evaluated_rules: all_rules,
+        milestone_results,
+        completed_milestone_count,
+        total_milestone_count,
     }))
 }
 
@@ -7320,7 +7339,7 @@ mod tests {
         AgreementDeadlines, AgreementMilestone, AgreementObject, AgreementParty,
         AgreementRefundCondition, AgreementReleaseCondition, AgreementTemplateType,
         AGREEMENT_SIGNATURE_TYPE_SECP256K1, ApprovedAttestor,
-        NoResponseRule, NoResponseTrigger, ProofPolicy, ProofRequirement,
+        NoResponseRule, NoResponseTrigger, PolicyMilestone, ProofPolicy, ProofRequirement,
         ProofResolution, ProofSignatureEnvelope, PROOF_POLICY_SCHEMA_ID,
         SETTLEMENT_PROOF_SCHEMA_ID, SettlementProof,
         settlement_proof_payload_bytes,
@@ -8300,6 +8319,7 @@ mod tests {
             }],
             notes: None,
             expires_at_height: None,
+            milestones: vec![],
         }
     }
 
@@ -8852,6 +8872,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_policy_rpc_rejects_empty_milestone_id() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let mut policy = make_rpc_policy("hash-ms-empty-id", &pubkey_hex);
+        policy.milestones = vec![PolicyMilestone {
+            milestone_id: "".to_string(),
+            label: None,
+        }];
+        let result = store_policy_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false }),
+        ).await;
+        assert!(result.is_err(), "must reject empty milestone_id");
+    }
+
+    #[tokio::test]
+    async fn store_policy_rpc_rejects_duplicate_milestone_id() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let mut policy = make_rpc_policy("hash-ms-dup-id", &pubkey_hex);
+        policy.milestones = vec![
+            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None },
+            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None },
+        ];
+        let result = store_policy_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false }),
+        ).await;
+        assert!(result.is_err(), "must reject duplicate milestone_id");
+    }
+
+    #[tokio::test]
     async fn get_policy_rpc_returns_stored_policy() {
         let (state, _, _, _) = create_test_state(Some(0));
         let policy = make_rpc_policy("getpol-hash-001", "pk-get");
@@ -9347,6 +9401,199 @@ mod tests {
         assert_eq!(resp.outcome, PolicyOutcome::Unsatisfied);
         assert!(!resp.policy_found);
         assert!(!resp.release_eligible);
+    }
+
+    // ---- milestone rpc tests ----
+
+    fn make_rpc_policy_with_milestones(
+        agreement_hash: &str,
+        pubkey_hex: &str,
+        milestones: &[&str],
+    ) -> ProofPolicy {
+        let ms_decls: Vec<PolicyMilestone> = milestones
+            .iter()
+            .map(|id| PolicyMilestone {
+                milestone_id: id.to_string(),
+                label: None,
+            })
+            .collect();
+        let reqs: Vec<ProofRequirement> = milestones
+            .iter()
+            .map(|id| ProofRequirement {
+                requirement_id: format!("req-{}", id),
+                proof_type: format!("proof_type_{}", id),
+                required_by: None,
+                required_attestor_ids: vec!["rpc-attestor".to_string()],
+                resolution: ProofResolution::MilestoneRelease,
+                milestone_id: Some(id.to_string()),
+            })
+            .collect();
+        ProofPolicy {
+            policy_id: "pol-ms-rpc".to_string(),
+            schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+            agreement_hash: agreement_hash.to_string(),
+            required_proofs: reqs,
+            no_response_rules: vec![],
+            attestors: vec![ApprovedAttestor {
+                attestor_id: "rpc-attestor".to_string(),
+                pubkey_hex: pubkey_hex.to_string(),
+                display_name: None,
+                domain: None,
+            }],
+            notes: None,
+            expires_at_height: None,
+            milestones: ms_decls,
+        }
+    }
+
+    fn make_rpc_milestone_proof(
+        agreement_hash: &str,
+        milestone_id: &str,
+        sk: &SigningKey,
+    ) -> SettlementProof {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let pubkey_hex = rpc_pubkey_hex(sk);
+        let mut proof = SettlementProof {
+            proof_id: format!("prf-ms-{}", milestone_id),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: format!("proof_type_{}", milestone_id),
+            agreement_hash: agreement_hash.to_string(),
+            milestone_id: Some(milestone_id.to_string()),
+            attested_by: "rpc-attestor".to_string(),
+            attestation_time: 1_700_000_000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pubkey_hex.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+        };
+        let payload_bytes = irium_node_rs::settlement::settlement_proof_payload_bytes(&proof).unwrap();
+        let digest = Sha256::digest(&payload_bytes);
+        let mut digest_arr = [0u8; 32];
+        digest_arr.copy_from_slice(&digest);
+        let sig: k256::ecdsa::Signature = sk.sign_prehash(&digest_arr).unwrap();
+        proof.signature = ProofSignatureEnvelope {
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            pubkey_hex,
+            signature_hex: hex::encode(sig.to_bytes()),
+            payload_hash: hex::encode(digest),
+        };
+        proof
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_milestone_all_satisfied() {
+        // Two milestones; both proofs submitted -> overall Satisfied, completed=2.
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy_with_milestones(&agreement_hash, &pubkey_hex, &["ms-a", "ms-b"]);
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let proof_a = make_rpc_milestone_proof(&agreement_hash, "ms-a", &sk);
+        let proof_b = make_rpc_milestone_proof(&agreement_hash, "ms-b", &sk);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof: proof_a })).await.expect("submit proof a");
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof: proof_b })).await.expect("submit proof b");
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.outcome, PolicyOutcome::Satisfied);
+        assert!(resp.release_eligible);
+        assert_eq!(resp.total_milestone_count, 2);
+        assert_eq!(resp.completed_milestone_count, 2);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_milestone_partial_unsatisfied() {
+        // Two milestones; only ms-a proof submitted -> 1/2 satisfied -> Unsatisfied.
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy_with_milestones(&agreement_hash, &pubkey_hex, &["ms-a", "ms-b"]);
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let proof_a = make_rpc_milestone_proof(&agreement_hash, "ms-a", &sk);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof: proof_a })).await.expect("submit proof a");
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.outcome, PolicyOutcome::Unsatisfied);
+        assert!(!resp.release_eligible);
+        assert_eq!(resp.total_milestone_count, 2);
+        assert_eq!(resp.completed_milestone_count, 1);
+        assert_eq!(resp.milestone_results[0].milestone_id, "ms-a");
+        assert_eq!(resp.milestone_results[0].outcome, PolicyOutcome::Satisfied);
+        assert_eq!(resp.milestone_results[1].milestone_id, "ms-b");
+        assert_eq!(resp.milestone_results[1].outcome, PolicyOutcome::Unsatisfied);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_milestone_timeout() {
+        // ms-b has a no_response_rule; deadline elapsed -> overall Timeout.
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let mut policy = make_rpc_policy_with_milestones(&agreement_hash, &pubkey_hex, &["ms-a", "ms-b"]);
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-ms-b-dl".to_string(),
+            deadline_height: 50,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: Some("ms-b".to_string()),
+            notes: None,
+        });
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        // Advance chain past deadline (tip_height = chain.height - 1; need tip >= 50 -> height = 51)
+        { let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner()); chain.height = 51; }
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.outcome, PolicyOutcome::Timeout);
+        assert!(resp.refund_eligible);
+        assert_eq!(resp.total_milestone_count, 2);
+        let ms_b = resp.milestone_results.iter().find(|r| r.milestone_id == "ms-b").unwrap();
+        assert_eq!(ms_b.outcome, PolicyOutcome::Timeout);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_no_milestone_has_empty_milestone_results() {
+        // Policy without milestones: milestone_results must be empty.
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let proof = make_rpc_proof(&agreement_hash, &sk);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof })).await.expect("submit proof");
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.outcome, PolicyOutcome::Satisfied);
+        assert!(resp.milestone_results.is_empty());
+        assert_eq!(resp.total_milestone_count, 0);
+        assert_eq!(resp.completed_milestone_count, 0);
     }
 
     #[tokio::test]

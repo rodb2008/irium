@@ -628,6 +628,25 @@ struct EvaluatePolicyRpcRequest {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct MilestoneRpcResult {
+    #[serde(default)]
+    milestone_id: String,
+    #[serde(default)]
+    label: Option<String>,
+    /// "satisfied", "timeout", or "unsatisfied".
+    #[serde(default)]
+    outcome: String,
+    #[serde(default)]
+    release_eligible: bool,
+    #[serde(default)]
+    refund_eligible: bool,
+    #[serde(default)]
+    matched_proof_ids: Vec<String>,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct EvaluatePolicyRpcResponse {
     /// Deterministic classification: "satisfied", "timeout", or "unsatisfied".
     #[serde(default)]
@@ -662,6 +681,15 @@ struct EvaluatePolicyRpcResponse {
     reason: String,
     #[serde(default)]
     evaluated_rules: Vec<String>,
+    /// Per-milestone results; empty when no milestones declared.
+    #[serde(default)]
+    milestone_results: Vec<MilestoneRpcResult>,
+    /// Number of milestones with outcome == "satisfied".
+    #[serde(default)]
+    completed_milestone_count: usize,
+    /// Total declared milestones.
+    #[serde(default)]
+    total_milestone_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -5217,6 +5245,20 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
             lines.push(format!("  {}", rule));
         }
     }
+    if !resp.milestone_results.is_empty() {
+        lines.push(format!(
+            "milestones {}/{}",
+            resp.completed_milestone_count, resp.total_milestone_count
+        ));
+        for ms in &resp.milestone_results {
+            let display = ms
+                .label
+                .as_deref()
+                .filter(|l| !l.is_empty())
+                .unwrap_or(ms.milestone_id.as_str());
+            lines.push(format!("  milestone {} outcome {}", display, ms.outcome));
+        }
+    }
     lines.join("\n")
 }
 
@@ -9194,6 +9236,7 @@ mod tests {
                 }],
                 notes: None,
                 expires_at_height: None,
+                milestones: vec![],
             }),
             expires_at_height: None,
             expired: false,
@@ -9461,6 +9504,89 @@ mod tests {
         assert!(!out.contains("outcome "), "empty outcome must be silent; got: {out}");
     }
 
+    // ---- milestone render tests ----
+
+    #[test]
+    fn render_policy_evaluate_summary_milestone_breakdown() {
+        // Two milestones: ms-a satisfied, ms-b unsatisfied.
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "unsatisfied".to_string(),
+            agreement_hash: "hash-ms".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-ms".to_string()),
+            release_eligible: false,
+            reason: "1 of 2 milestones satisfied; 1 unsatisfied".to_string(),
+            total_milestone_count: 2,
+            completed_milestone_count: 1,
+            milestone_results: vec![
+                MilestoneRpcResult {
+                    milestone_id: "ms-a".to_string(),
+                    label: Some("Delivery".to_string()),
+                    outcome: "satisfied".to_string(),
+                    release_eligible: true,
+                    reason: "all release requirements satisfied by verified proofs".to_string(),
+                    ..Default::default()
+                },
+                MilestoneRpcResult {
+                    milestone_id: "ms-b".to_string(),
+                    label: None,
+                    outcome: "unsatisfied".to_string(),
+                    reason: "no release or refund condition was met".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("milestones 1/2"), "must show milestone count; got: {out}");
+        assert!(out.contains("Delivery outcome satisfied"), "must show labeled milestone; got: {out}");
+        assert!(out.contains("ms-b outcome unsatisfied"), "must show unlabeled milestone by id; got: {out}");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_milestone_all_satisfied() {
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "satisfied".to_string(),
+            agreement_hash: "hash-ms-sat".to_string(),
+            policy_found: true,
+            release_eligible: true,
+            reason: "all milestones satisfied".to_string(),
+            total_milestone_count: 2,
+            completed_milestone_count: 2,
+            milestone_results: vec![
+                MilestoneRpcResult {
+                    milestone_id: "ms-a".to_string(),
+                    outcome: "satisfied".to_string(),
+                    ..Default::default()
+                },
+                MilestoneRpcResult {
+                    milestone_id: "ms-b".to_string(),
+                    outcome: "satisfied".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("milestones 2/2"), "must show 2/2; got: {out}");
+        assert!(out.contains("outcome satisfied"), "got: {out}");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_no_milestone_section_when_empty() {
+        // When milestone_results is empty, "milestones" line must not appear.
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "satisfied".to_string(),
+            agreement_hash: "hash-no-ms".to_string(),
+            policy_found: true,
+            release_eligible: true,
+            reason: "all release requirements satisfied by verified proofs".to_string(),
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(!out.contains("milestones"), "must not show milestone section; got: {out}");
+    }
+
     #[test]
     fn parse_policy_list_cli_defaults() {
         let args: Vec<String> = vec![];
@@ -9607,6 +9733,7 @@ mod tests {
                 attestors: vec![],
                 notes: None,
                 expires_at_height: Some(500),
+                milestones: vec![],
             }),
             expires_at_height: Some(500),
             expired: false,
@@ -9631,6 +9758,7 @@ mod tests {
                 attestors: vec![],
                 notes: None,
                 expires_at_height: Some(10),
+                milestones: vec![],
             }),
             expires_at_height: Some(10),
             expired: true,
