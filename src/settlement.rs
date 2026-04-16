@@ -3738,12 +3738,31 @@ pub struct SettlementProof {
     pub expires_at_height: Option<u64>,
 }
 
+/// Objective, deterministic outcome of a policy evaluation.
+///
+/// - `satisfied`   — all required proofs present and signature-verified.
+/// - `timeout`     — a no-response deadline or refund required_by deadline elapsed
+///                   before release was achieved; proofs absent or insufficient.
+/// - `unsatisfied` — neither condition met; proofs missing, expired, or
+///                   signature-invalid, and no deadline has elapsed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyOutcome {
+    Satisfied,
+    Timeout,
+    Unsatisfied,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyEvaluationResult {
+    /// Objective classification of this evaluation.
+    pub outcome: PolicyOutcome,
     pub release_eligible: bool,
     pub refund_eligible: bool,
     pub reason: String,
     pub evaluated_rules: Vec<String>,
+    /// Proof IDs that passed signature verification and matched the policy.
+    pub matched_proof_ids: Vec<String>,
 }
 
 fn proof_policy_canonical_bytes(policy: &ProofPolicy) -> Result<Vec<u8>, String> {
@@ -3891,10 +3910,12 @@ pub fn evaluate_policy(
 
     if all_release_met {
         return Ok(PolicyEvaluationResult {
+            outcome: PolicyOutcome::Satisfied,
             release_eligible: true,
             refund_eligible: false,
             reason: "all release requirements satisfied by verified proofs".to_string(),
             evaluated_rules,
+            matched_proof_ids: satisfied.clone(),
         });
     }
 
@@ -3918,10 +3939,12 @@ pub fn evaluate_policy(
                 ProofResolution::Refund => (false, true),
             };
             return Ok(PolicyEvaluationResult {
+                outcome: PolicyOutcome::Timeout,
                 release_eligible: release,
                 refund_eligible: refund,
                 reason: label,
                 evaluated_rules,
+                matched_proof_ids: satisfied.clone(),
             });
         }
     }
@@ -3943,10 +3966,12 @@ pub fn evaluate_policy(
                     );
                     evaluated_rules.push(label.clone());
                     return Ok(PolicyEvaluationResult {
+                        outcome: PolicyOutcome::Timeout,
                         release_eligible: false,
                         refund_eligible: true,
                         reason: label,
                         evaluated_rules,
+                        matched_proof_ids: satisfied.clone(),
                     });
                 }
             }
@@ -3968,10 +3993,12 @@ pub fn evaluate_policy(
     }
 
     Ok(PolicyEvaluationResult {
+        outcome: PolicyOutcome::Unsatisfied,
         release_eligible: false,
         refund_eligible: false,
         reason: "no release or refund condition was met".to_string(),
         evaluated_rules,
+        matched_proof_ids: satisfied,
     })
 }
 
@@ -4098,16 +4125,21 @@ impl ProofStore {
             .values()
             .filter(|p| p.agreement_hash.to_lowercase() == lower)
             .collect();
-        proofs.sort_by(|a, b| a.proof_id.cmp(&b.proof_id));
+        proofs.sort_by(|a, b| {
+            a.attestation_time
+                .cmp(&b.attestation_time)
+                .then_with(|| a.proof_id.cmp(&b.proof_id))
+        });
         proofs
     }
 
-    /// Return all proofs in the store, sorted by agreement_hash then proof_id.
+    /// Return all proofs in the store, sorted by attestation_time ascending then proof_id
+    /// ascending as a stable tie-breaker. This ordering is consistent with list_by_agreement.
     pub fn list_all(&self) -> Vec<&SettlementProof> {
         let mut proofs: Vec<&SettlementProof> = self.proofs.values().collect();
         proofs.sort_by(|a, b| {
-            a.agreement_hash
-                .cmp(&b.agreement_hash)
+            a.attestation_time
+                .cmp(&b.attestation_time)
                 .then_with(|| a.proof_id.cmp(&b.proof_id))
         });
         proofs
@@ -4115,6 +4147,11 @@ impl ProofStore {
 
     pub fn count(&self) -> usize {
         self.proofs.len()
+    }
+
+    /// Return the proof with the given proof_id, or None if not found.
+    pub fn get_by_id(&self, proof_id: &str) -> Option<&SettlementProof> {
+        self.proofs.get(proof_id)
     }
 }
 
@@ -5460,6 +5497,134 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_policy_outcome_satisfied() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        let proof = make_test_proof(&agreement_hash, "attestor-a", &signing_key);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.release_eligible);
+        assert!(!result.refund_eligible);
+    }
+
+    #[test]
+    fn evaluate_policy_outcome_unsatisfied_missing_proofs() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        let result = evaluate_policy(&agreement, &policy, &[], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Unsatisfied);
+        assert!(!result.release_eligible);
+        assert!(!result.refund_eligible);
+    }
+
+    #[test]
+    fn evaluate_policy_outcome_unsatisfied_wrong_attestor() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        let mut policy2 = policy.clone();
+        policy2.required_proofs[0].required_attestor_ids = vec!["attestor-b".to_string()];
+        let proof = make_test_proof(&agreement_hash, "attestor-a", &signing_key);
+        // proof is attested_by "attestor-a"; policy2 requires "attestor-b" -> req unsatisfied
+        let result = evaluate_policy(&agreement, &policy2, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Unsatisfied);
+        assert!(!result.release_eligible);
+    }
+
+    #[test]
+    fn evaluate_policy_outcome_timeout_no_response_rule() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-refund-100".to_string(),
+            deadline_height: 100,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        });
+        let result = evaluate_policy(&agreement, &policy, &[], 100).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Timeout);
+        assert!(result.refund_eligible);
+        assert!(!result.release_eligible);
+    }
+
+    #[test]
+    fn evaluate_policy_outcome_timeout_required_by_deadline() {
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.required_proofs.clear();
+        policy.required_proofs.push(ProofRequirement {
+            requirement_id: "req-refund-deadline".to_string(),
+            proof_type: "refund_proof".to_string(),
+            required_by: Some(50),
+            required_attestor_ids: vec!["attestor-a".to_string()],
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+        });
+        let result = evaluate_policy(&agreement, &policy, &[], 50).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Timeout);
+        assert!(result.refund_eligible);
+        assert!(!result.release_eligible);
+    }
+
+    #[test]
+    fn evaluate_policy_outcome_satisfied_suppresses_no_response_rule() {
+        // Proofs satisfy release; no-response rule deadline also elapsed.
+        // Satisfied takes priority; outcome must be Satisfied.
+        let signing_key = sample_signing_key();
+        let pubkey_hex = hex::encode(
+            signing_key.verifying_key().to_encoded_point(false).as_bytes(),
+        );
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&agreement_hash, &pubkey_hex, "attestor-a");
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-refund-200".to_string(),
+            deadline_height: 200,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        });
+        let proof = make_test_proof(&agreement_hash, "attestor-a", &signing_key);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 300).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.release_eligible);
+        assert!(!result.refund_eligible);
+    }
+
+    #[test]
     fn policy_hash_mismatch_rejected() {
         let signing_key = sample_signing_key();
         let pubkey_hex = hex::encode(
@@ -5650,6 +5815,122 @@ mod tests {
         proof.signature.signature_hex = hex::encode(sig.to_bytes());
         proof.signature.payload_hash = hex::encode(digest);
         proof
+    }
+
+    /// Variant of build_signed_proof that accepts a custom attestation_time.
+    /// Used by ordering tests to control the temporal field in the signed payload.
+    fn build_signed_proof_at_time(
+        agreement_hash: &str,
+        attestor_id: &str,
+        signing_key: &SigningKey,
+        attestation_time: u64,
+    ) -> SettlementProof {
+        let pubkey_hex = hex::encode(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let mut proof = SettlementProof {
+            proof_id: format!("prf-store-{}-{}", attestor_id, agreement_hash),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: agreement_hash.to_string(),
+            milestone_id: None,
+            attested_by: attestor_id.to_string(),
+            attestation_time,
+            evidence_hash: None,
+            evidence_summary: Some("ordering test".to_string()),
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pubkey_hex.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+        };
+        let payload = settlement_proof_payload_bytes(&proof).unwrap();
+        let digest = sha2::Sha256::digest(&payload);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: k256::ecdsa::Signature = signing_key.sign_prehash(&arr).unwrap();
+        proof.signature.signature_hex = hex::encode(sig.to_bytes());
+        proof.signature.payload_hash = hex::encode(digest);
+        proof
+    }
+
+    #[test]
+    fn proof_store_list_by_agreement_orders_by_attestation_time() {
+        // Proofs submitted out of time-order must be returned oldest-first.
+        let mut store = make_proof_store();
+        let sk1 = SigningKey::from_bytes((&[50u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[51u8; 32]).into()).unwrap();
+        let sk3 = SigningKey::from_bytes((&[52u8; 32]).into()).unwrap();
+        let p_latest = build_signed_proof_at_time("ord-hash", "att-c", &sk3, 3_000);
+        let p_mid    = build_signed_proof_at_time("ord-hash", "att-b", &sk2, 2_000);
+        let p_oldest = build_signed_proof_at_time("ord-hash", "att-a", &sk1, 1_000);
+        // submit in reverse time order to rule out insertion-order artefacts
+        store.submit(p_latest).unwrap();
+        store.submit(p_mid).unwrap();
+        store.submit(p_oldest).unwrap();
+        let listed = store.list_by_agreement("ord-hash");
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].attestation_time, 1_000, "oldest must be first");
+        assert_eq!(listed[1].attestation_time, 2_000);
+        assert_eq!(listed[2].attestation_time, 3_000, "latest must be last");
+    }
+
+    #[test]
+    fn proof_store_list_all_orders_by_attestation_time() {
+        // list_all must apply the same ordering even across different agreement hashes.
+        let mut store = make_proof_store();
+        let sk1 = SigningKey::from_bytes((&[53u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[54u8; 32]).into()).unwrap();
+        let sk3 = SigningKey::from_bytes((&[55u8; 32]).into()).unwrap();
+        // different agreement hashes; p3 has smallest time, p1 largest
+        let p1 = build_signed_proof_at_time("hash-z", "att-z", &sk1, 9_000);
+        let p2 = build_signed_proof_at_time("hash-a", "att-a", &sk2, 5_000);
+        let p3 = build_signed_proof_at_time("hash-m", "att-m", &sk3, 1_000);
+        store.submit(p1).unwrap();
+        store.submit(p2).unwrap();
+        store.submit(p3).unwrap();
+        let all = store.list_all();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].attestation_time, 1_000, "oldest first regardless of agreement_hash");
+        assert_eq!(all[1].attestation_time, 5_000);
+        assert_eq!(all[2].attestation_time, 9_000, "latest last regardless of agreement_hash");
+    }
+
+    #[test]
+    fn proof_store_list_tie_breaks_by_proof_id() {
+        // Two proofs with identical attestation_time must be ordered by proof_id ascending.
+        let mut store = make_proof_store();
+        let sk1 = SigningKey::from_bytes((&[56u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[57u8; 32]).into()).unwrap();
+        let mut pa = build_signed_proof_at_time("tie-hash", "att-b", &sk1, 7_000);
+        let mut pb = build_signed_proof_at_time("tie-hash", "att-a", &sk2, 7_000);
+        // Override proof_ids so we control alphabetical order explicitly
+        pa.proof_id = "prf-zzz".to_string();
+        pb.proof_id = "prf-aaa".to_string();
+        // Re-sign after changing proof_id since proof_id is part of the payload
+        let payload_a = settlement_proof_payload_bytes(&pa).unwrap();
+        let digest_a = sha2::Sha256::digest(&payload_a);
+        let mut arr = [0u8; 32]; arr.copy_from_slice(&digest_a);
+        let sig_a: k256::ecdsa::Signature = sk1.sign_prehash(&arr).unwrap();
+        pa.signature.signature_hex = hex::encode(sig_a.to_bytes());
+        pa.signature.payload_hash = hex::encode(digest_a);
+        let payload_b = settlement_proof_payload_bytes(&pb).unwrap();
+        let digest_b = sha2::Sha256::digest(&payload_b);
+        arr.copy_from_slice(&digest_b);
+        let sig_b: k256::ecdsa::Signature = sk2.sign_prehash(&arr).unwrap();
+        pb.signature.signature_hex = hex::encode(sig_b.to_bytes());
+        pb.signature.payload_hash = hex::encode(digest_b);
+        store.submit(pa).unwrap();
+        store.submit(pb).unwrap();
+        let listed = store.list_by_agreement("tie-hash");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].proof_id, "prf-aaa", "alphabetically earlier proof_id must be first on tie");
+        assert_eq!(listed[1].proof_id, "prf-zzz");
     }
 
     #[test]

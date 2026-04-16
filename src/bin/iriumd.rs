@@ -57,6 +57,7 @@ use irium_node_rs::settlement::{
     AgreementFundingLegRef, AgreementLifecycleView, AgreementLinkedTx, AgreementMilestoneStatus,
     AgreementObject, AgreementSummary,
     evaluate_policy,
+    PolicyOutcome,
     ProofPolicy,
     SettlementProof,
     ProofStore,
@@ -675,6 +676,8 @@ struct SubmitProofResponse {
     expires_at_height: Option<u64>,
     /// True when tip_height >= expires_at_height at submit time. False when expires_at_height is None.
     expired: bool,
+    /// Derived lifecycle status: "active" or "expired". Consistent with listproofs per-proof status.
+    status: String,
 }
 
 #[derive(Deserialize)]
@@ -704,6 +707,7 @@ struct ListPoliciesResponse {
 }
 
 #[derive(Deserialize)]
+#[derive(Default)]
 struct ListProofsRequest {
     /// Filter by agreement hash. When absent, all proofs are returned.
     #[serde(default)]
@@ -711,18 +715,48 @@ struct ListProofsRequest {
     /// When true, only proofs that are not expired at the current tip are returned.
     #[serde(default)]
     active_only: bool,
+    /// Number of proofs to skip before returning results. Default: 0.
+    #[serde(default)]
+    offset: u32,
+    /// Maximum number of proofs to return. When absent, all matching proofs are returned.
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+fn proof_lifecycle_status(expires_at_height: Option<u64>, tip_height: u64) -> &'static str {
+    match expires_at_height {
+        None => "active",
+        Some(h) if tip_height < h => "active",
+        Some(_) => "expired",
+    }
+}
+
+#[derive(Serialize)]
+struct ProofStatusEntry {
+    #[serde(flatten)]
+    proof: SettlementProof,
+    /// Derived lifecycle status: "active" or "expired".
+    status: String,
 }
 
 #[derive(Serialize)]
 struct ListProofsResponse {
     agreement_hash: String,
-    /// Chain tip height at the time of the query; clients use this to compute
-    /// expired = tip_height >= proof.expires_at_height.
+    /// Chain tip height at the time of the query.
     tip_height: u64,
     /// Echoes the active_only filter from the request.
     active_only: bool,
-    count: usize,
-    proofs: Vec<SettlementProof>,
+    /// Total number of proofs that matched the filters before pagination was applied.
+    total_count: usize,
+    /// Number of proofs returned in this page. Equals proofs.len().
+    returned_count: usize,
+    /// True when more proofs remain after this page (total_count > offset + returned_count).
+    has_more: bool,
+    /// Echoes the offset from the request.
+    offset: u32,
+    /// Echoes the limit from the request. Null when no limit was requested.
+    limit: Option<u32>,
+    proofs: Vec<ProofStatusEntry>,
 }
 
 #[derive(Deserialize)]
@@ -751,11 +785,20 @@ struct EvaluatePolicyRequest {
 
 #[derive(Debug, Serialize)]
 struct EvaluatePolicyResponse {
+    /// Deterministic classification: "satisfied", "timeout", or "unsatisfied".
+    outcome: PolicyOutcome,
     agreement_hash: String,
     policy_found: bool,
     policy_id: Option<String>,
     tip_height: u64,
+    /// Total active (non-expired) proofs considered for evaluation.
     proof_count: usize,
+    /// Proofs filtered out as expired before evaluation.
+    expired_proof_count: usize,
+    /// Proofs that passed signature verification and matched the policy.
+    matched_proof_count: usize,
+    /// IDs of proofs that passed signature verification.
+    matched_proof_ids: Vec<String>,
     expired: bool,
     release_eligible: bool,
     refund_eligible: bool,
@@ -791,6 +834,29 @@ struct GetPolicyResponse {
     policy: Option<ProofPolicy>,
     expires_at_height: Option<u64>,
     expired: bool,
+}
+
+#[derive(Deserialize)]
+struct GetProofRequest {
+    /// Unique identifier of the proof to retrieve.
+    proof_id: String,
+}
+
+#[derive(Serialize)]
+struct GetProofResponse {
+    proof_id: String,
+    /// True when the proof was found in the store.
+    found: bool,
+    /// Chain tip height at the time of the query.
+    tip_height: u64,
+    /// Full proof object; null when found=false.
+    proof: Option<SettlementProof>,
+    /// Expiry height from the proof, if any; null when found=false.
+    expires_at_height: Option<u64>,
+    /// True when tip_height >= expires_at_height at query time.
+    expired: bool,
+    /// Derived lifecycle status: "active" or "expired". Empty string when found=false.
+    status: String,
 }
 
 #[derive(Serialize)]
@@ -5067,6 +5133,7 @@ async fn submit_proof_rpc(
     };
     let mut store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
     let outcome = store.submit(req.proof).map_err(|e| bad(&e))?;
+    let status = proof_lifecycle_status(expires_at_height, tip_height).to_string();
     Ok(Json(SubmitProofResponse {
         proof_id: outcome.proof_id,
         agreement_hash: outcome.agreement_hash,
@@ -5076,6 +5143,7 @@ async fn submit_proof_rpc(
         tip_height,
         expires_at_height,
         expired,
+        status,
     }))
 }
 
@@ -5149,13 +5217,34 @@ async fn list_proofs_rpc(
             Some(h) => tip_height < h,
         });
     }
-    let count = proofs.len();
+    let total_count = proofs.len();
+    // Apply pagination: offset first, then limit.
+    let offset_usize = req.offset as usize;
+    let paged: Vec<SettlementProof> = proofs.into_iter().skip(offset_usize).collect();
+    let paged: Vec<SettlementProof> = if let Some(lim) = req.limit {
+        paged.into_iter().take(lim as usize).collect()
+    } else {
+        paged
+    };
+    let returned_count = paged.len();
+    let has_more = total_count > req.offset as usize + returned_count;
+    let entries: Vec<ProofStatusEntry> = paged
+        .into_iter()
+        .map(|p| {
+            let status = proof_lifecycle_status(p.expires_at_height, tip_height).to_string();
+            ProofStatusEntry { proof: p, status }
+        })
+        .collect();
     Ok(Json(ListProofsResponse {
         agreement_hash: filter_hash,
         tip_height,
         active_only: req.active_only,
-        count,
-        proofs,
+        total_count,
+        returned_count,
+        has_more,
+        offset: req.offset,
+        limit: req.limit,
+        proofs: entries,
     }))
 }
 
@@ -5177,6 +5266,43 @@ async fn store_policy_rpc(
         accepted: outcome.accepted,
         updated: outcome.updated,
         message: outcome.message,
+    }))
+}
+
+async fn get_proof_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<GetProofRequest>,
+) -> Result<Json<GetProofResponse>, (StatusCode, String)> {
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let tip_height = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.tip_height()
+    };
+    let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+    let proof = store.get_by_id(&req.proof_id).cloned();
+    let found = proof.is_some();
+    let expires_at_height = proof.as_ref().and_then(|p| p.expires_at_height);
+    let expired = match expires_at_height {
+        None => false,
+        Some(h) => tip_height >= h,
+    };
+    let status = if found {
+        proof_lifecycle_status(expires_at_height, tip_height).to_string()
+    } else {
+        String::new()
+    };
+    Ok(Json(GetProofResponse {
+        proof_id: req.proof_id,
+        found,
+        tip_height,
+        proof,
+        expires_at_height,
+        expired,
+        status,
     }))
 }
 
@@ -5230,11 +5356,15 @@ async fn evaluate_policy_rpc(
     let policy = match policy {
         None => {
             return Ok(Json(EvaluatePolicyResponse {
+                outcome: PolicyOutcome::Unsatisfied,
                 agreement_hash,
                 policy_found: false,
                 policy_id: None,
                 tip_height,
                 proof_count: 0,
+                expired_proof_count: 0,
+                matched_proof_count: 0,
+                matched_proof_ids: Vec::new(),
                 expired: false,
                 release_eligible: false,
                 refund_eligible: false,
@@ -5271,15 +5401,20 @@ async fn evaluate_policy_rpc(
         })
         .collect();
     let proof_count = active_proofs.len();
+    let expiry_rule_count = expiry_rules.len();
     // Policy expiry check: treat expired policy as inactive.
     if let Some(expires) = policy.expires_at_height {
         if tip_height >= expires {
             return Ok(Json(EvaluatePolicyResponse {
+                outcome: PolicyOutcome::Unsatisfied,
                 agreement_hash,
                 policy_found: true,
                 policy_id: Some(policy.policy_id.clone()),
                 tip_height,
                 proof_count,
+                expired_proof_count: expiry_rules.len(),
+                matched_proof_count: 0,
+                matched_proof_ids: Vec::new(),
                 expired: true,
                 release_eligible: false,
                 refund_eligible: false,
@@ -5293,12 +5428,18 @@ async fn evaluate_policy_rpc(
         .map_err(|e| bad(&format!("policy_eval_failed:{e}")))?;
     let mut all_rules = expiry_rules;
     all_rules.extend(result.evaluated_rules);
+    let matched_proof_count = result.matched_proof_ids.len();
+    let matched_proof_ids = result.matched_proof_ids;
     Ok(Json(EvaluatePolicyResponse {
+        outcome: result.outcome,
         agreement_hash,
         policy_found: true,
         policy_id: Some(policy_id),
         tip_height,
         proof_count,
+        expired_proof_count: expiry_rule_count,
+        matched_proof_count,
+        matched_proof_ids,
         expired: false,
         release_eligible: result.release_eligible,
         refund_eligible: result.refund_eligible,
@@ -7050,6 +7191,7 @@ async fn main() {
         .route("/rpc/checkpolicy", post(check_policy_rpc))
         .route("/rpc/submitproof", post(submit_proof_rpc))
         .route("/rpc/listproofs", post(list_proofs_rpc))
+        .route("/rpc/getproof", post(get_proof_rpc))
         .route("/rpc/storepolicy", post(store_policy_rpc))
         .route("/rpc/getpolicy", post(get_policy_rpc))
         .route("/rpc/evaluatepolicy", post(evaluate_policy_rpc))
@@ -8427,6 +8569,154 @@ mod tests {
         proof
     }
 
+    /// Variant of make_signed_proof_for_rpc with configurable proof_id and attestation_time.
+    fn make_proof_with_time(
+        proof_id: &str,
+        agreement_hash: &str,
+        attestation_time: u64,
+        signing_key: &SigningKey,
+    ) -> SettlementProof {
+        use irium_node_rs::settlement::{
+            settlement_proof_payload_bytes, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+            SETTLEMENT_PROOF_SCHEMA_ID,
+        };
+        let pubkey_hex = hex::encode(signing_key.verifying_key().to_encoded_point(false).as_bytes());
+        let mut proof = SettlementProof {
+            proof_id: proof_id.to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: agreement_hash.to_string(),
+            milestone_id: None,
+            attested_by: "att-order-test".to_string(),
+            attestation_time,
+            evidence_hash: None,
+            evidence_summary: Some("ordering test proof".to_string()),
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pubkey_hex.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+        };
+        let payload = settlement_proof_payload_bytes(&proof).unwrap();
+        let digest = sha2::Sha256::digest(&payload);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: k256::ecdsa::Signature = signing_key.sign_prehash(&arr).unwrap();
+        proof.signature.signature_hex = hex::encode(sig.to_bytes());
+        proof.signature.payload_hash = hex::encode(digest);
+        proof
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_ordering_by_attestation_time() {
+        // Proofs submitted in reverse time order must be listed oldest-first.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk1 = SigningKey::from_bytes((&[60u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[61u8; 32]).into()).unwrap();
+        let sk3 = SigningKey::from_bytes((&[62u8; 32]).into()).unwrap();
+        let p_late  = make_proof_with_time("prf-ord-c", "hash-ord", 3_000, &sk3);
+        let p_mid   = make_proof_with_time("prf-ord-b", "hash-ord", 2_000, &sk2);
+        let p_early = make_proof_with_time("prf-ord-a", "hash-ord", 1_000, &sk1);
+        for p in [p_late, p_mid, p_early] {
+            submit_proof_rpc(
+                ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p }),
+            ).await.expect("submit");
+        }
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false, ..Default::default() }),
+        ).await.expect("list").0;
+        assert_eq!(resp.proofs.len(), 3);
+        assert_eq!(resp.proofs[0].proof.attestation_time, 1_000, "oldest must be first");
+        assert_eq!(resp.proofs[1].proof.attestation_time, 2_000);
+        assert_eq!(resp.proofs[2].proof.attestation_time, 3_000, "latest must be last");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_ordering_tie_break_by_proof_id() {
+        // Two proofs with identical attestation_time must be sorted by proof_id ascending.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk1 = SigningKey::from_bytes((&[63u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[64u8; 32]).into()).unwrap();
+        let p_zzz = make_proof_with_time("prf-tie-zzz", "hash-tie", 5_000, &sk1);
+        let p_aaa = make_proof_with_time("prf-tie-aaa", "hash-tie", 5_000, &sk2);
+        for p in [p_zzz, p_aaa] {
+            submit_proof_rpc(
+                ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p }),
+            ).await.expect("submit");
+        }
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: Some("hash-tie".to_string()), active_only: false, ..Default::default() }),
+        ).await.expect("list").0;
+        assert_eq!(resp.proofs.len(), 2);
+        assert_eq!(resp.proofs[0].proof.proof_id, "prf-tie-aaa", "earlier proof_id must come first on tie");
+        assert_eq!(resp.proofs[1].proof.proof_id, "prf-tie-zzz");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_ordering_agreement_scoped() {
+        // Agreement-scoped listing must also respect attestation_time order.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk1 = SigningKey::from_bytes((&[65u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[66u8; 32]).into()).unwrap();
+        let sk3 = SigningKey::from_bytes((&[67u8; 32]).into()).unwrap();
+        let pa2 = make_proof_with_time("prf-sc-a2", "hash-scope-a", 2_000, &sk2);
+        let pa1 = make_proof_with_time("prf-sc-a1", "hash-scope-a", 1_000, &sk1);
+        let pb1 = make_proof_with_time("prf-sc-b1", "hash-scope-b",   500, &sk3);
+        for p in [pa2, pb1, pa1] {
+            submit_proof_rpc(
+                ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p }),
+            ).await.expect("submit");
+        }
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: Some("hash-scope-a".to_string()), active_only: false, ..Default::default() }),
+        ).await.expect("list").0;
+        assert_eq!(resp.proofs.len(), 2, "scoped query must not include other agreement proofs");
+        assert_eq!(resp.proofs[0].proof.attestation_time, 1_000, "oldest scoped proof must be first");
+        assert_eq!(resp.proofs[1].proof.attestation_time, 2_000);
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_ordering_preserved_with_active_only() {
+        // active_only filter must not disturb the attestation_time ordering of surviving proofs.
+        // Chain tip is always 0 in tests; expires_at_height=Some(0) => expired (0 >= 0),
+        // expires_at_height=Some(1) => active (0 < 1).
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk1 = SigningKey::from_bytes((&[68u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[69u8; 32]).into()).unwrap();
+        let sk3 = SigningKey::from_bytes((&[70u8; 32]).into()).unwrap();
+        let sk4 = SigningKey::from_bytes((&[71u8; 32]).into()).unwrap();
+        let p1 = make_proof_with_time("prf-ao-1", "hash-ao", 1_000, &sk1); // no expiry -> active
+        let mut p2 = make_proof_with_time("prf-ao-2", "hash-ao", 2_000, &sk2);
+        p2.expires_at_height = Some(0); // tip=0 >= 0 -> expired, filtered out
+        let mut p3 = make_proof_with_time("prf-ao-3", "hash-ao", 3_000, &sk3);
+        p3.expires_at_height = Some(1); // tip=0 < 1 -> active
+        let mut p4 = make_proof_with_time("prf-ao-4", "hash-ao", 4_000, &sk4);
+        p4.expires_at_height = Some(0); // tip=0 >= 0 -> expired, filtered out
+        for p in [p1, p2, p3, p4] {
+            submit_proof_rpc(
+                ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p }),
+            ).await.expect("submit");
+        }
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None, active_only: true, ..Default::default() }),
+        ).await.expect("list").0;
+        assert_eq!(resp.proofs.len(), 2, "only 2 active proofs must survive");
+        assert_eq!(resp.proofs[0].proof.attestation_time, 1_000, "surviving proofs must remain time-ordered");
+        assert_eq!(resp.proofs[1].proof.attestation_time, 3_000);
+        assert_eq!(resp.proofs[0].status, "active");
+        assert_eq!(resp.proofs[1].status, "active");
+    }
+
     #[tokio::test]
     async fn submit_proof_rpc_accepts_valid_proof() {
         let (state, _, _, _) = create_test_state(Some(0));
@@ -8517,13 +8807,14 @@ mod tests {
             Json(ListProofsRequest {
                 agreement_hash: Some("listtest".to_string()),
                 active_only: false,
+                ..Default::default()
             }),
         )
         .await
         .expect("list")
         .0;
-        assert_eq!(list_resp.count, 1);
-        assert_eq!(list_resp.proofs[0].proof_id, "rpc-store-prf-001");
+        assert_eq!(list_resp.returned_count, 1);
+        assert_eq!(list_resp.proofs[0].proof.proof_id, "rpc-store-prf-001");
     }
 
     #[tokio::test]
@@ -8773,10 +9064,290 @@ mod tests {
 
         assert!(resp.policy_found);
         assert_eq!(resp.proof_count, 0, "proof for A must not be fetched for B");
+        assert_eq!(resp.expired_proof_count, 0);
+        assert_eq!(resp.matched_proof_count, 0);
+        assert!(resp.matched_proof_ids.is_empty());
         assert!(!resp.release_eligible);
     }
 
 
+
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_enrichment_satisfied_by_active_proof() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let proof = make_rpc_proof(&agreement_hash, &sk);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof })).await.expect("submit proof");
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.proof_count, 1);
+        assert_eq!(resp.expired_proof_count, 0, "proof is active");
+        assert_eq!(resp.matched_proof_count, 1, "one proof verified ok");
+        assert_eq!(resp.matched_proof_ids.len(), 1);
+        assert!(resp.release_eligible);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_enrichment_expired_proof_excluded() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let mut proof = make_rpc_proof(&agreement_hash, &sk);
+        proof.expires_at_height = Some(0);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof })).await.expect("submit proof");
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.proof_count, 0, "expired proof not in active count");
+        assert_eq!(resp.expired_proof_count, 1, "one proof filtered as expired");
+        assert_eq!(resp.matched_proof_count, 0);
+        assert!(resp.matched_proof_ids.is_empty());
+        assert!(!resp.release_eligible);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_enrichment_mixed_active_and_expired() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let sk2 = SigningKey::from_bytes((&[77u8; 32]).into()).unwrap();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let active_proof = make_rpc_proof(&agreement_hash, &sk);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof: active_proof })).await.expect("submit active");
+        let mut expired_proof = make_proof_with_time("prf-expired-mix", &agreement_hash, 500, &sk2);
+        expired_proof.expires_at_height = Some(0);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof: expired_proof })).await.expect("submit expired");
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.proof_count, 1, "only active proof in proof_count");
+        assert_eq!(resp.expired_proof_count, 1, "one expired");
+        assert_eq!(resp.matched_proof_count, 1, "active proof verified ok");
+        assert_eq!(resp.matched_proof_ids.len(), 1);
+        assert!(resp.release_eligible);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_enrichment_empty_proof_set() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.proof_count, 0);
+        assert_eq!(resp.expired_proof_count, 0);
+        assert_eq!(resp.matched_proof_count, 0);
+        assert!(resp.matched_proof_ids.is_empty());
+        assert!(!resp.release_eligible);
+    }
+
+    // ---- outcome field tests ----
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_outcome_satisfied() {
+        // Valid proof matches policy -> outcome "satisfied".
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let proof = make_rpc_proof(&agreement_hash, &sk);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof })).await.expect("submit proof");
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.outcome, PolicyOutcome::Satisfied);
+        assert!(resp.release_eligible);
+        assert!(!resp.refund_eligible);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_outcome_unsatisfied_missing_proofs() {
+        // No proofs submitted, no deadline elapsed -> outcome "unsatisfied".
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.outcome, PolicyOutcome::Unsatisfied);
+        assert!(!resp.release_eligible);
+        assert!(!resp.refund_eligible);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_outcome_unsatisfied_expired_proofs_only() {
+        // Only expired proofs remain -> active proof_count=0, outcome "unsatisfied".
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let mut proof = make_proof_with_time("prf-exp-out", &agreement_hash, 1_000, &sk);
+        proof.expires_at_height = Some(5);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof })).await.expect("submit expired proof");
+        // Advance chain past expiry
+        { let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner()); chain.height = 10; }
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.outcome, PolicyOutcome::Unsatisfied);
+        assert_eq!(resp.proof_count, 0, "expired proof must be excluded");
+        assert_eq!(resp.expired_proof_count, 1);
+        assert!(!resp.release_eligible);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_outcome_timeout_no_response_rule() {
+        // No-response rule deadline elapsed with no release -> outcome "timeout".
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-timeout-50".to_string(),
+            deadline_height: 50,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        });
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        // tip_height() = chain.height - 1; set to 51 so tip=50 meets deadline 50.
+        { let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner()); chain.height = 51; }
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.outcome, PolicyOutcome::Timeout);
+        assert!(resp.refund_eligible);
+        assert!(!resp.release_eligible);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_outcome_timeout_required_by_deadline() {
+        // Refund required_by deadline elapsed with no proof -> outcome "timeout".
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        policy.required_proofs = vec![ProofRequirement {
+            requirement_id: "req-refund-dl".to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            required_by: Some(75),
+            required_attestor_ids: vec!["rpc-attestor".to_string()],
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+        }];
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        // tip_height() = chain.height - 1; set to 76 so tip=75 meets deadline 75.
+        { let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner()); chain.height = 76; }
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.outcome, PolicyOutcome::Timeout);
+        assert!(resp.refund_eligible);
+        assert!(!resp.release_eligible);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_outcome_satisfied_when_no_response_deadline_also_elapsed() {
+        // Proofs satisfy release AND no-response deadline has elapsed.
+        // Satisfied must take priority; outcome must be Satisfied.
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        policy.no_response_rules.push(NoResponseRule {
+            rule_id: "rule-refund-suppress".to_string(),
+            deadline_height: 10,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: None,
+        });
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let proof = make_rpc_proof(&agreement_hash, &sk);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof })).await.expect("submit proof");
+        { let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner()); chain.height = 100; }
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.outcome, PolicyOutcome::Satisfied);
+        assert!(resp.release_eligible);
+        assert!(!resp.refund_eligible);
+    }
+
+    #[tokio::test]
+    async fn evaluate_policy_rpc_outcome_unsatisfied_no_policy() {
+        // No policy stored for the agreement -> outcome "unsatisfied".
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let resp = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(resp.outcome, PolicyOutcome::Unsatisfied);
+        assert!(!resp.policy_found);
+        assert!(!resp.release_eligible);
+    }
 
     #[tokio::test]
     async fn list_policies_rpc_empty_returns_count_zero() {
@@ -9469,14 +10040,14 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: None, active_only: false }),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false, ..Default::default() }),
         )
         .await
         .expect("list all must succeed")
         .0;
-        assert_eq!(resp.count, 1, "must return the stored proof; got count={}", resp.count);
+        assert_eq!(resp.returned_count, 1, "must return the stored proof; got count={}", resp.returned_count);
         assert_eq!(resp.agreement_hash, "*", "agreement_hash must be * for global list");
-        assert_eq!(resp.proofs[0].agreement_hash, "hash-aaa", "proof must carry its own agreement_hash");
+        assert_eq!(resp.proofs[0].proof.agreement_hash, "hash-aaa", "proof must carry its own agreement_hash");
     }
 
     #[tokio::test]
@@ -9498,25 +10069,25 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: Some("hash-filter-a".to_string()), active_only: false }),
+            Json(ListProofsRequest { agreement_hash: Some("hash-filter-a".to_string()), active_only: false, ..Default::default() }),
         )
         .await
         .expect("filtered list must succeed")
         .0;
-        assert_eq!(resp_a.count, 1, "filter must return only matching proof");
+        assert_eq!(resp_a.returned_count, 1, "filter must return only matching proof");
         assert_eq!(resp_a.agreement_hash, "hash-filter-a");
-        assert_eq!(resp_a.proofs[0].agreement_hash, "hash-filter-a");
+        assert_eq!(resp_a.proofs[0].proof.agreement_hash, "hash-filter-a");
         // Filter by hash-filter-b: no proofs stored under that hash.
         let resp_b = list_proofs_rpc(
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: Some("hash-filter-b".to_string()), active_only: false }),
+            Json(ListProofsRequest { agreement_hash: Some("hash-filter-b".to_string()), active_only: false, ..Default::default() }),
         )
         .await
         .expect("filter-b list must succeed")
         .0;
-        assert_eq!(resp_b.count, 0, "filter-b must return no proofs");
+        assert_eq!(resp_b.returned_count, 0, "filter-b must return no proofs");
         assert_eq!(resp_b.agreement_hash, "hash-filter-b");
     }
 
@@ -9527,12 +10098,12 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: None, active_only: false }),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false, ..Default::default() }),
         )
         .await
         .expect("empty all list must succeed")
         .0;
-        assert_eq!(resp.count, 0);
+        assert_eq!(resp.returned_count, 0);
         assert_eq!(resp.agreement_hash, "*");
         assert_eq!(resp.tip_height, 0, "test node starts at height 0");
     }
@@ -9555,14 +10126,14 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: None, active_only: false }),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false, ..Default::default() }),
         )
         .await
         .expect("list")
         .0;
         // Test chain starts at genesis (height 0); tip_height field must be present.
         assert_eq!(resp.tip_height, 0, "tip_height must reflect chain genesis height");
-        assert_eq!(resp.count, 1);
+        assert_eq!(resp.returned_count, 1);
     }
 
     #[tokio::test]
@@ -9584,12 +10155,12 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: None, active_only: false }),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false, ..Default::default() }),
         )
         .await
         .expect("list")
         .0;
-        assert_eq!(resp.proofs[0].expires_at_height, Some(500),
+        assert_eq!(resp.proofs[0].proof.expires_at_height, Some(500),
             "expires_at_height must be returned in listing");
     }
 
@@ -9710,13 +10281,13 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: None, active_only: true }),
+            Json(ListProofsRequest { agreement_hash: None, active_only: true, ..Default::default() }),
         )
         .await
         .expect("list active_only")
         .0;
         assert!(resp.active_only, "active_only must be echoed true");
-        assert_eq!(resp.count, 0, "expired proof must be excluded when active_only=true");
+        assert_eq!(resp.returned_count, 0, "expired proof must be excluded when active_only=true");
     }
 
     #[tokio::test]
@@ -9737,13 +10308,13 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: None, active_only: true }),
+            Json(ListProofsRequest { agreement_hash: None, active_only: true, ..Default::default() }),
         )
         .await
         .expect("list active_only")
         .0;
         assert!(resp.active_only);
-        assert_eq!(resp.count, 1, "non-expiring proof must be included when active_only=true");
+        assert_eq!(resp.returned_count, 1, "non-expiring proof must be included when active_only=true");
     }
 
     #[tokio::test]
@@ -9765,13 +10336,13 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            Json(ListProofsRequest { agreement_hash: None, active_only: false }),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false, ..Default::default() }),
         )
         .await
         .expect("list default")
         .0;
         assert!(!resp.active_only);
-        assert_eq!(resp.count, 1, "expired proof must still be included when active_only=false");
+        assert_eq!(resp.returned_count, 1, "expired proof must still be included when active_only=false");
     }
 
     #[tokio::test]
@@ -9793,6 +10364,7 @@ mod tests {
         assert_eq!(resp.tip_height, 0);
         assert!(resp.expires_at_height.is_none(), "no expiry must be None");
         assert!(!resp.expired, "non-expiring proof must not be expired");
+        assert_eq!(resp.status, "active", "non-expiring proof must have status=active");
     }
 
     #[tokio::test]
@@ -9815,6 +10387,7 @@ mod tests {
         assert_eq!(resp.tip_height, 0);
         assert_eq!(resp.expires_at_height, Some(1));
         assert!(!resp.expired, "expires_at_height=1 at tip=0 must not be expired");
+        assert_eq!(resp.status, "active", "expires_at_height=1 at tip=0 must have status=active");
     }
 
     #[tokio::test]
@@ -9838,6 +10411,7 @@ mod tests {
         assert_eq!(resp.tip_height, 0);
         assert_eq!(resp.expires_at_height, Some(0));
         assert!(resp.expired, "tip=0 >= expires_at_height=0 must be reported as expired");
+        assert_eq!(resp.status, "expired", "tip=0 >= expires_at_height=0 must have status=expired");
     }
 
     #[tokio::test]
@@ -9869,6 +10443,931 @@ mod tests {
         assert_eq!(dup.tip_height, 0);
         assert_eq!(dup.expires_at_height, Some(0));
         assert!(dup.expired, "lifecycle fields must be present even on duplicate response");
+        assert_eq!(dup.status, "expired", "status must be present on duplicate response");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_status_non_expiring_is_active() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[32u8; 32]).into()).unwrap();
+        let proof = make_signed_proof_for_rpc("st-ne", &sk);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit");
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false, ..Default::default() }),
+        )
+        .await
+        .expect("list")
+        .0;
+        assert_eq!(resp.proofs[0].status, "active", "non-expiring proof must have status=active");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_status_future_expiry_is_active() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[33u8; 32]).into()).unwrap();
+        let mut proof = make_signed_proof_for_rpc("st-fe", &sk);
+        proof.expires_at_height = Some(1000);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit");
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false, ..Default::default() }),
+        )
+        .await
+        .expect("list")
+        .0;
+        assert_eq!(resp.proofs[0].status, "active", "expires_at_height=1000 at tip=0 must be active");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_status_already_expired_is_expired() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[34u8; 32]).into()).unwrap();
+        let mut proof = make_signed_proof_for_rpc("st-ae", &sk);
+        proof.expires_at_height = Some(0);
+        submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit");
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false, ..Default::default() }),
+        )
+        .await
+        .expect("list")
+        .0;
+        assert_eq!(resp.proofs[0].status, "expired", "expires_at_height=0 at tip=0 must be expired");
+    }
+
+    #[test]
+    fn proof_lifecycle_status_boundary_equal_is_expired() {
+        assert_eq!(proof_lifecycle_status(Some(5), 5), "expired");
+    }
+
+    #[test]
+    fn proof_lifecycle_status_boundary_one_before_is_active() {
+        assert_eq!(proof_lifecycle_status(Some(5), 4), "active");
+    }
+
+    #[tokio::test]
+    async fn submit_status_matches_list_status_active() {
+        // Submit a non-expiring proof; list it back; submit.status must equal list entry status.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[35u8; 32]).into()).unwrap();
+        let proof = make_signed_proof_for_rpc("sl-ne", &sk);
+        let sub = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit")
+        .0;
+        let list = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false, ..Default::default() }),
+        )
+        .await
+        .expect("list")
+        .0;
+        assert_eq!(sub.status, "active");
+        assert_eq!(list.proofs[0].status, sub.status,
+            "submit status must match list status for same proof");
+    }
+
+    #[tokio::test]
+    async fn submit_status_matches_list_status_expired() {
+        // Submit a proof already expired at tip=0; list it; statuses must agree.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[36u8; 32]).into()).unwrap();
+        let mut proof = make_signed_proof_for_rpc("sl-ae", &sk);
+        proof.expires_at_height = Some(0);
+        let sub = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit")
+        .0;
+        let list = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false, ..Default::default() }),
+        )
+        .await
+        .expect("list")
+        .0;
+        assert_eq!(sub.status, "expired");
+        assert_eq!(list.proofs[0].status, sub.status,
+            "submit status must match list status for expired proof");
+    }
+
+    #[tokio::test]
+    async fn submit_status_consistent_with_expired_bool() {
+        // Invariant: (status=="expired") == expired for all submit responses.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[37u8; 32]).into()).unwrap();
+        // Case A: no expiry -> expired=false, status=active.
+        let proof_a = make_signed_proof_for_rpc("sl-inv-a", &sk);
+        let resp_a = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof: proof_a }),
+        )
+        .await
+        .expect("submit a")
+        .0;
+        assert_eq!(resp_a.expired, resp_a.status == "expired",
+            "expired bool must agree with status field (case a)");
+        // Case B: expires_at_height=0 at tip=0 -> expired=true, status=expired.
+        let sk2 = SigningKey::from_bytes((&[38u8; 32]).into()).unwrap();
+        let mut proof_b = make_signed_proof_for_rpc("sl-inv-b", &sk2);
+        proof_b.expires_at_height = Some(0);
+        let resp_b = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof: proof_b }),
+        )
+        .await
+        .expect("submit b")
+        .0;
+        assert_eq!(resp_b.expired, resp_b.status == "expired",
+            "expired bool must agree with status field (case b)");
+    }
+
+    #[tokio::test]
+    async fn get_proof_rpc_found_active() {
+        // Submit a non-expiring proof; get it by proof_id; must be found with status=active.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[40u8; 32]).into()).unwrap();
+        let proof = make_signed_proof_for_rpc("gp-active", &sk);
+        let submitted = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit")
+        .0;
+        let resp = get_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(GetProofRequest { proof_id: submitted.proof_id.clone() }),
+        )
+        .await
+        .expect("get")
+        .0;
+        assert!(resp.found, "proof must be found");
+        assert_eq!(resp.proof_id, submitted.proof_id);
+        assert!(resp.proof.is_some(), "proof field must be populated");
+        assert_eq!(resp.status, "active", "non-expiring proof must have status=active");
+        assert!(!resp.expired, "non-expiring proof must not be expired");
+        assert_eq!(resp.tip_height, 0);
+    }
+
+    #[tokio::test]
+    async fn get_proof_rpc_found_expired() {
+        // Submit a proof already expired at tip=0; get it; must be found with status=expired.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[41u8; 32]).into()).unwrap();
+        let mut proof = make_signed_proof_for_rpc("gp-expired", &sk);
+        proof.expires_at_height = Some(0);
+        let submitted = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit")
+        .0;
+        let resp = get_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(GetProofRequest { proof_id: submitted.proof_id.clone() }),
+        )
+        .await
+        .expect("get")
+        .0;
+        assert!(resp.found, "expired proof must still be found");
+        assert_eq!(resp.status, "expired", "tip=0 >= expires_at_height=0 must be expired");
+        assert!(resp.expired);
+        assert_eq!(resp.expires_at_height, Some(0));
+    }
+
+    #[tokio::test]
+    async fn get_proof_rpc_not_found() {
+        // Request a proof that was never submitted; must return found=false with empty status.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let resp = get_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(GetProofRequest { proof_id: "nonexistent-proof-id".to_string() }),
+        )
+        .await
+        .expect("get")
+        .0;
+        assert!(!resp.found, "unknown proof_id must return found=false");
+        assert!(resp.proof.is_none(), "proof must be null when not found");
+        assert!(resp.status.is_empty(), "status must be empty when not found");
+        assert!(!resp.expired);
+    }
+
+    #[tokio::test]
+    async fn get_proof_rpc_status_consistent_with_expired_bool() {
+        // Invariant: (status=="expired") == expired for getproof responses.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[42u8; 32]).into()).unwrap();
+        // Submit expired proof.
+        let mut proof = make_signed_proof_for_rpc("gp-inv", &sk);
+        proof.expires_at_height = Some(0);
+        let sub = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit")
+        .0;
+        let get = get_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(GetProofRequest { proof_id: sub.proof_id }),
+        )
+        .await
+        .expect("get")
+        .0;
+        assert_eq!(get.expired, get.status == "expired",
+            "(status==expired) must equal expired bool");
+    }
+
+    #[tokio::test]
+    async fn get_proof_rpc_status_matches_list_status() {
+        // Consistency: getproof status must equal listproofs per-proof status for the same proof.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk = SigningKey::from_bytes((&[43u8; 32]).into()).unwrap();
+        let mut proof = make_signed_proof_for_rpc("gp-cons", &sk);
+        proof.expires_at_height = Some(0); // expired at tip=0
+        let sub = submit_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        )
+        .await
+        .expect("submit")
+        .0;
+        let get = get_proof_rpc(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(GetProofRequest { proof_id: sub.proof_id }),
+        )
+        .await
+        .expect("get")
+        .0;
+        let list = list_proofs_rpc(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Json(ListProofsRequest { agreement_hash: None, active_only: false, ..Default::default() }),
+        )
+        .await
+        .expect("list")
+        .0;
+        assert_eq!(get.status, list.proofs[0].status,
+            "getproof status must match listproofs status for the same proof");
+    }
+
+
+    // ---- Pagination tests ----
+
+    #[tokio::test]
+    async fn list_proofs_rpc_pagination_limit_only() {
+        // limit=3 on 5 proofs must return first 3 in time order.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let keys: Vec<_> = (72u8..77).map(|b| SigningKey::from_bytes((&[b; 32]).into()).unwrap()).collect();
+        for (i, sk) in keys.iter().enumerate() {
+            let p = make_proof_with_time(&format!("prf-lim-{}", i), "hash-lim", (i as u64 + 1) * 1000, sk);
+            submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p })).await.expect("submit");
+        }
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest { limit: Some(3), ..Default::default() }),
+        ).await.expect("list").0;
+        assert_eq!(resp.total_count, 5, "total_count must reflect unsliced count");
+        assert_eq!(resp.returned_count, 3, "count must reflect page size");
+        assert!(resp.has_more, "3 of 5 returned at offset 0, more remain");
+        assert_eq!(resp.proofs.len(), 3);
+        assert_eq!(resp.offset, 0);
+        assert_eq!(resp.limit, Some(3));
+        assert_eq!(resp.proofs[0].proof.attestation_time, 1_000, "first page must start from oldest");
+        assert_eq!(resp.proofs[2].proof.attestation_time, 3_000);
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_pagination_offset_only() {
+        // offset=2 on 5 proofs must skip first 2 and return the rest.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let keys: Vec<_> = (77u8..82).map(|b| SigningKey::from_bytes((&[b; 32]).into()).unwrap()).collect();
+        for (i, sk) in keys.iter().enumerate() {
+            let p = make_proof_with_time(&format!("prf-off-{}", i), "hash-off", (i as u64 + 1) * 1000, sk);
+            submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p })).await.expect("submit");
+        }
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest { offset: 2, ..Default::default() }),
+        ).await.expect("list").0;
+        assert_eq!(resp.total_count, 5);
+        assert_eq!(resp.returned_count, 3, "5 proofs minus offset 2 = 3");
+        assert!(!resp.has_more, "all remaining proofs returned");
+        assert_eq!(resp.proofs.len(), 3);
+        assert_eq!(resp.offset, 2);
+        assert_eq!(resp.limit, None);
+        assert_eq!(resp.proofs[0].proof.attestation_time, 3_000, "offset 2 must skip first two");
+        assert_eq!(resp.proofs[2].proof.attestation_time, 5_000);
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_pagination_limit_and_offset() {
+        // offset=1, limit=2 on 5 proofs must return proofs at index 1 and 2.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let keys: Vec<_> = (82u8..87).map(|b| SigningKey::from_bytes((&[b; 32]).into()).unwrap()).collect();
+        for (i, sk) in keys.iter().enumerate() {
+            let p = make_proof_with_time(&format!("prf-lo-{}", i), "hash-lo", (i as u64 + 1) * 1000, sk);
+            submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p })).await.expect("submit");
+        }
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest { offset: 1, limit: Some(2), ..Default::default() }),
+        ).await.expect("list").0;
+        assert_eq!(resp.total_count, 5);
+        assert_eq!(resp.returned_count, 2);
+        assert!(resp.has_more, "5 > offset(1)+returned(2)");
+        assert_eq!(resp.proofs.len(), 2);
+        assert_eq!(resp.proofs[0].proof.attestation_time, 2_000, "offset=1 skips index 0, starts at index 1");
+        assert_eq!(resp.proofs[1].proof.attestation_time, 3_000, "limit=2 stops after index 2");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_pagination_offset_beyond_length() {
+        // offset beyond list length must return empty proofs but total_count reflects full size.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let keys: Vec<_> = (87u8..90).map(|b| SigningKey::from_bytes((&[b; 32]).into()).unwrap()).collect();
+        for (i, sk) in keys.iter().enumerate() {
+            let p = make_proof_with_time(&format!("prf-oob-{}", i), "hash-oob", (i as u64 + 1) * 1000, sk);
+            submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p })).await.expect("submit");
+        }
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest { offset: 100, ..Default::default() }),
+        ).await.expect("list").0;
+        assert_eq!(resp.total_count, 3, "total_count must equal full list");
+        assert_eq!(resp.returned_count, 0, "no proofs when offset > total");
+        assert!(!resp.has_more, "empty page, nothing more");
+        assert!(resp.proofs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_pagination_limit_larger_than_list() {
+        // limit larger than total proofs must return all proofs without error.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let keys: Vec<_> = (90u8..93).map(|b| SigningKey::from_bytes((&[b; 32]).into()).unwrap()).collect();
+        for (i, sk) in keys.iter().enumerate() {
+            let p = make_proof_with_time(&format!("prf-big-{}", i), "hash-big", (i as u64 + 1) * 1000, sk);
+            submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p })).await.expect("submit");
+        }
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest { limit: Some(999), ..Default::default() }),
+        ).await.expect("list").0;
+        assert_eq!(resp.total_count, 3);
+        assert_eq!(resp.returned_count, 3, "limit > total must return all proofs");
+        assert!(!resp.has_more, "all proofs returned, nothing more");
+        assert_eq!(resp.proofs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_pagination_with_active_only() {
+        // active_only filter applies before pagination; total_count reflects post-filter count.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk1 = SigningKey::from_bytes((&[93u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[94u8; 32]).into()).unwrap();
+        let sk3 = SigningKey::from_bytes((&[95u8; 32]).into()).unwrap();
+        let sk4 = SigningKey::from_bytes((&[96u8; 32]).into()).unwrap();
+        let p1 = make_proof_with_time("prf-aop-1", "hash-aop", 1_000, &sk1); // active
+        let mut p2 = make_proof_with_time("prf-aop-2", "hash-aop", 2_000, &sk2);
+        p2.expires_at_height = Some(0); // expired
+        let p3 = make_proof_with_time("prf-aop-3", "hash-aop", 3_000, &sk3); // active
+        let p4 = make_proof_with_time("prf-aop-4", "hash-aop", 4_000, &sk4); // active
+        for p in [p1, p2, p3, p4] {
+            submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p })).await.expect("submit");
+        }
+        // active_only=true leaves 3; limit=2 must page those 3
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest { active_only: true, limit: Some(2), ..Default::default() }),
+        ).await.expect("list").0;
+        assert_eq!(resp.total_count, 3, "total_count must be post-filter pre-pagination");
+        assert_eq!(resp.returned_count, 2, "limit=2 must cap page");
+        assert!(resp.has_more, "3 active proofs paged at 2, one remains");
+        assert_eq!(resp.proofs[0].proof.attestation_time, 1_000);
+        assert_eq!(resp.proofs[1].proof.attestation_time, 3_000);
+        assert_eq!(resp.proofs[0].status, "active");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_pagination_with_agreement_hash() {
+        // agreement_hash scoping applies before pagination.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let keys: Vec<_> = (97u8..103).map(|b| SigningKey::from_bytes((&[b; 32]).into()).unwrap()).collect();
+        // 4 proofs for hash-pg-a, 2 for hash-pg-b
+        for (i, sk) in keys[..4].iter().enumerate() {
+            let p = make_proof_with_time(&format!("prf-pga-{}", i), "hash-pg-a", (i as u64 + 1) * 1000, sk);
+            submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p })).await.expect("submit");
+        }
+        for (i, sk) in keys[4..].iter().enumerate() {
+            let p = make_proof_with_time(&format!("prf-pgb-{}", i), "hash-pg-b", (i as u64 + 1) * 1000, sk);
+            submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p })).await.expect("submit");
+        }
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest {
+                agreement_hash: Some("hash-pg-a".to_string()),
+                offset: 1,
+                limit: Some(2),
+                ..Default::default()
+            }),
+        ).await.expect("list").0;
+        assert_eq!(resp.total_count, 4, "scoped to hash-pg-a only");
+        assert_eq!(resp.returned_count, 2);
+        assert!(resp.has_more, "4 scoped proofs, offset=1+returned=2, one more at index 3");
+        assert_eq!(resp.proofs[0].proof.attestation_time, 2_000, "offset=1 skips first");
+        assert_eq!(resp.proofs[1].proof.attestation_time, 3_000);
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_has_more_false_on_last_page() {
+        // Last page: offset + returned_count == total_count => has_more false.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let keys: Vec<_> = (103u8..107).map(|b| SigningKey::from_bytes((&[b; 32]).into()).unwrap()).collect();
+        for (i, sk) in keys.iter().enumerate() {
+            let p = make_proof_with_time(&format!("prf-lp-{}", i), "hash-lp", (i as u64 + 1) * 1000, sk);
+            submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p })).await.expect("submit");
+        }
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest { offset: 2, limit: Some(2), ..Default::default() }),
+        ).await.expect("list").0;
+        assert_eq!(resp.total_count, 4);
+        assert_eq!(resp.returned_count, 2);
+        assert!(!resp.has_more, "offset(2)+returned(2)==total(4), last page");
+    }
+
+    #[tokio::test]
+    async fn list_proofs_rpc_has_more_false_no_limit_full_result() {
+        // No limit: all proofs returned => has_more always false.
+        let (state, _, _, _) = create_test_state(Some(0));
+        let keys: Vec<_> = (107u8..110).map(|b| SigningKey::from_bytes((&[b; 32]).into()).unwrap()).collect();
+        for (i, sk) in keys.iter().enumerate() {
+            let p = make_proof_with_time(&format!("prf-nolim-{}", i), "hash-nolim", (i as u64 + 1) * 1000, sk);
+            submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p })).await.expect("submit");
+        }
+        let resp = list_proofs_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest { ..Default::default() }),
+        ).await.expect("list").0;
+        assert_eq!(resp.total_count, 3);
+        assert_eq!(resp.returned_count, 3);
+        assert!(!resp.has_more, "no limit means all results returned");
+    }
+
+    // ---- Integration audit tests ----
+    // These tests exercise multiple surfaces in sequence to validate
+    // cross-surface invariants across the full Phase 2 proof-automation stack.
+
+    #[tokio::test]
+    async fn integration_submit_list_get_evaluate_full_flow() {
+        // Full 4-step chain: submit -> listproofs -> getproof -> evaluatepolicy.
+        // Verifies every surface returns consistent data for the same proof.
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+
+        // 1. Submit proof
+        let proof = make_rpc_proof(&agreement_hash, &sk);
+        let proof_id = proof.proof_id.clone();
+        let sub = submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof })).await.expect("submit").0;
+        assert!(sub.accepted, "proof must be accepted");
+        assert_eq!(sub.status, "active", "fresh proof must be active");
+        assert!(!sub.expired);
+
+        // 2. listproofs - verify proof appears with consistent lifecycle data
+        let list = list_proofs_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(ListProofsRequest {
+                agreement_hash: Some(agreement_hash.clone()),
+                active_only: false,
+                ..Default::default()
+            })).await.expect("list").0;
+        assert_eq!(list.returned_count, 1);
+        assert_eq!(list.total_count, 1);
+        assert!(!list.has_more, "single proof, no pagination, must not have more");
+        assert_eq!(list.proofs[0].proof.proof_id, proof_id);
+        assert_eq!(list.proofs[0].status, sub.status, "list status must match submit status");
+        assert_eq!(list.proofs[0].status, "active");
+
+        // 3. getproof - verify individual retrieval is consistent with list
+        let get = get_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(GetProofRequest { proof_id: proof_id.clone() })).await.expect("get").0;
+        assert!(get.found, "submitted proof must be found by proof_id");
+        assert_eq!(get.status, sub.status, "getproof status must match submit status");
+        assert_eq!(get.status, list.proofs[0].status, "getproof status must match listproofs status");
+        assert_eq!(get.expired, sub.expired, "getproof expired must match submit expired");
+        assert!(get.proof.is_some(), "proof body must be present");
+        assert_eq!(get.proof.unwrap().proof_id, proof_id);
+
+        // 4. evaluatepolicy - store policy and evaluate; must reflect proof as matched
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let eval = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(eval.outcome, PolicyOutcome::Satisfied);
+        assert!(eval.release_eligible);
+        assert!(!eval.refund_eligible);
+        assert_eq!(eval.proof_count, 1, "active proof must be counted");
+        assert_eq!(eval.expired_proof_count, 0);
+        assert_eq!(eval.matched_proof_count, 1);
+        assert_eq!(eval.matched_proof_ids, vec![proof_id],
+            "matched_proof_ids must contain the same proof_id seen in list/get");
+    }
+
+    #[tokio::test]
+    async fn integration_expired_proof_visible_in_get_excluded_from_evaluate() {
+        // Invariant: a proof that getproof reports as expired must be excluded from
+        // evaluatepolicy's active proof set (proof_count=0, expired_proof_count=1).
+        // listproofs active_only=true must also return zero proofs for the same agreement.
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+
+        // Submit proof expired at tip=0 (expires_at_height=0, tip_height()=0)
+        let mut rpc_proof = make_rpc_proof(&agreement_hash, &sk);
+        rpc_proof.expires_at_height = Some(0);
+        let proof_id = rpc_proof.proof_id.clone();
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof: rpc_proof })).await.expect("submit expired");
+
+        // getproof: expired proof must be findable but flagged expired
+        let get = get_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(GetProofRequest { proof_id: proof_id.clone() })).await.expect("get").0;
+        assert!(get.found, "expired proof must still be findable via getproof");
+        assert_eq!(get.status, "expired", "getproof must report status=expired");
+        assert!(get.expired, "getproof expired bool must be true");
+
+        // listproofs active_only=false: proof appears with status=expired
+        let list_all = list_proofs_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(ListProofsRequest {
+                agreement_hash: Some(agreement_hash.clone()),
+                active_only: false,
+                ..Default::default()
+            })).await.expect("list all").0;
+        assert_eq!(list_all.returned_count, 1, "expired proof must appear in full list");
+        assert_eq!(list_all.proofs[0].status, "expired");
+        assert_eq!(list_all.proofs[0].status, get.status,
+            "listproofs and getproof must agree on status");
+
+        // listproofs active_only=true: expired proof must be excluded
+        let list_active = list_proofs_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(ListProofsRequest {
+                agreement_hash: Some(agreement_hash.clone()),
+                active_only: true,
+                ..Default::default()
+            })).await.expect("list active").0;
+        assert_eq!(list_active.returned_count, 0, "active_only must exclude expired proof");
+        assert_eq!(list_active.total_count, 0);
+        assert!(!list_active.has_more);
+
+        // evaluatepolicy: same exclusion must apply — proof_count=0
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
+        let eval = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(eval.proof_count, 0,
+            "evaluatepolicy must apply the same expiry exclusion as active_only; got {}", eval.proof_count);
+        assert_eq!(eval.expired_proof_count, 1,
+            "expired proof must be counted in expired_proof_count");
+        assert_eq!(eval.outcome, PolicyOutcome::Unsatisfied);
+        assert!(!eval.release_eligible);
+    }
+
+    #[tokio::test]
+    async fn integration_outcome_invariant_coherence() {
+        // Invariant audit: outcome field must be coherent with release_eligible and refund_eligible.
+        // satisfied  -> release_eligible=true,  refund_eligible=false
+        // unsatisfied -> release_eligible=false, refund_eligible=false
+        // timeout    -> refund_eligible=true (when rule resolution=Refund), release_eligible=false
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+
+        // Case A: satisfied
+        {
+            let (state, sender, recipient, _) = create_test_state(Some(0));
+            let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+            let bytes = agreement_canonical_bytes(&agreement).unwrap();
+            let agreement_hash = hex::encode(Sha256::digest(&bytes));
+            let sk = rpc_signing_key();
+            let pubkey_hex = rpc_pubkey_hex(&sk);
+            let proof = make_rpc_proof(&agreement_hash, &sk);
+            submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof })).await.expect("submit");
+            store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(StorePolicyRequest { policy: make_rpc_policy(&agreement_hash, &pubkey_hex), replace: false }))
+                .await.expect("store");
+            let eval = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+                Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+            assert_eq!(eval.outcome, PolicyOutcome::Satisfied, "case A: satisfied");
+            assert!(eval.release_eligible, "satisfied must imply release_eligible");
+            assert!(!eval.refund_eligible, "satisfied must not imply refund_eligible");
+        }
+
+        // Case B: unsatisfied (no proofs)
+        {
+            let (state, sender, recipient, _) = create_test_state(Some(0));
+            let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+            let bytes = agreement_canonical_bytes(&agreement).unwrap();
+            let agreement_hash = hex::encode(Sha256::digest(&bytes));
+            let sk = rpc_signing_key();
+            let pubkey_hex = rpc_pubkey_hex(&sk);
+            store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(StorePolicyRequest { policy: make_rpc_policy(&agreement_hash, &pubkey_hex), replace: false }))
+                .await.expect("store");
+            let eval = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+                Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+            assert_eq!(eval.outcome, PolicyOutcome::Unsatisfied, "case B: unsatisfied");
+            assert!(!eval.release_eligible, "unsatisfied must not imply release_eligible");
+            assert!(!eval.refund_eligible, "unsatisfied must not imply refund_eligible");
+        }
+
+        // Case C: timeout via no-response rule
+        {
+            let (state, sender, recipient, _) = create_test_state(Some(0));
+            let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+            let bytes = agreement_canonical_bytes(&agreement).unwrap();
+            let agreement_hash = hex::encode(Sha256::digest(&bytes));
+            let sk = rpc_signing_key();
+            let pubkey_hex = rpc_pubkey_hex(&sk);
+            let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+            policy.no_response_rules.push(NoResponseRule {
+                rule_id: "rule-inv-c".to_string(),
+                deadline_height: 10,
+                trigger: NoResponseTrigger::FundedAndNoRelease,
+                resolution: ProofResolution::Refund,
+                milestone_id: None,
+                notes: None,
+            });
+            store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(StorePolicyRequest { policy, replace: false })).await.expect("store");
+            // tip_height() = chain.height - 1; set height=11 so tip=10 >= deadline 10
+            { let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner()); chain.height = 11; }
+            let eval = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+                Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+            assert_eq!(eval.outcome, PolicyOutcome::Timeout, "case C: timeout");
+            assert!(eval.refund_eligible, "timeout (refund resolution) must imply refund_eligible");
+            assert!(!eval.release_eligible, "timeout must not imply release_eligible when resolution=Refund");
+        }
+    }
+
+    #[tokio::test]
+    async fn integration_active_only_pagination_two_page_traversal() {
+        // 5 proofs: 3 active, 2 expired.
+        // Page 1: active_only=true, limit=2 -> returned=2, has_more=true.
+        // Page 2: active_only=true, limit=2, offset=2 -> returned=1, has_more=false.
+        // Ordering must be preserved across both pages (attestation_time ascending).
+        let (state, _, _, _) = create_test_state(Some(0));
+        let sk1 = SigningKey::from_bytes((&[110u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[111u8; 32]).into()).unwrap();
+        let sk3 = SigningKey::from_bytes((&[112u8; 32]).into()).unwrap();
+        let sk4 = SigningKey::from_bytes((&[113u8; 32]).into()).unwrap();
+        let sk5 = SigningKey::from_bytes((&[114u8; 32]).into()).unwrap();
+        // Times: 1000(active), 2000(expired), 3000(active), 4000(expired), 5000(active)
+        let p1 = make_proof_with_time("prf-tt-1", "hash-tt", 1_000, &sk1);
+        let mut p2 = make_proof_with_time("prf-tt-2", "hash-tt", 2_000, &sk2);
+        p2.expires_at_height = Some(0);
+        let p3 = make_proof_with_time("prf-tt-3", "hash-tt", 3_000, &sk3);
+        let mut p4 = make_proof_with_time("prf-tt-4", "hash-tt", 4_000, &sk4);
+        p4.expires_at_height = Some(0);
+        let p5 = make_proof_with_time("prf-tt-5", "hash-tt", 5_000, &sk5);
+        for p in [p1, p2, p3, p4, p5] {
+            submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(SubmitProofRequest { proof: p })).await.expect("submit");
+        }
+
+        // Page 1
+        let page1 = list_proofs_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(ListProofsRequest {
+                agreement_hash: Some("hash-tt".to_string()),
+                active_only: true, limit: Some(2), offset: 0,
+                ..Default::default()
+            })).await.expect("list page1").0;
+        assert_eq!(page1.total_count, 3, "3 active proofs after expiry filter");
+        assert_eq!(page1.returned_count, 2);
+        assert!(page1.has_more, "1 more active proof on page 2");
+        assert_eq!(page1.proofs[0].proof.attestation_time, 1_000, "page1[0] must be oldest active");
+        assert_eq!(page1.proofs[1].proof.attestation_time, 3_000, "page1[1] must skip expired at 2000");
+        assert_eq!(page1.proofs[0].status, "active");
+        assert_eq!(page1.proofs[1].status, "active");
+
+        // Page 2
+        let page2 = list_proofs_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(ListProofsRequest {
+                agreement_hash: Some("hash-tt".to_string()),
+                active_only: true, limit: Some(2), offset: 2,
+                ..Default::default()
+            })).await.expect("list page2").0;
+        assert_eq!(page2.total_count, 3, "total_count must be same as page1");
+        assert_eq!(page2.returned_count, 1, "only 1 active proof remains at offset=2");
+        assert!(!page2.has_more, "last page must have has_more=false");
+        assert_eq!(page2.proofs[0].proof.attestation_time, 5_000, "page2 must contain the last active proof");
+        assert_eq!(page2.proofs[0].status, "active");
+    }
+
+    #[tokio::test]
+    async fn integration_evaluate_active_count_matches_listproofs_active_only() {
+        // Cross-surface invariant: evaluatepolicy.proof_count must equal the
+        // total_count returned by listproofs with active_only=true for the same agreement.
+        // Both surfaces must apply the same expiry rule.
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+
+        // Submit 2 active + 2 expired proofs for this agreement
+        let sk2 = SigningKey::from_bytes((&[115u8; 32]).into()).unwrap();
+        let sk3 = SigningKey::from_bytes((&[116u8; 32]).into()).unwrap();
+        let sk4 = SigningKey::from_bytes((&[117u8; 32]).into()).unwrap();
+        let active1 = make_rpc_proof(&agreement_hash, &sk);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof: active1 })).await.expect("submit active1");
+        let mut expired1 = make_proof_with_time("prf-cross-exp1", &agreement_hash, 2_000, &sk2);
+        expired1.expires_at_height = Some(0);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof: expired1 })).await.expect("submit expired1");
+        let mut expired2 = make_proof_with_time("prf-cross-exp2", &agreement_hash, 3_000, &sk3);
+        expired2.expires_at_height = Some(0);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof: expired2 })).await.expect("submit expired2");
+        let active2 = make_proof_with_time("prf-cross-act2", &agreement_hash, 4_000, &sk4);
+        submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(SubmitProofRequest { proof: active2 })).await.expect("submit active2");
+
+        // listproofs active_only=true: should return total_count=1
+        // (only the rpc-proof is active AND matches the rpc-attestor policy requirement)
+        // For the count check we use the raw active filter regardless of policy matching:
+        let list_active = list_proofs_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(ListProofsRequest {
+                agreement_hash: Some(agreement_hash.clone()),
+                active_only: true,
+                ..Default::default()
+            })).await.expect("list active").0;
+        // active1 (rpc-proof, no expiry) + active2 (prf-cross-act2, no expiry) = 2 active
+        assert_eq!(list_active.total_count, 2, "2 active proofs expected");
+
+        // evaluatepolicy: proof_count must equal listproofs active total_count
+        store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+            Json(StorePolicyRequest { policy: make_rpc_policy(&agreement_hash, &pubkey_hex), replace: false }))
+            .await.expect("store");
+        let eval = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+        assert_eq!(eval.proof_count, list_active.total_count,
+            "evaluatepolicy proof_count must equal listproofs active_only total_count: expected {} got {}",
+            list_active.total_count, eval.proof_count);
+        assert_eq!(eval.expired_proof_count, 2, "2 expired proofs must be noted");
+    }
+
+    #[tokio::test]
+    async fn integration_deadline_at_exact_boundary_height() {
+        // Boundary audit: a no-response rule fires exactly at deadline_height.
+        // tip_height() == deadline_height must trigger Timeout (>= is the check).
+        // tip_height() == deadline_height - 1 must NOT trigger (remain Unsatisfied).
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+
+        let deadline = 25u64;
+
+        // Sub-case 1: tip_height exactly at deadline -> Timeout
+        {
+            let (state, sender, recipient, _) = create_test_state(Some(0));
+            let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+            let bytes = agreement_canonical_bytes(&agreement).unwrap();
+            let agreement_hash = hex::encode(Sha256::digest(&bytes));
+            let sk = rpc_signing_key();
+            let pubkey_hex = rpc_pubkey_hex(&sk);
+            let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+            policy.no_response_rules.push(NoResponseRule {
+                rule_id: "rule-bnd-at".to_string(),
+                deadline_height: deadline,
+                trigger: NoResponseTrigger::FundedAndNoRelease,
+                resolution: ProofResolution::Refund,
+                milestone_id: None,
+                notes: None,
+            });
+            store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(StorePolicyRequest { policy, replace: false })).await.expect("store");
+            // tip_height() = chain.height - 1; set height = deadline + 1 so tip == deadline
+            { let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner()); chain.height = deadline + 1; }
+            let eval = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+                Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+            assert_eq!(eval.outcome, PolicyOutcome::Timeout,
+                "tip_height==deadline must trigger Timeout; reason: {}", eval.reason);
+        }
+
+        // Sub-case 2: tip_height one before deadline -> Unsatisfied
+        {
+            let (state, sender, recipient, _) = create_test_state(Some(0));
+            let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+            let bytes = agreement_canonical_bytes(&agreement).unwrap();
+            let agreement_hash = hex::encode(Sha256::digest(&bytes));
+            let sk = rpc_signing_key();
+            let pubkey_hex = rpc_pubkey_hex(&sk);
+            let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+            policy.no_response_rules.push(NoResponseRule {
+                rule_id: "rule-bnd-before".to_string(),
+                deadline_height: deadline,
+                trigger: NoResponseTrigger::FundedAndNoRelease,
+                resolution: ProofResolution::Refund,
+                milestone_id: None,
+                notes: None,
+            });
+            store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
+                Json(StorePolicyRequest { policy, replace: false })).await.expect("store");
+            // tip_height() = deadline - 1 (one before): height = deadline (height-1 = deadline-1)
+            { let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner()); chain.height = deadline; }
+            let eval = evaluate_policy_rpc(ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+                Json(EvaluatePolicyRequest { agreement })).await.expect("evaluate").0;
+            assert_eq!(eval.outcome, PolicyOutcome::Unsatisfied,
+                "tip_height==deadline-1 must NOT trigger; got: {}", eval.reason);
+            assert!(!eval.refund_eligible);
+        }
     }
 
 }

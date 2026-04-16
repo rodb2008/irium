@@ -175,6 +175,10 @@ Authorization: Bearer <token>
   "agreement_hash": "<64-char hex>",
   "policy_id": "pol-001",
   "tip_height": 1500,
+  "proof_count": 1,
+  "expired_proof_count": 0,
+  "matched_proof_count": 1,
+  "matched_proof_ids": ["prf-001"],
   "release_eligible": true,
   "refund_eligible": false,
   "reason": "all release requirements satisfied by verified proofs",
@@ -186,7 +190,13 @@ Authorization: Bearer <token>
 
 - `agreement_hash`: SHA-256 of the canonical agreement, computed by the node.
 - `tip_height`: chain tip height at the moment of evaluation.
+- `proof_count`: active (non-expired) proofs considered for evaluation.
+- `expired_proof_count`: proofs filtered out as expired before evaluation.
+- `matched_proof_count`: proofs that passed signature verification and matched
+  the policy attestor list.
+- `matched_proof_ids`: IDs of those matched proofs.
 - `release_eligible` / `refund_eligible`: at most one will be true per response.
+- `outcome`: deterministic classification — `satisfied`, `timeout`, or `unsatisfied`. Shown by `agreement-policy-evaluate` immediately after `tip_height`.
 - `reason`: human-readable explanation of the outcome.
 - `evaluated_rules`: ordered list of strings describing each step taken, including
   verified proofs, rejected proofs, and triggered or pending deadline rules.
@@ -307,7 +317,8 @@ Authorization: Bearer <token>
   "message": "proof accepted",
   "tip_height": 1042,
   "expires_at_height": 2000,
-  "expired": false
+  "expired": false,
+  "status": "active"
 }
 ```
 
@@ -317,6 +328,7 @@ Authorization: Bearer <token>
 - `tip_height`: chain tip height at the moment the proof was submitted.
 - `expires_at_height`: value of `expires_at_height` from the submitted proof, or `null` if the proof has no expiry.
 - `expired`: `true` when `tip_height >= expires_at_height` at submit time; always `false` when `expires_at_height` is `null`. Expiry does **not** affect acceptance — an expired proof is still stored.
+- `status`: `"active"` or `"expired"`. Consistent with per-proof `status` in `/rpc/listproofs`. Derived from `expired`: if `expired` is true then `status` is `"expired"`, otherwise `"active"`.
 
 ### Error responses
 
@@ -336,9 +348,9 @@ Authorization: Bearer <token>
 
 ---
 
-## POST /rpc/listproofs
+## POST /rpc/getproof
 
-Returns all stored proofs for a given agreement hash.
+Retrieves a single settlement proof by its `proof_id`.
 
 ### Authentication
 
@@ -348,7 +360,76 @@ Requires `Authorization: Bearer <IRIUM_RPC_TOKEN>`. Rate-limited.
 
 ```json
 {
-  "agreement_hash": "<64-char hex>"
+  "proof_id": "prf-001"
+}
+```
+
+### Response (200 OK)
+
+```json
+{
+  "proof_id": "prf-001",
+  "found": true,
+  "tip_height": 19200,
+  "proof": { "proof_id": "prf-001", "agreement_hash": "...", "expires_at_height": null, "..." : "..." },
+  "expires_at_height": null,
+  "expired": false,
+  "status": "active"
+}
+```
+
+When not found:
+
+```json
+{
+  "proof_id": "prf-unknown",
+  "found": false,
+  "tip_height": 19200,
+  "proof": null,
+  "expires_at_height": null,
+  "expired": false,
+  "status": ""
+}
+```
+
+### Fields
+
+- `found`: `true` if the proof exists in the store; `false` if not found.
+- `proof`: full `SettlementProof` object when `found=true`; `null` otherwise.
+- `tip_height`: chain tip height at query time.
+- `expires_at_height`: echoed from the proof; `null` if no expiry or `found=false`.
+- `expired`: `true` when `tip_height >= expires_at_height`; always `false` when `expires_at_height` is null or `found=false`.
+- `status`: `"active"` or `"expired"` when `found=true`, consistent with per-proof `status` in `/rpc/listproofs`. Empty string when `found=false`.
+- Invariant: `(status == "expired") == expired` always holds.
+
+### Error responses
+
+- `401 Unauthorized` — missing or invalid RPC token.
+- `429 Too Many Requests` — rate limit exceeded.
+- Not found is signalled by `found: false` in the response body (not a 404).
+
+---
+
+## POST /rpc/listproofs
+
+Returns all stored proofs for a given agreement hash.
+
+**Ordering guarantee:** Proofs are always returned sorted by `attestation_time` ascending,
+with `proof_id` ascending as a stable tie-breaker. This rule applies to global queries
+(`agreement_hash` omitted), agreement-scoped queries, and `active_only` filtered queries.
+
+### Authentication
+
+Requires `Authorization: Bearer <IRIUM_RPC_TOKEN>`. Rate-limited.
+
+### Request
+
+```json
+{
+  "agreement_hash": "<64-char hex>",
+  "active_only": false,
+  "offset": 0,
+  "limit": 50
 }
 ```
 
@@ -357,15 +438,38 @@ Requires `Authorization: Bearer <IRIUM_RPC_TOKEN>`. Rate-limited.
 ```json
 {
   "agreement_hash": "<64-char hex>",
-  "count": 1,
+  "tip_height": 19200,
+  "active_only": false,
+  "total_count": 25,
+  "returned_count": 5,
+  "has_more": true,
+  "offset": 10,
+  "limit": 5,
   "proofs": [
-    { ... }
+    { "proof_id": "prf-011", "expires_at_height": null, "status": "active", "..." : "..." }
   ]
 }
 ```
 
-- `proofs`: array of `SettlementProof` objects sorted by `proof_id`.
-- Returns an empty array if no proofs are stored for the given hash.
+- `tip_height`: chain tip height at query time.
+- `active_only`: echoes the request filter.
+- `total_count`: total proofs matching all filters before pagination. Equals `returned_count`
+  when no pagination is applied.
+- `returned_count`: number of proofs returned in this page. Always equals `proofs.len()`.
+- `has_more`: `true` when more proofs remain after this page
+  (`total_count > offset + returned_count`); `false` on the last page or when all results
+  fit in one page. Clients should use this field to drive cursor-style pagination.
+- `offset`: echoed from the request (0 when omitted).
+- `limit`: echoed from the request (`null` when omitted).
+- `proofs`: array of proof objects sorted **by `attestation_time` ascending, then `proof_id`
+  ascending** as a stable tie-breaker. This order is consistent across global queries,
+  agreement-scoped queries, and `active_only` filtered queries. Each proof includes:
+  - All `SettlementProof` fields.
+  - `status`: `"active"` if the proof is not expired at `tip_height`; `"expired"` if `tip_height >= expires_at_height`.
+- Returns an empty `proofs` array and `returned_count: 0` if offset exceeds available proofs.
+  `has_more` will be `false` in this case.
+- `limit` and `offset` are optional. When omitted, all matching proofs are returned from offset 0
+  and `has_more` will always be `false`.
 
 ---
 
@@ -397,16 +501,62 @@ message proof accepted
 tip_height 1042
 expires_at_height 2000
 expired false
+status active
 ```
 
 `expires_at_height` is shown as `none` when the proof carries no expiry. `expired` reflects
 whether `tip_height >= expires_at_height` at submit time; an expired proof is still accepted
-for storage.
+for storage. `status` shows `active` or `expired` and is consistent with the `status` field
+in `agreement-proof-list` output. `status` is omitted if the node does not return it (older nodes).
 
 ### Exit codes
 
 - `0`: proof was accepted or duplicate.
 - `1`: proof was rejected, RPC call failed, or input parsing failed.
+
+---
+
+## irium-wallet agreement-proof-get
+
+Retrieves a single settlement proof by `proof_id` from the node.
+
+```
+irium-wallet agreement-proof-get \n  --proof-id <id> \n  [--rpc <url>] \n  [--json]
+```
+
+### Arguments
+
+| Flag | Required | Description |
+|---|---|---|
+| `--proof-id <id>` | yes | The `proof_id` of the proof to retrieve |
+| `--rpc <url>` | no | Node RPC base URL |
+| `--json` | no | Output raw JSON response |
+
+### Default output (found)
+
+```
+proof_id prf-001
+found true
+tip_height 19200
+agreement_hash <64-char hex>
+proof_type delivery_confirmation
+attested_by attestor-a
+expires_at_height none
+expired false
+status active
+```
+
+### Default output (not found)
+
+```
+proof_id prf-unknown
+not_found true
+```
+
+### Exit codes
+
+- `0`: proof was found.
+- `1`: proof not found, RPC call failed, or input parsing failed.
 
 ---
 
@@ -439,7 +589,7 @@ irium-wallet agreement-proof-list \
 ```
 agreement_hash <64-char hex>
 count 1
-  agreement_hash=<64-char hex> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation expires_at_height=none
+  agreement_hash=<64-char hex> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation expires_at_height=none status=active
 ```
 
 ### Default output (global — no filter)
@@ -447,9 +597,9 @@ count 1
 ```
 agreement_hash * (all)
 count 3
-  agreement_hash=<hex-a> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation expires_at_height=none
-  agreement_hash=<hex-b> proof_id=prf-002 attested_by=attestor-b proof_type=payment expires_at_height=5000 expired=false
-  agreement_hash=<hex-c> proof_id=prf-003 attested_by=attestor-c proof_type=milestone expires_at_height=100 expired=true
+  agreement_hash=<hex-a> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation expires_at_height=none status=active
+  agreement_hash=<hex-b> proof_id=prf-002 attested_by=attestor-b proof_type=payment expires_at_height=5000 expired=false status=active
+  agreement_hash=<hex-c> proof_id=prf-003 attested_by=attestor-c proof_type=milestone expires_at_height=100 expired=true status=expired
 ```
 
 ### With `--active-only`
@@ -667,9 +817,10 @@ A stored proof may carry an optional `expires_at_height` field (a `u64` block he
   `evaluated_rules` with the message `"proof '<id>' skipped: expired at height <H> (tip <T)"`.
 - `/rpc/checkpolicy` (manual check) does **not** enforce proof expiry; the caller supplies
   proofs directly and is responsible for filtering.
-- `/rpc/listproofs` includes `expires_at_height` per proof and a top-level `tip_height` so
-  clients can compute `expired = tip_height >= proof.expires_at_height`.
-- The `irium-wallet agreement-proof-list` output shows `expires_at_height=<N> expired=<bool>`
+- `/rpc/listproofs` includes `expires_at_height` per proof and a top-level `tip_height`.
+  Each proof entry also carries a derived `status` field: `"active"` when not expired,
+  `"expired"` when `tip_height >= expires_at_height`.
+- The `irium-wallet agreement-proof-list` output shows `expires_at_height=<N> expired=<bool> status=<active|expired>`
   (or `expires_at_height=none`) per proof line.
 
 Pass `--expires-at-height <n>` to `agreement-proof-create` to set the expiry height when
@@ -755,6 +906,8 @@ policy_id pol-<id>
 policy_found true
 tip_height <n>
 proof_count <n>
+matched_proof_count <n>
+matched_proof_ids <id1>, <id2>
 release_eligible true
 refund_eligible false
 reason all release requirements satisfied by verified proofs
@@ -784,11 +937,16 @@ Exits with code `1` when neither `release_eligible` nor `refund_eligible` is tru
 Response:
 ```json
 {
+  "outcome": "satisfied",
   "agreement_hash": "<hex>",
   "policy_found": true,
   "policy_id": "<id>",
   "tip_height": <n>,
   "proof_count": <n>,
+  "expired_proof_count": <n>,
+  "matched_proof_count": <n>,
+  "matched_proof_ids": ["<id>"],
+  "expired": false,
   "release_eligible": true,
   "refund_eligible": false,
   "reason": "<string>",
@@ -796,6 +954,40 @@ Response:
 }
 ```
 `policy_id` is `null` when no policy is stored.
+
+#### `outcome` field
+
+The `outcome` field provides a single deterministic classification of each evaluation.
+It is objective — derived purely from proof signatures, policy rules, and `tip_height`.
+
+| Value | Meaning |
+|---|---|
+| `"satisfied"` | All required proofs are present and signature-verified. `release_eligible` will be `true`. |
+| `"timeout"` | A `no_response_rule` deadline or a refund `required_by` deadline has elapsed before release was achieved. Proofs are missing or insufficient. |
+| `"unsatisfied"` | Neither condition is met — proofs are missing, expired, or signature-invalid, and no deadline has elapsed. |
+
+**Rules:**
+- `"satisfied"` is returned in Step 2 of evaluation, before any deadline check. If proofs satisfy release, no-response rules are suppressed entirely.
+- `"timeout"` fires when either a `no_response_rule.deadline_height` is reached (Step 3) or a refund requirement's `required_by` deadline is reached (Step 4).
+- `"unsatisfied"` is the fallthrough when no condition has triggered (Step 5).
+- A policy with no stored policy returns `"unsatisfied"` (`policy_found: false`).
+- An expired policy returns `"unsatisfied"` (`expired: true`).
+
+**Examples:**
+
+```json
+// Proof submitted and verified:
+{ "outcome": "satisfied", "release_eligible": true, "refund_eligible": false }
+
+// No-response deadline elapsed, no proof submitted:
+{ "outcome": "timeout", "release_eligible": false, "refund_eligible": true }
+
+// No proof submitted, no deadline elapsed:
+{ "outcome": "unsatisfied", "release_eligible": false, "refund_eligible": false }
+
+// Only expired proofs remain (active proof_count = 0), no deadline:
+{ "outcome": "unsatisfied", "proof_count": 0, "expired_proof_count": 1 }
+```
 
 ### Relationship to agreement-policy-check
 
