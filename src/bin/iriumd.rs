@@ -59,6 +59,7 @@ use irium_node_rs::settlement::{
     evaluate_policy,
     HoldbackEvaluationResult,
     MilestoneEvaluationResult,
+    RequirementThresholdResult,
     PolicyOutcome,
     ProofPolicy,
     SettlementProof,
@@ -814,6 +815,8 @@ struct EvaluatePolicyResponse {
     total_milestone_count: usize,
     /// Top-level holdback result; None when no holdback configured or milestone path used.
     holdback: Option<HoldbackEvaluationResult>,
+    /// Threshold results for requirements with explicit threshold set; empty otherwise.
+    threshold_results: Vec<RequirementThresholdResult>,
 }
 
 #[derive(Deserialize)]
@@ -5384,6 +5387,7 @@ async fn evaluate_policy_rpc(
                 completed_milestone_count: 0,
                 total_milestone_count: 0,
                 holdback: None,
+                threshold_results: vec![],
             }));
         }
         Some(p) => p,
@@ -5438,6 +5442,7 @@ async fn evaluate_policy_rpc(
                 completed_milestone_count: 0,
                 total_milestone_count: 0,
                 holdback: None,
+                threshold_results: vec![],
             }));
         }
     }
@@ -5452,6 +5457,7 @@ async fn evaluate_policy_rpc(
     let total_milestone_count = result.total_milestone_count;
     let milestone_results = result.milestone_results;
     let holdback = result.holdback;
+    let threshold_results = result.threshold_results;
     Ok(Json(EvaluatePolicyResponse {
         outcome: result.outcome,
         agreement_hash,
@@ -5471,6 +5477,7 @@ async fn evaluate_policy_rpc(
         completed_milestone_count,
         total_milestone_count,
         holdback,
+        threshold_results,
     }))
 }
 
@@ -8316,6 +8323,7 @@ mod tests {
                 required_attestor_ids: vec!["rpc-attestor".to_string()],
                 resolution: ProofResolution::Release,
                 milestone_id: None,
+                threshold: None,
             }],
             no_response_rules: vec![],
             attestors: vec![ApprovedAttestor {
@@ -9355,6 +9363,7 @@ mod tests {
             required_attestor_ids: vec!["rpc-attestor".to_string()],
             resolution: ProofResolution::Refund,
             milestone_id: None,
+            threshold: None,
         }];
         store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
             Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
@@ -9436,6 +9445,7 @@ mod tests {
                 required_attestor_ids: vec!["rpc-attestor".to_string()],
                 resolution: ProofResolution::MilestoneRelease,
                 milestone_id: Some(id.to_string()),
+                threshold: None,
             })
             .collect();
         ProofPolicy {
@@ -9740,6 +9750,7 @@ mod tests {
                 required_attestor_ids: vec!["rpc-attestor".to_string()],
                 resolution: irium_node_rs::settlement::ProofResolution::Refund,
                 milestone_id: None,
+                threshold: None,
             },
         ];
         store_policy_rpc(

@@ -645,6 +645,20 @@ struct HoldbackRpcResult {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct ThresholdResultRpc {
+    #[serde(default)]
+    requirement_id: String,
+    #[serde(default)]
+    threshold_required: u32,
+    #[serde(default)]
+    approved_attestor_count: usize,
+    #[serde(default)]
+    matched_attestor_ids: Vec<String>,
+    #[serde(default)]
+    threshold_satisfied: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct MilestoneRpcResult {
     #[serde(default)]
     milestone_id: String,
@@ -663,6 +677,8 @@ struct MilestoneRpcResult {
     reason: String,
     #[serde(default)]
     holdback: Option<HoldbackRpcResult>,
+    #[serde(default)]
+    threshold_results: Vec<ThresholdResultRpc>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -712,6 +728,9 @@ struct EvaluatePolicyRpcResponse {
     /// Top-level holdback result; None when no holdback configured or milestone path used.
     #[serde(default)]
     holdback: Option<HoldbackRpcResult>,
+    /// Threshold results for requirements with explicit threshold set; empty otherwise.
+    #[serde(default)]
+    threshold_results: Vec<ThresholdResultRpc>,
 }
 
 #[derive(Debug, Clone)]
@@ -5299,6 +5318,18 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
             lines.push(format!("holdback_reason {}", hb.holdback_reason));
         }
     }
+    if !resp.threshold_results.is_empty() {
+        lines.push("threshold_requirements".to_string());
+        for tr in &resp.threshold_results {
+            lines.push(format!(
+                "  req {} threshold {}/{} {}",
+                tr.requirement_id,
+                tr.approved_attestor_count,
+                tr.threshold_required,
+                if tr.threshold_satisfied { "satisfied" } else { "pending" }
+            ));
+        }
+    }
     lines.join("\n")
 }
 
@@ -9266,6 +9297,7 @@ mod tests {
                     required_attestor_ids: vec!["att-1".to_string()],
                     resolution: ProofResolution::Release,
                     milestone_id: None,
+                    threshold: None,
                 }],
                 no_response_rules: vec![],
                 attestors: vec![ApprovedAttestor {

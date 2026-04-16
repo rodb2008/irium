@@ -61,6 +61,15 @@ A proof policy binds a set of requirements and timeout rules to a specific agree
     }
   ],
   "notes": null,
+  "required_proofs": [
+    {
+      "requirement_id": "req-delivery",
+      "proof_type": "delivery_confirmation",
+      "required_attestor_ids": ["att-1", "att-2"],
+      "resolution": "release",
+      "threshold": 2
+    }
+  ],
   "milestones": [
     { "milestone_id": "ms-delivery", "label": "Delivery confirmation" },
     { "milestone_id": "ms-inspection", "label": "Inspection sign-off" }
@@ -982,13 +991,23 @@ Response:
     "immediate_release_bps": 9000,
     "holdback_outcome": "held",
     "holdback_reason": "<string>"
-  }
+  },
+  "threshold_results": [
+    {
+      "requirement_id": "<id>",
+      "threshold_required": <n>,
+      "approved_attestor_count": <n>,
+      "matched_attestor_ids": ["<id>"],
+      "threshold_satisfied": true
+    }
+  ]
 }
 ```
 `policy_id` is `null` when no policy is stored.
 `milestone_results` is an empty array when no milestones are declared.
 `holdback` is `null` when no holdback is configured; present only when the base
 condition is `satisfied`.
+`threshold_results` is an empty array when no requirements have an explicit `threshold` field.
 
 #### `outcome` field
 
@@ -1042,6 +1061,56 @@ When milestones are declared:
 **Backward compatibility:** policies without a `milestones` array are evaluated
 using the traditional flat-requirements path. `milestone_results` will be `[]` and
 both counts will be `0`.
+
+#### Approved-attestor threshold
+
+A `ProofRequirement` may declare an optional `threshold` field (integer >= 1) requiring
+that at least that many **distinct** approved attestors submit matching verified proofs
+before the requirement is considered satisfied.
+
+| Field | Type | Description |
+|---|---|---|
+| `threshold` | integer\|null | Minimum distinct approved attestors needed. Defaults to 1 (absent = single-attestor). |
+
+**Semantics:**
+- Only attestors in `required_attestor_ids` count toward the threshold.
+- Multiple proofs from the same attestor count as **1** distinct attestor.
+- Expired proofs (filtered at RPC layer) do not count.
+- Unapproved attestors (not in `policy.attestors`) are rejected at signature-verification and do not count.
+- `threshold: null` or absent behaves identically to `threshold: 1`.
+
+**Output:** `threshold_results` array in the evaluate response, one entry per requirement
+with an explicit `threshold`. Empty when no threshold requirements exist.
+
+**Example — 2-of-3 delivery confirmation:**
+
+```json
+{
+  "requirement_id": "req-delivery",
+  "proof_type": "delivery_confirmation",
+  "required_attestor_ids": ["att-1", "att-2", "att-3"],
+  "resolution": "release",
+  "threshold": 2
+}
+```
+
+After att-1 and att-2 each submit a verified proof, the requirement is satisfied.
+The response includes:
+
+```json
+"threshold_results": [{
+  "requirement_id": "req-delivery",
+  "threshold_required": 2,
+  "approved_attestor_count": 2,
+  "matched_attestor_ids": ["att-1", "att-2"],
+  "threshold_satisfied": true
+}]
+```
+
+**Validation at store time:**
+- `threshold` must be >= 1.
+- `threshold` must not exceed `required_attestor_ids.len()`.
+- `required_attestor_ids` must be non-empty when `threshold` is set.
 
 #### Holdback / retention release
 
