@@ -61,15 +61,6 @@ A proof policy binds a set of requirements and timeout rules to a specific agree
     }
   ],
   "notes": null,
-  "required_proofs": [
-    {
-      "requirement_id": "req-delivery",
-      "proof_type": "delivery_confirmation",
-      "required_attestor_ids": ["att-1", "att-2"],
-      "resolution": "release",
-      "threshold": 2
-    }
-  ],
   "milestones": [
     { "milestone_id": "ms-delivery", "label": "Delivery confirmation" },
     { "milestone_id": "ms-inspection", "label": "Inspection sign-off" }

@@ -4810,6 +4810,29 @@ impl PolicyStore {
                 }
             }
         }
+        // Validate threshold declarations on requirements.
+        for req in &policy.required_proofs {
+            if let Some(thr) = req.threshold {
+                if thr == 0 {
+                    return Err(format!(
+                        "requirement '{}' threshold must be >= 1",
+                        req.requirement_id
+                    ));
+                }
+                if req.required_attestor_ids.is_empty() {
+                    return Err(format!(
+                        "requirement '{}' has threshold but no required_attestor_ids",
+                        req.requirement_id
+                    ));
+                }
+                if thr as usize > req.required_attestor_ids.len() {
+                    return Err(format!(
+                        "requirement '{}' threshold {} exceeds required_attestor_ids count {}",
+                        req.requirement_id, thr, req.required_attestor_ids.len()
+                    ));
+                }
+            }
+        }
         let key = policy.agreement_hash.to_lowercase();
         let policy_id = policy.policy_id.clone();
         let agreement_hash = policy.agreement_hash.clone();
