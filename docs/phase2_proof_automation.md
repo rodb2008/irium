@@ -64,7 +64,12 @@ A proof policy binds a set of requirements and timeout rules to a specific agree
   "milestones": [
     { "milestone_id": "ms-delivery", "label": "Delivery confirmation" },
     { "milestone_id": "ms-inspection", "label": "Inspection sign-off" }
-  ]
+  ],
+  "holdback": {
+    "holdback_bps": 1000,
+    "release_requirement_id": "req-holdback",
+    "deadline_height": 50000
+  }
 }
 ```
 
@@ -969,11 +974,21 @@ Response:
     }
   ],
   "completed_milestone_count": <n>,
-  "total_milestone_count": <n>
+  "total_milestone_count": <n>,
+  "holdback": {
+    "holdback_present": true,
+    "holdback_released": false,
+    "holdback_bps": 1000,
+    "immediate_release_bps": 9000,
+    "holdback_outcome": "held",
+    "holdback_reason": "<string>"
+  }
 }
 ```
 `policy_id` is `null` when no policy is stored.
 `milestone_results` is an empty array when no milestones are declared.
+`holdback` is `null` when no holdback is configured; present only when the base
+condition is `satisfied`.
 
 #### `outcome` field
 
@@ -1027,6 +1042,35 @@ When milestones are declared:
 **Backward compatibility:** policies without a `milestones` array are evaluated
 using the traditional flat-requirements path. `milestone_results` will be `[]` and
 both counts will be `0`.
+
+#### Holdback / retention release
+
+A `ProofPolicy` or `PolicyMilestone` may declare an optional `holdback` that retains
+a portion of the settlement amount until a secondary condition is met.
+
+| Field | Type | Description |
+|---|---|---|
+| `holdback_bps` | integer | Basis points to hold back (1–9999). |
+| `release_requirement_id` | string\|null | ID of a `ProofRequirement` whose satisfaction releases the holdback. |
+| `deadline_height` | integer\|null | Block height at or after which the holdback auto-releases. |
+
+At least one of `release_requirement_id` or `deadline_height` must be supplied.
+Proof-condition release takes priority over deadline release.
+
+**Holdback outcome vocabulary**
+
+| Value | Meaning |
+|---|---|
+| `pending` | Base condition not yet satisfied; holdback not yet active. |
+| `held` | Base satisfied; holdback condition not yet met. |
+| `released` | Holdback released (by proof or deadline). |
+
+`immediate_release_bps` is `10000 - holdback_bps` when `held`, and `10000` when `released`.
+
+**Scope rules:**
+- `policy.holdback` applies in the non-milestone evaluation path only.
+- `milestone.holdback` applies per-milestone within the milestone evaluation path.
+- When holdback is absent, `holdback` in the response is `null`.
 
 **Example policy with two milestones:**
 

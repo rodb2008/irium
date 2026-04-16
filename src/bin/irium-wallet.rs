@@ -628,6 +628,23 @@ struct EvaluatePolicyRpcRequest {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct HoldbackRpcResult {
+    #[serde(default)]
+    holdback_present: bool,
+    #[serde(default)]
+    holdback_released: bool,
+    #[serde(default)]
+    holdback_bps: u32,
+    #[serde(default)]
+    immediate_release_bps: u32,
+    /// "pending", "held", or "released".
+    #[serde(default)]
+    holdback_outcome: String,
+    #[serde(default)]
+    holdback_reason: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct MilestoneRpcResult {
     #[serde(default)]
     milestone_id: String,
@@ -644,6 +661,8 @@ struct MilestoneRpcResult {
     matched_proof_ids: Vec<String>,
     #[serde(default)]
     reason: String,
+    #[serde(default)]
+    holdback: Option<HoldbackRpcResult>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -690,6 +709,9 @@ struct EvaluatePolicyRpcResponse {
     /// Total declared milestones.
     #[serde(default)]
     total_milestone_count: usize,
+    /// Top-level holdback result; None when no holdback configured or milestone path used.
+    #[serde(default)]
+    holdback: Option<HoldbackRpcResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -5257,6 +5279,24 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
                 .filter(|l| !l.is_empty())
                 .unwrap_or(ms.milestone_id.as_str());
             lines.push(format!("  milestone {} outcome {}", display, ms.outcome));
+            if let Some(ref hb) = ms.holdback {
+                lines.push(format!(
+                    "    holdback {} bps holdback_outcome {}",
+                    hb.holdback_bps, hb.holdback_outcome
+                ));
+                if !hb.holdback_reason.is_empty() {
+                    lines.push(format!("    holdback_reason {}", hb.holdback_reason));
+                }
+            }
+        }
+    }
+    if let Some(ref hb) = resp.holdback {
+        lines.push(format!(
+            "holdback {} bps holdback_outcome {}",
+            hb.holdback_bps, hb.holdback_outcome
+        ));
+        if !hb.holdback_reason.is_empty() {
+            lines.push(format!("holdback_reason {}", hb.holdback_reason));
         }
     }
     lines.join("\n")
@@ -9237,6 +9277,7 @@ mod tests {
                 notes: None,
                 expires_at_height: None,
                 milestones: vec![],
+                holdback: None,
             }),
             expires_at_height: None,
             expired: false,
@@ -9734,6 +9775,7 @@ mod tests {
                 notes: None,
                 expires_at_height: Some(500),
                 milestones: vec![],
+                holdback: None,
             }),
             expires_at_height: Some(500),
             expired: false,
@@ -9759,6 +9801,7 @@ mod tests {
                 notes: None,
                 expires_at_height: Some(10),
                 milestones: vec![],
+                holdback: None,
             }),
             expires_at_height: Some(10),
             expired: true,

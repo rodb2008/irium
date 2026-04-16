@@ -3714,6 +3714,10 @@ pub struct ProofPolicy {
     /// and each milestone is evaluated independently.
     #[serde(default)]
     pub milestones: Vec<PolicyMilestone>,
+    /// Top-level holdback applied in the non-milestone evaluation path.
+    /// Ignored when `milestones` is non-empty (use `PolicyMilestone.holdback` instead).
+    #[serde(default)]
+    pub holdback: Option<PolicyHoldback>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3743,6 +3747,48 @@ pub struct SettlementProof {
     pub expires_at_height: Option<u64>,
 }
 
+/// Holdback (retention) configuration attached to a policy or milestone.
+/// `holdback_bps` basis points of the settlement amount are held until either
+/// `release_requirement_id` is satisfied or `deadline_height` is reached.
+/// At least one of the two release conditions must be supplied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyHoldback {
+    /// Basis points to hold back (1–9999; 10000 bps = 100 %).
+    pub holdback_bps: u32,
+    /// ID of an existing `ProofRequirement` whose satisfaction releases the holdback.
+    /// When `None` the holdback is released only by `deadline_height`.
+    #[serde(default)]
+    pub release_requirement_id: Option<String>,
+    /// Block height at or after which the holdback is automatically released.
+    /// When `None` the holdback is released only by `release_requirement_id`.
+    #[serde(default)]
+    pub deadline_height: Option<u64>,
+}
+
+/// Outcome of evaluating the holdback condition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldbackOutcome {
+    /// Base condition not yet satisfied; holdback not yet active.
+    Pending,
+    /// Base satisfied but neither release requirement nor deadline has been met.
+    Held,
+    /// Holdback released (by proof or deadline).
+    Released,
+}
+
+/// Result of evaluating a holdback condition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HoldbackEvaluationResult {
+    pub holdback_present: bool,
+    pub holdback_released: bool,
+    pub holdback_bps: u32,
+    /// Basis points immediately releasable (10000 - holdback_bps when holdback held; 10000 when released).
+    pub immediate_release_bps: u32,
+    pub holdback_outcome: HoldbackOutcome,
+    pub holdback_reason: String,
+}
+
 /// Declares a named milestone (tranche) within a policy.
 /// `ProofRequirement` and `NoResponseRule` entries with a matching `milestone_id`
 /// are grouped under this milestone and evaluated independently.
@@ -3751,6 +3797,9 @@ pub struct PolicyMilestone {
     pub milestone_id: String,
     /// Human-readable label shown in evaluation output.
     pub label: Option<String>,
+    /// Optional holdback declaration for this milestone.
+    #[serde(default)]
+    pub holdback: Option<PolicyHoldback>,
 }
 
 /// Outcome of evaluating a single milestone independently.
@@ -3764,6 +3813,8 @@ pub struct MilestoneEvaluationResult {
     pub refund_eligible: bool,
     pub matched_proof_ids: Vec<String>,
     pub reason: String,
+    /// Holdback result for this milestone; `None` when no holdback is configured.
+    pub holdback: Option<HoldbackEvaluationResult>,
 }
 
 /// Objective, deterministic outcome of a policy evaluation.
@@ -3797,6 +3848,9 @@ pub struct PolicyEvaluationResult {
     pub completed_milestone_count: usize,
     /// Total declared milestones (len of policy.milestones).
     pub total_milestone_count: usize,
+    /// Top-level holdback result; `None` when no holdback is configured or
+    /// when the policy uses milestone-level holdbacks.
+    pub holdback: Option<HoldbackEvaluationResult>,
 }
 
 fn proof_policy_canonical_bytes(policy: &ProofPolicy) -> Result<Vec<u8>, String> {
@@ -3952,6 +4006,79 @@ fn eval_milestone_subset(
     )
 }
 
+/// Evaluate a holdback condition given the base satisfaction state.
+///
+/// - If base is not satisfied: returns `Pending` (holdback not yet active).
+/// - If `release_requirement_id` is provided and satisfied: returns `Released`.
+/// - If `deadline_height` has been reached: returns `Released`.
+/// - Otherwise: returns `Held` with the split bps.
+fn evaluate_holdback(
+    holdback: &PolicyHoldback,
+    base_satisfied: bool,
+    scope_reqs: &[&ProofRequirement],
+    proofs: &[SettlementProof],
+    satisfied: &[String],
+    tip_height: u64,
+) -> HoldbackEvaluationResult {
+    if !base_satisfied {
+        return HoldbackEvaluationResult {
+            holdback_present: true,
+            holdback_released: false,
+            holdback_bps: holdback.holdback_bps,
+            immediate_release_bps: 0,
+            holdback_outcome: HoldbackOutcome::Pending,
+            holdback_reason: "base condition not yet satisfied".to_string(),
+        };
+    }
+
+    // Proof-condition release takes priority over deadline release.
+    if let Some(ref req_id) = holdback.release_requirement_id {
+        let req_met = scope_reqs.iter().any(|req| {
+            req.requirement_id == *req_id
+                && proofs.iter().any(|p| {
+                    satisfied.contains(&p.proof_id)
+                        && p.proof_type == req.proof_type
+                        && req.required_attestor_ids.contains(&p.attested_by)
+                })
+        });
+        if req_met {
+            return HoldbackEvaluationResult {
+                holdback_present: true,
+                holdback_released: true,
+                holdback_bps: holdback.holdback_bps,
+                immediate_release_bps: 10000,
+                holdback_outcome: HoldbackOutcome::Released,
+                holdback_reason: format!("holdback released by requirement '{}'", req_id),
+            };
+        }
+    }
+
+    if let Some(deadline) = holdback.deadline_height {
+        if tip_height >= deadline {
+            return HoldbackEvaluationResult {
+                holdback_present: true,
+                holdback_released: true,
+                holdback_bps: holdback.holdback_bps,
+                immediate_release_bps: 10000,
+                holdback_outcome: HoldbackOutcome::Released,
+                holdback_reason: format!(
+                    "holdback released by deadline at height {}",
+                    deadline
+                ),
+            };
+        }
+    }
+
+    HoldbackEvaluationResult {
+        holdback_present: true,
+        holdback_released: false,
+        holdback_bps: holdback.holdback_bps,
+        immediate_release_bps: 10000u32.saturating_sub(holdback.holdback_bps),
+        holdback_outcome: HoldbackOutcome::Held,
+        holdback_reason: "base satisfied; holdback pending release condition".to_string(),
+    }
+}
+
 pub fn evaluate_policy(
     agreement: &AgreementObject,
     policy: &ProofPolicy,
@@ -4045,6 +4172,17 @@ pub fn evaluate_policy(
                 mid, ms_outcome
             ));
 
+            let ms_holdback = ms.holdback.as_ref().map(|hb| {
+                evaluate_holdback(
+                    hb,
+                    ms_outcome == PolicyOutcome::Satisfied,
+                    &ms_release_reqs,
+                    proofs,
+                    &satisfied,
+                    tip_height,
+                )
+            });
+
             milestone_results.push(MilestoneEvaluationResult {
                 milestone_id: ms.milestone_id.clone(),
                 label: ms.label.clone(),
@@ -4053,6 +4191,7 @@ pub fn evaluate_policy(
                 refund_eligible: ms_refund,
                 matched_proof_ids: ms_matched,
                 reason: ms_reason,
+                holdback: ms_holdback,
             });
         }
 
@@ -4104,6 +4243,7 @@ pub fn evaluate_policy(
             milestone_results,
             completed_milestone_count: completed,
             total_milestone_count: total,
+            holdback: None,
         });
     }
 
@@ -4140,6 +4280,16 @@ pub fn evaluate_policy(
         && release_requirements.iter().all(|req| req_satisfied(*req));
 
     if all_release_met {
+        let top_holdback = policy.holdback.as_ref().map(|hb| {
+            evaluate_holdback(
+                hb,
+                true,
+                &release_requirements,
+                proofs,
+                &satisfied,
+                tip_height,
+            )
+        });
         return Ok(PolicyEvaluationResult {
             outcome: PolicyOutcome::Satisfied,
             release_eligible: true,
@@ -4150,6 +4300,7 @@ pub fn evaluate_policy(
             milestone_results: vec![],
             completed_milestone_count: 0,
             total_milestone_count: 0,
+            holdback: top_holdback,
         });
     }
 
@@ -4182,6 +4333,7 @@ pub fn evaluate_policy(
                 milestone_results: vec![],
                 completed_milestone_count: 0,
                 total_milestone_count: 0,
+                holdback: None,
             });
         }
     }
@@ -4212,6 +4364,7 @@ pub fn evaluate_policy(
                         milestone_results: vec![],
                         completed_milestone_count: 0,
                         total_milestone_count: 0,
+                        holdback: None,
                     });
                 }
             }
@@ -4242,6 +4395,7 @@ pub fn evaluate_policy(
         milestone_results: vec![],
         completed_milestone_count: 0,
         total_milestone_count: 0,
+        holdback: None,
     })
 }
 
@@ -4468,6 +4622,55 @@ impl PolicyStore {
             }
             if !seen_ms_ids.insert(ms.milestone_id.as_str()) {
                 return Err(format!("duplicate milestone_id '{}'", ms.milestone_id));
+            }
+        }
+        // Validate top-level holdback (non-milestone path).
+        if let Some(ref hb) = policy.holdback {
+            if hb.holdback_bps == 0 || hb.holdback_bps >= 10000 {
+                return Err("holdback_bps must be between 1 and 9999".to_string());
+            }
+            if hb.release_requirement_id.is_none() && hb.deadline_height.is_none() {
+                return Err(
+                    "holdback must specify at least one release condition (release_requirement_id or deadline_height)"
+                        .to_string(),
+                );
+            }
+            if let Some(ref req_id) = hb.release_requirement_id {
+                if !policy.required_proofs.iter().any(|r| r.requirement_id == *req_id) {
+                    return Err(format!(
+                        "holdback release_requirement_id '{}' not found in policy requirements",
+                        req_id
+                    ));
+                }
+            }
+        }
+        // Validate per-milestone holdbacks.
+        for ms in &policy.milestones {
+            if let Some(ref hb) = ms.holdback {
+                if hb.holdback_bps == 0 || hb.holdback_bps >= 10000 {
+                    return Err(format!(
+                        "milestone '{}' holdback_bps must be between 1 and 9999",
+                        ms.milestone_id
+                    ));
+                }
+                if hb.release_requirement_id.is_none() && hb.deadline_height.is_none() {
+                    return Err(format!(
+                        "milestone '{}' holdback must specify at least one release condition",
+                        ms.milestone_id
+                    ));
+                }
+                if let Some(ref req_id) = hb.release_requirement_id {
+                    let in_scope = policy.required_proofs.iter().any(|r| {
+                        r.requirement_id == *req_id
+                            && r.milestone_id.as_deref() == Some(ms.milestone_id.as_str())
+                    });
+                    if !in_scope {
+                        return Err(format!(
+                            "milestone '{}' holdback release_requirement_id '{}' not found in milestone requirements",
+                            ms.milestone_id, req_id
+                        ));
+                    }
+                }
             }
         }
         let key = policy.agreement_hash.to_lowercase();
@@ -5565,6 +5768,7 @@ mod tests {
             notes: None,
             expires_at_height: None,
             milestones: vec![],
+            holdback: None,
         }
     }
 
@@ -5890,6 +6094,7 @@ mod tests {
             .map(|(id, label)| PolicyMilestone {
                 milestone_id: id.to_string(),
                 label: label.map(|l| l.to_string()),
+                holdback: None,
             })
             .collect();
         let reqs: Vec<ProofRequirement> = milestones
@@ -5918,6 +6123,7 @@ mod tests {
             notes: None,
             expires_at_height: None,
             milestones: ms_decls,
+            holdback: None,
         }
     }
 
@@ -6943,6 +7149,7 @@ mod tests {
         policy.milestones = vec![PolicyMilestone {
             milestone_id: "  ".to_string(), // blank
             label: None,
+            holdback: None,
         }];
         let err = store.store(policy, false).unwrap_err();
         assert!(err.contains("milestone_id must not be empty"), "got: {err}");
@@ -6960,12 +7167,175 @@ mod tests {
         let hash = hex::encode(Sha256::digest(&bytes));
         let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
         policy.milestones = vec![
-            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None },
-            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None },
+            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None, holdback: None },
+            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None, holdback: None },
         ];
         let err = store.store(policy, false).unwrap_err();
         assert!(err.contains("duplicate milestone_id"), "got: {err}");
         assert!(err.contains("ms-dup"), "got: {err}");
+    }
+
+    // ---- Holdback tests ----
+
+    #[test]
+    fn holdback_none_when_base_not_satisfied() {
+        // Holdback is only computed when base is satisfied (Satisfied path).
+        // When no proofs: Unsatisfied, holdback must be None.
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 2000,
+            release_requirement_id: None,
+            deadline_height: Some(500),
+        });
+        let result = evaluate_policy(&agreement, &policy, &[], 100).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Unsatisfied);
+        assert!(result.holdback.is_none(), "holdback must be None when base not satisfied");
+    }
+
+    #[test]
+    fn holdback_held_when_base_satisfied_deadline_not_reached() {
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 1000,
+            release_requirement_id: None,
+            deadline_height: Some(1000), // deadline in the future
+        });
+        let proof = make_test_proof(&hash, "att", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 100).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        let hb = result.holdback.expect("holdback must be present when base satisfied");
+        assert!(hb.holdback_present);
+        assert!(!hb.holdback_released);
+        assert_eq!(hb.holdback_outcome, HoldbackOutcome::Held);
+        assert_eq!(hb.holdback_bps, 1000);
+        assert_eq!(hb.immediate_release_bps, 9000);
+    }
+
+    #[test]
+    fn holdback_released_by_deadline() {
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 500,
+            release_requirement_id: None,
+            deadline_height: Some(200),
+        });
+        let proof = make_test_proof(&hash, "att", &sk);
+        // tip_height >= 200 → deadline fires.
+        let result = evaluate_policy(&agreement, &policy, &[proof], 200).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        let hb = result.holdback.expect("holdback must be present");
+        assert!(hb.holdback_released);
+        assert_eq!(hb.holdback_outcome, HoldbackOutcome::Released);
+        assert_eq!(hb.immediate_release_bps, 10000);
+        assert!(hb.holdback_reason.contains("deadline"), "got: {}", hb.holdback_reason);
+    }
+
+    #[test]
+    fn holdback_released_by_proof() {
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        // req-001 is both the base requirement and the holdback release requirement.
+        // When the proof satisfies req-001, holdback is also released immediately.
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 3000,
+            release_requirement_id: Some("req-001".to_string()),
+            deadline_height: Some(9999),
+        });
+        let proof = make_test_proof(&hash, "att", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 100).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        let hb = result.holdback.expect("holdback must be present");
+        assert!(hb.holdback_released);
+        assert_eq!(hb.holdback_outcome, HoldbackOutcome::Released);
+        assert_eq!(hb.immediate_release_bps, 10000);
+        assert!(hb.holdback_reason.contains("req-001"), "got: {}", hb.holdback_reason);
+    }
+
+    #[test]
+    fn holdback_absent_when_no_holdback_configured() {
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let policy = make_test_policy(&hash, &pubkey_hex, "att");
+        let proof = make_test_proof(&hash, "att", &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 100).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.holdback.is_none(), "holdback field must be None when not configured");
+    }
+
+    #[test]
+    fn store_policy_rejects_invalid_holdback_bps() {
+        let mut store = make_policy_store();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 0,
+            release_requirement_id: None,
+            deadline_height: Some(100),
+        });
+        let err = store.store(policy, false).unwrap_err();
+        assert!(err.contains("holdback_bps"), "got: {err}");
+    }
+
+    #[test]
+    fn store_policy_rejects_holdback_with_no_release_condition() {
+        let mut store = make_policy_store();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 1000,
+            release_requirement_id: None,
+            deadline_height: None,
+        });
+        let err = store.store(policy, false).unwrap_err();
+        assert!(err.contains("release condition"), "got: {err}");
+    }
+
+    #[test]
+    fn store_policy_rejects_holdback_with_unknown_req_id() {
+        let mut store = make_policy_store();
+        let sk = sample_signing_key();
+        let pubkey_hex = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let mut policy = make_test_policy(&hash, &pubkey_hex, "att");
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 500,
+            release_requirement_id: Some("no-such-req".to_string()),
+            deadline_height: None,
+        });
+        let err = store.store(policy, false).unwrap_err();
+        assert!(err.contains("no-such-req"), "got: {err}");
     }
 
 

@@ -57,6 +57,7 @@ use irium_node_rs::settlement::{
     AgreementFundingLegRef, AgreementLifecycleView, AgreementLinkedTx, AgreementMilestoneStatus,
     AgreementObject, AgreementSummary,
     evaluate_policy,
+    HoldbackEvaluationResult,
     MilestoneEvaluationResult,
     PolicyOutcome,
     ProofPolicy,
@@ -811,6 +812,8 @@ struct EvaluatePolicyResponse {
     completed_milestone_count: usize,
     /// Total declared milestones.
     total_milestone_count: usize,
+    /// Top-level holdback result; None when no holdback configured or milestone path used.
+    holdback: Option<HoldbackEvaluationResult>,
 }
 
 #[derive(Deserialize)]
@@ -5380,6 +5383,7 @@ async fn evaluate_policy_rpc(
                 milestone_results: vec![],
                 completed_milestone_count: 0,
                 total_milestone_count: 0,
+                holdback: None,
             }));
         }
         Some(p) => p,
@@ -5433,6 +5437,7 @@ async fn evaluate_policy_rpc(
                 milestone_results: vec![],
                 completed_milestone_count: 0,
                 total_milestone_count: 0,
+                holdback: None,
             }));
         }
     }
@@ -5446,6 +5451,7 @@ async fn evaluate_policy_rpc(
     let completed_milestone_count = result.completed_milestone_count;
     let total_milestone_count = result.total_milestone_count;
     let milestone_results = result.milestone_results;
+    let holdback = result.holdback;
     Ok(Json(EvaluatePolicyResponse {
         outcome: result.outcome,
         agreement_hash,
@@ -5464,6 +5470,7 @@ async fn evaluate_policy_rpc(
         milestone_results,
         completed_milestone_count,
         total_milestone_count,
+        holdback,
     }))
 }
 
@@ -8320,6 +8327,7 @@ mod tests {
             notes: None,
             expires_at_height: None,
             milestones: vec![],
+            holdback: None,
         }
     }
 
@@ -8880,6 +8888,7 @@ mod tests {
         policy.milestones = vec![PolicyMilestone {
             milestone_id: "".to_string(),
             label: None,
+            holdback: None,
         }];
         let result = store_policy_rpc(
             ConnectInfo(test_socket()), State(state), HeaderMap::new(),
@@ -8895,8 +8904,8 @@ mod tests {
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let mut policy = make_rpc_policy("hash-ms-dup-id", &pubkey_hex);
         policy.milestones = vec![
-            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None },
-            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None },
+            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None, holdback: None },
+            PolicyMilestone { milestone_id: "ms-dup".to_string(), label: None, holdback: None },
         ];
         let result = store_policy_rpc(
             ConnectInfo(test_socket()), State(state), HeaderMap::new(),
@@ -9415,6 +9424,7 @@ mod tests {
             .map(|id| PolicyMilestone {
                 milestone_id: id.to_string(),
                 label: None,
+                holdback: None,
             })
             .collect();
         let reqs: Vec<ProofRequirement> = milestones
@@ -9443,6 +9453,7 @@ mod tests {
             notes: None,
             expires_at_height: None,
             milestones: ms_decls,
+            holdback: None,
         }
     }
 
