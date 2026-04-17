@@ -19,6 +19,7 @@ use irium_node_rs::settlement::{
     AgreementStatement, AgreementSummary, AgreementTemplateType,
     AGREEMENT_SIGNATURE_TYPE_SECP256K1, AGREEMENT_SIGNATURE_VERSION,
     ProofPolicy, ProofSignatureEnvelope, SettlementProof, SETTLEMENT_PROOF_SCHEMA_ID,
+    TypedProofPayload, validate_typed_proof_payload,
     settlement_proof_payload_bytes,
 };
 use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
@@ -436,6 +437,9 @@ struct SubmitProofRpcResponse {
     /// True when tip_height >= expires_at_height at submit time. Always false when expires_at_height is None.
     #[serde(default)]
     expired: bool,
+    /// Derived lifecycle status: "active" or "expired". Empty string when talking to older nodes.
+    #[serde(default)]
+    status: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -462,25 +466,52 @@ struct ListPoliciesRpcResponse {
     active_only: bool,
 }
 
+fn u32_is_zero(n: &u32) -> bool { *n == 0 }
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ListProofsRpcRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     agreement_hash: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     active_only: bool,
+    #[serde(skip_serializing_if = "u32_is_zero")]
+    offset: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+struct ProofListItem {
+    #[serde(flatten)]
+    proof: SettlementProof,
+    /// Derived lifecycle status from the node: "active" or "expired". Empty when talking to older nodes.
+    #[serde(default)]
+    status: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct ListProofsRpcResponse {
     agreement_hash: String,
-    /// Chain tip height at query time. Used to compute expired = tip_height >= proof.expires_at_height.
+    /// Chain tip height at query time.
     #[serde(default)]
     tip_height: u64,
     /// Echoed from the request; true when only non-expired proofs were returned.
     #[serde(default)]
     active_only: bool,
-    count: usize,
-    proofs: Vec<SettlementProof>,
+    /// Total matches before pagination; equals returned_count when no pagination was applied.
+    #[serde(default)]
+    total_count: usize,
+    /// Number of proofs returned in this page. Equals proofs.len().
+    #[serde(default)]
+    returned_count: usize,
+    /// True when more proofs remain after this page.
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    offset: u32,
+    #[serde(default)]
+    limit: Option<u32>,
+    proofs: Vec<ProofListItem>,
 }
 
 #[derive(Debug, Clone)]
@@ -494,6 +525,36 @@ struct ProofSubmitCliOptions {
 struct ProofListCliOptions {
     agreement_hash: Option<String>,
     active_only: bool,
+    offset: u32,
+    limit: Option<u32>,
+    rpc_url: String,
+    json_mode: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct GetProofRpcRequest {
+    proof_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct GetProofRpcResponse {
+    proof_id: String,
+    found: bool,
+    #[serde(default)]
+    tip_height: u64,
+    proof: Option<SettlementProof>,
+    #[serde(default)]
+    expires_at_height: Option<u64>,
+    #[serde(default)]
+    expired: bool,
+    /// Derived lifecycle status: "active" or "expired". Empty when found=false or older nodes.
+    #[serde(default)]
+    status: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProofGetCliOptions {
+    proof_id: String,
     rpc_url: String,
     json_mode: bool,
 }
@@ -512,6 +573,8 @@ struct ProofCreateCliOptions {
     out_path: Option<String>,
     json_mode: bool,
     expires_at_height: Option<u64>,
+    proof_kind: Option<String>,
+    reference_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -567,19 +630,110 @@ struct EvaluatePolicyRpcRequest {
     agreement: AgreementObject,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct HoldbackRpcResult {
+    #[serde(default)]
+    holdback_present: bool,
+    #[serde(default)]
+    holdback_released: bool,
+    #[serde(default)]
+    holdback_bps: u32,
+    #[serde(default)]
+    immediate_release_bps: u32,
+    /// "pending", "held", or "released".
+    #[serde(default)]
+    holdback_outcome: String,
+    #[serde(default)]
+    holdback_reason: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct ThresholdResultRpc {
+    #[serde(default)]
+    requirement_id: String,
+    #[serde(default)]
+    threshold_required: u32,
+    #[serde(default)]
+    approved_attestor_count: usize,
+    #[serde(default)]
+    matched_attestor_ids: Vec<String>,
+    #[serde(default)]
+    threshold_satisfied: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct MilestoneRpcResult {
+    #[serde(default)]
+    milestone_id: String,
+    #[serde(default)]
+    label: Option<String>,
+    /// "satisfied", "timeout", or "unsatisfied".
+    #[serde(default)]
+    outcome: String,
+    #[serde(default)]
+    release_eligible: bool,
+    #[serde(default)]
+    refund_eligible: bool,
+    #[serde(default)]
+    matched_proof_ids: Vec<String>,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    holdback: Option<HoldbackRpcResult>,
+    #[serde(default)]
+    threshold_results: Vec<ThresholdResultRpc>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct EvaluatePolicyRpcResponse {
+    /// Deterministic classification: "satisfied", "timeout", or "unsatisfied".
+    #[serde(default)]
+    outcome: String,
+    #[serde(default)]
     agreement_hash: String,
+    #[serde(default)]
     policy_found: bool,
+    #[serde(default)]
     policy_id: Option<String>,
     #[serde(default)]
     expired: bool,
+    #[serde(default)]
     tip_height: u64,
+    /// Total active (non-expired) proofs considered for evaluation.
+    #[serde(default)]
     proof_count: usize,
+    /// Proofs filtered out as expired before evaluation.
+    #[serde(default)]
+    expired_proof_count: usize,
+    /// Proofs that passed signature verification and matched the policy.
+    #[serde(default)]
+    matched_proof_count: usize,
+    /// IDs of proofs that passed signature verification.
+    #[serde(default)]
+    matched_proof_ids: Vec<String>,
+    #[serde(default)]
     release_eligible: bool,
+    #[serde(default)]
     refund_eligible: bool,
+    #[serde(default)]
     reason: String,
+    #[serde(default)]
     evaluated_rules: Vec<String>,
+    /// Per-milestone results; empty when no milestones declared.
+    #[serde(default)]
+    milestone_results: Vec<MilestoneRpcResult>,
+    /// Number of milestones with outcome == "satisfied".
+    #[serde(default)]
+    completed_milestone_count: usize,
+    /// Total declared milestones.
+    #[serde(default)]
+    total_milestone_count: usize,
+    /// Top-level holdback result; None when no holdback configured or milestone path used.
+    #[serde(default)]
+    holdback: Option<HoldbackRpcResult>,
+    /// Threshold results for requirements with explicit threshold set; empty otherwise.
+    #[serde(default)]
+    threshold_results: Vec<ThresholdResultRpc>,
 }
 
 #[derive(Debug, Clone)]
@@ -1818,9 +1972,10 @@ fn usage() {
   eprintln!("  irium-wallet agreement-policy-get --agreement-hash <hex> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-evaluate --agreement <agreement.json|-> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-list [--active-only] [--rpc <url>] [--json]");
-    eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--expires-at-height <n>] [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <unix>] [--out <path>] [--json]");
+    eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--expires-at-height <n>] [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <unix>] [--proof-kind <kind>] [--reference-id <ref>] [--out <path>] [--json]");
     eprintln!("  irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>] [--json]");
-    eprintln!("  irium-wallet agreement-proof-list [--agreement-hash <hex>] [--active-only] [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-proof-list [--agreement-hash <hex>] [--active-only] [--offset <n>] [--limit <n>] [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-proof-get --proof-id <id> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-release-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
     eprintln!("  irium-wallet agreement-refund-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
     eprintln!("  irium-wallet agreement-release-send <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
@@ -2675,6 +2830,12 @@ fn create_settlement_proof_signed(opts: &ProofCreateCliOptions) -> Result<Settle
             payload_hash: String::new(),
         },
         expires_at_height: opts.expires_at_height,
+        typed_payload: opts.proof_kind.as_ref().map(|kind| TypedProofPayload {
+            proof_kind: kind.clone(),
+            content_hash: None,
+            reference_id: opts.reference_id.clone(),
+            attributes: None,
+        }),
     };
 
     let payload_bytes = settlement_proof_payload_bytes(&proof)
@@ -4622,6 +4783,8 @@ fn parse_proof_submit_cli(args: &[String]) -> Result<ProofSubmitCliOptions, Stri
 fn parse_proof_list_cli(args: &[String]) -> Result<ProofListCliOptions, String> {
     let mut agreement_hash: Option<String> = None;
     let mut active_only = false;
+    let mut offset: u32 = 0;
+    let mut limit: Option<u32> = None;
     let mut rpc_url = default_rpc_url();
     let mut json_mode = false;
     let mut i = 0;
@@ -4636,6 +4799,20 @@ fn parse_proof_list_cli(args: &[String]) -> Result<ProofListCliOptions, String> 
             }
             "--active-only" => {
                 active_only = true;
+            }
+            "--offset" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--offset requires a value".to_string());
+                }
+                offset = args[i].parse::<u32>().map_err(|_| "--offset must be a non-negative integer".to_string())?;
+            }
+            "--limit" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--limit requires a value".to_string());
+                }
+                limit = Some(args[i].parse::<u32>().map_err(|_| "--limit must be a positive integer".to_string())?);
             }
             "--rpc" => {
                 i += 1;
@@ -4656,9 +4833,45 @@ fn parse_proof_list_cli(args: &[String]) -> Result<ProofListCliOptions, String> 
     Ok(ProofListCliOptions {
         agreement_hash,
         active_only,
+        offset,
+        limit,
         rpc_url,
         json_mode,
     })
+}
+
+fn parse_proof_get_cli(args: &[String]) -> Result<ProofGetCliOptions, String> {
+    let mut proof_id: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--proof-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--proof-id requires a value".to_string());
+                }
+                proof_id = Some(args[i].clone());
+            }
+            "--rpc" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--rpc requires a value".to_string());
+                }
+                rpc_url = args[i].clone();
+            }
+            "--json" => {
+                json_mode = true;
+            }
+            other => {
+                return Err(format!("unknown argument: {}", other));
+            }
+        }
+        i += 1;
+    }
+    let proof_id = proof_id.ok_or_else(|| "--proof-id is required".to_string())?;
+    Ok(ProofGetCliOptions { proof_id, rpc_url, json_mode })
 }
 
 fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, String> {
@@ -4674,6 +4887,8 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
     let mut out_path: Option<String> = None;
     let mut json_mode = false;
     let mut expires_at_height: Option<u64> = None;
+    let mut proof_kind: Option<String> = None;
+    let mut reference_id: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -4763,6 +4978,16 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
             "--json" => {
                 json_mode = true;
             }
+            "--proof-kind" => {
+                i += 1;
+                if i >= args.len() { return Err("--proof-kind requires a value".to_string()); }
+                proof_kind = Some(args[i].clone());
+            }
+            "--reference-id" => {
+                i += 1;
+                if i >= args.len() { return Err("--reference-id requires a value".to_string()); }
+                reference_id = Some(args[i].clone());
+            }
             other => {
                 return Err(format!("unknown argument: {}", other));
             }
@@ -4783,6 +5008,8 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
         out_path,
         json_mode,
         expires_at_height,
+        proof_kind,
+        reference_id,
     })
 }
 
@@ -4799,6 +5026,9 @@ fn render_proof_submit_summary(resp: &SubmitProofRpcResponse) -> String {
         Some(h) => lines.push(format!("expires_at_height {}", h)),
     }
     lines.push(format!("expired {}", resp.expired));
+    if !resp.status.is_empty() {
+        lines.push(format!("status {}", resp.status));
+    }
     lines.join("\n")
 }
 
@@ -4812,22 +5042,75 @@ fn render_proof_list_summary(resp: &ListProofsRpcResponse) -> String {
     } else {
         lines.push(format!("agreement_hash {}", resp.agreement_hash));
     }
-    lines.push(format!("count {}", resp.count));
-    for proof in &resp.proofs {
-        let expiry_str = match proof.expires_at_height {
+    lines.push(format!("returned_count {}", resp.returned_count));
+    if resp.has_more || resp.total_count != resp.returned_count || resp.offset != 0 || resp.limit.is_some() {
+        lines.push(format!("total_count {}", resp.total_count));
+        if resp.offset != 0 { lines.push(format!("offset {}", resp.offset)); }
+        if let Some(lim) = resp.limit { lines.push(format!("limit {}", lim)); }
+        if resp.has_more { lines.push("has_more true".to_string()); }
+    }
+    for item in &resp.proofs {
+        let expiry_str = match item.proof.expires_at_height {
             None => "expires_at_height=none".to_string(),
             Some(h) => {
                 let expired = resp.tip_height >= h;
                 format!("expires_at_height={} expired={}", h, expired)
             }
         };
+        let status_str = if item.status.is_empty() {
+            String::new()
+        } else {
+            format!(" status={}", item.status)
+        };
+        // proof_kind is unsigned metadata (not part of signed proof payload); label clearly.
+        let kind_str = item.proof.typed_payload.as_ref()
+            .map(|tp| format!(" proof_kind={} [metadata]", tp.proof_kind))
+            .unwrap_or_default();
         lines.push(format!(
-            "  agreement_hash={} proof_id={} attested_by={} proof_type={} {}",
-            proof.agreement_hash, proof.proof_id, proof.attested_by, proof.proof_type,
-            expiry_str
+            "  agreement_hash={} proof_id={} attested_by={} proof_type={} {}{}{}",
+            item.proof.agreement_hash, item.proof.proof_id, item.proof.attested_by, item.proof.proof_type,
+            expiry_str, status_str, kind_str
         ));
     }
-    lines.join("\n")
+    lines.join("
+")
+}
+
+fn render_proof_get_summary(resp: &GetProofRpcResponse) -> String {
+    if !resp.found {
+        return format!("proof_id {}
+not_found true", resp.proof_id);
+    }
+    let mut lines = Vec::new();
+    lines.push(format!("proof_id {}", resp.proof_id));
+    lines.push(format!("found {}", resp.found));
+    lines.push(format!("tip_height {}", resp.tip_height));
+    if let Some(ref proof) = resp.proof {
+        lines.push(format!("agreement_hash {}", proof.agreement_hash));
+        lines.push(format!("proof_type {}", proof.proof_type));
+        lines.push(format!("attested_by {}", proof.attested_by));
+        if let Some(ref mid) = proof.milestone_id {
+            lines.push(format!("milestone_id {}", mid));
+        }
+        // typed_payload fields are unsigned metadata (not part of the signed proof payload).
+        // They cannot be used as attestation evidence.
+        if let Some(ref tp) = proof.typed_payload {
+            lines.push(format!("proof_kind {} [metadata]", tp.proof_kind));
+            if let Some(ref rid) = tp.reference_id {
+                lines.push(format!("reference_id {} [metadata]", rid));
+            }
+        }
+    }
+    match resp.expires_at_height {
+        None => lines.push("expires_at_height none".to_string()),
+        Some(h) => lines.push(format!("expires_at_height {}", h)),
+    }
+    lines.push(format!("expired {}", resp.expired));
+    if !resp.status.is_empty() {
+        lines.push(format!("status {}", resp.status));
+    }
+    lines.join("
+")
 }
 
 fn parse_policy_set_cli(args: &[String]) -> Result<PolicySetCliOptions, String> {
@@ -5017,7 +5300,17 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
     }
     lines.push(format!("policy_found {}", resp.policy_found));
     lines.push(format!("tip_height {}", resp.tip_height));
+    if !resp.outcome.is_empty() {
+        lines.push(format!("outcome {}", resp.outcome));
+    }
     lines.push(format!("proof_count {}", resp.proof_count));
+    if resp.expired_proof_count > 0 {
+        lines.push(format!("expired_proof_count {}", resp.expired_proof_count));
+    }
+    lines.push(format!("matched_proof_count {}", resp.matched_proof_count));
+    if !resp.matched_proof_ids.is_empty() {
+        lines.push(format!("matched_proof_ids {}", resp.matched_proof_ids.join(", ")));
+    }
     lines.push(format!("expired {}", resp.expired));
     lines.push(format!("release_eligible {}", resp.release_eligible));
     lines.push(format!("refund_eligible {}", resp.refund_eligible));
@@ -5026,6 +5319,50 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
         lines.push("evaluated_rules".to_string());
         for rule in &resp.evaluated_rules {
             lines.push(format!("  {}", rule));
+        }
+    }
+    if !resp.milestone_results.is_empty() {
+        lines.push(format!(
+            "milestones {}/{}",
+            resp.completed_milestone_count, resp.total_milestone_count
+        ));
+        for ms in &resp.milestone_results {
+            let display = ms
+                .label
+                .as_deref()
+                .filter(|l| !l.is_empty())
+                .unwrap_or(ms.milestone_id.as_str());
+            lines.push(format!("  milestone {} outcome {}", display, ms.outcome));
+            if let Some(ref hb) = ms.holdback {
+                lines.push(format!(
+                    "    holdback {} bps holdback_outcome {}",
+                    hb.holdback_bps, hb.holdback_outcome
+                ));
+                if !hb.holdback_reason.is_empty() {
+                    lines.push(format!("    holdback_reason {}", hb.holdback_reason));
+                }
+            }
+        }
+    }
+    if let Some(ref hb) = resp.holdback {
+        lines.push(format!(
+            "holdback {} bps holdback_outcome {}",
+            hb.holdback_bps, hb.holdback_outcome
+        ));
+        if !hb.holdback_reason.is_empty() {
+            lines.push(format!("holdback_reason {}", hb.holdback_reason));
+        }
+    }
+    if !resp.threshold_results.is_empty() {
+        lines.push("threshold_requirements".to_string());
+        for tr in &resp.threshold_results {
+            lines.push(format!(
+                "  req {} threshold {}/{} {}",
+                tr.requirement_id,
+                tr.approved_attestor_count,
+                tr.threshold_required,
+                if tr.threshold_satisfied { "satisfied" } else { "pending" }
+            ));
         }
     }
     lines.join("\n")
@@ -6571,6 +6908,7 @@ fn submit_tx(client: &Client, base: &str, tx: &Transaction) -> Result<(), String
         return Err(format!("submit tx failed: {}", resp.status()));
     }
     Ok(())
+
 }
 
 #[cfg(test)]
@@ -8543,6 +8881,7 @@ mod tests {
             tip_height: 0,
             expires_at_height: None,
             expired: false,
+            status: "active".to_string(),
         };
         let out = render_proof_submit_summary(&resp);
         assert!(out.contains("proof_id prf-001"), "got: {out}");
@@ -8552,6 +8891,7 @@ mod tests {
         assert!(out.contains("tip_height 0"), "got: {out}");
         assert!(out.contains("expires_at_height none"), "got: {out}");
         assert!(out.contains("expired false"), "got: {out}");
+        assert!(out.contains("status active"), "must show status=active; got: {out}");
     }
 
     #[test]
@@ -8565,6 +8905,7 @@ mod tests {
             tip_height: 10,
             expires_at_height: Some(5),
             expired: true,
+            status: "expired".to_string(),
         };
         let out = render_proof_submit_summary(&resp);
         assert!(out.contains("accepted false"));
@@ -8572,6 +8913,7 @@ mod tests {
         assert!(out.contains("tip_height 10"));
         assert!(out.contains("expires_at_height 5"));
         assert!(out.contains("expired true"));
+        assert!(out.contains("status expired"), "must show status=expired; got: {out}");
     }
 
     #[test]
@@ -8594,17 +8936,19 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let resp = ListProofsRpcResponse {
             agreement_hash: "aabbcc".to_string(),
             tip_height: 0,
             active_only: false,
-            count: 1,
-            proofs: vec![proof],
+            returned_count: 1,
+            proofs: vec![ProofListItem { proof, status: String::new() }],
+            ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
         assert!(out.contains("agreement_hash aabbcc"), "got: {out}");
-        assert!(out.contains("count 1"), "got: {out}");
+        assert!(out.contains("returned_count 1"), "got: {out}");
         assert!(out.contains("prf-list-001"), "got: {out}");
         assert!(out.contains("att-1"), "got: {out}");
         assert!(out.contains("agreement_hash=aabbcc"), "per-proof hash; got: {out}");
@@ -8617,11 +8961,12 @@ mod tests {
             agreement_hash: "deadbeef".to_string(),
             tip_height: 0,
             active_only: false,
-            count: 0,
+            returned_count: 0,
             proofs: vec![],
+            ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(out.contains("count 0"));
+        assert!(out.contains("returned_count 0"));
         assert!(out.contains("deadbeef"));
     }
 
@@ -8796,6 +9141,8 @@ mod tests {
             out_path: None,
             json_mode: false,
             expires_at_height: None,
+            proof_kind: None,
+            reference_id: None,
         };
 
         let proof = create_settlement_proof_signed(&opts).expect("must create proof");
@@ -8837,6 +9184,7 @@ mod tests {
                 payload_hash: "ph789".to_string(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let out = render_proof_create_summary(&proof);
         assert!(out.contains("proof_id prf-render-001"), "got: {out}");
@@ -8899,6 +9247,8 @@ mod tests {
             out_path: None,
             json_mode: false,
             expires_at_height: None,
+            proof_kind: None,
+            reference_id: None,
         };
 
         let proof = create_settlement_proof_signed(&opts).expect("must create proof");
@@ -8988,6 +9338,7 @@ mod tests {
                     required_attestor_ids: vec!["att-1".to_string()],
                     resolution: ProofResolution::Release,
                     milestone_id: None,
+                    threshold: None,
                 }],
                 no_response_rules: vec![],
                 attestors: vec![ApprovedAttestor {
@@ -8998,6 +9349,8 @@ mod tests {
                 }],
                 notes: None,
                 expires_at_height: None,
+                milestones: vec![],
+                holdback: None,
             }),
             expires_at_height: None,
             expired: false,
@@ -9057,17 +9410,21 @@ mod tests {
             policy_id: Some("pol-eval-001".to_string()),
             tip_height: 100,
             proof_count: 1,
+            matched_proof_count: 1,
+            matched_proof_ids: vec!["prf-1".to_string()],
             release_eligible: true,
             refund_eligible: false,
             reason: "all release requirements satisfied".to_string(),
             evaluated_rules: vec!["proof 'prf-1' verified ok".to_string()],
-            expired: false,
+            ..Default::default()
         };
         let out = render_policy_evaluate_summary(&resp);
         assert!(out.contains("agreement_hash aabbcc"), "got: {out}");
         assert!(out.contains("policy_id pol-eval-001"), "got: {out}");
         assert!(out.contains("policy_found true"), "got: {out}");
         assert!(out.contains("proof_count 1"), "got: {out}");
+        assert!(out.contains("matched_proof_count 1"), "got: {out}");
+        assert!(out.contains("matched_proof_ids prf-1"), "got: {out}");
         assert!(out.contains("release_eligible true"), "got: {out}");
         assert!(out.contains("verified ok"), "got: {out}");
     }
@@ -9084,7 +9441,7 @@ mod tests {
             refund_eligible: false,
             reason: "no policy stored for this agreement".to_string(),
             evaluated_rules: vec![],
-            expired: false,
+            ..Default::default()
         };
         let out = render_policy_evaluate_summary(&resp);
         assert!(out.contains("policy_found false"), "got: {out}");
@@ -9104,11 +9461,244 @@ mod tests {
             refund_eligible: false,
             reason: "no release or refund condition was met".to_string(),
             evaluated_rules: vec![],
-            expired: false,
+            ..Default::default()
         };
         let out = render_policy_evaluate_summary(&resp);
         assert!(out.contains("proof_count 0"), "got: {out}");
+        assert!(out.contains("matched_proof_count 0"), "got: {out}");
         assert!(out.contains("release_eligible false"), "got: {out}");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_with_expired_proofs() {
+        // Expired proofs are filtered before evaluation; expired_proof_count shows how many.
+        let resp = EvaluatePolicyRpcResponse {
+            agreement_hash: "exp-hash".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-exp".to_string()),
+            proof_count: 0,
+            expired_proof_count: 2,
+            matched_proof_count: 0,
+            release_eligible: false,
+            refund_eligible: false,
+            reason: "no release or refund condition was met".to_string(),
+            evaluated_rules: vec![
+                "proof 'prf-x' skipped: expired at height 5 (tip 10)".to_string(),
+                "proof 'prf-y' skipped: expired at height 3 (tip 10)".to_string(),
+            ],
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("expired_proof_count 2"), "must show expired count; got: {out}");
+        assert!(out.contains("matched_proof_count 0"), "no matched; got: {out}");
+        assert!(!out.contains("matched_proof_ids"), "no matched ids to show; got: {out}");
+        assert!(out.contains("skipped"), "evaluated_rules must mention skipped; got: {out}");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_mixed_active_expired() {
+        // 1 active proof matched, 1 expired filtered out.
+        let resp = EvaluatePolicyRpcResponse {
+            agreement_hash: "mix-hash".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-mix".to_string()),
+            proof_count: 1,
+            expired_proof_count: 1,
+            matched_proof_count: 1,
+            matched_proof_ids: vec!["prf-active".to_string()],
+            release_eligible: true,
+            refund_eligible: false,
+            reason: "all release requirements satisfied by verified proofs".to_string(),
+            evaluated_rules: vec![
+                "proof 'prf-expired' skipped: expired at height 0 (tip 5)".to_string(),
+                "proof 'prf-active' verified ok".to_string(),
+            ],
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("proof_count 1"), "got: {out}");
+        assert!(out.contains("expired_proof_count 1"), "got: {out}");
+        assert!(out.contains("matched_proof_count 1"), "got: {out}");
+        assert!(out.contains("matched_proof_ids prf-active"), "got: {out}");
+        assert!(out.contains("release_eligible true"), "got: {out}");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_no_expired_count_hidden_when_zero() {
+        // expired_proof_count=0 must not appear in the summary output.
+        let resp = EvaluatePolicyRpcResponse {
+            agreement_hash: "clean-hash".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-clean".to_string()),
+            proof_count: 1,
+            expired_proof_count: 0,
+            matched_proof_count: 1,
+            matched_proof_ids: vec!["prf-ok".to_string()],
+            release_eligible: true,
+            refund_eligible: false,
+            reason: "all release requirements satisfied by verified proofs".to_string(),
+            evaluated_rules: vec!["proof 'prf-ok' verified ok".to_string()],
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(!out.contains("expired_proof_count"), "zero expired must be silent; got: {out}");
+        assert!(out.contains("matched_proof_count 1"), "got: {out}");
+    }
+
+    // ---- outcome field render tests ----
+
+    #[test]
+    fn render_policy_evaluate_summary_outcome_satisfied() {
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "satisfied".to_string(),
+            agreement_hash: "hash-sat".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-sat".to_string()),
+            proof_count: 1,
+            matched_proof_count: 1,
+            matched_proof_ids: vec!["prf-1".to_string()],
+            release_eligible: true,
+            reason: "all release requirements satisfied by verified proofs".to_string(),
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("outcome satisfied"), "must show outcome; got: {out}");
+        assert!(out.contains("release_eligible true"), "got: {out}");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_outcome_unsatisfied() {
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "unsatisfied".to_string(),
+            agreement_hash: "hash-unsat".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-unsat".to_string()),
+            proof_count: 0,
+            release_eligible: false,
+            reason: "no release or refund condition was met".to_string(),
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("outcome unsatisfied"), "must show outcome; got: {out}");
+        assert!(out.contains("release_eligible false"), "got: {out}");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_outcome_timeout() {
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "timeout".to_string(),
+            agreement_hash: "hash-to".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-to".to_string()),
+            proof_count: 0,
+            refund_eligible: true,
+            reason: "no_response_rule rule-1 deadline 100 reached at tip 100 trigger funded_and_no_release".to_string(),
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("outcome timeout"), "must show outcome; got: {out}");
+        assert!(out.contains("refund_eligible true"), "got: {out}");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_outcome_empty_string_hidden() {
+        // Old server responses without outcome field must not show "outcome " line.
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: String::new(),
+            agreement_hash: "hash-old".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-old".to_string()),
+            proof_count: 1,
+            matched_proof_count: 1,
+            release_eligible: true,
+            reason: "all release requirements satisfied by verified proofs".to_string(),
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(!out.contains("outcome "), "empty outcome must be silent; got: {out}");
+    }
+
+    // ---- milestone render tests ----
+
+    #[test]
+    fn render_policy_evaluate_summary_milestone_breakdown() {
+        // Two milestones: ms-a satisfied, ms-b unsatisfied.
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "unsatisfied".to_string(),
+            agreement_hash: "hash-ms".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-ms".to_string()),
+            release_eligible: false,
+            reason: "1 of 2 milestones satisfied; 1 unsatisfied".to_string(),
+            total_milestone_count: 2,
+            completed_milestone_count: 1,
+            milestone_results: vec![
+                MilestoneRpcResult {
+                    milestone_id: "ms-a".to_string(),
+                    label: Some("Delivery".to_string()),
+                    outcome: "satisfied".to_string(),
+                    release_eligible: true,
+                    reason: "all release requirements satisfied by verified proofs".to_string(),
+                    ..Default::default()
+                },
+                MilestoneRpcResult {
+                    milestone_id: "ms-b".to_string(),
+                    label: None,
+                    outcome: "unsatisfied".to_string(),
+                    reason: "no release or refund condition was met".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("milestones 1/2"), "must show milestone count; got: {out}");
+        assert!(out.contains("Delivery outcome satisfied"), "must show labeled milestone; got: {out}");
+        assert!(out.contains("ms-b outcome unsatisfied"), "must show unlabeled milestone by id; got: {out}");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_milestone_all_satisfied() {
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "satisfied".to_string(),
+            agreement_hash: "hash-ms-sat".to_string(),
+            policy_found: true,
+            release_eligible: true,
+            reason: "all milestones satisfied".to_string(),
+            total_milestone_count: 2,
+            completed_milestone_count: 2,
+            milestone_results: vec![
+                MilestoneRpcResult {
+                    milestone_id: "ms-a".to_string(),
+                    outcome: "satisfied".to_string(),
+                    ..Default::default()
+                },
+                MilestoneRpcResult {
+                    milestone_id: "ms-b".to_string(),
+                    outcome: "satisfied".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("milestones 2/2"), "must show 2/2; got: {out}");
+        assert!(out.contains("outcome satisfied"), "got: {out}");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_no_milestone_section_when_empty() {
+        // When milestone_results is empty, "milestones" line must not appear.
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "satisfied".to_string(),
+            agreement_hash: "hash-no-ms".to_string(),
+            policy_found: true,
+            release_eligible: true,
+            reason: "all release requirements satisfied by verified proofs".to_string(),
+            ..Default::default()
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(!out.contains("milestones"), "must not show milestone section; got: {out}");
     }
 
     #[test]
@@ -9257,6 +9847,8 @@ mod tests {
                 attestors: vec![],
                 notes: None,
                 expires_at_height: Some(500),
+                milestones: vec![],
+                holdback: None,
             }),
             expires_at_height: Some(500),
             expired: false,
@@ -9281,6 +9873,8 @@ mod tests {
                 attestors: vec![],
                 notes: None,
                 expires_at_height: Some(10),
+                milestones: vec![],
+                holdback: None,
             }),
             expires_at_height: Some(10),
             expired: true,
@@ -9387,12 +9981,13 @@ mod tests {
             agreement_hash: "*".to_string(),
             tip_height: 0,
             active_only: false,
-            count: 0,
+            returned_count: 0,
             proofs: vec![],
+            ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
         assert!(out.contains("agreement_hash * (all)"), "must show global header; got: {out}");
-        assert!(out.contains("count 0"), "got: {out}");
+        assert!(out.contains("returned_count 0"), "got: {out}");
     }
 
     #[test]
@@ -9401,8 +9996,9 @@ mod tests {
             agreement_hash: "aabbcc".to_string(),
             tip_height: 0,
             active_only: false,
-            count: 0,
+            returned_count: 0,
             proofs: vec![],
+            ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
         assert!(out.contains("agreement_hash aabbcc"), "must show filter hash; got: {out}");
@@ -9455,18 +10051,21 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: Some(1000),
+            typed_payload: None,
         };
         // tip_height=50 < expires_at_height=1000 => not expired
         let resp = ListProofsRpcResponse {
             agreement_hash: "hashexp".to_string(),
             tip_height: 50,
             active_only: false,
-            count: 1,
-            proofs: vec![proof],
+            returned_count: 1,
+            proofs: vec![ProofListItem { proof, status: "active".to_string() }],
+            ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
         assert!(out.contains("expires_at_height=1000"), "must show expiry height; got: {out}");
         assert!(out.contains("expired=false"), "must show not expired at tip 50; got: {out}");
+        assert!(out.contains("status=active"), "must show status=active; got: {out}");
     }
 
     #[test]
@@ -9489,18 +10088,21 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: Some(100),
+            typed_payload: None,
         };
         // tip_height=200 >= expires_at_height=100 => expired
         let resp = ListProofsRpcResponse {
             agreement_hash: "hashexp2".to_string(),
             tip_height: 200,
             active_only: false,
-            count: 1,
-            proofs: vec![proof],
+            returned_count: 1,
+            proofs: vec![ProofListItem { proof, status: "expired".to_string() }],
+            ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
         assert!(out.contains("expires_at_height=100"), "must show expiry height; got: {out}");
         assert!(out.contains("expired=true"), "must show expired at tip 200; got: {out}");
+        assert!(out.contains("status=expired"), "must show status=expired; got: {out}");
     }
 
     #[test]
@@ -9523,6 +10125,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: Some(8000),
+            typed_payload: None,
         };
         let out = render_proof_create_summary(&proof);
         assert!(out.contains("expires_at_height 8000"), "must show expiry height; got: {out}");
@@ -9548,6 +10151,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let out = render_proof_create_summary(&proof);
         assert!(out.contains("expires_at_height none"), "must show none when no expiry; got: {out}");
@@ -9575,8 +10179,9 @@ mod tests {
             agreement_hash: "*".to_string(),
             tip_height: 0,
             active_only: true,
-            count: 0,
+            returned_count: 0,
             proofs: vec![],
+            ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
         assert!(out.contains("filter active_only true"), "must show filter header; got: {out}");
@@ -9588,8 +10193,9 @@ mod tests {
             agreement_hash: "*".to_string(),
             tip_height: 0,
             active_only: false,
-            count: 0,
+            returned_count: 0,
             proofs: vec![],
+            ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
         assert!(!out.contains("filter active_only"), "must not show filter header; got: {out}");
@@ -9619,11 +10225,13 @@ mod tests {
             tip_height: 100,
             expires_at_height: None,
             expired: false,
+            status: "active".to_string(),
         };
         let out = render_proof_submit_summary(&resp);
         assert!(out.contains("expires_at_height none"), "must show none; got: {out}");
         assert!(out.contains("expired false"), "non-expiring must show expired false; got: {out}");
         assert!(out.contains("tip_height 100"), "must show tip; got: {out}");
+        assert!(out.contains("status active"), "non-expiring must show status active; got: {out}");
     }
 
     #[test]
@@ -9637,10 +10245,12 @@ mod tests {
             tip_height: 0,
             expires_at_height: Some(1000),
             expired: false,
+            status: "active".to_string(),
         };
         let out = render_proof_submit_summary(&resp);
         assert!(out.contains("expires_at_height 1000"), "must show expiry height; got: {out}");
         assert!(out.contains("expired false"), "future expiry must show expired false; got: {out}");
+        assert!(out.contains("status active"), "future expiry must show status active; got: {out}");
     }
 
     #[test]
@@ -9654,11 +10264,403 @@ mod tests {
             tip_height: 50,
             expires_at_height: Some(10),
             expired: true,
+            status: "expired".to_string(),
         };
         let out = render_proof_submit_summary(&resp);
         assert!(out.contains("expires_at_height 10"), "must show expiry height; got: {out}");
         assert!(out.contains("expired true"), "must show expired true; got: {out}");
         assert!(out.contains("tip_height 50"), "must show tip height; got: {out}");
+        assert!(out.contains("status expired"), "must show status expired; got: {out}");
+    }
+
+
+    #[test]
+    fn render_proof_list_summary_status_active_shown() {
+        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        let proof = SettlementProof {
+            proof_id: "prf-st-a".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: "hashst".to_string(),
+            milestone_id: None,
+            attested_by: "att-s".to_string(),
+            attestation_time: 1700000000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: String::new(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: Some(1000),
+            typed_payload: None,
+        };
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "hashst".to_string(),
+            tip_height: 0,
+            active_only: false,
+            returned_count: 1,
+            proofs: vec![ProofListItem { proof, status: "active".to_string() }],
+            ..Default::default()
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("status=active"), "status=active must appear in output; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_list_summary_status_expired_shown() {
+        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        let proof = SettlementProof {
+            proof_id: "prf-st-e".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: "hashste".to_string(),
+            milestone_id: None,
+            attested_by: "att-se".to_string(),
+            attestation_time: 1700000000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: String::new(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: Some(100),
+            typed_payload: None,
+        };
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "hashste".to_string(),
+            tip_height: 200,
+            active_only: false,
+            returned_count: 1,
+            proofs: vec![ProofListItem { proof, status: "expired".to_string() }],
+            ..Default::default()
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("status=expired"), "status=expired must appear in output; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_list_summary_status_empty_not_shown() {
+        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        let proof = SettlementProof {
+            proof_id: "prf-st-none".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: "hashstn".to_string(),
+            milestone_id: None,
+            attested_by: "att-sn".to_string(),
+            attestation_time: 1700000000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: String::new(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+            typed_payload: None,
+        };
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "hashstn".to_string(),
+            tip_height: 0,
+            active_only: false,
+            returned_count: 1,
+            proofs: vec![ProofListItem { proof, status: String::new() }],
+            ..Default::default()
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(!out.contains("status="), "empty status must not appear in output; got: {out}");
+    }
+
+
+    #[test]
+    fn render_proof_submit_summary_status_active_shown() {
+        let resp = SubmitProofRpcResponse {
+            proof_id: "prf-s-a".to_string(),
+            agreement_hash: "hash-sa".to_string(),
+            accepted: true,
+            duplicate: false,
+            message: "proof accepted".to_string(),
+            tip_height: 0,
+            expires_at_height: None,
+            expired: false,
+            status: "active".to_string(),
+        };
+        let out = render_proof_submit_summary(&resp);
+        assert!(out.contains("status active"), "status active must appear; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_submit_summary_status_expired_shown() {
+        let resp = SubmitProofRpcResponse {
+            proof_id: "prf-s-e".to_string(),
+            agreement_hash: "hash-se".to_string(),
+            accepted: true,
+            duplicate: false,
+            message: "proof accepted".to_string(),
+            tip_height: 100,
+            expires_at_height: Some(50),
+            expired: true,
+            status: "expired".to_string(),
+        };
+        let out = render_proof_submit_summary(&resp);
+        assert!(out.contains("status expired"), "status expired must appear; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_submit_summary_status_empty_not_shown() {
+        // Old node response with no status field: status defaults to empty, must not appear in output.
+        let resp = SubmitProofRpcResponse {
+            proof_id: "prf-s-n".to_string(),
+            agreement_hash: "hash-sn".to_string(),
+            accepted: true,
+            duplicate: false,
+            message: "proof accepted".to_string(),
+            tip_height: 0,
+            expires_at_height: None,
+            expired: false,
+            status: String::new(),
+        };
+        let out = render_proof_submit_summary(&resp);
+        assert!(!out.contains("status"), "empty status must not appear in output; got: {out}");
+    }
+
+
+    #[test]
+    fn parse_proof_get_cli_parses_required_args() {
+        let args: Vec<String> = vec![
+            "--proof-id".to_string(), "prf-001".to_string(),
+        ];
+        let opts = parse_proof_get_cli(&args).expect("must parse");
+        assert_eq!(opts.proof_id, "prf-001");
+    }
+
+    #[test]
+    fn parse_proof_get_cli_rejects_missing_proof_id() {
+        let args: Vec<String> = vec![];
+        let err = parse_proof_get_cli(&args).unwrap_err();
+        assert!(err.contains("--proof-id"), "got: {err}");
+    }
+
+    #[test]
+    fn render_proof_get_summary_found_active() {
+        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        let proof = SettlementProof {
+            proof_id: "prf-get-1".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: "hashget".to_string(),
+            milestone_id: None,
+            attested_by: "att-g".to_string(),
+            attestation_time: 1700000000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: String::new(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+            typed_payload: None,
+        };
+        let resp = GetProofRpcResponse {
+            proof_id: "prf-get-1".to_string(),
+            found: true,
+            tip_height: 0,
+            proof: Some(proof),
+            expires_at_height: None,
+            expired: false,
+            status: "active".to_string(),
+        };
+        let out = render_proof_get_summary(&resp);
+        assert!(out.contains("found true"), "got: {out}");
+        assert!(out.contains("prf-get-1"), "got: {out}");
+        assert!(out.contains("expires_at_height none"), "got: {out}");
+        assert!(out.contains("expired false"), "got: {out}");
+        assert!(out.contains("status active"), "got: {out}");
+    }
+
+    #[test]
+    fn render_proof_get_summary_found_expired() {
+        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        let proof = SettlementProof {
+            proof_id: "prf-get-2".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "payment".to_string(),
+            agreement_hash: "hashgete".to_string(),
+            milestone_id: None,
+            attested_by: "att-ge".to_string(),
+            attestation_time: 1700000000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: String::new(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: Some(100),
+            typed_payload: None,
+        };
+        let resp = GetProofRpcResponse {
+            proof_id: "prf-get-2".to_string(),
+            found: true,
+            tip_height: 200,
+            proof: Some(proof),
+            expires_at_height: Some(100),
+            expired: true,
+            status: "expired".to_string(),
+        };
+        let out = render_proof_get_summary(&resp);
+        assert!(out.contains("expires_at_height 100"), "got: {out}");
+        assert!(out.contains("expired true"), "got: {out}");
+        assert!(out.contains("status expired"), "got: {out}");
+    }
+
+    #[test]
+    fn render_proof_get_summary_not_found() {
+        let resp = GetProofRpcResponse {
+            proof_id: "no-such-proof".to_string(),
+            found: false,
+            tip_height: 0,
+            proof: None,
+            expires_at_height: None,
+            expired: false,
+            status: String::new(),
+        };
+        let out = render_proof_get_summary(&resp);
+        assert!(out.contains("not_found true"), "must show not_found; got: {out}");
+        assert!(!out.contains("
+found true"), "must not show found true; got: {out}");
+        assert!(!out.contains("status"), "status must not appear when not found; got: {out}");
+    }
+
+
+    // ---- Pagination CLI + render tests ----
+
+    #[test]
+    fn proof_list_cli_parses_limit_flag() {
+        let args = vec!["--limit".to_string(), "10".to_string()];
+        let opts = parse_proof_list_cli(&args).expect("must parse");
+        assert_eq!(opts.limit, Some(10));
+        assert_eq!(opts.offset, 0);
+    }
+
+    #[test]
+    fn proof_list_cli_parses_offset_flag() {
+        let args = vec!["--offset".to_string(), "5".to_string()];
+        let opts = parse_proof_list_cli(&args).expect("must parse");
+        assert_eq!(opts.offset, 5);
+        assert_eq!(opts.limit, None);
+    }
+
+    #[test]
+    fn proof_list_cli_parses_limit_and_offset() {
+        let args = vec![
+            "--offset".to_string(), "3".to_string(),
+            "--limit".to_string(), "7".to_string(),
+        ];
+        let opts = parse_proof_list_cli(&args).expect("must parse");
+        assert_eq!(opts.offset, 3);
+        assert_eq!(opts.limit, Some(7));
+    }
+
+    #[test]
+    fn proof_list_cli_rejects_non_integer_limit() {
+        let args = vec!["--limit".to_string(), "abc".to_string()];
+        let err = parse_proof_list_cli(&args).unwrap_err();
+        assert!(err.contains("--limit"), "got: {err}");
+    }
+
+    #[test]
+    fn render_proof_list_summary_shows_pagination_info() {
+        // When total_count != returned_count, pagination metadata must appear in output.
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "*".to_string(),
+            returned_count: 2,
+            total_count: 10,
+            has_more: true,
+            offset: 4,
+            limit: Some(2),
+            ..Default::default()
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("total_count 10"), "must show total; got: {out}");
+        assert!(out.contains("offset 4"), "must show offset; got: {out}");
+        assert!(out.contains("limit 2"), "must show limit; got: {out}");
+        assert!(out.contains("has_more true"), "must show has_more when true; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_list_summary_no_pagination_info_when_full_page() {
+        // When no pagination, total_count/offset/limit/has_more must not appear.
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "*".to_string(),
+            returned_count: 3,
+            total_count: 3,
+            ..Default::default()
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(!out.contains("total_count"), "must not show pagination noise; got: {out}");
+        assert!(!out.contains("offset"), "must not show offset when zero; got: {out}");
+        assert!(!out.contains("limit"), "must not show limit when absent; got: {out}");
+        assert!(!out.contains("has_more"), "must not show has_more when false; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_list_summary_has_more_false_on_last_page() {
+        // Last page: returned_count + offset == total_count => has_more false, not shown.
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "*".to_string(),
+            returned_count: 2,
+            total_count: 4,
+            has_more: false,
+            offset: 2,
+            limit: Some(2),
+            ..Default::default()
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("total_count 4"), "must show total; got: {out}");
+        assert!(out.contains("offset 2"), "must show offset; got: {out}");
+        assert!(!out.contains("has_more"), "has_more false must be silent; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_list_summary_has_more_true_shown() {
+        // First page: has_more=true must appear in output.
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "*".to_string(),
+            returned_count: 2,
+            total_count: 5,
+            has_more: true,
+            offset: 0,
+            limit: Some(2),
+            ..Default::default()
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(out.contains("has_more true"), "must show has_more when true; got: {out}");
+        assert!(out.contains("total_count 5"), "must show total; got: {out}");
+        assert!(!out.contains("offset"), "offset is zero, must be silent; got: {out}");
+    }
+
+    #[test]
+    fn render_proof_list_summary_no_limit_full_result_no_pagination_noise() {
+        // No limit, returned_count == total_count => no pagination metadata shown.
+        let resp = ListProofsRpcResponse {
+            agreement_hash: "*".to_string(),
+            returned_count: 3,
+            total_count: 3,
+            has_more: false,
+            ..Default::default()
+        };
+        let out = render_proof_list_summary(&resp);
+        assert!(!out.contains("has_more"), "no pagination noise; got: {out}");
+        assert!(!out.contains("total_count"), "no pagination noise; got: {out}");
     }
 
 }
@@ -12608,6 +13610,8 @@ fn main() {
             let req = ListProofsRpcRequest {
                 agreement_hash: opts.agreement_hash.clone(),
                 active_only: opts.active_only,
+                offset: opts.offset,
+                limit: opts.limit,
             };
             let resp: ListProofsRpcResponse =
                 match rpc_post_json(&client, base, "/rpc/listproofs", &req) {
@@ -12624,6 +13628,44 @@ fn main() {
                 );
             } else {
                 println!("{}", render_proof_list_summary(&resp));
+            }
+        }
+        "agreement-proof-get" => {
+            let opts = match parse_proof_get_cli(&args[1..]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    usage();
+                    std::process::exit(1);
+                }
+            };
+            let base = opts.rpc_url.trim_end_matches('/');
+            let client = match rpc_client(base) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let req = GetProofRpcRequest { proof_id: opts.proof_id };
+            let resp: GetProofRpcResponse =
+                match rpc_post_json(&client, base, "/rpc/getproof", &req) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                };
+            if opts.json_mode {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap()
+                );
+            } else {
+                println!("{}", render_proof_get_summary(&resp));
+            }
+            if !resp.found {
+                std::process::exit(1);
             }
         }
         "agreement-policy-check" => {
@@ -13597,5 +14639,4 @@ fn main() {
             std::process::exit(1);
         }
     }
-
 }
