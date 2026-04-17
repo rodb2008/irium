@@ -60,7 +60,16 @@ A proof policy binds a set of requirements and timeout rules to a specific agree
       "domain": null
     }
   ],
-  "notes": null
+  "notes": null,
+  "milestones": [
+    { "milestone_id": "ms-delivery", "label": "Delivery confirmation" },
+    { "milestone_id": "ms-inspection", "label": "Inspection sign-off" }
+  ],
+  "holdback": {
+    "holdback_bps": 1000,
+    "release_requirement_id": "req-holdback",
+    "deadline_height": 50000
+  }
 }
 ```
 
@@ -79,7 +88,9 @@ A proof policy binds a set of requirements and timeout rules to a specific agree
 - `required_by` (block height deadline on a ProofRequirement) is stored but not evaluated.
 - `resolution: "refund"` on a `ProofRequirement` is stored but not evaluated. Proof-triggered
   refunds are only reachable via `no_response_rules` in the current implementation.
-- `milestone_id` scoping on requirements and rules is stored but not used in evaluation logic.
+- `milestone_id` scoping: requirements and rules with a `milestone_id` are now
+  evaluated independently per milestone when the policy declares a `milestones` array.
+  See [Milestone / tranche-based evaluation](#milestone--tranche-based-evaluation) below.
 
 ---
 
@@ -180,7 +191,15 @@ Authorization: Bearer <token>
   "reason": "all release requirements satisfied by verified proofs",
   "evaluated_rules": [
     "proof 'prf-001' verified ok"
-  ]
+  ],
+  "holdback": {
+    "holdback_present": true,
+    "holdback_released": false,
+    "holdback_bps": 1000,
+    "immediate_release_bps": 9000,
+    "holdback_outcome": "held",
+    "holdback_reason": "base satisfied; holdback pending release condition"
+  }
 }
 ```
 
@@ -190,6 +209,73 @@ Authorization: Bearer <token>
 - `reason`: human-readable explanation of the outcome.
 - `evaluated_rules`: ordered list of strings describing each step taken, including
   verified proofs, rejected proofs, and triggered or pending deadline rules.
+- `holdback`: present only when the policy declares a top-level holdback. Absent
+  (`null`-omitted) when no holdback is configured or when the milestone evaluation
+  path is used (in which case per-milestone holdbacks appear inside
+  `milestone_results`). See **Holdback detail** below.
+- `milestone_results`: present only when the policy declares milestones; each entry
+  mirrors the `MilestoneEvaluationResult` shape from `/rpc/evaluatepolicy`.
+
+#### Holdback detail fields
+
+| Field | Type | Description |
+|---|---|---|
+| `holdback_present` | bool | Always `true` when this object is present. |
+| `holdback_released` | bool | `true` when the holdback has been released. |
+| `holdback_bps` | integer | Basis points retained (1–9999). |
+| `immediate_release_bps` | integer | Basis points immediately releasable: `10000 - holdback_bps` when `held`; `10000` when `released`. |
+| `holdback_outcome` | string | `"pending"`, `"held"`, or `"released"`. |
+| `holdback_reason` | string | Human-readable explanation. |
+
+**`holdback_outcome` values:**
+
+| Value | Meaning |
+|---|---|
+| `"pending"` | Base release condition not yet satisfied; holdback not yet active. |
+| `"held"` | Base satisfied but holdback release condition (deadline or requirement) not met. |
+| `"released"` | Holdback released — either the deadline passed or the release requirement was satisfied. |
+
+#### Holdback example: held vs released
+
+**Held** (base release satisfied, holdback deadline in the future at tip 100):
+```json
+{
+  "release_eligible": true,
+  "holdback": {
+    "holdback_present": true,
+    "holdback_released": false,
+    "holdback_bps": 1000,
+    "immediate_release_bps": 9000,
+    "holdback_outcome": "held",
+    "holdback_reason": "base satisfied; holdback pending release condition"
+  }
+}
+```
+
+**Released** (deadline height 500 passed at tip 1000):
+```json
+{
+  "release_eligible": true,
+  "holdback": {
+    "holdback_present": true,
+    "holdback_released": true,
+    "holdback_bps": 500,
+    "immediate_release_bps": 10000,
+    "holdback_outcome": "released",
+    "holdback_reason": "holdback released by deadline at height 500"
+  }
+}
+```
+
+**No holdback** (policy without a `holdback` declaration):
+```json
+{
+  "release_eligible": true,
+  "reason": "all release requirements satisfied by verified proofs",
+  "evaluated_rules": ["proof 'prf-001' verified ok"]
+}
+```
+The `holdback` key is omitted entirely — not set to `null` — when absent.
 
 ### Error responses
 
@@ -307,7 +393,8 @@ Authorization: Bearer <token>
   "message": "proof accepted",
   "tip_height": 1042,
   "expires_at_height": 2000,
-  "expired": false
+  "expired": false,
+  "status": "active"
 }
 ```
 
@@ -317,6 +404,7 @@ Authorization: Bearer <token>
 - `tip_height`: chain tip height at the moment the proof was submitted.
 - `expires_at_height`: value of `expires_at_height` from the submitted proof, or `null` if the proof has no expiry.
 - `expired`: `true` when `tip_height >= expires_at_height` at submit time; always `false` when `expires_at_height` is `null`. Expiry does **not** affect acceptance — an expired proof is still stored.
+- `status`: `"active"` or `"expired"`. Consistent with per-proof `status` in `/rpc/listproofs`. Derived from `expired`: if `expired` is true then `status` is `"expired"`, otherwise `"active"`.
 
 ### Error responses
 
@@ -336,9 +424,9 @@ Authorization: Bearer <token>
 
 ---
 
-## POST /rpc/listproofs
+## POST /rpc/getproof
 
-Returns all stored proofs for a given agreement hash.
+Retrieves a single settlement proof by its `proof_id`.
 
 ### Authentication
 
@@ -348,7 +436,76 @@ Requires `Authorization: Bearer <IRIUM_RPC_TOKEN>`. Rate-limited.
 
 ```json
 {
-  "agreement_hash": "<64-char hex>"
+  "proof_id": "prf-001"
+}
+```
+
+### Response (200 OK)
+
+```json
+{
+  "proof_id": "prf-001",
+  "found": true,
+  "tip_height": 19200,
+  "proof": { "proof_id": "prf-001", "agreement_hash": "...", "expires_at_height": null, "..." : "..." },
+  "expires_at_height": null,
+  "expired": false,
+  "status": "active"
+}
+```
+
+When not found:
+
+```json
+{
+  "proof_id": "prf-unknown",
+  "found": false,
+  "tip_height": 19200,
+  "proof": null,
+  "expires_at_height": null,
+  "expired": false,
+  "status": ""
+}
+```
+
+### Fields
+
+- `found`: `true` if the proof exists in the store; `false` if not found.
+- `proof`: full `SettlementProof` object when `found=true`; `null` otherwise.
+- `tip_height`: chain tip height at query time.
+- `expires_at_height`: echoed from the proof; `null` if no expiry or `found=false`.
+- `expired`: `true` when `tip_height >= expires_at_height`; always `false` when `expires_at_height` is null or `found=false`.
+- `status`: `"active"` or `"expired"` when `found=true`, consistent with per-proof `status` in `/rpc/listproofs`. Empty string when `found=false`.
+- Invariant: `(status == "expired") == expired` always holds.
+
+### Error responses
+
+- `401 Unauthorized` — missing or invalid RPC token.
+- `429 Too Many Requests` — rate limit exceeded.
+- Not found is signalled by `found: false` in the response body (not a 404).
+
+---
+
+## POST /rpc/listproofs
+
+Returns all stored proofs for a given agreement hash.
+
+**Ordering guarantee:** Proofs are always returned sorted by `attestation_time` ascending,
+with `proof_id` ascending as a stable tie-breaker. This rule applies to global queries
+(`agreement_hash` omitted), agreement-scoped queries, and `active_only` filtered queries.
+
+### Authentication
+
+Requires `Authorization: Bearer <IRIUM_RPC_TOKEN>`. Rate-limited.
+
+### Request
+
+```json
+{
+  "agreement_hash": "<64-char hex>",
+  "active_only": false,
+  "offset": 0,
+  "limit": 50
 }
 ```
 
@@ -357,15 +514,38 @@ Requires `Authorization: Bearer <IRIUM_RPC_TOKEN>`. Rate-limited.
 ```json
 {
   "agreement_hash": "<64-char hex>",
-  "count": 1,
+  "tip_height": 19200,
+  "active_only": false,
+  "total_count": 25,
+  "returned_count": 5,
+  "has_more": true,
+  "offset": 10,
+  "limit": 5,
   "proofs": [
-    { ... }
+    { "proof_id": "prf-011", "expires_at_height": null, "status": "active", "..." : "..." }
   ]
 }
 ```
 
-- `proofs`: array of `SettlementProof` objects sorted by `proof_id`.
-- Returns an empty array if no proofs are stored for the given hash.
+- `tip_height`: chain tip height at query time.
+- `active_only`: echoes the request filter.
+- `total_count`: total proofs matching all filters before pagination. Equals `returned_count`
+  when no pagination is applied.
+- `returned_count`: number of proofs returned in this page. Always equals `proofs.len()`.
+- `has_more`: `true` when more proofs remain after this page
+  (`total_count > offset + returned_count`); `false` on the last page or when all results
+  fit in one page. Clients should use this field to drive cursor-style pagination.
+- `offset`: echoed from the request (0 when omitted).
+- `limit`: echoed from the request (`null` when omitted).
+- `proofs`: array of proof objects sorted **by `attestation_time` ascending, then `proof_id`
+  ascending** as a stable tie-breaker. This order is consistent across global queries,
+  agreement-scoped queries, and `active_only` filtered queries. Each proof includes:
+  - All `SettlementProof` fields.
+  - `status`: `"active"` if the proof is not expired at `tip_height`; `"expired"` if `tip_height >= expires_at_height`.
+- Returns an empty `proofs` array and `returned_count: 0` if offset exceeds available proofs.
+  `has_more` will be `false` in this case.
+- `limit` and `offset` are optional. When omitted, all matching proofs are returned from offset 0
+  and `has_more` will always be `false`.
 
 ---
 
@@ -397,16 +577,62 @@ message proof accepted
 tip_height 1042
 expires_at_height 2000
 expired false
+status active
 ```
 
 `expires_at_height` is shown as `none` when the proof carries no expiry. `expired` reflects
 whether `tip_height >= expires_at_height` at submit time; an expired proof is still accepted
-for storage.
+for storage. `status` shows `active` or `expired` and is consistent with the `status` field
+in `agreement-proof-list` output. `status` is omitted if the node does not return it (older nodes).
 
 ### Exit codes
 
 - `0`: proof was accepted or duplicate.
 - `1`: proof was rejected, RPC call failed, or input parsing failed.
+
+---
+
+## irium-wallet agreement-proof-get
+
+Retrieves a single settlement proof by `proof_id` from the node.
+
+```
+irium-wallet agreement-proof-get \n  --proof-id <id> \n  [--rpc <url>] \n  [--json]
+```
+
+### Arguments
+
+| Flag | Required | Description |
+|---|---|---|
+| `--proof-id <id>` | yes | The `proof_id` of the proof to retrieve |
+| `--rpc <url>` | no | Node RPC base URL |
+| `--json` | no | Output raw JSON response |
+
+### Default output (found)
+
+```
+proof_id prf-001
+found true
+tip_height 19200
+agreement_hash <64-char hex>
+proof_type delivery_confirmation
+attested_by attestor-a
+expires_at_height none
+expired false
+status active
+```
+
+### Default output (not found)
+
+```
+proof_id prf-unknown
+not_found true
+```
+
+### Exit codes
+
+- `0`: proof was found.
+- `1`: proof not found, RPC call failed, or input parsing failed.
 
 ---
 
@@ -439,7 +665,7 @@ irium-wallet agreement-proof-list \
 ```
 agreement_hash <64-char hex>
 count 1
-  agreement_hash=<64-char hex> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation expires_at_height=none
+  agreement_hash=<64-char hex> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation expires_at_height=none status=active
 ```
 
 ### Default output (global — no filter)
@@ -447,9 +673,9 @@ count 1
 ```
 agreement_hash * (all)
 count 3
-  agreement_hash=<hex-a> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation expires_at_height=none
-  agreement_hash=<hex-b> proof_id=prf-002 attested_by=attestor-b proof_type=payment expires_at_height=5000 expired=false
-  agreement_hash=<hex-c> proof_id=prf-003 attested_by=attestor-c proof_type=milestone expires_at_height=100 expired=true
+  agreement_hash=<hex-a> proof_id=prf-001 attested_by=attestor-a proof_type=delivery_confirmation expires_at_height=none status=active
+  agreement_hash=<hex-b> proof_id=prf-002 attested_by=attestor-b proof_type=payment expires_at_height=5000 expired=false status=active
+  agreement_hash=<hex-c> proof_id=prf-003 attested_by=attestor-c proof_type=milestone expires_at_height=100 expired=true status=expired
 ```
 
 ### With `--active-only`
@@ -667,9 +893,10 @@ A stored proof may carry an optional `expires_at_height` field (a `u64` block he
   `evaluated_rules` with the message `"proof '<id>' skipped: expired at height <H> (tip <T)"`.
 - `/rpc/checkpolicy` (manual check) does **not** enforce proof expiry; the caller supplies
   proofs directly and is responsible for filtering.
-- `/rpc/listproofs` includes `expires_at_height` per proof and a top-level `tip_height` so
-  clients can compute `expired = tip_height >= proof.expires_at_height`.
-- The `irium-wallet agreement-proof-list` output shows `expires_at_height=<N> expired=<bool>`
+- `/rpc/listproofs` includes `expires_at_height` per proof and a top-level `tip_height`.
+  Each proof entry also carries a derived `status` field: `"active"` when not expired,
+  `"expired"` when `tip_height >= expires_at_height`.
+- The `irium-wallet agreement-proof-list` output shows `expires_at_height=<N> expired=<bool> status=<active|expired>`
   (or `expires_at_height=none`) per proof line.
 
 Pass `--expires-at-height <n>` to `agreement-proof-create` to set the expiry height when
@@ -755,6 +982,8 @@ policy_id pol-<id>
 policy_found true
 tip_height <n>
 proof_count <n>
+matched_proof_count <n>
+matched_proof_ids <id1>, <id2>
 release_eligible true
 refund_eligible false
 reason all release requirements satisfied by verified proofs
@@ -784,18 +1013,222 @@ Exits with code `1` when neither `release_eligible` nor `refund_eligible` is tru
 Response:
 ```json
 {
+  "outcome": "satisfied",
   "agreement_hash": "<hex>",
   "policy_found": true,
   "policy_id": "<id>",
   "tip_height": <n>,
   "proof_count": <n>,
+  "expired_proof_count": <n>,
+  "matched_proof_count": <n>,
+  "matched_proof_ids": ["<id>"],
+  "expired": false,
   "release_eligible": true,
   "refund_eligible": false,
   "reason": "<string>",
-  "evaluated_rules": ["..."]
+  "evaluated_rules": ["..."],
+  "milestone_results": [
+    {
+      "milestone_id": "<id>",
+      "label": "<string or null>",
+      "outcome": "satisfied",
+      "release_eligible": true,
+      "refund_eligible": false,
+      "matched_proof_ids": ["<id>"],
+      "reason": "<string>"
+    }
+  ],
+  "completed_milestone_count": <n>,
+  "total_milestone_count": <n>,
+  "holdback": {
+    "holdback_present": true,
+    "holdback_released": false,
+    "holdback_bps": 1000,
+    "immediate_release_bps": 9000,
+    "holdback_outcome": "held",
+    "holdback_reason": "<string>"
+  },
+  "threshold_results": [
+    {
+      "requirement_id": "<id>",
+      "threshold_required": <n>,
+      "approved_attestor_count": <n>,
+      "matched_attestor_ids": ["<id>"],
+      "threshold_satisfied": true
+    }
+  ]
 }
 ```
 `policy_id` is `null` when no policy is stored.
+`milestone_results` is an empty array when no milestones are declared.
+`holdback` is `null` when no holdback is configured; present only when the base
+condition is `satisfied`.
+`threshold_results` is an empty array when no requirements have an explicit `threshold` field.
+
+#### `outcome` field
+
+The `outcome` field provides a single deterministic classification of each evaluation.
+It is objective — derived purely from proof signatures, policy rules, and `tip_height`.
+
+| Value | Meaning |
+|---|---|
+| `"satisfied"` | All required proofs are present and signature-verified. `release_eligible` will be `true`. |
+| `"timeout"` | A `no_response_rule` deadline or a refund `required_by` deadline has elapsed before release was achieved. Proofs are missing or insufficient. |
+| `"unsatisfied"` | Neither condition is met — proofs are missing, expired, or signature-invalid, and no deadline has elapsed. |
+
+**Rules:**
+- `"satisfied"` is returned in Step 2 of evaluation, before any deadline check. If proofs satisfy release, no-response rules are suppressed entirely.
+- `"timeout"` fires when either a `no_response_rule.deadline_height` is reached (Step 3) or a refund requirement's `required_by` deadline is reached (Step 4).
+- `"unsatisfied"` is the fallthrough when no condition has triggered (Step 5).
+- A policy with no stored policy returns `"unsatisfied"` (`policy_found: false`).
+- An expired policy returns `"unsatisfied"` (`expired: true`).
+
+**Examples:**
+
+```json
+// Proof submitted and verified:
+{ "outcome": "satisfied", "release_eligible": true, "refund_eligible": false }
+
+// No-response deadline elapsed, no proof submitted:
+{ "outcome": "timeout", "release_eligible": false, "refund_eligible": true }
+
+// No proof submitted, no deadline elapsed:
+{ "outcome": "unsatisfied", "release_eligible": false, "refund_eligible": false }
+
+// Only expired proofs remain (active proof_count = 0), no deadline:
+{ "outcome": "unsatisfied", "proof_count": 0, "expired_proof_count": 1 }
+```
+
+#### Milestone / tranche-based evaluation
+
+A `ProofPolicy` may declare one or more **milestones** via the `milestones` array.
+When milestones are declared:
+
+- Each milestone is identified by a `milestone_id` string.
+- `ProofRequirement` entries with a matching `milestone_id` field belong to that milestone.
+- `NoResponseRule` entries with a matching `milestone_id` field belong to that milestone.
+- Each milestone is evaluated **independently** using the same 5-step logic.
+- The overall `outcome` is the **aggregate** of all milestone outcomes:
+  - All milestones `satisfied` → overall `"satisfied"`.
+  - Any milestone `timeout` (and not all satisfied) → overall `"timeout"`.
+  - Otherwise → overall `"unsatisfied"`.
+- `completed_milestone_count` and `total_milestone_count` track partial progress.
+
+**Backward compatibility:** policies without a `milestones` array are evaluated
+using the traditional flat-requirements path. `milestone_results` will be `[]` and
+both counts will be `0`.
+
+#### Approved-attestor threshold
+
+A `ProofRequirement` may declare an optional `threshold` field (integer >= 1) requiring
+that at least that many **distinct** approved attestors submit matching verified proofs
+before the requirement is considered satisfied.
+
+| Field | Type | Description |
+|---|---|---|
+| `threshold` | integer\|null | Minimum distinct approved attestors needed. Defaults to 1 (absent = single-attestor). |
+
+**Semantics:**
+- Only attestors in `required_attestor_ids` count toward the threshold.
+- Multiple proofs from the same attestor count as **1** distinct attestor.
+- Expired proofs (filtered at RPC layer) do not count.
+- Unapproved attestors (not in `policy.attestors`) are rejected at signature-verification and do not count.
+- `threshold: null` or absent behaves identically to `threshold: 1`.
+
+**Output:** `threshold_results` array in the evaluate response, one entry per requirement
+with an explicit `threshold`. Empty when no threshold requirements exist.
+
+**Example — 2-of-3 delivery confirmation:**
+
+```json
+{
+  "requirement_id": "req-delivery",
+  "proof_type": "delivery_confirmation",
+  "required_attestor_ids": ["att-1", "att-2", "att-3"],
+  "resolution": "release",
+  "threshold": 2
+}
+```
+
+After att-1 and att-2 each submit a verified proof, the requirement is satisfied.
+The response includes:
+
+```json
+"threshold_results": [{
+  "requirement_id": "req-delivery",
+  "threshold_required": 2,
+  "approved_attestor_count": 2,
+  "matched_attestor_ids": ["att-1", "att-2"],
+  "threshold_satisfied": true
+}]
+```
+
+**Validation at store time:**
+- `threshold` must be >= 1.
+- `threshold` must not exceed `required_attestor_ids.len()`.
+- `required_attestor_ids` must be non-empty when `threshold` is set.
+
+#### Holdback / retention release
+
+A `ProofPolicy` or `PolicyMilestone` may declare an optional `holdback` that retains
+a portion of the settlement amount until a secondary condition is met.
+
+| Field | Type | Description |
+|---|---|---|
+| `holdback_bps` | integer | Basis points to hold back (1–9999). |
+| `release_requirement_id` | string\|null | ID of a `ProofRequirement` whose satisfaction releases the holdback. |
+| `deadline_height` | integer\|null | Block height at or after which the holdback auto-releases. |
+
+At least one of `release_requirement_id` or `deadline_height` must be supplied.
+Proof-condition release takes priority over deadline release.
+
+**Holdback outcome vocabulary**
+
+| Value | Meaning |
+|---|---|
+| `pending` | Base condition not yet satisfied; holdback not yet active. |
+| `held` | Base satisfied; holdback condition not yet met. |
+| `released` | Holdback released (by proof or deadline). |
+
+`immediate_release_bps` is `10000 - holdback_bps` when `held`, and `10000` when `released`.
+
+**Scope rules:**
+- `policy.holdback` applies in the non-milestone evaluation path only.
+- `milestone.holdback` applies per-milestone within the milestone evaluation path.
+- When holdback is absent, `holdback` in the response is `null`.
+
+**Example policy with two milestones:**
+
+```json
+{
+  "policy_id": "pol-tranche",
+  "agreement_hash": "<hex>",
+  "required_proofs": [
+    { "requirement_id": "req-ms-a", "proof_type": "delivery_confirmation",
+      "required_attestor_ids": ["att-1"], "resolution": "milestone_release",
+      "milestone_id": "ms-a" },
+    { "requirement_id": "req-ms-b", "proof_type": "inspection_report",
+      "required_attestor_ids": ["att-1"], "resolution": "milestone_release",
+      "milestone_id": "ms-b" }
+  ],
+  "milestones": [
+    { "milestone_id": "ms-a", "label": "Delivery" },
+    { "milestone_id": "ms-b", "label": "Inspection" }
+  ],
+  "attestors": [{ "attestor_id": "att-1", "pubkey_hex": "<hex>" }]
+}
+```
+
+**Partial completion response (ms-a done, ms-b pending):**
+
+```json
+{ "outcome": "unsatisfied", "completed_milestone_count": 1, "total_milestone_count": 2,
+  "milestone_results": [
+    { "milestone_id": "ms-a", "label": "Delivery", "outcome": "satisfied", "release_eligible": true },
+    { "milestone_id": "ms-b", "label": "Inspection", "outcome": "unsatisfied", "release_eligible": false }
+  ]
+}
+```
 
 ### Relationship to agreement-policy-check
 
@@ -973,3 +1406,360 @@ current chain tip height for deadline evaluation but does not write any state, s
 transactions, or alter consensus rules. No blocks are produced or validated differently
 as a result of any Phase 2 operation. Phase 1 HTLC spend eligibility (secret preimage,
 timeout refund) is unchanged.
+
+---
+
+## Typed proof payload (structured proof objects)
+
+### Overview
+
+`SettlementProof` carries an optional `typed_payload` field that allows provers to attach
+structured, normalized metadata to any proof without affecting its cryptographic signature.
+This is a pure application-layer extension — existing proofs without the field deserialize
+correctly (`typed_payload` defaults to `None`), and the field is intentionally excluded from
+`settlement_proof_payload_bytes()` so that all previously-signed proofs remain valid.
+
+### Schema
+
+```json
+{
+  "proof_kind": "delivery_confirmation",   // required, non-empty string
+  "content_hash": "aabbcc...(64 hex)",     // optional, must be 64 lowercase hex chars
+  "reference_id": "TRK-12345",             // optional, free-form reference string
+  "attributes": { "carrier": "DHL" }       // optional, JSON object only
+}
+```
+
+| Field | Type | Required | Constraints |
+|---|---|---|---|
+| `proof_kind` | string | yes | non-empty after trim |
+| `content_hash` | string | no | exactly 64 lowercase hex chars; if set alongside `evidence_hash`, must match |
+| `reference_id` | string | no | free-form, any UTF-8 string |
+| `attributes` | object | no | must be a JSON object (not array/scalar) |
+
+### Backward compatibility
+
+- Proofs stored without `typed_payload` deserialize with `typed_payload = None` — no migration needed.
+- `settlement_proof_payload_bytes()` does **not** include `typed_payload` in the signed payload.
+  Adding or removing this field after signing does not invalidate the signature.
+- Policy evaluation (`evaluate_policy`) ignores `typed_payload` entirely — matching is done on
+  `proof_type`, `attested_by`, and `milestone_id` as before.
+
+### Validation (at submit time)
+
+`ProofStore::submit()` calls `validate_typed_proof_payload()` before signature verification
+when `typed_payload` is `Some`. The following are rejected with a `BAD_REQUEST` response:
+
+- `proof_kind` is empty or whitespace-only
+- `content_hash` is not exactly 64 lowercase hex characters
+- `content_hash` is set alongside `evidence_hash` but they do not match
+- `attributes` is present but is not a JSON object
+
+### CLI usage (irium-wallet)
+
+```sh
+irium-wallet agreement-proof-create \
+  --agreement-hash <hex> \
+  --proof-type delivery_confirmation \
+  --attested-by my-attestor \
+  --address irium1abc... \
+  --proof-kind delivery_confirmation \
+  --reference-id TRK-99887766
+```
+
+The `--proof-kind` and `--reference-id` flags populate `typed_payload.proof_kind` and
+`typed_payload.reference_id` respectively. `content_hash` and `attributes` can be set
+programmatically via the JSON submission path (`/rpc/submitproof`).
+
+### Display
+
+- `agreement-proof-get` renders `proof_kind` and `reference_id` lines when present.
+- `agreement-proof-list` appends ` proof_kind=<value>` to each proof line when present.
+- JSON output from `/rpc/listproofs` and `/rpc/getproof` includes the full `typed_payload`
+  object (serialized inline on `SettlementProof` via `#[serde(default)]`).
+
+### Example flow
+
+```sh
+# Submit a typed proof
+irium-wallet agreement-proof-create \
+  --agreement-hash $(cat agreement.hash) \
+  --proof-type delivery_confirmation \
+  --attested-by logistics-oracle \
+  --address irium1... \
+  --proof-kind shipment_delivered \
+  --reference-id BILL-OF-LADING-2026-001
+
+# List proofs — typed proofs show proof_kind
+irium-wallet agreement-proof-list --agreement-hash $(cat agreement.hash)
+# => proof_id=prf-xxx  ...  proof_kind=shipment_delivered
+
+# Get proof details
+irium-wallet agreement-proof-get --proof-id prf-xxx
+# =>  proof_kind shipment_delivered
+# =>  reference_id BILL-OF-LADING-2026-001
+```
+
+### Security and trust boundary
+
+**`typed_payload` is unsigned.** The fields `proof_kind`, `content_hash`, `reference_id`, and
+`attributes` are NOT included in `settlement_proof_payload_bytes()` and are therefore NOT
+covered by the attestor's cryptographic signature. This means:
+
+- `proof_kind` cannot be used as attestation evidence. It is normalization metadata only.
+- A proof where `proof_kind = "fraud_report"` but `proof_type = "delivery_confirmation"` is
+  valid — the contradiction is permitted. Policy evaluation uses the **signed** `proof_type`.
+- `reference_id` is an opaque external pointer; its correctness cannot be verified on-chain.
+- `attributes` is arbitrary JSON; treat it as unverified supplementary information.
+
+**Display markers:** The wallet CLI marks these fields as `[metadata]` in human-readable output
+(e.g., `proof_kind shipment_delivered [metadata]`) to distinguish them from attested fields
+like `proof_type` and `attested_by`.
+
+**Invariant for future developers:** `typed_payload` fields must never be used in
+`req_satisfied_threshold()`, `evaluate_holdback()`, or `evaluate_policy()` as matching criteria.
+Doing so would allow unsigned data to influence security-sensitive release/refund decisions.
+This constraint is enforced by a regression test (`typed_payload_proof_kind_contradiction_does_not_affect_policy`)
+and by SAFETY INVARIANT comments in the source code.
+
+**Signed fields** (any addition here requires a schema version bump and breaks all prior signatures):
+`proof_id`, `schema_id`, `proof_type`, `agreement_hash`, `milestone_id`, `attested_by`,
+`attestation_time`, `evidence_hash`, `evidence_summary`
+
+**Excluded from signature** (safe to evolve without breaking existing proofs):
+`expires_at_height`, `typed_payload` (and all its subfields)
+
+---
+
+## Commercial Policy Templates
+
+Phase 2 ships three policy template builder functions in `settlement.rs` that let integrators
+construct correct `ProofPolicy` objects using existing evaluation primitives without writing
+policy JSON by hand. Templates enforce invariants, return descriptive errors on bad input, and
+produce policies that are fully compatible with `evaluate_policy()`.
+
+### `contractor_milestone_template`
+
+**Use when:** a contractor must deliver multiple discrete work items, each with its own holdback
+and optional deadline. A timeout rule fires a `Refund` if no proof arrives by the deadline.
+
+**Signature:**
+```rust
+pub fn contractor_milestone_template(
+    policy_id: &str,
+    agreement_hash: &str,
+    attestors: &[TemplateAttestor],
+    milestones: &[MilestoneSpec],
+    notes: Option<String>,
+) -> Result<ProofPolicy, String>
+```
+
+**Behaviour:**
+- Each `MilestoneSpec` produces a `ProofRequirement` with id `req-{milestone_id}`,
+  resolution `MilestoneRelease`, and the milestone's `proof_type`.
+- If `deadline_height` is set on a milestone, a `PolicyRule` with id `rule-{milestone_id}` is
+  added: trigger `FundedAndNoRelease`, deadline `deadline_height`, resolution `Refund`.
+- If `holdback_bps` and `holdback_release_height` are both set, a `PolicyHoldback` is added to
+  the requirement with `deadline_height = holdback_release_height`.
+- Rejects: empty attestors, empty milestones, duplicate milestone ids, `holdback_bps` set
+  without `holdback_release_height`, `holdback_bps` > 10000.
+
+**Example JSON** (two milestones, first with a 30-day holdback):
+```json
+{
+  "schema_id": "irium.phase2.proof_policy.v1",
+  "policy_id": "pol-construction-001",
+  "agreement_hash": "aabbcc...",
+  "approved_attestors": [
+    { "attestor_id": "att-inspector", "pubkey_hex": "03abc...", "display_name": "Site Inspector" }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "req-foundation",
+      "proof_type": "foundation_complete",
+      "resolution": "MilestoneRelease",
+      "milestone_id": "foundation",
+      "holdback": {
+        "holdback_bps": 1000,
+        "deadline_height": 750000
+      }
+    },
+    {
+      "requirement_id": "req-framing",
+      "proof_type": "framing_complete",
+      "resolution": "MilestoneRelease",
+      "milestone_id": "framing"
+    }
+  ],
+  "rules": [
+    {
+      "rule_id": "rule-framing",
+      "trigger": "FundedAndNoRelease",
+      "deadline_height": 800000,
+      "resolution": "Refund"
+    }
+  ]
+}
+```
+
+---
+
+### `preorder_deposit_template`
+
+**Use when:** a buyer deposits funds for a pre-ordered item. Funds release on a delivery proof;
+a timeout rule refunds the buyer if no delivery proof arrives before a deadline.
+
+**Signature:**
+```rust
+pub fn preorder_deposit_template(
+    policy_id: &str,
+    agreement_hash: &str,
+    attestors: &[TemplateAttestor],
+    delivery_proof_type: &str,
+    refund_deadline_height: u64,
+    holdback_bps: Option<u32>,
+    holdback_release_height: Option<u64>,
+    notes: Option<String>,
+) -> Result<ProofPolicy, String>
+```
+
+**Behaviour:**
+- Produces a single requirement `req-delivery` with resolution `Release`.
+- Produces a single rule `rule-timeout-refund` with trigger `FundedAndNoRelease`,
+  deadline `refund_deadline_height`, resolution `Refund`.
+- If `holdback_bps` is set, a top-level `policy.holdback` is added (requires
+  `holdback_release_height`).
+- Rejects: empty attestors, `holdback_bps` set without `holdback_release_height`,
+  `holdback_bps` > 10000.
+
+**Example JSON** (5% holdback, 60-day refund window):
+```json
+{
+  "schema_id": "irium.phase2.proof_policy.v1",
+  "policy_id": "pol-preorder-42",
+  "agreement_hash": "aabbcc...",
+  "approved_attestors": [
+    { "attestor_id": "att-warehouse", "pubkey_hex": "03def...", "display_name": "Warehouse" }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "req-delivery",
+      "proof_type": "shipment_delivered",
+      "resolution": "Release"
+    }
+  ],
+  "rules": [
+    {
+      "rule_id": "rule-timeout-refund",
+      "trigger": "FundedAndNoRelease",
+      "deadline_height": 850000,
+      "resolution": "Refund"
+    }
+  ],
+  "holdback": {
+    "holdback_bps": 500,
+    "deadline_height": 870000
+  }
+}
+```
+
+---
+
+### `basic_otc_escrow_template`
+
+**Use when:** two parties want a simple OTC escrow — funds release when one (or more) trusted
+attestors submit a matching proof. A timeout refund fires if no release proof arrives.
+
+**Signature:**
+```rust
+pub fn basic_otc_escrow_template(
+    policy_id: &str,
+    agreement_hash: &str,
+    attestors: &[TemplateAttestor],
+    release_proof_type: &str,
+    refund_deadline_height: u64,
+    threshold: Option<u32>,
+    notes: Option<String>,
+) -> Result<ProofPolicy, String>
+```
+
+**Behaviour:**
+- Produces a single requirement `req-release` with resolution `Release`.
+- If `threshold` is `None` or `Some(1)`, no `threshold` field is set on the requirement
+  (single-attestor backward-compatible path).
+- If `threshold` is `Some(n)` where `n > 1`, the requirement's `threshold` field is set to `n`
+  and `required_attestor_ids` is populated from all attestors.
+- Produces a single rule `rule-timeout-refund` with trigger `FundedAndNoRelease`,
+  deadline `refund_deadline_height`, resolution `Refund`.
+- Rejects: empty attestors, `threshold` > number of attestors.
+
+**Example JSON** (2-of-3 multi-sig escrow):
+```json
+{
+  "schema_id": "irium.phase2.proof_policy.v1",
+  "policy_id": "pol-otc-77",
+  "agreement_hash": "aabbcc...",
+  "approved_attestors": [
+    { "attestor_id": "att-a", "pubkey_hex": "03aaa...", "display_name": "Arbitrator A" },
+    { "attestor_id": "att-b", "pubkey_hex": "03bbb...", "display_name": "Arbitrator B" },
+    { "attestor_id": "att-c", "pubkey_hex": "03ccc...", "display_name": "Arbitrator C" }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "req-release",
+      "proof_type": "otc_trade_confirmed",
+      "resolution": "Release",
+      "threshold": 2,
+      "required_attestor_ids": ["att-a", "att-b", "att-c"]
+    }
+  ],
+  "rules": [
+    {
+      "rule_id": "rule-timeout-refund",
+      "trigger": "FundedAndNoRelease",
+      "deadline_height": 900000,
+      "resolution": "Refund"
+    }
+  ]
+}
+```
+
+---
+
+### Input types
+
+```rust
+pub struct TemplateAttestor {
+    pub attestor_id: String,
+    pub pubkey_hex: String,
+    pub display_name: Option<String>,
+}
+
+pub struct MilestoneSpec {
+    pub milestone_id: String,
+    pub label: Option<String>,
+    pub proof_type: String,
+    pub deadline_height: Option<u64>,
+    pub holdback_bps: Option<u32>,
+    pub holdback_release_height: Option<u64>,
+}
+```
+
+### Serialising a template to JSON
+
+```rust
+pub fn policy_template_to_json(policy: &ProofPolicy) -> Result<String, String>
+```
+
+Wraps `serde_json::to_string_pretty`. Use this to write a policy to disk or transmit it
+to `store-policy` RPC before a funded agreement starts.
+
+### Design constraints
+
+Templates compose only existing `ProofPolicy` primitives. They:
+
+- Do **not** add new evaluation logic or consensus rules.
+- Do **not** introduce new struct fields on `ProofPolicy`, `ProofRequirement`, or `PolicyRule`.
+- Do **not** modify `evaluate_policy()` or any holdback/threshold evaluator.
+- Are tested against `evaluate_policy()` directly so that template-generated policies behave
+  identically to hand-crafted ones with the same structure.
