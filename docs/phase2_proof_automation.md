@@ -1341,3 +1341,125 @@ current chain tip height for deadline evaluation but does not write any state, s
 transactions, or alter consensus rules. No blocks are produced or validated differently
 as a result of any Phase 2 operation. Phase 1 HTLC spend eligibility (secret preimage,
 timeout refund) is unchanged.
+
+---
+
+## Typed proof payload (structured proof objects)
+
+### Overview
+
+`SettlementProof` carries an optional `typed_payload` field that allows provers to attach
+structured, normalized metadata to any proof without affecting its cryptographic signature.
+This is a pure application-layer extension — existing proofs without the field deserialize
+correctly (`typed_payload` defaults to `None`), and the field is intentionally excluded from
+`settlement_proof_payload_bytes()` so that all previously-signed proofs remain valid.
+
+### Schema
+
+```json
+{
+  "proof_kind": "delivery_confirmation",   // required, non-empty string
+  "content_hash": "aabbcc...(64 hex)",     // optional, must be 64 lowercase hex chars
+  "reference_id": "TRK-12345",             // optional, free-form reference string
+  "attributes": { "carrier": "DHL" }       // optional, JSON object only
+}
+```
+
+| Field | Type | Required | Constraints |
+|---|---|---|---|
+| `proof_kind` | string | yes | non-empty after trim |
+| `content_hash` | string | no | exactly 64 lowercase hex chars; if set alongside `evidence_hash`, must match |
+| `reference_id` | string | no | free-form, any UTF-8 string |
+| `attributes` | object | no | must be a JSON object (not array/scalar) |
+
+### Backward compatibility
+
+- Proofs stored without `typed_payload` deserialize with `typed_payload = None` — no migration needed.
+- `settlement_proof_payload_bytes()` does **not** include `typed_payload` in the signed payload.
+  Adding or removing this field after signing does not invalidate the signature.
+- Policy evaluation (`evaluate_policy`) ignores `typed_payload` entirely — matching is done on
+  `proof_type`, `attested_by`, and `milestone_id` as before.
+
+### Validation (at submit time)
+
+`ProofStore::submit()` calls `validate_typed_proof_payload()` before signature verification
+when `typed_payload` is `Some`. The following are rejected with a `BAD_REQUEST` response:
+
+- `proof_kind` is empty or whitespace-only
+- `content_hash` is not exactly 64 lowercase hex characters
+- `content_hash` is set alongside `evidence_hash` but they do not match
+- `attributes` is present but is not a JSON object
+
+### CLI usage (irium-wallet)
+
+```sh
+irium-wallet agreement-proof-create \
+  --agreement-hash <hex> \
+  --proof-type delivery_confirmation \
+  --attested-by my-attestor \
+  --address irium1abc... \
+  --proof-kind delivery_confirmation \
+  --reference-id TRK-99887766
+```
+
+The `--proof-kind` and `--reference-id` flags populate `typed_payload.proof_kind` and
+`typed_payload.reference_id` respectively. `content_hash` and `attributes` can be set
+programmatically via the JSON submission path (`/rpc/submitproof`).
+
+### Display
+
+- `agreement-proof-get` renders `proof_kind` and `reference_id` lines when present.
+- `agreement-proof-list` appends ` proof_kind=<value>` to each proof line when present.
+- JSON output from `/rpc/listproofs` and `/rpc/getproof` includes the full `typed_payload`
+  object (serialized inline on `SettlementProof` via `#[serde(default)]`).
+
+### Example flow
+
+```sh
+# Submit a typed proof
+irium-wallet agreement-proof-create \
+  --agreement-hash $(cat agreement.hash) \
+  --proof-type delivery_confirmation \
+  --attested-by logistics-oracle \
+  --address irium1... \
+  --proof-kind shipment_delivered \
+  --reference-id BILL-OF-LADING-2026-001
+
+# List proofs — typed proofs show proof_kind
+irium-wallet agreement-proof-list --agreement-hash $(cat agreement.hash)
+# => proof_id=prf-xxx  ...  proof_kind=shipment_delivered
+
+# Get proof details
+irium-wallet agreement-proof-get --proof-id prf-xxx
+# =>  proof_kind shipment_delivered
+# =>  reference_id BILL-OF-LADING-2026-001
+```
+
+### Security and trust boundary
+
+**`typed_payload` is unsigned.** The fields `proof_kind`, `content_hash`, `reference_id`, and
+`attributes` are NOT included in `settlement_proof_payload_bytes()` and are therefore NOT
+covered by the attestor's cryptographic signature. This means:
+
+- `proof_kind` cannot be used as attestation evidence. It is normalization metadata only.
+- A proof where `proof_kind = "fraud_report"` but `proof_type = "delivery_confirmation"` is
+  valid — the contradiction is permitted. Policy evaluation uses the **signed** `proof_type`.
+- `reference_id` is an opaque external pointer; its correctness cannot be verified on-chain.
+- `attributes` is arbitrary JSON; treat it as unverified supplementary information.
+
+**Display markers:** The wallet CLI marks these fields as `[metadata]` in human-readable output
+(e.g., `proof_kind shipment_delivered [metadata]`) to distinguish them from attested fields
+like `proof_type` and `attested_by`.
+
+**Invariant for future developers:** `typed_payload` fields must never be used in
+`req_satisfied_threshold()`, `evaluate_holdback()`, or `evaluate_policy()` as matching criteria.
+Doing so would allow unsigned data to influence security-sensitive release/refund decisions.
+This constraint is enforced by a regression test (`typed_payload_proof_kind_contradiction_does_not_affect_policy`)
+and by SAFETY INVARIANT comments in the source code.
+
+**Signed fields** (any addition here requires a schema version bump and breaks all prior signatures):
+`proof_id`, `schema_id`, `proof_type`, `agreement_hash`, `milestone_id`, `attested_by`,
+`attestation_time`, `evidence_hash`, `evidence_summary`
+
+**Excluded from signature** (safe to evolve without breaking existing proofs):
+`expires_at_height`, `typed_payload` (and all its subfields)

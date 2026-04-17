@@ -60,6 +60,7 @@ use irium_node_rs::settlement::{
     HoldbackEvaluationResult,
     MilestoneEvaluationResult,
     RequirementThresholdResult,
+    TypedProofPayload,
     PolicyOutcome,
     ProofPolicy,
     SettlementProof,
@@ -8468,6 +8469,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         proof.signature = sign_rpc_proof(&proof, sk);
         proof
@@ -8614,6 +8616,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let payload = settlement_proof_payload_bytes(&proof).unwrap();
         let digest = sha2::Sha256::digest(&payload);
@@ -8654,6 +8657,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let payload = settlement_proof_payload_bytes(&proof).unwrap();
         let digest = sha2::Sha256::digest(&payload);
@@ -8771,6 +8775,62 @@ mod tests {
         assert_eq!(resp.proofs[1].proof.attestation_time, 3_000);
         assert_eq!(resp.proofs[0].status, "active");
         assert_eq!(resp.proofs[1].status, "active");
+    }
+
+    #[tokio::test]
+    async fn submit_proof_rpc_rejects_invalid_typed_payload() {
+        use irium_node_rs::settlement::{
+            settlement_proof_payload_bytes, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+            SETTLEMENT_PROOF_SCHEMA_ID,
+        };
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let mut proof = SettlementProof {
+            proof_id: "prf-typed-rpc-bad".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: agreement_hash.clone(),
+            milestone_id: None,
+            attested_by: "rpc-attestor".to_string(),
+            attestation_time: 1_700_999_999,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pubkey_hex.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+            typed_payload: Some(TypedProofPayload {
+                proof_kind: String::new(), // invalid: empty
+                content_hash: None,
+                reference_id: None,
+                attributes: None,
+            }),
+        };
+        let payload = settlement_proof_payload_bytes(&proof).unwrap();
+        let digest = sha2::Sha256::digest(&payload);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: k256::ecdsa::Signature = sk.sign_prehash(&arr).unwrap();
+        proof.signature.signature_hex = hex::encode(sig.to_bytes());
+        proof.signature.payload_hash = hex::encode(digest);
+        let result = submit_proof_rpc(
+            ConnectInfo("127.0.0.1:0".parse().unwrap()),
+            State(state),
+            HeaderMap::new(),
+            Json(SubmitProofRequest { proof }),
+        ).await;
+        assert!(result.is_err(), "empty proof_kind must be rejected by RPC");
+        let (status, msg) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("proof_kind"), "got: {msg}");
     }
 
     #[tokio::test]
@@ -9511,6 +9571,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let payload_bytes = irium_node_rs::settlement::settlement_proof_payload_bytes(&proof).unwrap();
         let digest = Sha256::digest(&payload_bytes);
