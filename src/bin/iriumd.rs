@@ -780,6 +780,13 @@ struct CheckPolicyResponse {
     refund_eligible: bool,
     reason: String,
     evaluated_rules: Vec<String>,
+    /// Top-level holdback result; absent when no holdback is declared on the policy.
+    /// `None` on the milestone path (per-milestone holdbacks are in `milestone_results`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    holdback: Option<HoldbackEvaluationResult>,
+    /// Per-milestone evaluation results; absent when no milestones are declared.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    milestone_results: Vec<MilestoneEvaluationResult>,
 }
 
 #[derive(Deserialize)]
@@ -5508,6 +5515,8 @@ async fn check_policy_rpc(
         refund_eligible: result.refund_eligible,
         reason: result.reason,
         evaluated_rules: result.evaluated_rules,
+        holdback: result.holdback,
+        milestone_results: result.milestone_results,
     }))
 }
 
@@ -7354,6 +7363,7 @@ mod tests {
         AgreementDeadlines, AgreementMilestone, AgreementObject, AgreementParty,
         AgreementRefundCondition, AgreementReleaseCondition, AgreementTemplateType,
         AGREEMENT_SIGNATURE_TYPE_SECP256K1, ApprovedAttestor,
+        HoldbackOutcome, PolicyHoldback,
         NoResponseRule, NoResponseTrigger, PolicyMilestone, ProofPolicy, ProofRequirement,
         ProofResolution, ProofSignatureEnvelope, PROOF_POLICY_SCHEMA_ID,
         SETTLEMENT_PROOF_SCHEMA_ID, SettlementProof,
@@ -10222,6 +10232,84 @@ mod tests {
             "check_policy must not enforce expiry; reason: {}", resp.reason
         );
     }
+    #[tokio::test]
+    async fn check_policy_no_holdback_field_absent() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        let proof = make_rpc_proof(&agreement_hash, &sk);
+        let req = CheckPolicyRequest { agreement, policy, proofs: vec![proof] };
+        let resp = check_policy_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(), Json(req),
+        ).await.expect("must succeed").0;
+        assert!(resp.holdback.is_none(), "no holdback on policy => holdback field absent");
+        assert!(resp.milestone_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn check_policy_holdback_held_when_future_deadline() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        // Holdback: 10% held until height 999999 (far future at tip=0)
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 1000,
+            release_requirement_id: None,
+            deadline_height: Some(999999),
+        });
+        let proof = make_rpc_proof(&agreement_hash, &sk);
+        let req = CheckPolicyRequest { agreement, policy, proofs: vec![proof] };
+        let resp = check_policy_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(), Json(req),
+        ).await.expect("must succeed").0;
+        assert!(resp.release_eligible, "base must be satisfied");
+        let hb = resp.holdback.expect("holdback field must be present");
+        assert_eq!(hb.holdback_outcome, HoldbackOutcome::Held);
+        assert_eq!(hb.holdback_bps, 1000);
+        assert_eq!(hb.immediate_release_bps, 9000);
+        assert!(!hb.holdback_released);
+        assert!(hb.holdback_present);
+    }
+
+    #[tokio::test]
+    async fn check_policy_holdback_released_when_deadline_passed() {
+        use irium_node_rs::settlement::agreement_canonical_bytes;
+        // tip_height=0 >= deadline_height=0 => released
+        let (state, sender, recipient, _) = create_test_state(Some(0));
+        let (agreement, _) = milestone_agreement_for_test(&sender, &recipient, 200);
+        let bytes = agreement_canonical_bytes(&agreement).unwrap();
+        let agreement_hash = hex::encode(Sha256::digest(&bytes));
+        let sk = rpc_signing_key();
+        let pubkey_hex = rpc_pubkey_hex(&sk);
+        let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
+        policy.holdback = Some(PolicyHoldback {
+            holdback_bps: 500,
+            release_requirement_id: None,
+            deadline_height: Some(0), // deadline at height 0, tip=0 => passed
+        });
+        let proof = make_rpc_proof(&agreement_hash, &sk);
+        let req = CheckPolicyRequest { agreement, policy, proofs: vec![proof] };
+        let resp = check_policy_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(), Json(req),
+        ).await.expect("must succeed").0;
+        assert!(resp.release_eligible);
+        let hb = resp.holdback.expect("holdback field must be present");
+        assert_eq!(hb.holdback_outcome, HoldbackOutcome::Released);
+        assert_eq!(hb.holdback_bps, 500);
+        assert_eq!(hb.immediate_release_bps, 10000);
+        assert!(hb.holdback_released);
+    }
+
     #[tokio::test]
     async fn list_policies_rpc_active_only_excludes_expired() {
         let (state, _, _, _) = create_test_state(Some(0));

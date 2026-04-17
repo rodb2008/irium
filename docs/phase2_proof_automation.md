@@ -186,31 +186,96 @@ Authorization: Bearer <token>
   "agreement_hash": "<64-char hex>",
   "policy_id": "pol-001",
   "tip_height": 1500,
-  "proof_count": 1,
-  "expired_proof_count": 0,
-  "matched_proof_count": 1,
-  "matched_proof_ids": ["prf-001"],
   "release_eligible": true,
   "refund_eligible": false,
   "reason": "all release requirements satisfied by verified proofs",
   "evaluated_rules": [
     "proof 'prf-001' verified ok"
-  ]
+  ],
+  "holdback": {
+    "holdback_present": true,
+    "holdback_released": false,
+    "holdback_bps": 1000,
+    "immediate_release_bps": 9000,
+    "holdback_outcome": "held",
+    "holdback_reason": "base satisfied; holdback pending release condition"
+  }
 }
 ```
 
 - `agreement_hash`: SHA-256 of the canonical agreement, computed by the node.
 - `tip_height`: chain tip height at the moment of evaluation.
-- `proof_count`: active (non-expired) proofs considered for evaluation.
-- `expired_proof_count`: proofs filtered out as expired before evaluation.
-- `matched_proof_count`: proofs that passed signature verification and matched
-  the policy attestor list.
-- `matched_proof_ids`: IDs of those matched proofs.
 - `release_eligible` / `refund_eligible`: at most one will be true per response.
-- `outcome`: deterministic classification — `satisfied`, `timeout`, or `unsatisfied`. Shown by `agreement-policy-evaluate` immediately after `tip_height`.
 - `reason`: human-readable explanation of the outcome.
 - `evaluated_rules`: ordered list of strings describing each step taken, including
   verified proofs, rejected proofs, and triggered or pending deadline rules.
+- `holdback`: present only when the policy declares a top-level holdback. Absent
+  (`null`-omitted) when no holdback is configured or when the milestone evaluation
+  path is used (in which case per-milestone holdbacks appear inside
+  `milestone_results`). See **Holdback detail** below.
+- `milestone_results`: present only when the policy declares milestones; each entry
+  mirrors the `MilestoneEvaluationResult` shape from `/rpc/evaluatepolicy`.
+
+#### Holdback detail fields
+
+| Field | Type | Description |
+|---|---|---|
+| `holdback_present` | bool | Always `true` when this object is present. |
+| `holdback_released` | bool | `true` when the holdback has been released. |
+| `holdback_bps` | integer | Basis points retained (1–9999). |
+| `immediate_release_bps` | integer | Basis points immediately releasable: `10000 - holdback_bps` when `held`; `10000` when `released`. |
+| `holdback_outcome` | string | `"pending"`, `"held"`, or `"released"`. |
+| `holdback_reason` | string | Human-readable explanation. |
+
+**`holdback_outcome` values:**
+
+| Value | Meaning |
+|---|---|
+| `"pending"` | Base release condition not yet satisfied; holdback not yet active. |
+| `"held"` | Base satisfied but holdback release condition (deadline or requirement) not met. |
+| `"released"` | Holdback released — either the deadline passed or the release requirement was satisfied. |
+
+#### Holdback example: held vs released
+
+**Held** (base release satisfied, holdback deadline in the future at tip 100):
+```json
+{
+  "release_eligible": true,
+  "holdback": {
+    "holdback_present": true,
+    "holdback_released": false,
+    "holdback_bps": 1000,
+    "immediate_release_bps": 9000,
+    "holdback_outcome": "held",
+    "holdback_reason": "base satisfied; holdback pending release condition"
+  }
+}
+```
+
+**Released** (deadline height 500 passed at tip 1000):
+```json
+{
+  "release_eligible": true,
+  "holdback": {
+    "holdback_present": true,
+    "holdback_released": true,
+    "holdback_bps": 500,
+    "immediate_release_bps": 10000,
+    "holdback_outcome": "released",
+    "holdback_reason": "holdback released by deadline at height 500"
+  }
+}
+```
+
+**No holdback** (policy without a `holdback` declaration):
+```json
+{
+  "release_eligible": true,
+  "reason": "all release requirements satisfied by verified proofs",
+  "evaluated_rules": ["proof 'prf-001' verified ok"]
+}
+```
+The `holdback` key is omitted entirely — not set to `null` — when absent.
 
 ### Error responses
 
