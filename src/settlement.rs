@@ -8616,6 +8616,143 @@ mod tests {
         assert_eq!(evaluate_policy(&agreement, &legacy, &[proof.clone()], 0).unwrap().outcome, PolicyOutcome::Satisfied);
         assert_eq!(evaluate_policy(&agreement, &template, &[proof], 0).unwrap().outcome, PolicyOutcome::Satisfied);
     }
+
+    // ── Phase 3 audit hardening tests ────────────────────────────────────────
+
+    // policy_id validation
+    #[test]
+    fn contractor_template_rejects_empty_policy_id() {
+        let err = contractor_milestone_template(
+            "", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            &[ms_spec("ms-1", "t", None, None, None)], None,
+        ).unwrap_err();
+        assert!(err.contains("policy_id must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn preorder_template_rejects_empty_policy_id() {
+        let err = preorder_deposit_template(
+            "", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            "delivery", 500, None, None, None,
+        ).unwrap_err();
+        assert!(err.contains("policy_id must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn otc_template_rejects_empty_policy_id() {
+        let err = basic_otc_escrow_template(
+            "", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            "trade", 500, None, None,
+        ).unwrap_err();
+        assert!(err.contains("policy_id must not be empty"), "got: {err}");
+    }
+
+    // per-attestor validation
+    #[test]
+    fn contractor_template_rejects_empty_attestor_id() {
+        let att = TemplateAttestor { attestor_id: "".to_string(), pubkey_hex: "pk".to_string(), display_name: None };
+        let err = contractor_milestone_template(
+            "p", &dummy_hash_64(), &[att], &[ms_spec("m", "t", None, None, None)], None,
+        ).unwrap_err();
+        assert!(err.contains("attestor_id must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn contractor_template_rejects_empty_pubkey_hex() {
+        let att = TemplateAttestor { attestor_id: "att".to_string(), pubkey_hex: "".to_string(), display_name: None };
+        let err = contractor_milestone_template(
+            "p", &dummy_hash_64(), &[att], &[ms_spec("m", "t", None, None, None)], None,
+        ).unwrap_err();
+        assert!(err.contains("pubkey_hex must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn preorder_template_rejects_empty_attestor_id() {
+        let att = TemplateAttestor { attestor_id: "".to_string(), pubkey_hex: "pk".to_string(), display_name: None };
+        let err = preorder_deposit_template(
+            "p", &dummy_hash_64(), &[att], "delivery", 100, None, None, None,
+        ).unwrap_err();
+        assert!(err.contains("attestor_id must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn preorder_template_rejects_empty_pubkey_hex() {
+        let att = TemplateAttestor { attestor_id: "att".to_string(), pubkey_hex: "".to_string(), display_name: None };
+        let err = preorder_deposit_template(
+            "p", &dummy_hash_64(), &[att], "delivery", 100, None, None, None,
+        ).unwrap_err();
+        assert!(err.contains("pubkey_hex must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn otc_template_rejects_empty_attestor_id() {
+        let att = TemplateAttestor { attestor_id: "".to_string(), pubkey_hex: "pk".to_string(), display_name: None };
+        let err = basic_otc_escrow_template(
+            "p", &dummy_hash_64(), &[att], "trade", 100, None, None,
+        ).unwrap_err();
+        assert!(err.contains("attestor_id must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn otc_template_rejects_empty_pubkey_hex() {
+        let att = TemplateAttestor { attestor_id: "att".to_string(), pubkey_hex: "".to_string(), display_name: None };
+        let err = basic_otc_escrow_template(
+            "p", &dummy_hash_64(), &[att], "trade", 100, None, None,
+        ).unwrap_err();
+        assert!(err.contains("pubkey_hex must not be empty"), "got: {err}");
+    }
+
+    // proof_type validation
+    #[test]
+    fn contractor_template_rejects_empty_proof_type_in_milestone() {
+        let err = contractor_milestone_template(
+            "p", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            &[ms_spec("ms-1", "", None, None, None)], None,
+        ).unwrap_err();
+        assert!(err.contains("proof_type must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn preorder_template_rejects_empty_delivery_proof_type() {
+        let err = preorder_deposit_template(
+            "p", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            "", 100, None, None, None,
+        ).unwrap_err();
+        assert!(err.contains("delivery_proof_type must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn otc_template_rejects_empty_release_proof_type() {
+        let err = basic_otc_escrow_template(
+            "p", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            "", 100, None, None,
+        ).unwrap_err();
+        assert!(err.contains("release_proof_type must not be empty"), "got: {err}");
+    }
+
+    // threshold=0 explicit rejection
+    #[test]
+    fn otc_template_rejects_threshold_zero_explicitly() {
+        let err = basic_otc_escrow_template(
+            "p", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            "trade", 100, Some(0), None,
+        ).unwrap_err();
+        assert!(err.contains("threshold must be >= 1"), "got: {err}");
+    }
+
+    // summary derives from generated policy (milestone_count consistency)
+    #[test]
+    fn policy_template_to_json_round_trips() {
+        let policy = contractor_milestone_template(
+            "pol-rt", &dummy_hash_64(), &[test_attestor_tmpl("att", "03".to_string() + &"ab".repeat(32))],
+            &[ms_spec("ms-1", "proof_a", None, None, None)], None,
+        ).unwrap();
+        let json = policy_template_to_json(&policy).unwrap();
+        let reparsed: ProofPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(reparsed.policy_id, policy.policy_id);
+        assert_eq!(reparsed.required_proofs.len(), policy.required_proofs.len());
+        assert_eq!(reparsed.milestones.len(), policy.milestones.len());
+    }
 }
 
 
@@ -8687,8 +8824,19 @@ pub fn contractor_milestone_template(
     milestones: &[MilestoneSpec],
     notes: Option<String>,
 ) -> Result<ProofPolicy, String> {
+    if policy_id.trim().is_empty() {
+        return Err("contractor_milestone_template: policy_id must not be empty".to_string());
+    }
     if attestors.is_empty() {
         return Err("contractor_milestone_template: attestors must not be empty".to_string());
+    }
+    for a in attestors {
+        if a.attestor_id.trim().is_empty() {
+            return Err("contractor_milestone_template: attestor_id must not be empty".to_string());
+        }
+        if a.pubkey_hex.trim().is_empty() {
+            return Err("contractor_milestone_template: pubkey_hex must not be empty".to_string());
+        }
     }
     if milestones.is_empty() {
         return Err("contractor_milestone_template: milestones must not be empty".to_string());
@@ -8701,6 +8849,12 @@ pub fn contractor_milestone_template(
         if !seen_ids.insert(ms.milestone_id.as_str()) {
             return Err(format!(
                 "contractor_milestone_template: duplicate milestone_id '{}'",
+                ms.milestone_id
+            ));
+        }
+        if ms.proof_type.trim().is_empty() {
+            return Err(format!(
+                "contractor_milestone_template: milestone '{}' proof_type must not be empty",
                 ms.milestone_id
             ));
         }
@@ -8805,8 +8959,22 @@ pub fn preorder_deposit_template(
     holdback_release_height: Option<u64>,
     notes: Option<String>,
 ) -> Result<ProofPolicy, String> {
+    if policy_id.trim().is_empty() {
+        return Err("preorder_deposit_template: policy_id must not be empty".to_string());
+    }
+    if delivery_proof_type.trim().is_empty() {
+        return Err("preorder_deposit_template: delivery_proof_type must not be empty".to_string());
+    }
     if attestors.is_empty() {
         return Err("preorder_deposit_template: attestors must not be empty".to_string());
+    }
+    for a in attestors {
+        if a.attestor_id.trim().is_empty() {
+            return Err("preorder_deposit_template: attestor_id must not be empty".to_string());
+        }
+        if a.pubkey_hex.trim().is_empty() {
+            return Err("preorder_deposit_template: pubkey_hex must not be empty".to_string());
+        }
     }
     if let Some(bps) = holdback_bps {
         if bps == 0 || bps >= 10000 {
@@ -8888,8 +9056,25 @@ pub fn basic_otc_escrow_template(
     threshold: Option<u32>,
     notes: Option<String>,
 ) -> Result<ProofPolicy, String> {
+    if policy_id.trim().is_empty() {
+        return Err("basic_otc_escrow_template: policy_id must not be empty".to_string());
+    }
+    if release_proof_type.trim().is_empty() {
+        return Err("basic_otc_escrow_template: release_proof_type must not be empty".to_string());
+    }
     if attestors.is_empty() {
         return Err("basic_otc_escrow_template: attestors must not be empty".to_string());
+    }
+    for a in attestors {
+        if a.attestor_id.trim().is_empty() {
+            return Err("basic_otc_escrow_template: attestor_id must not be empty".to_string());
+        }
+        if a.pubkey_hex.trim().is_empty() {
+            return Err("basic_otc_escrow_template: pubkey_hex must not be empty".to_string());
+        }
+    }
+    if let Some(0) = threshold {
+        return Err("basic_otc_escrow_template: threshold must be >= 1".to_string());
     }
     let eff_threshold = threshold.unwrap_or(1).max(1);
     if eff_threshold as usize > attestors.len() {

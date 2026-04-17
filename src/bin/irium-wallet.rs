@@ -14305,7 +14305,14 @@ fn main() {
                         i += 2;
                     }
                     "--delivery-proof-type" => { delivery_proof_type = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
-                    "--refund-deadline-height" => { refund_deadline_height = args.get(i+1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 2; }
+                    "--refund-deadline-height" => {
+                        let raw = args.get(i+1).cloned().unwrap_or_default();
+                        refund_deadline_height = match raw.parse::<u64>() {
+                            Ok(v) => v,
+                            Err(_) => { eprintln!("--refund-deadline-height expects a non-negative integer, got: {}", raw); std::process::exit(1); }
+                        };
+                        i += 2;
+                    }
                     "--holdback-bps" => { holdback_bps = args.get(i+1).and_then(|v| v.parse().ok()); i += 2; }
                     "--holdback-release-height" => { holdback_release_height = args.get(i+1).and_then(|v| v.parse().ok()); i += 2; }
                     "--notes" => { notes = Some(args.get(i+1).cloned().unwrap_or_default()); i += 2; }
@@ -14353,7 +14360,14 @@ fn main() {
                         i += 2;
                     }
                     "--release-proof-type" => { release_proof_type = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
-                    "--refund-deadline-height" => { refund_deadline_height = args.get(i+1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 2; }
+                    "--refund-deadline-height" => {
+                        let raw = args.get(i+1).cloned().unwrap_or_default();
+                        refund_deadline_height = match raw.parse::<u64>() {
+                            Ok(v) => v,
+                            Err(_) => { eprintln!("--refund-deadline-height expects a non-negative integer, got: {}", raw); std::process::exit(1); }
+                        };
+                        i += 2;
+                    }
                     "--threshold" => { threshold = args.get(i+1).and_then(|v| v.parse().ok()); i += 2; }
                     "--notes" => { notes = Some(args.get(i+1).cloned().unwrap_or_default()); i += 2; }
                     "--rpc" => { rpc_url = args.get(i+1).cloned().unwrap_or_default(); i += 2; }

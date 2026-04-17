@@ -12268,5 +12268,178 @@ mod tests {
         assert!(msg.contains("threshold"), "error must mention threshold; got: {msg}");
     }
 
+    // Phase 3 audit: empty policy_id is rejected at the template layer
+    #[tokio::test]
+    async fn build_contractor_template_rpc_rejects_empty_policy_id() {
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildContractorTemplateRequest {
+            policy_id: "".to_string(),
+            agreement_hash: "aa".repeat(32),
+            attestors: vec![TemplateAttestorInput {
+                attestor_id: "att".to_string(),
+                pubkey_hex: "03".to_string() + &"ab".repeat(32),
+                display_name: None,
+            }],
+            milestones: vec![MilestoneSpecInput {
+                milestone_id: "ms-1".to_string(),
+                label: None,
+                proof_type: "delivery".to_string(),
+                deadline_height: None,
+                holdback_bps: None,
+                holdback_release_height: None,
+            }],
+            notes: None,
+        };
+        let result = build_contractor_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await;
+        assert!(result.is_err());
+        let (status, msg) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("policy_id must not be empty"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn build_contractor_template_rpc_rejects_empty_proof_type() {
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildContractorTemplateRequest {
+            policy_id: "pol-empty-pt".to_string(),
+            agreement_hash: "bb".repeat(32),
+            attestors: vec![TemplateAttestorInput {
+                attestor_id: "att".to_string(),
+                pubkey_hex: "03".to_string() + &"cd".repeat(32),
+                display_name: None,
+            }],
+            milestones: vec![MilestoneSpecInput {
+                milestone_id: "ms-1".to_string(),
+                label: None,
+                proof_type: "".to_string(),
+                deadline_height: None,
+                holdback_bps: None,
+                holdback_release_height: None,
+            }],
+            notes: None,
+        };
+        let result = build_contractor_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await;
+        assert!(result.is_err());
+        let (status, msg) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("proof_type must not be empty"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn build_preorder_template_rpc_rejects_empty_delivery_proof_type() {
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildPreorderTemplateRequest {
+            policy_id: "pol-empty-dpt".to_string(),
+            agreement_hash: "cc".repeat(32),
+            attestors: vec![TemplateAttestorInput {
+                attestor_id: "att".to_string(),
+                pubkey_hex: "03".to_string() + &"ef".repeat(32),
+                display_name: None,
+            }],
+            delivery_proof_type: "".to_string(),
+            refund_deadline_height: 100_000,
+            holdback_bps: None,
+            holdback_release_height: None,
+            notes: None,
+        };
+        let result = build_preorder_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await;
+        assert!(result.is_err());
+        let (status, msg) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("delivery_proof_type must not be empty"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn build_otc_template_rpc_rejects_threshold_zero() {
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildOtcTemplateRequest {
+            policy_id: "pol-thr0".to_string(),
+            agreement_hash: "dd".repeat(32),
+            attestors: vec![TemplateAttestorInput {
+                attestor_id: "att".to_string(),
+                pubkey_hex: "03".to_string() + &"12".repeat(32),
+                display_name: None,
+            }],
+            release_proof_type: "trade".to_string(),
+            refund_deadline_height: 500_000,
+            threshold: Some(0),
+            notes: None,
+        };
+        let result = build_otc_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await;
+        assert!(result.is_err());
+        let (status, msg) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("threshold must be >= 1"), "got: {msg}");
+    }
+
+    // milestone_count in response is derived from policy, not caller input
+    #[tokio::test]
+    async fn build_contractor_template_milestone_count_matches_policy() {
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildContractorTemplateRequest {
+            policy_id: "pol-ms-count".to_string(),
+            agreement_hash: "ee".repeat(32),
+            attestors: vec![TemplateAttestorInput {
+                attestor_id: "att".to_string(),
+                pubkey_hex: "03".to_string() + &"ab".repeat(32),
+                display_name: None,
+            }],
+            milestones: vec![
+                MilestoneSpecInput { milestone_id: "ms-a".to_string(), label: None, proof_type: "pa".to_string(), deadline_height: None, holdback_bps: None, holdback_release_height: None },
+                MilestoneSpecInput { milestone_id: "ms-b".to_string(), label: None, proof_type: "pb".to_string(), deadline_height: None, holdback_bps: None, holdback_release_height: None },
+                MilestoneSpecInput { milestone_id: "ms-c".to_string(), label: None, proof_type: "pc".to_string(), deadline_height: None, holdback_bps: None, holdback_release_height: None },
+            ],
+            notes: None,
+        };
+        let resp = build_contractor_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await.expect("should succeed").0;
+        // milestone_count in response must match actual policy.milestones.len()
+        assert_eq!(resp.milestone_count, resp.policy.milestones.len(),
+            "milestone_count must be derived from policy, not caller input");
+        assert_eq!(resp.milestone_count, 3);
+        assert_eq!(resp.requirement_count, resp.policy.required_proofs.len());
+    }
+
+    // summary attestor list must reflect the policy's attestors
+    #[tokio::test]
+    async fn build_otc_summary_reflects_policy_attestors() {
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildOtcTemplateRequest {
+            policy_id: "pol-summary-check".to_string(),
+            agreement_hash: "ff".repeat(32),
+            attestors: vec![
+                TemplateAttestorInput { attestor_id: "arbitrator-alpha".to_string(), pubkey_hex: "03".to_string() + &"aa".repeat(32), display_name: None },
+                TemplateAttestorInput { attestor_id: "arbitrator-beta".to_string(), pubkey_hex: "03".to_string() + &"bb".repeat(32), display_name: None },
+            ],
+            release_proof_type: "trade_confirmed".to_string(),
+            refund_deadline_height: 1_000_000,
+            threshold: Some(2),
+            notes: None,
+        };
+        let resp = build_otc_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await.expect("should succeed").0;
+        assert!(resp.summary.contains("arbitrator-alpha"), "summary must list attestor ids: {}", resp.summary);
+        assert!(resp.summary.contains("arbitrator-beta"), "summary must list attestor ids: {}", resp.summary);
+        assert_eq!(resp.attestor_count, 2);
+        assert_eq!(resp.attestor_count, resp.policy.attestors.len());
+    }
+
 }
+
 
