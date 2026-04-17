@@ -186,31 +186,96 @@ Authorization: Bearer <token>
   "agreement_hash": "<64-char hex>",
   "policy_id": "pol-001",
   "tip_height": 1500,
-  "proof_count": 1,
-  "expired_proof_count": 0,
-  "matched_proof_count": 1,
-  "matched_proof_ids": ["prf-001"],
   "release_eligible": true,
   "refund_eligible": false,
   "reason": "all release requirements satisfied by verified proofs",
   "evaluated_rules": [
     "proof 'prf-001' verified ok"
-  ]
+  ],
+  "holdback": {
+    "holdback_present": true,
+    "holdback_released": false,
+    "holdback_bps": 1000,
+    "immediate_release_bps": 9000,
+    "holdback_outcome": "held",
+    "holdback_reason": "base satisfied; holdback pending release condition"
+  }
 }
 ```
 
 - `agreement_hash`: SHA-256 of the canonical agreement, computed by the node.
 - `tip_height`: chain tip height at the moment of evaluation.
-- `proof_count`: active (non-expired) proofs considered for evaluation.
-- `expired_proof_count`: proofs filtered out as expired before evaluation.
-- `matched_proof_count`: proofs that passed signature verification and matched
-  the policy attestor list.
-- `matched_proof_ids`: IDs of those matched proofs.
 - `release_eligible` / `refund_eligible`: at most one will be true per response.
-- `outcome`: deterministic classification — `satisfied`, `timeout`, or `unsatisfied`. Shown by `agreement-policy-evaluate` immediately after `tip_height`.
 - `reason`: human-readable explanation of the outcome.
 - `evaluated_rules`: ordered list of strings describing each step taken, including
   verified proofs, rejected proofs, and triggered or pending deadline rules.
+- `holdback`: present only when the policy declares a top-level holdback. Absent
+  (`null`-omitted) when no holdback is configured or when the milestone evaluation
+  path is used (in which case per-milestone holdbacks appear inside
+  `milestone_results`). See **Holdback detail** below.
+- `milestone_results`: present only when the policy declares milestones; each entry
+  mirrors the `MilestoneEvaluationResult` shape from `/rpc/evaluatepolicy`.
+
+#### Holdback detail fields
+
+| Field | Type | Description |
+|---|---|---|
+| `holdback_present` | bool | Always `true` when this object is present. |
+| `holdback_released` | bool | `true` when the holdback has been released. |
+| `holdback_bps` | integer | Basis points retained (1–9999). |
+| `immediate_release_bps` | integer | Basis points immediately releasable: `10000 - holdback_bps` when `held`; `10000` when `released`. |
+| `holdback_outcome` | string | `"pending"`, `"held"`, or `"released"`. |
+| `holdback_reason` | string | Human-readable explanation. |
+
+**`holdback_outcome` values:**
+
+| Value | Meaning |
+|---|---|
+| `"pending"` | Base release condition not yet satisfied; holdback not yet active. |
+| `"held"` | Base satisfied but holdback release condition (deadline or requirement) not met. |
+| `"released"` | Holdback released — either the deadline passed or the release requirement was satisfied. |
+
+#### Holdback example: held vs released
+
+**Held** (base release satisfied, holdback deadline in the future at tip 100):
+```json
+{
+  "release_eligible": true,
+  "holdback": {
+    "holdback_present": true,
+    "holdback_released": false,
+    "holdback_bps": 1000,
+    "immediate_release_bps": 9000,
+    "holdback_outcome": "held",
+    "holdback_reason": "base satisfied; holdback pending release condition"
+  }
+}
+```
+
+**Released** (deadline height 500 passed at tip 1000):
+```json
+{
+  "release_eligible": true,
+  "holdback": {
+    "holdback_present": true,
+    "holdback_released": true,
+    "holdback_bps": 500,
+    "immediate_release_bps": 10000,
+    "holdback_outcome": "released",
+    "holdback_reason": "holdback released by deadline at height 500"
+  }
+}
+```
+
+**No holdback** (policy without a `holdback` declaration):
+```json
+{
+  "release_eligible": true,
+  "reason": "all release requirements satisfied by verified proofs",
+  "evaluated_rules": ["proof 'prf-001' verified ok"]
+}
+```
+The `holdback` key is omitted entirely — not set to `null` — when absent.
 
 ### Error responses
 
@@ -1463,3 +1528,238 @@ and by SAFETY INVARIANT comments in the source code.
 
 **Excluded from signature** (safe to evolve without breaking existing proofs):
 `expires_at_height`, `typed_payload` (and all its subfields)
+
+---
+
+## Commercial Policy Templates
+
+Phase 2 ships three policy template builder functions in `settlement.rs` that let integrators
+construct correct `ProofPolicy` objects using existing evaluation primitives without writing
+policy JSON by hand. Templates enforce invariants, return descriptive errors on bad input, and
+produce policies that are fully compatible with `evaluate_policy()`.
+
+### `contractor_milestone_template`
+
+**Use when:** a contractor must deliver multiple discrete work items, each with its own holdback
+and optional deadline. A timeout rule fires a `Refund` if no proof arrives by the deadline.
+
+**Signature:**
+```rust
+pub fn contractor_milestone_template(
+    policy_id: &str,
+    agreement_hash: &str,
+    attestors: &[TemplateAttestor],
+    milestones: &[MilestoneSpec],
+    notes: Option<String>,
+) -> Result<ProofPolicy, String>
+```
+
+**Behaviour:**
+- Each `MilestoneSpec` produces a `ProofRequirement` with id `req-{milestone_id}`,
+  resolution `MilestoneRelease`, and the milestone's `proof_type`.
+- If `deadline_height` is set on a milestone, a `PolicyRule` with id `rule-{milestone_id}` is
+  added: trigger `FundedAndNoRelease`, deadline `deadline_height`, resolution `Refund`.
+- If `holdback_bps` and `holdback_release_height` are both set, a `PolicyHoldback` is added to
+  the requirement with `deadline_height = holdback_release_height`.
+- Rejects: empty attestors, empty milestones, duplicate milestone ids, `holdback_bps` set
+  without `holdback_release_height`, `holdback_bps` > 10000.
+
+**Example JSON** (two milestones, first with a 30-day holdback):
+```json
+{
+  "schema_id": "irium.phase2.proof_policy.v1",
+  "policy_id": "pol-construction-001",
+  "agreement_hash": "aabbcc...",
+  "approved_attestors": [
+    { "attestor_id": "att-inspector", "pubkey_hex": "03abc...", "display_name": "Site Inspector" }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "req-foundation",
+      "proof_type": "foundation_complete",
+      "resolution": "MilestoneRelease",
+      "milestone_id": "foundation",
+      "holdback": {
+        "holdback_bps": 1000,
+        "deadline_height": 750000
+      }
+    },
+    {
+      "requirement_id": "req-framing",
+      "proof_type": "framing_complete",
+      "resolution": "MilestoneRelease",
+      "milestone_id": "framing"
+    }
+  ],
+  "rules": [
+    {
+      "rule_id": "rule-framing",
+      "trigger": "FundedAndNoRelease",
+      "deadline_height": 800000,
+      "resolution": "Refund"
+    }
+  ]
+}
+```
+
+---
+
+### `preorder_deposit_template`
+
+**Use when:** a buyer deposits funds for a pre-ordered item. Funds release on a delivery proof;
+a timeout rule refunds the buyer if no delivery proof arrives before a deadline.
+
+**Signature:**
+```rust
+pub fn preorder_deposit_template(
+    policy_id: &str,
+    agreement_hash: &str,
+    attestors: &[TemplateAttestor],
+    delivery_proof_type: &str,
+    refund_deadline_height: u64,
+    holdback_bps: Option<u32>,
+    holdback_release_height: Option<u64>,
+    notes: Option<String>,
+) -> Result<ProofPolicy, String>
+```
+
+**Behaviour:**
+- Produces a single requirement `req-delivery` with resolution `Release`.
+- Produces a single rule `rule-timeout-refund` with trigger `FundedAndNoRelease`,
+  deadline `refund_deadline_height`, resolution `Refund`.
+- If `holdback_bps` is set, a top-level `policy.holdback` is added (requires
+  `holdback_release_height`).
+- Rejects: empty attestors, `holdback_bps` set without `holdback_release_height`,
+  `holdback_bps` > 10000.
+
+**Example JSON** (5% holdback, 60-day refund window):
+```json
+{
+  "schema_id": "irium.phase2.proof_policy.v1",
+  "policy_id": "pol-preorder-42",
+  "agreement_hash": "aabbcc...",
+  "approved_attestors": [
+    { "attestor_id": "att-warehouse", "pubkey_hex": "03def...", "display_name": "Warehouse" }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "req-delivery",
+      "proof_type": "shipment_delivered",
+      "resolution": "Release"
+    }
+  ],
+  "rules": [
+    {
+      "rule_id": "rule-timeout-refund",
+      "trigger": "FundedAndNoRelease",
+      "deadline_height": 850000,
+      "resolution": "Refund"
+    }
+  ],
+  "holdback": {
+    "holdback_bps": 500,
+    "deadline_height": 870000
+  }
+}
+```
+
+---
+
+### `basic_otc_escrow_template`
+
+**Use when:** two parties want a simple OTC escrow — funds release when one (or more) trusted
+attestors submit a matching proof. A timeout refund fires if no release proof arrives.
+
+**Signature:**
+```rust
+pub fn basic_otc_escrow_template(
+    policy_id: &str,
+    agreement_hash: &str,
+    attestors: &[TemplateAttestor],
+    release_proof_type: &str,
+    refund_deadline_height: u64,
+    threshold: Option<u32>,
+    notes: Option<String>,
+) -> Result<ProofPolicy, String>
+```
+
+**Behaviour:**
+- Produces a single requirement `req-release` with resolution `Release`.
+- If `threshold` is `None` or `Some(1)`, no `threshold` field is set on the requirement
+  (single-attestor backward-compatible path).
+- If `threshold` is `Some(n)` where `n > 1`, the requirement's `threshold` field is set to `n`
+  and `required_attestor_ids` is populated from all attestors.
+- Produces a single rule `rule-timeout-refund` with trigger `FundedAndNoRelease`,
+  deadline `refund_deadline_height`, resolution `Refund`.
+- Rejects: empty attestors, `threshold` > number of attestors.
+
+**Example JSON** (2-of-3 multi-sig escrow):
+```json
+{
+  "schema_id": "irium.phase2.proof_policy.v1",
+  "policy_id": "pol-otc-77",
+  "agreement_hash": "aabbcc...",
+  "approved_attestors": [
+    { "attestor_id": "att-a", "pubkey_hex": "03aaa...", "display_name": "Arbitrator A" },
+    { "attestor_id": "att-b", "pubkey_hex": "03bbb...", "display_name": "Arbitrator B" },
+    { "attestor_id": "att-c", "pubkey_hex": "03ccc...", "display_name": "Arbitrator C" }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "req-release",
+      "proof_type": "otc_trade_confirmed",
+      "resolution": "Release",
+      "threshold": 2,
+      "required_attestor_ids": ["att-a", "att-b", "att-c"]
+    }
+  ],
+  "rules": [
+    {
+      "rule_id": "rule-timeout-refund",
+      "trigger": "FundedAndNoRelease",
+      "deadline_height": 900000,
+      "resolution": "Refund"
+    }
+  ]
+}
+```
+
+---
+
+### Input types
+
+```rust
+pub struct TemplateAttestor {
+    pub attestor_id: String,
+    pub pubkey_hex: String,
+    pub display_name: Option<String>,
+}
+
+pub struct MilestoneSpec {
+    pub milestone_id: String,
+    pub label: Option<String>,
+    pub proof_type: String,
+    pub deadline_height: Option<u64>,
+    pub holdback_bps: Option<u32>,
+    pub holdback_release_height: Option<u64>,
+}
+```
+
+### Serialising a template to JSON
+
+```rust
+pub fn policy_template_to_json(policy: &ProofPolicy) -> Result<String, String>
+```
+
+Wraps `serde_json::to_string_pretty`. Use this to write a policy to disk or transmit it
+to `store-policy` RPC before a funded agreement starts.
+
+### Design constraints
+
+Templates compose only existing `ProofPolicy` primitives. They:
+
+- Do **not** add new evaluation logic or consensus rules.
+- Do **not** introduce new struct fields on `ProofPolicy`, `ProofRequirement`, or `PolicyRule`.
+- Do **not** modify `evaluate_policy()` or any holdback/threshold evaluator.
+- Are tested against `evaluate_policy()` directly so that template-generated policies behave
+  identically to hand-crafted ones with the same structure.

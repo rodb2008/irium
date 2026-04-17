@@ -8260,4 +8260,688 @@ mod tests {
             "proof_kind contradiction must not change policy outcome; only signed proof_type counts"
         );
     }
+
+    // ---- Commercial Policy Template Tests ----
+
+    fn test_attestor_tmpl(id: &str, pk: &str) -> TemplateAttestor {
+        TemplateAttestor { attestor_id: id.to_string(), pubkey_hex: pk.to_string(), display_name: None }
+    }
+
+    fn dummy_hash_64() -> String { "a".repeat(64) }
+
+    fn ms_spec(id: &str, pt: &str, dl: Option<u64>, hb: Option<u32>, hb_ht: Option<u64>) -> MilestoneSpec {
+        MilestoneSpec {
+            milestone_id: id.to_string(), label: None,
+            proof_type: pt.to_string(), deadline_height: dl,
+            holdback_bps: hb, holdback_release_height: hb_ht,
+        }
+    }
+
+    #[test]
+    fn contractor_template_valid_two_milestones() {
+        let policy = contractor_milestone_template(
+            "pol-c1", &dummy_hash_64(),
+            &[test_attestor_tmpl("att", "pk")],
+            &[ms_spec("ms-1", "completion", Some(1000), None, None),
+              ms_spec("ms-2", "delivery", Some(2000), Some(500), Some(2500))],
+            None,
+        ).unwrap();
+        assert_eq!(policy.schema_id, PROOF_POLICY_SCHEMA_ID);
+        assert_eq!(policy.milestones.len(), 2);
+        assert_eq!(policy.required_proofs.len(), 2);
+        assert_eq!(policy.no_response_rules.len(), 2);
+        assert_eq!(policy.milestones.iter().find(|m| m.milestone_id == "ms-2").unwrap()
+            .holdback.as_ref().unwrap().holdback_bps, 500);
+        assert!(policy.milestones.iter().find(|m| m.milestone_id == "ms-1").unwrap().holdback.is_none());
+    }
+
+    #[test]
+    fn contractor_template_no_deadline_no_rule() {
+        let policy = contractor_milestone_template(
+            "p", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            &[ms_spec("ms-nodl", "t", None, None, None)], None,
+        ).unwrap();
+        assert!(policy.no_response_rules.is_empty());
+    }
+
+    #[test]
+    fn contractor_template_rejects_empty_attestors() {
+        let err = contractor_milestone_template(
+            "p", &dummy_hash_64(), &[], &[ms_spec("m", "t", None, None, None)], None,
+        ).unwrap_err();
+        assert!(err.contains("attestors must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn contractor_template_rejects_empty_milestones() {
+        let err = contractor_milestone_template(
+            "p", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")], &[], None,
+        ).unwrap_err();
+        assert!(err.contains("milestones must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn contractor_template_rejects_duplicate_milestone_ids() {
+        let err = contractor_milestone_template(
+            "p", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            &[ms_spec("ms-x", "t", None, None, None), ms_spec("ms-x", "t", None, None, None)],
+            None,
+        ).unwrap_err();
+        assert!(err.contains("duplicate milestone_id"), "got: {err}");
+    }
+
+    #[test]
+    fn contractor_template_rejects_holdback_without_release_height() {
+        let err = contractor_milestone_template(
+            "p", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            &[ms_spec("ms-1", "t", None, Some(300), None)], None,
+        ).unwrap_err();
+        assert!(err.contains("holdback_release_height"), "got: {err}");
+    }
+
+    #[test]
+    fn contractor_template_rejects_holdback_bps_out_of_range() {
+        let err = contractor_milestone_template(
+            "p", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            &[ms_spec("ms-1", "t", None, Some(10000), Some(999))], None,
+        ).unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn preorder_template_basic() {
+        let policy = preorder_deposit_template(
+            "pol-pre", &dummy_hash_64(), &[test_attestor_tmpl("att", "pk")],
+            "delivery_confirmation", 5000, None, None, None,
+        ).unwrap();
+        assert_eq!(policy.required_proofs[0].proof_type, "delivery_confirmation");
+        assert_eq!(policy.required_proofs[0].resolution, ProofResolution::Release);
+        assert_eq!(policy.no_response_rules[0].deadline_height, 5000);
+        assert_eq!(policy.no_response_rules[0].resolution, ProofResolution::Refund);
+        assert!(policy.holdback.is_none());
+        assert!(policy.milestones.is_empty());
+    }
+
+    #[test]
+    fn preorder_template_with_holdback() {
+        let policy = preorder_deposit_template(
+            "pol-pre-hb", &dummy_hash_64(), &[test_attestor_tmpl("att", "pk")],
+            "delivery_confirmation", 5000, Some(1000), Some(6000), None,
+        ).unwrap();
+        let hb = policy.holdback.as_ref().unwrap();
+        assert_eq!(hb.holdback_bps, 1000);
+        assert_eq!(hb.deadline_height, Some(6000));
+        assert!(hb.release_requirement_id.is_none());
+    }
+
+    #[test]
+    fn preorder_template_rejects_empty_attestors() {
+        let err = preorder_deposit_template(
+            "p", &dummy_hash_64(), &[], "t", 100, None, None, None,
+        ).unwrap_err();
+        assert!(err.contains("attestors must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn preorder_template_rejects_holdback_without_release_height() {
+        let err = preorder_deposit_template(
+            "p", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            "t", 100, Some(500), None, None,
+        ).unwrap_err();
+        assert!(err.contains("holdback_release_height"), "got: {err}");
+    }
+
+    #[test]
+    fn preorder_template_rejects_holdback_bps_out_of_range() {
+        let err = preorder_deposit_template(
+            "p", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")],
+            "t", 100, Some(0), Some(200), None,
+        ).unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn otc_template_single_attestor() {
+        let policy = basic_otc_escrow_template(
+            "pol-otc", &dummy_hash_64(), &[test_attestor_tmpl("agent", "pk")],
+            "trade_settlement", 10000, None, None,
+        ).unwrap();
+        assert!(policy.required_proofs[0].threshold.is_none());
+        assert_eq!(policy.required_proofs[0].resolution, ProofResolution::Release);
+        assert_eq!(policy.no_response_rules[0].resolution, ProofResolution::Refund);
+    }
+
+    #[test]
+    fn otc_template_multi_attestor_threshold() {
+        let policy = basic_otc_escrow_template(
+            "pol-otc-2of3", &dummy_hash_64(),
+            &[test_attestor_tmpl("a1", "pk1"), test_attestor_tmpl("a2", "pk2"), test_attestor_tmpl("a3", "pk3")],
+            "trade_settlement", 10000, Some(2), None,
+        ).unwrap();
+        assert_eq!(policy.required_proofs[0].threshold, Some(2));
+        assert_eq!(policy.required_proofs[0].required_attestor_ids.len(), 3);
+    }
+
+    #[test]
+    fn otc_template_threshold_1_does_not_set_field() {
+        let policy = basic_otc_escrow_template(
+            "p", &dummy_hash_64(), &[test_attestor_tmpl("a", "pk")], "t", 100, Some(1), None,
+        ).unwrap();
+        assert!(policy.required_proofs[0].threshold.is_none(),
+            "threshold=1 must not set the threshold field (backward compat)");
+    }
+
+    #[test]
+    fn otc_template_rejects_threshold_exceeds_attestors() {
+        let err = basic_otc_escrow_template(
+            "p", &dummy_hash_64(),
+            &[test_attestor_tmpl("a1", "pk1"), test_attestor_tmpl("a2", "pk2")],
+            "t", 100, Some(3), None,
+        ).unwrap_err();
+        assert!(err.contains("threshold 3 exceeds attestor count"), "got: {err}");
+    }
+
+    #[test]
+    fn otc_template_rejects_empty_attestors() {
+        let err = basic_otc_escrow_template(
+            "p", &dummy_hash_64(), &[], "t", 100, None, None,
+        ).unwrap_err();
+        assert!(err.contains("attestors must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn preorder_evaluates_satisfied_when_proof_present() {
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let policy = preorder_deposit_template(
+            "pol-eval-pre", &hash,
+            &[TemplateAttestor { attestor_id: "att".to_string(), pubkey_hex: pk.clone(), display_name: None }],
+            "delivery_confirmation", 9999, None, None, None,
+        ).unwrap();
+        let mut proof = SettlementProof {
+            proof_id: "prf-pre-001".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: hash.clone(), milestone_id: None,
+            attested_by: "att".to_string(), attestation_time: 1_700_000_000,
+            evidence_hash: None, evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pk.clone(), signature_hex: String::new(), payload_hash: String::new(),
+            },
+            expires_at_height: None, typed_payload: None,
+        };
+        proof.signature = sign_proof(&proof, &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.release_eligible);
+        assert!(!result.refund_eligible);
+    }
+
+    #[test]
+    fn preorder_evaluates_timeout_when_deadline_passed_no_proof() {
+        let agreement = sample_agreement();
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let policy = preorder_deposit_template(
+            "pol-eval-timeout", &hash,
+            &[TemplateAttestor { attestor_id: "att".to_string(), pubkey_hex: "pk-dummy".to_string(), display_name: None }],
+            "delivery_confirmation", 100, None, None, None,
+        ).unwrap();
+        let result = evaluate_policy(&agreement, &policy, &[], 200).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Timeout);
+        assert!(!result.release_eligible);
+        assert!(result.refund_eligible);
+    }
+
+    #[test]
+    fn contractor_milestone_evaluates_partial_completion() {
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let policy = contractor_milestone_template(
+            "pol-c-eval", &hash,
+            &[TemplateAttestor { attestor_id: "att".to_string(), pubkey_hex: pk.clone(), display_name: None }],
+            &[ms_spec("ms-1", "milestone_completion", Some(5000), None, None),
+              ms_spec("ms-2", "delivery_confirmation", Some(8000), None, None)],
+            None,
+        ).unwrap();
+        let mut proof = SettlementProof {
+            proof_id: "prf-ms1".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "milestone_completion".to_string(),
+            agreement_hash: hash.clone(), milestone_id: None,
+            attested_by: "att".to_string(), attestation_time: 1_700_000_000,
+            evidence_hash: None, evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pk.clone(), signature_hex: String::new(), payload_hash: String::new(),
+            },
+            expires_at_height: None, typed_payload: None,
+        };
+        proof.signature = sign_proof(&proof, &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Unsatisfied);
+        assert_eq!(result.milestone_results.len(), 2);
+        assert_eq!(
+            result.milestone_results.iter().find(|m| m.milestone_id == "ms-1").unwrap().outcome,
+            PolicyOutcome::Satisfied
+        );
+        assert_eq!(
+            result.milestone_results.iter().find(|m| m.milestone_id == "ms-2").unwrap().outcome,
+            PolicyOutcome::Unsatisfied
+        );
+    }
+
+    #[test]
+    fn otc_escrow_threshold_evaluates_correctly() {
+        let sk1 = SigningKey::from_bytes((&[11u8; 32]).into()).unwrap();
+        let sk2 = SigningKey::from_bytes((&[22u8; 32]).into()).unwrap();
+        let pk1 = hex::encode(sk1.verifying_key().to_encoded_point(false).as_bytes());
+        let pk2 = hex::encode(sk2.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let policy = basic_otc_escrow_template(
+            "pol-otc-thr", &hash,
+            &[TemplateAttestor { attestor_id: "arb-1".to_string(), pubkey_hex: pk1.clone(), display_name: None },
+              TemplateAttestor { attestor_id: "arb-2".to_string(), pubkey_hex: pk2.clone(), display_name: None }],
+            "trade_settlement", 9999, Some(2), None,
+        ).unwrap();
+        let make_p = |id: &str, att: &str, pk: String, sk: &SigningKey| -> SettlementProof {
+            let mut p = SettlementProof {
+                proof_id: id.to_string(),
+                schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+                proof_type: "trade_settlement".to_string(),
+                agreement_hash: hash.clone(), milestone_id: None,
+                attested_by: att.to_string(), attestation_time: 1_700_000_000,
+                evidence_hash: None, evidence_summary: None,
+                signature: ProofSignatureEnvelope {
+                    signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                    pubkey_hex: pk, signature_hex: String::new(), payload_hash: String::new(),
+                },
+                expires_at_height: None, typed_payload: None,
+            };
+            p.signature = sign_proof(&p, sk);
+            p
+        };
+        let p1 = make_p("prf-1", "arb-1", pk1.clone(), &sk1);
+        let p2 = make_p("prf-2", "arb-2", pk2.clone(), &sk2);
+        assert_eq!(evaluate_policy(&agreement, &policy, &[p1.clone()], 0).unwrap().outcome, PolicyOutcome::Unsatisfied);
+        let result = evaluate_policy(&agreement, &policy, &[p1, p2], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+        assert!(result.release_eligible);
+    }
+
+    #[test]
+    fn policy_template_to_json_roundtrips() {
+        let policy = basic_otc_escrow_template(
+            "pol-json", &dummy_hash_64(), &[test_attestor_tmpl("att", "pk")],
+            "trade_settlement", 1000, None, None,
+        ).unwrap();
+        let json = policy_template_to_json(&policy).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["schema_id"], PROOF_POLICY_SCHEMA_ID);
+        let reparsed: ProofPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(reparsed.policy_id, policy.policy_id);
+    }
+
+    #[test]
+    fn template_backward_compat_vs_handcrafted_policy() {
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let legacy = make_test_policy(&hash, &pk, "att");
+        let template = basic_otc_escrow_template(
+            "pol-001", &hash,
+            &[TemplateAttestor { attestor_id: "att".to_string(), pubkey_hex: pk.clone(), display_name: None }],
+            "delivery_confirmation", 99999, None, None,
+        ).unwrap();
+        let mut proof = SettlementProof {
+            proof_id: "prf-bc".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: hash.clone(), milestone_id: None,
+            attested_by: "att".to_string(), attestation_time: 1_700_000_000,
+            evidence_hash: None, evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pk.clone(), signature_hex: String::new(), payload_hash: String::new(),
+            },
+            expires_at_height: None, typed_payload: None,
+        };
+        proof.signature = sign_proof(&proof, &sk);
+        assert_eq!(evaluate_policy(&agreement, &legacy, &[proof.clone()], 0).unwrap().outcome, PolicyOutcome::Satisfied);
+        assert_eq!(evaluate_policy(&agreement, &template, &[proof], 0).unwrap().outcome, PolicyOutcome::Satisfied);
+    }
+}
+
+
+// ============================================================================
+// Commercial Policy Templates
+// ============================================================================
+//
+// Pure composition helpers: each function returns a valid ProofPolicy built from
+// existing primitives.  No new evaluation logic, no new consensus rules.
+// Templates validate their inputs before constructing the policy; callers receive
+// a descriptive error when parameters are inconsistent.
+//
+// To submit a template to the node call /rpc/storepolicy with the serialised JSON.
+// Use `policy_template_to_json` to obtain the canonical JSON string.
+// ============================================================================
+
+/// Serialise a `ProofPolicy` to a canonical JSON string for RPC submission.
+pub fn policy_template_to_json(policy: &ProofPolicy) -> Result<String, String> {
+    serde_json::to_string_pretty(policy).map_err(|e| format!("serialize policy: {e}"))
+}
+
+// ── Shared input types ────────────────────────────────────────────────────────
+
+/// A single approved attestor descriptor used by template builders.
+#[derive(Debug, Clone)]
+pub struct TemplateAttestor {
+    /// Unique identifier referenced in `required_attestor_ids` and `attestors`.
+    pub attestor_id: String,
+    /// Uncompressed secp256k1 public key (130 hex chars) or compressed (66 hex chars).
+    pub pubkey_hex: String,
+    /// Optional human-readable label.
+    pub display_name: Option<String>,
+}
+
+/// Per-milestone descriptor used by `contractor_milestone_template`.
+#[derive(Debug, Clone)]
+pub struct MilestoneSpec {
+    /// Unique identifier for this milestone (e.g. "ms-design", "ms-delivery").
+    pub milestone_id: String,
+    /// Human-readable label shown in evaluation output.
+    pub label: Option<String>,
+    /// Proof type that must be attested to release this milestone.
+    pub proof_type: String,
+    /// Block height deadline after which a missing proof triggers a timeout refund.
+    /// `None` means no timeout rule for this milestone.
+    pub deadline_height: Option<u64>,
+    /// Basis points (1-9999) held back after release until `holdback_release_height`.
+    /// `None` means no holdback on this milestone.
+    pub holdback_bps: Option<u32>,
+    /// Block height at which an active holdback is automatically released.
+    /// Required when `holdback_bps` is set.
+    pub holdback_release_height: Option<u64>,
+}
+
+// ── Template 1: contractor_milestone_template ─────────────────────────────────
+
+/// Build a milestone-based contractor payment policy.
+///
+/// Each milestone becomes an independent tranche evaluated separately.
+/// Release is gated on a proof of `milestone.proof_type` from any attestor in
+/// `attestors`.  When `deadline_height` is set a `funded_and_no_release` timeout
+/// rule triggers refund eligibility if no proof arrives by that height.
+/// When `holdback_bps` is set on a milestone a fraction is held back until
+/// `holdback_release_height`.
+pub fn contractor_milestone_template(
+    policy_id: &str,
+    agreement_hash: &str,
+    attestors: &[TemplateAttestor],
+    milestones: &[MilestoneSpec],
+    notes: Option<String>,
+) -> Result<ProofPolicy, String> {
+    if attestors.is_empty() {
+        return Err("contractor_milestone_template: attestors must not be empty".to_string());
+    }
+    if milestones.is_empty() {
+        return Err("contractor_milestone_template: milestones must not be empty".to_string());
+    }
+    let mut seen_ids = std::collections::HashSet::new();
+    for ms in milestones {
+        if ms.milestone_id.trim().is_empty() {
+            return Err("contractor_milestone_template: milestone_id must not be empty".to_string());
+        }
+        if !seen_ids.insert(ms.milestone_id.as_str()) {
+            return Err(format!(
+                "contractor_milestone_template: duplicate milestone_id '{}'",
+                ms.milestone_id
+            ));
+        }
+        if let Some(bps) = ms.holdback_bps {
+            if bps == 0 || bps >= 10000 {
+                return Err(format!(
+                    "contractor_milestone_template: milestone '{}' holdback_bps {} out of range (1-9999)",
+                    ms.milestone_id, bps
+                ));
+            }
+            if ms.holdback_release_height.is_none() {
+                return Err(format!(
+                    "contractor_milestone_template: milestone '{}' holdback_bps set but holdback_release_height not supplied",
+                    ms.milestone_id
+                ));
+            }
+        }
+    }
+
+    let approved_attestors: Vec<ApprovedAttestor> = attestors
+        .iter()
+        .map(|a| ApprovedAttestor {
+            attestor_id: a.attestor_id.clone(),
+            pubkey_hex: a.pubkey_hex.clone(),
+            display_name: a.display_name.clone(),
+            domain: None,
+        })
+        .collect();
+
+    let attestor_ids: Vec<String> = attestors.iter().map(|a| a.attestor_id.clone()).collect();
+
+    let mut required_proofs: Vec<ProofRequirement> = Vec::new();
+    let mut no_response_rules: Vec<NoResponseRule> = Vec::new();
+    let mut policy_milestones: Vec<PolicyMilestone> = Vec::new();
+
+    for ms in milestones {
+        let req_id = format!("req-{}", ms.milestone_id);
+
+        required_proofs.push(ProofRequirement {
+            requirement_id: req_id.clone(),
+            proof_type: ms.proof_type.clone(),
+            required_by: ms.deadline_height,
+            required_attestor_ids: attestor_ids.clone(),
+            resolution: ProofResolution::MilestoneRelease,
+            milestone_id: Some(ms.milestone_id.clone()),
+            threshold: None,
+        });
+
+        if let Some(dl) = ms.deadline_height {
+            no_response_rules.push(NoResponseRule {
+                rule_id: format!("rule-{}", ms.milestone_id),
+                deadline_height: dl,
+                trigger: NoResponseTrigger::FundedAndNoRelease,
+                resolution: ProofResolution::Refund,
+                milestone_id: Some(ms.milestone_id.clone()),
+                notes: Some(format!("timeout refund for milestone '{}'", ms.milestone_id)),
+            });
+        }
+
+        let holdback = ms.holdback_bps.map(|bps| PolicyHoldback {
+            holdback_bps: bps,
+            release_requirement_id: None,
+            deadline_height: ms.holdback_release_height,
+        });
+
+        policy_milestones.push(PolicyMilestone {
+            milestone_id: ms.milestone_id.clone(),
+            label: ms.label.clone(),
+            holdback,
+        });
+    }
+
+    Ok(ProofPolicy {
+        policy_id: policy_id.to_string(),
+        schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+        agreement_hash: agreement_hash.to_string(),
+        required_proofs,
+        no_response_rules,
+        attestors: approved_attestors,
+        notes,
+        expires_at_height: None,
+        milestones: policy_milestones,
+        holdback: None,
+    })
+}
+
+// ── Template 2: preorder_deposit_template ────────────────────────────────────
+
+/// Build a preorder/deposit protection policy.
+///
+/// Funds release when an approved attestor provides a `delivery_proof_type` proof.
+/// If no proof arrives by `refund_deadline_height` the buyer becomes refund-eligible.
+/// Optional holdback: `holdback_bps` fraction retained after delivery proof, released
+/// at `holdback_release_height`.
+pub fn preorder_deposit_template(
+    policy_id: &str,
+    agreement_hash: &str,
+    attestors: &[TemplateAttestor],
+    delivery_proof_type: &str,
+    refund_deadline_height: u64,
+    holdback_bps: Option<u32>,
+    holdback_release_height: Option<u64>,
+    notes: Option<String>,
+) -> Result<ProofPolicy, String> {
+    if attestors.is_empty() {
+        return Err("preorder_deposit_template: attestors must not be empty".to_string());
+    }
+    if let Some(bps) = holdback_bps {
+        if bps == 0 || bps >= 10000 {
+            return Err(format!(
+                "preorder_deposit_template: holdback_bps {} out of range (1-9999)", bps
+            ));
+        }
+        if holdback_release_height.is_none() {
+            return Err(
+                "preorder_deposit_template: holdback_bps set but holdback_release_height not supplied"
+                    .to_string(),
+            );
+        }
+    }
+
+    let attestor_ids: Vec<String> = attestors.iter().map(|a| a.attestor_id.clone()).collect();
+    let approved_attestors: Vec<ApprovedAttestor> = attestors
+        .iter()
+        .map(|a| ApprovedAttestor {
+            attestor_id: a.attestor_id.clone(),
+            pubkey_hex: a.pubkey_hex.clone(),
+            display_name: a.display_name.clone(),
+            domain: None,
+        })
+        .collect();
+
+    let required_proofs = vec![ProofRequirement {
+        requirement_id: "req-delivery".to_string(),
+        proof_type: delivery_proof_type.to_string(),
+        required_by: Some(refund_deadline_height),
+        required_attestor_ids: attestor_ids,
+        resolution: ProofResolution::Release,
+        milestone_id: None,
+        threshold: None,
+    }];
+
+    let no_response_rules = vec![NoResponseRule {
+        rule_id: "rule-timeout-refund".to_string(),
+        deadline_height: refund_deadline_height,
+        trigger: NoResponseTrigger::FundedAndNoRelease,
+        resolution: ProofResolution::Refund,
+        milestone_id: None,
+        notes: Some("refund buyer if delivery proof not provided by deadline".to_string()),
+    }];
+
+    let holdback = holdback_bps.map(|bps| PolicyHoldback {
+        holdback_bps: bps,
+        release_requirement_id: None,
+        deadline_height: holdback_release_height,
+    });
+
+    Ok(ProofPolicy {
+        policy_id: policy_id.to_string(),
+        schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+        agreement_hash: agreement_hash.to_string(),
+        required_proofs,
+        no_response_rules,
+        attestors: approved_attestors,
+        notes,
+        expires_at_height: None,
+        milestones: vec![],
+        holdback,
+    })
+}
+
+// ── Template 3: basic_otc_escrow_template ────────────────────────────────────
+
+/// Build a basic OTC escrow policy.
+///
+/// Funds release when `threshold` approved attestors provide a `release_proof_type` proof.
+/// `threshold` defaults to 1 (single-sig escrow).  Values > 1 enable multi-party release.
+/// Timeout refund triggers at `refund_deadline_height` if the quorum is not reached.
+pub fn basic_otc_escrow_template(
+    policy_id: &str,
+    agreement_hash: &str,
+    attestors: &[TemplateAttestor],
+    release_proof_type: &str,
+    refund_deadline_height: u64,
+    threshold: Option<u32>,
+    notes: Option<String>,
+) -> Result<ProofPolicy, String> {
+    if attestors.is_empty() {
+        return Err("basic_otc_escrow_template: attestors must not be empty".to_string());
+    }
+    let eff_threshold = threshold.unwrap_or(1).max(1);
+    if eff_threshold as usize > attestors.len() {
+        return Err(format!(
+            "basic_otc_escrow_template: threshold {} exceeds attestor count {}",
+            eff_threshold, attestors.len()
+        ));
+    }
+
+    let attestor_ids: Vec<String> = attestors.iter().map(|a| a.attestor_id.clone()).collect();
+    let approved_attestors: Vec<ApprovedAttestor> = attestors
+        .iter()
+        .map(|a| ApprovedAttestor {
+            attestor_id: a.attestor_id.clone(),
+            pubkey_hex: a.pubkey_hex.clone(),
+            display_name: a.display_name.clone(),
+            domain: None,
+        })
+        .collect();
+
+    // Only set threshold field when > 1 to preserve single-attestor backward-compatible path.
+    let threshold_field = if eff_threshold > 1 { Some(eff_threshold) } else { None };
+
+    let required_proofs = vec![ProofRequirement {
+        requirement_id: "req-release".to_string(),
+        proof_type: release_proof_type.to_string(),
+        required_by: Some(refund_deadline_height),
+        required_attestor_ids: attestor_ids,
+        resolution: ProofResolution::Release,
+        milestone_id: None,
+        threshold: threshold_field,
+    }];
+
+    let no_response_rules = vec![NoResponseRule {
+        rule_id: "rule-timeout-refund".to_string(),
+        deadline_height: refund_deadline_height,
+        trigger: NoResponseTrigger::FundedAndNoRelease,
+        resolution: ProofResolution::Refund,
+        milestone_id: None,
+        notes: Some("refund if release proof quorum not reached by deadline".to_string()),
+    }];
+
+    Ok(ProofPolicy {
+        policy_id: policy_id.to_string(),
+        schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+        agreement_hash: agreement_hash.to_string(),
+        required_proofs,
+        no_response_rules,
+        attestors: approved_attestors,
+        notes,
+        expires_at_height: None,
+        milestones: vec![],
+        holdback: None,
+    })
 }
