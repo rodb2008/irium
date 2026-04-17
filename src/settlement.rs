@@ -3724,6 +3724,25 @@ pub struct ProofPolicy {
     pub holdback: Option<PolicyHoldback>,
 }
 
+/// Normalized application-layer proof payload metadata.
+/// Carried alongside the proof but excluded from `settlement_proof_payload_bytes` -
+/// existing signatures remain valid. Policy evaluation continues to match on `proof_type`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TypedProofPayload {
+    /// Normalized proof category. Must be non-empty.
+    pub proof_kind: String,
+    /// SHA-256 hex (64 lowercase chars) of the attached evidence object.
+    /// When set alongside `evidence_hash` on the parent proof the two must agree.
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    /// Opaque external reference (tracking number, invoice ID, etc.).
+    #[serde(default)]
+    pub reference_id: Option<String>,
+    /// Additional typed key-value attributes; must be a JSON object when present.
+    #[serde(default)]
+    pub attributes: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofSignatureEnvelope {
     pub signature_type: String,
@@ -3749,6 +3768,10 @@ pub struct SettlementProof {
     /// the proof is skipped in evaluate_policy_rpc. Does not affect check_policy_rpc.
     #[serde(default)]
     pub expires_at_height: Option<u64>,
+    /// Optional normalized proof payload metadata. Excluded from signature payload bytes;
+    /// backward compatible - legacy proofs without this field deserialize fine.
+    #[serde(default)]
+    pub typed_payload: Option<TypedProofPayload>,
 }
 
 /// Attestor threshold evaluation result for a single requirement.
@@ -3889,6 +3912,16 @@ pub fn compute_proof_policy_hash(policy: &ProofPolicy) -> Result<String, String>
     Ok(hex::encode(digest))
 }
 
+/// SIGNED FIELDS (included in signature payload - changing these breaks all existing signatures):
+///   proof_id, schema_id, proof_type, agreement_hash, milestone_id, attested_by,
+///   attestation_time, evidence_hash, evidence_summary
+///
+/// EXCLUDED FROM SIGNATURE (unsigned application-layer fields - safe to evolve):
+///   expires_at_height  - lifecycle filter only, unsigned by design
+///   typed_payload      - display/normalization metadata, unsigned by design
+///
+/// INVARIANT: do not add typed_payload or expires_at_height here.
+/// Any new field added to this function becomes a breaking change for all prior signatures.
 pub fn settlement_proof_payload_bytes(proof: &SettlementProof) -> Result<Vec<u8>, String> {
     let value = serde_json::json!({
         "proof_id": proof.proof_id,
@@ -3911,6 +3944,40 @@ fn compute_settlement_proof_payload_hash(proof: &SettlementProof) -> Result<[u8;
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     Ok(out)
+}
+
+/// Validates a typed proof payload object.
+/// - proof_kind must be non-empty
+/// - content_hash when present must be 64 lowercase hex chars
+/// - content_hash must equal evidence_hash when both are set
+/// - attributes when present must be a JSON object
+pub fn validate_typed_proof_payload(
+    payload: &TypedProofPayload,
+    evidence_hash: Option<&str>,
+) -> Result<(), String> {
+    if payload.proof_kind.trim().is_empty() {
+        return Err("typed_payload.proof_kind must not be empty".to_string());
+    }
+    if let Some(ref ch) = payload.content_hash {
+        if ch.len() != 64 || !ch.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()) {
+            return Err(format!(
+                "typed_payload.content_hash must be 64 lowercase hex chars, got: {ch}"
+            ));
+        }
+        if let Some(eh) = evidence_hash {
+            if ch.as_str() != eh {
+                return Err(format!(
+                    "typed_payload.content_hash {ch} does not match proof evidence_hash {eh}"
+                ));
+            }
+        }
+    }
+    if let Some(ref attrs) = payload.attributes {
+        if !attrs.is_object() {
+            return Err("typed_payload.attributes must be a JSON object".to_string());
+        }
+    }
+    Ok(())
 }
 
 pub fn verify_settlement_proof(
@@ -4602,6 +4669,10 @@ impl ProofStore {
             return Err(format!(
                 "proof schema_id must be {SETTLEMENT_PROOF_SCHEMA_ID}"
             ));
+        }
+        if let Some(ref tp) = proof.typed_payload {
+            validate_typed_proof_payload(tp, proof.evidence_hash.as_deref())
+                .map_err(|e| format!("typed_payload validation: {e}"))?;
         }
         verify_settlement_proof_signature_only(&proof)?;
         let agreement_hash = proof.agreement_hash.clone();
@@ -5987,6 +6058,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         proof.signature = sign_proof(&proof, signing_key);
         proof
@@ -6320,6 +6392,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         proof.signature = sign_proof(&proof, signing_key);
         proof
@@ -6649,6 +6722,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let payload = settlement_proof_payload_bytes(&proof).unwrap();
         let digest = sha2::Sha256::digest(&payload);
@@ -6691,6 +6765,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let payload = settlement_proof_payload_bytes(&proof).unwrap();
         let digest = sha2::Sha256::digest(&payload);
@@ -7576,6 +7651,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         proof.signature = sign_proof(&proof, signing_key);
         proof
@@ -7774,6 +7850,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         prf_a.signature = sign_proof(&prf_a, &sk_a);
         let result1 = evaluate_policy(&agreement, &policy, &[prf_a.clone()], 0).unwrap();
@@ -7801,6 +7878,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         prf_b.signature = sign_proof(&prf_b, &sk_b);
         let result2 = evaluate_policy(&agreement, &policy, &[prf_a, prf_b], 0).unwrap();
@@ -8000,5 +8078,186 @@ mod tests {
         assert_eq!(result_pre.outcome, PolicyOutcome::Unsatisfied);
         assert_eq!(result_pre.threshold_results.len(), 1,
             "Unsatisfied with threshold req also populates threshold_results");
+    }
+
+    // ---- Typed proof payload tests --------------------------------------
+
+    #[test]
+    fn typed_payload_none_is_backward_compat() {
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let policy = make_test_policy(&hash, &pk, "att");
+        let proof = make_test_proof(&hash, "att", &sk);
+        assert!(proof.typed_payload.is_none());
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied);
+    }
+
+    #[test]
+    fn typed_payload_stored_and_retrieved() {
+        let mut store = make_proof_store();
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let mut proof = SettlementProof {
+            proof_id: "prf-typed-001".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: "aabbccdd".to_string(),
+            milestone_id: None,
+            attested_by: "att-typed".to_string(),
+            attestation_time: 1_700_000_000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pk.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+            typed_payload: Some(TypedProofPayload {
+                proof_kind: "delivery_confirmation".to_string(),
+                content_hash: None,
+                reference_id: Some("TRK-12345".to_string()),
+                attributes: Some(serde_json::json!({"carrier": "DHL"})),
+            }),
+        };
+        proof.signature = sign_proof(&proof, &sk);
+        let outcome = store.submit(proof).unwrap();
+        assert!(outcome.accepted);
+        let tp = store.get_by_id("prf-typed-001").unwrap().typed_payload.as_ref().unwrap();
+        assert_eq!(tp.proof_kind, "delivery_confirmation");
+        assert_eq!(tp.reference_id.as_deref(), Some("TRK-12345"));
+    }
+
+    #[test]
+    fn typed_payload_does_not_affect_signature_verification() {
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let policy = make_test_policy(&hash, &pk, "att");
+        let mut proof = make_test_proof(&hash, "att", &sk);
+        proof.typed_payload = Some(TypedProofPayload {
+            proof_kind: "delivery_confirmation".to_string(),
+            content_hash: None,
+            reference_id: None,
+            attributes: None,
+        });
+        verify_settlement_proof(&proof, &policy).expect("signature must still be valid");
+    }
+
+    #[test]
+    fn typed_payload_empty_proof_kind_rejected() {
+        let tp = TypedProofPayload { proof_kind: "  ".to_string(), content_hash: None, reference_id: None, attributes: None };
+        let err = validate_typed_proof_payload(&tp, None).unwrap_err();
+        assert!(err.contains("proof_kind must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn typed_payload_invalid_content_hash_rejected() {
+        let tp = TypedProofPayload { proof_kind: "x".to_string(), content_hash: Some("not-hex".to_string()), reference_id: None, attributes: None };
+        let err = validate_typed_proof_payload(&tp, None).unwrap_err();
+        assert!(err.contains("content_hash must be 64 lowercase hex"), "got: {err}");
+    }
+
+    #[test]
+    fn typed_payload_content_hash_mismatch_rejected() {
+        let ch = "a".repeat(64);
+        let eh = "b".repeat(64);
+        let tp = TypedProofPayload { proof_kind: "x".to_string(), content_hash: Some(ch), reference_id: None, attributes: None };
+        let err = validate_typed_proof_payload(&tp, Some(&eh)).unwrap_err();
+        assert!(err.contains("does not match proof evidence_hash"), "got: {err}");
+    }
+
+    #[test]
+    fn typed_payload_content_hash_matching_evidence_hash_ok() {
+        let h = "a".repeat(64);
+        let tp = TypedProofPayload { proof_kind: "x".to_string(), content_hash: Some(h.clone()), reference_id: None, attributes: None };
+        validate_typed_proof_payload(&tp, Some(&h)).expect("matching hashes must be ok");
+    }
+
+    #[test]
+    fn typed_payload_attributes_must_be_object() {
+        let tp = TypedProofPayload { proof_kind: "x".to_string(), content_hash: None, reference_id: None, attributes: Some(serde_json::json!([1,2,3])) };
+        let err = validate_typed_proof_payload(&tp, None).unwrap_err();
+        assert!(err.contains("must be a JSON object"), "got: {err}");
+    }
+
+    #[test]
+    fn typed_payload_submit_rejects_invalid_payload() {
+        let mut store = make_proof_store();
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let mut proof = SettlementProof {
+            proof_id: "prf-bad-tp".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "delivery_confirmation".to_string(),
+            agreement_hash: "aabbccdd".to_string(),
+            milestone_id: None,
+            attested_by: "att-tp".to_string(),
+            attestation_time: 1_700_000_001,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pk.clone(),
+                signature_hex: String::new(),
+                payload_hash: String::new(),
+            },
+            expires_at_height: None,
+            typed_payload: Some(TypedProofPayload { proof_kind: String::new(), content_hash: None, reference_id: None, attributes: None }),
+        };
+        proof.signature = sign_proof(&proof, &sk);
+        let err = store.submit(proof).unwrap_err();
+        assert!(err.contains("proof_kind must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn typed_payload_policy_evaluation_unchanged() {
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let policy = make_test_policy(&hash, &pk, "att");
+        let mut proof = make_test_proof(&hash, "att", &sk);
+        proof.typed_payload = Some(TypedProofPayload {
+            proof_kind: "delivery_confirmation".to_string(),
+            content_hash: None,
+            reference_id: Some("REF-001".to_string()),
+            attributes: Some(serde_json::json!({"notes": "signed by receiver"})),
+        });
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied,
+            "typed_payload must not interfere with policy evaluation");
+    }
+
+    #[test]
+    /// Regression guard: a proof whose typed_payload.proof_kind deliberately differs
+    /// from proof_type must still satisfy a policy matching on proof_type.
+    /// Fails immediately if proof_kind-based matching is accidentally added to
+    /// req_satisfied_threshold or evaluate_policy.
+    fn typed_payload_proof_kind_contradiction_does_not_affect_policy() {
+        let agreement = sample_agreement();
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let policy = make_test_policy(&hash, &pk, "att");
+        let mut proof = make_test_proof(&hash, "att", &sk);
+        // typed_payload.proof_kind deliberately contradicts signed proof_type.
+        // Policy evaluation must use the signed proof_type, not this unsigned field.
+        proof.typed_payload = Some(TypedProofPayload {
+            proof_kind: "completely_unrelated_category".to_string(),
+            content_hash: None,
+            reference_id: None,
+            attributes: None,
+        });
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(
+            result.outcome, PolicyOutcome::Satisfied,
+            "proof_kind contradiction must not change policy outcome; only signed proof_type counts"
+        );
     }
 }

@@ -19,6 +19,7 @@ use irium_node_rs::settlement::{
     AgreementStatement, AgreementSummary, AgreementTemplateType,
     AGREEMENT_SIGNATURE_TYPE_SECP256K1, AGREEMENT_SIGNATURE_VERSION,
     ProofPolicy, ProofSignatureEnvelope, SettlementProof, SETTLEMENT_PROOF_SCHEMA_ID,
+    TypedProofPayload, validate_typed_proof_payload,
     settlement_proof_payload_bytes,
 };
 use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
@@ -572,6 +573,8 @@ struct ProofCreateCliOptions {
     out_path: Option<String>,
     json_mode: bool,
     expires_at_height: Option<u64>,
+    proof_kind: Option<String>,
+    reference_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1969,7 +1972,7 @@ fn usage() {
   eprintln!("  irium-wallet agreement-policy-get --agreement-hash <hex> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-evaluate --agreement <agreement.json|-> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-list [--active-only] [--rpc <url>] [--json]");
-    eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--expires-at-height <n>] [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <unix>] [--out <path>] [--json]");
+    eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--expires-at-height <n>] [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <unix>] [--proof-kind <kind>] [--reference-id <ref>] [--out <path>] [--json]");
     eprintln!("  irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-list [--agreement-hash <hex>] [--active-only] [--offset <n>] [--limit <n>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-get --proof-id <id> [--rpc <url>] [--json]");
@@ -2827,6 +2830,12 @@ fn create_settlement_proof_signed(opts: &ProofCreateCliOptions) -> Result<Settle
             payload_hash: String::new(),
         },
         expires_at_height: opts.expires_at_height,
+        typed_payload: opts.proof_kind.as_ref().map(|kind| TypedProofPayload {
+            proof_kind: kind.clone(),
+            content_hash: None,
+            reference_id: opts.reference_id.clone(),
+            attributes: None,
+        }),
     };
 
     let payload_bytes = settlement_proof_payload_bytes(&proof)
@@ -4878,6 +4887,8 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
     let mut out_path: Option<String> = None;
     let mut json_mode = false;
     let mut expires_at_height: Option<u64> = None;
+    let mut proof_kind: Option<String> = None;
+    let mut reference_id: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -4967,6 +4978,16 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
             "--json" => {
                 json_mode = true;
             }
+            "--proof-kind" => {
+                i += 1;
+                if i >= args.len() { return Err("--proof-kind requires a value".to_string()); }
+                proof_kind = Some(args[i].clone());
+            }
+            "--reference-id" => {
+                i += 1;
+                if i >= args.len() { return Err("--reference-id requires a value".to_string()); }
+                reference_id = Some(args[i].clone());
+            }
             other => {
                 return Err(format!("unknown argument: {}", other));
             }
@@ -4987,6 +5008,8 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
         out_path,
         json_mode,
         expires_at_height,
+        proof_kind,
+        reference_id,
     })
 }
 
@@ -5039,10 +5062,14 @@ fn render_proof_list_summary(resp: &ListProofsRpcResponse) -> String {
         } else {
             format!(" status={}", item.status)
         };
+        // proof_kind is unsigned metadata (not part of signed proof payload); label clearly.
+        let kind_str = item.proof.typed_payload.as_ref()
+            .map(|tp| format!(" proof_kind={} [metadata]", tp.proof_kind))
+            .unwrap_or_default();
         lines.push(format!(
-            "  agreement_hash={} proof_id={} attested_by={} proof_type={} {}{}",
+            "  agreement_hash={} proof_id={} attested_by={} proof_type={} {}{}{}",
             item.proof.agreement_hash, item.proof.proof_id, item.proof.attested_by, item.proof.proof_type,
-            expiry_str, status_str
+            expiry_str, status_str, kind_str
         ));
     }
     lines.join("
@@ -5064,6 +5091,14 @@ not_found true", resp.proof_id);
         lines.push(format!("attested_by {}", proof.attested_by));
         if let Some(ref mid) = proof.milestone_id {
             lines.push(format!("milestone_id {}", mid));
+        }
+        // typed_payload fields are unsigned metadata (not part of the signed proof payload).
+        // They cannot be used as attestation evidence.
+        if let Some(ref tp) = proof.typed_payload {
+            lines.push(format!("proof_kind {} [metadata]", tp.proof_kind));
+            if let Some(ref rid) = tp.reference_id {
+                lines.push(format!("reference_id {} [metadata]", rid));
+            }
         }
     }
     match resp.expires_at_height {
@@ -8901,6 +8936,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let resp = ListProofsRpcResponse {
             agreement_hash: "aabbcc".to_string(),
@@ -9105,6 +9141,8 @@ mod tests {
             out_path: None,
             json_mode: false,
             expires_at_height: None,
+            proof_kind: None,
+            reference_id: None,
         };
 
         let proof = create_settlement_proof_signed(&opts).expect("must create proof");
@@ -9146,6 +9184,7 @@ mod tests {
                 payload_hash: "ph789".to_string(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let out = render_proof_create_summary(&proof);
         assert!(out.contains("proof_id prf-render-001"), "got: {out}");
@@ -9208,6 +9247,8 @@ mod tests {
             out_path: None,
             json_mode: false,
             expires_at_height: None,
+            proof_kind: None,
+            reference_id: None,
         };
 
         let proof = create_settlement_proof_signed(&opts).expect("must create proof");
@@ -10010,6 +10051,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: Some(1000),
+            typed_payload: None,
         };
         // tip_height=50 < expires_at_height=1000 => not expired
         let resp = ListProofsRpcResponse {
@@ -10046,6 +10088,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: Some(100),
+            typed_payload: None,
         };
         // tip_height=200 >= expires_at_height=100 => expired
         let resp = ListProofsRpcResponse {
@@ -10082,6 +10125,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: Some(8000),
+            typed_payload: None,
         };
         let out = render_proof_create_summary(&proof);
         assert!(out.contains("expires_at_height 8000"), "must show expiry height; got: {out}");
@@ -10107,6 +10151,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let out = render_proof_create_summary(&proof);
         assert!(out.contains("expires_at_height none"), "must show none when no expiry; got: {out}");
@@ -10249,6 +10294,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: Some(1000),
+            typed_payload: None,
         };
         let resp = ListProofsRpcResponse {
             agreement_hash: "hashst".to_string(),
@@ -10282,6 +10328,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: Some(100),
+            typed_payload: None,
         };
         let resp = ListProofsRpcResponse {
             agreement_hash: "hashste".to_string(),
@@ -10315,6 +10362,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let resp = ListProofsRpcResponse {
             agreement_hash: "hashstn".to_string(),
@@ -10418,6 +10466,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: None,
+            typed_payload: None,
         };
         let resp = GetProofRpcResponse {
             proof_id: "prf-get-1".to_string(),
@@ -10456,6 +10505,7 @@ mod tests {
                 payload_hash: String::new(),
             },
             expires_at_height: Some(100),
+            typed_payload: None,
         };
         let resp = GetProofRpcResponse {
             proof_id: "prf-get-2".to_string(),
