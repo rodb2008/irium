@@ -19,6 +19,7 @@ use irium_node_rs::settlement::{
     AgreementStatement, AgreementSummary, AgreementTemplateType,
     AGREEMENT_SIGNATURE_TYPE_SECP256K1, AGREEMENT_SIGNATURE_VERSION,
     HoldbackEvaluationResult, HoldbackOutcome, MilestoneEvaluationResult,
+    PolicyOutcome,
     ProofPolicy, ProofSignatureEnvelope, SettlementProof, SETTLEMENT_PROOF_SCHEMA_ID,
     TypedProofPayload, validate_typed_proof_payload,
     settlement_proof_payload_bytes,
@@ -631,6 +632,69 @@ struct GetPolicyRpcResponse {
     expires_at_height: Option<u64>,
     expired: bool,
 }
+
+// Phase 3: builder RPC types
+#[derive(Serialize, Clone, Debug)]
+struct BuildContractorTemplateRpcRequest {
+    policy_id: String,
+    agreement_hash: String,
+    attestors: Vec<BuildTemplateAttestorInput>,
+    milestones: Vec<BuildTemplateMilestoneInput>,
+    notes: Option<String>,
+}
+#[derive(Serialize, Clone, Debug)]
+struct BuildPreorderTemplateRpcRequest {
+    policy_id: String,
+    agreement_hash: String,
+    attestors: Vec<BuildTemplateAttestorInput>,
+    delivery_proof_type: String,
+    refund_deadline_height: u64,
+    holdback_bps: Option<u32>,
+    holdback_release_height: Option<u64>,
+    notes: Option<String>,
+}
+#[derive(Serialize, Clone, Debug)]
+struct BuildOtcTemplateRpcRequest {
+    policy_id: String,
+    agreement_hash: String,
+    attestors: Vec<BuildTemplateAttestorInput>,
+    release_proof_type: String,
+    refund_deadline_height: u64,
+    threshold: Option<u32>,
+    notes: Option<String>,
+}
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BuildTemplateAttestorInput {
+    attestor_id: String,
+    pubkey_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+}
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BuildTemplateMilestoneInput {
+    milestone_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    proof_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deadline_height: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    holdback_bps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    holdback_release_height: Option<u64>,
+}
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BuildTemplateRpcResponse {
+    policy: ProofPolicy,
+    policy_json: String,
+    summary: String,
+    requirement_count: usize,
+    attestor_count: usize,
+    milestone_count: usize,
+    has_holdback: bool,
+    has_timeout_rules: bool,
+}
+
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct EvaluatePolicyRpcRequest {
@@ -5512,6 +5576,30 @@ fn render_policy_check_summary(resp: &CheckPolicyRpcResponse) -> String {
             lines.push(format!("  {}", rule));
         }
     }
+    if !resp.milestone_results.is_empty() {
+        let satisfied = resp.milestone_results.iter().filter(|m| matches!(m.outcome, PolicyOutcome::Satisfied)).count();
+        lines.push(format!("milestones {}/{}", satisfied, resp.milestone_results.len()));
+        for ms in &resp.milestone_results {
+            let display = ms.label.as_deref().filter(|l| !l.is_empty()).unwrap_or(ms.milestone_id.as_str());
+            let ms_outcome_str = match ms.outcome {
+                PolicyOutcome::Satisfied => "satisfied",
+                PolicyOutcome::Timeout => "timeout",
+                PolicyOutcome::Unsatisfied => "unsatisfied",
+            };
+            lines.push(format!("  milestone {} outcome {}", display, ms_outcome_str));
+            if let Some(ref hb) = ms.holdback {
+                let hb_ms_outcome_str = match hb.holdback_outcome {
+                    HoldbackOutcome::Held => "held",
+                    HoldbackOutcome::Released => "released",
+                    HoldbackOutcome::Pending => "pending",
+                };
+                lines.push(format!("    holdback {} bps holdback_outcome {}", hb.holdback_bps, hb_ms_outcome_str));
+                if !hb.holdback_reason.is_empty() {
+                    lines.push(format!("    holdback_reason {}", hb.holdback_reason));
+                }
+            }
+        }
+    }
     if let Some(ref hb) = resp.holdback {
         let outcome_str = match hb.holdback_outcome {
             HoldbackOutcome::Held => "held",
@@ -5523,8 +5611,24 @@ fn render_policy_check_summary(resp: &CheckPolicyRpcResponse) -> String {
         lines.push(format!("immediate_release_bps {}", hb.immediate_release_bps));
         lines.push(format!("holdback_reason {}", hb.holdback_reason));
     }
-    lines.join("
-")
+    lines.join("\n")
+}
+
+fn render_build_template_summary(resp: &BuildTemplateRpcResponse) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("policy_id {}", resp.policy.policy_id));
+    lines.push(format!("summary {}", resp.summary));
+    lines.push(format!("requirement_count {}", resp.requirement_count));
+    lines.push(format!("attestor_count {}", resp.attestor_count));
+    if resp.milestone_count > 0 {
+        lines.push(format!("milestone_count {}", resp.milestone_count));
+    }
+    lines.push(format!("has_holdback {}", resp.has_holdback));
+    lines.push(format!("has_timeout_rules {}", resp.has_timeout_rules));
+    lines.push(String::new());
+    lines.push("--- policy_json ---".to_string());
+    lines.push(resp.policy_json.clone());
+    lines.join("\n")
 }
 
 fn parse_agreement_spend_cli(args: &[String]) -> Result<AgreementSpendCliOptions, String> {
@@ -8885,6 +8989,151 @@ mod tests {
         assert!(!out.contains("holdback_outcome held"), "must not show held: {out}");
     }
 
+
+    // ── Phase 3 render tests ────────────────────────────────────────────────
+
+    #[test]
+    fn render_policy_check_summary_shows_milestone_results() {
+        use irium_node_rs::settlement::{MilestoneEvaluationResult, PolicyOutcome};
+        let resp = CheckPolicyRpcResponse {
+            agreement_hash: "ms01".to_string(),
+            policy_id: "pol-ms-check".to_string(),
+            tip_height: 100,
+            release_eligible: false,
+            refund_eligible: false,
+            reason: "milestone partial".to_string(),
+            evaluated_rules: vec![],
+            holdback: None,
+            milestone_results: vec![
+                MilestoneEvaluationResult {
+                    milestone_id: "ms-foundation".to_string(),
+                    label: Some("Foundation".to_string()),
+                    outcome: PolicyOutcome::Satisfied,
+                    release_eligible: true,
+                    refund_eligible: false,
+                    matched_proof_ids: vec![],
+                    reason: "proof matched".to_string(),
+                    holdback: None,
+                    threshold_results: vec![],
+                },
+                MilestoneEvaluationResult {
+                    milestone_id: "ms-framing".to_string(),
+                    label: Some("Framing".to_string()),
+                    outcome: PolicyOutcome::Unsatisfied,
+                    release_eligible: false,
+                    refund_eligible: false,
+                    matched_proof_ids: vec![],
+                    reason: "no proof".to_string(),
+                    holdback: None,
+                    threshold_results: vec![],
+                },
+            ],
+        };
+        let out = render_policy_check_summary(&resp);
+        assert!(out.contains("milestones 1/2"), "must show 1/2 satisfied: {out}");
+        assert!(out.contains("Foundation") || out.contains("ms-foundation"), "must show first milestone: {out}");
+        assert!(out.contains("satisfied"), "must show satisfied outcome: {out}");
+        assert!(out.contains("unsatisfied"), "must show unsatisfied outcome: {out}");
+    }
+
+    #[test]
+    fn render_build_template_summary_contractor() {
+        use irium_node_rs::settlement::ProofPolicy;
+        // Construct a minimal BuildTemplateRpcResponse
+        let resp = BuildTemplateRpcResponse {
+            policy: {
+                let p = serde_json::json!({
+                    "schema_id": "irium.phase2.proof_policy.v1",
+                    "policy_id": "pol-test-ct",
+                    "agreement_hash": "aa".repeat(32).chars().take(64).collect::<String>(),
+                    "required_proofs": [],
+                    "no_response_rules": [],
+                    "attestors": [],
+                    "milestones": []
+                });
+                serde_json::from_value(p).unwrap()
+            },
+            policy_json: r#"{"policy_id":"pol-test-ct"}"#.to_string(),
+            summary: "Contractor milestone policy pol-test-ct: 2 milestone(s), 1 attestor(s) [att-site], 1 timeout rule(s).".to_string(),
+            requirement_count: 2,
+            attestor_count: 1,
+            milestone_count: 2,
+            has_holdback: false,
+            has_timeout_rules: true,
+        };
+        let out = render_build_template_summary(&resp);
+        assert!(out.contains("policy_id pol-test-ct"), "must show policy_id: {out}");
+        assert!(out.contains("summary Contractor"), "must show summary: {out}");
+        assert!(out.contains("requirement_count 2"), "must show requirement_count: {out}");
+        assert!(out.contains("milestone_count 2"), "must show milestone_count: {out}");
+        assert!(out.contains("has_holdback false"), "must show has_holdback: {out}");
+        assert!(out.contains("has_timeout_rules true"), "must show has_timeout_rules: {out}");
+        assert!(out.contains("policy_json"), "must include policy_json section: {out}");
+    }
+
+    #[test]
+    fn render_build_template_summary_no_milestone_count_when_zero() {
+        let resp = BuildTemplateRpcResponse {
+            policy: serde_json::from_value(serde_json::json!({
+                "schema_id": "irium.phase2.proof_policy.v1",
+                "policy_id": "pol-otc-render",
+                "agreement_hash": "bb".repeat(32).chars().take(64).collect::<String>(),
+                "required_proofs": [],
+                "no_response_rules": [],
+                "attestors": [],
+                "milestones": []
+            })).unwrap(),
+            policy_json: r#"{"policy_id":"pol-otc-render"}"#.to_string(),
+            summary: "OTC escrow policy pol-otc-render: 1-of-1 release on trade proof from [att], refund at height 900000.".to_string(),
+            requirement_count: 1,
+            attestor_count: 1,
+            milestone_count: 0,
+            has_holdback: false,
+            has_timeout_rules: true,
+        };
+        let out = render_build_template_summary(&resp);
+        assert!(!out.contains("milestone_count"), "milestone_count must be absent when 0: {out}");
+        assert!(out.contains("policy_id pol-otc-render"), "must show policy_id: {out}");
+    }
+
+    // ── Phase 3 wallet CLI arg-parse tests ──────────────────────────────────
+
+    // (The three new subcommand parsers are inline in main(), not separate parse_ fns.
+    //  Verify that the build* subcommand strings are recognized by the main
+    //  dispatch table — compile-time proof via cfg(test) is not required since
+    //  the match arms will produce "unreachable" warnings if removed.)
+
+    #[test]
+    fn build_template_structs_serialize_correctly() {
+        let att = BuildTemplateAttestorInput {
+            attestor_id: "att-1".to_string(),
+            pubkey_hex: "03abcd".to_string(),
+            display_name: Some("Att One".to_string()),
+        };
+        let ms = BuildTemplateMilestoneInput {
+            milestone_id: "ms-1".to_string(),
+            label: None,
+            proof_type: "delivery".to_string(),
+            deadline_height: Some(500_000),
+            holdback_bps: None,
+            holdback_release_height: None,
+        };
+        let req = BuildContractorTemplateRpcRequest {
+            policy_id: "pol-ser-1".to_string(),
+            agreement_hash: "cc".repeat(32).chars().take(64).collect::<String>(),
+            attestors: vec![att],
+            milestones: vec![ms],
+            notes: None,
+        };
+        let json = serde_json::to_string(&req).expect("must serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["policy_id"], "pol-ser-1");
+        assert_eq!(v["attestors"][0]["attestor_id"], "att-1");
+        assert_eq!(v["milestones"][0]["proof_type"], "delivery");
+        assert!(v["milestones"][0]["holdback_bps"].is_null(), "None fields must not appear (skip_serializing_if)");
+    }
+
+    // ── Phase 3 render test ─────────────────────────────────────────────────
 
     // ---- Phase 2 proof submit/list wallet CLI tests ----
 
@@ -13976,6 +14225,155 @@ fn main() {
             }
             if !resp.release_eligible && !resp.refund_eligible {
                 std::process::exit(1);
+            }
+        }
+        "policy-build-contractor" => {
+            // irium-wallet policy-build-contractor --policy-id <id> --agreement-hash <hash>
+            //   --attestor <id>:<pubkey> [--attestor ...] --milestone <id>:<proof_type> [--milestone ...]
+            //   [--rpc <url>] [--json]
+            let mut policy_id = String::new();
+            let mut agreement_hash = String::new();
+            let mut attestors: Vec<BuildTemplateAttestorInput> = Vec::new();
+            let mut milestones: Vec<BuildTemplateMilestoneInput> = Vec::new();
+            let mut rpc_url = default_rpc_url();
+            let mut json_mode = false;
+            let mut notes: Option<String> = None;
+            let mut i = 1usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--policy-id" => { policy_id = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--agreement-hash" => { agreement_hash = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--attestor" => {
+                        let raw = args.get(i+1).cloned().unwrap_or_default();
+                        let parts: Vec<&str> = raw.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            attestors.push(BuildTemplateAttestorInput { attestor_id: parts[0].to_string(), pubkey_hex: parts[1].to_string(), display_name: None });
+                        } else { eprintln!("--attestor expects <id>:<pubkey>"); std::process::exit(1); }
+                        i += 2;
+                    }
+                    "--milestone" => {
+                        let raw = args.get(i+1).cloned().unwrap_or_default();
+                        let parts: Vec<&str> = raw.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            milestones.push(BuildTemplateMilestoneInput { milestone_id: parts[0].to_string(), label: None, proof_type: parts[1].to_string(), deadline_height: None, holdback_bps: None, holdback_release_height: None });
+                        } else { eprintln!("--milestone expects <id>:<proof_type>"); std::process::exit(1); }
+                        i += 2;
+                    }
+                    "--notes" => { notes = Some(args.get(i+1).cloned().unwrap_or_default()); i += 2; }
+                    "--rpc" => { rpc_url = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--json" => { json_mode = true; i += 1; }
+                    _ => { i += 1; }
+                }
+            }
+            if policy_id.is_empty() || agreement_hash.is_empty() || attestors.is_empty() || milestones.is_empty() {
+                eprintln!("policy-build-contractor requires --policy-id, --agreement-hash, at least one --attestor and one --milestone");
+                std::process::exit(1);
+            }
+            let base = rpc_url.trim_end_matches('/');
+            let client = rpc_client(base).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
+            let req = BuildContractorTemplateRpcRequest { policy_id, agreement_hash, attestors, milestones, notes };
+            let resp: BuildTemplateRpcResponse = rpc_post_json(&client, base, "/rpc/buildcontractortemplate", &req)
+                .unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap());
+            } else {
+                println!("{}", render_build_template_summary(&resp));
+            }
+        }
+        "policy-build-preorder" => {
+            let mut policy_id = String::new();
+            let mut agreement_hash = String::new();
+            let mut attestors: Vec<BuildTemplateAttestorInput> = Vec::new();
+            let mut delivery_proof_type = String::new();
+            let mut refund_deadline_height: u64 = 0;
+            let mut holdback_bps: Option<u32> = None;
+            let mut holdback_release_height: Option<u64> = None;
+            let mut rpc_url = default_rpc_url();
+            let mut json_mode = false;
+            let mut notes: Option<String> = None;
+            let mut i = 1usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--policy-id" => { policy_id = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--agreement-hash" => { agreement_hash = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--attestor" => {
+                        let raw = args.get(i+1).cloned().unwrap_or_default();
+                        let parts: Vec<&str> = raw.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            attestors.push(BuildTemplateAttestorInput { attestor_id: parts[0].to_string(), pubkey_hex: parts[1].to_string(), display_name: None });
+                        } else { eprintln!("--attestor expects <id>:<pubkey>"); std::process::exit(1); }
+                        i += 2;
+                    }
+                    "--delivery-proof-type" => { delivery_proof_type = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--refund-deadline-height" => { refund_deadline_height = args.get(i+1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 2; }
+                    "--holdback-bps" => { holdback_bps = args.get(i+1).and_then(|v| v.parse().ok()); i += 2; }
+                    "--holdback-release-height" => { holdback_release_height = args.get(i+1).and_then(|v| v.parse().ok()); i += 2; }
+                    "--notes" => { notes = Some(args.get(i+1).cloned().unwrap_or_default()); i += 2; }
+                    "--rpc" => { rpc_url = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--json" => { json_mode = true; i += 1; }
+                    _ => { i += 1; }
+                }
+            }
+            if policy_id.is_empty() || agreement_hash.is_empty() || attestors.is_empty() || delivery_proof_type.is_empty() {
+                eprintln!("policy-build-preorder requires --policy-id, --agreement-hash, at least one --attestor, and --delivery-proof-type");
+                std::process::exit(1);
+            }
+            let base = rpc_url.trim_end_matches('/');
+            let client = rpc_client(base).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
+            let req = BuildPreorderTemplateRpcRequest { policy_id, agreement_hash, attestors, delivery_proof_type, refund_deadline_height, holdback_bps, holdback_release_height, notes };
+            let resp: BuildTemplateRpcResponse = rpc_post_json(&client, base, "/rpc/buildpreordertemplate", &req)
+                .unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap());
+            } else {
+                println!("{}", render_build_template_summary(&resp));
+            }
+        }
+        "policy-build-otc" => {
+            let mut policy_id = String::new();
+            let mut agreement_hash = String::new();
+            let mut attestors: Vec<BuildTemplateAttestorInput> = Vec::new();
+            let mut release_proof_type = String::new();
+            let mut refund_deadline_height: u64 = 0;
+            let mut threshold: Option<u32> = None;
+            let mut rpc_url = default_rpc_url();
+            let mut json_mode = false;
+            let mut notes: Option<String> = None;
+            let mut i = 1usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--policy-id" => { policy_id = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--agreement-hash" => { agreement_hash = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--attestor" => {
+                        let raw = args.get(i+1).cloned().unwrap_or_default();
+                        let parts: Vec<&str> = raw.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            attestors.push(BuildTemplateAttestorInput { attestor_id: parts[0].to_string(), pubkey_hex: parts[1].to_string(), display_name: None });
+                        } else { eprintln!("--attestor expects <id>:<pubkey>"); std::process::exit(1); }
+                        i += 2;
+                    }
+                    "--release-proof-type" => { release_proof_type = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--refund-deadline-height" => { refund_deadline_height = args.get(i+1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 2; }
+                    "--threshold" => { threshold = args.get(i+1).and_then(|v| v.parse().ok()); i += 2; }
+                    "--notes" => { notes = Some(args.get(i+1).cloned().unwrap_or_default()); i += 2; }
+                    "--rpc" => { rpc_url = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--json" => { json_mode = true; i += 1; }
+                    _ => { i += 1; }
+                }
+            }
+            if policy_id.is_empty() || agreement_hash.is_empty() || attestors.is_empty() || release_proof_type.is_empty() {
+                eprintln!("policy-build-otc requires --policy-id, --agreement-hash, at least one --attestor, and --release-proof-type");
+                std::process::exit(1);
+            }
+            let base = rpc_url.trim_end_matches('/');
+            let client = rpc_client(base).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
+            let req = BuildOtcTemplateRpcRequest { policy_id, agreement_hash, attestors, release_proof_type, refund_deadline_height, threshold, notes };
+            let resp: BuildTemplateRpcResponse = rpc_post_json(&client, base, "/rpc/buildotctemplate", &req)
+                .unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap());
+            } else {
+                println!("{}", render_build_template_summary(&resp));
             }
         }
         "agreement-policy-list" => {

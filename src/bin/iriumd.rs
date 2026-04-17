@@ -67,6 +67,12 @@ use irium_node_rs::settlement::{
     ProofStore,
     PolicyStore,
     StorePolicyOutcome,
+    contractor_milestone_template,
+    preorder_deposit_template,
+    basic_otc_escrow_template,
+    policy_template_to_json,
+    TemplateAttestor,
+    MilestoneSpec,
 };
 use irium_node_rs::storage;
 use irium_node_rs::tx::{
@@ -5289,7 +5295,249 @@ async fn list_proofs_rpc(
     }))
 }
 
+// Phase 3: template builder types
+#[derive(Deserialize)]
+struct TemplateAttestorInput {
+    attestor_id: String,
+    pubkey_hex: String,
+    display_name: Option<String>,
+}
+#[derive(Deserialize)]
+struct MilestoneSpecInput {
+    milestone_id: String,
+    label: Option<String>,
+    proof_type: String,
+    deadline_height: Option<u64>,
+    holdback_bps: Option<u32>,
+    holdback_release_height: Option<u64>,
+}
+#[derive(Deserialize)]
+struct BuildContractorTemplateRequest {
+    policy_id: String,
+    agreement_hash: String,
+    attestors: Vec<TemplateAttestorInput>,
+    milestones: Vec<MilestoneSpecInput>,
+    notes: Option<String>,
+}
+#[derive(Deserialize)]
+struct BuildPreorderTemplateRequest {
+    policy_id: String,
+    agreement_hash: String,
+    attestors: Vec<TemplateAttestorInput>,
+    delivery_proof_type: String,
+    refund_deadline_height: u64,
+    holdback_bps: Option<u32>,
+    holdback_release_height: Option<u64>,
+    notes: Option<String>,
+}
+#[derive(Deserialize)]
+struct BuildOtcTemplateRequest {
+    policy_id: String,
+    agreement_hash: String,
+    attestors: Vec<TemplateAttestorInput>,
+    release_proof_type: String,
+    refund_deadline_height: u64,
+    threshold: Option<u32>,
+    notes: Option<String>,
+}
+/// Response for all three template builder endpoints.
+#[derive(Debug, Serialize)]
+struct BuildTemplateResponse {
+    /// Fully-constructed ProofPolicy ready for /rpc/storepolicy.
+    policy: ProofPolicy,
+    /// Pretty-printed JSON of the policy.
+    policy_json: String,
+    /// Human-readable summary of policy enforcement rules.
+    summary: String,
+    requirement_count: usize,
+    attestor_count: usize,
+    /// 0 for preorder/OTC templates.
+    milestone_count: usize,
+    has_holdback: bool,
+    has_timeout_rules: bool,
+}
+fn input_to_template_attestor(a: &TemplateAttestorInput) -> TemplateAttestor {
+    TemplateAttestor {
+        attestor_id: a.attestor_id.clone(),
+        pubkey_hex: a.pubkey_hex.clone(),
+        display_name: a.display_name.clone(),
+    }
+}
+fn input_to_milestone_spec(m: &MilestoneSpecInput) -> MilestoneSpec {
+    MilestoneSpec {
+        milestone_id: m.milestone_id.clone(),
+        label: m.label.clone(),
+        proof_type: m.proof_type.clone(),
+        deadline_height: m.deadline_height,
+        holdback_bps: m.holdback_bps,
+        holdback_release_height: m.holdback_release_height,
+    }
+}
+fn build_template_summary_contractor(policy: &ProofPolicy, milestone_count: usize) -> String {
+    let ids: Vec<&str> = policy.attestors.iter().map(|a| a.attestor_id.as_str()).collect();
+    let hb = if policy.milestones.iter().any(|m| m.holdback.is_some()) {
+        ", holdback on milestone(s)"
+    } else {
+        ""
+    };
+    format!(
+        "Contractor milestone policy {pol}: {ms} milestone(s), {att} attestor(s) [{ids}], {dl} timeout rule(s){hb}.",
+        pol = policy.policy_id,
+        ms = milestone_count,
+        att = ids.len(),
+        ids = ids.join(", "),
+        dl = policy.no_response_rules.len(),
+        hb = hb,
+    )
+}
+fn build_template_summary_preorder(policy: &ProofPolicy) -> String {
+    let ids: Vec<&str> = policy.attestors.iter().map(|a| a.attestor_id.as_str()).collect();
+    let pt = policy.required_proofs.first().map(|r| r.proof_type.as_str()).unwrap_or("?");
+    let dl = policy.no_response_rules.first().map(|r| r.deadline_height).unwrap_or(0);
+    let hb = match &policy.holdback {
+        Some(h) => format!(", {}bps holdback", h.holdback_bps),
+        None => String::new(),
+    };
+    format!(
+        "Preorder deposit policy {pol}: release on {pt} proof from [{ids}], refund at height {dl}{hb}.",
+        pol = policy.policy_id,
+        pt = pt,
+        ids = ids.join(", "),
+        dl = dl,
+        hb = hb,
+    )
+}
+fn build_template_summary_otc(policy: &ProofPolicy) -> String {
+    let ids: Vec<&str> = policy.attestors.iter().map(|a| a.attestor_id.as_str()).collect();
+    let pt = policy.required_proofs.first().map(|r| r.proof_type.as_str()).unwrap_or("?");
+    let thr = policy.required_proofs.first().and_then(|r| r.threshold).unwrap_or(1);
+    let dl = policy.no_response_rules.first().map(|r| r.deadline_height).unwrap_or(0);
+    format!(
+        "OTC escrow policy {pol}: {thr}-of-{tot} release on {pt} proof from [{ids}], refund at height {dl}.",
+        pol = policy.policy_id,
+        thr = thr,
+        tot = ids.len(),
+        pt = pt,
+        ids = ids.join(", "),
+        dl = dl,
+    )
+}
+async fn build_contractor_template_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<BuildContractorTemplateRequest>,
+) -> Result<Json<BuildTemplateResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| (StatusCode::BAD_REQUEST, reason.to_string());
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let attestors: Vec<TemplateAttestor> =
+        req.attestors.iter().map(input_to_template_attestor).collect();
+    let milestones: Vec<MilestoneSpec> =
+        req.milestones.iter().map(input_to_milestone_spec).collect();
+    let milestone_count = milestones.len();
+    let policy = contractor_milestone_template(
+        &req.policy_id, &req.agreement_hash, &attestors, &milestones, req.notes,
+    )
+    .map_err(|e| bad(&e))?;
+    let policy_json = policy_template_to_json(&policy).map_err(|e| bad(&e))?;
+    let summary = build_template_summary_contractor(&policy, milestone_count);
+    let requirement_count = policy.required_proofs.len();
+    let attestor_count = policy.attestors.len();
+    let has_holdback = policy.milestones.iter().any(|m| m.holdback.is_some());
+    let has_timeout_rules = !policy.no_response_rules.is_empty();
+    Ok(Json(BuildTemplateResponse {
+        policy,
+        policy_json,
+        summary,
+        requirement_count,
+        attestor_count,
+        milestone_count,
+        has_holdback,
+        has_timeout_rules,
+    }))
+}
+async fn build_preorder_template_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<BuildPreorderTemplateRequest>,
+) -> Result<Json<BuildTemplateResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| (StatusCode::BAD_REQUEST, reason.to_string());
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let attestors: Vec<TemplateAttestor> =
+        req.attestors.iter().map(input_to_template_attestor).collect();
+    let policy = preorder_deposit_template(
+        &req.policy_id,
+        &req.agreement_hash,
+        &attestors,
+        &req.delivery_proof_type,
+        req.refund_deadline_height,
+        req.holdback_bps,
+        req.holdback_release_height,
+        req.notes,
+    )
+    .map_err(|e| bad(&e))?;
+    let policy_json = policy_template_to_json(&policy).map_err(|e| bad(&e))?;
+    let summary = build_template_summary_preorder(&policy);
+    let requirement_count = policy.required_proofs.len();
+    let attestor_count = policy.attestors.len();
+    let has_holdback = policy.holdback.is_some();
+    let has_timeout_rules = !policy.no_response_rules.is_empty();
+    Ok(Json(BuildTemplateResponse {
+        policy,
+        policy_json,
+        summary,
+        requirement_count,
+        attestor_count,
+        milestone_count: 0,
+        has_holdback,
+        has_timeout_rules,
+    }))
+}
+async fn build_otc_template_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<BuildOtcTemplateRequest>,
+) -> Result<Json<BuildTemplateResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| (StatusCode::BAD_REQUEST, reason.to_string());
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    let attestors: Vec<TemplateAttestor> =
+        req.attestors.iter().map(input_to_template_attestor).collect();
+    let policy = basic_otc_escrow_template(
+        &req.policy_id,
+        &req.agreement_hash,
+        &attestors,
+        &req.release_proof_type,
+        req.refund_deadline_height,
+        req.threshold,
+        req.notes,
+    )
+    .map_err(|e| bad(&e))?;
+    let policy_json = policy_template_to_json(&policy).map_err(|e| bad(&e))?;
+    let summary = build_template_summary_otc(&policy);
+    let requirement_count = policy.required_proofs.len();
+    let attestor_count = policy.attestors.len();
+    let has_timeout_rules = !policy.no_response_rules.is_empty();
+    Ok(Json(BuildTemplateResponse {
+        policy,
+        policy_json,
+        summary,
+        requirement_count,
+        attestor_count,
+        milestone_count: 0,
+        has_holdback: false,
+        has_timeout_rules,
+    }))
+}
 async fn store_policy_rpc(
+
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7251,6 +7499,9 @@ async fn main() {
         )
         .route("/rpc/buildagreementrelease", post(build_agreement_release))
         .route("/rpc/buildagreementrefund", post(build_agreement_refund))
+        .route("/rpc/buildcontractortemplate", post(build_contractor_template_rpc))
+        .route("/rpc/buildpreordertemplate", post(build_preorder_template_rpc))
+        .route("/rpc/buildotctemplate", post(build_otc_template_rpc))
         .route("/rpc/checkpolicy", post(check_policy_rpc))
         .route("/rpc/submitproof", post(submit_proof_rpc))
         .route("/rpc/listproofs", post(list_proofs_rpc))
@@ -11808,4 +12059,214 @@ mod tests {
         }
     }
 
+    // ── Phase 3: template builder RPC tests ──────────────────────────────────
+
+    #[tokio::test]
+    async fn build_contractor_template_rpc_returns_policy_and_summary() {
+        use irium_node_rs::settlement::TemplateAttestor;
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildContractorTemplateRequest {
+            policy_id: "pol-contractor-1".to_string(),
+            agreement_hash: "aa".repeat(32),
+            attestors: vec![TemplateAttestorInput {
+                attestor_id: "att-site".to_string(),
+                pubkey_hex: "03".to_string() + &"ab".repeat(32),
+                display_name: Some("Site Inspector".to_string()),
+            }],
+            milestones: vec![
+                MilestoneSpecInput {
+                    milestone_id: "ms-foundation".to_string(),
+                    label: Some("Foundation".to_string()),
+                    proof_type: "foundation_complete".to_string(),
+                    deadline_height: Some(500_000),
+                    holdback_bps: None,
+                    holdback_release_height: None,
+                },
+                MilestoneSpecInput {
+                    milestone_id: "ms-framing".to_string(),
+                    label: Some("Framing".to_string()),
+                    proof_type: "framing_complete".to_string(),
+                    deadline_height: None,
+                    holdback_bps: None,
+                    holdback_release_height: None,
+                },
+            ],
+            notes: None,
+        };
+        let resp = build_contractor_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await.expect("build_contractor_template_rpc should succeed").0;
+        assert_eq!(resp.milestone_count, 2);
+        assert_eq!(resp.requirement_count, 2);
+        assert_eq!(resp.attestor_count, 1);
+        assert!(resp.has_timeout_rules, "foundation milestone has a deadline");
+        assert!(!resp.has_holdback);
+        assert!(resp.summary.contains("pol-contractor-1"), "summary contains policy_id");
+        assert!(!resp.policy_json.is_empty(), "policy_json must be present");
+        // policy_json must be valid JSON
+        let v: serde_json::Value = serde_json::from_str(&resp.policy_json).expect("policy_json is valid JSON");
+        assert_eq!(v["policy_id"], "pol-contractor-1");
+    }
+
+    #[tokio::test]
+    async fn build_contractor_template_rpc_rejects_empty_milestones() {
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildContractorTemplateRequest {
+            policy_id: "pol-c-2".to_string(),
+            agreement_hash: "bb".repeat(32),
+            attestors: vec![TemplateAttestorInput {
+                attestor_id: "att-1".to_string(),
+                pubkey_hex: "03".to_string() + &"cd".repeat(32),
+                display_name: None,
+            }],
+            milestones: vec![],
+            notes: None,
+        };
+        let result = build_contractor_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await;
+        assert!(result.is_err(), "empty milestones must be rejected");
+        let (status, _msg) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn build_preorder_template_rpc_returns_policy_and_summary() {
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildPreorderTemplateRequest {
+            policy_id: "pol-preorder-1".to_string(),
+            agreement_hash: "cc".repeat(32),
+            attestors: vec![TemplateAttestorInput {
+                attestor_id: "att-warehouse".to_string(),
+                pubkey_hex: "03".to_string() + &"ef".repeat(32),
+                display_name: None,
+            }],
+            delivery_proof_type: "shipment_delivered".to_string(),
+            refund_deadline_height: 900_000,
+            holdback_bps: None,
+            holdback_release_height: None,
+            notes: None,
+        };
+        let resp = build_preorder_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await.expect("build_preorder_template_rpc should succeed").0;
+        assert_eq!(resp.requirement_count, 1);
+        assert_eq!(resp.attestor_count, 1);
+        assert_eq!(resp.milestone_count, 0);
+        assert!(resp.has_timeout_rules);
+        assert!(!resp.has_holdback);
+        assert!(resp.summary.contains("pol-preorder-1"));
+        let v: serde_json::Value = serde_json::from_str(&resp.policy_json).unwrap();
+        assert_eq!(v["policy_id"], "pol-preorder-1");
+    }
+
+    #[tokio::test]
+    async fn build_preorder_template_rpc_rejects_empty_attestors() {
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildPreorderTemplateRequest {
+            policy_id: "pol-p-empty".to_string(),
+            agreement_hash: "dd".repeat(32),
+            attestors: vec![],
+            delivery_proof_type: "proof".to_string(),
+            refund_deadline_height: 1_000,
+            holdback_bps: None,
+            holdback_release_height: None,
+            notes: None,
+        };
+        let result = build_preorder_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await;
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn build_otc_template_rpc_single_attestor_default_threshold() {
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildOtcTemplateRequest {
+            policy_id: "pol-otc-1".to_string(),
+            agreement_hash: "ee".repeat(32),
+            attestors: vec![TemplateAttestorInput {
+                attestor_id: "att-arb".to_string(),
+                pubkey_hex: "03".to_string() + &"12".repeat(32),
+                display_name: None,
+            }],
+            release_proof_type: "otc_trade_confirmed".to_string(),
+            refund_deadline_height: 800_000,
+            threshold: None,
+            notes: None,
+        };
+        let resp = build_otc_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await.expect("build_otc_template_rpc should succeed").0;
+        assert_eq!(resp.requirement_count, 1);
+        assert_eq!(resp.attestor_count, 1);
+        assert_eq!(resp.milestone_count, 0);
+        assert!(!resp.has_holdback);
+        assert!(resp.has_timeout_rules);
+        assert!(resp.summary.contains("pol-otc-1"));
+        // single attestor => no threshold field in JSON
+        let v: serde_json::Value = serde_json::from_str(&resp.policy_json).unwrap();
+        assert!(v["required_proofs"][0]["threshold"].is_null(), "single-attestor path must not set threshold");
+    }
+
+    #[tokio::test]
+    async fn build_otc_template_rpc_multi_attestor_threshold() {
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildOtcTemplateRequest {
+            policy_id: "pol-otc-multi".to_string(),
+            agreement_hash: "ff".repeat(32),
+            attestors: vec![
+                TemplateAttestorInput { attestor_id: "att-a".to_string(), pubkey_hex: "03".to_string() + &"aa".repeat(32), display_name: None },
+                TemplateAttestorInput { attestor_id: "att-b".to_string(), pubkey_hex: "03".to_string() + &"bb".repeat(32), display_name: None },
+                TemplateAttestorInput { attestor_id: "att-c".to_string(), pubkey_hex: "03".to_string() + &"cc".repeat(32), display_name: None },
+            ],
+            release_proof_type: "otc_trade_confirmed".to_string(),
+            refund_deadline_height: 900_000,
+            threshold: Some(2),
+            notes: None,
+        };
+        let resp = build_otc_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await.expect("build_otc_template_rpc 2-of-3 should succeed").0;
+        assert_eq!(resp.attestor_count, 3);
+        let v: serde_json::Value = serde_json::from_str(&resp.policy_json).unwrap();
+        assert_eq!(v["required_proofs"][0]["threshold"], 2, "2-of-3 must set threshold=2");
+        assert!(resp.summary.contains("2-of-3") || resp.summary.contains("2-of"), "summary describes threshold");
+    }
+
+    #[tokio::test]
+    async fn build_otc_template_rpc_rejects_threshold_exceeds_attestors() {
+        let (state, _, _, _) = create_test_state(None);
+        let req = BuildOtcTemplateRequest {
+            policy_id: "pol-otc-bad".to_string(),
+            agreement_hash: "1a".repeat(32),
+            attestors: vec![TemplateAttestorInput {
+                attestor_id: "att-only".to_string(),
+                pubkey_hex: "03".to_string() + &"11".repeat(32),
+                display_name: None,
+            }],
+            release_proof_type: "proof".to_string(),
+            refund_deadline_height: 1000,
+            threshold: Some(3),
+            notes: None,
+        };
+        let result = build_otc_template_rpc(
+            ConnectInfo(test_socket()), State(state), HeaderMap::new(),
+            AxumJson(req),
+        ).await;
+        assert!(result.is_err());
+        let (status, msg) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("threshold"), "error must mention threshold; got: {msg}");
+    }
+
 }
+
