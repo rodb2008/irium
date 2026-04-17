@@ -18,6 +18,7 @@ use irium_node_rs::settlement::{
     AgreementSignatureEnvelope, AgreementSignatureTargetType, AgreementSignatureVerification,
     AgreementStatement, AgreementSummary, AgreementTemplateType,
     AGREEMENT_SIGNATURE_TYPE_SECP256K1, AGREEMENT_SIGNATURE_VERSION,
+    HoldbackEvaluationResult, HoldbackOutcome, MilestoneEvaluationResult,
     ProofPolicy, ProofSignatureEnvelope, SettlementProof, SETTLEMENT_PROOF_SCHEMA_ID,
     TypedProofPayload, validate_typed_proof_payload,
     settlement_proof_payload_bytes,
@@ -594,6 +595,12 @@ struct CheckPolicyRpcResponse {
     refund_eligible: bool,
     reason: String,
     evaluated_rules: Vec<String>,
+    /// Top-level holdback result; absent when no holdback is declared on the policy.
+    #[serde(default)]
+    holdback: Option<HoldbackEvaluationResult>,
+    /// Per-milestone results; empty when no milestones are declared.
+    #[serde(default)]
+    milestone_results: Vec<MilestoneEvaluationResult>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -5505,7 +5512,19 @@ fn render_policy_check_summary(resp: &CheckPolicyRpcResponse) -> String {
             lines.push(format!("  {}", rule));
         }
     }
-    lines.join("\n")
+    if let Some(ref hb) = resp.holdback {
+        let outcome_str = match hb.holdback_outcome {
+            HoldbackOutcome::Held => "held",
+            HoldbackOutcome::Released => "released",
+            HoldbackOutcome::Pending => "pending",
+        };
+        lines.push(format!("holdback_outcome {}", outcome_str));
+        lines.push(format!("holdback_bps {}", hb.holdback_bps));
+        lines.push(format!("immediate_release_bps {}", hb.immediate_release_bps));
+        lines.push(format!("holdback_reason {}", hb.holdback_reason));
+    }
+    lines.join("
+")
 }
 
 fn parse_agreement_spend_cli(args: &[String]) -> Result<AgreementSpendCliOptions, String> {
@@ -8758,6 +8777,8 @@ mod tests {
             refund_eligible: false,
             reason: "all release requirements satisfied".to_string(),
             evaluated_rules: vec!["proof 'prf-1' verified ok".to_string()],
+            holdback: None,
+            milestone_results: vec![],
         };
         let out = render_policy_check_summary(&resp);
         assert!(out.contains("agreement_hash aabbcc"), "missing hash: {out}");
@@ -8778,6 +8799,8 @@ mod tests {
             refund_eligible: true,
             reason: "no-response rule deadline reached".to_string(),
             evaluated_rules: vec![],
+            holdback: None,
+            milestone_results: vec![],
         };
         let out = render_policy_check_summary(&resp);
         assert!(out.contains("refund_eligible true"), "must show refund: {out}");
@@ -8795,11 +8818,71 @@ mod tests {
             refund_eligible: false,
             reason: "no release or refund condition was met".to_string(),
             evaluated_rules: vec!["requirement 'req-001': unsatisfied".to_string()],
+            holdback: None,
+            milestone_results: vec![],
         };
         let out = render_policy_check_summary(&resp);
         assert!(out.contains("release_eligible false"));
         assert!(out.contains("refund_eligible false"));
         assert!(out.contains("no release or refund"));
+    }
+
+
+    #[test]
+    fn render_policy_check_summary_holdback_held() {
+        use irium_node_rs::settlement::{HoldbackEvaluationResult, HoldbackOutcome};
+        let resp = CheckPolicyRpcResponse {
+            agreement_hash: "aabb01".to_string(),
+            policy_id: "pol-hb-held".to_string(),
+            tip_height: 100,
+            release_eligible: true,
+            refund_eligible: false,
+            reason: "base satisfied; holdback pending".to_string(),
+            evaluated_rules: vec![],
+            holdback: Some(HoldbackEvaluationResult {
+                holdback_present: true,
+                holdback_released: false,
+                holdback_bps: 1000,
+                immediate_release_bps: 9000,
+                holdback_outcome: HoldbackOutcome::Held,
+                holdback_reason: "base satisfied; holdback pending release condition".to_string(),
+            }),
+            milestone_results: vec![],
+        };
+        let out = render_policy_check_summary(&resp);
+        assert!(out.contains("holdback_outcome held"), "must show held: {out}");
+        assert!(out.contains("holdback_bps 1000"), "must show bps: {out}");
+        assert!(out.contains("immediate_release_bps 9000"), "must show releasable: {out}");
+        assert!(out.contains("holdback_reason"), "must show reason: {out}");
+        assert!(out.contains("release_eligible true"), "base must show eligible: {out}");
+    }
+
+    #[test]
+    fn render_policy_check_summary_holdback_released() {
+        use irium_node_rs::settlement::{HoldbackEvaluationResult, HoldbackOutcome};
+        let resp = CheckPolicyRpcResponse {
+            agreement_hash: "aabb02".to_string(),
+            policy_id: "pol-hb-released".to_string(),
+            tip_height: 1000,
+            release_eligible: true,
+            refund_eligible: false,
+            reason: "all conditions met".to_string(),
+            evaluated_rules: vec![],
+            holdback: Some(HoldbackEvaluationResult {
+                holdback_present: true,
+                holdback_released: true,
+                holdback_bps: 500,
+                immediate_release_bps: 10000,
+                holdback_outcome: HoldbackOutcome::Released,
+                holdback_reason: "holdback released by deadline at height 500".to_string(),
+            }),
+            milestone_results: vec![],
+        };
+        let out = render_policy_check_summary(&resp);
+        assert!(out.contains("holdback_outcome released"), "must show released: {out}");
+        assert!(out.contains("holdback_bps 500"), "must show bps: {out}");
+        assert!(out.contains("immediate_release_bps 10000"), "must show full release: {out}");
+        assert!(!out.contains("holdback_outcome held"), "must not show held: {out}");
     }
 
 
