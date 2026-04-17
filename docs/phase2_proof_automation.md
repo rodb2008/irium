@@ -1463,3 +1463,238 @@ and by SAFETY INVARIANT comments in the source code.
 
 **Excluded from signature** (safe to evolve without breaking existing proofs):
 `expires_at_height`, `typed_payload` (and all its subfields)
+
+---
+
+## Commercial Policy Templates
+
+Phase 2 ships three policy template builder functions in `settlement.rs` that let integrators
+construct correct `ProofPolicy` objects using existing evaluation primitives without writing
+policy JSON by hand. Templates enforce invariants, return descriptive errors on bad input, and
+produce policies that are fully compatible with `evaluate_policy()`.
+
+### `contractor_milestone_template`
+
+**Use when:** a contractor must deliver multiple discrete work items, each with its own holdback
+and optional deadline. A timeout rule fires a `Refund` if no proof arrives by the deadline.
+
+**Signature:**
+```rust
+pub fn contractor_milestone_template(
+    policy_id: &str,
+    agreement_hash: &str,
+    attestors: &[TemplateAttestor],
+    milestones: &[MilestoneSpec],
+    notes: Option<String>,
+) -> Result<ProofPolicy, String>
+```
+
+**Behaviour:**
+- Each `MilestoneSpec` produces a `ProofRequirement` with id `req-{milestone_id}`,
+  resolution `MilestoneRelease`, and the milestone's `proof_type`.
+- If `deadline_height` is set on a milestone, a `PolicyRule` with id `rule-{milestone_id}` is
+  added: trigger `FundedAndNoRelease`, deadline `deadline_height`, resolution `Refund`.
+- If `holdback_bps` and `holdback_release_height` are both set, a `PolicyHoldback` is added to
+  the requirement with `deadline_height = holdback_release_height`.
+- Rejects: empty attestors, empty milestones, duplicate milestone ids, `holdback_bps` set
+  without `holdback_release_height`, `holdback_bps` > 10000.
+
+**Example JSON** (two milestones, first with a 30-day holdback):
+```json
+{
+  "schema_id": "irium.phase2.proof_policy.v1",
+  "policy_id": "pol-construction-001",
+  "agreement_hash": "aabbcc...",
+  "approved_attestors": [
+    { "attestor_id": "att-inspector", "pubkey_hex": "03abc...", "display_name": "Site Inspector" }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "req-foundation",
+      "proof_type": "foundation_complete",
+      "resolution": "MilestoneRelease",
+      "milestone_id": "foundation",
+      "holdback": {
+        "holdback_bps": 1000,
+        "deadline_height": 750000
+      }
+    },
+    {
+      "requirement_id": "req-framing",
+      "proof_type": "framing_complete",
+      "resolution": "MilestoneRelease",
+      "milestone_id": "framing"
+    }
+  ],
+  "rules": [
+    {
+      "rule_id": "rule-framing",
+      "trigger": "FundedAndNoRelease",
+      "deadline_height": 800000,
+      "resolution": "Refund"
+    }
+  ]
+}
+```
+
+---
+
+### `preorder_deposit_template`
+
+**Use when:** a buyer deposits funds for a pre-ordered item. Funds release on a delivery proof;
+a timeout rule refunds the buyer if no delivery proof arrives before a deadline.
+
+**Signature:**
+```rust
+pub fn preorder_deposit_template(
+    policy_id: &str,
+    agreement_hash: &str,
+    attestors: &[TemplateAttestor],
+    delivery_proof_type: &str,
+    refund_deadline_height: u64,
+    holdback_bps: Option<u32>,
+    holdback_release_height: Option<u64>,
+    notes: Option<String>,
+) -> Result<ProofPolicy, String>
+```
+
+**Behaviour:**
+- Produces a single requirement `req-delivery` with resolution `Release`.
+- Produces a single rule `rule-timeout-refund` with trigger `FundedAndNoRelease`,
+  deadline `refund_deadline_height`, resolution `Refund`.
+- If `holdback_bps` is set, a top-level `policy.holdback` is added (requires
+  `holdback_release_height`).
+- Rejects: empty attestors, `holdback_bps` set without `holdback_release_height`,
+  `holdback_bps` > 10000.
+
+**Example JSON** (5% holdback, 60-day refund window):
+```json
+{
+  "schema_id": "irium.phase2.proof_policy.v1",
+  "policy_id": "pol-preorder-42",
+  "agreement_hash": "aabbcc...",
+  "approved_attestors": [
+    { "attestor_id": "att-warehouse", "pubkey_hex": "03def...", "display_name": "Warehouse" }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "req-delivery",
+      "proof_type": "shipment_delivered",
+      "resolution": "Release"
+    }
+  ],
+  "rules": [
+    {
+      "rule_id": "rule-timeout-refund",
+      "trigger": "FundedAndNoRelease",
+      "deadline_height": 850000,
+      "resolution": "Refund"
+    }
+  ],
+  "holdback": {
+    "holdback_bps": 500,
+    "deadline_height": 870000
+  }
+}
+```
+
+---
+
+### `basic_otc_escrow_template`
+
+**Use when:** two parties want a simple OTC escrow — funds release when one (or more) trusted
+attestors submit a matching proof. A timeout refund fires if no release proof arrives.
+
+**Signature:**
+```rust
+pub fn basic_otc_escrow_template(
+    policy_id: &str,
+    agreement_hash: &str,
+    attestors: &[TemplateAttestor],
+    release_proof_type: &str,
+    refund_deadline_height: u64,
+    threshold: Option<u32>,
+    notes: Option<String>,
+) -> Result<ProofPolicy, String>
+```
+
+**Behaviour:**
+- Produces a single requirement `req-release` with resolution `Release`.
+- If `threshold` is `None` or `Some(1)`, no `threshold` field is set on the requirement
+  (single-attestor backward-compatible path).
+- If `threshold` is `Some(n)` where `n > 1`, the requirement's `threshold` field is set to `n`
+  and `required_attestor_ids` is populated from all attestors.
+- Produces a single rule `rule-timeout-refund` with trigger `FundedAndNoRelease`,
+  deadline `refund_deadline_height`, resolution `Refund`.
+- Rejects: empty attestors, `threshold` > number of attestors.
+
+**Example JSON** (2-of-3 multi-sig escrow):
+```json
+{
+  "schema_id": "irium.phase2.proof_policy.v1",
+  "policy_id": "pol-otc-77",
+  "agreement_hash": "aabbcc...",
+  "approved_attestors": [
+    { "attestor_id": "att-a", "pubkey_hex": "03aaa...", "display_name": "Arbitrator A" },
+    { "attestor_id": "att-b", "pubkey_hex": "03bbb...", "display_name": "Arbitrator B" },
+    { "attestor_id": "att-c", "pubkey_hex": "03ccc...", "display_name": "Arbitrator C" }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "req-release",
+      "proof_type": "otc_trade_confirmed",
+      "resolution": "Release",
+      "threshold": 2,
+      "required_attestor_ids": ["att-a", "att-b", "att-c"]
+    }
+  ],
+  "rules": [
+    {
+      "rule_id": "rule-timeout-refund",
+      "trigger": "FundedAndNoRelease",
+      "deadline_height": 900000,
+      "resolution": "Refund"
+    }
+  ]
+}
+```
+
+---
+
+### Input types
+
+```rust
+pub struct TemplateAttestor {
+    pub attestor_id: String,
+    pub pubkey_hex: String,
+    pub display_name: Option<String>,
+}
+
+pub struct MilestoneSpec {
+    pub milestone_id: String,
+    pub label: Option<String>,
+    pub proof_type: String,
+    pub deadline_height: Option<u64>,
+    pub holdback_bps: Option<u32>,
+    pub holdback_release_height: Option<u64>,
+}
+```
+
+### Serialising a template to JSON
+
+```rust
+pub fn policy_template_to_json(policy: &ProofPolicy) -> Result<String, String>
+```
+
+Wraps `serde_json::to_string_pretty`. Use this to write a policy to disk or transmit it
+to `store-policy` RPC before a funded agreement starts.
+
+### Design constraints
+
+Templates compose only existing `ProofPolicy` primitives. They:
+
+- Do **not** add new evaluation logic or consensus rules.
+- Do **not** introduce new struct fields on `ProofPolicy`, `ProofRequirement`, or `PolicyRule`.
+- Do **not** modify `evaluate_policy()` or any holdback/threshold evaluator.
+- Are tested against `evaluate_policy()` directly so that template-generated policies behave
+  identically to hand-crafted ones with the same structure.
