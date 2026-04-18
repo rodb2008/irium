@@ -4085,16 +4085,36 @@ fn eval_milestone_subset(
     satisfied: &[String],
     tip_height: u64,
 ) -> (PolicyOutcome, bool, bool, String, Vec<String>, Vec<RequirementThresholdResult>) {
+    // Proofs attested after the milestone's refund deadline cannot count toward
+    // release eligibility — once the refund deadline passes the payer's claim is
+    // vested and cannot be retroactively overridden by a late attestation.
+    let ms_refund_cutoff: Option<u64> = no_response_rules
+        .iter()
+        .filter(|r| matches!(r.resolution, ProofResolution::Refund))
+        .map(|r| r.deadline_height)
+        .min();
+    let timely: Vec<String> = match ms_refund_cutoff {
+        None => satisfied.to_vec(),
+        Some(cutoff) => satisfied
+            .iter()
+            .filter(|id| {
+                proofs
+                    .iter()
+                    .any(|p| &p.proof_id == *id && p.attestation_time <= cutoff)
+            })
+            .cloned()
+            .collect(),
+    };
     let all_release_met =
         !release_reqs.is_empty()
             && release_reqs
                 .iter()
-                .all(|req| req_satisfied_threshold(req, proofs, satisfied));
+                .all(|req| req_satisfied_threshold(req, proofs, &timely));
     if all_release_met {
         let matched: Vec<String> = proofs
             .iter()
             .filter(|p| {
-                satisfied.contains(&p.proof_id)
+                timely.contains(&p.proof_id)
                     && release_reqs.iter().any(|r| {
                         p.proof_type == r.proof_type
                             && r.required_attestor_ids.contains(&p.attested_by)
@@ -4105,7 +4125,7 @@ fn eval_milestone_subset(
         let thr: Vec<RequirementThresholdResult> = release_reqs
             .iter()
             .chain(refund_reqs.iter())
-            .filter_map(|r| build_threshold_result(r, proofs, satisfied))
+            .filter_map(|r| build_threshold_result(r, proofs, &timely))
             .collect();
         return (
             PolicyOutcome::Satisfied,
@@ -4429,12 +4449,43 @@ pub fn evaluate_policy(
         .filter(|r| matches!(r.resolution, ProofResolution::Refund))
         .collect();
 
-    // Step 2: if all release requirements are already satisfied, return release.
-    // No-response rules are suppressed when release is already achieved.
+    // Step 2: if all release requirements are already satisfied by *timely* proofs,
+    // return release. Proofs submitted after the refund deadline are excluded from
+    // release eligibility — once the refund deadline passes the payer's claim is
+    // vested and cannot be retroactively overridden by a late attestation.
+    let refund_cutoff: Option<u64> = policy
+        .no_response_rules
+        .iter()
+        .filter(|r| {
+            r.milestone_id.is_none() && matches!(r.resolution, ProofResolution::Refund)
+        })
+        .map(|r| r.deadline_height)
+        .min();
+    let timely_satisfied: Vec<String> = match refund_cutoff {
+        None => satisfied.clone(),
+        Some(cutoff) => satisfied
+            .iter()
+            .filter(|id| {
+                proofs
+                    .iter()
+                    .any(|p| &p.proof_id == *id && p.attestation_time <= cutoff)
+            })
+            .cloned()
+            .collect(),
+    };
+    for id in &satisfied {
+        if !timely_satisfied.contains(id) {
+            evaluated_rules.push(format!(
+                "proof '{}' excluded from release eligibility: attestation_time exceeds refund deadline {}",
+                id,
+                refund_cutoff.unwrap_or(0)
+            ));
+        }
+    }
     let all_release_met = !release_requirements.is_empty()
         && release_requirements
             .iter()
-            .all(|req| req_satisfied_threshold(req, proofs, &satisfied));
+            .all(|req| req_satisfied_threshold(req, proofs, &timely_satisfied));
 
     if all_release_met {
         let top_holdback = policy.holdback.as_ref().map(|hb| {
@@ -4443,14 +4494,14 @@ pub fn evaluate_policy(
                 true,
                 &release_requirements,
                 proofs,
-                &satisfied,
+                &timely_satisfied,
                 tip_height,
             )
         });
         let top_thr: Vec<RequirementThresholdResult> = policy
             .required_proofs
             .iter()
-            .filter_map(|r| build_threshold_result(r, proofs, &satisfied))
+            .filter_map(|r| build_threshold_result(r, proofs, &timely_satisfied))
             .collect();
         return Ok(PolicyEvaluationResult {
             outcome: PolicyOutcome::Satisfied,
@@ -4458,7 +4509,7 @@ pub fn evaluate_policy(
             refund_eligible: false,
             reason: "all release requirements satisfied by verified proofs".to_string(),
             evaluated_rules,
-            matched_proof_ids: satisfied.clone(),
+            matched_proof_ids: timely_satisfied.clone(),
             milestone_results: vec![],
             completed_milestone_count: 0,
             total_milestone_count: 0,
