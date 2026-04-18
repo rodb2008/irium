@@ -3829,6 +3829,9 @@ pub struct HoldbackEvaluationResult {
     pub immediate_release_bps: u32,
     pub holdback_outcome: HoldbackOutcome,
     pub holdback_reason: String,
+    /// Block height at which the holdback becomes releasable; None if released by proof condition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_height: Option<u64>,
 }
 
 /// Declares a named milestone (tranche) within a policy.
@@ -4031,6 +4034,7 @@ fn req_satisfied_threshold(
             satisfied.contains(&p.proof_id)
                 && p.proof_type == req.proof_type
                 && req.required_attestor_ids.contains(&p.attested_by)
+                && (p.milestone_id.is_none() || req.milestone_id.is_none() || req.milestone_id == p.milestone_id)
         });
     }
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -4038,6 +4042,7 @@ fn req_satisfied_threshold(
         if satisfied.contains(&p.proof_id)
             && p.proof_type == req.proof_type
             && req.required_attestor_ids.contains(&p.attested_by)
+            && (p.milestone_id.is_none() || req.milestone_id.is_none() || req.milestone_id == p.milestone_id)
         {
             seen.insert(p.attested_by.as_str());
             if seen.len() >= threshold {
@@ -4062,6 +4067,7 @@ fn build_threshold_result(
         if satisfied.contains(&p.proof_id)
             && p.proof_type == req.proof_type
             && req.required_attestor_ids.contains(&p.attested_by)
+            && (p.milestone_id.is_none() || req.milestone_id.is_none() || req.milestone_id == p.milestone_id)
             && seen.insert(p.attested_by.as_str())
         {
             attestor_ids.push(p.attested_by.clone());
@@ -4214,6 +4220,7 @@ fn evaluate_holdback(
             immediate_release_bps: 0,
             holdback_outcome: HoldbackOutcome::Pending,
             holdback_reason: "base condition not yet satisfied".to_string(),
+            deadline_height: holdback.deadline_height,
         };
     }
 
@@ -4231,6 +4238,7 @@ fn evaluate_holdback(
                 immediate_release_bps: 10000,
                 holdback_outcome: HoldbackOutcome::Released,
                 holdback_reason: format!("holdback released by requirement '{}'", req_id),
+                deadline_height: holdback.deadline_height,
             };
         }
     }
@@ -4247,6 +4255,7 @@ fn evaluate_holdback(
                     "holdback released by deadline at height {}",
                     deadline
                 ),
+                deadline_height: Some(deadline),
             };
         }
     }
@@ -4258,6 +4267,7 @@ fn evaluate_holdback(
         immediate_release_bps: 10000u32.saturating_sub(holdback.holdback_bps),
         holdback_outcome: HoldbackOutcome::Held,
         holdback_reason: "base satisfied; holdback pending release condition".to_string(),
+        deadline_height: holdback.deadline_height,
     }
 }
 
@@ -6099,7 +6109,7 @@ mod tests {
             agreement_hash: agreement_hash.to_string(),
             milestone_id: None,
             attested_by: attestor_id.to_string(),
-            attestation_time: 1_700_000_000,
+            attestation_time: 0,
             evidence_hash: None,
             evidence_summary: Some("goods delivered and received".to_string()),
             signature: ProofSignatureEnvelope {
@@ -6433,7 +6443,7 @@ mod tests {
             agreement_hash: agreement_hash.to_string(),
             milestone_id: Some(milestone_id.to_string()),
             attested_by: attestor_id.to_string(),
-            attestation_time: 1_700_000_000,
+            attestation_time: 0,
             evidence_hash: None,
             evidence_summary: None,
             signature: ProofSignatureEnvelope {
@@ -7692,7 +7702,7 @@ mod tests {
             agreement_hash: hash.to_string(),
             milestone_id: None,
             attested_by: attestor_id.to_string(),
-            attestation_time: 1_700_000_000,
+            attestation_time: 0,
             evidence_hash: None,
             evidence_summary: None,
             signature: ProofSignatureEnvelope {
@@ -7891,7 +7901,7 @@ mod tests {
             agreement_hash: hash.clone(),
             milestone_id: Some("ms-1".to_string()),
             attested_by: "att-a".to_string(),
-            attestation_time: 1_700_000_000,
+            attestation_time: 0,
             evidence_hash: None,
             evidence_summary: None,
             signature: ProofSignatureEnvelope {
@@ -7919,7 +7929,7 @@ mod tests {
             agreement_hash: hash.clone(),
             milestone_id: Some("ms-1".to_string()),
             attested_by: "att-b".to_string(),
-            attestation_time: 1_700_000_000,
+            attestation_time: 0,
             evidence_hash: None,
             evidence_summary: None,
             signature: ProofSignatureEnvelope {
@@ -8158,7 +8168,7 @@ mod tests {
             agreement_hash: "aabbccdd".to_string(),
             milestone_id: None,
             attested_by: "att-typed".to_string(),
-            attestation_time: 1_700_000_000,
+            attestation_time: 0,
             evidence_hash: None,
             evidence_summary: None,
             signature: ProofSignatureEnvelope {
@@ -8516,7 +8526,7 @@ mod tests {
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
             proof_type: "delivery_confirmation".to_string(),
             agreement_hash: hash.clone(), milestone_id: None,
-            attested_by: "att".to_string(), attestation_time: 1_700_000_000,
+            attested_by: "att".to_string(), attestation_time: 0,
             evidence_hash: None, evidence_summary: None,
             signature: ProofSignatureEnvelope {
                 signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
@@ -8564,7 +8574,7 @@ mod tests {
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
             proof_type: "milestone_completion".to_string(),
             agreement_hash: hash.clone(), milestone_id: None,
-            attested_by: "att".to_string(), attestation_time: 1_700_000_000,
+            attested_by: "att".to_string(), attestation_time: 0,
             evidence_hash: None, evidence_summary: None,
             signature: ProofSignatureEnvelope {
                 signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
@@ -8606,7 +8616,7 @@ mod tests {
                 schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
                 proof_type: "trade_settlement".to_string(),
                 agreement_hash: hash.clone(), milestone_id: None,
-                attested_by: att.to_string(), attestation_time: 1_700_000_000,
+                attested_by: att.to_string(), attestation_time: 0,
                 evidence_hash: None, evidence_summary: None,
                 signature: ProofSignatureEnvelope {
                     signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
@@ -8655,7 +8665,7 @@ mod tests {
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
             proof_type: "delivery_confirmation".to_string(),
             agreement_hash: hash.clone(), milestone_id: None,
-            attested_by: "att".to_string(), attestation_time: 1_700_000_000,
+            attested_by: "att".to_string(), attestation_time: 0,
             evidence_hash: None, evidence_summary: None,
             signature: ProofSignatureEnvelope {
                 signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
@@ -8795,7 +8805,7 @@ mod tests {
     #[test]
     fn policy_template_to_json_round_trips() {
         let policy = contractor_milestone_template(
-            "pol-rt", &dummy_hash_64(), &[test_attestor_tmpl("att", "03".to_string() + &"ab".repeat(32))],
+            "pol-rt", &dummy_hash_64(), &[test_attestor_tmpl("att", &("03".to_string() + &"ab".repeat(32)))],
             &[ms_spec("ms-1", "proof_a", None, None, None)], None,
         ).unwrap();
         let json = policy_template_to_json(&policy).unwrap();
