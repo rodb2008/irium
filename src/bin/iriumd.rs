@@ -833,6 +833,43 @@ struct EvaluatePolicyResponse {
     threshold_results: Vec<RequirementThresholdResult>,
 }
 
+/// A single settlement action derived from policy evaluation.
+#[derive(Debug, Serialize)]
+struct SettlementAction {
+    /// "release" or "refund"
+    action: String,
+    /// Human-readable recipient label
+    recipient_label: String,
+    /// Recipient address from the agreement (payer or payee address)
+    recipient_address: String,
+    /// Basis points of total_amount allocated to this action (10000 = 100%)
+    amount_bps: u32,
+    /// Absolute amount in satoshis
+    amount_sat: u64,
+    /// Whether this action can be executed now (vs held/pending)
+    executable: bool,
+    /// Reason why not executable (None if executable=true)
+    hold_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BuildSettlementTxResponse {
+    agreement_hash: String,
+    policy_found: bool,
+    tip_height: u64,
+    release_eligible: bool,
+    refund_eligible: bool,
+    outcome: PolicyOutcome,
+    reason: String,
+    total_amount_sat: u64,
+    actions: Vec<SettlementAction>,
+}
+
+#[derive(Deserialize)]
+struct BuildSettlementTxRequest {
+    agreement: AgreementObject,
+}
+
 #[derive(Deserialize)]
 struct StorePolicyRequest {
     policy: ProofPolicy,
@@ -5757,6 +5794,156 @@ async fn evaluate_policy_rpc(
     }))
 }
 
+async fn build_settlement_tx_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<BuildSettlementTxRequest>,
+) -> Result<Json<BuildSettlementTxResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| (StatusCode::BAD_REQUEST, reason.to_string());
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    let tip_height = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.tip_height()
+    };
+    let agreement_hash = compute_agreement_hash_hex(&req.agreement)
+        .map_err(|e| bad(&format!("agreement_hash_failed:{e}")))?;
+
+    let policy = {
+        let store = state.policy_store.lock().unwrap_or_else(|e| e.into_inner());
+        store.get(&agreement_hash).cloned()
+    };
+    let policy = match policy {
+        None => {
+            return Ok(Json(BuildSettlementTxResponse {
+                agreement_hash,
+                policy_found: false,
+                tip_height,
+                release_eligible: false,
+                refund_eligible: false,
+                outcome: PolicyOutcome::Unsatisfied,
+                reason: "no policy stored for this agreement".to_string(),
+                total_amount_sat: req.agreement.total_amount,
+                actions: vec![],
+            }));
+        }
+        Some(p) => p,
+    };
+
+    let all_stored_proofs = {
+        let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+        store
+            .list_by_agreement(&agreement_hash)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let active_proofs: Vec<SettlementProof> = all_stored_proofs
+        .into_iter()
+        .filter(|p| {
+            p.expires_at_height
+                .map(|h| tip_height < h)
+                .unwrap_or(true)
+        })
+        .collect();
+
+    let result = evaluate_policy(&req.agreement, &policy, &active_proofs, tip_height)
+        .map_err(|e| bad(&format!("policy_eval_failed:{e}")))?;
+
+    let total_sat = req.agreement.total_amount;
+
+    // Resolve payer/payee addresses from the agreement parties list.
+    let payer_id: &str = &req.agreement.payer;
+    let payee_id: &str = &req.agreement.payee;
+    let payer_addr = req.agreement.parties.iter()
+        .find(|p| p.party_id == payer_id)
+        .map(|p| p.address.clone())
+        .unwrap_or_else(|| payer_id.to_string());
+    let payee_addr = req.agreement.parties.iter()
+        .find(|p| p.party_id == payee_id)
+        .map(|p| p.address.clone())
+        .unwrap_or_else(|| payee_id.to_string());
+
+    let mut actions: Vec<SettlementAction> = Vec::new();
+
+    if result.release_eligible {
+        // Check for top-level holdback split.
+        if let Some(ref hb) = result.holdback {
+            let immediate_bps = hb.immediate_release_bps;
+            let held_bps = hb.holdback_bps;
+            let immediate_sat = (total_sat as u128 * immediate_bps as u128 / 10000) as u64;
+            let held_sat = (total_sat as u128 * held_bps as u128 / 10000) as u64;
+
+            // Immediate portion to payee
+            actions.push(SettlementAction {
+                action: "release".to_string(),
+                recipient_label: "payee (immediate)".to_string(),
+                recipient_address: payee_addr.clone(),
+                amount_bps: immediate_bps,
+                amount_sat: immediate_sat,
+                executable: true,
+                hold_reason: None,
+            });
+
+            // Held portion
+            if held_bps > 0 {
+                let (exec, hold_reason) = if hb.holdback_released {
+                    (true, None)
+                } else {
+                    (false, Some(hb.holdback_reason.clone()))
+                };
+                actions.push(SettlementAction {
+                    action: "release".to_string(),
+                    recipient_label: "payee (holdback)".to_string(),
+                    recipient_address: payee_addr.clone(),
+                    amount_bps: held_bps,
+                    amount_sat: held_sat,
+                    executable: exec,
+                    hold_reason,
+                });
+            }
+        } else {
+            // Simple full release
+            actions.push(SettlementAction {
+                action: "release".to_string(),
+                recipient_label: "payee".to_string(),
+                recipient_address: payee_addr,
+                amount_bps: 10000,
+                amount_sat: total_sat,
+                executable: true,
+                hold_reason: None,
+            });
+        }
+    } else if result.refund_eligible {
+        // Full refund to payer
+        actions.push(SettlementAction {
+            action: "refund".to_string(),
+            recipient_label: "payer".to_string(),
+            recipient_address: payer_addr,
+            amount_bps: 10000,
+            amount_sat: total_sat,
+            executable: true,
+            hold_reason: None,
+        });
+    }
+    // If neither eligible, actions list is empty — funds stay locked.
+
+    Ok(Json(BuildSettlementTxResponse {
+        agreement_hash,
+        policy_found: true,
+        tip_height,
+        release_eligible: result.release_eligible,
+        refund_eligible: result.refund_eligible,
+        outcome: result.outcome,
+        reason: result.reason,
+        total_amount_sat: total_sat,
+        actions,
+    }))
+}
+
 async fn check_policy_rpc(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -7509,6 +7696,7 @@ async fn main() {
         .route("/rpc/storepolicy", post(store_policy_rpc))
         .route("/rpc/getpolicy", post(get_policy_rpc))
         .route("/rpc/evaluatepolicy", post(evaluate_policy_rpc))
+        .route("/rpc/buildsettlementtx", post(build_settlement_tx_rpc))
         .route("/rpc/listpolicies", post(list_policies_rpc))
         .route("/rpc/createhtlc", post(create_htlc))
         .route("/rpc/decodehtlc", post(decode_htlc))
