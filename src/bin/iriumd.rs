@@ -9927,7 +9927,11 @@ mod tests {
         });
         store_policy_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
             Json(StorePolicyRequest { policy, replace: false })).await.expect("store policy");
-        let proof = make_rpc_proof(&agreement_hash, &sk);
+        // The proof must have attestation_time <= the refund deadline (10) to be
+        // considered timely by the late-proof guard in evaluate_policy.
+        let mut proof = make_rpc_proof(&agreement_hash, &sk);
+        proof.attestation_time = 5;
+        proof.signature = sign_rpc_proof(&proof, &sk);
         submit_proof_rpc(ConnectInfo(test_socket()), State(state.clone()), HeaderMap::new(),
             Json(SubmitProofRequest { proof })).await.expect("submit proof");
         { let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner()); chain.height = 100; }
@@ -10349,8 +10353,12 @@ mod tests {
         .await
         .expect("store policy");
 
-        // Submit a valid proof
-        let proof = make_rpc_proof(&agreement_hash, &sk);
+        // Submit a valid proof with attestation_time before the refund deadline (10).
+        // The late-proof guard in evaluate_policy filters proofs with
+        // attestation_time > refund_deadline; we need attestation_time <= 10 here.
+        let mut proof = make_rpc_proof(&agreement_hash, &sk);
+        proof.attestation_time = 5;
+        proof.signature = sign_rpc_proof(&proof, &sk);
         submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),

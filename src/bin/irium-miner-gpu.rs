@@ -347,6 +347,11 @@ fn rpc_client() -> Result<Client, String> {
         let cert = Certificate::from_pem(&pem).map_err(|e| format!("invalid CA: {e}"))?;
         builder = builder.add_root_certificate(cert);
     }
+    // IRIUM_RPC_INSECURE is a development-only escape hatch that disables TLS
+    // certificate verification. It is intentionally restricted to loopback
+    // addresses (localhost / 127.0.0.1 / ::1) to prevent accidental use against
+    // remote nodes where certificate bypass would expose the connection to MITM.
+    // For production use with self-signed certs, use IRIUM_RPC_CA instead.
     let insecure = env::var("IRIUM_RPC_INSECURE")
         .ok()
         .map(|v| {
@@ -356,12 +361,25 @@ fn rpc_client() -> Result<Client, String> {
         .unwrap_or(false);
     if insecure {
         let base = node_rpc_base();
-        if let Ok(url) = reqwest::Url::parse(&base) {
-            if !is_loopback_host(url.host_str().unwrap_or("")) {
+        match reqwest::Url::parse(&base) {
+            Ok(url) if is_loopback_host(url.host_str().unwrap_or("")) => {
+                // Loopback-only: permit certificate bypass for local dev nodes.
                 builder = builder.danger_accept_invalid_certs(true);
             }
-        } else {
-            builder = builder.danger_accept_invalid_certs(true);
+            Ok(_) => {
+                // Non-loopback: refuse to disable TLS verification regardless of
+                // the env flag. Use IRIUM_RPC_CA to trust a self-signed cert instead.
+                eprintln!(
+                    "[warn] IRIUM_RPC_INSECURE is set but the RPC URL ({}) is not a                      loopback address; TLS certificate verification will NOT be disabled.                      Use IRIUM_RPC_CA to trust a custom CA certificate.",
+                    base
+                );
+            }
+            Err(_) => {
+                // URL parse failure: refuse to disable TLS verification.
+                eprintln!(
+                    "[warn] IRIUM_RPC_INSECURE is set but the RPC URL could not be parsed;                      TLS certificate verification will NOT be disabled."
+                );
+            }
         }
     }
     builder.build().map_err(|e| format!("HTTP client: {e}"))
