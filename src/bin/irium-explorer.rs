@@ -720,7 +720,7 @@ fn agreement_header_markup(agreement: &AgreementObject, agreement_hash: &str) ->
         "<section><h1>Agreement {}</h1><p><strong>Agreement hash:</strong> <code>{}</code></p><p><strong>Schema:</strong> <code>{}</code></p><p><strong>Version:</strong> {}</p><p><strong>Template:</strong> {:?}</p><p><strong>Payer:</strong> {}</p><p><strong>Payee:</strong> {}</p><p><strong>Total amount:</strong> {}</p><p><strong>Document hash:</strong> <code>{}</code></p><p><strong>Metadata hash:</strong> {}</p><p><strong>Settlement deadline:</strong> {:?}</p><p><strong>Refund deadline:</strong> {:?}</p>{}</section>",
         html_escape(&agreement.agreement_id),
         html_escape(agreement_hash),
-        agreement.schema_id.as_deref().unwrap_or("legacy_unlabeled"),
+        html_escape(agreement.schema_id.as_deref().unwrap_or("legacy_unlabeled")),
         agreement.version,
         agreement.template_type,
         html_escape(&agreement.payer),
