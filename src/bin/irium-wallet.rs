@@ -807,6 +807,69 @@ struct EvaluatePolicyRpcResponse {
     threshold_results: Vec<ThresholdResultRpc>,
 }
 
+/// Settlement action returned by buildsettlementtx RPC.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct SettlementActionRpc {
+    /// "release", "refund", or future action types.
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    recipient_address: String,
+    #[serde(default)]
+    recipient_label: String,
+    /// Basis-points share of total_amount for this action (0-10000).
+    #[serde(default)]
+    amount_bps: u32,
+    /// True when the chain conditions are met and the action can be broadcast now.
+    #[serde(default)]
+    executable: bool,
+    /// Block height at or after which this action becomes executable; None = now.
+    #[serde(default)]
+    executable_after_height: Option<u64>,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct BuildSettlementTxRpcRequest {
+    agreement: AgreementObject,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct BuildSettlementTxRpcResponse {
+    #[serde(default)]
+    agreement_hash: String,
+    #[serde(default)]
+    policy_found: bool,
+    #[serde(default)]
+    release_eligible: bool,
+    #[serde(default)]
+    refund_eligible: bool,
+    #[serde(default)]
+    tip_height: u64,
+    #[serde(default)]
+    actions: Vec<SettlementActionRpc>,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ComputeAgreementHashRpcRequest {
+    agreement: AgreementObject,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct ComputeAgreementHashRpcResponse {
+    #[serde(default)]
+    agreement_hash: String,
+    /// Canonical JSON string that was hashed; clients can SHA-256 to verify.
+    #[serde(default)]
+    canonical_json: String,
+    /// Human-readable description of the serialization rules applied.
+    #[serde(default)]
+    serialization_rules: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct PolicyListCliOptions {
     rpc_url: String,
@@ -2188,6 +2251,52 @@ fn rpc_client(base: &str) -> Result<Client, String> {
         }
     }
     builder.build().map_err(|e| format!("build client: {e}"))
+}
+
+/// Typed client for the Irium settlement RPC endpoints.
+///
+/// Wraps `rpc_client` + `rpc_post_json` so callers don't need to repeat
+/// the client-construction and path-building boilerplate for every call.
+struct SettlementClient {
+    client: reqwest::blocking::Client,
+    base: String,
+}
+
+impl SettlementClient {
+    fn new(base: &str) -> Result<Self, String> {
+        let client = rpc_client(base)?;
+        Ok(Self { client, base: base.to_string() })
+    }
+
+    fn post<TReq: serde::Serialize, TResp: for<'de> serde::Deserialize<'de>>(
+        &self, path: &str, body: &TReq,
+    ) -> Result<TResp, String> {
+        rpc_post_json(&self.client, &self.base, path, body)
+    }
+
+    fn compute_agreement_hash(
+        &self, agreement: AgreementObject,
+    ) -> Result<ComputeAgreementHashRpcResponse, String> {
+        self.post("computeagreementhash", &ComputeAgreementHashRpcRequest { agreement })
+    }
+
+    fn get_policy(
+        &self, agreement_hash: String,
+    ) -> Result<GetPolicyRpcResponse, String> {
+        self.post("getpolicy", &GetPolicyRpcRequest { agreement_hash })
+    }
+
+    fn evaluate_policy(
+        &self, agreement: AgreementObject,
+    ) -> Result<EvaluatePolicyRpcResponse, String> {
+        self.post("evaluatepolicy", &EvaluatePolicyRpcRequest { agreement })
+    }
+
+    fn build_settlement_tx(
+        &self, agreement: AgreementObject,
+    ) -> Result<BuildSettlementTxRpcResponse, String> {
+        self.post("buildsettlementtx", &BuildSettlementTxRpcRequest { agreement })
+    }
 }
 
 fn p2pkh_script(pkh: &[u8; 20]) -> Vec<u8> {
@@ -5476,6 +5585,30 @@ found true",
             )
         }
     }
+}
+
+fn render_build_settlement_summary(resp: &BuildSettlementTxRpcResponse) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("agreement_hash {}", resp.agreement_hash));
+    lines.push(format!("tip_height {}", resp.tip_height));
+    lines.push(format!("policy_found {}", resp.policy_found));
+    lines.push(format!("release_eligible {}", resp.release_eligible));
+    lines.push(format!("refund_eligible {}", resp.refund_eligible));
+    if !resp.reason.is_empty() {
+        lines.push(format!("reason {}", resp.reason));
+    }
+    lines.push(format!("action_count {}", resp.actions.len()));
+    for (i, a) in resp.actions.iter().enumerate() {
+        let exec_after = match a.executable_after_height {
+            None => "now".to_string(),
+            Some(h) => format!("height_{}", h),
+        };
+        lines.push(format!(
+            "action[{}] {} recipient={} bps={} executable={} executable_after={}",
+            i, a.action, a.recipient_address, a.amount_bps, a.executable, exec_after
+        ));
+    }
+    lines.join("\n")
 }
 
 fn render_proof_create_summary(proof: &SettlementProof) -> String {
@@ -10995,6 +11128,101 @@ found true"), "must not show found true; got: {out}");
         assert!(!out.contains("total_count"), "no pagination noise; got: {out}");
     }
 
+    // ── Phase 4: render_build_settlement_summary unit tests ──────────────────
+
+    #[test]
+    fn render_build_settlement_summary_release() {
+        let resp = BuildSettlementTxRpcResponse {
+            agreement_hash: "abc123".to_string(),
+            tip_height: 19500,
+            policy_found: true,
+            release_eligible: true,
+            refund_eligible: false,
+            reason: String::new(),
+            actions: vec![SettlementActionRpc {
+                action: "release".to_string(),
+                recipient_address: "irium1payee000".to_string(),
+                recipient_label: "payee".to_string(),
+                amount_bps: 10000,
+                executable: true,
+                executable_after_height: None,
+                reason: String::new(),
+            }],
+        };
+        let s = render_build_settlement_summary(&resp);
+        assert!(s.contains("release_eligible true"), "must mark release eligible: {s}");
+        assert!(s.contains("refund_eligible false"), "must mark refund not eligible: {s}");
+        assert!(s.contains("action[0] release"), "must list release action: {s}");
+        assert!(s.contains("irium1payee000"), "must include recipient address: {s}");
+        assert!(s.contains("executable=true"), "must mark as executable: {s}");
+    }
+
+    #[test]
+    fn render_build_settlement_summary_refund() {
+        let resp = BuildSettlementTxRpcResponse {
+            agreement_hash: "def456".to_string(),
+            tip_height: 20000,
+            policy_found: true,
+            release_eligible: false,
+            refund_eligible: true,
+            reason: "deadline_elapsed".to_string(),
+            actions: vec![SettlementActionRpc {
+                action: "refund".to_string(),
+                recipient_address: "irium1payer000".to_string(),
+                recipient_label: "payer".to_string(),
+                amount_bps: 10000,
+                executable: true,
+                executable_after_height: None,
+                reason: String::new(),
+            }],
+        };
+        let s = render_build_settlement_summary(&resp);
+        assert!(s.contains("release_eligible false"), "must mark release not eligible: {s}");
+        assert!(s.contains("refund_eligible true"), "must mark refund eligible: {s}");
+        assert!(s.contains("action[0] refund"), "must list refund action: {s}");
+        assert!(s.contains("irium1payer000"), "must include payer address: {s}");
+        assert!(s.contains("deadline_elapsed"), "must include reason: {s}");
+    }
+
+    #[test]
+    fn render_build_settlement_summary_holdback_locked() {
+        let resp = BuildSettlementTxRpcResponse {
+            agreement_hash: "ghi789".to_string(),
+            tip_height: 19500,
+            policy_found: true,
+            release_eligible: true,
+            refund_eligible: false,
+            reason: String::new(),
+            actions: vec![
+                SettlementActionRpc {
+                    action: "release".to_string(),
+                    recipient_address: "irium1payee000".to_string(),
+                    recipient_label: "immediate".to_string(),
+                    amount_bps: 9200,
+                    executable: true,
+                    executable_after_height: None,
+                    reason: String::new(),
+                },
+                SettlementActionRpc {
+                    action: "release".to_string(),
+                    recipient_address: "irium1payee000".to_string(),
+                    recipient_label: "holdback".to_string(),
+                    amount_bps: 800,
+                    executable: false,
+                    executable_after_height: Some(99999),
+                    reason: String::new(),
+                },
+            ],
+        };
+        let s = render_build_settlement_summary(&resp);
+        assert!(s.contains("action_count 2"), "must report 2 actions: {s}");
+        assert!(s.contains("action[0]"), "must list first action: {s}");
+        assert!(s.contains("action[1]"), "must list second action: {s}");
+        assert!(s.contains("bps=800"), "must include holdback bps: {s}");
+        assert!(s.contains("executable=false"), "holdback must be non-executable: {s}");
+        assert!(s.contains("height_99999"), "must include holdback unlock height: {s}");
+    }
+
 }
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -15128,6 +15356,85 @@ fn main() {
                 std::process::exit(1);
             }
             println!("txid {}", hex::encode(tx.txid()));
+        }
+        "agreement-build-settlement" => {
+            // agreement-build-settlement <agreement.json> [--rpc <url>]
+            let mut args = args.iter().skip(1);
+            let agreement_path = match args.next() {
+                Some(p) => p.clone(),
+                None => {
+                    eprintln!("usage: agreement-build-settlement <agreement.json> [--rpc <url>]");
+                    std::process::exit(1);
+                }
+            };
+            let mut rpc_url = node_rpc_base();
+            while let Some(flag) = args.next() {
+                if flag == "--rpc" {
+                    if let Some(u) = args.next() { rpc_url = u.clone(); }
+                }
+            }
+            let agreement_json = std::fs::read_to_string(&agreement_path)
+                .unwrap_or_else(|e| { eprintln!("read {}: {}", agreement_path, e); std::process::exit(1); });
+            let agreement: AgreementObject = serde_json::from_str(&agreement_json)
+                .unwrap_or_else(|e| { eprintln!("parse agreement: {}", e); std::process::exit(1); });
+            let sc = SettlementClient::new(&rpc_url)
+                .unwrap_or_else(|e| { eprintln!("rpc client: {}", e); std::process::exit(1); });
+            let resp = sc.build_settlement_tx(agreement)
+                .unwrap_or_else(|e| { eprintln!("buildsettlementtx: {}", e); std::process::exit(1); });
+            if std::env::var("IRIUM_JSON").ok().map(|v| v == "1").unwrap_or(false) {
+                println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+            } else {
+                println!("{}", render_build_settlement_summary(&resp));
+            }
+        }
+        "agreement-settle-status" => {
+            // agreement-settle-status <agreement.json> [--rpc <url>]
+            // End-to-end helper: computeagreementhash -> getpolicy -> evaluatepolicy -> buildsettlementtx
+            let mut args = args.iter().skip(1);
+            let agreement_path = match args.next() {
+                Some(p) => p.clone(),
+                None => {
+                    eprintln!("usage: agreement-settle-status <agreement.json> [--rpc <url>]");
+                    std::process::exit(1);
+                }
+            };
+            let mut rpc_url = node_rpc_base();
+            while let Some(flag) = args.next() {
+                if flag == "--rpc" {
+                    if let Some(u) = args.next() { rpc_url = u.clone(); }
+                }
+            }
+            let agreement_json = std::fs::read_to_string(&agreement_path)
+                .unwrap_or_else(|e| { eprintln!("read {}: {}", agreement_path, e); std::process::exit(1); });
+            let agreement: AgreementObject = serde_json::from_str(&agreement_json)
+                .unwrap_or_else(|e| { eprintln!("parse agreement: {}", e); std::process::exit(1); });
+            let sc = SettlementClient::new(&rpc_url)
+                .unwrap_or_else(|e| { eprintln!("rpc client: {}", e); std::process::exit(1); });
+
+            // Step 1: compute canonical hash
+            let hash_resp = sc.compute_agreement_hash(agreement.clone())
+                .unwrap_or_else(|e| { eprintln!("computeagreementhash: {}", e); std::process::exit(1); });
+            println!("=== agreement hash ===");
+            println!("agreement_hash {}", hash_resp.agreement_hash);
+            println!("canonical_rules {}", hash_resp.serialization_rules.len());
+
+            // Step 2: getpolicy
+            let pol_resp = sc.get_policy(hash_resp.agreement_hash.clone())
+                .unwrap_or_else(|e| { eprintln!("getpolicy: {}", e); std::process::exit(1); });
+            println!("\n=== policy ===");
+            println!("{}", render_policy_get_summary(&pol_resp));
+
+            // Step 3: evaluatepolicy
+            let eval_resp = sc.evaluate_policy(agreement.clone())
+                .unwrap_or_else(|e| { eprintln!("evaluatepolicy: {}", e); std::process::exit(1); });
+            println!("\n=== evaluation ===");
+            println!("{}", render_policy_evaluate_summary(&eval_resp));
+
+            // Step 4: buildsettlementtx
+            let bst_resp = sc.build_settlement_tx(agreement)
+                .unwrap_or_else(|e| { eprintln!("buildsettlementtx: {}", e); std::process::exit(1); });
+            println!("\n=== settlement actions ===");
+            println!("{}", render_build_settlement_summary(&bst_resp));
         }
         _ => {
             usage();
