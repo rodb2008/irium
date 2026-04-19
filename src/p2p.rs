@@ -7698,6 +7698,13 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::sync::Mutex;
 
+    /// Serialise all tests that touch the global orphan-header statics so they
+    /// cannot race with each other under `cargo test` parallel execution.
+    fn orphan_test_lock() -> &'static StdMutex<()> {
+        static LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
     fn mine_header(mut header: BlockHeader) -> BlockHeader {
         for nonce in 0u32..u32::MAX {
             header.nonce = nonce;
@@ -7764,6 +7771,7 @@ mod tests {
 
     #[test]
     fn duplicate_orphan_headers_are_not_reinserted() {
+        let _serial = orphan_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let locked = load_locked_genesis().expect("load locked genesis");
         let genesis = block_from_locked(&locked).expect("build genesis block");
         let pow_limit = crate::pow::Target { bits: 0x207fffff };
@@ -7802,6 +7810,7 @@ mod tests {
 
     #[test]
     fn orphan_reinsert_after_removal_is_suppressed_within_ttl() {
+        let _serial = orphan_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let locked = load_locked_genesis().expect("load locked genesis");
         let genesis = block_from_locked(&locked).expect("build genesis block");
         let pow_limit = crate::pow::Target { bits: 0x207fffff };

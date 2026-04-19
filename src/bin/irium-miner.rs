@@ -250,9 +250,10 @@ mod tests {
     #[test]
     fn mainnet_ignores_env_activation_override() {
         std::env::set_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT", "42");
+        // Mainnet ignores the env var; returns the code-defined value Some(18677).
         assert_eq!(
             resolved_htlcv1_activation_height(NetworkKind::Mainnet),
-            None
+            Some(18677)
         );
         std::env::remove_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT");
     }
