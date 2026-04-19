@@ -850,6 +850,9 @@ struct SettlementAction {
     executable: bool,
     /// Reason why not executable (None if executable=true)
     hold_reason: Option<String>,
+    /// Block height at which this action becomes executable; None if immediately executable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executable_after_height: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5886,6 +5889,7 @@ async fn build_settlement_tx_rpc(
                 amount_sat: immediate_sat,
                 executable: true,
                 hold_reason: None,
+                executable_after_height: None,
             });
 
             // Held portion
@@ -5903,6 +5907,7 @@ async fn build_settlement_tx_rpc(
                     amount_sat: held_sat,
                     executable: exec,
                     hold_reason,
+                    executable_after_height: if exec { None } else { hb.deadline_height },
                 });
             }
         } else {
@@ -5915,6 +5920,7 @@ async fn build_settlement_tx_rpc(
                 amount_sat: total_sat,
                 executable: true,
                 hold_reason: None,
+                executable_after_height: None,
             });
         }
     } else if result.refund_eligible {
@@ -5927,6 +5933,7 @@ async fn build_settlement_tx_rpc(
             amount_sat: total_sat,
             executable: true,
             hold_reason: None,
+            executable_after_height: None,
         });
     }
     // If neither eligible, actions list is empty — funds stay locked.

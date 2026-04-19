@@ -571,7 +571,10 @@ struct ProofCreateCliOptions {
     evidence_summary: Option<String>,
     evidence_hash: Option<String>,
     proof_id: Option<String>,
+    /// Explicit block-height-scale timestamp. When absent, fetched from --rpc or defaults to 0.
     timestamp: Option<u64>,
+    /// Optional RPC URL used to fetch the current tip height as default attestation_time.
+    rpc_url: Option<String>,
     out_path: Option<String>,
     json_mode: bool,
     expires_at_height: Option<u64>,
@@ -2103,12 +2106,15 @@ fn usage() {
     eprintln!("  irium-wallet agreement-refund-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-policy-check --agreement <agreement.json|-> --policy <policy.json|-> [--proof <proof.json>]... [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-set --policy <policy.json|-> [--rpc <url>] [--json] [--replace] [--expires-at-height <n>]");
+  eprintln!("  irium-wallet policy-build-contractor --policy-id <id> --agreement-hash <hash> --attestor <id>:<pubkey_or_addr> --milestone <id>:<type> [--raw-policy] [--json] [--rpc <url>]");
+  eprintln!("  irium-wallet policy-build-preorder --policy-id <id> --agreement-hash <hash> --attestor <id>:<pubkey_or_addr> --delivery-proof-type <type> [--raw-policy] [--json] [--rpc <url>]");
+  eprintln!("  irium-wallet policy-build-otc --policy-id <id> --agreement-hash <hash> --attestor <id>:<pubkey_or_addr> --release-proof-type <type> [--raw-policy] [--json] [--rpc <url>]");
   eprintln!("  irium-wallet agreement-policy-get --agreement-hash <hex> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-policy-evaluate --agreement <agreement.json|-> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-build-settlement <agreement.json> [--rpc <url>] [--json]");
   eprintln!("  irium-wallet agreement-settle-status <agreement.json> [--rpc <url>]");
   eprintln!("  irium-wallet agreement-policy-list [--active-only] [--rpc <url>] [--json]");
-    eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--expires-at-height <n>] [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <unix>] [--proof-kind <kind>] [--reference-id <ref>] [--out <path>] [--json]");
+    eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--expires-at-height <n>] [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <block_height>] [--rpc <url>] [--proof-kind <kind>] [--reference-id <ref>] [--out <path>] [--json]");
     eprintln!("  irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-list [--agreement-hash <hex>] [--active-only] [--offset <n>] [--limit <n>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-get --proof-id <id> [--rpc <url>] [--json]");
@@ -2406,6 +2412,28 @@ fn fetch_fee_estimate(client: &Client, base: &str) -> Result<FeeEstimateResponse
     }
     resp.json::<FeeEstimateResponse>()
         .map_err(|e| format!("parse fee estimate response: {e}"))
+}
+
+/// Fetch the current chain tip height from the node status endpoint.
+/// Returns Ok(height) on success, Err with message on failure.
+fn fetch_tip_height(client: &Client, base: &str) -> Result<u64, String> {
+    let resp = send_with_https_fallback(base, |b| {
+        let url = format!("{}/status", b.trim_end_matches('/'));
+        let mut req = client.get(&url);
+        if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    })
+    .map_err(|e| format!("status request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("status request failed: {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json()
+        .map_err(|e| format!("parse status response: {e}"))?;
+    body.get("height")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "status response missing 'height' field".to_string())
 }
 
 fn rpc_post_json<TReq: Serialize, TResp: for<'de> Deserialize<'de>>(
@@ -2931,6 +2959,24 @@ fn resolve_bundle_reference_or_stdin(reference: &str) -> Result<StoredAgreementB
     resolve_bundle_input(reference)
 }
 
+fn resolve_attestor_pubkey_hex(pubkey_or_address: &str) -> Result<String, String> {
+    // Accept compressed secp256k1 pubkey hex (66 hex chars) directly.
+    if pubkey_or_address.len() == 66
+        && pubkey_or_address.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Ok(pubkey_or_address.to_string());
+    }
+    // Otherwise treat as a wallet address and resolve to pubkey.
+    let wallet = ensure_wallet(&wallet_path())?;
+    let key = find_key(&wallet, pubkey_or_address).ok_or_else(|| {
+        format!(
+            "attestor address {} not found in wallet; provide a pubkey hex directly",
+            pubkey_or_address
+        )
+    })?;
+    Ok(key.pubkey.clone())
+}
+
 fn signer_material_from_wallet(address: &str) -> Result<(WalletKey, SigningKey), String> {
     let wallet = ensure_wallet(&wallet_path())?;
     let key = find_key(&wallet, address)
@@ -2971,16 +3017,8 @@ fn sign_target_hash(
     Ok(envelope)
 }
 
-fn create_settlement_proof_signed(opts: &ProofCreateCliOptions) -> Result<SettlementProof, String> {
+fn create_settlement_proof_signed(opts: &ProofCreateCliOptions, attestation_time: u64) -> Result<SettlementProof, String> {
     let (key, signing_key) = signer_material_from_wallet(&opts.address)?;
-
-    let attestation_time = match opts.timestamp {
-        Some(t) => t,
-        None => SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    };
 
     // Generate a deterministic proof_id from (proof_type, agreement_hash, timestamp) if not provided.
     let proof_id = match &opts.proof_id {
@@ -5066,6 +5104,7 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
     let mut evidence_hash: Option<String> = None;
     let mut proof_id: Option<String> = None;
     let mut timestamp: Option<u64> = None;
+    let mut rpc_url: Option<String> = None;
     let mut out_path: Option<String> = None;
     let mut json_mode = false;
     let mut expires_at_height: Option<u64> = None;
@@ -5170,6 +5209,11 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
                 if i >= args.len() { return Err("--reference-id requires a value".to_string()); }
                 reference_id = Some(args[i].clone());
             }
+            "--rpc" => {
+                i += 1;
+                if i >= args.len() { return Err("--rpc requires a value".to_string()); }
+                rpc_url = Some(args[i].clone());
+            }
             other => {
                 return Err(format!("unknown argument: {}", other));
             }
@@ -5187,6 +5231,7 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
         evidence_hash,
         proof_id,
         timestamp,
+        rpc_url,
         out_path,
         json_mode,
         expires_at_height,
@@ -5514,7 +5559,19 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
                 .as_deref()
                 .filter(|l| !l.is_empty())
                 .unwrap_or(ms.milestone_id.as_str());
-            lines.push(format!("  milestone {} outcome {}", display, ms.outcome));
+            // Distinguish "no proof submitted yet" from "proof submitted but rejected".
+            let outcome_label = if ms.outcome == "unsatisfied" && ms.matched_proof_ids.is_empty() {
+                "not_yet_attested"
+            } else {
+                ms.outcome.as_str()
+            };
+            lines.push(format!("  milestone {} outcome {}", display, outcome_label));
+            if !ms.matched_proof_ids.is_empty() {
+                lines.push(format!("    matched_proof_ids {}", ms.matched_proof_ids.join(", ")));
+            }
+            if !ms.reason.is_empty() && ms.outcome != "satisfied" {
+                lines.push(format!("    reason {}", ms.reason));
+            }
             if let Some(ref hb) = ms.holdback {
                 lines.push(format!(
                     "    holdback {} bps holdback_outcome {}",
@@ -9085,6 +9142,7 @@ mod tests {
                 immediate_release_bps: 9000,
                 holdback_outcome: HoldbackOutcome::Held,
                 holdback_reason: "base satisfied; holdback pending release condition".to_string(),
+                deadline_height: None,
             }),
             milestone_results: vec![],
         };
@@ -9114,6 +9172,7 @@ mod tests {
                 immediate_release_bps: 10000,
                 holdback_outcome: HoldbackOutcome::Released,
                 holdback_reason: "holdback released by deadline at height 500".to_string(),
+                deadline_height: None,
             }),
             milestone_results: vec![],
         };
@@ -9605,6 +9664,7 @@ mod tests {
             evidence_hash: None,
             proof_id: Some("prf-unit-001".to_string()),
             timestamp: Some(1700000000),
+            rpc_url: None,
             out_path: None,
             json_mode: false,
             expires_at_height: None,
@@ -9612,7 +9672,7 @@ mod tests {
             reference_id: None,
         };
 
-        let proof = create_settlement_proof_signed(&opts).expect("must create proof");
+        let proof = create_settlement_proof_signed(&opts, 1700000000).expect("must create proof");
 
         assert_eq!(proof.proof_id, "prf-unit-001");
         assert_eq!(proof.schema_id, SETTLEMENT_PROOF_SCHEMA_ID);
@@ -9711,6 +9771,7 @@ mod tests {
             evidence_hash: None,
             proof_id: None,
             timestamp: Some(1700001234),
+            rpc_url: None,
             out_path: None,
             json_mode: false,
             expires_at_height: None,
@@ -9718,7 +9779,7 @@ mod tests {
             reference_id: None,
         };
 
-        let proof = create_settlement_proof_signed(&opts).expect("must create proof");
+        let proof = create_settlement_proof_signed(&opts, 1700001234).expect("must create proof");
         assert!(proof.proof_id.starts_with("prf-"), "got: {}", proof.proof_id);
         assert_eq!(proof.proof_id.len(), 4 + 16, "got: {}", proof.proof_id);
         verify_settlement_proof_signature_only(&proof).expect("signature must verify");
@@ -10121,7 +10182,7 @@ mod tests {
         let out = render_policy_evaluate_summary(&resp);
         assert!(out.contains("milestones 1/2"), "must show milestone count; got: {out}");
         assert!(out.contains("Delivery outcome satisfied"), "must show labeled milestone; got: {out}");
-        assert!(out.contains("ms-b outcome unsatisfied"), "must show unlabeled milestone by id; got: {out}");
+        assert!(out.contains("ms-b outcome not_yet_attested"), "must show not_yet_attested for unmatched milestone; got: {out}");
     }
 
     #[test]
@@ -11352,6 +11413,167 @@ found true"), "must not show found true; got: {out}");
         assert!(s.contains("bps=800"), "must include holdback bps: {s}");
         assert!(s.contains("executable=false"), "holdback must be non-executable: {s}");
         assert!(s.contains("height_99999"), "must include holdback unlock height: {s}");
+    }
+
+    // ── Phase 5 review hardening tests ──────────────────────────────────────
+
+    #[test]
+    fn resolve_attestor_pubkey_hex_returns_66char_hex_unchanged() {
+        // A 66-char all-hex string is returned as-is; wallet lookup not performed.
+        let valid_pubkey = "03".to_string() + &"ab".repeat(32); // 66 chars
+        let result = resolve_attestor_pubkey_hex(&valid_pubkey);
+        assert!(result.is_ok(), "must accept valid 66-char pubkey hex");
+        assert_eq!(result.unwrap(), valid_pubkey);
+    }
+
+    #[test]
+    fn resolve_attestor_pubkey_hex_rejects_short_string_as_address_not_in_wallet() {
+        // A string that is NOT 66 hex chars is treated as wallet address lookup.
+        // If not present in wallet, must return a clear error.
+        let result = resolve_attestor_pubkey_hex("irium1notinwallet");
+        assert!(result.is_err(), "must fail for address not in wallet");
+        let err = result.unwrap_err();
+        assert!(err.contains("not found in wallet") || err.contains("irium1notinwallet"),
+            "error must identify the address: {err}");
+    }
+
+    #[test]
+    fn resolve_attestor_pubkey_hex_rejects_65_char_hex() {
+        // 65 hex chars is NOT a valid pubkey (one byte short); must attempt wallet lookup.
+        let short_hex = "03".to_string() + &"ab".repeat(31) + "a"; // 65 chars
+        assert_eq!(short_hex.len(), 65);
+        let result = resolve_attestor_pubkey_hex(&short_hex);
+        // It falls through to wallet lookup which will fail (not a known address).
+        assert!(result.is_err(), "must fail for 65-char hex (not a valid pubkey, wallet lookup also fails)");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_unsatisfied_no_proofs_shows_not_yet_attested() {
+        // When a milestone outcome is "unsatisfied" and no proofs matched,
+        // the render must display "not_yet_attested" to distinguish from a
+        // failed proof (proof submitted but rejected).
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "unsatisfied".to_string(),
+            agreement_hash: "aabb".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-001".to_string()),
+            expired: false,
+            tip_height: 100,
+            proof_count: 0,
+            expired_proof_count: 0,
+            matched_proof_count: 0,
+            matched_proof_ids: vec![],
+            release_eligible: false,
+            refund_eligible: false,
+            reason: "no proofs".to_string(),
+            evaluated_rules: vec![],
+            milestone_results: vec![MilestoneRpcResult {
+                milestone_id: "ms-1".to_string(),
+                label: Some("First Milestone".to_string()),
+                outcome: "unsatisfied".to_string(),
+                release_eligible: false,
+                refund_eligible: false,
+                matched_proof_ids: vec![],  // No proofs → not_yet_attested
+                reason: String::new(),
+                holdback: None,
+                threshold_results: vec![],
+            }],
+            completed_milestone_count: 0,
+            total_milestone_count: 1,
+            holdback: None,
+            threshold_results: vec![],
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("not_yet_attested"),
+            "must show not_yet_attested when no proofs matched: {out}");
+        assert!(out.contains("milestone First Milestone outcome not_yet_attested")
+            || out.contains("outcome not_yet_attested"),
+            "milestone line must use not_yet_attested label: {out}");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_unsatisfied_with_proof_shows_unsatisfied() {
+        // When a milestone outcome is "unsatisfied" but matched_proof_ids is non-empty
+        // (a proof was submitted but did not satisfy the policy), show "unsatisfied"
+        // not "not_yet_attested".
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "unsatisfied".to_string(),
+            agreement_hash: "aabb".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-002".to_string()),
+            expired: false,
+            tip_height: 100,
+            proof_count: 1,
+            expired_proof_count: 0,
+            matched_proof_count: 1,
+            matched_proof_ids: vec!["prf-rejected-01".to_string()],
+            release_eligible: false,
+            refund_eligible: false,
+            reason: "proof not matching".to_string(),
+            evaluated_rules: vec![],
+            milestone_results: vec![MilestoneRpcResult {
+                milestone_id: "ms-1".to_string(),
+                label: None,
+                outcome: "unsatisfied".to_string(),
+                release_eligible: false,
+                refund_eligible: false,
+                matched_proof_ids: vec!["prf-rejected-01".to_string()],
+                reason: "proof type mismatch".to_string(),
+                holdback: None,
+                threshold_results: vec![],
+            }],
+            completed_milestone_count: 0,
+            total_milestone_count: 1,
+            holdback: None,
+            threshold_results: vec![],
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("outcome unsatisfied"),
+            "must show unsatisfied when proof was matched but policy not satisfied: {out}");
+        assert!(!out.contains("not_yet_attested"),
+            "must not show not_yet_attested when a proof was matched: {out}");
+        assert!(out.contains("matched_proof_ids prf-rejected-01"),
+            "must list the matched proof ids: {out}");
+    }
+
+    #[test]
+    fn holdback_action_executable_after_height_is_set_when_not_executable() {
+        // When a settlement action has executable=false and a holdback unlock height,
+        // the render must include the unlock height.
+        let resp = BuildSettlementTxRpcResponse {
+            agreement_hash: "hbcheck01".to_string(),
+            tip_height: 1000,
+            policy_found: true,
+            release_eligible: true,
+            refund_eligible: false,
+            reason: String::new(),
+            actions: vec![
+                SettlementActionRpc {
+                    action: "release".to_string(),
+                    recipient_address: "irium1payee".to_string(),
+                    recipient_label: "immediate".to_string(),
+                    amount_bps: 9000,
+                    executable: true,
+                    executable_after_height: None,
+                    reason: String::new(),
+                },
+                SettlementActionRpc {
+                    action: "release".to_string(),
+                    recipient_address: "irium1payee".to_string(),
+                    recipient_label: "holdback".to_string(),
+                    amount_bps: 1000,
+                    executable: false,
+                    executable_after_height: Some(5000),
+                    reason: String::new(),
+                },
+            ],
+        };
+        let s = render_build_settlement_summary(&resp);
+        // Immediate action
+        assert!(s.contains("executable=true"), "must mark immediate as executable: {s}");
+        // Holdback action
+        assert!(s.contains("executable=false"), "must mark holdback as non-executable: {s}");
+        assert!(s.contains("height_5000"), "must include holdback unlock height: {s}");
     }
 
 }
@@ -14196,7 +14418,23 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let proof = match create_settlement_proof_signed(&opts) {
+            // Resolve attestation_time: explicit --timestamp > fetch from --rpc > 0 with warning.
+            let attestation_time: u64 = if let Some(t) = opts.timestamp {
+                t
+            } else if let Some(ref rpc_url) = opts.rpc_url {
+                let base = rpc_url.trim_end_matches('/');
+                match rpc_client(base).and_then(|c| fetch_tip_height(&c, base)) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("[warn] could not fetch tip height from {}: {}; using 0", base, e);
+                        0
+                    }
+                }
+            } else {
+                eprintln!("[warn] attestation_time defaults to 0; pass --rpc <url> or --timestamp <height> to set a block-height value");
+                0
+            };
+            let proof = match create_settlement_proof_signed(&opts, attestation_time) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("{}", e);
@@ -14596,6 +14834,7 @@ fn main() {
             let mut milestones: Vec<BuildTemplateMilestoneInput> = Vec::new();
             let mut rpc_url = default_rpc_url();
             let mut json_mode = false;
+            let mut raw_policy_mode = false;
             let mut notes: Option<String> = None;
             let mut i = 1usize;
             while i < args.len() {
@@ -14606,8 +14845,10 @@ fn main() {
                         let raw = args.get(i+1).cloned().unwrap_or_default();
                         let parts: Vec<&str> = raw.splitn(2, ':').collect();
                         if parts.len() == 2 {
-                            attestors.push(BuildTemplateAttestorInput { attestor_id: parts[0].to_string(), pubkey_hex: parts[1].to_string(), display_name: None });
-                        } else { eprintln!("--attestor expects <id>:<pubkey>"); std::process::exit(1); }
+                            let pubkey_hex = resolve_attestor_pubkey_hex(parts[1])
+                                .unwrap_or_else(|e| { eprintln!("--attestor: {}", e); std::process::exit(1); });
+                            attestors.push(BuildTemplateAttestorInput { attestor_id: parts[0].to_string(), pubkey_hex, display_name: None });
+                        } else { eprintln!("--attestor expects <id>:<pubkey_or_address>"); std::process::exit(1); }
                         i += 2;
                     }
                     "--milestone" => {
@@ -14621,6 +14862,7 @@ fn main() {
                     "--notes" => { notes = Some(args.get(i+1).cloned().unwrap_or_default()); i += 2; }
                     "--rpc" => { rpc_url = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
                     "--json" => { json_mode = true; i += 1; }
+                    "--raw-policy" => { raw_policy_mode = true; i += 1; }
                     _ => { i += 1; }
                 }
             }
@@ -14633,7 +14875,9 @@ fn main() {
             let req = BuildContractorTemplateRpcRequest { policy_id, agreement_hash, attestors, milestones, notes };
             let resp: BuildTemplateRpcResponse = rpc_post_json(&client, base, "/rpc/buildcontractortemplate", &req)
                 .unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
-            if json_mode {
+            if raw_policy_mode {
+                println!("{}", resp.policy_json);
+            } else if json_mode {
                 println!("{}", serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap());
             } else {
                 println!("{}", render_build_template_summary(&resp));
@@ -14649,6 +14893,7 @@ fn main() {
             let mut holdback_release_height: Option<u64> = None;
             let mut rpc_url = default_rpc_url();
             let mut json_mode = false;
+            let mut raw_policy_mode = false;
             let mut notes: Option<String> = None;
             let mut i = 1usize;
             while i < args.len() {
@@ -14659,8 +14904,10 @@ fn main() {
                         let raw = args.get(i+1).cloned().unwrap_or_default();
                         let parts: Vec<&str> = raw.splitn(2, ':').collect();
                         if parts.len() == 2 {
-                            attestors.push(BuildTemplateAttestorInput { attestor_id: parts[0].to_string(), pubkey_hex: parts[1].to_string(), display_name: None });
-                        } else { eprintln!("--attestor expects <id>:<pubkey>"); std::process::exit(1); }
+                            let pubkey_hex = resolve_attestor_pubkey_hex(parts[1])
+                                .unwrap_or_else(|e| { eprintln!("--attestor: {}", e); std::process::exit(1); });
+                            attestors.push(BuildTemplateAttestorInput { attestor_id: parts[0].to_string(), pubkey_hex, display_name: None });
+                        } else { eprintln!("--attestor expects <id>:<pubkey_or_address>"); std::process::exit(1); }
                         i += 2;
                     }
                     "--delivery-proof-type" => { delivery_proof_type = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
@@ -14677,6 +14924,7 @@ fn main() {
                     "--notes" => { notes = Some(args.get(i+1).cloned().unwrap_or_default()); i += 2; }
                     "--rpc" => { rpc_url = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
                     "--json" => { json_mode = true; i += 1; }
+                    "--raw-policy" => { raw_policy_mode = true; i += 1; }
                     _ => { i += 1; }
                 }
             }
@@ -14689,7 +14937,9 @@ fn main() {
             let req = BuildPreorderTemplateRpcRequest { policy_id, agreement_hash, attestors, delivery_proof_type, refund_deadline_height, holdback_bps, holdback_release_height, notes };
             let resp: BuildTemplateRpcResponse = rpc_post_json(&client, base, "/rpc/buildpreordertemplate", &req)
                 .unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
-            if json_mode {
+            if raw_policy_mode {
+                println!("{}", resp.policy_json);
+            } else if json_mode {
                 println!("{}", serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap());
             } else {
                 println!("{}", render_build_template_summary(&resp));
@@ -14704,6 +14954,7 @@ fn main() {
             let mut threshold: Option<u32> = None;
             let mut rpc_url = default_rpc_url();
             let mut json_mode = false;
+            let mut raw_policy_mode = false;
             let mut notes: Option<String> = None;
             let mut i = 1usize;
             while i < args.len() {
@@ -14714,8 +14965,10 @@ fn main() {
                         let raw = args.get(i+1).cloned().unwrap_or_default();
                         let parts: Vec<&str> = raw.splitn(2, ':').collect();
                         if parts.len() == 2 {
-                            attestors.push(BuildTemplateAttestorInput { attestor_id: parts[0].to_string(), pubkey_hex: parts[1].to_string(), display_name: None });
-                        } else { eprintln!("--attestor expects <id>:<pubkey>"); std::process::exit(1); }
+                            let pubkey_hex = resolve_attestor_pubkey_hex(parts[1])
+                                .unwrap_or_else(|e| { eprintln!("--attestor: {}", e); std::process::exit(1); });
+                            attestors.push(BuildTemplateAttestorInput { attestor_id: parts[0].to_string(), pubkey_hex, display_name: None });
+                        } else { eprintln!("--attestor expects <id>:<pubkey_or_address>"); std::process::exit(1); }
                         i += 2;
                     }
                     "--release-proof-type" => { release_proof_type = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
@@ -14731,6 +14984,7 @@ fn main() {
                     "--notes" => { notes = Some(args.get(i+1).cloned().unwrap_or_default()); i += 2; }
                     "--rpc" => { rpc_url = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
                     "--json" => { json_mode = true; i += 1; }
+                    "--raw-policy" => { raw_policy_mode = true; i += 1; }
                     _ => { i += 1; }
                 }
             }
@@ -14743,7 +14997,9 @@ fn main() {
             let req = BuildOtcTemplateRpcRequest { policy_id, agreement_hash, attestors, release_proof_type, refund_deadline_height, threshold, notes };
             let resp: BuildTemplateRpcResponse = rpc_post_json(&client, base, "/rpc/buildotctemplate", &req)
                 .unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
-            if json_mode {
+            if raw_policy_mode {
+                println!("{}", resp.policy_json);
+            } else if json_mode {
                 println!("{}", serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap());
             } else {
                 println!("{}", render_build_template_summary(&resp));
