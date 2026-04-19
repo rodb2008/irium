@@ -2080,9 +2080,9 @@ fn usage() {
     eprintln!("  irium-wallet agreement-share-package-prune [--dry-run] [--older-than <days>] [--include-archived] [--remove-imported-artifacts] [--json]");
     eprintln!("  irium-wallet agreement-share-package-remove <receipt-id|receipt.json|dir> [--path <local-path>] [--agreement-hash <hash>] [--bundle-hash <hash>] [--dry-run] [--remove-imported-artifacts] [--json]");
     eprintln!("  irium-wallet agreement-local-store-list [--include-archived] [--json]");
-    eprintln!("  irium-wallet agreement-sign --agreement <agreement.json|-> --signer <base58_addr> [--role <text>] [--timestamp <block_height>] [--rpc <url>] [--out <file>] [--json]");
+    eprintln!("  irium-wallet agreement-sign --agreement <agreement.json|-> --signer <base58_addr> [--role <text>] [--timestamp <unix>] [--out <file>] [--json]");
     eprintln!("  irium-wallet agreement-verify-signature [--agreement <agreement.json|->] [--bundle <bundle.json|->] --signature <signature.json|-> [--json] [--out <file>]");
-    eprintln!("  irium-wallet agreement-bundle-sign --bundle <bundle.json|agreement_id|agreement_hash|-> --signer <base58_addr> [--role <text>] [--timestamp <block_height>] [--rpc <url>] [--embed] [--out <file>] [--json]");
+    eprintln!("  irium-wallet agreement-bundle-sign --bundle <bundle.json|agreement_id|agreement_hash|-> --signer <base58_addr> [--role <text>] [--timestamp <unix>] [--embed] [--out <file>] [--json]");
     eprintln!("  irium-wallet agreement-bundle-verify-signatures --bundle <bundle.json|agreement_id|agreement_hash|-> [--json]");
     eprintln!("  irium-wallet agreement-signature-inspect --signature <signature.json|-> [--agreement <agreement.json|->] [--bundle <bundle.json|->] [--json]");
     eprintln!("  irium-wallet agreement-save <agreement.json|bundle.json|agreement_id|agreement_hash> [--label <label>] [--note <note>] [--funding-txid <txid>] [--json]");
@@ -10182,7 +10182,7 @@ mod tests {
         let out = render_policy_evaluate_summary(&resp);
         assert!(out.contains("milestones 1/2"), "must show milestone count; got: {out}");
         assert!(out.contains("Delivery outcome satisfied"), "must show labeled milestone; got: {out}");
-        assert!(out.contains("ms-b outcome unsatisfied"), "must show unlabeled milestone by id; got: {out}");
+        assert!(out.contains("ms-b outcome not_yet_attested"), "must show not_yet_attested for unmatched milestone; got: {out}");
     }
 
     #[test]
@@ -11413,6 +11413,167 @@ found true"), "must not show found true; got: {out}");
         assert!(s.contains("bps=800"), "must include holdback bps: {s}");
         assert!(s.contains("executable=false"), "holdback must be non-executable: {s}");
         assert!(s.contains("height_99999"), "must include holdback unlock height: {s}");
+    }
+
+    // ── Phase 5 review hardening tests ──────────────────────────────────────
+
+    #[test]
+    fn resolve_attestor_pubkey_hex_returns_66char_hex_unchanged() {
+        // A 66-char all-hex string is returned as-is; wallet lookup not performed.
+        let valid_pubkey = "03".to_string() + &"ab".repeat(32); // 66 chars
+        let result = resolve_attestor_pubkey_hex(&valid_pubkey);
+        assert!(result.is_ok(), "must accept valid 66-char pubkey hex");
+        assert_eq!(result.unwrap(), valid_pubkey);
+    }
+
+    #[test]
+    fn resolve_attestor_pubkey_hex_rejects_short_string_as_address_not_in_wallet() {
+        // A string that is NOT 66 hex chars is treated as wallet address lookup.
+        // If not present in wallet, must return a clear error.
+        let result = resolve_attestor_pubkey_hex("irium1notinwallet");
+        assert!(result.is_err(), "must fail for address not in wallet");
+        let err = result.unwrap_err();
+        assert!(err.contains("not found in wallet") || err.contains("irium1notinwallet"),
+            "error must identify the address: {err}");
+    }
+
+    #[test]
+    fn resolve_attestor_pubkey_hex_rejects_65_char_hex() {
+        // 65 hex chars is NOT a valid pubkey (one byte short); must attempt wallet lookup.
+        let short_hex = "03".to_string() + &"ab".repeat(31) + "a"; // 65 chars
+        assert_eq!(short_hex.len(), 65);
+        let result = resolve_attestor_pubkey_hex(&short_hex);
+        // It falls through to wallet lookup which will fail (not a known address).
+        assert!(result.is_err(), "must fail for 65-char hex (not a valid pubkey, wallet lookup also fails)");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_unsatisfied_no_proofs_shows_not_yet_attested() {
+        // When a milestone outcome is "unsatisfied" and no proofs matched,
+        // the render must display "not_yet_attested" to distinguish from a
+        // failed proof (proof submitted but rejected).
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "unsatisfied".to_string(),
+            agreement_hash: "aabb".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-001".to_string()),
+            expired: false,
+            tip_height: 100,
+            proof_count: 0,
+            expired_proof_count: 0,
+            matched_proof_count: 0,
+            matched_proof_ids: vec![],
+            release_eligible: false,
+            refund_eligible: false,
+            reason: "no proofs".to_string(),
+            evaluated_rules: vec![],
+            milestone_results: vec![MilestoneRpcResult {
+                milestone_id: "ms-1".to_string(),
+                label: Some("First Milestone".to_string()),
+                outcome: "unsatisfied".to_string(),
+                release_eligible: false,
+                refund_eligible: false,
+                matched_proof_ids: vec![],  // No proofs → not_yet_attested
+                reason: String::new(),
+                holdback: None,
+                threshold_results: vec![],
+            }],
+            completed_milestone_count: 0,
+            total_milestone_count: 1,
+            holdback: None,
+            threshold_results: vec![],
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("not_yet_attested"),
+            "must show not_yet_attested when no proofs matched: {out}");
+        assert!(out.contains("milestone First Milestone outcome not_yet_attested")
+            || out.contains("outcome not_yet_attested"),
+            "milestone line must use not_yet_attested label: {out}");
+    }
+
+    #[test]
+    fn render_policy_evaluate_summary_unsatisfied_with_proof_shows_unsatisfied() {
+        // When a milestone outcome is "unsatisfied" but matched_proof_ids is non-empty
+        // (a proof was submitted but did not satisfy the policy), show "unsatisfied"
+        // not "not_yet_attested".
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "unsatisfied".to_string(),
+            agreement_hash: "aabb".to_string(),
+            policy_found: true,
+            policy_id: Some("pol-002".to_string()),
+            expired: false,
+            tip_height: 100,
+            proof_count: 1,
+            expired_proof_count: 0,
+            matched_proof_count: 1,
+            matched_proof_ids: vec!["prf-rejected-01".to_string()],
+            release_eligible: false,
+            refund_eligible: false,
+            reason: "proof not matching".to_string(),
+            evaluated_rules: vec![],
+            milestone_results: vec![MilestoneRpcResult {
+                milestone_id: "ms-1".to_string(),
+                label: None,
+                outcome: "unsatisfied".to_string(),
+                release_eligible: false,
+                refund_eligible: false,
+                matched_proof_ids: vec!["prf-rejected-01".to_string()],
+                reason: "proof type mismatch".to_string(),
+                holdback: None,
+                threshold_results: vec![],
+            }],
+            completed_milestone_count: 0,
+            total_milestone_count: 1,
+            holdback: None,
+            threshold_results: vec![],
+        };
+        let out = render_policy_evaluate_summary(&resp);
+        assert!(out.contains("outcome unsatisfied"),
+            "must show unsatisfied when proof was matched but policy not satisfied: {out}");
+        assert!(!out.contains("not_yet_attested"),
+            "must not show not_yet_attested when a proof was matched: {out}");
+        assert!(out.contains("matched_proof_ids prf-rejected-01"),
+            "must list the matched proof ids: {out}");
+    }
+
+    #[test]
+    fn holdback_action_executable_after_height_is_set_when_not_executable() {
+        // When a settlement action has executable=false and a holdback unlock height,
+        // the render must include the unlock height.
+        let resp = BuildSettlementTxRpcResponse {
+            agreement_hash: "hbcheck01".to_string(),
+            tip_height: 1000,
+            policy_found: true,
+            release_eligible: true,
+            refund_eligible: false,
+            reason: String::new(),
+            actions: vec![
+                SettlementActionRpc {
+                    action: "release".to_string(),
+                    recipient_address: "irium1payee".to_string(),
+                    recipient_label: "immediate".to_string(),
+                    amount_bps: 9000,
+                    executable: true,
+                    executable_after_height: None,
+                    reason: String::new(),
+                },
+                SettlementActionRpc {
+                    action: "release".to_string(),
+                    recipient_address: "irium1payee".to_string(),
+                    recipient_label: "holdback".to_string(),
+                    amount_bps: 1000,
+                    executable: false,
+                    executable_after_height: Some(5000),
+                    reason: String::new(),
+                },
+            ],
+        };
+        let s = render_build_settlement_summary(&resp);
+        // Immediate action
+        assert!(s.contains("executable=true"), "must mark immediate as executable: {s}");
+        // Holdback action
+        assert!(s.contains("executable=false"), "must mark holdback as non-executable: {s}");
+        assert!(s.contains("height_5000"), "must include holdback unlock height: {s}");
     }
 
 }

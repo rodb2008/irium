@@ -8814,6 +8814,159 @@ mod tests {
         assert_eq!(reparsed.required_proofs.len(), policy.required_proofs.len());
         assert_eq!(reparsed.milestones.len(), policy.milestones.len());
     }
+
+    // ── Phase 5 review: milestone scope matching semantics ───────────────────
+
+    /// A proof without milestone_id (scope-unspecified) must satisfy a requirement
+    /// scoped to a specific milestone.  This maintains backward compatibility with
+    /// proofs created before milestone_id support was added.
+    #[test]
+    fn proof_without_milestone_id_satisfies_scoped_requirement() {
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let policy = contractor_milestone_template(
+            "pol-scope-01", &hash,
+            &[TemplateAttestor { attestor_id: "att".to_string(), pubkey_hex: pk.clone(), display_name: None }],
+            &[ms_spec("ms-1", "milestone_completion", None, None, None)],
+            None,
+        ).unwrap();
+        // Proof with no milestone_id — backward-compatible generic proof.
+        let mut proof = SettlementProof {
+            proof_id: "prf-generic-01".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "milestone_completion".to_string(),
+            agreement_hash: hash.clone(), milestone_id: None,
+            attested_by: "att".to_string(), attestation_time: 0,
+            evidence_hash: None, evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pk.clone(), signature_hex: String::new(), payload_hash: String::new(),
+            },
+            expires_at_height: None, typed_payload: None,
+        };
+        proof.signature = sign_proof(&proof, &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied,
+            "proof without milestone_id must satisfy scoped requirement (backward compat)");
+        assert!(result.release_eligible);
+    }
+
+    /// A proof with an explicit milestone_id must satisfy a requirement scoped to
+    /// the same milestone.
+    #[test]
+    fn proof_with_milestone_id_satisfies_matching_requirement() {
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let policy = contractor_milestone_template(
+            "pol-scope-02", &hash,
+            &[TemplateAttestor { attestor_id: "att".to_string(), pubkey_hex: pk.clone(), display_name: None }],
+            &[ms_spec("ms-1", "milestone_completion", None, None, None)],
+            None,
+        ).unwrap();
+        let mut proof = SettlementProof {
+            proof_id: "prf-ms1-01".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "milestone_completion".to_string(),
+            agreement_hash: hash.clone(), milestone_id: Some("ms-1".to_string()),
+            attested_by: "att".to_string(), attestation_time: 0,
+            evidence_hash: None, evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pk.clone(), signature_hex: String::new(), payload_hash: String::new(),
+            },
+            expires_at_height: None, typed_payload: None,
+        };
+        proof.signature = sign_proof(&proof, &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied,
+            "proof with matching milestone_id must satisfy scoped requirement");
+    }
+
+    /// A proof scoped to ms-2 must NOT satisfy a requirement scoped to ms-1.
+    /// This is the core bug fix in Phase 5.
+    #[test]
+    fn proof_with_mismatched_milestone_id_does_not_satisfy_requirement() {
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let policy = contractor_milestone_template(
+            "pol-scope-03", &hash,
+            &[TemplateAttestor { attestor_id: "att".to_string(), pubkey_hex: pk.clone(), display_name: None }],
+            &[ms_spec("ms-1", "milestone_completion", None, None, None),
+              ms_spec("ms-2", "milestone_completion", None, None, None)],
+            None,
+        ).unwrap();
+        // Only submit a proof for ms-2.
+        let mut proof = SettlementProof {
+            proof_id: "prf-ms2-wrong".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: "milestone_completion".to_string(),
+            agreement_hash: hash.clone(), milestone_id: Some("ms-2".to_string()),
+            attested_by: "att".to_string(), attestation_time: 0,
+            evidence_hash: None, evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: pk.clone(), signature_hex: String::new(), payload_hash: String::new(),
+            },
+            expires_at_height: None, typed_payload: None,
+        };
+        proof.signature = sign_proof(&proof, &sk);
+        let result = evaluate_policy(&agreement, &policy, &[proof], 0).unwrap();
+        // ms-2 proof satisfies ms-2 but NOT ms-1; overall still Unsatisfied.
+        assert_ne!(result.outcome, PolicyOutcome::Satisfied,
+            "proof for ms-2 must NOT satisfy ms-1 requirement");
+        let ms1 = result.milestone_results.iter().find(|m| m.milestone_id == "ms-1").unwrap();
+        let ms2 = result.milestone_results.iter().find(|m| m.milestone_id == "ms-2").unwrap();
+        assert_ne!(ms1.outcome, PolicyOutcome::Satisfied,
+            "ms-1 must not be satisfied by ms-2 proof");
+        assert_eq!(ms2.outcome, PolicyOutcome::Satisfied,
+            "ms-2 must be satisfied by its own proof");
+    }
+
+    /// When multiple proofs are present (one per milestone), each milestone's
+    /// requirement is satisfied only by its own proof.  Overall outcome is Satisfied.
+    #[test]
+    fn multiple_proofs_each_satisfies_own_milestone() {
+        let sk = sample_signing_key();
+        let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+        let agreement = sample_agreement();
+        let hash = hex::encode(Sha256::digest(&agreement_canonical_bytes(&agreement).unwrap()));
+        let policy = contractor_milestone_template(
+            "pol-scope-04", &hash,
+            &[TemplateAttestor { attestor_id: "att".to_string(), pubkey_hex: pk.clone(), display_name: None }],
+            &[ms_spec("ms-1", "milestone_completion", None, None, None),
+              ms_spec("ms-2", "milestone_completion", None, None, None)],
+            None,
+        ).unwrap();
+        let make_proof = |pid: &str, mid: &str| {
+            let mut p = SettlementProof {
+                proof_id: pid.to_string(),
+                schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+                proof_type: "milestone_completion".to_string(),
+                agreement_hash: hash.clone(), milestone_id: Some(mid.to_string()),
+                attested_by: "att".to_string(), attestation_time: 0,
+                evidence_hash: None, evidence_summary: None,
+                signature: ProofSignatureEnvelope {
+                    signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                    pubkey_hex: pk.clone(), signature_hex: String::new(), payload_hash: String::new(),
+                },
+                expires_at_height: None, typed_payload: None,
+            };
+            p.signature = sign_proof(&p, &sk);
+            p
+        };
+        let proof1 = make_proof("prf-ms1", "ms-1");
+        let proof2 = make_proof("prf-ms2", "ms-2");
+        let result = evaluate_policy(&agreement, &policy, &[proof1, proof2], 0).unwrap();
+        assert_eq!(result.outcome, PolicyOutcome::Satisfied,
+            "both milestones satisfied → overall satisfied");
+        assert_eq!(result.completed_milestone_count, 2);
+    }
 }
 
 
