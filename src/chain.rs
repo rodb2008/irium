@@ -2347,67 +2347,67 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Activation boundary simulation: heights 19723-19726
+    // Activation boundary simulation: heights 19738-19741
     // -----------------------------------------------------------------------
 
     #[test]
     fn lwma_v2_boundary_no_off_by_one() {
-        // Build a chain with v1 active from height 16462 and v2 from 19725.
-        // Populate synthetic blocks up to height 19726 and verify:
-        //   heights < 19725  => v1 params (N=60, clamp=6T)
-        //   heights >= 19725 => v2 params (N=30, clamp=10T)
+        // Build a chain with v1 active from height 16462 and v2 from 19740.
+        // Populate synthetic blocks up to height 19741 and verify:
+        //   heights < 19740  => v1 params (N=60, clamp=6T)
+        //   heights >= 19740 => v2 params (N=30, clamp=10T)
         // Also verifies: no panic, deterministic target, no off-by-one.
         let v1_act: u64 = 16_462;
-        let v2_act: u64 = 19_725;
+        let v2_act: u64 = 19_740;
 
         let mut chain = difficulty_chain_v2(Some(v1_act), Some(v2_act), 0x207fffff);
         let bits = synthetic_working_bits(&chain);
         let mut time = chain.chain[0].header.time;
 
-        // Push 19726 blocks at 600s each to go past the activation boundary.
-        for _ in 1..=19_726u64 {
+        // Push 19741 blocks at 600s each to go past the activation boundary.
+        for _ in 1..=19_741u64 {
             time += 600;
             push_synthetic_block(&mut chain, time, bits);
         }
 
         // Collect targets at the four boundary heights.
-        let t_19723 = chain.target_for_height(19_723);
-        let t_19724 = chain.target_for_height(19_724);
-        let t_19725 = chain.target_for_height(19_725);
-        let t_19726 = chain.target_for_height(19_726);
+        let t_19738 = chain.target_for_height(19_738);
+        let t_19739 = chain.target_for_height(19_739);
+        let t_19740 = chain.target_for_height(19_740);
+        let t_19741 = chain.target_for_height(19_741);
 
         // All must be non-zero and within pow_limit.
         let pow_limit = chain.params.pow_limit.to_target();
-        for (h, t) in [(19_723u64, &t_19723), (19_724, &t_19724),
-                       (19_725, &t_19725), (19_726, &t_19726)] {
+        for (h, t) in [(19_738u64, &t_19738), (19_739, &t_19739),
+                       (19_740, &t_19740), (19_741, &t_19741)] {
             assert_ne!(t.bits, 0, "target at height {} must be non-zero", h);
             assert!(t.to_target() <= pow_limit,
                 "target at height {} must not exceed pow_limit", h);
         }
 
         // Below activation: lwma_v2_active_at must be false.
-        assert!(!chain.lwma_v2_active_at(19_724),
-            "lwma_v2 must NOT be active at height 19724 (one below activation)");
+        assert!(!chain.lwma_v2_active_at(19_739),
+            "lwma_v2 must NOT be active at height 19739 (one below activation)");
 
         // At and above activation: lwma_v2_active_at must be true.
-        assert!(chain.lwma_v2_active_at(19_725),
-            "lwma_v2 must be active at height 19725 (activation height)");
-        assert!(chain.lwma_v2_active_at(19_726),
-            "lwma_v2 must be active at height 19726 (above activation)");
+        assert!(chain.lwma_v2_active_at(19_740),
+            "lwma_v2 must be active at height 19740 (activation height)");
+        assert!(chain.lwma_v2_active_at(19_741),
+            "lwma_v2 must be active at height 19741 (above activation)");
 
         // Under steady-state 600s intervals the target should be stable across the
         // boundary -- no sudden jump.  Allow a 4x band around the pre-activation
         // target to account for legitimate parameter differences.
-        let base = t_19724.to_target();
+        let base = t_19739.to_target();
         let lo = &base / BigUint::from(4u8);
         let hi = &base * BigUint::from(4u8);
         assert!(
-            t_19725.to_target() >= lo && t_19725.to_target() <= hi,
-            "target at activation (19725) must not jump more than 4x from prior block:              19724={} 19725={}", t_19724.bits, t_19725.bits
+            t_19740.to_target() >= lo && t_19740.to_target() <= hi,
+            "target at activation (19740) must not jump more than 4x from prior block:              19739={} 19740={}", t_19739.bits, t_19740.bits
         );
         assert!(
-            t_19726.to_target() >= lo && t_19726.to_target() <= hi,
-            "target at 19726 must not jump more than 4x from prior block:              19724={} 19726={}", t_19724.bits, t_19726.bits
+            t_19741.to_target() >= lo && t_19741.to_target() <= hi,
+            "target at 19741 must not jump more than 4x from prior block:              19739={} 19741={}", t_19739.bits, t_19741.bits
         );
     }
 
