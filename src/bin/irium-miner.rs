@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use irium_node_rs::activation::{
     network_kind_from_env, resolved_htlcv1_activation_height, resolved_lwma_activation_height,
-    runtime_lwma_env_override,
+    resolved_lwma_v2_activation_height, runtime_lwma_env_override,
 };
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
@@ -2035,11 +2035,13 @@ fn main() {
     if network == irium_node_rs::activation::NetworkKind::Mainnet && lwma_env_override.is_some() {
         eprintln!("[warn] Ignoring IRIUM_LWMA_ACTIVATION_HEIGHT on mainnet; activation source is code-defined");
     }
+    let lwma_v2_activation = resolved_lwma_v2_activation_height(network);
     let params = ChainParams {
         genesis_block: block,
         pow_limit,
         htlcv1_activation_height: htlc_activation,
         lwma: LwmaParams::new(lwma_activation, pow_limit),
+        lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
     };
 
     let mut state = ChainState::new(params.clone());

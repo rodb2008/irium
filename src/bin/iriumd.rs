@@ -32,7 +32,8 @@ use bs58;
 use get_if_addrs::get_if_addrs;
 use irium_node_rs::activation::{
     network_kind_from_env, resolved_htlcv1_activation_height, resolved_lwma_activation_height,
-    runtime_htlcv1_env_override, runtime_lwma_env_override, NetworkKind,
+    resolved_lwma_v2_activation_height, runtime_htlcv1_env_override, runtime_lwma_env_override,
+    NetworkKind,
 };
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
@@ -6809,11 +6810,28 @@ async fn main() {
     if network == NetworkKind::Mainnet && lwma_env_override.is_some() {
         eprintln!("[warn] Ignoring IRIUM_LWMA_ACTIVATION_HEIGHT on mainnet; activation source is code-defined");
     }
+    let lwma_v2_activation = resolved_lwma_v2_activation_height(network);
+    match (network, lwma_v2_activation) {
+        (NetworkKind::Mainnet, Some(h)) => {
+            println!("LWMA v2 activates on mainnet at height {}", h)
+        }
+        (NetworkKind::Mainnet, None) => {
+            println!("LWMA v2 not yet activated on mainnet")
+        }
+        (_, Some(h)) => println!("LWMA v2 non-mainnet activation height from env: {}", h),
+        (_, None) => println!("LWMA v2 non-mainnet activation unset (env not provided)"),
+    }
+    if network == NetworkKind::Mainnet
+        && std::env::var("IRIUM_LWMA_V2_ACTIVATION_HEIGHT").is_ok()
+    {
+        eprintln!("[warn] Ignoring IRIUM_LWMA_V2_ACTIVATION_HEIGHT on mainnet; activation source is code-defined");
+    }
     let params = ChainParams {
         genesis_block: genesis_block.clone(),
         pow_limit,
         htlcv1_activation_height: htlc_activation,
         lwma: LwmaParams::new(lwma_activation, pow_limit),
+        lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
     };
     let mut state = ChainState::new(params);
     if load_persisted {
@@ -7875,6 +7893,7 @@ mod tests {
             genesis_block,
             htlcv1_activation_height: activation,
             lwma: LwmaParams::new(None, pow_limit),
+        lwma_v2: None,
         };
         let chain = Arc::new(Mutex::new(ChainState::new(params)));
 
@@ -8771,6 +8790,7 @@ mod tests {
             genesis_block,
             htlcv1_activation_height: None,
             lwma: LwmaParams::new(None, pow_limit),
+        lwma_v2: None,
         };
         let chain = ChainState::new(params);
         let genesis_hash = hex::encode(chain.tip_hash());
