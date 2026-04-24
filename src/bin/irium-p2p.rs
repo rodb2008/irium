@@ -42,6 +42,7 @@ async fn main() {
         pow_limit,
         htlcv1_activation_height: resolved_htlcv1_activation_height(network),
         lwma: LwmaParams::new(resolved_lwma_activation_height(network), pow_limit),
+        lwma_v2: None,
     };
     let chain = Arc::new(Mutex::new(ChainState::new(params)));
     let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));

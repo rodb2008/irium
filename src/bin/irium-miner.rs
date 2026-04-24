@@ -2040,6 +2040,7 @@ fn main() {
         pow_limit,
         htlcv1_activation_height: htlc_activation,
         lwma: LwmaParams::new(lwma_activation, pow_limit),
+        lwma_v2: None,
     };
 
     let mut state = ChainState::new(params.clone());

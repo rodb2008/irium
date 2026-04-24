@@ -15,7 +15,9 @@ use crate::block::{Block, BlockHeader};
 use crate::constants::{
     block_reward, BLOCK_TARGET_INTERVAL, COINBASE_MATURITY, DIFFICULTY_RETARGET_INTERVAL,
     LWMA_MAX_TARGET_DOWN_FACTOR, LWMA_MAX_TARGET_UP_FACTOR, LWMA_MIN_DIFFICULTY_FLOOR,
-    LWMA_SOLVETIME_CLAMP_FACTOR, LWMA_WINDOW, MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
+    LWMA_SOLVETIME_CLAMP_FACTOR, LWMA_WINDOW, LWMA_V2_MAX_TARGET_DOWN_FACTOR,
+    LWMA_V2_MAX_TARGET_UP_FACTOR, LWMA_V2_SOLVETIME_CLAMP_FACTOR, LWMA_V2_WINDOW,
+    MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
 };
 use crate::genesis::LockedGenesis;
 use crate::pow::{meets_target, min_difficulty_target, sha256d, Target};
@@ -67,6 +69,21 @@ impl LwmaParams {
             max_target: min_difficulty_target(pow_limit, LWMA_MIN_DIFFICULTY_FLOOR),
         }
     }
+
+    /// Construct LWMA v2 parameters: smaller window + larger solvetime clamp
+    /// for faster post-collapse recovery. Per-block step clamp factors are
+    /// unchanged, preserving manipulation resistance.
+    pub fn new_v2(activation_height: Option<u64>, pow_limit: Target) -> Self {
+        Self {
+            activation_height,
+            window: LWMA_V2_WINDOW,
+            min_solvetime: 1,
+            max_solvetime: BLOCK_TARGET_INTERVAL.saturating_mul(LWMA_V2_SOLVETIME_CLAMP_FACTOR),
+            max_target_up_factor: LWMA_V2_MAX_TARGET_UP_FACTOR,
+            max_target_down_factor: LWMA_V2_MAX_TARGET_DOWN_FACTOR,
+            max_target: min_difficulty_target(pow_limit, LWMA_MIN_DIFFICULTY_FLOOR),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +92,9 @@ pub struct ChainParams {
     pub pow_limit: Target,
     pub htlcv1_activation_height: Option<u64>,
     pub lwma: LwmaParams,
+    /// Optional LWMA v2 params. When Some and height >= v2.activation_height,
+    /// replaces v1. None keeps v1 behavior indefinitely.
+    pub lwma_v2: Option<LwmaParams>,
 }
 
 /// Reference to a specific transaction output.
@@ -176,6 +196,11 @@ impl ChainState {
             .htlcv1_activation_height
             .map(|h| height >= h)
             .unwrap_or(false)
+    }
+
+    /// Convenience wrapper: compute LWMA target using v1 parameters.
+    fn lwma_target_for_height(&self) -> Target {
+        self.lwma_target_for_height_with(&self.params.lwma)
     }
 
     fn lwma_active_at(&self, height: u64) -> bool {
@@ -336,13 +361,13 @@ impl ChainState {
     ///
     /// All arithmetic is integer-only and deterministic. Compact bits encoding
     /// is used only at the boundaries.
-    fn lwma_target_for_height(&self) -> Target {
+    fn lwma_target_for_height_with(&self, params: &LwmaParams) -> Target {
         let last_block = self
             .chain
             .last()
             .expect("chain should have at least genesis when querying target");
         let sample_count = std::cmp::min(
-            self.params.lwma.window as usize,
+            params.window as usize,
             self.chain.len().saturating_sub(1),
         );
         if sample_count == 0 {
@@ -361,8 +386,8 @@ impl ChainState {
                 .header
                 .time
                 .saturating_sub(previous.header.time)
-                .max(self.params.lwma.min_solvetime as u32) as u64;
-            let solvetime = raw_solvetime.min(self.params.lwma.max_solvetime);
+                .max(params.min_solvetime as u32) as u64;
+            let solvetime = raw_solvetime.min(params.max_solvetime);
             let weight = (offset as u128) + 1;
             weighted_solvetimes += weight * u128::from(solvetime);
             weight_total += weight;
@@ -384,12 +409,12 @@ impl ChainState {
 
         let previous_target = last_block.header.target().to_target();
         let mut min_step_target = previous_target.clone();
-        min_step_target /= BigUint::from(self.params.lwma.max_target_down_factor.max(1));
+        min_step_target /= BigUint::from(params.max_target_down_factor.max(1));
         if min_step_target.is_zero() {
             min_step_target = BigUint::from(1u8);
         }
         let max_step_target =
-            &previous_target * BigUint::from(self.params.lwma.max_target_up_factor.max(1));
+            &previous_target * BigUint::from(params.max_target_up_factor.max(1));
 
         if next_target < min_step_target {
             next_target = min_step_target;
@@ -399,7 +424,7 @@ impl ChainState {
         }
 
         let mut hard_max_target = self.params.pow_limit.to_target();
-        let lwma_max_target = self.params.lwma.max_target.to_target();
+        let lwma_max_target = params.max_target.to_target();
         if lwma_max_target < hard_max_target {
             hard_max_target = lwma_max_target;
         }
@@ -410,17 +435,33 @@ impl ChainState {
         Target::from_target(&next_target)
     }
 
+    /// Returns true if LWMA v2 is active at the given height.
+    fn lwma_v2_active_at(&self, height: u64) -> bool {
+        self.params
+            .lwma_v2
+            .and_then(|v2| v2.activation_height)
+            .map(|h| height >= h)
+            .unwrap_or(false)
+    }
+
     pub fn target_for_height(&self, height: u64) -> Target {
         let legacy_target = self.legacy_target_for_height(height);
         if !self.lwma_active_at(height) {
             return legacy_target;
         }
 
-        let lwma_target = self.lwma_target_for_height();
+        // Use LWMA v2 params if active; otherwise fall back to v1.
+        let (lwma_target, version) = if self.lwma_v2_active_at(height) {
+            let v2 = self.params.lwma_v2.expect("lwma_v2 must be Some when v2 is active");
+            (self.lwma_target_for_height_with(&v2), 2u8)
+        } else {
+            (self.lwma_target_for_height(), 1u8)
+        };
+
         if Self::lwma_trace_enabled() {
             eprintln!(
-                "[trace][lwma] height={} old_bits={:08x} lwma_bits={:08x} selected_bits={:08x}",
-                height, legacy_target.bits, lwma_target.bits, lwma_target.bits
+                "[trace][lwma] height={} version={} old_bits={:08x} lwma_bits={:08x} selected_bits={:08x}",
+                height, version, legacy_target.bits, lwma_target.bits, lwma_target.bits
             );
         }
         lwma_target
@@ -1396,6 +1437,7 @@ mod tests {
             pow_limit,
             htlcv1_activation_height: activation,
             lwma: LwmaParams::new(None, pow_limit),
+        lwma_v2: None,
         };
         ChainState::new(params)
     }
@@ -1467,6 +1509,7 @@ mod tests {
             pow_limit,
             htlcv1_activation_height: None,
             lwma: LwmaParams::new(lwma_activation, pow_limit),
+        lwma_v2: None,
         };
         ChainState::new(params)
     }
@@ -2141,4 +2184,166 @@ mod tests {
 
         assert!(chain.validate_transaction(&tx).is_ok());
     }
+
+    // -----------------------------------------------------------------------
+    // LWMA v2 tests (N=30, clamp=10T) -- gated behind lwma_v2 activation
+    // -----------------------------------------------------------------------
+
+    fn difficulty_chain_v2(lwma_v1_activation: Option<u64>, v2_activation: Option<u64>, pow_limit_bits: u32) -> ChainState {
+        let locked = crate::genesis::load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let pow_limit = Target { bits: pow_limit_bits };
+        let v2 = v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit));
+        let params = ChainParams {
+            genesis_block: genesis,
+            pow_limit,
+            htlcv1_activation_height: None,
+            lwma: LwmaParams::new(lwma_v1_activation, pow_limit),
+            lwma_v2: v2,
+        };
+        ChainState::new(params)
+    }
+
+    #[test]
+    fn lwma_v2_inactive_when_field_is_none() {
+        // With lwma_v2: None the chain must behave identically to v1.
+        let activation = 70u64;
+        let mut v1_chain = difficulty_chain(Some(activation), 0x207fffff);
+        let mut v2_chain = difficulty_chain_v2(Some(activation), None, 0x207fffff);
+        let bits = synthetic_working_bits(&v1_chain);
+        let mut time = v1_chain.chain[0].header.time;
+        for _ in 1..=80 {
+            time += 600;
+            push_synthetic_block(&mut v1_chain, time, bits);
+            push_synthetic_block(&mut v2_chain, time, bits);
+        }
+        let t1 = v1_chain.target_for_height(80);
+        let t2 = v2_chain.target_for_height(80);
+        assert_eq!(t1.bits, t2.bits, "v2=None must produce same target as pure v1");
+    }
+
+    #[test]
+    fn lwma_v2_activates_at_boundary() {
+        let v1_act = 10u64;
+        let v2_act = 50u64;
+        let mut chain = difficulty_chain_v2(Some(v1_act), Some(v2_act), 0x207fffff);
+        let bits = synthetic_working_bits(&chain);
+        let mut time = chain.chain[0].header.time;
+        for _ in 1..=80 {
+            time += 600;
+            push_synthetic_block(&mut chain, time, bits);
+        }
+        let below = chain.target_for_height(v2_act - 1);
+        let at    = chain.target_for_height(v2_act);
+        let above = chain.target_for_height(v2_act + 5);
+        let pow_limit = chain.params.pow_limit.to_target();
+        assert!(below.to_target() <= pow_limit);
+        assert!(at.to_target()    <= pow_limit);
+        assert!(above.to_target() <= pow_limit);
+        assert_ne!(at.bits, 0, "v2 target must be non-zero at activation");
+        assert_ne!(above.bits, 0, "v2 target must be non-zero above activation");
+    }
+
+    #[test]
+    fn lwma_v2_step_clamp_unchanged() {
+        let v1_act = 10u64;
+        let v2_act = 20u64;
+        let mut chain = difficulty_chain_v2(Some(v1_act), Some(v2_act), 0x207fffff);
+        let bits = synthetic_working_bits(&chain);
+        let mut time = chain.chain[0].header.time;
+        for _ in 1..=20 {
+            time += 600;
+            push_synthetic_block(&mut chain, time, bits);
+        }
+        // Slow blocks at v2 max solvetime (10T = 6000s).
+        let mut prev_target = chain.target_for_height(20);
+        for h in 21u64..=50 {
+            time += 6000;
+            push_synthetic_block(&mut chain, time, bits);
+            let next_target = chain.target_for_height(h);
+            let max_allowed = Target::from_target(
+                &(prev_target.to_target() * BigUint::from(2u8))
+            );
+            assert!(
+                next_target.to_target() <= max_allowed.to_target(),
+                "v2 step clamp violated at height {}: {:?} > 2x {:?}", h, next_target, prev_target
+            );
+            prev_target = next_target;
+        }
+    }
+
+    #[test]
+    fn lwma_v2_recovers_faster_than_v1_after_hashrate_drop() {
+        // Use a hard initial bits (well below max_target) so there is ample room to
+        // ease without saturating.  After exactly 35 moderate-slow blocks (900s =
+        // 1.5x T, step-clamp NOT binding), v2's 30-block window is fully refreshed
+        // while v1's 60-block window is still half diluted by old fast blocks.
+        // Therefore v2 must produce a strictly higher (easier) target.
+        let v1_act = 10u64;
+        let v2_act = 10u64;
+        // Hard bits: far from the 0x207fffff max_target so no saturation.
+        let hard_bits: u32 = 0x1a007fff;
+        let slow_st: u32 = 900; // 1.5x T; ratio < 2x so step clamp never fires
+
+        let mut v1 = difficulty_chain(Some(v1_act), 0x207fffff);
+        let mut v2 = difficulty_chain_v2(Some(v1_act), Some(v2_act), 0x207fffff);
+
+        let mut time_v1 = v1.chain[0].header.time;
+        let mut time_v2 = v2.chain[0].header.time;
+
+        // 70 normal blocks to fill both windows with fast-block history.
+        for _ in 1..=70 {
+            time_v1 += 600;
+            push_synthetic_block(&mut v1, time_v1, hard_bits);
+            time_v2 += 600;
+            push_synthetic_block(&mut v2, time_v2, hard_bits);
+        }
+
+        // 35 slow blocks.  After 30 slow blocks v2 window is fully refreshed;
+        // v1 still carries 25 old fast blocks in its 60-block window.
+        for _ in 0..35 {
+            time_v1 += slow_st;
+            push_synthetic_block(&mut v1, time_v1, hard_bits);
+            time_v2 += slow_st;
+            push_synthetic_block(&mut v2, time_v2, hard_bits);
+        }
+
+        let h = v1.height;
+        let t_v1 = v1.target_for_height(h).to_target();
+        let t_v2 = v2.target_for_height(h).to_target();
+
+        // v2: weighted_avg_st=900s -> ratio 1.5x; v1: ~847s -> ratio ~1.41x
+        // Both < 2x so step clamp does not fire. v2 must be strictly easier.
+        assert!(
+            t_v2 > t_v1,
+            "v2 (N=30) should ease faster: v2_target={} v1_target={}",
+            t_v2, t_v1
+        );
+    }
+
+    #[test]
+    fn lwma_v2_steady_state_stable() {
+        let v1_act = 10u64;
+        let v2_act = 20u64;
+        let mut chain = difficulty_chain_v2(Some(v1_act), Some(v2_act), 0x207fffff);
+        let bits = synthetic_working_bits(&chain);
+        let mut time = chain.chain[0].header.time;
+        for _ in 1..=20 {
+            time += 600;
+            push_synthetic_block(&mut chain, time, bits);
+        }
+        let base = chain.target_for_height(v2_act).to_target();
+        for h in (v2_act + 1)..=(v2_act + 100) {
+            time += 600;
+            push_synthetic_block(&mut chain, time, bits);
+            let t = chain.target_for_height(h).to_target();
+            let lo = &base / BigUint::from(4u8);
+            let hi = &base * BigUint::from(4u8);
+            assert!(
+                t >= lo && t <= hi,
+                "v2 target drifted out of 4x band at height {}: {} vs base {}", h, t, base
+            );
+        }
+    }
+
 }
