@@ -9,6 +9,10 @@ pub const HTLC_V1_SCRIPT_LEN: usize = 83;
 pub const HTLC_WITNESS_CLAIM: u8 = 1;
 pub const HTLC_WITNESS_REFUND: u8 = 2;
 
+pub const MPSO_V1_TAG: u8 = 0xc1;
+pub const MPSO_V1_MAX_SCRIPT_SIZE: usize = 640;
+pub const MPSO_V1_MAX_WITNESS_SIZE: usize = 768;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxInput {
     pub prev_txid: [u8; 32],
@@ -87,9 +91,24 @@ pub struct HtlcV1Output {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MpsoV1Output {
+    pub flags: u8,
+    pub claim_n: u8,
+    pub claim_m: u8,
+    pub refund_n: u8,
+    pub refund_m: u8,
+    pub agreement_hash: [u8; 32],
+    pub claim_pubkeys: Vec<[u8; 33]>,
+    pub refund_pubkeys: Vec<[u8; 33]>,
+    pub timeout_height: u64,
+    pub optional_hash: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputEncumbrance {
     P2pkh([u8; 20]),
     HtlcV1(HtlcV1Output),
+    MpsoV1(MpsoV1Output),
     Unknown,
 }
 
@@ -162,25 +181,158 @@ pub fn parse_htlcv1_script(script: &[u8]) -> Option<HtlcV1Output> {
     if script[2] != HTLC_V1_HASHALG_SHA256 {
         return None;
     }
-
     let mut expected_hash = [0u8; 32];
     expected_hash.copy_from_slice(&script[3..35]);
-
     let mut recipient_pkh = [0u8; 20];
     recipient_pkh.copy_from_slice(&script[35..55]);
-
     let mut refund_pkh = [0u8; 20];
     refund_pkh.copy_from_slice(&script[55..75]);
-
     let mut timeout_bytes = [0u8; 8];
     timeout_bytes.copy_from_slice(&script[75..83]);
     let timeout_height = u64::from_le_bytes(timeout_bytes);
-
     Some(HtlcV1Output {
         expected_hash,
         recipient_pkh,
         refund_pkh,
         timeout_height,
+    })
+}
+
+pub fn encode_mpso_script(o: &MpsoV1Output) -> Vec<u8> {
+    let secret_gate = o.flags & 0x01 != 0;
+    let pubkey_bytes = (o.claim_n as usize + o.refund_n as usize) * 33;
+    let total = 48 + pubkey_bytes + if secret_gate { 32 } else { 0 };
+    let mut script = Vec::with_capacity(total);
+    script.push(MPSO_V1_TAG);
+    script.push(0x01);
+    script.push(o.flags);
+    script.push(0x00);
+    script.push(o.claim_n);
+    script.push(o.claim_m);
+    script.push(o.refund_n);
+    script.push(o.refund_m);
+    script.extend_from_slice(&o.agreement_hash);
+    for pk in &o.claim_pubkeys {
+        script.extend_from_slice(pk.as_ref());
+    }
+    for pk in &o.refund_pubkeys {
+        script.extend_from_slice(pk.as_ref());
+    }
+    script.extend_from_slice(&o.timeout_height.to_le_bytes());
+    if let Some(h) = &o.optional_hash {
+        script.extend_from_slice(h.as_ref());
+    }
+    script
+}
+
+pub fn parse_mpso_script(script: &[u8]) -> Option<MpsoV1Output> {
+    if script.len() < 8 {
+        return None;
+    }
+    if script[0] != MPSO_V1_TAG {
+        return None;
+    }
+    if script[1] != 0x01 {
+        return None;
+    }
+    let flags = script[2];
+    if flags & 0xFE != 0 {
+        return None;
+    }
+    if script[3] != 0x00 {
+        return None;
+    }
+    let claim_n = script[4];
+    let claim_m = script[5];
+    let refund_n = script[6];
+    let refund_m = script[7];
+    if claim_n < 1 || claim_n > 8 {
+        return None;
+    }
+    if claim_m < 1 || claim_m > claim_n {
+        return None;
+    }
+    if refund_n < 1 || refund_n > 8 {
+        return None;
+    }
+    if refund_m < 1 || refund_m > refund_n {
+        return None;
+    }
+    let secret_gate = flags & 0x01 != 0;
+    let expected_len =
+        48 + (claim_n as usize + refund_n as usize) * 33 + if secret_gate { 32 } else { 0 };
+    if script.len() != expected_len {
+        return None;
+    }
+    if script.len() > MPSO_V1_MAX_SCRIPT_SIZE {
+        return None;
+    }
+    let mut agreement_hash = [0u8; 32];
+    agreement_hash.copy_from_slice(&script[8..40]);
+    let mut claim_pubkeys: Vec<[u8; 33]> = Vec::with_capacity(claim_n as usize);
+    let mut pos = 40usize;
+    for _ in 0..claim_n {
+        if script[pos] != 0x02 && script[pos] != 0x03 {
+            return None;
+        }
+        let mut pk = [0u8; 33];
+        pk.copy_from_slice(&script[pos..pos + 33]);
+        claim_pubkeys.push(pk);
+        pos += 33;
+    }
+    let mut refund_pubkeys: Vec<[u8; 33]> = Vec::with_capacity(refund_n as usize);
+    for _ in 0..refund_n {
+        if script[pos] != 0x02 && script[pos] != 0x03 {
+            return None;
+        }
+        let mut pk = [0u8; 33];
+        pk.copy_from_slice(&script[pos..pos + 33]);
+        refund_pubkeys.push(pk);
+        pos += 33;
+    }
+    for i in 0..claim_pubkeys.len() {
+        for j in (i + 1)..claim_pubkeys.len() {
+            if claim_pubkeys[i] == claim_pubkeys[j] {
+                return None;
+            }
+        }
+    }
+    for i in 0..refund_pubkeys.len() {
+        for j in (i + 1)..refund_pubkeys.len() {
+            if refund_pubkeys[i] == refund_pubkeys[j] {
+                return None;
+            }
+        }
+    }
+    for cpk in &claim_pubkeys {
+        for rpk in &refund_pubkeys {
+            if cpk == rpk {
+                return None;
+            }
+        }
+    }
+    let mut timeout_bytes = [0u8; 8];
+    timeout_bytes.copy_from_slice(&script[pos..pos + 8]);
+    let timeout_height = u64::from_le_bytes(timeout_bytes);
+    pos += 8;
+    let optional_hash = if secret_gate {
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&script[pos..pos + 32]);
+        Some(h)
+    } else {
+        None
+    };
+    Some(MpsoV1Output {
+        flags,
+        claim_n,
+        claim_m,
+        refund_n,
+        refund_m,
+        agreement_hash,
+        claim_pubkeys,
+        refund_pubkeys,
+        timeout_height,
+        optional_hash,
     })
 }
 
@@ -190,6 +342,9 @@ pub fn parse_output_encumbrance(script: &[u8]) -> OutputEncumbrance {
     }
     if let Some(htlc) = parse_htlcv1_script(script) {
         return OutputEncumbrance::HtlcV1(htlc);
+    }
+    if let Some(mpso) = parse_mpso_script(script) {
+        return OutputEncumbrance::MpsoV1(mpso);
     }
     OutputEncumbrance::Unknown
 }
@@ -246,11 +401,49 @@ pub fn encode_htlcv1_refund_witness(sig: &[u8], pubkey: &[u8]) -> Option<Vec<u8>
     Some(out)
 }
 
+pub fn encode_mpso_claim_witness(
+    bitmap: u8,
+    sigs: &[Vec<u8>],
+    preimage: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    out.push(0x01u8);
+    out.push(bitmap);
+    for sig in sigs {
+        if sig.is_empty() || sig.len() > 255 {
+            return None;
+        }
+        out.push(sig.len() as u8);
+        out.extend_from_slice(sig);
+    }
+    if let Some(pre) = preimage {
+        if pre.is_empty() || pre.len() > 64 {
+            return None;
+        }
+        out.push(pre.len() as u8);
+        out.extend_from_slice(pre);
+    }
+    Some(out)
+}
+
+pub fn encode_mpso_refund_witness(bitmap: u8, sigs: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    out.push(0x02u8);
+    out.push(bitmap);
+    for sig in sigs {
+        if sig.is_empty() || sig.len() > 255 {
+            return None;
+        }
+        out.push(sig.len() as u8);
+        out.extend_from_slice(sig);
+    }
+    Some(out)
+}
+
 pub fn parse_input_witness(script_sig: &[u8]) -> InputWitness {
     if script_sig.is_empty() {
         return InputWitness::Unknown;
     }
-
     match script_sig[0] {
         HTLC_WITNESS_CLAIM => {
             if script_sig.len() < 4 {
@@ -305,14 +498,11 @@ pub fn parse_input_witness(script_sig: &[u8]) -> InputWitness {
     }
 }
 
-/// Helper used later to decode compact genesis tx hex.
 pub fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
     Vec::from_hex(s)
 }
 
 #[allow(dead_code)]
-/// Decode a full Transaction from its serialized bytes (the inverse of `serialize`).
-/// This is used by tooling such as the Rust wallet and explorer.
 pub fn decode_full_tx(raw: &[u8]) -> Result<Transaction, String> {
     let mut offset = 0usize;
     let tx = decode_full_tx_at(raw, &mut offset)?;
@@ -322,8 +512,6 @@ pub fn decode_full_tx(raw: &[u8]) -> Result<Transaction, String> {
     Ok(tx)
 }
 
-/// Decode a full Transaction from its serialized bytes, updating the provided
-/// offset as bytes are consumed. This mirrors the Python compact encoding.
 pub fn decode_full_tx_at(raw: &[u8], offset: &mut usize) -> Result<Transaction, String> {
     let read_u8 = |buf: &[u8], off: &mut usize| -> Result<u8, String> {
         if *off >= buf.len() {
@@ -333,7 +521,6 @@ pub fn decode_full_tx_at(raw: &[u8], offset: &mut usize) -> Result<Transaction, 
         *off += 1;
         Ok(v)
     };
-
     let read_u32 = |buf: &[u8], off: &mut usize| -> Result<u32, String> {
         if *off + 4 > buf.len() {
             return Err("unexpected EOF".to_string());
@@ -343,7 +530,6 @@ pub fn decode_full_tx_at(raw: &[u8], offset: &mut usize) -> Result<Transaction, 
         *off += 4;
         Ok(u32::from_le_bytes(bytes))
     };
-
     let read_u64 = |buf: &[u8], off: &mut usize| -> Result<u64, String> {
         if *off + 8 > buf.len() {
             return Err("unexpected EOF".to_string());
@@ -353,7 +539,6 @@ pub fn decode_full_tx_at(raw: &[u8], offset: &mut usize) -> Result<Transaction, 
         *off += 8;
         Ok(u64::from_le_bytes(bytes))
     };
-
     let read_bytes = |buf: &[u8], off: &mut usize, len: usize| -> Result<Vec<u8>, String> {
         if *off + len > buf.len() {
             return Err("unexpected EOF".to_string());
@@ -362,7 +547,6 @@ pub fn decode_full_tx_at(raw: &[u8], offset: &mut usize) -> Result<Transaction, 
         *off += len;
         Ok(out)
     };
-
     let version = read_u32(raw, offset)?;
     let input_count = read_u8(raw, offset)? as usize;
     let mut inputs = Vec::with_capacity(input_count);
@@ -385,7 +569,6 @@ pub fn decode_full_tx_at(raw: &[u8], offset: &mut usize) -> Result<Transaction, 
             sequence,
         });
     }
-
     let output_count = read_u8(raw, offset)? as usize;
     let mut outputs = Vec::with_capacity(output_count);
     for _ in 0..output_count {
@@ -397,9 +580,7 @@ pub fn decode_full_tx_at(raw: &[u8], offset: &mut usize) -> Result<Transaction, 
             script_pubkey,
         });
     }
-
     let locktime = read_u32(raw, offset)?;
-
     Ok(Transaction {
         version,
         inputs,
@@ -453,5 +634,187 @@ mod tests {
             }
             _ => panic!("wrong witness"),
         }
+    }
+
+    fn valid_compressed_pubkey(seed: u8) -> [u8; 33] {
+        use k256::ecdsa::SigningKey;
+        let mut sk_bytes = [0u8; 32];
+        sk_bytes[31] = seed;
+        let sk = SigningKey::from_bytes((&sk_bytes).into()).expect("sk");
+        let encoded = sk.verifying_key().to_encoded_point(true);
+        let bytes = encoded.as_bytes();
+        let mut pk = [0u8; 33];
+        pk.copy_from_slice(bytes);
+        pk
+    }
+
+    fn make_mpso(claim_n: u8, claim_m: u8, refund_n: u8, refund_m: u8, flags: u8) -> MpsoV1Output {
+        let mut claim_pubkeys = Vec::new();
+        for i in 0..claim_n {
+            claim_pubkeys.push(valid_compressed_pubkey(i + 1));
+        }
+        let mut refund_pubkeys = Vec::new();
+        for i in 0..refund_n {
+            refund_pubkeys.push(valid_compressed_pubkey(i + 1 + claim_n));
+        }
+        let optional_hash = if flags & 0x01 != 0 {
+            Some([0xaau8; 32])
+        } else {
+            None
+        };
+        MpsoV1Output {
+            flags,
+            claim_n,
+            claim_m,
+            refund_n,
+            refund_m,
+            agreement_hash: [0x42u8; 32],
+            claim_pubkeys,
+            refund_pubkeys,
+            timeout_height: 1000,
+            optional_hash,
+        }
+    }
+
+    #[test]
+    fn mpso_script_roundtrip_no_secret() {
+        let o = make_mpso(2, 1, 2, 2, 0x00);
+        let script = encode_mpso_script(&o);
+        let parsed = parse_mpso_script(&script).expect("parse");
+        assert_eq!(parsed, o);
+    }
+
+    #[test]
+    fn mpso_script_roundtrip_with_secret() {
+        let o = make_mpso(2, 2, 1, 1, 0x01);
+        let script = encode_mpso_script(&o);
+        let parsed = parse_mpso_script(&script).expect("parse");
+        assert_eq!(parsed, o);
+    }
+
+    #[test]
+    fn mpso_script_roundtrip_max_size() {
+        let o = make_mpso(8, 8, 8, 8, 0x01);
+        let script = encode_mpso_script(&o);
+        assert_eq!(script.len(), 608);
+        assert!(script.len() <= MPSO_V1_MAX_SCRIPT_SIZE);
+        let parsed = parse_mpso_script(&script).expect("parse max-size script");
+        assert_eq!(parsed, o);
+    }
+
+    #[test]
+    fn mpso_script_reject_trailing_byte() {
+        let o = make_mpso(2, 1, 1, 1, 0x00);
+        let mut script = encode_mpso_script(&o);
+        script.push(0x00);
+        assert!(parse_mpso_script(&script).is_none());
+    }
+
+    #[test]
+    fn mpso_script_reject_wrong_tag() {
+        let o = make_mpso(1, 1, 1, 1, 0x00);
+        let mut script = encode_mpso_script(&o);
+        script[0] = 0xc0;
+        assert!(parse_mpso_script(&script).is_none());
+    }
+
+    #[test]
+    fn mpso_script_reject_reserved_flag_bits() {
+        let o = make_mpso(1, 1, 1, 1, 0x00);
+        let mut script = encode_mpso_script(&o);
+        script[2] = 0x02;
+        assert!(parse_mpso_script(&script).is_none());
+    }
+
+    #[test]
+    fn mpso_script_reject_nonzero_reserved_byte() {
+        let o = make_mpso(1, 1, 1, 1, 0x00);
+        let mut script = encode_mpso_script(&o);
+        script[3] = 0x01;
+        assert!(parse_mpso_script(&script).is_none());
+    }
+
+    #[test]
+    fn mpso_script_reject_zero_claim_n() {
+        let o = make_mpso(1, 1, 1, 1, 0x00);
+        let mut script = encode_mpso_script(&o);
+        script[4] = 0;
+        assert!(parse_mpso_script(&script).is_none());
+    }
+
+    #[test]
+    fn mpso_script_reject_claim_m_gt_claim_n() {
+        let o = make_mpso(2, 2, 1, 1, 0x00);
+        let mut script = encode_mpso_script(&o);
+        script[5] = 3;
+        assert!(parse_mpso_script(&script).is_none());
+    }
+
+    #[test]
+    fn mpso_script_reject_refund_m_gt_refund_n() {
+        let o = make_mpso(1, 1, 2, 2, 0x00);
+        let mut script = encode_mpso_script(&o);
+        script[7] = 3;
+        assert!(parse_mpso_script(&script).is_none());
+    }
+
+    #[test]
+    fn mpso_script_reject_duplicate_claim_pubkey() {
+        let pk1 = valid_compressed_pubkey(1);
+        let rp1 = valid_compressed_pubkey(3);
+        let o = MpsoV1Output {
+            flags: 0x00,
+            claim_n: 2,
+            claim_m: 1,
+            refund_n: 1,
+            refund_m: 1,
+            agreement_hash: [0x42u8; 32],
+            claim_pubkeys: vec![pk1, pk1],
+            refund_pubkeys: vec![rp1],
+            timeout_height: 1000,
+            optional_hash: None,
+        };
+        let script = encode_mpso_script(&o);
+        assert!(parse_mpso_script(&script).is_none());
+    }
+
+    #[test]
+    fn mpso_script_reject_duplicate_refund_pubkey() {
+        let cp1 = valid_compressed_pubkey(1);
+        let rp1 = valid_compressed_pubkey(3);
+        let o = MpsoV1Output {
+            flags: 0x00,
+            claim_n: 1,
+            claim_m: 1,
+            refund_n: 2,
+            refund_m: 1,
+            agreement_hash: [0x42u8; 32],
+            claim_pubkeys: vec![cp1],
+            refund_pubkeys: vec![rp1, rp1],
+            timeout_height: 1000,
+            optional_hash: None,
+        };
+        let script = encode_mpso_script(&o);
+        assert!(parse_mpso_script(&script).is_none());
+    }
+
+    #[test]
+    fn mpso_script_reject_claim_refund_overlap() {
+        let shared = valid_compressed_pubkey(1);
+        let cp2 = valid_compressed_pubkey(2);
+        let o = MpsoV1Output {
+            flags: 0x00,
+            claim_n: 2,
+            claim_m: 1,
+            refund_n: 1,
+            refund_m: 1,
+            agreement_hash: [0x42u8; 32],
+            claim_pubkeys: vec![cp2, shared],
+            refund_pubkeys: vec![shared],
+            timeout_height: 1000,
+            optional_hash: None,
+        };
+        let script = encode_mpso_script(&o);
+        assert!(parse_mpso_script(&script).is_none());
     }
 }

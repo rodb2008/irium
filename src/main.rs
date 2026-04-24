@@ -37,6 +37,7 @@ fn main() {
         genesis_block: block,
         pow_limit,
         htlcv1_activation_height: resolved_htlcv1_activation_height(network),
+        mpsov1_activation_height: None,
         lwma: LwmaParams::new(resolved_lwma_activation_height(network), pow_limit),
         lwma_v2: resolved_lwma_v2_activation_height(network)
             .map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
