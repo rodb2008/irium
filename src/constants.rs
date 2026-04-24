@@ -31,3 +31,22 @@ pub fn block_reward(height: u64) -> u64 {
     }
     INITIAL_SUBSIDY >> halvings
 }
+
+// LWMA v2 parameters (inactive until MAINNET_LWMA_V2_ACTIVATION_HEIGHT is set).
+//
+// Motivation: real-world observation (blocks 19639-19704) showed that after a
+// dominant miner left the network, the 60-block window dilutes slow-block signal
+// so heavily that difficulty takes ~7.5 days to reach usable levels for infra
+// miners alone. Smaller window and larger solvetime clamp both increase the
+// signal each slow block contributes without weakening the per-block step clamp.
+//
+// Simulation (infra at 16.7 MH/s, difficulty 1.02e12, T=600s):
+//   v1 (N=60, clamp=6T): usable after 7.1d, near-target after 7.5d
+//   v2 (N=30, clamp=10T): usable after 2.6d, near-target after 2.7d
+//
+// Max single-block ease is unchanged (2x step clamp), preserving manipulation
+// resistance. Upward step clamp (hardening) is also unchanged.
+pub const LWMA_V2_WINDOW: u64 = 30; // reduced from 60 for faster response
+pub const LWMA_V2_SOLVETIME_CLAMP_FACTOR: u64 = 10; // increased from 6 for stronger slow-block signal
+pub const LWMA_V2_MAX_TARGET_UP_FACTOR: u64 = 2; // unchanged: max 2x ease per block
+pub const LWMA_V2_MAX_TARGET_DOWN_FACTOR: u64 = 2; // unchanged: max 2x harden per block
