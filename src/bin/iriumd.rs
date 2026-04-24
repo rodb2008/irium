@@ -6691,6 +6691,10 @@ async fn submit_tx(
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
+    // Install ring as the default rustls crypto provider before any TLS code runs.
+    // When both ring and aws-lc-rs appear in the dep tree, rustls 0.23 panics
+    // unless install_default() is called explicitly (e.g. on nodes using TLS RPC).
+    let _ = rustls::crypto::ring::default_provider().install_default();
     // Load config first so data_dir can influence runtime path selection.
     let node_cfg: Option<NodeConfig> = load_node_config_from_env();
     if let Some(data_dir) = node_cfg
