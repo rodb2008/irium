@@ -18,7 +18,7 @@ pub const MAINNET_LWMA_ACTIVATION_HEIGHT: Option<u64> = Some(16_462);
 /// and explicit approval. When active, switches difficulty to LWMA v2
 /// parameters (N=30, clamp=10T) for faster post-collapse recovery.
 /// Historical consensus before this height is unaffected.
-pub const MAINNET_LWMA_V2_ACTIVATION_HEIGHT: Option<u64> = Some(19_725);
+pub const MAINNET_LWMA_V2_ACTIVATION_HEIGHT: Option<u64> = Some(19_740);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkKind {
@@ -144,13 +144,13 @@ mod tests {
     fn mainnet_lwma_v2_activation_height_is_set() {
         assert_eq!(
             MAINNET_LWMA_V2_ACTIVATION_HEIGHT,
-            Some(19_725),
-            "LWMA v2 mainnet activation height must be 19725"
+            Some(19_740),
+            "LWMA v2 mainnet activation height must be 19740"
         );
         assert_eq!(
             resolved_lwma_v2_activation_height(NetworkKind::Mainnet),
-            Some(19_725),
-            "resolved v2 height must be Some(19725) for mainnet"
+            Some(19_740),
+            "resolved v2 height must be Some(19740) for mainnet"
         );
     }
 
@@ -164,8 +164,8 @@ mod tests {
         assert_eq!(resolved, MAINNET_LWMA_V2_ACTIVATION_HEIGHT);
         assert_eq!(
             resolved,
-            Some(19_725),
-            "mainnet v2 height must be code-defined 19725, not env override 99999"
+            Some(19_740),
+            "mainnet v2 height must be code-defined 19740, not env override 99999"
         );
     }
 
