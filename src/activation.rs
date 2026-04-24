@@ -18,7 +18,7 @@ pub const MAINNET_LWMA_ACTIVATION_HEIGHT: Option<u64> = Some(16_462);
 /// and explicit approval. When active, switches difficulty to LWMA v2
 /// parameters (N=30, clamp=10T) for faster post-collapse recovery.
 /// Historical consensus before this height is unaffected.
-pub const MAINNET_LWMA_V2_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const MAINNET_LWMA_V2_ACTIVATION_HEIGHT: Option<u64> = Some(19_725);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkKind {
@@ -141,11 +141,17 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_lwma_v2_is_inactive_by_default() {
-        assert_eq!(MAINNET_LWMA_V2_ACTIVATION_HEIGHT, None,
-            "LWMA v2 must remain inactive on mainnet until explicitly activated");
-        assert_eq!(resolved_lwma_v2_activation_height(NetworkKind::Mainnet), None,
-            "resolved v2 height must be None for mainnet when constant is None");
+    fn mainnet_lwma_v2_activation_height_is_set() {
+        assert_eq!(
+            MAINNET_LWMA_V2_ACTIVATION_HEIGHT,
+            Some(19_725),
+            "LWMA v2 mainnet activation height must be 19725"
+        );
+        assert_eq!(
+            resolved_lwma_v2_activation_height(NetworkKind::Mainnet),
+            Some(19_725),
+            "resolved v2 height must be Some(19725) for mainnet"
+        );
     }
 
     #[test]
@@ -154,8 +160,13 @@ mod tests {
         std::env::set_var("IRIUM_LWMA_V2_ACTIVATION_HEIGHT", "99999");
         let resolved = resolved_lwma_v2_activation_height(NetworkKind::Mainnet);
         std::env::remove_var("IRIUM_LWMA_V2_ACTIVATION_HEIGHT");
-        assert_eq!(resolved, MAINNET_LWMA_V2_ACTIVATION_HEIGHT,
-            "mainnet v2 height must not be overridden by env var");
+        // Mainnet must always use the code-defined constant, never the env var.
+        assert_eq!(resolved, MAINNET_LWMA_V2_ACTIVATION_HEIGHT);
+        assert_eq!(
+            resolved,
+            Some(19_725),
+            "mainnet v2 height must be code-defined 19725, not env override 99999"
+        );
     }
 
     #[test]
