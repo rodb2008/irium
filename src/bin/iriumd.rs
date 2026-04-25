@@ -5025,7 +5025,7 @@ async fn decode_htlc(
             recipient_address: None,
             refund_address: None,
         })),
-        OutputEncumbrance::Unknown => Ok(Json(DecodeHtlcResponse {
+        OutputEncumbrance::MpsoV1(_) | OutputEncumbrance::Unknown => Ok(Json(DecodeHtlcResponse {
             found: false,
             vout: Some(idx as u32),
             output_type: "unknown".to_string(),
@@ -6834,6 +6834,7 @@ async fn main() {
         genesis_block: genesis_block.clone(),
         pow_limit,
         htlcv1_activation_height: htlc_activation,
+        mpsov1_activation_height: None,
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
     };
@@ -7896,6 +7897,7 @@ mod tests {
             pow_limit,
             genesis_block,
             htlcv1_activation_height: activation,
+            mpsov1_activation_height: None,
             lwma: LwmaParams::new(None, pow_limit),
         lwma_v2: None,
         };
@@ -8793,6 +8795,7 @@ mod tests {
             pow_limit,
             genesis_block,
             htlcv1_activation_height: None,
+            mpsov1_activation_height: None,
             lwma: LwmaParams::new(None, pow_limit),
         lwma_v2: None,
         };

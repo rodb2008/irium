@@ -2040,6 +2040,7 @@ fn main() {
         genesis_block: block,
         pow_limit,
         htlcv1_activation_height: htlc_activation,
+        mpsov1_activation_height: None,
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
     };

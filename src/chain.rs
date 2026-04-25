@@ -15,16 +15,15 @@ use crate::block::{Block, BlockHeader};
 use crate::constants::{
     block_reward, BLOCK_TARGET_INTERVAL, COINBASE_MATURITY, DIFFICULTY_RETARGET_INTERVAL,
     LWMA_MAX_TARGET_DOWN_FACTOR, LWMA_MAX_TARGET_UP_FACTOR, LWMA_MIN_DIFFICULTY_FLOOR,
-    LWMA_SOLVETIME_CLAMP_FACTOR, LWMA_WINDOW, LWMA_V2_MAX_TARGET_DOWN_FACTOR,
-    LWMA_V2_MAX_TARGET_UP_FACTOR, LWMA_V2_SOLVETIME_CLAMP_FACTOR, LWMA_V2_WINDOW,
-    MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
+    LWMA_SOLVETIME_CLAMP_FACTOR, LWMA_V2_MAX_TARGET_DOWN_FACTOR, LWMA_V2_MAX_TARGET_UP_FACTOR,
+    LWMA_V2_SOLVETIME_CLAMP_FACTOR, LWMA_V2_WINDOW, LWMA_WINDOW, MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
 };
 use crate::genesis::LockedGenesis;
 use crate::pow::{meets_target, min_difficulty_target, sha256d, Target};
 use crate::tx::{
-    decode_hex, encode_htlcv1_script, parse_htlcv1_script, parse_input_witness,
-    parse_output_encumbrance, InputWitness, OutputEncumbrance, Transaction, TxInput, TxOutput,
-    HTLC_V1_SCRIPT_TAG,
+    decode_hex, encode_htlcv1_script, encode_mpso_script, parse_htlcv1_script, parse_input_witness,
+    parse_mpso_script, parse_output_encumbrance, InputWitness, MpsoV1Output, OutputEncumbrance,
+    Transaction, TxInput, TxOutput, HTLC_V1_SCRIPT_TAG, MPSO_V1_MAX_WITNESS_SIZE, MPSO_V1_TAG,
 };
 
 const MAX_ORPHAN_BLOCKS: usize = 100;
@@ -91,6 +90,7 @@ pub struct ChainParams {
     pub genesis_block: Block,
     pub pow_limit: Target,
     pub htlcv1_activation_height: Option<u64>,
+    pub mpsov1_activation_height: Option<u64>,
     pub lwma: LwmaParams,
     /// Optional LWMA v2 params. When Some and height >= v2.activation_height,
     /// replaces v1. None keeps v1 behavior indefinitely.
@@ -194,6 +194,13 @@ impl ChainState {
     fn htlcv1_active_at(&self, height: u64) -> bool {
         self.params
             .htlcv1_activation_height
+            .map(|h| height >= h)
+            .unwrap_or(false)
+    }
+
+    fn mpsov1_active_at(&self, height: u64) -> bool {
+        self.params
+            .mpsov1_activation_height
             .map(|h| height >= h)
             .unwrap_or(false)
     }
@@ -366,10 +373,8 @@ impl ChainState {
             .chain
             .last()
             .expect("chain should have at least genesis when querying target");
-        let sample_count = std::cmp::min(
-            params.window as usize,
-            self.chain.len().saturating_sub(1),
-        );
+        let sample_count =
+            std::cmp::min(params.window as usize, self.chain.len().saturating_sub(1));
         if sample_count == 0 {
             return last_block.header.target();
         }
@@ -413,8 +418,7 @@ impl ChainState {
         if min_step_target.is_zero() {
             min_step_target = BigUint::from(1u8);
         }
-        let max_step_target =
-            &previous_target * BigUint::from(params.max_target_up_factor.max(1));
+        let max_step_target = &previous_target * BigUint::from(params.max_target_up_factor.max(1));
 
         if next_target < min_step_target {
             next_target = min_step_target;
@@ -452,7 +456,10 @@ impl ChainState {
 
         // Use LWMA v2 params if active; otherwise fall back to v1.
         let (lwma_target, version) = if self.lwma_v2_active_at(height) {
-            let v2 = self.params.lwma_v2.expect("lwma_v2 must be Some when v2 is active");
+            let v2 = self
+                .params
+                .lwma_v2
+                .expect("lwma_v2 must be Some when v2 is active");
             (self.lwma_target_for_height_with(&v2), 2u8)
         } else {
             (self.lwma_target_for_height(), 1u8)
@@ -837,7 +844,12 @@ impl ChainState {
 
         let mut coinbase_total: u64 = 0;
         for output in &coinbase.outputs {
-            validate_output(output, self.htlcv1_active_at(height))?;
+            validate_output(
+                output,
+                self.htlcv1_active_at(height),
+                self.mpsov1_active_at(height),
+                height,
+            )?;
             coinbase_total = coinbase_total
                 .checked_add(output.value)
                 .ok_or_else(|| "Coinbase outputs overflow".to_string())?;
@@ -1119,6 +1131,7 @@ impl ChainState {
                 &utxo_entry.output,
                 height,
                 self.htlcv1_active_at(height),
+                self.mpsov1_active_at(height),
             ) {
                 return Err("Transaction signature verification failed".to_string());
             }
@@ -1129,7 +1142,12 @@ impl ChainState {
 
         let mut output_total: i64 = 0;
         for output in &tx.outputs {
-            validate_output(output, self.htlcv1_active_at(height))?;
+            validate_output(
+                output,
+                self.htlcv1_active_at(height),
+                self.mpsov1_active_at(height),
+                height,
+            )?;
             output_total += output.value as i64;
         }
         if input_total < output_total {
@@ -1152,15 +1170,41 @@ fn is_coinbase(tx: &Transaction) -> bool {
     coinbase_input.prev_txid == [0u8; 32] && coinbase_input.prev_index == 0xffff_ffff
 }
 
-fn validate_output(output: &TxOutput, htlcv1_active: bool) -> Result<(), String> {
+fn validate_output(
+    output: &TxOutput,
+    htlcv1_active: bool,
+    mpsov1_active: bool,
+    height: u64,
+) -> Result<(), String> {
     if output.value > MAX_MONEY {
         return Err("Output value out of range".to_string());
     }
+
+    let tag = output.script_pubkey.first().copied();
+
+    // MPSOv1 has its own size cap (640 bytes); checked before the 255-byte legacy limit.
+    if tag == Some(MPSO_V1_TAG) {
+        if !mpsov1_active {
+            return Err("MPSOv1 output before activation".to_string());
+        }
+        if output.script_pubkey.len() > 640 {
+            return Err("MPSOv1 script_pubkey too large".to_string());
+        }
+        let mpso = parse_mpso_script(&output.script_pubkey)
+            .ok_or_else(|| "Malformed MPSOv1 output".to_string())?;
+        validate_mpso_pubkeys_on_curve(&mpso)?;
+        if mpso.timeout_height <= height {
+            return Err("MPSOv1 timeout_height must be greater than current height".to_string());
+        }
+        return Ok(());
+    }
+
+    // All non-MPSOv1 outputs keep the existing 255-byte limit.
     if output.script_pubkey.len() > 0xff {
         return Err("script_pubkey too large".to_string());
     }
 
-    if output.script_pubkey.first() == Some(&HTLC_V1_SCRIPT_TAG) {
+    if tag == Some(HTLC_V1_SCRIPT_TAG) {
         if !htlcv1_active {
             return Err("HTLCv1 output before activation".to_string());
         }
@@ -1169,6 +1213,15 @@ fn validate_output(output: &TxOutput, htlcv1_active: bool) -> Result<(), String>
         }
     }
 
+    Ok(())
+}
+
+fn validate_mpso_pubkeys_on_curve(mpso: &MpsoV1Output) -> Result<(), String> {
+    use k256::ecdsa::VerifyingKey;
+    for pk in mpso.claim_pubkeys.iter().chain(mpso.refund_pubkeys.iter()) {
+        VerifyingKey::from_sec1_bytes(pk.as_ref())
+            .map_err(|_| "MPSOv1 output contains invalid secp256k1 pubkey".to_string())?;
+    }
     Ok(())
 }
 
@@ -1238,6 +1291,7 @@ fn verify_transaction_signature(
     utxo: &TxOutput,
     spend_height: u64,
     htlcv1_active: bool,
+    mpsov1_active: bool,
 ) -> bool {
     match parse_output_encumbrance(&utxo.script_pubkey) {
         OutputEncumbrance::P2pkh(expected_pkh) => {
@@ -1283,6 +1337,138 @@ fn verify_transaction_signature(
                     }
                     let script = encode_htlcv1_script(&htlc);
                     verify_sig_with_pubkey(tx, input_index, &script, &sig, &pubkey)
+                }
+                _ => false,
+            }
+        }
+        OutputEncumbrance::MpsoV1(ref mpso) => {
+            if !mpsov1_active {
+                return false;
+            }
+            let script_sig = &txin.script_sig;
+            if script_sig.len() > MPSO_V1_MAX_WITNESS_SIZE {
+                return false;
+            }
+            if script_sig.is_empty() {
+                return false;
+            }
+            let scriptcode = encode_mpso_script(mpso);
+            match script_sig[0] {
+                0x01 => {
+                    // Claim path: valid only when spend_height < timeout_height.
+                    if spend_height >= mpso.timeout_height {
+                        return false;
+                    }
+                    if script_sig.len() < 2 {
+                        return false;
+                    }
+                    let bitmap = script_sig[1];
+                    let valid_mask: u8 = if mpso.claim_n == 8 {
+                        0xff
+                    } else {
+                        (1u8 << mpso.claim_n) - 1
+                    };
+                    if bitmap & !valid_mask != 0 {
+                        return false;
+                    }
+                    if bitmap.count_ones() != mpso.claim_m as u32 {
+                        return false;
+                    }
+                    let mut pos = 2usize;
+                    for i in 0..mpso.claim_n {
+                        if bitmap & (1u8 << i) == 0 {
+                            continue;
+                        }
+                        if pos >= script_sig.len() {
+                            return false;
+                        }
+                        let sig_len = script_sig[pos] as usize;
+                        pos += 1;
+                        if sig_len == 0 || pos + sig_len > script_sig.len() {
+                            return false;
+                        }
+                        let sig = &script_sig[pos..pos + sig_len];
+                        pos += sig_len;
+                        if !verify_sig_with_pubkey(
+                            tx,
+                            input_index,
+                            &scriptcode,
+                            sig,
+                            &mpso.claim_pubkeys[i as usize],
+                        ) {
+                            return false;
+                        }
+                    }
+                    if mpso.flags & 0x01 != 0 {
+                        if pos >= script_sig.len() {
+                            return false;
+                        }
+                        let pre_len = script_sig[pos] as usize;
+                        pos += 1;
+                        if pre_len == 0 || pre_len > 64 {
+                            return false;
+                        }
+                        if pos + pre_len > script_sig.len() {
+                            return false;
+                        }
+                        let preimage = &script_sig[pos..pos + pre_len];
+                        pos += pre_len;
+                        let hash = Sha256::digest(preimage);
+                        let expected = mpso
+                            .optional_hash
+                            .expect("flags bit 0 set implies optional_hash");
+                        if hash[..] != expected {
+                            return false;
+                        }
+                    }
+                    pos == script_sig.len()
+                }
+                0x02 => {
+                    // Refund path: valid only when spend_height >= timeout_height.
+                    if spend_height < mpso.timeout_height {
+                        return false;
+                    }
+                    if script_sig.len() < 2 {
+                        return false;
+                    }
+                    let bitmap = script_sig[1];
+                    let valid_mask: u8 = if mpso.refund_n == 8 {
+                        0xff
+                    } else {
+                        (1u8 << mpso.refund_n) - 1
+                    };
+                    if bitmap & !valid_mask != 0 {
+                        return false;
+                    }
+                    if bitmap.count_ones() != mpso.refund_m as u32 {
+                        return false;
+                    }
+                    let mut pos = 2usize;
+                    for i in 0..mpso.refund_n {
+                        if bitmap & (1u8 << i) == 0 {
+                            continue;
+                        }
+                        if pos >= script_sig.len() {
+                            return false;
+                        }
+                        let sig_len = script_sig[pos] as usize;
+                        pos += 1;
+                        if sig_len == 0 || pos + sig_len > script_sig.len() {
+                            return false;
+                        }
+                        let sig = &script_sig[pos..pos + sig_len];
+                        pos += sig_len;
+                        if !verify_sig_with_pubkey(
+                            tx,
+                            input_index,
+                            &scriptcode,
+                            sig,
+                            &mpso.refund_pubkeys[i as usize],
+                        ) {
+                            return false;
+                        }
+                    }
+                    pos == script_sig.len()
                 }
                 _ => false,
             }
@@ -1436,8 +1622,9 @@ mod tests {
             genesis_block: genesis,
             pow_limit,
             htlcv1_activation_height: activation,
+            mpsov1_activation_height: None,
             lwma: LwmaParams::new(None, pow_limit),
-        lwma_v2: None,
+            lwma_v2: None,
         };
         ChainState::new(params)
     }
@@ -1508,8 +1695,9 @@ mod tests {
             genesis_block: genesis,
             pow_limit,
             htlcv1_activation_height: None,
+            mpsov1_activation_height: None,
             lwma: LwmaParams::new(lwma_activation, pow_limit),
-        lwma_v2: None,
+            lwma_v2: None,
         };
         ChainState::new(params)
     }
@@ -2189,15 +2377,22 @@ mod tests {
     // LWMA v2 tests (N=30, clamp=10T) -- gated behind lwma_v2 activation
     // -----------------------------------------------------------------------
 
-    fn difficulty_chain_v2(lwma_v1_activation: Option<u64>, v2_activation: Option<u64>, pow_limit_bits: u32) -> ChainState {
+    fn difficulty_chain_v2(
+        lwma_v1_activation: Option<u64>,
+        v2_activation: Option<u64>,
+        pow_limit_bits: u32,
+    ) -> ChainState {
         let locked = crate::genesis::load_locked_genesis().expect("locked genesis");
         let genesis = block_from_locked(&locked).expect("genesis block");
-        let pow_limit = Target { bits: pow_limit_bits };
+        let pow_limit = Target {
+            bits: pow_limit_bits,
+        };
         let v2 = v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit));
         let params = ChainParams {
             genesis_block: genesis,
             pow_limit,
             htlcv1_activation_height: None,
+            mpsov1_activation_height: None,
             lwma: LwmaParams::new(lwma_v1_activation, pow_limit),
             lwma_v2: v2,
         };
@@ -2219,7 +2414,10 @@ mod tests {
         }
         let t1 = v1_chain.target_for_height(80);
         let t2 = v2_chain.target_for_height(80);
-        assert_eq!(t1.bits, t2.bits, "v2=None must produce same target as pure v1");
+        assert_eq!(
+            t1.bits, t2.bits,
+            "v2=None must produce same target as pure v1"
+        );
     }
 
     #[test]
@@ -2234,11 +2432,11 @@ mod tests {
             push_synthetic_block(&mut chain, time, bits);
         }
         let below = chain.target_for_height(v2_act - 1);
-        let at    = chain.target_for_height(v2_act);
+        let at = chain.target_for_height(v2_act);
         let above = chain.target_for_height(v2_act + 5);
         let pow_limit = chain.params.pow_limit.to_target();
         assert!(below.to_target() <= pow_limit);
-        assert!(at.to_target()    <= pow_limit);
+        assert!(at.to_target() <= pow_limit);
         assert!(above.to_target() <= pow_limit);
         assert_ne!(at.bits, 0, "v2 target must be non-zero at activation");
         assert_ne!(above.bits, 0, "v2 target must be non-zero above activation");
@@ -2261,12 +2459,13 @@ mod tests {
             time += 6000;
             push_synthetic_block(&mut chain, time, bits);
             let next_target = chain.target_for_height(h);
-            let max_allowed = Target::from_target(
-                &(prev_target.to_target() * BigUint::from(2u8))
-            );
+            let max_allowed = Target::from_target(&(prev_target.to_target() * BigUint::from(2u8)));
             assert!(
                 next_target.to_target() <= max_allowed.to_target(),
-                "v2 step clamp violated at height {}: {:?} > 2x {:?}", h, next_target, prev_target
+                "v2 step clamp violated at height {}: {:?} > 2x {:?}",
+                h,
+                next_target,
+                prev_target
             );
             prev_target = next_target;
         }
@@ -2317,7 +2516,8 @@ mod tests {
         assert!(
             t_v2 > t_v1,
             "v2 (N=30) should ease faster: v2_target={} v1_target={}",
-            t_v2, t_v1
+            t_v2,
+            t_v1
         );
     }
 
@@ -2341,7 +2541,10 @@ mod tests {
             let hi = &base * BigUint::from(4u8);
             assert!(
                 t >= lo && t <= hi,
-                "v2 target drifted out of 4x band at height {}: {} vs base {}", h, t, base
+                "v2 target drifted out of 4x band at height {}: {} vs base {}",
+                h,
+                t,
+                base
             );
         }
     }
@@ -2378,22 +2581,35 @@ mod tests {
 
         // All must be non-zero and within pow_limit.
         let pow_limit = chain.params.pow_limit.to_target();
-        for (h, t) in [(19_738u64, &t_19738), (19_739, &t_19739),
-                       (19_740, &t_19740), (19_741, &t_19741)] {
+        for (h, t) in [
+            (19_738u64, &t_19738),
+            (19_739, &t_19739),
+            (19_740, &t_19740),
+            (19_741, &t_19741),
+        ] {
             assert_ne!(t.bits, 0, "target at height {} must be non-zero", h);
-            assert!(t.to_target() <= pow_limit,
-                "target at height {} must not exceed pow_limit", h);
+            assert!(
+                t.to_target() <= pow_limit,
+                "target at height {} must not exceed pow_limit",
+                h
+            );
         }
 
         // Below activation: lwma_v2_active_at must be false.
-        assert!(!chain.lwma_v2_active_at(19_739),
-            "lwma_v2 must NOT be active at height 19739 (one below activation)");
+        assert!(
+            !chain.lwma_v2_active_at(19_739),
+            "lwma_v2 must NOT be active at height 19739 (one below activation)"
+        );
 
         // At and above activation: lwma_v2_active_at must be true.
-        assert!(chain.lwma_v2_active_at(19_740),
-            "lwma_v2 must be active at height 19740 (activation height)");
-        assert!(chain.lwma_v2_active_at(19_741),
-            "lwma_v2 must be active at height 19741 (above activation)");
+        assert!(
+            chain.lwma_v2_active_at(19_740),
+            "lwma_v2 must be active at height 19740 (activation height)"
+        );
+        assert!(
+            chain.lwma_v2_active_at(19_741),
+            "lwma_v2 must be active at height 19741 (above activation)"
+        );
 
         // Under steady-state 600s intervals the target should be stable across the
         // boundary -- no sudden jump.  Allow a 4x band around the pre-activation
@@ -2411,4 +2627,835 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // MPSOv1 tests
+    // -----------------------------------------------------------------------
+
+    fn mpso_chain(activation: Option<u64>) -> ChainState {
+        let locked = load_locked_genesis().expect("locked genesis");
+        let genesis = block_from_locked(&locked).expect("genesis block");
+        let pow_limit = Target { bits: 0x1f00ffff };
+        let params = ChainParams {
+            genesis_block: genesis,
+            pow_limit,
+            htlcv1_activation_height: None,
+            mpsov1_activation_height: activation,
+            lwma: LwmaParams::new(None, pow_limit),
+            lwma_v2: None,
+        };
+        ChainState::new(params)
+    }
+
+    fn mpso_signing_key(seed: u8) -> SigningKey {
+        let mut sk = [0u8; 32];
+        sk[31] = seed;
+        SigningKey::from_bytes((&sk).into()).expect("signing key")
+    }
+
+    fn mpso_pubkey_bytes(sk: &SigningKey) -> [u8; 33] {
+        let encoded = sk.verifying_key().to_encoded_point(true);
+        let bytes = encoded.as_bytes();
+        let mut pk = [0u8; 33];
+        pk.copy_from_slice(bytes);
+        pk
+    }
+
+    fn make_mpso_output(
+        claim_keys: &[&SigningKey],
+        claim_m: u8,
+        refund_keys: &[&SigningKey],
+        refund_m: u8,
+        timeout_height: u64,
+        secret: Option<&[u8]>,
+    ) -> (
+        crate::tx::MpsoV1Output,
+        Vec<u8>, // script
+    ) {
+        use crate::tx::{encode_mpso_script, MpsoV1Output};
+        use sha2::{Digest, Sha256};
+
+        let flags = if secret.is_some() { 0x01u8 } else { 0x00u8 };
+        let optional_hash = secret.map(|pre| {
+            let h = Sha256::digest(pre);
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&h);
+            arr
+        });
+        let mpso = MpsoV1Output {
+            flags,
+            claim_n: claim_keys.len() as u8,
+            claim_m,
+            refund_n: refund_keys.len() as u8,
+            refund_m,
+            agreement_hash: [0x55u8; 32],
+            claim_pubkeys: claim_keys.iter().map(|sk| mpso_pubkey_bytes(sk)).collect(),
+            refund_pubkeys: refund_keys.iter().map(|sk| mpso_pubkey_bytes(sk)).collect(),
+            timeout_height,
+            optional_hash,
+        };
+        let script = encode_mpso_script(&mpso);
+        (mpso, script)
+    }
+
+    fn add_mpso_utxo(
+        chain: &mut ChainState,
+        value: u64,
+        claim_keys: &[&SigningKey],
+        claim_m: u8,
+        refund_keys: &[&SigningKey],
+        refund_m: u8,
+        timeout_height: u64,
+        secret: Option<&[u8]>,
+    ) -> (OutPoint, crate::tx::MpsoV1Output) {
+        let (mpso, script) = make_mpso_output(
+            claim_keys,
+            claim_m,
+            refund_keys,
+            refund_m,
+            timeout_height,
+            secret,
+        );
+        let op = OutPoint {
+            txid: [0xaau8; 32],
+            index: 0,
+        };
+        chain.utxos.insert(
+            op.clone(),
+            UtxoEntry {
+                output: TxOutput {
+                    value,
+                    script_pubkey: script,
+                },
+                height: 1,
+                is_coinbase: false,
+            },
+        );
+        (op, mpso)
+    }
+
+    fn mpso_sign_claim(
+        tx: &Transaction,
+        input_index: usize,
+        mpso: &crate::tx::MpsoV1Output,
+        signers: &[&SigningKey],
+        bitmap: u8,
+        preimage: Option<&[u8]>,
+    ) -> Vec<u8> {
+        use crate::tx::{encode_mpso_claim_witness, encode_mpso_script};
+        let scriptcode = encode_mpso_script(mpso);
+        let digest = signature_digest(tx, input_index, &scriptcode);
+        let mut sigs = Vec::new();
+        for sk in signers {
+            let sig: Signature = sk.sign_prehash(&digest).expect("sign");
+            let sig = sig.normalize_s().unwrap_or(sig);
+            let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+            sig_bytes.push(0x01);
+            sigs.push(sig_bytes);
+        }
+        encode_mpso_claim_witness(bitmap, &sigs, preimage).expect("claim witness")
+    }
+
+    fn mpso_sign_refund(
+        tx: &Transaction,
+        input_index: usize,
+        mpso: &crate::tx::MpsoV1Output,
+        signers: &[&SigningKey],
+        bitmap: u8,
+    ) -> Vec<u8> {
+        use crate::tx::{encode_mpso_refund_witness, encode_mpso_script};
+        let scriptcode = encode_mpso_script(mpso);
+        let digest = signature_digest(tx, input_index, &scriptcode);
+        let mut sigs = Vec::new();
+        for sk in signers {
+            let sig: Signature = sk.sign_prehash(&digest).expect("sign");
+            let sig = sig.normalize_s().unwrap_or(sig);
+            let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+            sig_bytes.push(0x01);
+            sigs.push(sig_bytes);
+        }
+        encode_mpso_refund_witness(bitmap, &sigs).expect("refund witness")
+    }
+
+    fn simple_spend_tx(prev: &OutPoint, dest: &SigningKey) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_fffe,
+            }],
+            outputs: vec![TxOutput {
+                value: 9_000,
+                script_pubkey: p2pkh_script(&key_hash(dest)),
+            }],
+            locktime: 0,
+        }
+    }
+
+    #[test]
+    fn mpso_disabled_by_default_mainnet() {
+        let chain = mpso_chain(None);
+        assert!(!chain.mpsov1_active_at(0));
+        assert!(!chain.mpsov1_active_at(u64::MAX));
+    }
+
+    #[test]
+    fn mpso_activation_boundary() {
+        let chain = mpso_chain(Some(100));
+        assert!(!chain.mpsov1_active_at(99));
+        assert!(chain.mpsov1_active_at(100));
+        assert!(chain.mpsov1_active_at(101));
+    }
+
+    #[test]
+    fn mpso_output_rejected_before_activation() {
+        let mut chain = mpso_chain(Some(100));
+        chain.height = 50;
+        let sender = mpso_signing_key(1);
+        let ck1 = mpso_signing_key(2);
+        let rk1 = mpso_signing_key(3);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 10_000);
+        let (_, mpso_script) = make_mpso_output(&[&ck1], 1, &[&rk1], 1, 1000, None);
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 9_000,
+                script_pubkey: mpso_script,
+            }],
+            locktime: 0,
+        };
+        let utxo_script = chain.utxos.get(&prev).unwrap().output.script_pubkey.clone();
+        tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, &sender);
+
+        let err = chain
+            .validate_transaction(&tx)
+            .expect_err("must reject before activation");
+        assert!(
+            err.contains("MPSOv1 output before activation"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn mpso_output_accepted_after_activation() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let sender = mpso_signing_key(1);
+        let ck1 = mpso_signing_key(2);
+        let rk1 = mpso_signing_key(3);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 10_000);
+        let (_, mpso_script) = make_mpso_output(&[&ck1], 1, &[&rk1], 1, 100, None);
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 9_000,
+                script_pubkey: mpso_script,
+            }],
+            locktime: 0,
+        };
+        let utxo_script = chain.utxos.get(&prev).unwrap().output.script_pubkey.clone();
+        tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, &sender);
+        assert!(chain.validate_transaction(&tx).is_ok());
+    }
+
+    #[test]
+    fn mpso_output_reject_timeout_not_in_future() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let sender = mpso_signing_key(1);
+        let ck1 = mpso_signing_key(2);
+        let rk1 = mpso_signing_key(3);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 10_000);
+        // timeout_height = 50 == current height, must be rejected
+        let (_, mpso_script) = make_mpso_output(&[&ck1], 1, &[&rk1], 1, 50, None);
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 9_000,
+                script_pubkey: mpso_script,
+            }],
+            locktime: 0,
+        };
+        let utxo_script = chain.utxos.get(&prev).unwrap().output.script_pubkey.clone();
+        tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, &sender);
+        let err = chain
+            .validate_transaction(&tx)
+            .expect_err("timeout not in future");
+        assert!(err.contains("timeout_height"), "got: {err}");
+    }
+
+    #[test]
+    fn mpso_valid_1of1_claim_before_timeout() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(10);
+        let rk1 = mpso_signing_key(11);
+        let dest = mpso_signing_key(12);
+        let (prev, mpso) = add_mpso_utxo(&mut chain, 10_000, &[&ck1], 1, &[&rk1], 1, 100, None);
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        tx.inputs[0].script_sig = mpso_sign_claim(&tx, 0, &mpso, &[&ck1], 0b00000001, None);
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "valid 1-of-1 claim"
+        );
+    }
+
+    #[test]
+    fn mpso_reject_claim_at_timeout() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 100; // exactly timeout height
+        let ck1 = mpso_signing_key(10);
+        let rk1 = mpso_signing_key(11);
+        let dest = mpso_signing_key(12);
+        let (prev, mpso) = add_mpso_utxo(&mut chain, 10_000, &[&ck1], 1, &[&rk1], 1, 100, None);
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        tx.inputs[0].script_sig = mpso_sign_claim(&tx, 0, &mpso, &[&ck1], 0b00000001, None);
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "claim at timeout must fail"
+        );
+    }
+
+    #[test]
+    fn mpso_reject_claim_after_timeout() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 150;
+        let ck1 = mpso_signing_key(10);
+        let rk1 = mpso_signing_key(11);
+        let dest = mpso_signing_key(12);
+        let (prev, mpso) = add_mpso_utxo(&mut chain, 10_000, &[&ck1], 1, &[&rk1], 1, 100, None);
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        tx.inputs[0].script_sig = mpso_sign_claim(&tx, 0, &mpso, &[&ck1], 0b00000001, None);
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "claim after timeout must fail"
+        );
+    }
+
+    #[test]
+    fn mpso_valid_refund_at_timeout() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 100;
+        let ck1 = mpso_signing_key(10);
+        let rk1 = mpso_signing_key(11);
+        let dest = mpso_signing_key(12);
+        let (prev, mpso) = add_mpso_utxo(&mut chain, 10_000, &[&ck1], 1, &[&rk1], 1, 100, None);
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        tx.inputs[0].script_sig = mpso_sign_refund(&tx, 0, &mpso, &[&rk1], 0b00000001);
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "refund at timeout must succeed"
+        );
+    }
+
+    #[test]
+    fn mpso_valid_refund_after_timeout() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 200;
+        let ck1 = mpso_signing_key(10);
+        let rk1 = mpso_signing_key(11);
+        let dest = mpso_signing_key(12);
+        let (prev, mpso) = add_mpso_utxo(&mut chain, 10_000, &[&ck1], 1, &[&rk1], 1, 100, None);
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        tx.inputs[0].script_sig = mpso_sign_refund(&tx, 0, &mpso, &[&rk1], 0b00000001);
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "refund after timeout must succeed"
+        );
+    }
+
+    #[test]
+    fn mpso_reject_refund_before_timeout() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(10);
+        let rk1 = mpso_signing_key(11);
+        let dest = mpso_signing_key(12);
+        let (prev, mpso) = add_mpso_utxo(&mut chain, 10_000, &[&ck1], 1, &[&rk1], 1, 100, None);
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        tx.inputs[0].script_sig = mpso_sign_refund(&tx, 0, &mpso, &[&rk1], 0b00000001);
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "refund before timeout must fail"
+        );
+    }
+
+    #[test]
+    fn mpso_valid_2of3_claim() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(20);
+        let ck2 = mpso_signing_key(21);
+        let ck3 = mpso_signing_key(22);
+        let rk1 = mpso_signing_key(23);
+        let dest = mpso_signing_key(24);
+        let (prev, mpso) = add_mpso_utxo(
+            &mut chain,
+            10_000,
+            &[&ck1, &ck2, &ck3],
+            2,
+            &[&rk1],
+            1,
+            100,
+            None,
+        );
+
+        // Use signers 0 and 2 (bitmap = 0b00000101)
+        let mut tx = simple_spend_tx(&prev, &dest);
+        tx.inputs[0].script_sig = mpso_sign_claim(&tx, 0, &mpso, &[&ck1, &ck3], 0b00000101, None);
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "2-of-3 claim with keys 0,2"
+        );
+    }
+
+    #[test]
+    fn mpso_reject_1of2_when_threshold_is_2() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(20);
+        let ck2 = mpso_signing_key(21);
+        let rk1 = mpso_signing_key(22);
+        let dest = mpso_signing_key(23);
+        let (prev, mpso) =
+            add_mpso_utxo(&mut chain, 10_000, &[&ck1, &ck2], 2, &[&rk1], 1, 100, None);
+
+        // Only 1 signer but threshold is 2
+        let mut tx = simple_spend_tx(&prev, &dest);
+        tx.inputs[0].script_sig = mpso_sign_claim(&tx, 0, &mpso, &[&ck1], 0b00000001, None);
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "1-of-2 when threshold=2 must fail"
+        );
+    }
+
+    #[test]
+    fn mpso_reject_high_bitmap_bits() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(30);
+        let rk1 = mpso_signing_key(31);
+        let dest = mpso_signing_key(32);
+        let (prev, mpso) = add_mpso_utxo(&mut chain, 10_000, &[&ck1], 1, &[&rk1], 1, 100, None);
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        // bitmap = 0b10000001: bit 0 is valid (ck1), bit 7 is out of range for N=1
+        // popcount = 2, but claim_m = 1, so this also fails the popcount check
+        // Use bitmap = 0b10000000 with 0 valid signers but popcount=1 matches M=1
+        // (but bit 7 is out of range for claim_n=1)
+        let raw_witness = {
+            use crate::tx::encode_mpso_script;
+            let scriptcode = encode_mpso_script(&mpso);
+            let digest = signature_digest(&tx, 0, &scriptcode);
+            let sig: Signature = ck1.sign_prehash(&digest).expect("sign");
+            let sig = sig.normalize_s().unwrap_or(sig);
+            let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+            sig_bytes.push(0x01);
+            let mut w = Vec::new();
+            w.push(0x01u8); // claim
+            w.push(0b10000000u8); // bit 7 set, out of range for N=1
+            w.push(sig_bytes.len() as u8);
+            w.extend_from_slice(&sig_bytes);
+            w
+        };
+        tx.inputs[0].script_sig = raw_witness;
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "high bitmap bit must fail"
+        );
+    }
+
+    #[test]
+    fn mpso_reject_extra_signatures_trailing_bytes() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(40);
+        let rk1 = mpso_signing_key(41);
+        let dest = mpso_signing_key(42);
+        let (prev, mpso) = add_mpso_utxo(&mut chain, 10_000, &[&ck1], 1, &[&rk1], 1, 100, None);
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        let mut witness = mpso_sign_claim(&tx, 0, &mpso, &[&ck1], 0b00000001, None);
+        // Append a trailing byte
+        witness.push(0x00);
+        tx.inputs[0].script_sig = witness;
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "trailing witness byte must fail"
+        );
+    }
+
+    #[test]
+    fn mpso_valid_secret_gated_claim() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(50);
+        let rk1 = mpso_signing_key(51);
+        let dest = mpso_signing_key(52);
+        let preimage = b"test-mpso-secret";
+        let (prev, mpso) = add_mpso_utxo(
+            &mut chain,
+            10_000,
+            &[&ck1],
+            1,
+            &[&rk1],
+            1,
+            100,
+            Some(preimage),
+        );
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        tx.inputs[0].script_sig =
+            mpso_sign_claim(&tx, 0, &mpso, &[&ck1], 0b00000001, Some(preimage));
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "secret-gated claim must succeed"
+        );
+    }
+
+    #[test]
+    fn mpso_reject_missing_preimage_when_secret_gate_set() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(50);
+        let rk1 = mpso_signing_key(51);
+        let dest = mpso_signing_key(52);
+        let preimage = b"test-mpso-secret";
+        let (prev, mpso) = add_mpso_utxo(
+            &mut chain,
+            10_000,
+            &[&ck1],
+            1,
+            &[&rk1],
+            1,
+            100,
+            Some(preimage),
+        );
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        // No preimage provided
+        tx.inputs[0].script_sig = mpso_sign_claim(&tx, 0, &mpso, &[&ck1], 0b00000001, None);
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "missing preimage must fail"
+        );
+    }
+
+    #[test]
+    fn mpso_reject_wrong_preimage() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(50);
+        let rk1 = mpso_signing_key(51);
+        let dest = mpso_signing_key(52);
+        let preimage = b"correct-preimage";
+        let (prev, mpso) = add_mpso_utxo(
+            &mut chain,
+            10_000,
+            &[&ck1],
+            1,
+            &[&rk1],
+            1,
+            100,
+            Some(preimage),
+        );
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        tx.inputs[0].script_sig =
+            mpso_sign_claim(&tx, 0, &mpso, &[&ck1], 0b00000001, Some(b"wrong-preimage"));
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "wrong preimage must fail"
+        );
+    }
+
+    #[test]
+    fn mpso_reject_preimage_too_long() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(50);
+        let rk1 = mpso_signing_key(51);
+        let dest = mpso_signing_key(52);
+        let preimage = b"correct-preimage";
+        let (prev, mpso) = add_mpso_utxo(
+            &mut chain,
+            10_000,
+            &[&ck1],
+            1,
+            &[&rk1],
+            1,
+            100,
+            Some(preimage),
+        );
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        let raw_witness = {
+            use crate::tx::encode_mpso_script;
+            let scriptcode = encode_mpso_script(&mpso);
+            let digest = signature_digest(&tx, 0, &scriptcode);
+            let sig: Signature = ck1.sign_prehash(&digest).expect("sign");
+            let sig = sig.normalize_s().unwrap_or(sig);
+            let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+            sig_bytes.push(0x01);
+            let long_pre = vec![0xffu8; 65];
+            let mut w = Vec::new();
+            w.push(0x01u8);
+            w.push(0b00000001u8);
+            w.push(sig_bytes.len() as u8);
+            w.extend_from_slice(&sig_bytes);
+            w.push(65u8);
+            w.extend_from_slice(&long_pre);
+            w
+        };
+        tx.inputs[0].script_sig = raw_witness;
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "65-byte preimage must fail"
+        );
+    }
+    #[test]
+    fn mpso_reject_claim_with_refund_key() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(60);
+        let rk1 = mpso_signing_key(61);
+        let dest = mpso_signing_key(62);
+        let (prev, mpso) = add_mpso_utxo(&mut chain, 10_000, &[&ck1], 1, &[&rk1], 1, 100, None);
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        // Sign with the refund key but present as claim
+        tx.inputs[0].script_sig = mpso_sign_claim(&tx, 0, &mpso, &[&rk1], 0b00000001, None);
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "refund key cannot claim"
+        );
+    }
+
+    #[test]
+    fn mpso_reject_refund_with_claim_key() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 200;
+        let ck1 = mpso_signing_key(60);
+        let rk1 = mpso_signing_key(61);
+        let dest = mpso_signing_key(62);
+        let (prev, mpso) = add_mpso_utxo(&mut chain, 10_000, &[&ck1], 1, &[&rk1], 1, 100, None);
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        // Sign with the claim key but present as refund
+        tx.inputs[0].script_sig = mpso_sign_refund(&tx, 0, &mpso, &[&ck1], 0b00000001);
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "claim key cannot refund"
+        );
+    }
+
+    #[test]
+    fn mpso_htlcv1_still_works_with_mpso_active() {
+        let mut chain = mpso_chain(Some(1));
+        // Also activate HTLCv1
+        chain.params.htlcv1_activation_height = Some(1);
+        chain.height = 50;
+        let sender = signing_key(1);
+        let recipient = signing_key(2);
+        let refund_sk = signing_key(3);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 10_000);
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 9_000,
+                script_pubkey: encode_htlcv1_script(&HtlcV1Output {
+                    expected_hash: [0x42; 32],
+                    recipient_pkh: key_hash(&recipient),
+                    refund_pkh: key_hash(&refund_sk),
+                    timeout_height: 200,
+                }),
+            }],
+            locktime: 0,
+        };
+        let utxo_script = chain.utxos.get(&prev).unwrap().output.script_pubkey.clone();
+        tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, &sender);
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "HTLCv1 must still work when MPSOv1 is also active"
+        );
+    }
+
+    #[test]
+    fn mpso_reject_invalid_compressed_pubkey_in_output() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let sender = mpso_signing_key(1);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 10_000);
+
+        // Build a script with an invalid pubkey (all-zero 33 bytes with prefix 0x02).
+        use crate::tx::{encode_mpso_script, MpsoV1Output};
+        let mpso_bad = MpsoV1Output {
+            flags: 0x00,
+            claim_n: 1,
+            claim_m: 1,
+            refund_n: 1,
+            refund_m: 1,
+            agreement_hash: [0x55u8; 32],
+            claim_pubkeys: vec![[
+                0x02u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0,
+            ]],
+            refund_pubkeys: vec![[
+                0x03u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0,
+            ]],
+            timeout_height: 100,
+            optional_hash: None,
+        };
+        let bad_script = encode_mpso_script(&mpso_bad);
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 9_000,
+                script_pubkey: bad_script,
+            }],
+            locktime: 0,
+        };
+        let utxo_script = chain.utxos.get(&prev).unwrap().output.script_pubkey.clone();
+        tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, &sender);
+        let err = chain
+            .validate_transaction(&tx)
+            .expect_err("invalid pubkey must fail");
+        assert!(
+            err.contains("invalid secp256k1 pubkey") || err.contains("Malformed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn mpso_witness_over_768_bytes_rejected() {
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(70);
+        let rk1 = mpso_signing_key(71);
+        let dest = mpso_signing_key(72);
+        let (prev, mpso) = add_mpso_utxo(&mut chain, 10_000, &[&ck1], 1, &[&rk1], 1, 100, None);
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        let mut witness = mpso_sign_claim(&tx, 0, &mpso, &[&ck1], 0b00000001, None);
+        // Pad to 769 bytes
+        while witness.len() < 769 {
+            witness.push(0x00);
+        }
+        tx.inputs[0].script_sig = witness;
+        assert!(
+            chain.validate_transaction(&tx).is_err(),
+            "769-byte witness must fail"
+        );
+    }
+
+    #[test]
+    fn mpso_full_quorum_claim_valid() {
+        // claim_m == claim_n (full quorum)
+        let mut chain = mpso_chain(Some(1));
+        chain.height = 50;
+        let ck1 = mpso_signing_key(80);
+        let ck2 = mpso_signing_key(81);
+        let rk1 = mpso_signing_key(82);
+        let dest = mpso_signing_key(83);
+        let (prev, mpso) =
+            add_mpso_utxo(&mut chain, 10_000, &[&ck1, &ck2], 2, &[&rk1], 1, 100, None);
+
+        let mut tx = simple_spend_tx(&prev, &dest);
+        tx.inputs[0].script_sig = mpso_sign_claim(&tx, 0, &mpso, &[&ck1, &ck2], 0b00000011, None);
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "full quorum claim must succeed"
+        );
+    }
+
+    #[test]
+    fn mpso_different_claim_refund_thresholds() {
+        // refund_m != claim_m
+        let mut chain = mpso_chain(Some(1));
+        let ck1 = mpso_signing_key(90);
+        let ck2 = mpso_signing_key(91);
+        let ck3 = mpso_signing_key(92);
+        let rk1 = mpso_signing_key(93);
+        let rk2 = mpso_signing_key(94);
+        let dest = mpso_signing_key(95);
+
+        // Claim: 2-of-3, Refund: 1-of-2
+        chain.height = 50;
+        let (prev, mpso) = add_mpso_utxo(
+            &mut chain,
+            10_000,
+            &[&ck1, &ck2, &ck3],
+            2,
+            &[&rk1, &rk2],
+            1,
+            100,
+            None,
+        );
+
+        // Valid claim: 2-of-3
+        let mut tx = simple_spend_tx(&prev, &dest);
+        tx.inputs[0].script_sig = mpso_sign_claim(&tx, 0, &mpso, &[&ck1, &ck2], 0b00000011, None);
+        assert!(chain.validate_transaction(&tx).is_ok(), "2-of-3 claim");
+
+        // Valid refund: 1-of-2
+        chain.height = 200;
+        let (prev2, mpso2) = add_mpso_utxo(
+            &mut chain,
+            10_000,
+            &[&ck1, &ck2, &ck3],
+            2,
+            &[&rk1, &rk2],
+            1,
+            100,
+            None,
+        );
+        let mut tx2 = simple_spend_tx(&prev2, &dest);
+        tx2.inputs[0].script_sig = mpso_sign_refund(&tx2, 0, &mpso2, &[&rk2], 0b00000010);
+        assert!(
+            chain.validate_transaction(&tx2).is_ok(),
+            "1-of-2 refund (key index 1)"
+        );
+    }
 }

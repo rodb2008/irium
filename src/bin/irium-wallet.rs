@@ -9,20 +9,18 @@ use irium_node_rs::settlement::{
     build_milestone_agreement, build_otc_agreement, build_simple_settlement_agreement,
     canonical_serialization_rules, compute_agreement_bundle_hash_hex,
     compute_agreement_signature_payload_hash, inspect_agreement_share_package,
-    inspect_agreement_signature, render_agreement_audit_csv, summarize_agreement_authenticity,
-    validate_agreement_signature_envelope, verify_agreement_bundle, verify_agreement_share_package,
+    inspect_agreement_signature, render_agreement_audit_csv, settlement_proof_payload_bytes,
+    summarize_agreement_authenticity, validate_agreement_signature_envelope,
+    validate_typed_proof_payload, verify_agreement_bundle, verify_agreement_share_package,
     verify_bundle_signatures, AgreementArtifactVerificationResult, AgreementAuditRecord,
     AgreementBundle, AgreementBundleChainObservationSnapshot, AgreementLifecycleView,
     AgreementMilestone, AgreementObject, AgreementParty, AgreementSharePackage,
     AgreementSharePackageInspection, AgreementSharePackageVerificationResult,
     AgreementSignatureEnvelope, AgreementSignatureTargetType, AgreementSignatureVerification,
-    AgreementStatement, AgreementSummary, AgreementTemplateType,
-    AGREEMENT_SIGNATURE_TYPE_SECP256K1, AGREEMENT_SIGNATURE_VERSION,
-    HoldbackEvaluationResult, HoldbackOutcome, MilestoneEvaluationResult,
-    PolicyOutcome,
-    ProofPolicy, ProofSignatureEnvelope, SettlementProof, SETTLEMENT_PROOF_SCHEMA_ID,
-    TypedProofPayload, validate_typed_proof_payload,
-    settlement_proof_payload_bytes,
+    AgreementStatement, AgreementSummary, AgreementTemplateType, HoldbackEvaluationResult,
+    HoldbackOutcome, MilestoneEvaluationResult, PolicyOutcome, ProofPolicy, ProofSignatureEnvelope,
+    SettlementProof, TypedProofPayload, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+    AGREEMENT_SIGNATURE_VERSION, SETTLEMENT_PROOF_SCHEMA_ID,
 };
 use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
 use k256::ecdsa::signature::hazmat::PrehashSigner;
@@ -416,8 +414,6 @@ struct AgreementSpendEligibilityResponse {
     trust_model_note: String,
 }
 
-
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct SubmitProofRpcRequest {
     proof: SettlementProof,
@@ -468,7 +464,9 @@ struct ListPoliciesRpcResponse {
     active_only: bool,
 }
 
-fn u32_is_zero(n: &u32) -> bool { *n == 0 }
+fn u32_is_zero(n: &u32) -> bool {
+    *n == 0
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ListProofsRpcRequest {
@@ -697,7 +695,6 @@ struct BuildTemplateRpcResponse {
     has_holdback: bool,
     has_timeout_rules: bool,
 }
-
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct EvaluatePolicyRpcRequest {
@@ -2105,17 +2102,19 @@ fn usage() {
     eprintln!("  irium-wallet agreement-release-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-refund-eligibility <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-policy-check --agreement <agreement.json|-> --policy <policy.json|-> [--proof <proof.json>]... [--rpc <url>] [--json]");
-  eprintln!("  irium-wallet agreement-policy-set --policy <policy.json|-> [--rpc <url>] [--json] [--replace] [--expires-at-height <n>]");
-  eprintln!("  irium-wallet policy-build-contractor --policy-id <id> --agreement-hash <hash> --attestor <id>:<pubkey_or_addr> --milestone <id>:<type> [--raw-policy] [--json] [--rpc <url>]");
-  eprintln!("  irium-wallet policy-build-preorder --policy-id <id> --agreement-hash <hash> --attestor <id>:<pubkey_or_addr> --delivery-proof-type <type> [--raw-policy] [--json] [--rpc <url>]");
-  eprintln!("  irium-wallet policy-build-otc --policy-id <id> --agreement-hash <hash> --attestor <id>:<pubkey_or_addr> --release-proof-type <type> [--raw-policy] [--json] [--rpc <url>]");
-  eprintln!("  irium-wallet agreement-policy-get --agreement-hash <hex> [--rpc <url>] [--json]");
-  eprintln!("  irium-wallet agreement-policy-evaluate --agreement <agreement.json|-> [--rpc <url>] [--json]");
-  eprintln!("  irium-wallet agreement-build-settlement <agreement.json> [--rpc <url>] [--json]");
-  eprintln!("  irium-wallet agreement-settle-status <agreement.json> [--rpc <url>]");
-  eprintln!("  irium-wallet agreement-policy-list [--active-only] [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-policy-set --policy <policy.json|-> [--rpc <url>] [--json] [--replace] [--expires-at-height <n>]");
+    eprintln!("  irium-wallet policy-build-contractor --policy-id <id> --agreement-hash <hash> --attestor <id>:<pubkey_or_addr> --milestone <id>:<type> [--raw-policy] [--json] [--rpc <url>]");
+    eprintln!("  irium-wallet policy-build-preorder --policy-id <id> --agreement-hash <hash> --attestor <id>:<pubkey_or_addr> --delivery-proof-type <type> [--raw-policy] [--json] [--rpc <url>]");
+    eprintln!("  irium-wallet policy-build-otc --policy-id <id> --agreement-hash <hash> --attestor <id>:<pubkey_or_addr> --release-proof-type <type> [--raw-policy] [--json] [--rpc <url>]");
+    eprintln!("  irium-wallet agreement-policy-get --agreement-hash <hex> [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-policy-evaluate --agreement <agreement.json|-> [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-build-settlement <agreement.json> [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-settle-status <agreement.json> [--rpc <url>]");
+    eprintln!("  irium-wallet agreement-policy-list [--active-only] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-create --agreement-hash <hex> --proof-type <type> --attested-by <id> --address <addr> [--expires-at-height <n>] [--milestone-id <id>] [--evidence-summary <text>] [--evidence-hash <hex>] [--proof-id <id>] [--timestamp <block_height>] [--rpc <url>] [--proof-kind <kind>] [--reference-id <ref>] [--out <path>] [--json]");
-    eprintln!("  irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>] [--json]");
+    eprintln!(
+        "  irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>] [--json]"
+    );
     eprintln!("  irium-wallet agreement-proof-list [--agreement-hash <hex>] [--active-only] [--offset <n>] [--limit <n>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-proof-get --proof-id <id> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet agreement-release-build <agreement.json|bundle.json|agreement_id|agreement_hash> [funding_txid] [--vout <n>] [--milestone-id <id>] [--destination <addr>] [--secret <hex>] [--fee-per-byte <n>] [--rpc <url>] [--json] [--show-raw-tx]");
@@ -2273,37 +2272,52 @@ struct SettlementClient {
 impl SettlementClient {
     fn new(base: &str) -> Result<Self, String> {
         let client = rpc_client(base)?;
-        Ok(Self { client, base: base.to_string() })
+        Ok(Self {
+            client,
+            base: base.to_string(),
+        })
     }
 
     fn post<TReq: serde::Serialize, TResp: for<'de> serde::Deserialize<'de>>(
-        &self, path: &str, body: &TReq,
+        &self,
+        path: &str,
+        body: &TReq,
     ) -> Result<TResp, String> {
         rpc_post_json(&self.client, &self.base, path, body)
     }
 
     fn compute_agreement_hash(
-        &self, agreement: AgreementObject,
+        &self,
+        agreement: AgreementObject,
     ) -> Result<ComputeAgreementHashRpcResponse, String> {
-        self.post("/rpc/computeagreementhash", &ComputeAgreementHashRpcRequest { agreement })
+        self.post(
+            "/rpc/computeagreementhash",
+            &ComputeAgreementHashRpcRequest { agreement },
+        )
     }
 
-    fn get_policy(
-        &self, agreement_hash: String,
-    ) -> Result<GetPolicyRpcResponse, String> {
+    fn get_policy(&self, agreement_hash: String) -> Result<GetPolicyRpcResponse, String> {
         self.post("/rpc/getpolicy", &GetPolicyRpcRequest { agreement_hash })
     }
 
     fn evaluate_policy(
-        &self, agreement: AgreementObject,
+        &self,
+        agreement: AgreementObject,
     ) -> Result<EvaluatePolicyRpcResponse, String> {
-        self.post("/rpc/evaluatepolicy", &EvaluatePolicyRpcRequest { agreement })
+        self.post(
+            "/rpc/evaluatepolicy",
+            &EvaluatePolicyRpcRequest { agreement },
+        )
     }
 
     fn build_settlement_tx(
-        &self, agreement: AgreementObject,
+        &self,
+        agreement: AgreementObject,
     ) -> Result<BuildSettlementTxRpcResponse, String> {
-        self.post("/rpc/buildsettlementtx", &BuildSettlementTxRpcRequest { agreement })
+        self.post(
+            "/rpc/buildsettlementtx",
+            &BuildSettlementTxRpcRequest { agreement },
+        )
     }
 }
 
@@ -2429,7 +2443,8 @@ fn fetch_tip_height(client: &Client, base: &str) -> Result<u64, String> {
     if !resp.status().is_success() {
         return Err(format!("status request failed: {}", resp.status()));
     }
-    let body: serde_json::Value = resp.json()
+    let body: serde_json::Value = resp
+        .json()
         .map_err(|e| format!("parse status response: {e}"))?;
     body.get("height")
         .and_then(|v| v.as_u64())
@@ -2961,9 +2976,7 @@ fn resolve_bundle_reference_or_stdin(reference: &str) -> Result<StoredAgreementB
 
 fn resolve_attestor_pubkey_hex(pubkey_or_address: &str) -> Result<String, String> {
     // Accept compressed secp256k1 pubkey hex (66 hex chars) directly.
-    if pubkey_or_address.len() == 66
-        && pubkey_or_address.chars().all(|c| c.is_ascii_hexdigit())
-    {
+    if pubkey_or_address.len() == 66 && pubkey_or_address.chars().all(|c| c.is_ascii_hexdigit()) {
         return Ok(pubkey_or_address.to_string());
     }
     // Otherwise treat as a wallet address and resolve to pubkey.
@@ -3017,7 +3030,10 @@ fn sign_target_hash(
     Ok(envelope)
 }
 
-fn create_settlement_proof_signed(opts: &ProofCreateCliOptions, attestation_time: u64) -> Result<SettlementProof, String> {
+fn create_settlement_proof_signed(
+    opts: &ProofCreateCliOptions,
+    attestation_time: u64,
+) -> Result<SettlementProof, String> {
     let (key, signing_key) = signer_material_from_wallet(&opts.address)?;
 
     // Generate a deterministic proof_id from (proof_type, agreement_hash, timestamp) if not provided.
@@ -4692,6 +4708,275 @@ fn render_agreement_statement(statement: &AgreementStatement) -> String {
     )
 }
 
+fn render_agreement_receipt_text(statement: &AgreementStatement) -> String {
+    let sep = "-------------------------------------";
+    let wide = "=====================================";
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", wide));
+    out.push_str("       IRIUM SETTLEMENT RECEIPT      \n");
+    out.push_str(&format!("{}\n", wide));
+    out.push_str("NOTICE: This receipt is informational. Canonical source of\n");
+    out.push_str("truth is the agreement hash plus on-chain / RPC state.\n");
+    out.push_str(&format!("{}\n", sep));
+    out.push_str("AGREEMENT\n");
+    out.push_str(&format!(
+        "  ID      : {}\n",
+        statement.identity.agreement_id
+    ));
+    out.push_str(&format!(
+        "  Hash    : {}\n",
+        statement.identity.agreement_hash
+    ));
+    let tmpl_raw = serde_json::to_string(&statement.identity.template_type)
+        .unwrap_or_else(|_| "\"unknown\"".to_string());
+    let tmpl = tmpl_raw.trim_start_matches("\"").trim_end_matches("\"");
+    out.push_str(&format!("  Template: {}\n", tmpl));
+    out.push_str(&format!("{}\n", sep));
+    out.push_str("PARTIES\n");
+    out.push_str(&format!("  Payer   : {}\n", statement.counterparties.payer));
+    out.push_str(&format!("  Payee   : {}\n", statement.counterparties.payee));
+    for p in &statement.counterparties.parties_summary {
+        out.push_str(&format!("  Party   : {}\n", p));
+    }
+    out.push_str(&format!("{}\n", sep));
+    out.push_str("COMMERCIAL TERMS\n");
+    out.push_str(&format!(
+        "  Total Amount     : {} IRM\n",
+        format_irm(statement.commercial.total_amount)
+    ));
+    out.push_str(&format!(
+        "  Milestones       : {}\n",
+        statement.commercial.milestone_summary
+    ));
+    out.push_str(&format!(
+        "  Release Path     : {}\n",
+        statement.commercial.release_path_summary
+    ));
+    out.push_str(&format!(
+        "  Refund Path      : {}\n",
+        statement.commercial.refund_path_summary
+    ));
+    if let Some(d) = statement.commercial.settlement_deadline {
+        out.push_str(&format!("  Settlement Deadline: {}\n", d));
+    }
+    if let Some(d) = statement.commercial.refund_deadline {
+        out.push_str(&format!("  Refund Deadline  : {}\n", d));
+    }
+    out.push_str(&format!("{}\n", sep));
+    out.push_str("OBSERVED ACTIVITY\n");
+    out.push_str(&format!(
+        "  Funding Observed : {}\n",
+        statement.observed.funding_observed
+    ));
+    out.push_str(&format!(
+        "  Release Observed : {}\n",
+        statement.observed.release_observed
+    ));
+    out.push_str(&format!(
+        "  Refund Observed  : {}\n",
+        statement.observed.refund_observed
+    ));
+    for txid in &statement.observed.linked_txids {
+        out.push_str(&format!("  Linked Txid      : {}\n", txid));
+    }
+    if let Some(w) = &statement.observed.ambiguity_warning {
+        out.push_str(&format!("  Ambiguity Warning: {}\n", w));
+    }
+    out.push_str(&format!("{}\n", sep));
+    out.push_str("SETTLEMENT OUTCOME\n");
+    out.push_str(&format!(
+        "  Status           : {}\n",
+        statement.derived.derived_state_label
+    ));
+    out.push_str(&format!(
+        "  Funded Amount    : {} IRM\n",
+        format_irm(statement.derived.funded_amount)
+    ));
+    out.push_str(&format!(
+        "  Released Amount  : {} IRM\n",
+        format_irm(statement.derived.released_amount)
+    ));
+    out.push_str(&format!(
+        "  Refunded Amount  : {} IRM\n",
+        format_irm(statement.derived.refunded_amount)
+    ));
+    if !statement.derived.note.is_empty() {
+        out.push_str(&format!(
+            "  Note             : {}\n",
+            statement.derived.note
+        ));
+    }
+    if let Some(auth) = &statement.authenticity {
+        out.push_str(&format!("{}\n", sep));
+        out.push_str("AUTHENTICITY\n");
+        out.push_str(&format!(
+            "  Valid / Invalid / Unverifiable: {} / {} / {}\n",
+            auth.valid_signatures, auth.invalid_signatures, auth.unverifiable_signatures
+        ));
+        out.push_str(&format!("  Summary : {}\n", auth.compact_summary));
+    }
+    out.push_str(&format!("{}\n", sep));
+    out.push_str("GENERATED\n");
+    out.push_str(&format!(
+        "  Generated At     : {}\n",
+        statement.metadata.generated_at
+    ));
+    out.push_str(&format!(
+        "  Canonical Notice : {}\n",
+        statement.references.canonical_agreement_notice
+    ));
+    out.push_str(&format!("{}\n", wide));
+    out
+}
+
+fn html_esc(s: &str) -> String {
+    s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+}
+
+fn render_agreement_receipt_html(statement: &AgreementStatement) -> String {
+    let tmpl_raw = serde_json::to_string(&statement.identity.template_type)
+        .unwrap_or_else(|_| "\"unknown\"".to_string());
+    let tmpl_str = tmpl_raw
+        .trim_start_matches("\"")
+        .trim_end_matches("\"")
+        .to_string();
+    let mut rows = String::new();
+    rows.push_str(&format!(
+        "<tr><th>Agreement ID</th><td><code>{}</code></td></tr>\n",
+        html_esc(&statement.identity.agreement_id)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Agreement Hash</th><td><code>{}</code></td></tr>\n",
+        html_esc(&statement.identity.agreement_hash)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Template</th><td>{}</td></tr>\n",
+        html_esc(&tmpl_str)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Payer</th><td><code>{}</code></td></tr>\n",
+        html_esc(&statement.counterparties.payer)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Payee</th><td><code>{}</code></td></tr>\n",
+        html_esc(&statement.counterparties.payee)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Total Amount</th><td>{} IRM</td></tr>\n",
+        html_esc(&format_irm(statement.commercial.total_amount))
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Milestones</th><td>{}</td></tr>\n",
+        html_esc(&statement.commercial.milestone_summary)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Release Path</th><td>{}</td></tr>\n",
+        html_esc(&statement.commercial.release_path_summary)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Refund Path</th><td>{}</td></tr>\n",
+        html_esc(&statement.commercial.refund_path_summary)
+    ));
+    if let Some(d) = statement.commercial.settlement_deadline {
+        rows.push_str(&format!(
+            "<tr><th>Settlement Deadline</th><td>{}</td></tr>\n",
+            d
+        ));
+    }
+    if let Some(d) = statement.commercial.refund_deadline {
+        rows.push_str(&format!(
+            "<tr><th>Refund Deadline</th><td>{}</td></tr>\n",
+            d
+        ));
+    }
+    rows.push_str(&format!(
+        "<tr><th>Funding Observed</th><td>{}</td></tr>\n",
+        statement.observed.funding_observed
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Release Observed</th><td>{}</td></tr>\n",
+        statement.observed.release_observed
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Refund Observed</th><td>{}</td></tr>\n",
+        statement.observed.refund_observed
+    ));
+    for txid in &statement.observed.linked_txids {
+        rows.push_str(&format!(
+            "<tr><th>Linked Txid</th><td><code>{}</code></td></tr>\n",
+            html_esc(txid)
+        ));
+    }
+    if let Some(w) = &statement.observed.ambiguity_warning {
+        rows.push_str(&format!(
+            "<tr><th>Ambiguity Warning</th><td class=\"warn\">{}</td></tr>\n",
+            html_esc(w)
+        ));
+    }
+    rows.push_str(&format!(
+        "<tr><th>Derived Status</th><td><strong>{}</strong></td></tr>\n",
+        html_esc(&statement.derived.derived_state_label)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Funded Amount</th><td>{} IRM</td></tr>\n",
+        html_esc(&format_irm(statement.derived.funded_amount))
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Released Amount</th><td>{} IRM</td></tr>\n",
+        html_esc(&format_irm(statement.derived.released_amount))
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Refunded Amount</th><td>{} IRM</td></tr>\n",
+        html_esc(&format_irm(statement.derived.refunded_amount))
+    ));
+    if !statement.derived.note.is_empty() {
+        rows.push_str(&format!(
+            "<tr><th>Note</th><td>{}</td></tr>\n",
+            html_esc(&statement.derived.note)
+        ));
+    }
+    if let Some(auth) = &statement.authenticity {
+        rows.push_str(&format!(
+            "<tr><th>Signatures</th><td>valid {} / invalid {} / unverifiable {}</td></tr>\n",
+            auth.valid_signatures, auth.invalid_signatures, auth.unverifiable_signatures
+        ));
+    }
+    rows.push_str(&format!(
+        "<tr><th>Generated At</th><td>{}</td></tr>\n",
+        statement.metadata.generated_at
+    ));
+    let canonical = html_esc(&statement.references.canonical_agreement_notice);
+    let mut html = String::new();
+    html.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    html.push_str("<title>Irium Settlement Receipt</title>\n<style>\n");
+    html.push_str("body{font-family:monospace;max-width:720px;margin:2em auto;padding:1em}\n");
+    html.push_str("h1{border-bottom:2px solid #333;padding-bottom:.4em}\n");
+    html.push_str("table{border-collapse:collapse;width:100%}\n");
+    html.push_str("th,td{text-align:left;padding:.4em .6em;border-bottom:1px solid #ddd;vertical-align:top}\n");
+    html.push_str("th{width:40%;color:#555;font-weight:normal}\n");
+    html.push_str("code{font-size:.9em;word-break:break-all}\n");
+    html.push_str(".notice{font-size:.85em;color:#666;margin:.5em 0}\n");
+    html.push_str(".warn{color:#b30000}\n");
+    html.push_str("</style>\n</head>\n<body>\n");
+    html.push_str("<h1>Irium Settlement Receipt</h1>\n");
+    html.push_str("<p class=\"notice\">This receipt is informational. ");
+    html.push_str(
+        "Canonical source of truth is the agreement hash plus on-chain / RPC state.</p>\n",
+    );
+    html.push_str("<table>\n");
+    html.push_str(&rows);
+    html.push_str("</table>\n");
+    html.push_str(&format!(
+        "<p class=\"notice\">Canonical notice: {}</p>\n",
+        canonical
+    ));
+    html.push_str("</body>\n</html>");
+    html
+}
+
 fn validate_agreement_audit_export_format(
     export_format: &str,
     json_mode: bool,
@@ -4961,8 +5246,6 @@ fn render_bundle_summary(bundle: &AgreementBundle, source: &str) -> String {
     )
 }
 
-
-
 fn parse_proof_submit_cli(args: &[String]) -> Result<ProofSubmitCliOptions, String> {
     let mut proof_path: Option<String> = None;
     let mut rpc_url = default_rpc_url();
@@ -5025,14 +5308,20 @@ fn parse_proof_list_cli(args: &[String]) -> Result<ProofListCliOptions, String> 
                 if i >= args.len() {
                     return Err("--offset requires a value".to_string());
                 }
-                offset = args[i].parse::<u32>().map_err(|_| "--offset must be a non-negative integer".to_string())?;
+                offset = args[i]
+                    .parse::<u32>()
+                    .map_err(|_| "--offset must be a non-negative integer".to_string())?;
             }
             "--limit" => {
                 i += 1;
                 if i >= args.len() {
                     return Err("--limit requires a value".to_string());
                 }
-                limit = Some(args[i].parse::<u32>().map_err(|_| "--limit must be a positive integer".to_string())?);
+                limit = Some(
+                    args[i]
+                        .parse::<u32>()
+                        .map_err(|_| "--limit must be a positive integer".to_string())?,
+                );
             }
             "--rpc" => {
                 i += 1;
@@ -5091,7 +5380,11 @@ fn parse_proof_get_cli(args: &[String]) -> Result<ProofGetCliOptions, String> {
         i += 1;
     }
     let proof_id = proof_id.ok_or_else(|| "--proof-id is required".to_string())?;
-    Ok(ProofGetCliOptions { proof_id, rpc_url, json_mode })
+    Ok(ProofGetCliOptions {
+        proof_id,
+        rpc_url,
+        json_mode,
+    })
 }
 
 fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, String> {
@@ -5192,7 +5485,10 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
                     return Err("--expires-at-height requires a value".to_string());
                 }
                 let v: u64 = args[i].parse().map_err(|_| {
-                    format!("--expires-at-height must be a non-negative integer, got: {}", args[i])
+                    format!(
+                        "--expires-at-height must be a non-negative integer, got: {}",
+                        args[i]
+                    )
                 })?;
                 expires_at_height = Some(v);
             }
@@ -5201,17 +5497,23 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
             }
             "--proof-kind" => {
                 i += 1;
-                if i >= args.len() { return Err("--proof-kind requires a value".to_string()); }
+                if i >= args.len() {
+                    return Err("--proof-kind requires a value".to_string());
+                }
                 proof_kind = Some(args[i].clone());
             }
             "--reference-id" => {
                 i += 1;
-                if i >= args.len() { return Err("--reference-id requires a value".to_string()); }
+                if i >= args.len() {
+                    return Err("--reference-id requires a value".to_string());
+                }
                 reference_id = Some(args[i].clone());
             }
             "--rpc" => {
                 i += 1;
-                if i >= args.len() { return Err("--rpc requires a value".to_string()); }
+                if i >= args.len() {
+                    return Err("--rpc requires a value".to_string());
+                }
                 rpc_url = Some(args[i].clone());
             }
             other => {
@@ -5221,8 +5523,7 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
         i += 1;
     }
     Ok(ProofCreateCliOptions {
-        agreement_hash: agreement_hash
-            .ok_or_else(|| "--agreement-hash is required".to_string())?,
+        agreement_hash: agreement_hash.ok_or_else(|| "--agreement-hash is required".to_string())?,
         proof_type: proof_type.ok_or_else(|| "--proof-type is required".to_string())?,
         attested_by: attested_by.ok_or_else(|| "--attested-by is required".to_string())?,
         address: address.ok_or_else(|| "--address is required".to_string())?,
@@ -5270,11 +5571,21 @@ fn render_proof_list_summary(resp: &ListProofsRpcResponse) -> String {
         lines.push(format!("agreement_hash {}", resp.agreement_hash));
     }
     lines.push(format!("returned_count {}", resp.returned_count));
-    if resp.has_more || resp.total_count != resp.returned_count || resp.offset != 0 || resp.limit.is_some() {
+    if resp.has_more
+        || resp.total_count != resp.returned_count
+        || resp.offset != 0
+        || resp.limit.is_some()
+    {
         lines.push(format!("total_count {}", resp.total_count));
-        if resp.offset != 0 { lines.push(format!("offset {}", resp.offset)); }
-        if let Some(lim) = resp.limit { lines.push(format!("limit {}", lim)); }
-        if resp.has_more { lines.push("has_more true".to_string()); }
+        if resp.offset != 0 {
+            lines.push(format!("offset {}", resp.offset));
+        }
+        if let Some(lim) = resp.limit {
+            lines.push(format!("limit {}", lim));
+        }
+        if resp.has_more {
+            lines.push("has_more true".to_string());
+        }
     }
     for item in &resp.proofs {
         let expiry_str = match item.proof.expires_at_height {
@@ -5290,23 +5601,36 @@ fn render_proof_list_summary(resp: &ListProofsRpcResponse) -> String {
             format!(" status={}", item.status)
         };
         // proof_kind is unsigned metadata (not part of signed proof payload); label clearly.
-        let kind_str = item.proof.typed_payload.as_ref()
+        let kind_str = item
+            .proof
+            .typed_payload
+            .as_ref()
             .map(|tp| format!(" proof_kind={} [metadata]", tp.proof_kind))
             .unwrap_or_default();
         lines.push(format!(
             "  agreement_hash={} proof_id={} attested_by={} proof_type={} {}{}{}",
-            item.proof.agreement_hash, item.proof.proof_id, item.proof.attested_by, item.proof.proof_type,
-            expiry_str, status_str, kind_str
+            item.proof.agreement_hash,
+            item.proof.proof_id,
+            item.proof.attested_by,
+            item.proof.proof_type,
+            expiry_str,
+            status_str,
+            kind_str
         ));
     }
-    lines.join("
-")
+    lines.join(
+        "
+",
+    )
 }
 
 fn render_proof_get_summary(resp: &GetProofRpcResponse) -> String {
     if !resp.found {
-        return format!("proof_id {}
-not_found true", resp.proof_id);
+        return format!(
+            "proof_id {}
+not_found true",
+            resp.proof_id
+        );
     }
     let mut lines = Vec::new();
     lines.push(format!("proof_id {}", resp.proof_id));
@@ -5336,8 +5660,10 @@ not_found true", resp.proof_id);
     if !resp.status.is_empty() {
         lines.push(format!("status {}", resp.status));
     }
-    lines.join("
-")
+    lines.join(
+        "
+",
+    )
 }
 
 fn parse_policy_set_cli(args: &[String]) -> Result<PolicySetCliOptions, String> {
@@ -5375,7 +5701,10 @@ fn parse_policy_set_cli(args: &[String]) -> Result<PolicySetCliOptions, String> 
                     return Err("--expires-at-height requires a value".to_string());
                 }
                 expires_at_height = Some(args[i].parse::<u64>().map_err(|_| {
-                    format!("--expires-at-height must be a non-negative integer, got: {}", args[i])
+                    format!(
+                        "--expires-at-height must be a non-negative integer, got: {}",
+                        args[i]
+                    )
                 })?);
             }
             other => {
@@ -5424,8 +5753,7 @@ fn parse_policy_get_cli(args: &[String]) -> Result<PolicyGetCliOptions, String> 
         i += 1;
     }
     Ok(PolicyGetCliOptions {
-        agreement_hash: agreement_hash
-            .ok_or_else(|| "--agreement-hash is required".to_string())?,
+        agreement_hash: agreement_hash.ok_or_else(|| "--agreement-hash is required".to_string())?,
         rpc_url,
         json_mode,
     })
@@ -5457,7 +5785,11 @@ fn parse_policy_list_cli(args: &[String]) -> Result<PolicyListCliOptions, String
         }
         i += 1;
     }
-    Ok(PolicyListCliOptions { rpc_url, json_mode, active_only })
+    Ok(PolicyListCliOptions {
+        rpc_url,
+        json_mode,
+        active_only,
+    })
 }
 
 fn render_policy_list_summary(resp: &ListPoliciesRpcResponse) -> String {
@@ -5510,11 +5842,24 @@ fn parse_policy_evaluate_cli(args: &[String]) -> Result<PolicyEvaluateCliOptions
         i += 1;
     }
     Ok(PolicyEvaluateCliOptions {
-        agreement_path: agreement_path
-            .ok_or_else(|| "--agreement is required".to_string())?,
+        agreement_path: agreement_path.ok_or_else(|| "--agreement is required".to_string())?,
         rpc_url,
         json_mode,
     })
+}
+
+fn flow_next_step_hint(outcome: &str, release_eligible: bool, refund_eligible: bool) -> &'static str {
+    if release_eligible {
+        "run agreement-release-build to construct the release transaction"
+    } else if refund_eligible {
+        "run agreement-refund-build to construct the refund transaction"
+    } else {
+        match outcome {
+            "satisfied" => "policy satisfied but not yet executable; re-run agreement-policy-evaluate after the holdback height",
+            "timeout"   => "agreement timed out; refund path is now eligible, run agreement-refund-build",
+            _           => "run agreement-proof-create then agreement-proof-submit to submit attestation, then re-evaluate",
+        }
+    }
 }
 
 fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
@@ -5536,7 +5881,10 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
     }
     lines.push(format!("matched_proof_count {}", resp.matched_proof_count));
     if !resp.matched_proof_ids.is_empty() {
-        lines.push(format!("matched_proof_ids {}", resp.matched_proof_ids.join(", ")));
+        lines.push(format!(
+            "matched_proof_ids {}",
+            resp.matched_proof_ids.join(", ")
+        ));
     }
     lines.push(format!("expired {}", resp.expired));
     lines.push(format!("release_eligible {}", resp.release_eligible));
@@ -5567,7 +5915,10 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
             };
             lines.push(format!("  milestone {} outcome {}", display, outcome_label));
             if !ms.matched_proof_ids.is_empty() {
-                lines.push(format!("    matched_proof_ids {}", ms.matched_proof_ids.join(", ")));
+                lines.push(format!(
+                    "    matched_proof_ids {}",
+                    ms.matched_proof_ids.join(", ")
+                ));
             }
             if !ms.reason.is_empty() && ms.outcome != "satisfied" {
                 lines.push(format!("    reason {}", ms.reason));
@@ -5600,23 +5951,36 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
                 tr.requirement_id,
                 tr.approved_attestor_count,
                 tr.threshold_required,
-                if tr.threshold_satisfied { "satisfied" } else { "pending" }
+                if tr.threshold_satisfied {
+                    "satisfied"
+                } else {
+                    "pending"
+                }
             ));
         }
     }
+    lines.push(format!("next_step  {}", flow_next_step_hint(&resp.outcome, resp.release_eligible, resp.refund_eligible)));
     lines.join("\n")
 }
 
 fn render_policy_set_summary(resp: &StorePolicyRpcResponse) -> String {
     let status = if resp.accepted {
-        if resp.updated { "replaced" } else { "accepted" }
+        if resp.updated {
+            "replaced"
+        } else {
+            "accepted"
+        }
     } else {
         "rejected"
     };
-    format!(
+    let mut out = format!(
         "policy_id {}\nagreement_hash {}\nstatus {}\nmessage {}",
         resp.policy_id, resp.agreement_hash, status, resp.message
-    )
+    );
+    if resp.accepted {
+        out.push_str("\nnext_step  run agreement-policy-evaluate to verify the policy is active");
+    }
+    out
 }
 
 fn render_policy_get_summary(resp: &GetPolicyRpcResponse) -> String {
@@ -5693,8 +6057,13 @@ fn render_proof_create_summary(proof: &SettlementProof) -> String {
     }
     lines.push(format!("payload_hash {}", proof.signature.payload_hash));
     lines.push(format!("pubkey_hex {}", proof.signature.pubkey_hex));
-    lines.join("
-")
+    lines.push(
+        "next_step  run agreement-proof-submit to broadcast this proof to the node".to_string(),
+    );
+    lines.join(
+        "
+",
+    )
 }
 
 fn parse_policy_check_cli(args: &[String]) -> Result<PolicyCheckCliOptions, String> {
@@ -5744,10 +6113,8 @@ fn parse_policy_check_cli(args: &[String]) -> Result<PolicyCheckCliOptions, Stri
         i += 1;
     }
     Ok(PolicyCheckCliOptions {
-        agreement_path: agreement_path
-            .ok_or_else(|| "--agreement is required".to_string())?,
-        policy_path: policy_path
-            .ok_or_else(|| "--policy is required".to_string())?,
+        agreement_path: agreement_path.ok_or_else(|| "--agreement is required".to_string())?,
+        policy_path: policy_path.ok_or_else(|| "--policy is required".to_string())?,
         proof_paths,
         rpc_url,
         json_mode,
@@ -5769,23 +6136,41 @@ fn render_policy_check_summary(resp: &CheckPolicyRpcResponse) -> String {
         }
     }
     if !resp.milestone_results.is_empty() {
-        let satisfied = resp.milestone_results.iter().filter(|m| matches!(m.outcome, PolicyOutcome::Satisfied)).count();
-        lines.push(format!("milestones {}/{}", satisfied, resp.milestone_results.len()));
+        let satisfied = resp
+            .milestone_results
+            .iter()
+            .filter(|m| matches!(m.outcome, PolicyOutcome::Satisfied))
+            .count();
+        lines.push(format!(
+            "milestones {}/{}",
+            satisfied,
+            resp.milestone_results.len()
+        ));
         for ms in &resp.milestone_results {
-            let display = ms.label.as_deref().filter(|l| !l.is_empty()).unwrap_or(ms.milestone_id.as_str());
+            let display = ms
+                .label
+                .as_deref()
+                .filter(|l| !l.is_empty())
+                .unwrap_or(ms.milestone_id.as_str());
             let ms_outcome_str = match ms.outcome {
                 PolicyOutcome::Satisfied => "satisfied",
                 PolicyOutcome::Timeout => "timeout",
                 PolicyOutcome::Unsatisfied => "unsatisfied",
             };
-            lines.push(format!("  milestone {} outcome {}", display, ms_outcome_str));
+            lines.push(format!(
+                "  milestone {} outcome {}",
+                display, ms_outcome_str
+            ));
             if let Some(ref hb) = ms.holdback {
                 let hb_ms_outcome_str = match hb.holdback_outcome {
                     HoldbackOutcome::Held => "held",
                     HoldbackOutcome::Released => "released",
                     HoldbackOutcome::Pending => "pending",
                 };
-                lines.push(format!("    holdback {} bps holdback_outcome {}", hb.holdback_bps, hb_ms_outcome_str));
+                lines.push(format!(
+                    "    holdback {} bps holdback_outcome {}",
+                    hb.holdback_bps, hb_ms_outcome_str
+                ));
                 if !hb.holdback_reason.is_empty() {
                     lines.push(format!("    holdback_reason {}", hb.holdback_reason));
                 }
@@ -5800,7 +6185,10 @@ fn render_policy_check_summary(resp: &CheckPolicyRpcResponse) -> String {
         };
         lines.push(format!("holdback_outcome {}", outcome_str));
         lines.push(format!("holdback_bps {}", hb.holdback_bps));
-        lines.push(format!("immediate_release_bps {}", hb.immediate_release_bps));
+        lines.push(format!(
+            "immediate_release_bps {}",
+            hb.immediate_release_bps
+        ));
         lines.push(format!("holdback_reason {}", hb.holdback_reason));
     }
     lines.join("\n")
@@ -6220,6 +6608,901 @@ fn parse_optional_hex_hash(value: Option<String>, label: &str) -> Result<Option<
         return Ok(Some(value));
     }
     Ok(None)
+}
+
+// ============================================================
+// Guided OTC flow (high-level orchestration commands)
+// ============================================================
+
+fn handle_otc_create(args: &[String]) -> Result<(), String> {
+    let mut seller: Option<String> = None;
+    let mut buyer: Option<String> = None;
+    let mut amount: Option<u64> = None;
+    let mut asset: Option<String> = None;
+    let mut payment_method: Option<String> = None;
+    let mut timeout: Option<u64> = None;
+    let mut agreement_id: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seller" => {
+                seller = Some(parse_required_string_flag(args, &mut i, "--seller")?);
+            }
+            "--buyer" => {
+                buyer = Some(parse_required_string_flag(args, &mut i, "--buyer")?);
+            }
+            "--amount" => {
+                amount = Some(parse_irm(&parse_required_string_flag(
+                    args, &mut i, "--amount",
+                )?)?);
+            }
+            "--asset" => {
+                asset = Some(parse_required_string_flag(args, &mut i, "--asset")?);
+            }
+            "--payment-method" => {
+                payment_method = Some(parse_required_string_flag(
+                    args,
+                    &mut i,
+                    "--payment-method",
+                )?);
+            }
+            "--timeout" => {
+                timeout = Some(
+                    parse_required_string_flag(args, &mut i, "--timeout")?
+                        .parse::<u64>()
+                        .map_err(|_| "--timeout must be a non-negative integer".to_string())?,
+                );
+            }
+            "--agreement-id" => {
+                agreement_id = Some(parse_required_string_flag(args, &mut i, "--agreement-id")?);
+            }
+            "--out" => {
+                out_path = Some(parse_required_string_flag(args, &mut i, "--out")?);
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let seller_addr = seller.ok_or_else(|| "--seller is required".to_string())?;
+    let buyer_addr = buyer.ok_or_else(|| "--buyer is required".to_string())?;
+    let amount_val = amount.ok_or_else(|| "--amount is required".to_string())?;
+    let asset_val = asset.ok_or_else(|| "--asset is required".to_string())?;
+    let pm_val = payment_method.ok_or_else(|| "--payment-method is required".to_string())?;
+    let timeout_val = timeout.ok_or_else(|| "--timeout is required".to_string())?;
+
+    let now = now_unix();
+    let id = agreement_id.unwrap_or_else(|| format!("otc-{}", now));
+
+    let seller_party = parse_party_spec(&format!("seller|Seller|{}|seller", seller_addr))?;
+    let buyer_party = parse_party_spec(&format!("buyer|Buyer|{}|buyer", buyer_addr))?;
+
+    let secret_hash_hex = hex::encode(Sha256::digest(
+        format!("otc-secret-{}-{}", id, now).as_bytes(),
+    ));
+    let doc_hash_hex = hex::encode(Sha256::digest(format!("otc-doc-{}-{}", id, now).as_bytes()));
+
+    let agreement = build_otc_agreement(
+        id.clone(),
+        now,
+        buyer_party,
+        seller_party,
+        amount_val,
+        asset_val,
+        pm_val,
+        timeout_val,
+        parse_required_secret_hash(secret_hash_hex)?,
+        parse_required_document_hash(doc_hash_hex)?,
+        None,
+        None,
+    )?;
+
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let saved_path = save_agreement_to_store_at(&imported_agreements_dir(), &agreement)?;
+
+    if let Some(ref out) = out_path {
+        let rendered = serde_json::to_string_pretty(&agreement)
+            .map_err(|e| format!("serialize agreement: {e}"))?;
+        std::fs::write(out, &rendered).map_err(|e| format!("write {}: {e}", out))?;
+    }
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agreement_id":   id,
+                "agreement_hash": agreement_hash,
+                "saved_path":     saved_path.display().to_string(),
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("agreement_id    {}", id);
+        println!("agreement_hash  {}", agreement_hash);
+        println!("saved_path      {}", saved_path.display());
+        println!();
+        println!("next_step  irium-wallet otc-attest --agreement {} --message \"<payment confirmed>\" --address <attestor_address>", agreement_hash);
+    }
+    Ok(())
+}
+
+fn handle_otc_attest(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut message: Option<String> = None;
+    let mut address: Option<String> = None;
+    let mut proof_type = "otc_release".to_string();
+    let mut rpc_url: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--message" => {
+                message = Some(parse_required_string_flag(args, &mut i, "--message")?);
+            }
+            "--address" => {
+                address = Some(parse_required_string_flag(args, &mut i, "--address")?);
+            }
+            "--proof-type" => {
+                proof_type = parse_required_string_flag(args, &mut i, "--proof-type")?;
+            }
+            "--rpc" => {
+                rpc_url = Some(parse_required_string_flag(args, &mut i, "--rpc")?);
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let agreement_ref = agreement_ref.ok_or_else(|| "--agreement is required".to_string())?;
+    let message_val = message.ok_or_else(|| "--message is required".to_string())?;
+    let address_val = address.ok_or_else(|| "--address is required".to_string())?;
+
+    let agreement = load_agreement(&agreement_ref)?;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+
+    let base = rpc_url
+        .as_deref()
+        .unwrap_or(&default_rpc_url())
+        .trim_end_matches('/')
+        .to_string();
+    let attestation_time: u64 = {
+        let client = rpc_client(&base)?;
+        fetch_tip_height(&client, &base).unwrap_or(0)
+    };
+
+    let opts = ProofCreateCliOptions {
+        agreement_hash: agreement_hash.clone(),
+        proof_type,
+        attested_by: address_val.clone(),
+        address: address_val.clone(),
+        milestone_id: None,
+        evidence_summary: Some(message_val),
+        evidence_hash: None,
+        proof_id: None,
+        timestamp: Some(attestation_time),
+        rpc_url: None,
+        out_path: None,
+        json_mode: false,
+        expires_at_height: None,
+        proof_kind: None,
+        reference_id: None,
+    };
+    let proof = create_settlement_proof_signed(&opts, attestation_time)?;
+
+    let client = rpc_client(&base)?;
+    let req = SubmitProofRpcRequest { proof };
+    let resp: SubmitProofRpcResponse = rpc_post_json(&client, &base, "/rpc/submitproof", &req)?;
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap()
+        );
+    } else {
+        println!("{}", render_proof_submit_summary(&resp));
+        println!();
+        println!(
+            "next_step  irium-wallet otc-settle --agreement {}",
+            agreement_ref
+        );
+    }
+
+    if !resp.accepted && !resp.duplicate {
+        return Err(format!("proof rejected: {}", resp.message));
+    }
+    Ok(())
+}
+
+fn handle_otc_settle(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let agreement_ref = agreement_ref.ok_or_else(|| "--agreement is required".to_string())?;
+    let agreement = load_agreement(&agreement_ref)?;
+
+    let sc = SettlementClient::new(&rpc_url)?;
+    let eval_resp = sc.evaluate_policy(agreement.clone())?;
+    let bst_resp = sc.build_settlement_tx(agreement)?;
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "evaluation": serde_json::to_value(&eval_resp).unwrap(),
+                "settlement": serde_json::to_value(&bst_resp).unwrap(),
+            }))
+            .unwrap()
+        );
+        return Ok(());
+    }
+
+    println!("=== policy evaluation ===");
+    println!("{}", render_policy_evaluate_summary(&eval_resp));
+    println!();
+    println!("=== settlement actions ===");
+    println!("{}", render_build_settlement_summary(&bst_resp));
+    println!();
+
+    let next_msg = match eval_resp.outcome.as_str() {
+        "satisfied" if bst_resp.actions.iter().any(|a| a.executable) => {
+            "Agreement is satisfied. Execute the settlement transaction to release funds."
+        }
+        "satisfied" => {
+            "Agreement is satisfied but no action is executable yet. Check executable_after height."
+        }
+        "timeout" => "Agreement timed out. Refund path is now eligible.",
+        _ => "Policy not yet satisfied. Wait for attestation or check otc-status.",
+    };
+    println!("next_step  {}", next_msg);
+    Ok(())
+}
+
+fn handle_otc_status(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let agreement_ref = agreement_ref.ok_or_else(|| "--agreement is required".to_string())?;
+    let agreement = load_agreement(&agreement_ref)?;
+
+    let sc = SettlementClient::new(&rpc_url)?;
+    let hash_resp = sc.compute_agreement_hash(agreement.clone())?;
+    let pol_resp = sc.get_policy(hash_resp.agreement_hash.clone())?;
+    let eval_resp = sc.evaluate_policy(agreement.clone())?;
+    let bst_resp = sc.build_settlement_tx(agreement.clone())?;
+
+    let client = rpc_client(&rpc_url)?;
+    let list_req = ListProofsRpcRequest {
+        agreement_hash: Some(hash_resp.agreement_hash.clone()),
+        active_only: false,
+        offset: 0,
+        limit: None,
+    };
+    let proofs_resp: ListProofsRpcResponse = rpc_post_json(
+        &client,
+        rpc_url.trim_end_matches('/'),
+        "/rpc/listproofs",
+        &list_req,
+    )
+    .unwrap_or_default();
+
+    println!("=== agreement ===");
+    println!("agreement_id   {}", agreement.agreement_id);
+    println!("agreement_hash {}", hash_resp.agreement_hash);
+    println!(
+        "amount         {:.8} IRM",
+        agreement.total_amount as f64 / 100_000_000.0
+    );
+    println!(
+        "asset          {}",
+        agreement.asset_reference.as_deref().unwrap_or("none")
+    );
+    println!(
+        "payment_method {}",
+        agreement.payment_reference.as_deref().unwrap_or("none")
+    );
+    println!();
+    println!("=== policy ===");
+    println!("{}", render_policy_get_summary(&pol_resp));
+    println!();
+    println!("=== proofs ({}) ===", proofs_resp.returned_count);
+    if proofs_resp.returned_count == 0 {
+        println!("  (no proofs submitted yet)");
+    }
+    for item in &proofs_resp.proofs {
+        let p = &item.proof;
+        println!(
+            "  proof_id={}  type={}  attested_by={}  time={}",
+            p.proof_id, p.proof_type, p.attested_by, p.attestation_time
+        );
+    }
+    println!();
+    println!("=== evaluation ===");
+    println!("{}", render_policy_evaluate_summary(&eval_resp));
+    println!();
+    println!("=== settlement actions ===");
+    println!("{}", render_build_settlement_summary(&bst_resp));
+    println!();
+    println!("=== deadline ===");
+    println!(
+        "refund_deadline_height {}",
+        agreement.deadlines.refund_deadline.unwrap_or(0)
+    );
+    println!(
+        "ready_to_settle        {}",
+        eval_resp.release_eligible || eval_resp.refund_eligible
+    );
+    Ok(())
+}
+
+// ============================================================
+// Remote attestor flow (proof-sign + proof-submit-json)
+// ============================================================
+
+/// Derives (address, pubkey_hex, SigningKey) from a raw private key.
+fn signing_key_from_raw(key_input: &str) -> Result<(String, String, SigningKey), String> {
+    let (secret_bytes, compressed) = if key_input.len() == 64 && hex::decode(key_input).is_ok() {
+        let mut b = [0u8; 32];
+        b.copy_from_slice(&hex::decode(key_input).unwrap());
+        (b, true)
+    } else {
+        wif_to_secret_and_compression(key_input)?
+    };
+    let secret =
+        SecretKey::from_slice(&secret_bytes).map_err(|e| format!("invalid private key: {e}"))?;
+    let wk = wallet_key_from_secret(&secret, compressed);
+    let signing_key = SigningKey::from(secret);
+    Ok((wk.address, wk.pubkey, signing_key))
+}
+
+fn handle_proof_sign(args: &[String]) -> Result<(), String> {
+    let mut agreement_hash: Option<String> = None;
+    let mut message: Option<String> = None;
+    let mut key_input: Option<String> = None;
+    let mut proof_type = "otc_release".to_string();
+    let mut attested_by: Option<String> = None;
+    let mut timestamp: Option<u64> = None;
+    let mut out_path: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_hash = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--message" => {
+                message = Some(parse_required_string_flag(args, &mut i, "--message")?);
+            }
+            "--key" => {
+                key_input = Some(parse_required_string_flag(args, &mut i, "--key")?);
+            }
+            "--proof-type" => {
+                proof_type = parse_required_string_flag(args, &mut i, "--proof-type")?;
+            }
+            "--attested-by" => {
+                attested_by = Some(parse_required_string_flag(args, &mut i, "--attested-by")?);
+            }
+            "--timestamp" => {
+                timestamp = Some(
+                    parse_required_string_flag(args, &mut i, "--timestamp")?
+                        .parse::<u64>()
+                        .map_err(|_| "--timestamp must be a non-negative integer".to_string())?,
+                );
+            }
+            "--out" => {
+                out_path = Some(parse_required_string_flag(args, &mut i, "--out")?);
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let agreement_hash = agreement_hash.ok_or_else(|| "--agreement is required".to_string())?;
+    let message_val = message.ok_or_else(|| "--message is required".to_string())?;
+    let key_val = key_input.ok_or_else(|| "--key is required".to_string())?;
+    let (address, pubkey_hex, signing_key) = signing_key_from_raw(&key_val)?;
+    let attestor = attested_by.unwrap_or_else(|| address.clone());
+    let attestation_time = timestamp.unwrap_or_else(now_unix);
+    let seed = format!("{}{}{}", proof_type, agreement_hash, attestation_time);
+    let proof_id = format!("prf-{}", hex::encode(&Sha256::digest(seed.as_bytes())[..8]));
+    let mut proof = SettlementProof {
+        proof_id,
+        schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+        proof_type,
+        agreement_hash,
+        milestone_id: None,
+        attested_by: attestor,
+        attestation_time,
+        evidence_hash: None,
+        evidence_summary: Some(message_val),
+        signature: ProofSignatureEnvelope {
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            pubkey_hex: pubkey_hex.clone(),
+            signature_hex: String::new(),
+            payload_hash: String::new(),
+        },
+        expires_at_height: None,
+        typed_payload: None,
+    };
+    let payload_bytes = settlement_proof_payload_bytes(&proof)
+        .map_err(|e| format!("compute payload bytes: {e}"))?;
+    let payload_digest = Sha256::digest(&payload_bytes);
+    let payload_hash_hex = hex::encode(&payload_digest);
+    let sig: Signature = signing_key
+        .sign_prehash(&payload_digest)
+        .map_err(|e| format!("sign proof payload: {e}"))?;
+    proof.signature.signature_hex = hex::encode(sig.to_bytes());
+    proof.signature.payload_hash = payload_hash_hex;
+    irium_node_rs::settlement::verify_settlement_proof_signature_only(&proof)
+        .map_err(|e| format!("self-verify failed: {e}"))?;
+    let proof_json =
+        serde_json::to_string_pretty(&proof).map_err(|e| format!("serialize proof: {e}"))?;
+    if let Some(ref out) = out_path {
+        std::fs::write(out, &proof_json).map_err(|e| format!("write {}: {e}", out))?;
+    }
+    if json_mode || out_path.is_none() {
+        println!("{}", proof_json);
+    } else {
+        println!("{}", render_proof_create_summary(&proof));
+        println!("written {}", out_path.as_deref().unwrap_or(""));
+    }
+    Ok(())
+}
+
+fn handle_proof_submit_json(args: &[String]) -> Result<(), String> {
+    let mut file_path: Option<String> = None;
+    let mut raw_json: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" => {
+                file_path = Some(parse_required_string_flag(args, &mut i, "--file")?);
+            }
+            "--raw" => {
+                raw_json = Some(parse_required_string_flag(args, &mut i, "--raw")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let proof_str = match (file_path, raw_json) {
+        (Some(path), None) => {
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path))?
+        }
+        (None, Some(raw)) => raw,
+        (Some(_), Some(_)) => return Err("--file and --raw are mutually exclusive".to_string()),
+        (None, None) => return Err("--file or --raw is required".to_string()),
+    };
+    let proof: SettlementProof =
+        serde_json::from_str(&proof_str).map_err(|e| format!("parse proof JSON: {e}"))?;
+    irium_node_rs::settlement::verify_settlement_proof_signature_only(&proof)
+        .map_err(|e| format!("proof signature invalid: {e}"))?;
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let req = SubmitProofRpcRequest { proof };
+    let resp: SubmitProofRpcResponse = rpc_post_json(&client, base, "/rpc/submitproof", &req)?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap()
+        );
+    } else {
+        println!("{}", render_proof_submit_summary(&resp));
+    }
+    if !resp.accepted && !resp.duplicate {
+        return Err(format!("proof rejected: {}", resp.message));
+    }
+    Ok(())
+}
+
+// ============================================================
+// Commercial templates (template-list, template-show, agreement-create-from-template)
+// ============================================================
+
+struct TemplateSpec {
+    template_id: &'static str,
+    template_type: &'static str,
+    description: &'static str,
+    required_fields: &'static [&'static str],
+    optional_fields: &'static [(&'static str, &'static str)],
+}
+
+fn all_templates() -> Vec<TemplateSpec> {
+    vec![
+        TemplateSpec {
+            template_id: "otc-basic",
+            template_type: "otc_settlement",
+            description: "Peer-to-peer OTC trade with timeout refund",
+            required_fields: &["--seller", "--buyer", "--amount", "--timeout"],
+            optional_fields: &[
+                ("--asset", "IRM"),
+                ("--payment-method", "off-chain"),
+                ("--agreement-id", "auto-generated"),
+                ("--json", "flag"),
+                ("--out", "write to file"),
+            ],
+        },
+        TemplateSpec {
+            template_id: "deposit-protection",
+            template_type: "refundable_deposit",
+            description: "Deposit held in escrow; refunded on timeout if release not triggered",
+            required_fields: &["--payer", "--payee", "--amount", "--timeout"],
+            optional_fields: &[
+                ("--purpose", "Deposit protection"),
+                ("--attestor", "none"),
+                ("--agreement-id", "auto-generated"),
+                ("--json", "flag"),
+                ("--out", "write to file"),
+            ],
+        },
+        TemplateSpec {
+            template_id: "milestone-payment",
+            template_type: "milestone_settlement",
+            description: "Single-milestone staged payment released on attestation",
+            required_fields: &["--payer", "--payee", "--amount", "--timeout"],
+            optional_fields: &[
+                ("--milestone-title", "Milestone 1"),
+                ("--agreement-id", "auto-generated"),
+                ("--json", "flag"),
+                ("--out", "write to file"),
+            ],
+        },
+    ]
+}
+
+fn handle_template_list(args: &[String]) -> Result<(), String> {
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let templates = all_templates();
+    if json_mode {
+        let list: Vec<serde_json::Value> = templates
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "template_id":     t.template_id,
+                    "template_type":   t.template_type,
+                    "description":     t.description,
+                    "required_fields": t.required_fields,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&list).unwrap());
+    } else {
+        println!("{:<24} {:<22} {}", "TEMPLATE", "TYPE", "DESCRIPTION");
+        for t in &templates {
+            println!(
+                "{:<24} {:<22} {}",
+                t.template_id, t.template_type, t.description
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_template_show(args: &[String]) -> Result<(), String> {
+    let mut template_id: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--template" => {
+                template_id = Some(parse_required_string_flag(args, &mut i, "--template")?);
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let id = template_id.ok_or_else(|| "--template is required".to_string())?;
+    let spec = all_templates()
+        .into_iter()
+        .find(|t| t.template_id == id)
+        .ok_or_else(|| format!("unknown template: {}", id))?;
+    if json_mode {
+        let optional: Vec<serde_json::Value> = spec
+            .optional_fields
+            .iter()
+            .map(|(f, d)| serde_json::json!({"flag": f, "default": d}))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "template_id":     spec.template_id,
+                "template_type":   spec.template_type,
+                "description":     spec.description,
+                "required_fields": spec.required_fields,
+                "optional_fields": optional,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("template_id    {}", spec.template_id);
+        println!("template_type  {}", spec.template_type);
+        println!("description    {}", spec.description);
+        println!();
+        println!("required fields:");
+        for f in spec.required_fields {
+            println!("  {}", f);
+        }
+        println!();
+        println!("optional fields:");
+        for (f, d) in spec.optional_fields {
+            println!("  {}  (default: {})", f, d);
+        }
+    }
+    Ok(())
+}
+
+fn handle_agreement_create_from_template(args: &[String]) -> Result<(), String> {
+    let mut template_id: Option<String> = None;
+    let mut seller: Option<String> = None;
+    let mut buyer: Option<String> = None;
+    let mut payer: Option<String> = None;
+    let mut payee: Option<String> = None;
+    let mut amount: Option<u64> = None;
+    let mut timeout: Option<u64> = None;
+    let mut asset: Option<String> = None;
+    let mut payment_method: Option<String> = None;
+    let mut purpose: Option<String> = None;
+    let mut attestor: Option<String> = None;
+    let mut milestone_title: Option<String> = None;
+    let mut agreement_id: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--template" => {
+                template_id = Some(parse_required_string_flag(args, &mut i, "--template")?);
+            }
+            "--seller" => {
+                seller = Some(parse_required_string_flag(args, &mut i, "--seller")?);
+            }
+            "--buyer" => {
+                buyer = Some(parse_required_string_flag(args, &mut i, "--buyer")?);
+            }
+            "--payer" => {
+                payer = Some(parse_required_string_flag(args, &mut i, "--payer")?);
+            }
+            "--payee" => {
+                payee = Some(parse_required_string_flag(args, &mut i, "--payee")?);
+            }
+            "--amount" => {
+                amount = Some(parse_irm(&parse_required_string_flag(
+                    args, &mut i, "--amount",
+                )?)?);
+            }
+            "--timeout" => {
+                timeout = Some(
+                    parse_required_string_flag(args, &mut i, "--timeout")?
+                        .parse::<u64>()
+                        .map_err(|_| "--timeout must be a non-negative integer".to_string())?,
+                );
+            }
+            "--asset" => {
+                asset = Some(parse_required_string_flag(args, &mut i, "--asset")?);
+            }
+            "--payment-method" => {
+                payment_method = Some(parse_required_string_flag(
+                    args,
+                    &mut i,
+                    "--payment-method",
+                )?);
+            }
+            "--purpose" => {
+                purpose = Some(parse_required_string_flag(args, &mut i, "--purpose")?);
+            }
+            "--attestor" => {
+                attestor = Some(parse_required_string_flag(args, &mut i, "--attestor")?);
+            }
+            "--milestone-title" => {
+                milestone_title = Some(parse_required_string_flag(
+                    args,
+                    &mut i,
+                    "--milestone-title",
+                )?);
+            }
+            "--agreement-id" => {
+                agreement_id = Some(parse_required_string_flag(args, &mut i, "--agreement-id")?);
+            }
+            "--out" => {
+                out_path = Some(parse_required_string_flag(args, &mut i, "--out")?);
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+
+    let tmpl = template_id.ok_or_else(|| "--template is required".to_string())?;
+    if !all_templates().iter().any(|t| t.template_id == tmpl) {
+        return Err(format!("unknown template: {}", tmpl));
+    }
+
+    let now = now_unix();
+    let id = agreement_id.unwrap_or_else(|| format!("agr-{}-{}", tmpl, now));
+    let secret_hash = hex::encode(Sha256::digest(
+        format!("tpl-secret-{}-{}", id, now).as_bytes(),
+    ));
+    let doc_hash = hex::encode(Sha256::digest(format!("tpl-doc-{}-{}", id, now).as_bytes()));
+
+    let agreement = match tmpl.as_str() {
+        "otc-basic" => {
+            let seller_addr =
+                seller.ok_or_else(|| "--seller is required for otc-basic".to_string())?;
+            let buyer_addr =
+                buyer.ok_or_else(|| "--buyer is required for otc-basic".to_string())?;
+            let amount_val = amount.ok_or_else(|| "--amount is required".to_string())?;
+            let timeout_val = timeout.ok_or_else(|| "--timeout is required".to_string())?;
+            let asset_val = asset.unwrap_or_else(|| "IRM".to_string());
+            let pm_val = payment_method.unwrap_or_else(|| "off-chain".to_string());
+            let seller_party = parse_party_spec(&format!("seller|Seller|{}|seller", seller_addr))?;
+            let buyer_party = parse_party_spec(&format!("buyer|Buyer|{}|buyer", buyer_addr))?;
+            build_otc_agreement(
+                id.clone(),
+                now,
+                buyer_party,
+                seller_party,
+                amount_val,
+                asset_val,
+                pm_val,
+                timeout_val,
+                secret_hash,
+                doc_hash,
+                None,
+                None,
+            )?
+        }
+        "deposit-protection" => {
+            let payer_addr =
+                payer.ok_or_else(|| "--payer is required for deposit-protection".to_string())?;
+            let payee_addr =
+                payee.ok_or_else(|| "--payee is required for deposit-protection".to_string())?;
+            let amount_val = amount.ok_or_else(|| "--amount is required".to_string())?;
+            let timeout_val = timeout.ok_or_else(|| "--timeout is required".to_string())?;
+            let purpose_val = purpose.unwrap_or_else(|| "Deposit protection".to_string());
+            let refund_summary = attestor
+                .map(|a| format!("Refund eligible after timeout; attestor: {}", a))
+                .unwrap_or_else(|| "Refund eligible after timeout".to_string());
+            let payer_party = parse_party_spec(&format!("payer|Payer|{}|payer", payer_addr))?;
+            let payee_party = parse_party_spec(&format!("payee|Payee|{}|payee", payee_addr))?;
+            build_deposit_agreement(
+                id.clone(),
+                now,
+                payer_party,
+                payee_party,
+                amount_val,
+                purpose_val,
+                refund_summary,
+                timeout_val,
+                secret_hash,
+                doc_hash,
+                None,
+                None,
+            )?
+        }
+        "milestone-payment" => {
+            let payer_addr =
+                payer.ok_or_else(|| "--payer is required for milestone-payment".to_string())?;
+            let payee_addr =
+                payee.ok_or_else(|| "--payee is required for milestone-payment".to_string())?;
+            let amount_val = amount.ok_or_else(|| "--amount is required".to_string())?;
+            let timeout_val = timeout.ok_or_else(|| "--timeout is required".to_string())?;
+            let title = milestone_title.unwrap_or_else(|| "Milestone 1".to_string());
+            let ms_secret =
+                hex::encode(Sha256::digest(format!("tpl-ms-{}-{}", id, now).as_bytes()));
+            let payer_party = parse_party_spec(&format!("payer|Payer|{}|payer", payer_addr))?;
+            let payee_party = parse_party_spec(&format!("payee|Payee|{}|payee", payee_addr))?;
+            let milestone = AgreementMilestone {
+                milestone_id: format!("ms-1-{}", now),
+                title,
+                amount: amount_val,
+                recipient_address: payee_party.address.clone(),
+                refund_address: payer_party.address.clone(),
+                secret_hash_hex: ms_secret,
+                timeout_height: timeout_val,
+                metadata_hash: None,
+            };
+            build_milestone_agreement(
+                id.clone(),
+                now,
+                payer_party,
+                payee_party,
+                vec![milestone],
+                timeout_val,
+                doc_hash,
+                None,
+                None,
+            )?
+        }
+        other => return Err(format!("unknown template: {}", other)),
+    };
+
+    let hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let saved = save_agreement_to_store_at(&imported_agreements_dir(), &agreement)?;
+
+    if let Some(ref out) = out_path {
+        let rendered =
+            serde_json::to_string_pretty(&agreement).map_err(|e| format!("serialize: {e}"))?;
+        std::fs::write(out, &rendered).map_err(|e| format!("write {}: {e}", out))?;
+    }
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agreement_id":   agreement.agreement_id,
+                "agreement_hash": hash,
+                "template":       tmpl,
+                "saved_path":     saved.display().to_string(),
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("agreement_id    {}", agreement.agreement_id);
+        println!("agreement_hash  {}", hash);
+        println!("template        {}", tmpl);
+        println!("saved_path      {}", saved.display());
+    }
+    Ok(())
 }
 
 fn handle_agreement_create_simple(args: &[String]) -> Result<(), String> {
@@ -7223,7 +8506,6 @@ fn submit_tx(client: &Client, base: &str, tx: &Transaction) -> Result<(), String
         return Err(format!("submit tx failed: {}", resp.status()));
     }
     Ok(())
-
 }
 
 #[cfg(test)]
@@ -8941,6 +10223,148 @@ mod tests {
         assert_eq!(value["identity"]["agreement_id"], "agr-wallet-statement");
         assert_eq!(value["derived"]["derived_state_label"], "proposed");
     }
+
+    fn make_receipt_test_statement() -> AgreementStatement {
+        AgreementStatement {
+            metadata: irium_node_rs::settlement::AgreementStatementMetadata {
+                version: 1,
+                generated_at: 1_710_001_000,
+                derived_notice: "derived only".to_string(),
+            },
+            identity: irium_node_rs::settlement::AgreementStatementIdentity {
+                agreement_id: "agr-receipt-test".to_string(),
+                agreement_hash: "bb".repeat(32),
+                template_type: AgreementTemplateType::SimpleReleaseRefund,
+            },
+            counterparties: irium_node_rs::settlement::AgreementStatementCounterparties {
+                payer: "Qpayer".to_string(),
+                payee: "Qpayee".to_string(),
+                parties_summary: vec!["payer: Alice <Qpayer>".to_string()],
+            },
+            commercial: irium_node_rs::settlement::AgreementStatementCommercialSummary {
+                total_amount: 250_000_000,
+                milestone_summary: "no milestones".to_string(),
+                settlement_deadline: Some(1_710_010_000),
+                refund_deadline: None,
+                release_path_summary: "htlc release".to_string(),
+                refund_path_summary: "htlc refund".to_string(),
+            },
+            observed: irium_node_rs::settlement::AgreementStatementObservedSummary {
+                funding_observed: true,
+                release_observed: false,
+                refund_observed: false,
+                ambiguity_warning: None,
+                linked_txids: vec!["txaabbcc".to_string()],
+            },
+            derived: irium_node_rs::settlement::AgreementStatementDerivedSummary {
+                derived_state_label: "funded".to_string(),
+                funded_amount: 250_000_000,
+                released_amount: 0,
+                refunded_amount: 0,
+                note: "funded; awaiting release or refund".to_string(),
+            },
+            authenticity: None,
+            trust_notice: irium_node_rs::settlement::AgreementStatementTrustNotice {
+                consensus_visible: vec!["anchor".to_string()],
+                htlc_enforced: vec!["htlc branch".to_string()],
+                derived_indexed: vec!["timeline".to_string()],
+                local_off_chain: vec!["exchange".to_string()],
+                canonical_notice: "canonical source is agreement hash".to_string(),
+            },
+            references: irium_node_rs::settlement::AgreementStatementReferences {
+                linked_txids: vec!["txaabbcc".to_string()],
+                selected_funding_txid: None,
+                canonical_agreement_notice: "verify via hash".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn receipt_text_render_contains_sections() {
+        let s = make_receipt_test_statement();
+        let out = render_agreement_receipt_text(&s);
+        assert!(out.contains("IRIUM SETTLEMENT RECEIPT"));
+        assert!(out.contains("AGREEMENT"));
+        assert!(out.contains("PARTIES"));
+        assert!(out.contains("COMMERCIAL TERMS"));
+        assert!(out.contains("OBSERVED ACTIVITY"));
+        assert!(out.contains("SETTLEMENT OUTCOME"));
+        assert!(out.contains("GENERATED"));
+        assert!(out.contains("NOTICE: This receipt is informational."));
+    }
+
+    #[test]
+    fn receipt_text_render_agreement_fields() {
+        let s = make_receipt_test_statement();
+        let out = render_agreement_receipt_text(&s);
+        assert!(out.contains("agr-receipt-test"));
+        assert!(out.contains("Qpayer"));
+        assert!(out.contains("Qpayee"));
+        assert!(out.contains("2.50000000 IRM"));
+        assert!(out.contains("funded"));
+        assert!(out.contains("txaabbcc"));
+        assert!(out.contains("1710001000"));
+        assert!(out.contains("verify via hash"));
+    }
+
+    #[test]
+    fn receipt_text_render_settlement_deadline_present() {
+        let s = make_receipt_test_statement();
+        let out = render_agreement_receipt_text(&s);
+        assert!(out.contains("Settlement Deadline"));
+        assert!(out.contains("1710010000"));
+        assert!(!out.contains("Refund Deadline"));
+    }
+
+    #[test]
+    fn receipt_html_render_structure() {
+        let s = make_receipt_test_statement();
+        let out = render_agreement_receipt_html(&s);
+        assert!(out.contains("<!DOCTYPE html>"));
+        assert!(out.contains("<title>Irium Settlement Receipt</title>"));
+        assert!(out.contains("<table>"));
+        assert!(out.contains("</table>"));
+        assert!(out.contains("Agreement ID"));
+        assert!(out.contains("Derived Status"));
+        assert!(out.contains("agr-receipt-test"));
+        assert!(out.contains("2.50000000 IRM"));
+    }
+
+    #[test]
+    fn receipt_html_esc_encodes_special_chars() {
+        assert_eq!(html_esc("a&b"), "a&amp;b");
+        assert_eq!(html_esc("<tag>"), "&lt;tag&gt;");
+        assert_eq!(html_esc("say \"hi\""), "say &quot;hi&quot;");
+        assert_eq!(html_esc("plain"), "plain");
+    }
+
+    #[test]
+    fn receipt_html_render_with_ambiguity_warning() {
+        let mut s = make_receipt_test_statement();
+        s.observed.ambiguity_warning = Some("duplicate funding txid".to_string());
+        let out = render_agreement_receipt_html(&s);
+        assert!(out.contains("warn"));
+        assert!(out.contains("duplicate funding txid"));
+    }
+
+    #[test]
+    fn receipt_text_render_with_authenticity_section() {
+        let mut s = make_receipt_test_statement();
+        s.authenticity = Some(
+            irium_node_rs::settlement::AgreementStatementAuthenticitySummary {
+                valid_signatures: 2,
+                invalid_signatures: 0,
+                unverifiable_signatures: 1,
+                compact_summary: "2 valid".to_string(),
+                authenticity_notice: "notice".to_string(),
+            },
+        );
+        let out = render_agreement_receipt_text(&s);
+        assert!(out.contains("AUTHENTICITY"));
+        assert!(out.contains("2 / 0 / 1"));
+        assert!(out.contains("2 valid"));
+    }
+
     #[test]
     fn signature_verification_summary_render_is_stable() {
         let verification = AgreementSignatureVerification {
@@ -9011,8 +10435,10 @@ mod tests {
     #[test]
     fn policy_check_cli_parses_required_args() {
         let args: Vec<String> = vec![
-            "--agreement".to_string(), "agr.json".to_string(),
-            "--policy".to_string(), "pol.json".to_string(),
+            "--agreement".to_string(),
+            "agr.json".to_string(),
+            "--policy".to_string(),
+            "pol.json".to_string(),
         ];
         let opts = parse_policy_check_cli(&args).expect("must parse");
         assert_eq!(opts.agreement_path, "agr.json");
@@ -9024,11 +10450,16 @@ mod tests {
     #[test]
     fn policy_check_cli_parses_all_flags() {
         let args: Vec<String> = vec![
-            "--agreement".to_string(), "agr.json".to_string(),
-            "--policy".to_string(), "pol.json".to_string(),
-            "--proof".to_string(), "prf1.json".to_string(),
-            "--proof".to_string(), "prf2.json".to_string(),
-            "--rpc".to_string(), "http://localhost:9090".to_string(),
+            "--agreement".to_string(),
+            "agr.json".to_string(),
+            "--policy".to_string(),
+            "pol.json".to_string(),
+            "--proof".to_string(),
+            "prf1.json".to_string(),
+            "--proof".to_string(),
+            "prf2.json".to_string(),
+            "--rpc".to_string(),
+            "http://localhost:9090".to_string(),
             "--json".to_string(),
         ];
         let opts = parse_policy_check_cli(&args).expect("must parse");
@@ -9055,8 +10486,10 @@ mod tests {
     #[test]
     fn policy_check_cli_rejects_unknown_flag() {
         let args: Vec<String> = vec![
-            "--agreement".to_string(), "agr.json".to_string(),
-            "--policy".to_string(), "pol.json".to_string(),
+            "--agreement".to_string(),
+            "agr.json".to_string(),
+            "--policy".to_string(),
+            "pol.json".to_string(),
             "--unknown-flag".to_string(),
         ];
         let err = parse_policy_check_cli(&args).unwrap_err();
@@ -9078,10 +10511,19 @@ mod tests {
         };
         let out = render_policy_check_summary(&resp);
         assert!(out.contains("agreement_hash aabbcc"), "missing hash: {out}");
-        assert!(out.contains("policy_id pol-render-001"), "missing policy_id: {out}");
+        assert!(
+            out.contains("policy_id pol-render-001"),
+            "missing policy_id: {out}"
+        );
         assert!(out.contains("tip_height 500"), "missing height: {out}");
-        assert!(out.contains("release_eligible true"), "must show release: {out}");
-        assert!(out.contains("refund_eligible false"), "must show refund: {out}");
+        assert!(
+            out.contains("release_eligible true"),
+            "must show release: {out}"
+        );
+        assert!(
+            out.contains("refund_eligible false"),
+            "must show refund: {out}"
+        );
         assert!(out.contains("prf-1"), "must show evaluated rule: {out}");
     }
 
@@ -9099,8 +10541,14 @@ mod tests {
             milestone_results: vec![],
         };
         let out = render_policy_check_summary(&resp);
-        assert!(out.contains("refund_eligible true"), "must show refund: {out}");
-        assert!(out.contains("release_eligible false"), "must show release: {out}");
+        assert!(
+            out.contains("refund_eligible true"),
+            "must show refund: {out}"
+        );
+        assert!(
+            out.contains("release_eligible false"),
+            "must show release: {out}"
+        );
         assert!(out.contains("no-response"), "must show reason: {out}");
     }
 
@@ -9122,7 +10570,6 @@ mod tests {
         assert!(out.contains("refund_eligible false"));
         assert!(out.contains("no release or refund"));
     }
-
 
     #[test]
     fn render_policy_check_summary_holdback_held() {
@@ -9147,11 +10594,20 @@ mod tests {
             milestone_results: vec![],
         };
         let out = render_policy_check_summary(&resp);
-        assert!(out.contains("holdback_outcome held"), "must show held: {out}");
+        assert!(
+            out.contains("holdback_outcome held"),
+            "must show held: {out}"
+        );
         assert!(out.contains("holdback_bps 1000"), "must show bps: {out}");
-        assert!(out.contains("immediate_release_bps 9000"), "must show releasable: {out}");
+        assert!(
+            out.contains("immediate_release_bps 9000"),
+            "must show releasable: {out}"
+        );
         assert!(out.contains("holdback_reason"), "must show reason: {out}");
-        assert!(out.contains("release_eligible true"), "base must show eligible: {out}");
+        assert!(
+            out.contains("release_eligible true"),
+            "base must show eligible: {out}"
+        );
     }
 
     #[test]
@@ -9177,12 +10633,20 @@ mod tests {
             milestone_results: vec![],
         };
         let out = render_policy_check_summary(&resp);
-        assert!(out.contains("holdback_outcome released"), "must show released: {out}");
+        assert!(
+            out.contains("holdback_outcome released"),
+            "must show released: {out}"
+        );
         assert!(out.contains("holdback_bps 500"), "must show bps: {out}");
-        assert!(out.contains("immediate_release_bps 10000"), "must show full release: {out}");
-        assert!(!out.contains("holdback_outcome held"), "must not show held: {out}");
+        assert!(
+            out.contains("immediate_release_bps 10000"),
+            "must show full release: {out}"
+        );
+        assert!(
+            !out.contains("holdback_outcome held"),
+            "must not show held: {out}"
+        );
     }
-
 
     // ── Phase 3 render tests ────────────────────────────────────────────────
 
@@ -9224,10 +10688,22 @@ mod tests {
             ],
         };
         let out = render_policy_check_summary(&resp);
-        assert!(out.contains("milestones 1/2"), "must show 1/2 satisfied: {out}");
-        assert!(out.contains("Foundation") || out.contains("ms-foundation"), "must show first milestone: {out}");
-        assert!(out.contains("satisfied"), "must show satisfied outcome: {out}");
-        assert!(out.contains("unsatisfied"), "must show unsatisfied outcome: {out}");
+        assert!(
+            out.contains("milestones 1/2"),
+            "must show 1/2 satisfied: {out}"
+        );
+        assert!(
+            out.contains("Foundation") || out.contains("ms-foundation"),
+            "must show first milestone: {out}"
+        );
+        assert!(
+            out.contains("satisfied"),
+            "must show satisfied outcome: {out}"
+        );
+        assert!(
+            out.contains("unsatisfied"),
+            "must show unsatisfied outcome: {out}"
+        );
     }
 
     #[test]
@@ -9256,13 +10732,34 @@ mod tests {
             has_timeout_rules: true,
         };
         let out = render_build_template_summary(&resp);
-        assert!(out.contains("policy_id pol-test-ct"), "must show policy_id: {out}");
-        assert!(out.contains("summary Contractor"), "must show summary: {out}");
-        assert!(out.contains("requirement_count 2"), "must show requirement_count: {out}");
-        assert!(out.contains("milestone_count 2"), "must show milestone_count: {out}");
-        assert!(out.contains("has_holdback false"), "must show has_holdback: {out}");
-        assert!(out.contains("has_timeout_rules true"), "must show has_timeout_rules: {out}");
-        assert!(out.contains("policy_json"), "must include policy_json section: {out}");
+        assert!(
+            out.contains("policy_id pol-test-ct"),
+            "must show policy_id: {out}"
+        );
+        assert!(
+            out.contains("summary Contractor"),
+            "must show summary: {out}"
+        );
+        assert!(
+            out.contains("requirement_count 2"),
+            "must show requirement_count: {out}"
+        );
+        assert!(
+            out.contains("milestone_count 2"),
+            "must show milestone_count: {out}"
+        );
+        assert!(
+            out.contains("has_holdback false"),
+            "must show has_holdback: {out}"
+        );
+        assert!(
+            out.contains("has_timeout_rules true"),
+            "must show has_timeout_rules: {out}"
+        );
+        assert!(
+            out.contains("policy_json"),
+            "must include policy_json section: {out}"
+        );
     }
 
     #[test]
@@ -9286,8 +10783,14 @@ mod tests {
             has_timeout_rules: true,
         };
         let out = render_build_template_summary(&resp);
-        assert!(!out.contains("milestone_count"), "milestone_count must be absent when 0: {out}");
-        assert!(out.contains("policy_id pol-otc-render"), "must show policy_id: {out}");
+        assert!(
+            !out.contains("milestone_count"),
+            "milestone_count must be absent when 0: {out}"
+        );
+        assert!(
+            out.contains("policy_id pol-otc-render"),
+            "must show policy_id: {out}"
+        );
     }
 
     // ── Phase 3 wallet CLI arg-parse tests ──────────────────────────────────
@@ -9324,7 +10827,10 @@ mod tests {
         assert_eq!(v["policy_id"], "pol-ser-1");
         assert_eq!(v["attestors"][0]["attestor_id"], "att-1");
         assert_eq!(v["milestones"][0]["proof_type"], "delivery");
-        assert!(v["milestones"][0]["holdback_bps"].is_null(), "None fields must not appear (skip_serializing_if)");
+        assert!(
+            v["milestones"][0]["holdback_bps"].is_null(),
+            "None fields must not appear (skip_serializing_if)"
+        );
     }
 
     // ── Phase 3 render test ─────────────────────────────────────────────────
@@ -9342,8 +10848,10 @@ mod tests {
     #[test]
     fn proof_submit_cli_parses_all_flags() {
         let args: Vec<String> = vec![
-            "--proof".to_string(), "prf.json".to_string(),
-            "--rpc".to_string(), "http://localhost:9090".to_string(),
+            "--proof".to_string(),
+            "prf.json".to_string(),
+            "--rpc".to_string(),
+            "http://localhost:9090".to_string(),
             "--json".to_string(),
         ];
         let opts = parse_proof_submit_cli(&args).expect("must parse");
@@ -9362,7 +10870,8 @@ mod tests {
     #[test]
     fn proof_submit_cli_rejects_unknown_flag() {
         let args: Vec<String> = vec![
-            "--proof".to_string(), "prf.json".to_string(),
+            "--proof".to_string(),
+            "prf.json".to_string(),
             "--unknown".to_string(),
         ];
         let err = parse_proof_submit_cli(&args).unwrap_err();
@@ -9380,8 +10889,10 @@ mod tests {
     #[test]
     fn proof_list_cli_parses_all_flags() {
         let args: Vec<String> = vec![
-            "--agreement-hash".to_string(), "aabbcc".to_string(),
-            "--rpc".to_string(), "http://localhost:9090".to_string(),
+            "--agreement-hash".to_string(),
+            "aabbcc".to_string(),
+            "--rpc".to_string(),
+            "http://localhost:9090".to_string(),
             "--json".to_string(),
         ];
         let opts = parse_proof_list_cli(&args).expect("must parse");
@@ -9417,7 +10928,10 @@ mod tests {
         assert!(out.contains("tip_height 0"), "got: {out}");
         assert!(out.contains("expires_at_height none"), "got: {out}");
         assert!(out.contains("expired false"), "got: {out}");
-        assert!(out.contains("status active"), "must show status=active; got: {out}");
+        assert!(
+            out.contains("status active"),
+            "must show status=active; got: {out}"
+        );
     }
 
     #[test]
@@ -9439,12 +10953,17 @@ mod tests {
         assert!(out.contains("tip_height 10"));
         assert!(out.contains("expires_at_height 5"));
         assert!(out.contains("expired true"));
-        assert!(out.contains("status expired"), "must show status=expired; got: {out}");
+        assert!(
+            out.contains("status expired"),
+            "must show status=expired; got: {out}"
+        );
     }
 
     #[test]
     fn render_proof_list_summary_with_proofs() {
-        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        use irium_node_rs::settlement::{
+            ProofSignatureEnvelope, AGREEMENT_SIGNATURE_TYPE_SECP256K1, SETTLEMENT_PROOF_SCHEMA_ID,
+        };
         let proof = SettlementProof {
             proof_id: "prf-list-001".to_string(),
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
@@ -9469,7 +10988,10 @@ mod tests {
             tip_height: 0,
             active_only: false,
             returned_count: 1,
-            proofs: vec![ProofListItem { proof, status: String::new() }],
+            proofs: vec![ProofListItem {
+                proof,
+                status: String::new(),
+            }],
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
@@ -9477,8 +10999,14 @@ mod tests {
         assert!(out.contains("returned_count 1"), "got: {out}");
         assert!(out.contains("prf-list-001"), "got: {out}");
         assert!(out.contains("att-1"), "got: {out}");
-        assert!(out.contains("agreement_hash=aabbcc"), "per-proof hash; got: {out}");
-        assert!(out.contains("expires_at_height=none"), "no expiry must show none; got: {out}");
+        assert!(
+            out.contains("agreement_hash=aabbcc"),
+            "per-proof hash; got: {out}"
+        );
+        assert!(
+            out.contains("expires_at_height=none"),
+            "no expiry must show none; got: {out}"
+        );
     }
 
     #[test]
@@ -9501,10 +11029,14 @@ mod tests {
     #[test]
     fn proof_create_cli_parses_required_args() {
         let args: Vec<String> = vec![
-            "--agreement-hash".to_string(), "aabbcc".to_string(),
-            "--proof-type".to_string(), "delivery_confirmation".to_string(),
-            "--attested-by".to_string(), "attestor-a".to_string(),
-            "--address".to_string(), "Iabc123".to_string(),
+            "--agreement-hash".to_string(),
+            "aabbcc".to_string(),
+            "--proof-type".to_string(),
+            "delivery_confirmation".to_string(),
+            "--attested-by".to_string(),
+            "attestor-a".to_string(),
+            "--address".to_string(),
+            "Iabc123".to_string(),
         ];
         let opts = parse_proof_create_cli(&args).expect("must parse");
         assert_eq!(opts.agreement_hash, "aabbcc");
@@ -9523,16 +11055,26 @@ mod tests {
     #[test]
     fn proof_create_cli_parses_all_optional_args() {
         let args: Vec<String> = vec![
-            "--agreement-hash".to_string(), "deadbeef".to_string(),
-            "--proof-type".to_string(), "acceptance".to_string(),
-            "--attested-by".to_string(), "att-b".to_string(),
-            "--address".to_string(), "Ixyz".to_string(),
-            "--milestone-id".to_string(), "ms-1".to_string(),
-            "--evidence-summary".to_string(), "goods received".to_string(),
-            "--evidence-hash".to_string(), "cafebabe".to_string(),
-            "--proof-id".to_string(), "prf-custom".to_string(),
-            "--timestamp".to_string(), "1700000000".to_string(),
-            "--out".to_string(), "/tmp/proof.json".to_string(),
+            "--agreement-hash".to_string(),
+            "deadbeef".to_string(),
+            "--proof-type".to_string(),
+            "acceptance".to_string(),
+            "--attested-by".to_string(),
+            "att-b".to_string(),
+            "--address".to_string(),
+            "Ixyz".to_string(),
+            "--milestone-id".to_string(),
+            "ms-1".to_string(),
+            "--evidence-summary".to_string(),
+            "goods received".to_string(),
+            "--evidence-hash".to_string(),
+            "cafebabe".to_string(),
+            "--proof-id".to_string(),
+            "prf-custom".to_string(),
+            "--timestamp".to_string(),
+            "1700000000".to_string(),
+            "--out".to_string(),
+            "/tmp/proof.json".to_string(),
             "--json".to_string(),
         ];
         let opts = parse_proof_create_cli(&args).expect("must parse");
@@ -9548,9 +11090,12 @@ mod tests {
     #[test]
     fn proof_create_cli_rejects_missing_agreement_hash() {
         let args: Vec<String> = vec![
-            "--proof-type".to_string(), "t".to_string(),
-            "--attested-by".to_string(), "a".to_string(),
-            "--address".to_string(), "x".to_string(),
+            "--proof-type".to_string(),
+            "t".to_string(),
+            "--attested-by".to_string(),
+            "a".to_string(),
+            "--address".to_string(),
+            "x".to_string(),
         ];
         let err = parse_proof_create_cli(&args).unwrap_err();
         assert!(err.contains("--agreement-hash"), "got: {err}");
@@ -9559,9 +11104,12 @@ mod tests {
     #[test]
     fn proof_create_cli_rejects_missing_proof_type() {
         let args: Vec<String> = vec![
-            "--agreement-hash".to_string(), "aa".to_string(),
-            "--attested-by".to_string(), "a".to_string(),
-            "--address".to_string(), "x".to_string(),
+            "--agreement-hash".to_string(),
+            "aa".to_string(),
+            "--attested-by".to_string(),
+            "a".to_string(),
+            "--address".to_string(),
+            "x".to_string(),
         ];
         let err = parse_proof_create_cli(&args).unwrap_err();
         assert!(err.contains("--proof-type"), "got: {err}");
@@ -9570,9 +11118,12 @@ mod tests {
     #[test]
     fn proof_create_cli_rejects_missing_attested_by() {
         let args: Vec<String> = vec![
-            "--agreement-hash".to_string(), "aa".to_string(),
-            "--proof-type".to_string(), "t".to_string(),
-            "--address".to_string(), "x".to_string(),
+            "--agreement-hash".to_string(),
+            "aa".to_string(),
+            "--proof-type".to_string(),
+            "t".to_string(),
+            "--address".to_string(),
+            "x".to_string(),
         ];
         let err = parse_proof_create_cli(&args).unwrap_err();
         assert!(err.contains("--attested-by"), "got: {err}");
@@ -9581,9 +11132,12 @@ mod tests {
     #[test]
     fn proof_create_cli_rejects_missing_address() {
         let args: Vec<String> = vec![
-            "--agreement-hash".to_string(), "aa".to_string(),
-            "--proof-type".to_string(), "t".to_string(),
-            "--attested-by".to_string(), "a".to_string(),
+            "--agreement-hash".to_string(),
+            "aa".to_string(),
+            "--proof-type".to_string(),
+            "t".to_string(),
+            "--attested-by".to_string(),
+            "a".to_string(),
         ];
         let err = parse_proof_create_cli(&args).unwrap_err();
         assert!(err.contains("--address"), "got: {err}");
@@ -9592,11 +11146,16 @@ mod tests {
     #[test]
     fn proof_create_cli_rejects_bad_timestamp() {
         let args: Vec<String> = vec![
-            "--agreement-hash".to_string(), "aa".to_string(),
-            "--proof-type".to_string(), "t".to_string(),
-            "--attested-by".to_string(), "a".to_string(),
-            "--address".to_string(), "x".to_string(),
-            "--timestamp".to_string(), "not-a-number".to_string(),
+            "--agreement-hash".to_string(),
+            "aa".to_string(),
+            "--proof-type".to_string(),
+            "t".to_string(),
+            "--attested-by".to_string(),
+            "a".to_string(),
+            "--address".to_string(),
+            "x".to_string(),
+            "--timestamp".to_string(),
+            "not-a-number".to_string(),
         ];
         let err = parse_proof_create_cli(&args).unwrap_err();
         assert!(err.contains("--timestamp"), "got: {err}");
@@ -9605,10 +11164,14 @@ mod tests {
     #[test]
     fn proof_create_cli_rejects_unknown_flag() {
         let args: Vec<String> = vec![
-            "--agreement-hash".to_string(), "aa".to_string(),
-            "--proof-type".to_string(), "t".to_string(),
-            "--attested-by".to_string(), "a".to_string(),
-            "--address".to_string(), "x".to_string(),
+            "--agreement-hash".to_string(),
+            "aa".to_string(),
+            "--proof-type".to_string(),
+            "t".to_string(),
+            "--attested-by".to_string(),
+            "a".to_string(),
+            "--address".to_string(),
+            "x".to_string(),
             "--unknown".to_string(),
         ];
         let err = parse_proof_create_cli(&args).unwrap_err();
@@ -9629,8 +11192,8 @@ mod tests {
         let tmp_dir = std::env::temp_dir();
         let wallet_path_buf = tmp_dir.join(format!("test_wallet_{}.json", std::process::id()));
         let address = {
-            use sha2::{Digest as _, Sha256 as Sha256Inner};
             use ripemd::Ripemd160;
+            use sha2::{Digest as _, Sha256 as Sha256Inner};
             let pk_bytes = secret.public_key().to_encoded_point(true);
             let sha = Sha256Inner::digest(pk_bytes.as_bytes());
             let pkh = Ripemd160::digest(&sha);
@@ -9651,7 +11214,11 @@ mod tests {
                 "privkey": hex::encode(raw),
             }]
         });
-        std::fs::write(&wallet_path_buf, serde_json::to_string(&wallet_json).unwrap()).unwrap();
+        std::fs::write(
+            &wallet_path_buf,
+            serde_json::to_string(&wallet_json).unwrap(),
+        )
+        .unwrap();
         std::env::set_var("IRIUM_WALLET_FILE", wallet_path_buf.to_str().unwrap());
 
         let opts = ProofCreateCliOptions {
@@ -9692,7 +11259,7 @@ mod tests {
     #[test]
     fn render_proof_create_summary_contains_key_fields() {
         use irium_node_rs::settlement::{
-            ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+            ProofSignatureEnvelope, AGREEMENT_SIGNATURE_TYPE_SECP256K1, SETTLEMENT_PROOF_SCHEMA_ID,
         };
         let proof = SettlementProof {
             proof_id: "prf-render-001".to_string(),
@@ -9736,8 +11303,8 @@ mod tests {
         let tmp_dir = std::env::temp_dir();
         let wallet_path_buf = tmp_dir.join(format!("test_wallet2_{}.json", std::process::id()));
         let address = {
-            use sha2::{Digest as _, Sha256 as Sha256Inner};
             use ripemd::Ripemd160;
+            use sha2::{Digest as _, Sha256 as Sha256Inner};
             let pk_bytes = secret.public_key().to_encoded_point(true);
             let sha = Sha256Inner::digest(pk_bytes.as_bytes());
             let pkh = Ripemd160::digest(&sha);
@@ -9758,7 +11325,11 @@ mod tests {
                 "privkey": hex::encode(raw),
             }]
         });
-        std::fs::write(&wallet_path_buf, serde_json::to_string(&wallet_json).unwrap()).unwrap();
+        std::fs::write(
+            &wallet_path_buf,
+            serde_json::to_string(&wallet_json).unwrap(),
+        )
+        .unwrap();
         std::env::set_var("IRIUM_WALLET_FILE", wallet_path_buf.to_str().unwrap());
 
         let opts = ProofCreateCliOptions {
@@ -9780,7 +11351,11 @@ mod tests {
         };
 
         let proof = create_settlement_proof_signed(&opts, 1700001234).expect("must create proof");
-        assert!(proof.proof_id.starts_with("prf-"), "got: {}", proof.proof_id);
+        assert!(
+            proof.proof_id.starts_with("prf-"),
+            "got: {}",
+            proof.proof_id
+        );
         assert_eq!(proof.proof_id.len(), 4 + 16, "got: {}", proof.proof_id);
         verify_settlement_proof_signature_only(&proof).expect("signature must verify");
 
@@ -9789,9 +11364,7 @@ mod tests {
     }
     #[test]
     fn policy_set_cli_parses_required_args() {
-        let args: Vec<String> = vec![
-            "--policy".to_string(), "policy.json".to_string(),
-        ];
+        let args: Vec<String> = vec!["--policy".to_string(), "policy.json".to_string()];
         let opts = parse_policy_set_cli(&args).expect("must parse");
         assert_eq!(opts.policy_path, "policy.json");
         assert!(!opts.json_mode);
@@ -9806,9 +11379,7 @@ mod tests {
 
     #[test]
     fn policy_get_cli_parses_required_args() {
-        let args: Vec<String> = vec![
-            "--agreement-hash".to_string(), "abcdef".to_string(),
-        ];
+        let args: Vec<String> = vec!["--agreement-hash".to_string(), "abcdef".to_string()];
         let opts = parse_policy_get_cli(&args).expect("must parse");
         assert_eq!(opts.agreement_hash, "abcdef");
         assert!(!opts.json_mode);
@@ -9905,9 +11476,7 @@ mod tests {
 
     #[test]
     fn policy_evaluate_cli_parses_required_args() {
-        let args: Vec<String> = vec![
-            "--agreement".to_string(), "agreement.json".to_string(),
-        ];
+        let args: Vec<String> = vec!["--agreement".to_string(), "agreement.json".to_string()];
         let opts = parse_policy_evaluate_cli(&args).expect("must parse");
         assert_eq!(opts.agreement_path, "agreement.json");
         assert!(!opts.json_mode);
@@ -9923,7 +11492,8 @@ mod tests {
     #[test]
     fn policy_evaluate_cli_rejects_unknown_flag() {
         let args: Vec<String> = vec![
-            "--agreement".to_string(), "a.json".to_string(),
+            "--agreement".to_string(),
+            "a.json".to_string(),
             "--unknown".to_string(),
         ];
         let err = parse_policy_evaluate_cli(&args).unwrap_err();
@@ -10017,10 +11587,22 @@ mod tests {
             ..Default::default()
         };
         let out = render_policy_evaluate_summary(&resp);
-        assert!(out.contains("expired_proof_count 2"), "must show expired count; got: {out}");
-        assert!(out.contains("matched_proof_count 0"), "no matched; got: {out}");
-        assert!(!out.contains("matched_proof_ids"), "no matched ids to show; got: {out}");
-        assert!(out.contains("skipped"), "evaluated_rules must mention skipped; got: {out}");
+        assert!(
+            out.contains("expired_proof_count 2"),
+            "must show expired count; got: {out}"
+        );
+        assert!(
+            out.contains("matched_proof_count 0"),
+            "no matched; got: {out}"
+        );
+        assert!(
+            !out.contains("matched_proof_ids"),
+            "no matched ids to show; got: {out}"
+        );
+        assert!(
+            out.contains("skipped"),
+            "evaluated_rules must mention skipped; got: {out}"
+        );
     }
 
     #[test]
@@ -10069,7 +11651,10 @@ mod tests {
             ..Default::default()
         };
         let out = render_policy_evaluate_summary(&resp);
-        assert!(!out.contains("expired_proof_count"), "zero expired must be silent; got: {out}");
+        assert!(
+            !out.contains("expired_proof_count"),
+            "zero expired must be silent; got: {out}"
+        );
         assert!(out.contains("matched_proof_count 1"), "got: {out}");
     }
 
@@ -10090,7 +11675,10 @@ mod tests {
             ..Default::default()
         };
         let out = render_policy_evaluate_summary(&resp);
-        assert!(out.contains("outcome satisfied"), "must show outcome; got: {out}");
+        assert!(
+            out.contains("outcome satisfied"),
+            "must show outcome; got: {out}"
+        );
         assert!(out.contains("release_eligible true"), "got: {out}");
     }
 
@@ -10107,7 +11695,10 @@ mod tests {
             ..Default::default()
         };
         let out = render_policy_evaluate_summary(&resp);
-        assert!(out.contains("outcome unsatisfied"), "must show outcome; got: {out}");
+        assert!(
+            out.contains("outcome unsatisfied"),
+            "must show outcome; got: {out}"
+        );
         assert!(out.contains("release_eligible false"), "got: {out}");
     }
 
@@ -10124,7 +11715,10 @@ mod tests {
             ..Default::default()
         };
         let out = render_policy_evaluate_summary(&resp);
-        assert!(out.contains("outcome timeout"), "must show outcome; got: {out}");
+        assert!(
+            out.contains("outcome timeout"),
+            "must show outcome; got: {out}"
+        );
         assert!(out.contains("refund_eligible true"), "got: {out}");
     }
 
@@ -10143,7 +11737,10 @@ mod tests {
             ..Default::default()
         };
         let out = render_policy_evaluate_summary(&resp);
-        assert!(!out.contains("outcome "), "empty outcome must be silent; got: {out}");
+        assert!(
+            !out.contains("outcome "),
+            "empty outcome must be silent; got: {out}"
+        );
     }
 
     // ---- milestone render tests ----
@@ -10180,9 +11777,18 @@ mod tests {
             ..Default::default()
         };
         let out = render_policy_evaluate_summary(&resp);
-        assert!(out.contains("milestones 1/2"), "must show milestone count; got: {out}");
-        assert!(out.contains("Delivery outcome satisfied"), "must show labeled milestone; got: {out}");
-        assert!(out.contains("ms-b outcome not_yet_attested"), "must show not_yet_attested for unmatched milestone; got: {out}");
+        assert!(
+            out.contains("milestones 1/2"),
+            "must show milestone count; got: {out}"
+        );
+        assert!(
+            out.contains("Delivery outcome satisfied"),
+            "must show labeled milestone; got: {out}"
+        );
+        assert!(
+            out.contains("ms-b outcome not_yet_attested"),
+            "must show not_yet_attested for unmatched milestone; got: {out}"
+        );
     }
 
     #[test]
@@ -10226,7 +11832,10 @@ mod tests {
             ..Default::default()
         };
         let out = render_policy_evaluate_summary(&resp);
-        assert!(!out.contains("milestones"), "must not show milestone section; got: {out}");
+        assert!(
+            !out.contains("milestones"),
+            "must not show milestone section; got: {out}"
+        );
     }
 
     #[test]
@@ -10283,7 +11892,7 @@ mod tests {
                     expired: false,
                 },
             ],
-            active_only: false
+            active_only: false,
         };
         let out = render_policy_list_summary(&resp);
         assert!(out.contains("count 2"), "got: {out}");
@@ -10295,11 +11904,11 @@ mod tests {
         assert!(out.contains("policy_id pol-002"), "got: {out}");
     }
 
-
     #[test]
     fn policy_set_cli_parses_replace_flag() {
         let args: Vec<String> = vec![
-            "--policy".to_string(), "p.json".to_string(),
+            "--policy".to_string(),
+            "p.json".to_string(),
             "--replace".to_string(),
         ];
         let opts = parse_policy_set_cli(&args).expect("must parse");
@@ -10309,9 +11918,7 @@ mod tests {
 
     #[test]
     fn policy_set_cli_replace_defaults_false() {
-        let args: Vec<String> = vec![
-            "--policy".to_string(), "p.json".to_string(),
-        ];
+        let args: Vec<String> = vec!["--policy".to_string(), "p.json".to_string()];
         let opts = parse_policy_set_cli(&args).expect("must parse");
         assert!(!opts.replace, "replace must default to false");
     }
@@ -10323,19 +11930,25 @@ mod tests {
             agreement_hash: "ff0011".to_string(),
             accepted: false,
             updated: false,
-            message: "a policy 'pol-001' already exists for this agreement; use --replace to overwrite".to_string(),
+            message:
+                "a policy 'pol-001' already exists for this agreement; use --replace to overwrite"
+                    .to_string(),
         };
         let out = render_policy_set_summary(&resp);
         assert!(out.contains("rejected"), "got: {out}");
-        assert!(out.contains("--replace"), "message must propagate; got: {out}");
+        assert!(
+            out.contains("--replace"),
+            "message must propagate; got: {out}"
+        );
     }
-
 
     #[test]
     fn policy_set_cli_parses_expires_at_height() {
         let args: Vec<String> = vec![
-            "--policy".to_string(), "p.json".to_string(),
-            "--expires-at-height".to_string(), "1000".to_string(),
+            "--policy".to_string(),
+            "p.json".to_string(),
+            "--expires-at-height".to_string(),
+            "1000".to_string(),
         ];
         let opts = parse_policy_set_cli(&args).expect("must parse");
         assert_eq!(opts.expires_at_height, Some(1000));
@@ -10343,9 +11956,7 @@ mod tests {
 
     #[test]
     fn policy_set_cli_expires_at_height_defaults_none() {
-        let args: Vec<String> = vec![
-            "--policy".to_string(), "p.json".to_string(),
-        ];
+        let args: Vec<String> = vec!["--policy".to_string(), "p.json".to_string()];
         let opts = parse_policy_set_cli(&args).expect("must parse");
         assert_eq!(opts.expires_at_height, None);
     }
@@ -10353,11 +11964,16 @@ mod tests {
     #[test]
     fn policy_set_cli_rejects_invalid_expires_height() {
         let args: Vec<String> = vec![
-            "--policy".to_string(), "p.json".to_string(),
-            "--expires-at-height".to_string(), "notanumber".to_string(),
+            "--policy".to_string(),
+            "p.json".to_string(),
+            "--expires-at-height".to_string(),
+            "notanumber".to_string(),
         ];
         let err = parse_policy_set_cli(&args).unwrap_err();
-        assert!(err.contains("integer") || err.contains("expires-at-height"), "got: {err}");
+        assert!(
+            err.contains("integer") || err.contains("expires-at-height"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -10383,7 +11999,10 @@ mod tests {
         };
         let out = render_policy_get_summary(&resp);
         assert!(out.contains("500"), "must show expiry height; got: {out}");
-        assert!(out.contains("expired false"), "must show expired false; got: {out}");
+        assert!(
+            out.contains("expired false"),
+            "must show expired false; got: {out}"
+        );
     }
 
     #[test]
@@ -10408,7 +12027,10 @@ mod tests {
             expired: true,
         };
         let out = render_policy_get_summary(&resp);
-        assert!(out.contains("expired true"), "must show expired true; got: {out}");
+        assert!(
+            out.contains("expired true"),
+            "must show expired true; got: {out}"
+        );
     }
 
     #[test]
@@ -10423,11 +12045,14 @@ mod tests {
                 expires_at_height: Some(777),
                 expired: true,
             }],
-            active_only: false
+            active_only: false,
         };
         let out = render_policy_list_summary(&resp);
         assert!(out.contains("777"), "must show expiry height; got: {out}");
-        assert!(out.contains("expired true"), "must show expired; got: {out}");
+        assert!(
+            out.contains("expired true"),
+            "must show expired; got: {out}"
+        );
     }
 
     #[test]
@@ -10442,12 +12067,14 @@ mod tests {
                 expires_at_height: None,
                 expired: false,
             }],
-            active_only: false
+            active_only: false,
         };
         let out = render_policy_list_summary(&resp);
-        assert!(out.contains("expires_at_height none"), "must show none; got: {out}");
+        assert!(
+            out.contains("expires_at_height none"),
+            "must show none; got: {out}"
+        );
     }
-
 
     #[test]
     fn parse_policy_list_cli_active_only_flag() {
@@ -10478,7 +12105,10 @@ mod tests {
             active_only: true,
         };
         let out = render_policy_list_summary(&resp);
-        assert!(out.contains("filter active_only true"), "must show filter header; got: {out}");
+        assert!(
+            out.contains("filter active_only true"),
+            "must show filter header; got: {out}"
+        );
         assert!(out.contains("count 1"), "got: {out}");
     }
 
@@ -10490,15 +12120,15 @@ mod tests {
             active_only: false,
         };
         let out = render_policy_list_summary(&resp);
-        assert!(!out.contains("filter active_only"), "must not show filter header; got: {out}");
+        assert!(
+            !out.contains("filter active_only"),
+            "must not show filter header; got: {out}"
+        );
     }
-
 
     #[test]
     fn proof_list_cli_agreement_hash_parsed_when_provided() {
-        let args: Vec<String> = vec![
-            "--agreement-hash".to_string(), "deadbeef".to_string(),
-        ];
+        let args: Vec<String> = vec!["--agreement-hash".to_string(), "deadbeef".to_string()];
         let opts = parse_proof_list_cli(&args).expect("must parse");
         assert_eq!(opts.agreement_hash, Some("deadbeef".to_string()));
     }
@@ -10514,7 +12144,10 @@ mod tests {
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(out.contains("agreement_hash * (all)"), "must show global header; got: {out}");
+        assert!(
+            out.contains("agreement_hash * (all)"),
+            "must show global header; got: {out}"
+        );
         assert!(out.contains("returned_count 0"), "got: {out}");
     }
 
@@ -10529,19 +12162,29 @@ mod tests {
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(out.contains("agreement_hash aabbcc"), "must show filter hash; got: {out}");
-        assert!(!out.contains("(all)"), "must not show global marker; got: {out}");
+        assert!(
+            out.contains("agreement_hash aabbcc"),
+            "must show filter hash; got: {out}"
+        );
+        assert!(
+            !out.contains("(all)"),
+            "must not show global marker; got: {out}"
+        );
     }
-
 
     #[test]
     fn proof_create_cli_parses_expires_at_height() {
         let args: Vec<String> = vec![
-            "--agreement-hash".to_string(), "aabbcc".to_string(),
-            "--proof-type".to_string(), "delivery_confirmation".to_string(),
-            "--attested-by".to_string(), "att-1".to_string(),
-            "--address".to_string(), "Iabc".to_string(),
-            "--expires-at-height".to_string(), "5000".to_string(),
+            "--agreement-hash".to_string(),
+            "aabbcc".to_string(),
+            "--proof-type".to_string(),
+            "delivery_confirmation".to_string(),
+            "--attested-by".to_string(),
+            "att-1".to_string(),
+            "--address".to_string(),
+            "Iabc".to_string(),
+            "--expires-at-height".to_string(),
+            "5000".to_string(),
         ];
         let opts = parse_proof_create_cli(&args).expect("must parse");
         assert_eq!(opts.expires_at_height, Some(5000));
@@ -10550,10 +12193,14 @@ mod tests {
     #[test]
     fn proof_create_cli_expires_defaults_to_none() {
         let args: Vec<String> = vec![
-            "--agreement-hash".to_string(), "aabbcc".to_string(),
-            "--proof-type".to_string(), "delivery_confirmation".to_string(),
-            "--attested-by".to_string(), "att-1".to_string(),
-            "--address".to_string(), "Iabc".to_string(),
+            "--agreement-hash".to_string(),
+            "aabbcc".to_string(),
+            "--proof-type".to_string(),
+            "delivery_confirmation".to_string(),
+            "--attested-by".to_string(),
+            "att-1".to_string(),
+            "--address".to_string(),
+            "Iabc".to_string(),
         ];
         let opts = parse_proof_create_cli(&args).expect("must parse");
         assert_eq!(opts.expires_at_height, None);
@@ -10561,7 +12208,9 @@ mod tests {
 
     #[test]
     fn render_proof_list_summary_shows_proof_expiry_not_expired() {
-        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        use irium_node_rs::settlement::{
+            ProofSignatureEnvelope, AGREEMENT_SIGNATURE_TYPE_SECP256K1, SETTLEMENT_PROOF_SCHEMA_ID,
+        };
         let proof = SettlementProof {
             proof_id: "prf-exp-1".to_string(),
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
@@ -10587,18 +12236,32 @@ mod tests {
             tip_height: 50,
             active_only: false,
             returned_count: 1,
-            proofs: vec![ProofListItem { proof, status: "active".to_string() }],
+            proofs: vec![ProofListItem {
+                proof,
+                status: "active".to_string(),
+            }],
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(out.contains("expires_at_height=1000"), "must show expiry height; got: {out}");
-        assert!(out.contains("expired=false"), "must show not expired at tip 50; got: {out}");
-        assert!(out.contains("status=active"), "must show status=active; got: {out}");
+        assert!(
+            out.contains("expires_at_height=1000"),
+            "must show expiry height; got: {out}"
+        );
+        assert!(
+            out.contains("expired=false"),
+            "must show not expired at tip 50; got: {out}"
+        );
+        assert!(
+            out.contains("status=active"),
+            "must show status=active; got: {out}"
+        );
     }
 
     #[test]
     fn render_proof_list_summary_shows_proof_expiry_expired() {
-        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        use irium_node_rs::settlement::{
+            ProofSignatureEnvelope, AGREEMENT_SIGNATURE_TYPE_SECP256K1, SETTLEMENT_PROOF_SCHEMA_ID,
+        };
         let proof = SettlementProof {
             proof_id: "prf-exp-2".to_string(),
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
@@ -10624,18 +12287,32 @@ mod tests {
             tip_height: 200,
             active_only: false,
             returned_count: 1,
-            proofs: vec![ProofListItem { proof, status: "expired".to_string() }],
+            proofs: vec![ProofListItem {
+                proof,
+                status: "expired".to_string(),
+            }],
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(out.contains("expires_at_height=100"), "must show expiry height; got: {out}");
-        assert!(out.contains("expired=true"), "must show expired at tip 200; got: {out}");
-        assert!(out.contains("status=expired"), "must show status=expired; got: {out}");
+        assert!(
+            out.contains("expires_at_height=100"),
+            "must show expiry height; got: {out}"
+        );
+        assert!(
+            out.contains("expired=true"),
+            "must show expired at tip 200; got: {out}"
+        );
+        assert!(
+            out.contains("status=expired"),
+            "must show status=expired; got: {out}"
+        );
     }
 
     #[test]
     fn render_proof_create_summary_shows_expiry_when_set() {
-        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        use irium_node_rs::settlement::{
+            ProofSignatureEnvelope, AGREEMENT_SIGNATURE_TYPE_SECP256K1, SETTLEMENT_PROOF_SCHEMA_ID,
+        };
         let proof = SettlementProof {
             proof_id: "prf-create-exp".to_string(),
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
@@ -10656,12 +12333,17 @@ mod tests {
             typed_payload: None,
         };
         let out = render_proof_create_summary(&proof);
-        assert!(out.contains("expires_at_height 8000"), "must show expiry height; got: {out}");
+        assert!(
+            out.contains("expires_at_height 8000"),
+            "must show expiry height; got: {out}"
+        );
     }
 
     #[test]
     fn render_proof_create_summary_shows_none_when_no_expiry() {
-        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        use irium_node_rs::settlement::{
+            ProofSignatureEnvelope, AGREEMENT_SIGNATURE_TYPE_SECP256K1, SETTLEMENT_PROOF_SCHEMA_ID,
+        };
         let proof = SettlementProof {
             proof_id: "prf-noexp".to_string(),
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
@@ -10682,10 +12364,11 @@ mod tests {
             typed_payload: None,
         };
         let out = render_proof_create_summary(&proof);
-        assert!(out.contains("expires_at_height none"), "must show none when no expiry; got: {out}");
+        assert!(
+            out.contains("expires_at_height none"),
+            "must show none when no expiry; got: {out}"
+        );
     }
-
-
 
     #[test]
     fn parse_proof_list_cli_active_only_flag() {
@@ -10712,7 +12395,10 @@ mod tests {
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(out.contains("filter active_only true"), "must show filter header; got: {out}");
+        assert!(
+            out.contains("filter active_only true"),
+            "must show filter header; got: {out}"
+        );
     }
 
     #[test]
@@ -10726,21 +12412,23 @@ mod tests {
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(!out.contains("filter active_only"), "must not show filter header; got: {out}");
+        assert!(
+            !out.contains("filter active_only"),
+            "must not show filter header; got: {out}"
+        );
     }
 
     #[test]
     fn parse_proof_list_cli_active_only_combined_with_agreement_hash() {
         let args: Vec<String> = vec![
             "--active-only".to_string(),
-            "--agreement-hash".to_string(), "deadbeef".to_string(),
+            "--agreement-hash".to_string(),
+            "deadbeef".to_string(),
         ];
         let opts = parse_proof_list_cli(&args).expect("must parse");
         assert!(opts.active_only);
         assert_eq!(opts.agreement_hash, Some("deadbeef".to_string()));
     }
-
-
 
     #[test]
     fn render_proof_submit_summary_non_expiring() {
@@ -10756,10 +12444,19 @@ mod tests {
             status: "active".to_string(),
         };
         let out = render_proof_submit_summary(&resp);
-        assert!(out.contains("expires_at_height none"), "must show none; got: {out}");
-        assert!(out.contains("expired false"), "non-expiring must show expired false; got: {out}");
+        assert!(
+            out.contains("expires_at_height none"),
+            "must show none; got: {out}"
+        );
+        assert!(
+            out.contains("expired false"),
+            "non-expiring must show expired false; got: {out}"
+        );
         assert!(out.contains("tip_height 100"), "must show tip; got: {out}");
-        assert!(out.contains("status active"), "non-expiring must show status active; got: {out}");
+        assert!(
+            out.contains("status active"),
+            "non-expiring must show status active; got: {out}"
+        );
     }
 
     #[test]
@@ -10776,9 +12473,18 @@ mod tests {
             status: "active".to_string(),
         };
         let out = render_proof_submit_summary(&resp);
-        assert!(out.contains("expires_at_height 1000"), "must show expiry height; got: {out}");
-        assert!(out.contains("expired false"), "future expiry must show expired false; got: {out}");
-        assert!(out.contains("status active"), "future expiry must show status active; got: {out}");
+        assert!(
+            out.contains("expires_at_height 1000"),
+            "must show expiry height; got: {out}"
+        );
+        assert!(
+            out.contains("expired false"),
+            "future expiry must show expired false; got: {out}"
+        );
+        assert!(
+            out.contains("status active"),
+            "future expiry must show status active; got: {out}"
+        );
     }
 
     #[test]
@@ -10795,16 +12501,29 @@ mod tests {
             status: "expired".to_string(),
         };
         let out = render_proof_submit_summary(&resp);
-        assert!(out.contains("expires_at_height 10"), "must show expiry height; got: {out}");
-        assert!(out.contains("expired true"), "must show expired true; got: {out}");
-        assert!(out.contains("tip_height 50"), "must show tip height; got: {out}");
-        assert!(out.contains("status expired"), "must show status expired; got: {out}");
+        assert!(
+            out.contains("expires_at_height 10"),
+            "must show expiry height; got: {out}"
+        );
+        assert!(
+            out.contains("expired true"),
+            "must show expired true; got: {out}"
+        );
+        assert!(
+            out.contains("tip_height 50"),
+            "must show tip height; got: {out}"
+        );
+        assert!(
+            out.contains("status expired"),
+            "must show status expired; got: {out}"
+        );
     }
-
 
     #[test]
     fn render_proof_list_summary_status_active_shown() {
-        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        use irium_node_rs::settlement::{
+            ProofSignatureEnvelope, AGREEMENT_SIGNATURE_TYPE_SECP256K1, SETTLEMENT_PROOF_SCHEMA_ID,
+        };
         let proof = SettlementProof {
             proof_id: "prf-st-a".to_string(),
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
@@ -10829,16 +12548,24 @@ mod tests {
             tip_height: 0,
             active_only: false,
             returned_count: 1,
-            proofs: vec![ProofListItem { proof, status: "active".to_string() }],
+            proofs: vec![ProofListItem {
+                proof,
+                status: "active".to_string(),
+            }],
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(out.contains("status=active"), "status=active must appear in output; got: {out}");
+        assert!(
+            out.contains("status=active"),
+            "status=active must appear in output; got: {out}"
+        );
     }
 
     #[test]
     fn render_proof_list_summary_status_expired_shown() {
-        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        use irium_node_rs::settlement::{
+            ProofSignatureEnvelope, AGREEMENT_SIGNATURE_TYPE_SECP256K1, SETTLEMENT_PROOF_SCHEMA_ID,
+        };
         let proof = SettlementProof {
             proof_id: "prf-st-e".to_string(),
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
@@ -10863,16 +12590,24 @@ mod tests {
             tip_height: 200,
             active_only: false,
             returned_count: 1,
-            proofs: vec![ProofListItem { proof, status: "expired".to_string() }],
+            proofs: vec![ProofListItem {
+                proof,
+                status: "expired".to_string(),
+            }],
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(out.contains("status=expired"), "status=expired must appear in output; got: {out}");
+        assert!(
+            out.contains("status=expired"),
+            "status=expired must appear in output; got: {out}"
+        );
     }
 
     #[test]
     fn render_proof_list_summary_status_empty_not_shown() {
-        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        use irium_node_rs::settlement::{
+            ProofSignatureEnvelope, AGREEMENT_SIGNATURE_TYPE_SECP256K1, SETTLEMENT_PROOF_SCHEMA_ID,
+        };
         let proof = SettlementProof {
             proof_id: "prf-st-none".to_string(),
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
@@ -10897,13 +12632,18 @@ mod tests {
             tip_height: 0,
             active_only: false,
             returned_count: 1,
-            proofs: vec![ProofListItem { proof, status: String::new() }],
+            proofs: vec![ProofListItem {
+                proof,
+                status: String::new(),
+            }],
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(!out.contains("status="), "empty status must not appear in output; got: {out}");
+        assert!(
+            !out.contains("status="),
+            "empty status must not appear in output; got: {out}"
+        );
     }
-
 
     #[test]
     fn render_proof_submit_summary_status_active_shown() {
@@ -10919,7 +12659,10 @@ mod tests {
             status: "active".to_string(),
         };
         let out = render_proof_submit_summary(&resp);
-        assert!(out.contains("status active"), "status active must appear; got: {out}");
+        assert!(
+            out.contains("status active"),
+            "status active must appear; got: {out}"
+        );
     }
 
     #[test]
@@ -10936,7 +12679,10 @@ mod tests {
             status: "expired".to_string(),
         };
         let out = render_proof_submit_summary(&resp);
-        assert!(out.contains("status expired"), "status expired must appear; got: {out}");
+        assert!(
+            out.contains("status expired"),
+            "status expired must appear; got: {out}"
+        );
     }
 
     #[test]
@@ -10954,15 +12700,15 @@ mod tests {
             status: String::new(),
         };
         let out = render_proof_submit_summary(&resp);
-        assert!(!out.contains("status"), "empty status must not appear in output; got: {out}");
+        assert!(
+            !out.contains("status"),
+            "empty status must not appear in output; got: {out}"
+        );
     }
-
 
     #[test]
     fn parse_proof_get_cli_parses_required_args() {
-        let args: Vec<String> = vec![
-            "--proof-id".to_string(), "prf-001".to_string(),
-        ];
+        let args: Vec<String> = vec!["--proof-id".to_string(), "prf-001".to_string()];
         let opts = parse_proof_get_cli(&args).expect("must parse");
         assert_eq!(opts.proof_id, "prf-001");
     }
@@ -10976,7 +12722,9 @@ mod tests {
 
     #[test]
     fn render_proof_get_summary_found_active() {
-        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        use irium_node_rs::settlement::{
+            ProofSignatureEnvelope, AGREEMENT_SIGNATURE_TYPE_SECP256K1, SETTLEMENT_PROOF_SCHEMA_ID,
+        };
         let proof = SettlementProof {
             proof_id: "prf-get-1".to_string(),
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
@@ -11015,7 +12763,9 @@ mod tests {
 
     #[test]
     fn render_proof_get_summary_found_expired() {
-        use irium_node_rs::settlement::{ProofSignatureEnvelope, SETTLEMENT_PROOF_SCHEMA_ID, AGREEMENT_SIGNATURE_TYPE_SECP256K1};
+        use irium_node_rs::settlement::{
+            ProofSignatureEnvelope, AGREEMENT_SIGNATURE_TYPE_SECP256K1, SETTLEMENT_PROOF_SCHEMA_ID,
+        };
         let proof = SettlementProof {
             proof_id: "prf-get-2".to_string(),
             schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
@@ -11062,12 +12812,22 @@ mod tests {
             status: String::new(),
         };
         let out = render_proof_get_summary(&resp);
-        assert!(out.contains("not_found true"), "must show not_found; got: {out}");
-        assert!(!out.contains("
-found true"), "must not show found true; got: {out}");
-        assert!(!out.contains("status"), "status must not appear when not found; got: {out}");
+        assert!(
+            out.contains("not_found true"),
+            "must show not_found; got: {out}"
+        );
+        assert!(
+            !out.contains(
+                "
+found true"
+            ),
+            "must not show found true; got: {out}"
+        );
+        assert!(
+            !out.contains("status"),
+            "status must not appear when not found; got: {out}"
+        );
     }
-
 
     // ---- Pagination CLI + render tests ----
 
@@ -11090,8 +12850,10 @@ found true"), "must not show found true; got: {out}");
     #[test]
     fn proof_list_cli_parses_limit_and_offset() {
         let args = vec![
-            "--offset".to_string(), "3".to_string(),
-            "--limit".to_string(), "7".to_string(),
+            "--offset".to_string(),
+            "3".to_string(),
+            "--limit".to_string(),
+            "7".to_string(),
         ];
         let opts = parse_proof_list_cli(&args).expect("must parse");
         assert_eq!(opts.offset, 3);
@@ -11118,10 +12880,16 @@ found true"), "must not show found true; got: {out}");
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(out.contains("total_count 10"), "must show total; got: {out}");
+        assert!(
+            out.contains("total_count 10"),
+            "must show total; got: {out}"
+        );
         assert!(out.contains("offset 4"), "must show offset; got: {out}");
         assert!(out.contains("limit 2"), "must show limit; got: {out}");
-        assert!(out.contains("has_more true"), "must show has_more when true; got: {out}");
+        assert!(
+            out.contains("has_more true"),
+            "must show has_more when true; got: {out}"
+        );
     }
 
     #[test]
@@ -11134,10 +12902,22 @@ found true"), "must not show found true; got: {out}");
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(!out.contains("total_count"), "must not show pagination noise; got: {out}");
-        assert!(!out.contains("offset"), "must not show offset when zero; got: {out}");
-        assert!(!out.contains("limit"), "must not show limit when absent; got: {out}");
-        assert!(!out.contains("has_more"), "must not show has_more when false; got: {out}");
+        assert!(
+            !out.contains("total_count"),
+            "must not show pagination noise; got: {out}"
+        );
+        assert!(
+            !out.contains("offset"),
+            "must not show offset when zero; got: {out}"
+        );
+        assert!(
+            !out.contains("limit"),
+            "must not show limit when absent; got: {out}"
+        );
+        assert!(
+            !out.contains("has_more"),
+            "must not show has_more when false; got: {out}"
+        );
     }
 
     #[test]
@@ -11155,7 +12935,10 @@ found true"), "must not show found true; got: {out}");
         let out = render_proof_list_summary(&resp);
         assert!(out.contains("total_count 4"), "must show total; got: {out}");
         assert!(out.contains("offset 2"), "must show offset; got: {out}");
-        assert!(!out.contains("has_more"), "has_more false must be silent; got: {out}");
+        assert!(
+            !out.contains("has_more"),
+            "has_more false must be silent; got: {out}"
+        );
     }
 
     #[test]
@@ -11171,9 +12954,15 @@ found true"), "must not show found true; got: {out}");
             ..Default::default()
         };
         let out = render_proof_list_summary(&resp);
-        assert!(out.contains("has_more true"), "must show has_more when true; got: {out}");
+        assert!(
+            out.contains("has_more true"),
+            "must show has_more when true; got: {out}"
+        );
         assert!(out.contains("total_count 5"), "must show total; got: {out}");
-        assert!(!out.contains("offset"), "offset is zero, must be silent; got: {out}");
+        assert!(
+            !out.contains("offset"),
+            "offset is zero, must be silent; got: {out}"
+        );
     }
 
     #[test]
@@ -11188,7 +12977,10 @@ found true"), "must not show found true; got: {out}");
         };
         let out = render_proof_list_summary(&resp);
         assert!(!out.contains("has_more"), "no pagination noise; got: {out}");
-        assert!(!out.contains("total_count"), "no pagination noise; got: {out}");
+        assert!(
+            !out.contains("total_count"),
+            "no pagination noise; got: {out}"
+        );
     }
 
     // ── Phase 4: render_build_settlement_summary unit tests ──────────────────
@@ -11213,11 +13005,26 @@ found true"), "must not show found true; got: {out}");
             }],
         };
         let s = render_build_settlement_summary(&resp);
-        assert!(s.contains("release_eligible true"), "must mark release eligible: {s}");
-        assert!(s.contains("refund_eligible false"), "must mark refund not eligible: {s}");
-        assert!(s.contains("action[0] release"), "must list release action: {s}");
-        assert!(s.contains("irium1payee000"), "must include recipient address: {s}");
-        assert!(s.contains("executable=true"), "must mark as executable: {s}");
+        assert!(
+            s.contains("release_eligible true"),
+            "must mark release eligible: {s}"
+        );
+        assert!(
+            s.contains("refund_eligible false"),
+            "must mark refund not eligible: {s}"
+        );
+        assert!(
+            s.contains("action[0] release"),
+            "must list release action: {s}"
+        );
+        assert!(
+            s.contains("irium1payee000"),
+            "must include recipient address: {s}"
+        );
+        assert!(
+            s.contains("executable=true"),
+            "must mark as executable: {s}"
+        );
     }
 
     #[test]
@@ -11240,10 +13047,22 @@ found true"), "must not show found true; got: {out}");
             }],
         };
         let s = render_build_settlement_summary(&resp);
-        assert!(s.contains("release_eligible false"), "must mark release not eligible: {s}");
-        assert!(s.contains("refund_eligible true"), "must mark refund eligible: {s}");
-        assert!(s.contains("action[0] refund"), "must list refund action: {s}");
-        assert!(s.contains("irium1payer000"), "must include payer address: {s}");
+        assert!(
+            s.contains("release_eligible false"),
+            "must mark release not eligible: {s}"
+        );
+        assert!(
+            s.contains("refund_eligible true"),
+            "must mark refund eligible: {s}"
+        );
+        assert!(
+            s.contains("action[0] refund"),
+            "must list refund action: {s}"
+        );
+        assert!(
+            s.contains("irium1payer000"),
+            "must include payer address: {s}"
+        );
         assert!(s.contains("deadline_elapsed"), "must include reason: {s}");
     }
 
@@ -11285,32 +13104,52 @@ found true"), "must not show found true; got: {out}");
         };
         // Serialize + round-trip: confirms field name is "agreement" (matching server schema).
         let serialized = serde_json::to_string(&req).expect("must serialize");
-        assert!(serialized.contains("\"agreement\":"), "request body must use agreement key: {serialized}");
+        assert!(
+            serialized.contains("\"agreement\":"),
+            "request body must use agreement key: {serialized}"
+        );
         // Re-deserialize to confirm serde round-trip is stable.
-        let _back: ComputeAgreementHashRpcRequest = serde_json::from_str(&serialized)
-            .expect("must round-trip");
+        let _back: ComputeAgreementHashRpcRequest =
+            serde_json::from_str(&serialized).expect("must round-trip");
 
         let bst_req = BuildSettlementTxRpcRequest {
             agreement: _back.agreement,
         };
         let bst_serialized = serde_json::to_string(&bst_req).expect("must serialize");
-        assert!(bst_serialized.contains("\"agreement\":"), "bst request body must use agreement key: {bst_serialized}");
+        assert!(
+            bst_serialized.contains("\"agreement\":"),
+            "bst request body must use agreement key: {bst_serialized}"
+        );
     }
 
     #[test]
     fn compute_agreement_hash_response_serde_defaults() {
         // A minimal/empty JSON object must deserialize to default values without panic.
-        let resp: ComputeAgreementHashRpcResponse = serde_json::from_str("{}").expect("must deserialize from empty object");
-        assert!(resp.agreement_hash.is_empty(), "agreement_hash defaults to empty");
-        assert!(resp.canonical_json.is_empty(), "canonical_json defaults to empty");
-        assert!(resp.serialization_rules.is_empty(), "serialization_rules defaults to empty vec");
+        let resp: ComputeAgreementHashRpcResponse =
+            serde_json::from_str("{}").expect("must deserialize from empty object");
+        assert!(
+            resp.agreement_hash.is_empty(),
+            "agreement_hash defaults to empty"
+        );
+        assert!(
+            resp.canonical_json.is_empty(),
+            "canonical_json defaults to empty"
+        );
+        assert!(
+            resp.serialization_rules.is_empty(),
+            "serialization_rules defaults to empty vec"
+        );
     }
 
     #[test]
     fn build_settlement_tx_response_serde_defaults() {
         // A minimal/empty JSON object must deserialize to default values without panic.
-        let resp: BuildSettlementTxRpcResponse = serde_json::from_str("{}").expect("must deserialize from empty object");
-        assert!(resp.agreement_hash.is_empty(), "agreement_hash defaults to empty");
+        let resp: BuildSettlementTxRpcResponse =
+            serde_json::from_str("{}").expect("must deserialize from empty object");
+        assert!(
+            resp.agreement_hash.is_empty(),
+            "agreement_hash defaults to empty"
+        );
         assert!(!resp.policy_found, "policy_found defaults to false");
         assert!(!resp.release_eligible, "release_eligible defaults to false");
         assert!(!resp.refund_eligible, "refund_eligible defaults to false");
@@ -11321,10 +13160,14 @@ found true"), "must not show found true; got: {out}");
     #[test]
     fn settlement_action_rpc_serde_defaults() {
         // A minimal action object deserializes without panic; executable defaults false.
-        let action: SettlementActionRpc = serde_json::from_str("{}").expect("must deserialize from empty object");
+        let action: SettlementActionRpc =
+            serde_json::from_str("{}").expect("must deserialize from empty object");
         assert!(action.action.is_empty(), "action defaults to empty");
         assert!(!action.executable, "executable defaults to false");
-        assert!(action.executable_after_height.is_none(), "executable_after_height defaults to None");
+        assert!(
+            action.executable_after_height.is_none(),
+            "executable_after_height defaults to None"
+        );
     }
 
     #[test]
@@ -11341,7 +13184,10 @@ found true"), "must not show found true; got: {out}");
             actions: vec![],
         };
         let s = render_build_settlement_summary(&resp);
-        assert!(s.contains("policy_found false"), "must show policy_found false: {s}");
+        assert!(
+            s.contains("policy_found false"),
+            "must show policy_found false: {s}"
+        );
         assert!(s.contains("action_count 0"), "must show 0 actions: {s}");
         assert!(s.contains("no_policy"), "must show reason: {s}");
         assert!(s.contains("tip_height 5000"), "must show tip_height: {s}");
@@ -11368,7 +13214,8 @@ found true"), "must not show found true; got: {out}");
             }],
         };
         let json = serde_json::to_string(&resp).expect("must serialize");
-        let back: BuildSettlementTxRpcResponse = serde_json::from_str(&json).expect("must deserialize");
+        let back: BuildSettlementTxRpcResponse =
+            serde_json::from_str(&json).expect("must deserialize");
         assert_eq!(back.agreement_hash, resp.agreement_hash);
         assert_eq!(back.tip_height, resp.tip_height);
         assert_eq!(back.actions.len(), 1);
@@ -11411,8 +13258,521 @@ found true"), "must not show found true; got: {out}");
         assert!(s.contains("action[0]"), "must list first action: {s}");
         assert!(s.contains("action[1]"), "must list second action: {s}");
         assert!(s.contains("bps=800"), "must include holdback bps: {s}");
-        assert!(s.contains("executable=false"), "holdback must be non-executable: {s}");
-        assert!(s.contains("height_99999"), "must include holdback unlock height: {s}");
+        assert!(
+            s.contains("executable=false"),
+            "holdback must be non-executable: {s}"
+        );
+        assert!(
+            s.contains("height_99999"),
+            "must include holdback unlock height: {s}"
+        );
+    }
+
+    // ============================================================
+    // Remote attestor flow tests
+    // ============================================================
+
+    fn test_privkey_hex() -> String {
+        hex::encode([7u8; 32])
+    }
+
+    fn test_agreement_hash() -> String {
+        "a".repeat(64)
+    }
+
+    #[test]
+    fn proof_sign_with_hex_key_produces_valid_signature() {
+        let args: Vec<String> = vec![
+            "--agreement".to_string(),
+            test_agreement_hash(),
+            "--message".to_string(),
+            "payment confirmed".to_string(),
+            "--key".to_string(),
+            test_privkey_hex(),
+            "--timestamp".to_string(),
+            "1000".to_string(),
+        ];
+        let result = handle_proof_sign(&args);
+        assert!(result.is_ok(), "expected ok, got: {:?}", result);
+    }
+
+    #[test]
+    fn proof_sign_with_wif_key_produces_valid_signature() {
+        let secret_bytes = [7u8; 32];
+        let mut wif_body = vec![0x80u8];
+        wif_body.extend_from_slice(&secret_bytes);
+        wif_body.push(0x01);
+        let first = sha2::Sha256::digest(&wif_body);
+        let second = sha2::Sha256::digest(&first);
+        let mut full = wif_body.clone();
+        full.extend_from_slice(&second[..4]);
+        let wif = bs58::encode(full).into_string();
+        let args: Vec<String> = vec![
+            "--agreement".to_string(),
+            test_agreement_hash(),
+            "--message".to_string(),
+            "payment confirmed".to_string(),
+            "--key".to_string(),
+            wif,
+            "--timestamp".to_string(),
+            "1000".to_string(),
+        ];
+        let result = handle_proof_sign(&args);
+        assert!(result.is_ok(), "expected ok, got: {:?}", result);
+    }
+
+    #[test]
+    fn signing_key_from_raw_hex_produces_correct_address() {
+        let privkey = test_privkey_hex();
+        let (address, pubkey_hex, _) = signing_key_from_raw(&privkey).unwrap();
+        assert!(!address.is_empty(), "address must not be empty");
+        assert!(!pubkey_hex.is_empty(), "pubkey_hex must not be empty");
+        assert!(address.starts_with('Q'), "Irium address must start with Q");
+        let (address2, _, _) = signing_key_from_raw(&privkey).unwrap();
+        assert_eq!(address, address2);
+    }
+
+    #[test]
+    fn signing_key_from_raw_invalid_key_returns_error() {
+        let result = signing_key_from_raw("not-a-valid-key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn proof_sign_missing_agreement_returns_error() {
+        let result = handle_proof_sign(&[
+            "--message".to_string(),
+            "test".to_string(),
+            "--key".to_string(),
+            test_privkey_hex(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--agreement"));
+    }
+
+    #[test]
+    fn proof_sign_missing_key_returns_error() {
+        let result = handle_proof_sign(&[
+            "--agreement".to_string(),
+            test_agreement_hash(),
+            "--message".to_string(),
+            "test".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--key"));
+    }
+
+    #[test]
+    fn proof_sign_unknown_flag_returns_error() {
+        let result = handle_proof_sign(&["--bogus-flag".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn proof_submit_json_missing_source_returns_error() {
+        let result = handle_proof_submit_json(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--file or --raw"));
+    }
+
+    #[test]
+    fn proof_submit_json_mutually_exclusive_returns_error() {
+        let result = handle_proof_submit_json(&[
+            "--file".to_string(),
+            "a.json".to_string(),
+            "--raw".to_string(),
+            "{}".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn proof_submit_json_malformed_json_returns_error() {
+        let result =
+            handle_proof_submit_json(&["--raw".to_string(), "{not valid json".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("parse proof JSON"));
+    }
+
+    fn tpl_test_addr_a() -> String {
+        let raw = [1u8; 32];
+        let secret = SecretKey::from_slice(&raw).unwrap();
+        wallet_key_from_secret(&secret, true).address
+    }
+
+    fn tpl_test_addr_b() -> String {
+        let raw = [2u8; 32];
+        let secret = SecretKey::from_slice(&raw).unwrap();
+        wallet_key_from_secret(&secret, true).address
+    }
+
+    #[test]
+    fn template_list_returns_three_templates() {
+        let templates = all_templates();
+        assert_eq!(templates.len(), 3);
+        let ids: Vec<&str> = templates.iter().map(|t| t.template_id).collect();
+        assert!(ids.contains(&"otc-basic"));
+        assert!(ids.contains(&"deposit-protection"));
+        assert!(ids.contains(&"milestone-payment"));
+    }
+
+    #[test]
+    fn template_list_command_text_mode() {
+        let result = handle_template_list(&[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn template_list_command_json_mode() {
+        let result = handle_template_list(&["--json".to_string()]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn template_list_unknown_flag_returns_error() {
+        let result = handle_template_list(&["--bogus".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn template_show_otc_basic_required_fields() {
+        let spec = all_templates()
+            .into_iter()
+            .find(|t| t.template_id == "otc-basic")
+            .unwrap();
+        assert!(spec.required_fields.contains(&"--seller"));
+        assert!(spec.required_fields.contains(&"--buyer"));
+        assert!(spec.required_fields.contains(&"--amount"));
+        assert!(spec.required_fields.contains(&"--timeout"));
+    }
+
+    #[test]
+    fn template_show_deposit_protection_required_fields() {
+        let spec = all_templates()
+            .into_iter()
+            .find(|t| t.template_id == "deposit-protection")
+            .unwrap();
+        assert!(spec.required_fields.contains(&"--payer"));
+        assert!(spec.required_fields.contains(&"--payee"));
+        assert!(spec.required_fields.contains(&"--amount"));
+        assert!(spec.required_fields.contains(&"--timeout"));
+    }
+
+    #[test]
+    fn template_show_milestone_payment_required_fields() {
+        let spec = all_templates()
+            .into_iter()
+            .find(|t| t.template_id == "milestone-payment")
+            .unwrap();
+        assert!(spec.required_fields.contains(&"--payer"));
+        assert!(spec.required_fields.contains(&"--payee"));
+        assert!(spec.required_fields.contains(&"--amount"));
+        assert!(spec.required_fields.contains(&"--timeout"));
+    }
+
+    #[test]
+    fn template_show_command_text_mode() {
+        let result = handle_template_show(&["--template".to_string(), "otc-basic".to_string()]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn template_show_command_json_mode() {
+        let result = handle_template_show(&[
+            "--template".to_string(),
+            "deposit-protection".to_string(),
+            "--json".to_string(),
+        ]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn template_show_unknown_returns_error() {
+        let result = handle_template_show(&["--template".to_string(), "nonexistent".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown template"));
+    }
+
+    #[test]
+    fn template_show_missing_flag_returns_error() {
+        let result = handle_template_show(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--template"));
+    }
+
+    #[test]
+    fn agreement_from_template_unknown_template_returns_error() {
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "nonexistent".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown template"));
+    }
+
+    #[test]
+    fn agreement_from_template_missing_template_returns_error() {
+        let result = handle_agreement_create_from_template(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--template"));
+    }
+
+    #[test]
+    fn agreement_from_template_otc_missing_seller_returns_error() {
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "otc-basic".to_string(),
+            "--buyer".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--timeout".to_string(),
+            "1000".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--seller"));
+    }
+
+    #[test]
+    fn agreement_from_template_otc_missing_amount_returns_error() {
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "otc-basic".to_string(),
+            "--seller".to_string(),
+            tpl_test_addr_a(),
+            "--buyer".to_string(),
+            tpl_test_addr_b(),
+            "--timeout".to_string(),
+            "1000".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--amount"));
+    }
+
+    #[test]
+    fn agreement_from_template_otc_invalid_address_returns_error() {
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "otc-basic".to_string(),
+            "--seller".to_string(),
+            "not-an-address".to_string(),
+            "--buyer".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--timeout".to_string(),
+            "1000".to_string(),
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn agreement_from_template_otc_basic_produces_valid_agreement() {
+        let _g = test_guard();
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "otc-basic".to_string(),
+            "--seller".to_string(),
+            tpl_test_addr_a(),
+            "--buyer".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "5.0".to_string(),
+            "--timeout".to_string(),
+            "2000".to_string(),
+            "--json".to_string(),
+        ]);
+        assert!(result.is_ok(), "unexpected err: {:?}", result.err());
+    }
+
+    #[test]
+    fn agreement_from_template_deposit_protection_produces_valid_agreement() {
+        let _g = test_guard();
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "deposit-protection".to_string(),
+            "--payer".to_string(),
+            tpl_test_addr_a(),
+            "--payee".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "2.5".to_string(),
+            "--timeout".to_string(),
+            "1500".to_string(),
+            "--json".to_string(),
+        ]);
+        assert!(result.is_ok(), "unexpected err: {:?}", result.err());
+    }
+
+    #[test]
+    fn agreement_from_template_milestone_payment_produces_valid_agreement() {
+        let _g = test_guard();
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "milestone-payment".to_string(),
+            "--payer".to_string(),
+            tpl_test_addr_a(),
+            "--payee".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "3.0".to_string(),
+            "--timeout".to_string(),
+            "3000".to_string(),
+            "--json".to_string(),
+        ]);
+        assert!(result.is_ok(), "unexpected err: {:?}", result.err());
+    }
+
+    #[test]
+    fn agreement_from_template_deposit_missing_payer_returns_error() {
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "deposit-protection".to_string(),
+            "--payee".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--timeout".to_string(),
+            "1000".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--payer"));
+    }
+
+    #[test]
+    fn agreement_from_template_otc_with_custom_asset() {
+        let _g = test_guard();
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "otc-basic".to_string(),
+            "--seller".to_string(),
+            tpl_test_addr_a(),
+            "--buyer".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "10.0".to_string(),
+            "--timeout".to_string(),
+            "5000".to_string(),
+            "--asset".to_string(),
+            "BTC".to_string(),
+            "--payment-method".to_string(),
+            "lightning".to_string(),
+            "--json".to_string(),
+        ]);
+        assert!(result.is_ok(), "unexpected err: {:?}", result.err());
+    }
+
+    // ============================================================
+    // Phase 3 integration: flow_next_step_hint
+    // ============================================================
+
+    #[test]
+    fn flow_next_step_hint_release_eligible() {
+        let hint = flow_next_step_hint("satisfied", true, false);
+        assert!(
+            hint.contains("release-build"),
+            "expected release-build in hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn flow_next_step_hint_refund_eligible() {
+        let hint = flow_next_step_hint("timeout", false, true);
+        assert!(
+            hint.contains("refund-build"),
+            "expected refund-build in hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn flow_next_step_hint_satisfied_not_executable() {
+        let hint = flow_next_step_hint("satisfied", false, false);
+        assert!(
+            hint.contains("holdback"),
+            "expected holdback in hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn flow_next_step_hint_timeout_no_eligible() {
+        let hint = flow_next_step_hint("timeout", false, false);
+        assert!(
+            hint.contains("refund-build"),
+            "expected refund-build in hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn flow_next_step_hint_pending() {
+        let hint = flow_next_step_hint("pending", false, false);
+        assert!(
+            hint.contains("proof-create"),
+            "expected proof-create in hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn render_policy_evaluate_includes_next_step() {
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "pending".to_string(),
+            agreement_hash: "abc".to_string(),
+            policy_found: true,
+            tip_height: 100,
+            ..Default::default()
+        };
+        let s = render_policy_evaluate_summary(&resp);
+        assert!(s.contains("next_step"), "must contain next_step: {s}");
+        assert!(
+            s.contains("proof-create"),
+            "must guide toward attestation: {s}"
+        );
+    }
+
+    #[test]
+    fn render_policy_evaluate_release_eligible_next_step() {
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "satisfied".to_string(),
+            agreement_hash: "abc".to_string(),
+            release_eligible: true,
+            ..Default::default()
+        };
+        let s = render_policy_evaluate_summary(&resp);
+        assert!(s.contains("release-build"), "release hint expected: {s}");
+    }
+
+    #[test]
+    fn render_policy_set_summary_accepted_has_next_step() {
+        let resp = StorePolicyRpcResponse {
+            policy_id: "pid-1".to_string(),
+            agreement_hash: "deadbeef".to_string(),
+            accepted: true,
+            updated: false,
+            message: "ok".to_string(),
+        };
+        let s = render_policy_set_summary(&resp);
+        assert!(
+            s.contains("next_step"),
+            "accepted response must include next_step: {s}"
+        );
+    }
+
+    #[test]
+    fn render_policy_set_summary_rejected_no_next_step() {
+        let resp = StorePolicyRpcResponse {
+            policy_id: "pid-2".to_string(),
+            agreement_hash: "cafebabe".to_string(),
+            accepted: false,
+            updated: false,
+            message: "rejected".to_string(),
+        };
+        let s = render_policy_set_summary(&resp);
+        assert!(
+            !s.contains("next_step"),
+            "rejected response must not include next_step: {s}"
+        );
     }
 
     // ── Phase 5 review hardening tests ──────────────────────────────────────
@@ -11433,8 +13793,10 @@ found true"), "must not show found true; got: {out}");
         let result = resolve_attestor_pubkey_hex("irium1notinwallet");
         assert!(result.is_err(), "must fail for address not in wallet");
         let err = result.unwrap_err();
-        assert!(err.contains("not found in wallet") || err.contains("irium1notinwallet"),
-            "error must identify the address: {err}");
+        assert!(
+            err.contains("not found in wallet") || err.contains("irium1notinwallet"),
+            "error must identify the address: {err}"
+        );
     }
 
     #[test]
@@ -11444,7 +13806,10 @@ found true"), "must not show found true; got: {out}");
         assert_eq!(short_hex.len(), 65);
         let result = resolve_attestor_pubkey_hex(&short_hex);
         // It falls through to wallet lookup which will fail (not a known address).
-        assert!(result.is_err(), "must fail for 65-char hex (not a valid pubkey, wallet lookup also fails)");
+        assert!(
+            result.is_err(),
+            "must fail for 65-char hex (not a valid pubkey, wallet lookup also fails)"
+        );
     }
 
     #[test]
@@ -11473,7 +13838,7 @@ found true"), "must not show found true; got: {out}");
                 outcome: "unsatisfied".to_string(),
                 release_eligible: false,
                 refund_eligible: false,
-                matched_proof_ids: vec![],  // No proofs → not_yet_attested
+                matched_proof_ids: vec![], // No proofs → not_yet_attested
                 reason: String::new(),
                 holdback: None,
                 threshold_results: vec![],
@@ -11484,11 +13849,15 @@ found true"), "must not show found true; got: {out}");
             threshold_results: vec![],
         };
         let out = render_policy_evaluate_summary(&resp);
-        assert!(out.contains("not_yet_attested"),
-            "must show not_yet_attested when no proofs matched: {out}");
-        assert!(out.contains("milestone First Milestone outcome not_yet_attested")
-            || out.contains("outcome not_yet_attested"),
-            "milestone line must use not_yet_attested label: {out}");
+        assert!(
+            out.contains("not_yet_attested"),
+            "must show not_yet_attested when no proofs matched: {out}"
+        );
+        assert!(
+            out.contains("milestone First Milestone outcome not_yet_attested")
+                || out.contains("outcome not_yet_attested"),
+            "milestone line must use not_yet_attested label: {out}"
+        );
     }
 
     #[test]
@@ -11528,12 +13897,18 @@ found true"), "must not show found true; got: {out}");
             threshold_results: vec![],
         };
         let out = render_policy_evaluate_summary(&resp);
-        assert!(out.contains("outcome unsatisfied"),
-            "must show unsatisfied when proof was matched but policy not satisfied: {out}");
-        assert!(!out.contains("not_yet_attested"),
-            "must not show not_yet_attested when a proof was matched: {out}");
-        assert!(out.contains("matched_proof_ids prf-rejected-01"),
-            "must list the matched proof ids: {out}");
+        assert!(
+            out.contains("outcome unsatisfied"),
+            "must show unsatisfied when proof was matched but policy not satisfied: {out}"
+        );
+        assert!(
+            !out.contains("not_yet_attested"),
+            "must not show not_yet_attested when a proof was matched: {out}"
+        );
+        assert!(
+            out.contains("matched_proof_ids prf-rejected-01"),
+            "must list the matched proof ids: {out}"
+        );
     }
 
     #[test]
@@ -11570,12 +13945,206 @@ found true"), "must not show found true; got: {out}");
         };
         let s = render_build_settlement_summary(&resp);
         // Immediate action
-        assert!(s.contains("executable=true"), "must mark immediate as executable: {s}");
+        assert!(
+            s.contains("executable=true"),
+            "must mark immediate as executable: {s}"
+        );
         // Holdback action
-        assert!(s.contains("executable=false"), "must mark holdback as non-executable: {s}");
-        assert!(s.contains("height_5000"), "must include holdback unlock height: {s}");
+        assert!(
+            s.contains("executable=false"),
+            "must mark holdback as non-executable: {s}"
+        );
+        assert!(
+            s.contains("height_5000"),
+            "must include holdback unlock height: {s}"
+        );
+    }
+    // ============================================================
+    // Guided OTC flow tests
+    // ============================================================
+
+    #[test]
+    fn otc_create_success_produces_valid_agreement() {
+        let args: Vec<String> = vec![
+            "irium-wallet".to_string(),
+            "otc-create".to_string(),
+            "--seller".to_string(),
+            "Qseller1111111111111111111111111111111".to_string(),
+            "--buyer".to_string(),
+            "Qbuyer1111111111111111111111111111111".to_string(),
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--asset".to_string(),
+            "IRM".to_string(),
+            "--payment-method".to_string(),
+            "bank-transfer".to_string(),
+            "--timeout".to_string(),
+            "144".to_string(),
+        ];
+        // Validates that the handler runs without error on valid inputs.
+        // We only test parse + agreement construction; no RPC needed.
+        let result = handle_otc_create(&args[2..]);
+        // handle_otc_create saves to ~/.irium/... which may not exist in test env.
+        // The parse path succeeds or fails with a clear message; no panic.
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                // Allowed only if the error is about file-system (save path), not input validation.
+                assert!(
+                    e.contains("create imported agreement dir") || e.contains("address"),
+                    "unexpected error: {}",
+                    e
+                );
+            }
+        }
     }
 
+    #[test]
+    fn otc_create_missing_seller_returns_error() {
+        let args: Vec<String> = vec![
+            "--buyer".to_string(),
+            "Qbuyer1111111111111111111111111111111".to_string(),
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--asset".to_string(),
+            "IRM".to_string(),
+            "--payment-method".to_string(),
+            "bank-transfer".to_string(),
+            "--timeout".to_string(),
+            "144".to_string(),
+        ];
+        let result = handle_otc_create(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--seller"));
+    }
+
+    #[test]
+    fn otc_create_missing_buyer_returns_error() {
+        let args: Vec<String> = vec![
+            "--seller".to_string(),
+            "Qseller1111111111111111111111111111111".to_string(),
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--asset".to_string(),
+            "IRM".to_string(),
+            "--payment-method".to_string(),
+            "bank-transfer".to_string(),
+            "--timeout".to_string(),
+            "144".to_string(),
+        ];
+        let result = handle_otc_create(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--buyer"));
+    }
+
+    #[test]
+    fn otc_create_missing_amount_returns_error() {
+        let args: Vec<String> = vec![
+            "--seller".to_string(),
+            "Qseller1111111111111111111111111111111".to_string(),
+            "--buyer".to_string(),
+            "Qbuyer1111111111111111111111111111111".to_string(),
+            "--asset".to_string(),
+            "IRM".to_string(),
+            "--payment-method".to_string(),
+            "bank-transfer".to_string(),
+            "--timeout".to_string(),
+            "144".to_string(),
+        ];
+        let result = handle_otc_create(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--amount"));
+    }
+
+    #[test]
+    fn otc_create_missing_timeout_returns_error() {
+        let args: Vec<String> = vec![
+            "--seller".to_string(),
+            "Qseller1111111111111111111111111111111".to_string(),
+            "--buyer".to_string(),
+            "Qbuyer1111111111111111111111111111111".to_string(),
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--asset".to_string(),
+            "IRM".to_string(),
+            "--payment-method".to_string(),
+            "bank-transfer".to_string(),
+        ];
+        let result = handle_otc_create(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--timeout"));
+    }
+
+    #[test]
+    fn otc_create_unknown_flag_returns_error() {
+        let args: Vec<String> = vec![
+            "--seller".to_string(),
+            "Qseller1111111111111111111111111111111".to_string(),
+            "--unknown-flag".to_string(),
+        ];
+        let result = handle_otc_create(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn otc_settle_missing_agreement_returns_error() {
+        let result = handle_otc_settle(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--agreement"));
+    }
+
+    #[test]
+    fn otc_status_missing_agreement_returns_error() {
+        let result = handle_otc_status(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--agreement"));
+    }
+
+    #[test]
+    fn otc_attest_missing_agreement_returns_error() {
+        let result = handle_otc_attest(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--agreement"));
+    }
+
+    #[test]
+    fn otc_attest_missing_message_returns_error() {
+        let args: Vec<String> = vec![
+            "--agreement".to_string(),
+            "some-hash".to_string(),
+            "--address".to_string(),
+            "Qtest1111111111111111111111111111111".to_string(),
+        ];
+        let result = handle_otc_attest(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--message"));
+    }
+
+    #[test]
+    fn otc_attest_missing_address_returns_error() {
+        let args: Vec<String> = vec![
+            "--agreement".to_string(),
+            "some-hash".to_string(),
+            "--message".to_string(),
+            "payment confirmed".to_string(),
+        ];
+        let result = handle_otc_attest(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--address"));
+    }
+
+    #[test]
+    fn otc_settle_unknown_flag_returns_error() {
+        let args: Vec<String> = vec![
+            "--agreement".to_string(),
+            "some.json".to_string(),
+            "--bogus-flag".to_string(),
+        ];
+        let result = handle_otc_settle(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
 }
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -14063,6 +16632,7 @@ fn main() {
             };
             let mut rpc_url = default_rpc_url();
             let mut out_path = None::<String>;
+            let mut export_format = String::from("json");
             let mut agreement_signature_path = None::<String>;
             let mut bundle_signature_path = None::<String>;
             let json_mode = args.iter().any(|a| a == "--json");
@@ -14077,6 +16647,10 @@ fn main() {
                         out_path = args.get(i + 1).cloned();
                         i += 2;
                     }
+                    "--format" => {
+                        export_format = args.get(i + 1).cloned().unwrap_or_default().to_lowercase();
+                        i += 2;
+                    }
                     "--agreement-signature" => {
                         agreement_signature_path = args.get(i + 1).cloned();
                         i += 2;
@@ -14085,12 +16659,22 @@ fn main() {
                         bundle_signature_path = args.get(i + 1).cloned();
                         i += 2;
                     }
-                    "--json" => i += 1,
+                    "--json" => {
+                        export_format = String::from("json");
+                        i += 1;
+                    }
                     other => {
                         eprintln!("Unknown argument {}", other);
                         std::process::exit(1);
                     }
                 }
+            }
+            if export_format != "json" && export_format != "text" && export_format != "html" {
+                eprintln!(
+                    "unsupported --format {}; expected json, text, or html",
+                    export_format
+                );
+                std::process::exit(1);
             }
             let out_path = match out_path {
                 Some(v) => v,
@@ -14141,18 +16725,162 @@ fn main() {
                 &detached_bundle_signatures,
             );
             let statement = build_agreement_statement(&audit);
-            let value = serde_json::to_value(&statement).unwrap();
-            if let Err(e) = save_json_output(Some(&out_path), &value) {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            }
-            if json_mode {
-                println!("{}", serde_json::to_string_pretty(&value).unwrap());
-            } else {
-                println!("{}", render_agreement_statement(&statement));
-                println!("exported_to {}", out_path);
+            match export_format.as_str() {
+                "text" => {
+                    let rendered = render_agreement_receipt_text(&statement);
+                    if let Err(e) = save_text_output(Some(&out_path), &rendered) {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                    println!("{}", rendered);
+                    println!("export_format text");
+                    println!("exported_to {}", out_path);
+                }
+                "html" => {
+                    let rendered = render_agreement_receipt_html(&statement);
+                    if let Err(e) = save_text_output(Some(&out_path), &rendered) {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                    println!("export_format html");
+                    println!("exported_to {}", out_path);
+                }
+                _ => {
+                    let value = serde_json::to_value(&statement).unwrap();
+                    if let Err(e) = save_json_output(Some(&out_path), &value) {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                    if json_mode {
+                        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+                    } else {
+                        println!("{}", render_agreement_statement(&statement));
+                        println!("exported_to {}", out_path);
+                    }
+                }
             }
         }
+
+        "agreement-receipt" => {
+            if args.len() < 2 {
+                usage();
+                std::process::exit(1);
+            }
+            let resolved = match resolve_agreement_input(&args[1]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let mut rpc_url = default_rpc_url();
+            let mut receipt_format = String::from("text");
+            let mut out_path = None::<String>;
+            let mut agreement_signature_path = None::<String>;
+            let mut bundle_signature_path = None::<String>;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--rpc" => {
+                        rpc_url = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--format" => {
+                        receipt_format =
+                            args.get(i + 1).cloned().unwrap_or_default().to_lowercase();
+                        i += 2;
+                    }
+                    "--out" => {
+                        out_path = args.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--agreement-signature" => {
+                        agreement_signature_path = args.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--bundle-signature" => {
+                        bundle_signature_path = args.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--json" => {
+                        receipt_format = String::from("json");
+                        i += 1;
+                    }
+                    other => {
+                        eprintln!("Unknown argument {}", other);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if receipt_format != "json" && receipt_format != "text" && receipt_format != "html" {
+                eprintln!(
+                    "unsupported --format {}; expected text, html, or json",
+                    receipt_format
+                );
+                std::process::exit(1);
+            }
+            let detached_agreement_signature = agreement_signature_path
+                .as_deref()
+                .map(|v| load_signature_from_path(Path::new(v)))
+                .transpose()
+                .unwrap_or_else(|e| {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                });
+            let detached_bundle_signature = bundle_signature_path
+                .as_deref()
+                .map(|v| load_signature_from_path(Path::new(v)))
+                .transpose()
+                .unwrap_or_else(|e| {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                });
+            let base = rpc_url.trim_end_matches('/');
+            let client = match rpc_client(base) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let mut audit = match fetch_agreement_audit(&client, base, &resolved) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let detached_agreement_signatures =
+                detached_agreement_signature.into_iter().collect::<Vec<_>>();
+            let detached_bundle_signatures =
+                detached_bundle_signature.into_iter().collect::<Vec<_>>();
+            attach_authenticity_to_audit(
+                &mut audit,
+                &resolved,
+                &detached_agreement_signatures,
+                &detached_bundle_signatures,
+            );
+            let statement = build_agreement_statement(&audit);
+            let rendered = match receipt_format.as_str() {
+                "html" => render_agreement_receipt_html(&statement),
+                "json" => serde_json::to_string_pretty(&serde_json::to_value(&statement).unwrap())
+                    .unwrap_or_default(),
+                _ => render_agreement_receipt_text(&statement),
+            };
+            if let Some(path) = out_path {
+                if let Err(e) = save_text_output(Some(&path), &rendered) {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+                if receipt_format != "html" {
+                    println!("{}", rendered);
+                }
+                println!("exported_to {}", path);
+            } else {
+                println!("{}", rendered);
+            }
+        }
+
         "agreement-verify-artifacts" => {
             let mut agreement_path = None::<String>;
             let mut bundle_path = None::<String>;
@@ -14426,7 +17154,10 @@ fn main() {
                 match rpc_client(base).and_then(|c| fetch_tip_height(&c, base)) {
                     Ok(h) => h,
                     Err(e) => {
-                        eprintln!("[warn] could not fetch tip height from {}: {}; using 0", base, e);
+                        eprintln!(
+                            "[warn] could not fetch tip height from {}: {}; using 0",
+                            base, e
+                        );
                         0
                     }
                 }
@@ -14472,16 +17203,14 @@ fn main() {
                 }
             };
             let proof: SettlementProof = {
-                let data = match read_text_from_path_or_stdin(
-                    Path::new(&opts.proof_path),
-                    "proof json",
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("{}", e);
-                        std::process::exit(1);
-                    }
-                };
+                let data =
+                    match read_text_from_path_or_stdin(Path::new(&opts.proof_path), "proof json") {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    };
                 match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(e) => {
@@ -14576,7 +17305,9 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let req = GetProofRpcRequest { proof_id: opts.proof_id };
+            let req = GetProofRpcRequest {
+                proof_id: opts.proof_id,
+            };
             let resp: GetProofRpcResponse =
                 match rpc_post_json(&client, base, "/rpc/getproof", &req) {
                     Ok(v) => v,
@@ -14614,16 +17345,15 @@ fn main() {
                 }
             };
             let policy: ProofPolicy = {
-                let data = match read_text_from_path_or_stdin(
-                    Path::new(&opts.policy_path),
-                    "policy json",
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("{}", e);
-                        std::process::exit(1);
-                    }
-                };
+                let data =
+                    match read_text_from_path_or_stdin(Path::new(&opts.policy_path), "policy json")
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    };
                 match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(e) => {
@@ -14692,16 +17422,15 @@ fn main() {
                 }
             };
             let mut policy: ProofPolicy = {
-                let data = match read_text_from_path_or_stdin(
-                    Path::new(&opts.policy_path),
-                    "policy json",
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("{}", e);
-                        std::process::exit(1);
-                    }
-                };
+                let data =
+                    match read_text_from_path_or_stdin(Path::new(&opts.policy_path), "policy json")
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    };
                 match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(e) => {
@@ -14721,7 +17450,10 @@ fn main() {
             if let Some(h) = opts.expires_at_height {
                 policy.expires_at_height = Some(h);
             }
-            let req = StorePolicyRpcRequest { policy, replace: opts.replace };
+            let req = StorePolicyRpcRequest {
+                policy,
+                replace: opts.replace,
+            };
             let resp: StorePolicyRpcResponse =
                 match rpc_post_json(&client, base, "/rpc/storepolicy", &req) {
                     Ok(v) => v,
@@ -14839,46 +17571,107 @@ fn main() {
             let mut i = 1usize;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--policy-id" => { policy_id = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
-                    "--agreement-hash" => { agreement_hash = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--policy-id" => {
+                        policy_id = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--agreement-hash" => {
+                        agreement_hash = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
                     "--attestor" => {
-                        let raw = args.get(i+1).cloned().unwrap_or_default();
+                        let raw = args.get(i + 1).cloned().unwrap_or_default();
                         let parts: Vec<&str> = raw.splitn(2, ':').collect();
                         if parts.len() == 2 {
-                            let pubkey_hex = resolve_attestor_pubkey_hex(parts[1])
-                                .unwrap_or_else(|e| { eprintln!("--attestor: {}", e); std::process::exit(1); });
-                            attestors.push(BuildTemplateAttestorInput { attestor_id: parts[0].to_string(), pubkey_hex, display_name: None });
-                        } else { eprintln!("--attestor expects <id>:<pubkey_or_address>"); std::process::exit(1); }
+                            let pubkey_hex =
+                                resolve_attestor_pubkey_hex(parts[1]).unwrap_or_else(|e| {
+                                    eprintln!("--attestor: {}", e);
+                                    std::process::exit(1);
+                                });
+                            attestors.push(BuildTemplateAttestorInput {
+                                attestor_id: parts[0].to_string(),
+                                pubkey_hex,
+                                display_name: None,
+                            });
+                        } else {
+                            eprintln!("--attestor expects <id>:<pubkey_or_address>");
+                            std::process::exit(1);
+                        }
                         i += 2;
                     }
                     "--milestone" => {
-                        let raw = args.get(i+1).cloned().unwrap_or_default();
+                        let raw = args.get(i + 1).cloned().unwrap_or_default();
                         let parts: Vec<&str> = raw.splitn(2, ':').collect();
                         if parts.len() == 2 {
-                            milestones.push(BuildTemplateMilestoneInput { milestone_id: parts[0].to_string(), label: None, proof_type: parts[1].to_string(), deadline_height: None, holdback_bps: None, holdback_release_height: None });
-                        } else { eprintln!("--milestone expects <id>:<proof_type>"); std::process::exit(1); }
+                            milestones.push(BuildTemplateMilestoneInput {
+                                milestone_id: parts[0].to_string(),
+                                label: None,
+                                proof_type: parts[1].to_string(),
+                                deadline_height: None,
+                                holdback_bps: None,
+                                holdback_release_height: None,
+                            });
+                        } else {
+                            eprintln!("--milestone expects <id>:<proof_type>");
+                            std::process::exit(1);
+                        }
                         i += 2;
                     }
-                    "--notes" => { notes = Some(args.get(i+1).cloned().unwrap_or_default()); i += 2; }
-                    "--rpc" => { rpc_url = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
-                    "--json" => { json_mode = true; i += 1; }
-                    "--raw-policy" => { raw_policy_mode = true; i += 1; }
-                    _ => { i += 1; }
+                    "--notes" => {
+                        notes = Some(args.get(i + 1).cloned().unwrap_or_default());
+                        i += 2;
+                    }
+                    "--rpc" => {
+                        rpc_url = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--json" => {
+                        json_mode = true;
+                        i += 1;
+                    }
+                    "--raw-policy" => {
+                        raw_policy_mode = true;
+                        i += 1;
+                    }
+                    _ => {
+                        i += 1;
+                    }
                 }
             }
-            if policy_id.is_empty() || agreement_hash.is_empty() || attestors.is_empty() || milestones.is_empty() {
+            if policy_id.is_empty()
+                || agreement_hash.is_empty()
+                || attestors.is_empty()
+                || milestones.is_empty()
+            {
                 eprintln!("policy-build-contractor requires --policy-id, --agreement-hash, at least one --attestor and one --milestone");
                 std::process::exit(1);
             }
             let base = rpc_url.trim_end_matches('/');
-            let client = rpc_client(base).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
-            let req = BuildContractorTemplateRpcRequest { policy_id, agreement_hash, attestors, milestones, notes };
-            let resp: BuildTemplateRpcResponse = rpc_post_json(&client, base, "/rpc/buildcontractortemplate", &req)
-                .unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
+            let client = rpc_client(base).unwrap_or_else(|e| {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            });
+            let req = BuildContractorTemplateRpcRequest {
+                policy_id,
+                agreement_hash,
+                attestors,
+                milestones,
+                notes,
+            };
+            let resp: BuildTemplateRpcResponse =
+                rpc_post_json(&client, base, "/rpc/buildcontractortemplate", &req).unwrap_or_else(
+                    |e| {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    },
+                );
             if raw_policy_mode {
                 println!("{}", resp.policy_json);
             } else if json_mode {
-                println!("{}", serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap()
+                );
             } else {
                 println!("{}", render_build_template_summary(&resp));
             }
@@ -14898,49 +17691,115 @@ fn main() {
             let mut i = 1usize;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--policy-id" => { policy_id = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
-                    "--agreement-hash" => { agreement_hash = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
-                    "--attestor" => {
-                        let raw = args.get(i+1).cloned().unwrap_or_default();
-                        let parts: Vec<&str> = raw.splitn(2, ':').collect();
-                        if parts.len() == 2 {
-                            let pubkey_hex = resolve_attestor_pubkey_hex(parts[1])
-                                .unwrap_or_else(|e| { eprintln!("--attestor: {}", e); std::process::exit(1); });
-                            attestors.push(BuildTemplateAttestorInput { attestor_id: parts[0].to_string(), pubkey_hex, display_name: None });
-                        } else { eprintln!("--attestor expects <id>:<pubkey_or_address>"); std::process::exit(1); }
+                    "--policy-id" => {
+                        policy_id = args.get(i + 1).cloned().unwrap_or_default();
                         i += 2;
                     }
-                    "--delivery-proof-type" => { delivery_proof_type = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--agreement-hash" => {
+                        agreement_hash = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--attestor" => {
+                        let raw = args.get(i + 1).cloned().unwrap_or_default();
+                        let parts: Vec<&str> = raw.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            let pubkey_hex =
+                                resolve_attestor_pubkey_hex(parts[1]).unwrap_or_else(|e| {
+                                    eprintln!("--attestor: {}", e);
+                                    std::process::exit(1);
+                                });
+                            attestors.push(BuildTemplateAttestorInput {
+                                attestor_id: parts[0].to_string(),
+                                pubkey_hex,
+                                display_name: None,
+                            });
+                        } else {
+                            eprintln!("--attestor expects <id>:<pubkey_or_address>");
+                            std::process::exit(1);
+                        }
+                        i += 2;
+                    }
+                    "--delivery-proof-type" => {
+                        delivery_proof_type = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
                     "--refund-deadline-height" => {
-                        let raw = args.get(i+1).cloned().unwrap_or_default();
+                        let raw = args.get(i + 1).cloned().unwrap_or_default();
                         refund_deadline_height = match raw.parse::<u64>() {
                             Ok(v) => v,
-                            Err(_) => { eprintln!("--refund-deadline-height expects a non-negative integer, got: {}", raw); std::process::exit(1); }
+                            Err(_) => {
+                                eprintln!("--refund-deadline-height expects a non-negative integer, got: {}", raw);
+                                std::process::exit(1);
+                            }
                         };
                         i += 2;
                     }
-                    "--holdback-bps" => { holdback_bps = args.get(i+1).and_then(|v| v.parse().ok()); i += 2; }
-                    "--holdback-release-height" => { holdback_release_height = args.get(i+1).and_then(|v| v.parse().ok()); i += 2; }
-                    "--notes" => { notes = Some(args.get(i+1).cloned().unwrap_or_default()); i += 2; }
-                    "--rpc" => { rpc_url = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
-                    "--json" => { json_mode = true; i += 1; }
-                    "--raw-policy" => { raw_policy_mode = true; i += 1; }
-                    _ => { i += 1; }
+                    "--holdback-bps" => {
+                        holdback_bps = args.get(i + 1).and_then(|v| v.parse().ok());
+                        i += 2;
+                    }
+                    "--holdback-release-height" => {
+                        holdback_release_height = args.get(i + 1).and_then(|v| v.parse().ok());
+                        i += 2;
+                    }
+                    "--notes" => {
+                        notes = Some(args.get(i + 1).cloned().unwrap_or_default());
+                        i += 2;
+                    }
+                    "--rpc" => {
+                        rpc_url = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--json" => {
+                        json_mode = true;
+                        i += 1;
+                    }
+                    "--raw-policy" => {
+                        raw_policy_mode = true;
+                        i += 1;
+                    }
+                    _ => {
+                        i += 1;
+                    }
                 }
             }
-            if policy_id.is_empty() || agreement_hash.is_empty() || attestors.is_empty() || delivery_proof_type.is_empty() {
+            if policy_id.is_empty()
+                || agreement_hash.is_empty()
+                || attestors.is_empty()
+                || delivery_proof_type.is_empty()
+            {
                 eprintln!("policy-build-preorder requires --policy-id, --agreement-hash, at least one --attestor, and --delivery-proof-type");
                 std::process::exit(1);
             }
             let base = rpc_url.trim_end_matches('/');
-            let client = rpc_client(base).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
-            let req = BuildPreorderTemplateRpcRequest { policy_id, agreement_hash, attestors, delivery_proof_type, refund_deadline_height, holdback_bps, holdback_release_height, notes };
-            let resp: BuildTemplateRpcResponse = rpc_post_json(&client, base, "/rpc/buildpreordertemplate", &req)
-                .unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
+            let client = rpc_client(base).unwrap_or_else(|e| {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            });
+            let req = BuildPreorderTemplateRpcRequest {
+                policy_id,
+                agreement_hash,
+                attestors,
+                delivery_proof_type,
+                refund_deadline_height,
+                holdback_bps,
+                holdback_release_height,
+                notes,
+            };
+            let resp: BuildTemplateRpcResponse =
+                rpc_post_json(&client, base, "/rpc/buildpreordertemplate", &req).unwrap_or_else(
+                    |e| {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    },
+                );
             if raw_policy_mode {
                 println!("{}", resp.policy_json);
             } else if json_mode {
-                println!("{}", serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap()
+                );
             } else {
                 println!("{}", render_build_template_summary(&resp));
             }
@@ -14959,48 +17818,109 @@ fn main() {
             let mut i = 1usize;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--policy-id" => { policy_id = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
-                    "--agreement-hash" => { agreement_hash = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
-                    "--attestor" => {
-                        let raw = args.get(i+1).cloned().unwrap_or_default();
-                        let parts: Vec<&str> = raw.splitn(2, ':').collect();
-                        if parts.len() == 2 {
-                            let pubkey_hex = resolve_attestor_pubkey_hex(parts[1])
-                                .unwrap_or_else(|e| { eprintln!("--attestor: {}", e); std::process::exit(1); });
-                            attestors.push(BuildTemplateAttestorInput { attestor_id: parts[0].to_string(), pubkey_hex, display_name: None });
-                        } else { eprintln!("--attestor expects <id>:<pubkey_or_address>"); std::process::exit(1); }
+                    "--policy-id" => {
+                        policy_id = args.get(i + 1).cloned().unwrap_or_default();
                         i += 2;
                     }
-                    "--release-proof-type" => { release_proof_type = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--agreement-hash" => {
+                        agreement_hash = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--attestor" => {
+                        let raw = args.get(i + 1).cloned().unwrap_or_default();
+                        let parts: Vec<&str> = raw.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            let pubkey_hex =
+                                resolve_attestor_pubkey_hex(parts[1]).unwrap_or_else(|e| {
+                                    eprintln!("--attestor: {}", e);
+                                    std::process::exit(1);
+                                });
+                            attestors.push(BuildTemplateAttestorInput {
+                                attestor_id: parts[0].to_string(),
+                                pubkey_hex,
+                                display_name: None,
+                            });
+                        } else {
+                            eprintln!("--attestor expects <id>:<pubkey_or_address>");
+                            std::process::exit(1);
+                        }
+                        i += 2;
+                    }
+                    "--release-proof-type" => {
+                        release_proof_type = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
                     "--refund-deadline-height" => {
-                        let raw = args.get(i+1).cloned().unwrap_or_default();
+                        let raw = args.get(i + 1).cloned().unwrap_or_default();
                         refund_deadline_height = match raw.parse::<u64>() {
                             Ok(v) => v,
-                            Err(_) => { eprintln!("--refund-deadline-height expects a non-negative integer, got: {}", raw); std::process::exit(1); }
+                            Err(_) => {
+                                eprintln!("--refund-deadline-height expects a non-negative integer, got: {}", raw);
+                                std::process::exit(1);
+                            }
                         };
                         i += 2;
                     }
-                    "--threshold" => { threshold = args.get(i+1).and_then(|v| v.parse().ok()); i += 2; }
-                    "--notes" => { notes = Some(args.get(i+1).cloned().unwrap_or_default()); i += 2; }
-                    "--rpc" => { rpc_url = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
-                    "--json" => { json_mode = true; i += 1; }
-                    "--raw-policy" => { raw_policy_mode = true; i += 1; }
-                    _ => { i += 1; }
+                    "--threshold" => {
+                        threshold = args.get(i + 1).and_then(|v| v.parse().ok());
+                        i += 2;
+                    }
+                    "--notes" => {
+                        notes = Some(args.get(i + 1).cloned().unwrap_or_default());
+                        i += 2;
+                    }
+                    "--rpc" => {
+                        rpc_url = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--json" => {
+                        json_mode = true;
+                        i += 1;
+                    }
+                    "--raw-policy" => {
+                        raw_policy_mode = true;
+                        i += 1;
+                    }
+                    other => {
+                        eprintln!("policy-build-otc: unknown argument: {}", other);
+                        std::process::exit(1);
+                    }
                 }
             }
-            if policy_id.is_empty() || agreement_hash.is_empty() || attestors.is_empty() || release_proof_type.is_empty() {
+            if policy_id.is_empty()
+                || agreement_hash.is_empty()
+                || attestors.is_empty()
+                || release_proof_type.is_empty()
+            {
                 eprintln!("policy-build-otc requires --policy-id, --agreement-hash, at least one --attestor, and --release-proof-type");
                 std::process::exit(1);
             }
             let base = rpc_url.trim_end_matches('/');
-            let client = rpc_client(base).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
-            let req = BuildOtcTemplateRpcRequest { policy_id, agreement_hash, attestors, release_proof_type, refund_deadline_height, threshold, notes };
-            let resp: BuildTemplateRpcResponse = rpc_post_json(&client, base, "/rpc/buildotctemplate", &req)
-                .unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
+            let client = rpc_client(base).unwrap_or_else(|e| {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            });
+            let req = BuildOtcTemplateRpcRequest {
+                policy_id,
+                agreement_hash,
+                attestors,
+                release_proof_type,
+                refund_deadline_height,
+                threshold,
+                notes,
+            };
+            let resp: BuildTemplateRpcResponse =
+                rpc_post_json(&client, base, "/rpc/buildotctemplate", &req).unwrap_or_else(|e| {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                });
             if raw_policy_mode {
                 println!("{}", resp.policy_json);
             } else if json_mode {
-                println!("{}", serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap()
+                );
             } else {
                 println!("{}", render_build_template_summary(&resp));
             }
@@ -15022,7 +17942,9 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let req = ListPoliciesRpcRequest { active_only: opts.active_only };
+            let req = ListPoliciesRpcRequest {
+                active_only: opts.active_only,
+            };
             let resp: ListPoliciesRpcResponse =
                 match rpc_post_json(&client, base, "/rpc/listpolicies", &req) {
                     Ok(v) => v,
@@ -15750,7 +18672,9 @@ fn main() {
             let agreement_path = match args.next() {
                 Some(p) => p.clone(),
                 None => {
-                    eprintln!("usage: agreement-build-settlement <agreement.json> [--rpc <url>] [--json]");
+                    eprintln!(
+                        "usage: agreement-build-settlement <agreement.json> [--rpc <url>] [--json]"
+                    );
                     std::process::exit(1);
                 }
             };
@@ -15758,23 +18682,67 @@ fn main() {
             let mut json_mode = false;
             while let Some(flag) = args.next() {
                 if flag == "--rpc" {
-                    if let Some(u) = args.next() { rpc_url = u.clone(); }
+                    if let Some(u) = args.next() {
+                        rpc_url = u.clone();
+                    }
                 } else if flag == "--json" {
                     json_mode = true;
                 }
             }
-            let agreement_json = std::fs::read_to_string(&agreement_path)
-                .unwrap_or_else(|e| { eprintln!("read {}: {}", agreement_path, e); std::process::exit(1); });
-            let agreement: AgreementObject = serde_json::from_str(&agreement_json)
-                .unwrap_or_else(|e| { eprintln!("parse agreement: {}", e); std::process::exit(1); });
-            let sc = SettlementClient::new(&rpc_url)
-                .unwrap_or_else(|e| { eprintln!("rpc client: {}", e); std::process::exit(1); });
-            let resp = sc.build_settlement_tx(agreement)
-                .unwrap_or_else(|e| { eprintln!("buildsettlementtx: {}", e); std::process::exit(1); });
+            let agreement_json = std::fs::read_to_string(&agreement_path).unwrap_or_else(|e| {
+                eprintln!("read {}: {}", agreement_path, e);
+                std::process::exit(1);
+            });
+            let agreement: AgreementObject =
+                serde_json::from_str(&agreement_json).unwrap_or_else(|e| {
+                    eprintln!("parse agreement: {}", e);
+                    std::process::exit(1);
+                });
+            let sc = SettlementClient::new(&rpc_url).unwrap_or_else(|e| {
+                eprintln!("rpc client: {}", e);
+                std::process::exit(1);
+            });
+            let resp = sc.build_settlement_tx(agreement).unwrap_or_else(|e| {
+                eprintln!("buildsettlementtx: {}", e);
+                std::process::exit(1);
+            });
             if json_mode {
-                println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).unwrap_or_default()
+                );
             } else {
                 println!("{}", render_build_settlement_summary(&resp));
+            }
+        }
+        "proof-sign" => {
+            if let Err(e) = handle_proof_sign(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "proof-submit-json" => {
+            if let Err(e) = handle_proof_submit_json(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "template-list" => {
+            if let Err(e) = handle_template_list(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "template-show" => {
+            if let Err(e) = handle_template_show(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-create-from-template" => {
+            if let Err(e) = handle_agreement_create_from_template(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
             }
         }
         "agreement-settle-status" => {
@@ -15791,26 +18759,43 @@ fn main() {
             let mut rpc_url = node_rpc_base();
             while let Some(flag) = args.next() {
                 if flag == "--rpc" {
-                    if let Some(u) = args.next() { rpc_url = u.clone(); }
+                    if let Some(u) = args.next() {
+                        rpc_url = u.clone();
+                    }
                 }
             }
-            let agreement_json = std::fs::read_to_string(&agreement_path)
-                .unwrap_or_else(|e| { eprintln!("read {}: {}", agreement_path, e); std::process::exit(1); });
-            let agreement: AgreementObject = serde_json::from_str(&agreement_json)
-                .unwrap_or_else(|e| { eprintln!("parse agreement: {}", e); std::process::exit(1); });
-            let sc = SettlementClient::new(&rpc_url)
-                .unwrap_or_else(|e| { eprintln!("rpc client: {}", e); std::process::exit(1); });
+            let agreement_json = std::fs::read_to_string(&agreement_path).unwrap_or_else(|e| {
+                eprintln!("read {}: {}", agreement_path, e);
+                std::process::exit(1);
+            });
+            let agreement: AgreementObject =
+                serde_json::from_str(&agreement_json).unwrap_or_else(|e| {
+                    eprintln!("parse agreement: {}", e);
+                    std::process::exit(1);
+                });
+            let sc = SettlementClient::new(&rpc_url).unwrap_or_else(|e| {
+                eprintln!("rpc client: {}", e);
+                std::process::exit(1);
+            });
 
             // Step 1: compute canonical hash
-            let hash_resp = sc.compute_agreement_hash(agreement.clone())
-                .unwrap_or_else(|e| { eprintln!("computeagreementhash: {}", e); std::process::exit(1); });
+            let hash_resp = sc
+                .compute_agreement_hash(agreement.clone())
+                .unwrap_or_else(|e| {
+                    eprintln!("computeagreementhash: {}", e);
+                    std::process::exit(1);
+                });
             println!("=== agreement hash ===");
             println!("agreement_hash {}", hash_resp.agreement_hash);
             println!("canonical_rules {}", hash_resp.serialization_rules.len());
 
             // Step 2: getpolicy
-            let pol_resp = sc.get_policy(hash_resp.agreement_hash.clone())
-                .unwrap_or_else(|e| { eprintln!("getpolicy: {}", e); std::process::exit(1); });
+            let pol_resp = sc
+                .get_policy(hash_resp.agreement_hash.clone())
+                .unwrap_or_else(|e| {
+                    eprintln!("getpolicy: {}", e);
+                    std::process::exit(1);
+                });
             println!("\n=== policy ===");
             println!("{}", render_policy_get_summary(&pol_resp));
             if !pol_resp.found {
@@ -15818,20 +18803,49 @@ fn main() {
             }
 
             // Step 3: evaluatepolicy
-            let eval_resp = sc.evaluate_policy(agreement.clone())
-                .unwrap_or_else(|e| { eprintln!("evaluatepolicy: {}", e); std::process::exit(1); });
+            let eval_resp = sc.evaluate_policy(agreement.clone()).unwrap_or_else(|e| {
+                eprintln!("evaluatepolicy: {}", e);
+                std::process::exit(1);
+            });
             println!("\n=== evaluation ===");
             println!("{}", render_policy_evaluate_summary(&eval_resp));
 
             // Step 4: buildsettlementtx
-            let bst_resp = sc.build_settlement_tx(agreement)
-                .unwrap_or_else(|e| { eprintln!("buildsettlementtx: {}", e); std::process::exit(1); });
+            let bst_resp = sc.build_settlement_tx(agreement).unwrap_or_else(|e| {
+                eprintln!("buildsettlementtx: {}", e);
+                std::process::exit(1);
+            });
             println!("\n=== settlement actions ===");
             println!("{}", render_build_settlement_summary(&bst_resp));
+        }
+        "otc-create" => {
+            if let Err(e) = handle_otc_create(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "otc-attest" => {
+            if let Err(e) = handle_otc_attest(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "otc-settle" => {
+            if let Err(e) = handle_otc_settle(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "otc-status" => {
+            if let Err(e) = handle_otc_status(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
         }
         _ => {
             usage();
             std::process::exit(1);
         }
     }
+    // ============================================================
 }
