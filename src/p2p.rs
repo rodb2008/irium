@@ -3016,10 +3016,20 @@ impl P2PNode {
                         if !trusted {
                             let subnet_count = {
                                 let guard = connected.lock().await;
-                                guard.iter().filter(|a| is_same_subnet_24(a.ip(), ip)).count()
+                                guard
+                                    .iter()
+                                    .filter(|a| is_same_subnet_24(a.ip(), ip))
+                                    .count()
                             };
                             if subnet_count >= P2PNode::max_peers_per_subnet_24() {
-                                P2PNode::log_event("warn", "net", format!("Rejecting inbound {}: /24 subnet limit ({} peers)", addr, subnet_count));
+                                P2PNode::log_event(
+                                    "warn",
+                                    "net",
+                                    format!(
+                                        "Rejecting inbound {}: /24 subnet limit ({} peers)",
+                                        addr, subnet_count
+                                    ),
+                                );
                                 continue;
                             }
                         }
@@ -3490,7 +3500,9 @@ impl P2PNode {
                 let node_clone = self.clone();
                 let agent_clone = self.agent.clone();
                 tokio::spawn(async move {
-                    let _ = node_clone.connect_and_handshake(addr, local_height, &agent_clone).await;
+                    let _ = node_clone
+                        .connect_and_handshake(addr, local_height, &agent_clone)
+                        .await;
                 });
                 added += 1;
             }
@@ -3542,7 +3554,9 @@ impl P2PNode {
                 let node_clone = self.clone();
                 let agent_clone = self.agent.clone();
                 tokio::spawn(async move {
-                    let _ = node_clone.connect_and_handshake(addr, local_height, &agent_clone).await;
+                    let _ = node_clone
+                        .connect_and_handshake(addr, local_height, &agent_clone)
+                        .await;
                 });
                 added += 1;
             }
@@ -4619,7 +4633,9 @@ impl P2PNode {
                         let peers_payload = {
                             let dir = dir.lock().await;
                             PeersPayload {
-                                peers: dir.peers().iter()
+                                peers: dir
+                                    .peers()
+                                    .iter()
                                     .filter(|p| p.dialable)
                                     .take(MAX_PEERS_IN_RESPONSE)
                                     .map(|p| p.multiaddr.clone())
@@ -6664,7 +6680,9 @@ async fn handle_incoming_with_sybil(
                 let peers_payload = {
                     let dir = directory.lock().await;
                     PeersPayload {
-                        peers: dir.peers().iter()
+                        peers: dir
+                            .peers()
+                            .iter()
                             .filter(|p| p.dialable)
                             .take(MAX_PEERS_IN_RESPONSE)
                             .map(|p| p.multiaddr.clone())
@@ -7725,6 +7743,7 @@ mod tests {
             genesis_block: genesis,
             pow_limit,
             htlcv1_activation_height: None,
+            mpsov1_activation_height: None,
             lwma: crate::chain::LwmaParams::new(None, pow_limit),
             lwma_v2: None,
         };
@@ -7780,6 +7799,7 @@ mod tests {
             genesis_block: genesis,
             pow_limit,
             htlcv1_activation_height: None,
+            mpsov1_activation_height: None,
             lwma: crate::chain::LwmaParams::new(None, pow_limit),
             lwma_v2: None,
         };
@@ -7820,6 +7840,7 @@ mod tests {
             genesis_block: genesis,
             pow_limit,
             htlcv1_activation_height: None,
+            mpsov1_activation_height: None,
             lwma: crate::chain::LwmaParams::new(None, pow_limit),
             lwma_v2: None,
         };
