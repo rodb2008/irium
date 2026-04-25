@@ -7118,6 +7118,371 @@ fn handle_proof_submit_json(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// ============================================================
+// Commercial templates (template-list, template-show, agreement-create-from-template)
+// ============================================================
+
+struct TemplateSpec {
+    template_id: &'static str,
+    template_type: &'static str,
+    description: &'static str,
+    required_fields: &'static [&'static str],
+    optional_fields: &'static [(&'static str, &'static str)],
+}
+
+fn all_templates() -> Vec<TemplateSpec> {
+    vec![
+        TemplateSpec {
+            template_id: "otc-basic",
+            template_type: "otc_settlement",
+            description: "Peer-to-peer OTC trade with timeout refund",
+            required_fields: &["--seller", "--buyer", "--amount", "--timeout"],
+            optional_fields: &[
+                ("--asset", "IRM"),
+                ("--payment-method", "off-chain"),
+                ("--agreement-id", "auto-generated"),
+                ("--json", "flag"),
+                ("--out", "write to file"),
+            ],
+        },
+        TemplateSpec {
+            template_id: "deposit-protection",
+            template_type: "refundable_deposit",
+            description: "Deposit held in escrow; refunded on timeout if release not triggered",
+            required_fields: &["--payer", "--payee", "--amount", "--timeout"],
+            optional_fields: &[
+                ("--purpose", "Deposit protection"),
+                ("--attestor", "none"),
+                ("--agreement-id", "auto-generated"),
+                ("--json", "flag"),
+                ("--out", "write to file"),
+            ],
+        },
+        TemplateSpec {
+            template_id: "milestone-payment",
+            template_type: "milestone_settlement",
+            description: "Single-milestone staged payment released on attestation",
+            required_fields: &["--payer", "--payee", "--amount", "--timeout"],
+            optional_fields: &[
+                ("--milestone-title", "Milestone 1"),
+                ("--agreement-id", "auto-generated"),
+                ("--json", "flag"),
+                ("--out", "write to file"),
+            ],
+        },
+    ]
+}
+
+fn handle_template_list(args: &[String]) -> Result<(), String> {
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let templates = all_templates();
+    if json_mode {
+        let list: Vec<serde_json::Value> = templates
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "template_id":     t.template_id,
+                    "template_type":   t.template_type,
+                    "description":     t.description,
+                    "required_fields": t.required_fields,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&list).unwrap());
+    } else {
+        println!("{:<24} {:<22} {}", "TEMPLATE", "TYPE", "DESCRIPTION");
+        for t in &templates {
+            println!(
+                "{:<24} {:<22} {}",
+                t.template_id, t.template_type, t.description
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_template_show(args: &[String]) -> Result<(), String> {
+    let mut template_id: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--template" => {
+                template_id = Some(parse_required_string_flag(args, &mut i, "--template")?);
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let id = template_id.ok_or_else(|| "--template is required".to_string())?;
+    let spec = all_templates()
+        .into_iter()
+        .find(|t| t.template_id == id)
+        .ok_or_else(|| format!("unknown template: {}", id))?;
+    if json_mode {
+        let optional: Vec<serde_json::Value> = spec
+            .optional_fields
+            .iter()
+            .map(|(f, d)| serde_json::json!({"flag": f, "default": d}))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "template_id":     spec.template_id,
+                "template_type":   spec.template_type,
+                "description":     spec.description,
+                "required_fields": spec.required_fields,
+                "optional_fields": optional,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("template_id    {}", spec.template_id);
+        println!("template_type  {}", spec.template_type);
+        println!("description    {}", spec.description);
+        println!();
+        println!("required fields:");
+        for f in spec.required_fields {
+            println!("  {}", f);
+        }
+        println!();
+        println!("optional fields:");
+        for (f, d) in spec.optional_fields {
+            println!("  {}  (default: {})", f, d);
+        }
+    }
+    Ok(())
+}
+
+fn handle_agreement_create_from_template(args: &[String]) -> Result<(), String> {
+    let mut template_id: Option<String> = None;
+    let mut seller: Option<String> = None;
+    let mut buyer: Option<String> = None;
+    let mut payer: Option<String> = None;
+    let mut payee: Option<String> = None;
+    let mut amount: Option<u64> = None;
+    let mut timeout: Option<u64> = None;
+    let mut asset: Option<String> = None;
+    let mut payment_method: Option<String> = None;
+    let mut purpose: Option<String> = None;
+    let mut attestor: Option<String> = None;
+    let mut milestone_title: Option<String> = None;
+    let mut agreement_id: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--template" => {
+                template_id = Some(parse_required_string_flag(args, &mut i, "--template")?);
+            }
+            "--seller" => {
+                seller = Some(parse_required_string_flag(args, &mut i, "--seller")?);
+            }
+            "--buyer" => {
+                buyer = Some(parse_required_string_flag(args, &mut i, "--buyer")?);
+            }
+            "--payer" => {
+                payer = Some(parse_required_string_flag(args, &mut i, "--payer")?);
+            }
+            "--payee" => {
+                payee = Some(parse_required_string_flag(args, &mut i, "--payee")?);
+            }
+            "--amount" => {
+                amount = Some(parse_irm(&parse_required_string_flag(
+                    args, &mut i, "--amount",
+                )?)?);
+            }
+            "--timeout" => {
+                timeout = Some(
+                    parse_required_string_flag(args, &mut i, "--timeout")?
+                        .parse::<u64>()
+                        .map_err(|_| "--timeout must be a non-negative integer".to_string())?,
+                );
+            }
+            "--asset" => {
+                asset = Some(parse_required_string_flag(args, &mut i, "--asset")?);
+            }
+            "--payment-method" => {
+                payment_method = Some(parse_required_string_flag(
+                    args,
+                    &mut i,
+                    "--payment-method",
+                )?);
+            }
+            "--purpose" => {
+                purpose = Some(parse_required_string_flag(args, &mut i, "--purpose")?);
+            }
+            "--attestor" => {
+                attestor = Some(parse_required_string_flag(args, &mut i, "--attestor")?);
+            }
+            "--milestone-title" => {
+                milestone_title = Some(parse_required_string_flag(
+                    args,
+                    &mut i,
+                    "--milestone-title",
+                )?);
+            }
+            "--agreement-id" => {
+                agreement_id = Some(parse_required_string_flag(args, &mut i, "--agreement-id")?);
+            }
+            "--out" => {
+                out_path = Some(parse_required_string_flag(args, &mut i, "--out")?);
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+
+    let tmpl = template_id.ok_or_else(|| "--template is required".to_string())?;
+    if !all_templates().iter().any(|t| t.template_id == tmpl) {
+        return Err(format!("unknown template: {}", tmpl));
+    }
+
+    let now = now_unix();
+    let id = agreement_id.unwrap_or_else(|| format!("agr-{}-{}", tmpl, now));
+    let secret_hash = hex::encode(Sha256::digest(
+        format!("tpl-secret-{}-{}", id, now).as_bytes(),
+    ));
+    let doc_hash = hex::encode(Sha256::digest(format!("tpl-doc-{}-{}", id, now).as_bytes()));
+
+    let agreement = match tmpl.as_str() {
+        "otc-basic" => {
+            let seller_addr =
+                seller.ok_or_else(|| "--seller is required for otc-basic".to_string())?;
+            let buyer_addr =
+                buyer.ok_or_else(|| "--buyer is required for otc-basic".to_string())?;
+            let amount_val = amount.ok_or_else(|| "--amount is required".to_string())?;
+            let timeout_val = timeout.ok_or_else(|| "--timeout is required".to_string())?;
+            let asset_val = asset.unwrap_or_else(|| "IRM".to_string());
+            let pm_val = payment_method.unwrap_or_else(|| "off-chain".to_string());
+            let seller_party = parse_party_spec(&format!("seller|Seller|{}|seller", seller_addr))?;
+            let buyer_party = parse_party_spec(&format!("buyer|Buyer|{}|buyer", buyer_addr))?;
+            build_otc_agreement(
+                id.clone(),
+                now,
+                buyer_party,
+                seller_party,
+                amount_val,
+                asset_val,
+                pm_val,
+                timeout_val,
+                secret_hash,
+                doc_hash,
+                None,
+                None,
+            )?
+        }
+        "deposit-protection" => {
+            let payer_addr =
+                payer.ok_or_else(|| "--payer is required for deposit-protection".to_string())?;
+            let payee_addr =
+                payee.ok_or_else(|| "--payee is required for deposit-protection".to_string())?;
+            let amount_val = amount.ok_or_else(|| "--amount is required".to_string())?;
+            let timeout_val = timeout.ok_or_else(|| "--timeout is required".to_string())?;
+            let purpose_val = purpose.unwrap_or_else(|| "Deposit protection".to_string());
+            let refund_summary = attestor
+                .map(|a| format!("Refund eligible after timeout; attestor: {}", a))
+                .unwrap_or_else(|| "Refund eligible after timeout".to_string());
+            let payer_party = parse_party_spec(&format!("payer|Payer|{}|payer", payer_addr))?;
+            let payee_party = parse_party_spec(&format!("payee|Payee|{}|payee", payee_addr))?;
+            build_deposit_agreement(
+                id.clone(),
+                now,
+                payer_party,
+                payee_party,
+                amount_val,
+                purpose_val,
+                refund_summary,
+                timeout_val,
+                secret_hash,
+                doc_hash,
+                None,
+                None,
+            )?
+        }
+        "milestone-payment" => {
+            let payer_addr =
+                payer.ok_or_else(|| "--payer is required for milestone-payment".to_string())?;
+            let payee_addr =
+                payee.ok_or_else(|| "--payee is required for milestone-payment".to_string())?;
+            let amount_val = amount.ok_or_else(|| "--amount is required".to_string())?;
+            let timeout_val = timeout.ok_or_else(|| "--timeout is required".to_string())?;
+            let title = milestone_title.unwrap_or_else(|| "Milestone 1".to_string());
+            let ms_secret =
+                hex::encode(Sha256::digest(format!("tpl-ms-{}-{}", id, now).as_bytes()));
+            let payer_party = parse_party_spec(&format!("payer|Payer|{}|payer", payer_addr))?;
+            let payee_party = parse_party_spec(&format!("payee|Payee|{}|payee", payee_addr))?;
+            let milestone = AgreementMilestone {
+                milestone_id: format!("ms-1-{}", now),
+                title,
+                amount: amount_val,
+                recipient_address: payee_party.address.clone(),
+                refund_address: payer_party.address.clone(),
+                secret_hash_hex: ms_secret,
+                timeout_height: timeout_val,
+                metadata_hash: None,
+            };
+            build_milestone_agreement(
+                id.clone(),
+                now,
+                payer_party,
+                payee_party,
+                vec![milestone],
+                timeout_val,
+                doc_hash,
+                None,
+                None,
+            )?
+        }
+        other => return Err(format!("unknown template: {}", other)),
+    };
+
+    let hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let saved = save_agreement_to_store_at(&imported_agreements_dir(), &agreement)?;
+
+    if let Some(ref out) = out_path {
+        let rendered =
+            serde_json::to_string_pretty(&agreement).map_err(|e| format!("serialize: {e}"))?;
+        std::fs::write(out, &rendered).map_err(|e| format!("write {}: {e}", out))?;
+    }
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agreement_id":   agreement.agreement_id,
+                "agreement_hash": hash,
+                "template":       tmpl,
+                "saved_path":     saved.display().to_string(),
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("agreement_id    {}", agreement.agreement_id);
+        println!("agreement_hash  {}", hash);
+        println!("template        {}", tmpl);
+        println!("saved_path      {}", saved.display());
+    }
+    Ok(())
+}
+
 fn handle_agreement_create_simple(args: &[String]) -> Result<(), String> {
     let mut agreement_id = None;
     let mut creation_time = None;
@@ -13009,6 +13374,275 @@ found true"
         assert!(result.unwrap_err().contains("parse proof JSON"));
     }
 
+    fn tpl_test_addr_a() -> String {
+        let raw = [1u8; 32];
+        let secret = SecretKey::from_slice(&raw).unwrap();
+        wallet_key_from_secret(&secret, true).address
+    }
+
+    fn tpl_test_addr_b() -> String {
+        let raw = [2u8; 32];
+        let secret = SecretKey::from_slice(&raw).unwrap();
+        wallet_key_from_secret(&secret, true).address
+    }
+
+    #[test]
+    fn template_list_returns_three_templates() {
+        let templates = all_templates();
+        assert_eq!(templates.len(), 3);
+        let ids: Vec<&str> = templates.iter().map(|t| t.template_id).collect();
+        assert!(ids.contains(&"otc-basic"));
+        assert!(ids.contains(&"deposit-protection"));
+        assert!(ids.contains(&"milestone-payment"));
+    }
+
+    #[test]
+    fn template_list_command_text_mode() {
+        let result = handle_template_list(&[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn template_list_command_json_mode() {
+        let result = handle_template_list(&["--json".to_string()]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn template_list_unknown_flag_returns_error() {
+        let result = handle_template_list(&["--bogus".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn template_show_otc_basic_required_fields() {
+        let spec = all_templates()
+            .into_iter()
+            .find(|t| t.template_id == "otc-basic")
+            .unwrap();
+        assert!(spec.required_fields.contains(&"--seller"));
+        assert!(spec.required_fields.contains(&"--buyer"));
+        assert!(spec.required_fields.contains(&"--amount"));
+        assert!(spec.required_fields.contains(&"--timeout"));
+    }
+
+    #[test]
+    fn template_show_deposit_protection_required_fields() {
+        let spec = all_templates()
+            .into_iter()
+            .find(|t| t.template_id == "deposit-protection")
+            .unwrap();
+        assert!(spec.required_fields.contains(&"--payer"));
+        assert!(spec.required_fields.contains(&"--payee"));
+        assert!(spec.required_fields.contains(&"--amount"));
+        assert!(spec.required_fields.contains(&"--timeout"));
+    }
+
+    #[test]
+    fn template_show_milestone_payment_required_fields() {
+        let spec = all_templates()
+            .into_iter()
+            .find(|t| t.template_id == "milestone-payment")
+            .unwrap();
+        assert!(spec.required_fields.contains(&"--payer"));
+        assert!(spec.required_fields.contains(&"--payee"));
+        assert!(spec.required_fields.contains(&"--amount"));
+        assert!(spec.required_fields.contains(&"--timeout"));
+    }
+
+    #[test]
+    fn template_show_command_text_mode() {
+        let result = handle_template_show(&["--template".to_string(), "otc-basic".to_string()]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn template_show_command_json_mode() {
+        let result = handle_template_show(&[
+            "--template".to_string(),
+            "deposit-protection".to_string(),
+            "--json".to_string(),
+        ]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn template_show_unknown_returns_error() {
+        let result = handle_template_show(&["--template".to_string(), "nonexistent".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown template"));
+    }
+
+    #[test]
+    fn template_show_missing_flag_returns_error() {
+        let result = handle_template_show(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--template"));
+    }
+
+    #[test]
+    fn agreement_from_template_unknown_template_returns_error() {
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "nonexistent".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown template"));
+    }
+
+    #[test]
+    fn agreement_from_template_missing_template_returns_error() {
+        let result = handle_agreement_create_from_template(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--template"));
+    }
+
+    #[test]
+    fn agreement_from_template_otc_missing_seller_returns_error() {
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "otc-basic".to_string(),
+            "--buyer".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--timeout".to_string(),
+            "1000".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--seller"));
+    }
+
+    #[test]
+    fn agreement_from_template_otc_missing_amount_returns_error() {
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "otc-basic".to_string(),
+            "--seller".to_string(),
+            tpl_test_addr_a(),
+            "--buyer".to_string(),
+            tpl_test_addr_b(),
+            "--timeout".to_string(),
+            "1000".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--amount"));
+    }
+
+    #[test]
+    fn agreement_from_template_otc_invalid_address_returns_error() {
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "otc-basic".to_string(),
+            "--seller".to_string(),
+            "not-an-address".to_string(),
+            "--buyer".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--timeout".to_string(),
+            "1000".to_string(),
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn agreement_from_template_otc_basic_produces_valid_agreement() {
+        let _g = test_guard();
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "otc-basic".to_string(),
+            "--seller".to_string(),
+            tpl_test_addr_a(),
+            "--buyer".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "5.0".to_string(),
+            "--timeout".to_string(),
+            "2000".to_string(),
+            "--json".to_string(),
+        ]);
+        assert!(result.is_ok(), "unexpected err: {:?}", result.err());
+    }
+
+    #[test]
+    fn agreement_from_template_deposit_protection_produces_valid_agreement() {
+        let _g = test_guard();
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "deposit-protection".to_string(),
+            "--payer".to_string(),
+            tpl_test_addr_a(),
+            "--payee".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "2.5".to_string(),
+            "--timeout".to_string(),
+            "1500".to_string(),
+            "--json".to_string(),
+        ]);
+        assert!(result.is_ok(), "unexpected err: {:?}", result.err());
+    }
+
+    #[test]
+    fn agreement_from_template_milestone_payment_produces_valid_agreement() {
+        let _g = test_guard();
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "milestone-payment".to_string(),
+            "--payer".to_string(),
+            tpl_test_addr_a(),
+            "--payee".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "3.0".to_string(),
+            "--timeout".to_string(),
+            "3000".to_string(),
+            "--json".to_string(),
+        ]);
+        assert!(result.is_ok(), "unexpected err: {:?}", result.err());
+    }
+
+    #[test]
+    fn agreement_from_template_deposit_missing_payer_returns_error() {
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "deposit-protection".to_string(),
+            "--payee".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--timeout".to_string(),
+            "1000".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--payer"));
+    }
+
+    #[test]
+    fn agreement_from_template_otc_with_custom_asset() {
+        let _g = test_guard();
+        let result = handle_agreement_create_from_template(&[
+            "--template".to_string(),
+            "otc-basic".to_string(),
+            "--seller".to_string(),
+            tpl_test_addr_a(),
+            "--buyer".to_string(),
+            tpl_test_addr_b(),
+            "--amount".to_string(),
+            "10.0".to_string(),
+            "--timeout".to_string(),
+            "5000".to_string(),
+            "--asset".to_string(),
+            "BTC".to_string(),
+            "--payment-method".to_string(),
+            "lightning".to_string(),
+            "--json".to_string(),
+        ]);
+        assert!(result.is_ok(), "unexpected err: {:?}", result.err());
+    }
+
     // ── Phase 5 review hardening tests ──────────────────────────────────────
 
     #[test]
@@ -17956,6 +18590,24 @@ fn main() {
         }
         "proof-submit-json" => {
             if let Err(e) = handle_proof_submit_json(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "template-list" => {
+            if let Err(e) = handle_template_list(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "template-show" => {
+            if let Err(e) = handle_template_show(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-create-from-template" => {
+            if let Err(e) = handle_agreement_create_from_template(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
