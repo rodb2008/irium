@@ -4719,8 +4719,14 @@ fn render_agreement_receipt_text(statement: &AgreementStatement) -> String {
     out.push_str("truth is the agreement hash plus on-chain / RPC state.\n");
     out.push_str(&format!("{}\n", sep));
     out.push_str("AGREEMENT\n");
-    out.push_str(&format!("  ID      : {}\n", statement.identity.agreement_id));
-    out.push_str(&format!("  Hash    : {}\n", statement.identity.agreement_hash));
+    out.push_str(&format!(
+        "  ID      : {}\n",
+        statement.identity.agreement_id
+    ));
+    out.push_str(&format!(
+        "  Hash    : {}\n",
+        statement.identity.agreement_hash
+    ));
     let tmpl_raw = serde_json::to_string(&statement.identity.template_type)
         .unwrap_or_else(|_| "\"unknown\"".to_string());
     let tmpl = tmpl_raw.trim_start_matches("\"").trim_end_matches("\"");
@@ -4795,7 +4801,10 @@ fn render_agreement_receipt_text(statement: &AgreementStatement) -> String {
         format_irm(statement.derived.refunded_amount)
     ));
     if !statement.derived.note.is_empty() {
-        out.push_str(&format!("  Note             : {}\n", statement.derived.note));
+        out.push_str(&format!(
+            "  Note             : {}\n",
+            statement.derived.note
+        ));
     }
     if let Some(auth) = &statement.authenticity {
         out.push_str(&format!("{}\n", sep));
@@ -4820,7 +4829,6 @@ fn render_agreement_receipt_text(statement: &AgreementStatement) -> String {
     out
 }
 
-
 fn html_esc(s: &str) -> String {
     s.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -4831,7 +4839,10 @@ fn html_esc(s: &str) -> String {
 fn render_agreement_receipt_html(statement: &AgreementStatement) -> String {
     let tmpl_raw = serde_json::to_string(&statement.identity.template_type)
         .unwrap_or_else(|_| "\"unknown\"".to_string());
-    let tmpl_str = tmpl_raw.trim_start_matches("\"").trim_end_matches("\"").to_string();
+    let tmpl_str = tmpl_raw
+        .trim_start_matches("\"")
+        .trim_end_matches("\"")
+        .to_string();
     let mut rows = String::new();
     rows.push_str(&format!(
         "<tr><th>Agreement ID</th><td><code>{}</code></td></tr>\n",
@@ -4870,10 +4881,16 @@ fn render_agreement_receipt_html(statement: &AgreementStatement) -> String {
         html_esc(&statement.commercial.refund_path_summary)
     ));
     if let Some(d) = statement.commercial.settlement_deadline {
-        rows.push_str(&format!("<tr><th>Settlement Deadline</th><td>{}</td></tr>\n", d));
+        rows.push_str(&format!(
+            "<tr><th>Settlement Deadline</th><td>{}</td></tr>\n",
+            d
+        ));
     }
     if let Some(d) = statement.commercial.refund_deadline {
-        rows.push_str(&format!("<tr><th>Refund Deadline</th><td>{}</td></tr>\n", d));
+        rows.push_str(&format!(
+            "<tr><th>Refund Deadline</th><td>{}</td></tr>\n",
+            d
+        ));
     }
     rows.push_str(&format!(
         "<tr><th>Funding Observed</th><td>{}</td></tr>\n",
@@ -4946,15 +4963,19 @@ fn render_agreement_receipt_html(statement: &AgreementStatement) -> String {
     html.push_str("</style>\n</head>\n<body>\n");
     html.push_str("<h1>Irium Settlement Receipt</h1>\n");
     html.push_str("<p class=\"notice\">This receipt is informational. ");
-    html.push_str("Canonical source of truth is the agreement hash plus on-chain / RPC state.</p>\n");
+    html.push_str(
+        "Canonical source of truth is the agreement hash plus on-chain / RPC state.</p>\n",
+    );
     html.push_str("<table>\n");
     html.push_str(&rows);
     html.push_str("</table>\n");
-    html.push_str(&format!("<p class=\"notice\">Canonical notice: {}</p>\n", canonical));
+    html.push_str(&format!(
+        "<p class=\"notice\">Canonical notice: {}</p>\n",
+        canonical
+    ));
     html.push_str("</body>\n</html>");
     html
 }
-
 
 fn validate_agreement_audit_export_format(
     export_format: &str,
@@ -6924,6 +6945,176 @@ fn handle_otc_status(args: &[String]) -> Result<(), String> {
         "ready_to_settle        {}",
         eval_resp.release_eligible || eval_resp.refund_eligible
     );
+    Ok(())
+}
+
+// ============================================================
+// Remote attestor flow (proof-sign + proof-submit-json)
+// ============================================================
+
+/// Derives (address, pubkey_hex, SigningKey) from a raw private key.
+fn signing_key_from_raw(key_input: &str) -> Result<(String, String, SigningKey), String> {
+    let (secret_bytes, compressed) = if key_input.len() == 64 && hex::decode(key_input).is_ok() {
+        let mut b = [0u8; 32];
+        b.copy_from_slice(&hex::decode(key_input).unwrap());
+        (b, true)
+    } else {
+        wif_to_secret_and_compression(key_input)?
+    };
+    let secret =
+        SecretKey::from_slice(&secret_bytes).map_err(|e| format!("invalid private key: {e}"))?;
+    let wk = wallet_key_from_secret(&secret, compressed);
+    let signing_key = SigningKey::from(secret);
+    Ok((wk.address, wk.pubkey, signing_key))
+}
+
+fn handle_proof_sign(args: &[String]) -> Result<(), String> {
+    let mut agreement_hash: Option<String> = None;
+    let mut message: Option<String> = None;
+    let mut key_input: Option<String> = None;
+    let mut proof_type = "otc_release".to_string();
+    let mut attested_by: Option<String> = None;
+    let mut timestamp: Option<u64> = None;
+    let mut out_path: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_hash = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--message" => {
+                message = Some(parse_required_string_flag(args, &mut i, "--message")?);
+            }
+            "--key" => {
+                key_input = Some(parse_required_string_flag(args, &mut i, "--key")?);
+            }
+            "--proof-type" => {
+                proof_type = parse_required_string_flag(args, &mut i, "--proof-type")?;
+            }
+            "--attested-by" => {
+                attested_by = Some(parse_required_string_flag(args, &mut i, "--attested-by")?);
+            }
+            "--timestamp" => {
+                timestamp = Some(
+                    parse_required_string_flag(args, &mut i, "--timestamp")?
+                        .parse::<u64>()
+                        .map_err(|_| "--timestamp must be a non-negative integer".to_string())?,
+                );
+            }
+            "--out" => {
+                out_path = Some(parse_required_string_flag(args, &mut i, "--out")?);
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let agreement_hash = agreement_hash.ok_or_else(|| "--agreement is required".to_string())?;
+    let message_val = message.ok_or_else(|| "--message is required".to_string())?;
+    let key_val = key_input.ok_or_else(|| "--key is required".to_string())?;
+    let (address, pubkey_hex, signing_key) = signing_key_from_raw(&key_val)?;
+    let attestor = attested_by.unwrap_or_else(|| address.clone());
+    let attestation_time = timestamp.unwrap_or_else(now_unix);
+    let seed = format!("{}{}{}", proof_type, agreement_hash, attestation_time);
+    let proof_id = format!("prf-{}", hex::encode(&Sha256::digest(seed.as_bytes())[..8]));
+    let mut proof = SettlementProof {
+        proof_id,
+        schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+        proof_type,
+        agreement_hash,
+        milestone_id: None,
+        attested_by: attestor,
+        attestation_time,
+        evidence_hash: None,
+        evidence_summary: Some(message_val),
+        signature: ProofSignatureEnvelope {
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            pubkey_hex: pubkey_hex.clone(),
+            signature_hex: String::new(),
+            payload_hash: String::new(),
+        },
+        expires_at_height: None,
+        typed_payload: None,
+    };
+    let payload_bytes = settlement_proof_payload_bytes(&proof)
+        .map_err(|e| format!("compute payload bytes: {e}"))?;
+    let payload_digest = Sha256::digest(&payload_bytes);
+    let payload_hash_hex = hex::encode(&payload_digest);
+    let sig: Signature = signing_key
+        .sign_prehash(&payload_digest)
+        .map_err(|e| format!("sign proof payload: {e}"))?;
+    proof.signature.signature_hex = hex::encode(sig.to_bytes());
+    proof.signature.payload_hash = payload_hash_hex;
+    irium_node_rs::settlement::verify_settlement_proof_signature_only(&proof)
+        .map_err(|e| format!("self-verify failed: {e}"))?;
+    let proof_json =
+        serde_json::to_string_pretty(&proof).map_err(|e| format!("serialize proof: {e}"))?;
+    if let Some(ref out) = out_path {
+        std::fs::write(out, &proof_json).map_err(|e| format!("write {}: {e}", out))?;
+    }
+    if json_mode || out_path.is_none() {
+        println!("{}", proof_json);
+    } else {
+        println!("{}", render_proof_create_summary(&proof));
+        println!("written {}", out_path.as_deref().unwrap_or(""));
+    }
+    Ok(())
+}
+
+fn handle_proof_submit_json(args: &[String]) -> Result<(), String> {
+    let mut file_path: Option<String> = None;
+    let mut raw_json: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" => {
+                file_path = Some(parse_required_string_flag(args, &mut i, "--file")?);
+            }
+            "--raw" => {
+                raw_json = Some(parse_required_string_flag(args, &mut i, "--raw")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let proof_str = match (file_path, raw_json) {
+        (Some(path), None) => {
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path))?
+        }
+        (None, Some(raw)) => raw,
+        (Some(_), Some(_)) => return Err("--file and --raw are mutually exclusive".to_string()),
+        (None, None) => return Err("--file or --raw is required".to_string()),
+    };
+    let proof: SettlementProof =
+        serde_json::from_str(&proof_str).map_err(|e| format!("parse proof JSON: {e}"))?;
+    irium_node_rs::settlement::verify_settlement_proof_signature_only(&proof)
+        .map_err(|e| format!("proof signature invalid: {e}"))?;
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let req = SubmitProofRpcRequest { proof };
+    let resp: SubmitProofRpcResponse = rpc_post_json(&client, base, "/rpc/submitproof", &req)?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::to_value(&resp).unwrap()).unwrap()
+        );
+    } else {
+        println!("{}", render_proof_submit_summary(&resp));
+    }
+    if !resp.accepted && !resp.duplicate {
+        return Err(format!("proof rejected: {}", resp.message));
+    }
     Ok(())
 }
 
@@ -9772,19 +9963,20 @@ mod tests {
     #[test]
     fn receipt_text_render_with_authenticity_section() {
         let mut s = make_receipt_test_statement();
-        s.authenticity = Some(irium_node_rs::settlement::AgreementStatementAuthenticitySummary {
-            valid_signatures: 2,
-            invalid_signatures: 0,
-            unverifiable_signatures: 1,
-            compact_summary: "2 valid".to_string(),
-            authenticity_notice: "notice".to_string(),
-        });
+        s.authenticity = Some(
+            irium_node_rs::settlement::AgreementStatementAuthenticitySummary {
+                valid_signatures: 2,
+                invalid_signatures: 0,
+                unverifiable_signatures: 1,
+                compact_summary: "2 valid".to_string(),
+                authenticity_notice: "notice".to_string(),
+            },
+        );
         let out = render_agreement_receipt_text(&s);
         assert!(out.contains("AUTHENTICITY"));
         assert!(out.contains("2 / 0 / 1"));
         assert!(out.contains("2 valid"));
     }
-
 
     #[test]
     fn signature_verification_summary_render_is_stable() {
@@ -12689,6 +12881,134 @@ found true"
         );
     }
 
+    // ============================================================
+    // Remote attestor flow tests
+    // ============================================================
+
+    fn test_privkey_hex() -> String {
+        hex::encode([7u8; 32])
+    }
+
+    fn test_agreement_hash() -> String {
+        "a".repeat(64)
+    }
+
+    #[test]
+    fn proof_sign_with_hex_key_produces_valid_signature() {
+        let args: Vec<String> = vec![
+            "--agreement".to_string(),
+            test_agreement_hash(),
+            "--message".to_string(),
+            "payment confirmed".to_string(),
+            "--key".to_string(),
+            test_privkey_hex(),
+            "--timestamp".to_string(),
+            "1000".to_string(),
+        ];
+        let result = handle_proof_sign(&args);
+        assert!(result.is_ok(), "expected ok, got: {:?}", result);
+    }
+
+    #[test]
+    fn proof_sign_with_wif_key_produces_valid_signature() {
+        let secret_bytes = [7u8; 32];
+        let mut wif_body = vec![0x80u8];
+        wif_body.extend_from_slice(&secret_bytes);
+        wif_body.push(0x01);
+        let first = sha2::Sha256::digest(&wif_body);
+        let second = sha2::Sha256::digest(&first);
+        let mut full = wif_body.clone();
+        full.extend_from_slice(&second[..4]);
+        let wif = bs58::encode(full).into_string();
+        let args: Vec<String> = vec![
+            "--agreement".to_string(),
+            test_agreement_hash(),
+            "--message".to_string(),
+            "payment confirmed".to_string(),
+            "--key".to_string(),
+            wif,
+            "--timestamp".to_string(),
+            "1000".to_string(),
+        ];
+        let result = handle_proof_sign(&args);
+        assert!(result.is_ok(), "expected ok, got: {:?}", result);
+    }
+
+    #[test]
+    fn signing_key_from_raw_hex_produces_correct_address() {
+        let privkey = test_privkey_hex();
+        let (address, pubkey_hex, _) = signing_key_from_raw(&privkey).unwrap();
+        assert!(!address.is_empty(), "address must not be empty");
+        assert!(!pubkey_hex.is_empty(), "pubkey_hex must not be empty");
+        assert!(address.starts_with('Q'), "Irium address must start with Q");
+        let (address2, _, _) = signing_key_from_raw(&privkey).unwrap();
+        assert_eq!(address, address2);
+    }
+
+    #[test]
+    fn signing_key_from_raw_invalid_key_returns_error() {
+        let result = signing_key_from_raw("not-a-valid-key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn proof_sign_missing_agreement_returns_error() {
+        let result = handle_proof_sign(&[
+            "--message".to_string(),
+            "test".to_string(),
+            "--key".to_string(),
+            test_privkey_hex(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--agreement"));
+    }
+
+    #[test]
+    fn proof_sign_missing_key_returns_error() {
+        let result = handle_proof_sign(&[
+            "--agreement".to_string(),
+            test_agreement_hash(),
+            "--message".to_string(),
+            "test".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--key"));
+    }
+
+    #[test]
+    fn proof_sign_unknown_flag_returns_error() {
+        let result = handle_proof_sign(&["--bogus-flag".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn proof_submit_json_missing_source_returns_error() {
+        let result = handle_proof_submit_json(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--file or --raw"));
+    }
+
+    #[test]
+    fn proof_submit_json_mutually_exclusive_returns_error() {
+        let result = handle_proof_submit_json(&[
+            "--file".to_string(),
+            "a.json".to_string(),
+            "--raw".to_string(),
+            "{}".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn proof_submit_json_malformed_json_returns_error() {
+        let result =
+            handle_proof_submit_json(&["--raw".to_string(), "{not valid json".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("parse proof JSON"));
+    }
+
     // ── Phase 5 review hardening tests ──────────────────────────────────────
 
     #[test]
@@ -15573,7 +15893,10 @@ fn main() {
                         bundle_signature_path = args.get(i + 1).cloned();
                         i += 2;
                     }
-                    "--json" => { export_format = String::from("json"); i += 1; }
+                    "--json" => {
+                        export_format = String::from("json");
+                        i += 1;
+                    }
                     other => {
                         eprintln!("Unknown argument {}", other);
                         std::process::exit(1);
@@ -15581,7 +15904,10 @@ fn main() {
                 }
             }
             if export_format != "json" && export_format != "text" && export_format != "html" {
-                eprintln!("unsupported --format {}; expected json, text, or html", export_format);
+                eprintln!(
+                    "unsupported --format {}; expected json, text, or html",
+                    export_format
+                );
                 std::process::exit(1);
             }
             let out_path = match out_path {
@@ -15694,7 +16020,8 @@ fn main() {
                         i += 2;
                     }
                     "--format" => {
-                        receipt_format = args.get(i + 1).cloned().unwrap_or_default().to_lowercase();
+                        receipt_format =
+                            args.get(i + 1).cloned().unwrap_or_default().to_lowercase();
                         i += 2;
                     }
                     "--out" => {
@@ -15709,7 +16036,10 @@ fn main() {
                         bundle_signature_path = args.get(i + 1).cloned();
                         i += 2;
                     }
-                    "--json" => { receipt_format = String::from("json"); i += 1; }
+                    "--json" => {
+                        receipt_format = String::from("json");
+                        i += 1;
+                    }
                     other => {
                         eprintln!("Unknown argument {}", other);
                         std::process::exit(1);
@@ -15717,7 +16047,10 @@ fn main() {
                 }
             }
             if receipt_format != "json" && receipt_format != "text" && receipt_format != "html" {
-                eprintln!("unsupported --format {}; expected text, html, or json", receipt_format);
+                eprintln!(
+                    "unsupported --format {}; expected text, html, or json",
+                    receipt_format
+                );
                 std::process::exit(1);
             }
             let detached_agreement_signature = agreement_signature_path
@@ -15764,9 +16097,8 @@ fn main() {
             let statement = build_agreement_statement(&audit);
             let rendered = match receipt_format.as_str() {
                 "html" => render_agreement_receipt_html(&statement),
-                "json" => serde_json::to_string_pretty(
-                    &serde_json::to_value(&statement).unwrap()
-                ).unwrap_or_default(),
+                "json" => serde_json::to_string_pretty(&serde_json::to_value(&statement).unwrap())
+                    .unwrap_or_default(),
                 _ => render_agreement_receipt_text(&statement),
             };
             if let Some(path) = out_path {
@@ -17614,6 +17946,18 @@ fn main() {
                 );
             } else {
                 println!("{}", render_build_settlement_summary(&resp));
+            }
+        }
+        "proof-sign" => {
+            if let Err(e) = handle_proof_sign(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "proof-submit-json" => {
+            if let Err(e) = handle_proof_submit_json(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
             }
         }
         "agreement-settle-status" => {
