@@ -228,6 +228,11 @@ fn coinbase_metadata_output() -> Option<TxOutput> {
 mod tests {
     use super::script_from_relay_address;
     use irium_node_rs::activation::{resolved_htlcv1_activation_height, NetworkKind};
+    use irium_node_rs::activation::{
+        resolved_lwma_v2_activation_height, MAINNET_LWMA_V2_ACTIVATION_HEIGHT,
+    };
+    use irium_node_rs::chain::LwmaParams;
+    use irium_node_rs::pow::Target;
 
     #[test]
     fn builds_p2pkh_from_hex() {
@@ -266,6 +271,49 @@ mod tests {
             Some(42)
         );
         std::env::remove_var("IRIUM_HTLCV1_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn mainnet_lwma_v2_activates_at_height_19740() {
+        assert_eq!(
+            MAINNET_LWMA_V2_ACTIVATION_HEIGHT,
+            Some(19_740u64),
+            "LWMA v2 must activate at height 19740; miners without v2 support will stall at this height"
+        );
+        assert_eq!(
+            resolved_lwma_v2_activation_height(NetworkKind::Mainnet),
+            Some(19_740u64)
+        );
+    }
+
+    #[test]
+    fn mainnet_miner_constructs_lwma_v2_params() {
+        let pow_limit = Target { bits: 0x1d00_ffff };
+        let v2_activation = resolved_lwma_v2_activation_height(NetworkKind::Mainnet);
+        assert!(
+            v2_activation.is_some(),
+            "Miner must have LWMA v2 params on mainnet"
+        );
+        let v2 = LwmaParams::new_v2(v2_activation, pow_limit);
+        let v1 = LwmaParams::new(None, pow_limit);
+        assert_eq!(v2.activation_height, Some(19_740u64));
+        assert_ne!(
+            v1.window, v2.window,
+            "v1 and v2 must have different window sizes"
+        );
+        assert!(
+            v2.window < v1.window,
+            "v2 uses smaller window for faster response"
+        );
+    }
+
+    #[test]
+    fn lwma_v2_window_smaller_than_v1() {
+        let pow_limit = Target { bits: 0x1d00_ffff };
+        let v1 = LwmaParams::new(Some(16_462), pow_limit);
+        let v2 = LwmaParams::new_v2(Some(19_740), pow_limit);
+        assert_eq!(v1.window, 60, "v1 LWMA window must be 60 blocks");
+        assert_eq!(v2.window, 30, "v2 LWMA window must be 30 blocks");
     }
 }
 
@@ -1212,6 +1260,10 @@ fn reconcile_with_template(
                     eprintln!("[warn] Miner failed to connect block {}: {}", h, e);
                     if e.contains("does not extend the current tip") {
                         eprintln!("[warn] Miner chain diverged during sync; resetting to node");
+                        prune_blocks_above(0);
+                        *state = ChainState::new(params.clone());
+                    } else if e.contains("bits mismatch") {
+                        eprintln!("[warn] Miner difficulty algorithm mismatch at height {} ({}); resetting chain state", h, e);
                         prune_blocks_above(0);
                         *state = ChainState::new(params.clone());
                     }
