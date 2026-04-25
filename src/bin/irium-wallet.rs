@@ -5848,6 +5848,20 @@ fn parse_policy_evaluate_cli(args: &[String]) -> Result<PolicyEvaluateCliOptions
     })
 }
 
+fn flow_next_step_hint(outcome: &str, release_eligible: bool, refund_eligible: bool) -> &'static str {
+    if release_eligible {
+        "run agreement-release-build to construct the release transaction"
+    } else if refund_eligible {
+        "run agreement-refund-build to construct the refund transaction"
+    } else {
+        match outcome {
+            "satisfied" => "policy satisfied but not yet executable; re-run agreement-policy-evaluate after the holdback height",
+            "timeout"   => "agreement timed out; refund path is now eligible, run agreement-refund-build",
+            _           => "run agreement-proof-create then agreement-proof-submit to submit attestation, then re-evaluate",
+        }
+    }
+}
+
 fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
     let mut lines = Vec::new();
     lines.push(format!("agreement_hash {}", resp.agreement_hash));
@@ -5945,6 +5959,7 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
             ));
         }
     }
+    lines.push(format!("next_step  {}", flow_next_step_hint(&resp.outcome, resp.release_eligible, resp.refund_eligible)));
     lines.join("\n")
 }
 
@@ -5958,10 +5973,14 @@ fn render_policy_set_summary(resp: &StorePolicyRpcResponse) -> String {
     } else {
         "rejected"
     };
-    format!(
+    let mut out = format!(
         "policy_id {}\nagreement_hash {}\nstatus {}\nmessage {}",
         resp.policy_id, resp.agreement_hash, status, resp.message
-    )
+    );
+    if resp.accepted {
+        out.push_str("\nnext_step  run agreement-policy-evaluate to verify the policy is active");
+    }
+    out
 }
 
 fn render_policy_get_summary(resp: &GetPolicyRpcResponse) -> String {
@@ -6038,6 +6057,9 @@ fn render_proof_create_summary(proof: &SettlementProof) -> String {
     }
     lines.push(format!("payload_hash {}", proof.signature.payload_hash));
     lines.push(format!("pubkey_hex {}", proof.signature.pubkey_hex));
+    lines.push(
+        "next_step  run agreement-proof-submit to broadcast this proof to the node".to_string(),
+    );
     lines.join(
         "
 ",
@@ -13643,6 +13665,116 @@ found true"
         assert!(result.is_ok(), "unexpected err: {:?}", result.err());
     }
 
+    // ============================================================
+    // Phase 3 integration: flow_next_step_hint
+    // ============================================================
+
+    #[test]
+    fn flow_next_step_hint_release_eligible() {
+        let hint = flow_next_step_hint("satisfied", true, false);
+        assert!(
+            hint.contains("release-build"),
+            "expected release-build in hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn flow_next_step_hint_refund_eligible() {
+        let hint = flow_next_step_hint("timeout", false, true);
+        assert!(
+            hint.contains("refund-build"),
+            "expected refund-build in hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn flow_next_step_hint_satisfied_not_executable() {
+        let hint = flow_next_step_hint("satisfied", false, false);
+        assert!(
+            hint.contains("holdback"),
+            "expected holdback in hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn flow_next_step_hint_timeout_no_eligible() {
+        let hint = flow_next_step_hint("timeout", false, false);
+        assert!(
+            hint.contains("refund-build"),
+            "expected refund-build in hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn flow_next_step_hint_pending() {
+        let hint = flow_next_step_hint("pending", false, false);
+        assert!(
+            hint.contains("proof-create"),
+            "expected proof-create in hint: {hint}"
+        );
+    }
+
+    #[test]
+    fn render_policy_evaluate_includes_next_step() {
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "pending".to_string(),
+            agreement_hash: "abc".to_string(),
+            policy_found: true,
+            tip_height: 100,
+            ..Default::default()
+        };
+        let s = render_policy_evaluate_summary(&resp);
+        assert!(s.contains("next_step"), "must contain next_step: {s}");
+        assert!(
+            s.contains("proof-create"),
+            "must guide toward attestation: {s}"
+        );
+    }
+
+    #[test]
+    fn render_policy_evaluate_release_eligible_next_step() {
+        let resp = EvaluatePolicyRpcResponse {
+            outcome: "satisfied".to_string(),
+            agreement_hash: "abc".to_string(),
+            release_eligible: true,
+            ..Default::default()
+        };
+        let s = render_policy_evaluate_summary(&resp);
+        assert!(s.contains("release-build"), "release hint expected: {s}");
+    }
+
+    #[test]
+    fn render_policy_set_summary_accepted_has_next_step() {
+        let resp = StorePolicyRpcResponse {
+            policy_id: "pid-1".to_string(),
+            agreement_hash: "deadbeef".to_string(),
+            accepted: true,
+            updated: false,
+            message: "ok".to_string(),
+        };
+        let s = render_policy_set_summary(&resp);
+        assert!(
+            s.contains("next_step"),
+            "accepted response must include next_step: {s}"
+        );
+    }
+
+    #[test]
+    fn render_policy_set_summary_rejected_no_next_step() {
+        let resp = StorePolicyRpcResponse {
+            policy_id: "pid-2".to_string(),
+            agreement_hash: "cafebabe".to_string(),
+            accepted: false,
+            updated: false,
+            message: "rejected".to_string(),
+        };
+        let s = render_policy_set_summary(&resp);
+        assert!(
+            !s.contains("next_step"),
+            "rejected response must not include next_step: {s}"
+        );
+    }
+
     // ── Phase 5 review hardening tests ──────────────────────────────────────
 
     #[test]
@@ -17749,8 +17881,9 @@ fn main() {
                         raw_policy_mode = true;
                         i += 1;
                     }
-                    _ => {
-                        i += 1;
+                    other => {
+                        eprintln!("policy-build-otc: unknown argument: {}", other);
+                        std::process::exit(1);
                     }
                 }
             }
