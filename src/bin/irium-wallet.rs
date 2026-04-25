@@ -4692,6 +4692,254 @@ fn render_agreement_statement(statement: &AgreementStatement) -> String {
     )
 }
 
+fn render_agreement_receipt_text(statement: &AgreementStatement) -> String {
+    let sep = "-------------------------------------";
+    let wide = "=====================================";
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", wide));
+    out.push_str("       IRIUM SETTLEMENT RECEIPT      \n");
+    out.push_str(&format!("{}\n", wide));
+    out.push_str("NOTICE: This receipt is informational. Canonical source of\n");
+    out.push_str("truth is the agreement hash plus on-chain / RPC state.\n");
+    out.push_str(&format!("{}\n", sep));
+    out.push_str("AGREEMENT\n");
+    out.push_str(&format!("  ID      : {}\n", statement.identity.agreement_id));
+    out.push_str(&format!("  Hash    : {}\n", statement.identity.agreement_hash));
+    let tmpl_raw = serde_json::to_string(&statement.identity.template_type)
+        .unwrap_or_else(|_| "\"unknown\"".to_string());
+    let tmpl = tmpl_raw.trim_start_matches("\"").trim_end_matches("\"");
+    out.push_str(&format!("  Template: {}\n", tmpl));
+    out.push_str(&format!("{}\n", sep));
+    out.push_str("PARTIES\n");
+    out.push_str(&format!("  Payer   : {}\n", statement.counterparties.payer));
+    out.push_str(&format!("  Payee   : {}\n", statement.counterparties.payee));
+    for p in &statement.counterparties.parties_summary {
+        out.push_str(&format!("  Party   : {}\n", p));
+    }
+    out.push_str(&format!("{}\n", sep));
+    out.push_str("COMMERCIAL TERMS\n");
+    out.push_str(&format!(
+        "  Total Amount     : {} IRM\n",
+        format_irm(statement.commercial.total_amount)
+    ));
+    out.push_str(&format!(
+        "  Milestones       : {}\n",
+        statement.commercial.milestone_summary
+    ));
+    out.push_str(&format!(
+        "  Release Path     : {}\n",
+        statement.commercial.release_path_summary
+    ));
+    out.push_str(&format!(
+        "  Refund Path      : {}\n",
+        statement.commercial.refund_path_summary
+    ));
+    if let Some(d) = statement.commercial.settlement_deadline {
+        out.push_str(&format!("  Settlement Deadline: {}\n", d));
+    }
+    if let Some(d) = statement.commercial.refund_deadline {
+        out.push_str(&format!("  Refund Deadline  : {}\n", d));
+    }
+    out.push_str(&format!("{}\n", sep));
+    out.push_str("OBSERVED ACTIVITY\n");
+    out.push_str(&format!(
+        "  Funding Observed : {}\n",
+        statement.observed.funding_observed
+    ));
+    out.push_str(&format!(
+        "  Release Observed : {}\n",
+        statement.observed.release_observed
+    ));
+    out.push_str(&format!(
+        "  Refund Observed  : {}\n",
+        statement.observed.refund_observed
+    ));
+    for txid in &statement.observed.linked_txids {
+        out.push_str(&format!("  Linked Txid      : {}\n", txid));
+    }
+    if let Some(w) = &statement.observed.ambiguity_warning {
+        out.push_str(&format!("  Ambiguity Warning: {}\n", w));
+    }
+    out.push_str(&format!("{}\n", sep));
+    out.push_str("SETTLEMENT OUTCOME\n");
+    out.push_str(&format!(
+        "  Status           : {}\n",
+        statement.derived.derived_state_label
+    ));
+    out.push_str(&format!(
+        "  Funded Amount    : {} IRM\n",
+        format_irm(statement.derived.funded_amount)
+    ));
+    out.push_str(&format!(
+        "  Released Amount  : {} IRM\n",
+        format_irm(statement.derived.released_amount)
+    ));
+    out.push_str(&format!(
+        "  Refunded Amount  : {} IRM\n",
+        format_irm(statement.derived.refunded_amount)
+    ));
+    if !statement.derived.note.is_empty() {
+        out.push_str(&format!("  Note             : {}\n", statement.derived.note));
+    }
+    if let Some(auth) = &statement.authenticity {
+        out.push_str(&format!("{}\n", sep));
+        out.push_str("AUTHENTICITY\n");
+        out.push_str(&format!(
+            "  Valid / Invalid / Unverifiable: {} / {} / {}\n",
+            auth.valid_signatures, auth.invalid_signatures, auth.unverifiable_signatures
+        ));
+        out.push_str(&format!("  Summary : {}\n", auth.compact_summary));
+    }
+    out.push_str(&format!("{}\n", sep));
+    out.push_str("GENERATED\n");
+    out.push_str(&format!(
+        "  Generated At     : {}\n",
+        statement.metadata.generated_at
+    ));
+    out.push_str(&format!(
+        "  Canonical Notice : {}\n",
+        statement.references.canonical_agreement_notice
+    ));
+    out.push_str(&format!("{}\n", wide));
+    out
+}
+
+
+fn html_esc(s: &str) -> String {
+    s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+}
+
+fn render_agreement_receipt_html(statement: &AgreementStatement) -> String {
+    let tmpl_raw = serde_json::to_string(&statement.identity.template_type)
+        .unwrap_or_else(|_| "\"unknown\"".to_string());
+    let tmpl_str = tmpl_raw.trim_start_matches("\"").trim_end_matches("\"").to_string();
+    let mut rows = String::new();
+    rows.push_str(&format!(
+        "<tr><th>Agreement ID</th><td><code>{}</code></td></tr>\n",
+        html_esc(&statement.identity.agreement_id)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Agreement Hash</th><td><code>{}</code></td></tr>\n",
+        html_esc(&statement.identity.agreement_hash)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Template</th><td>{}</td></tr>\n",
+        html_esc(&tmpl_str)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Payer</th><td><code>{}</code></td></tr>\n",
+        html_esc(&statement.counterparties.payer)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Payee</th><td><code>{}</code></td></tr>\n",
+        html_esc(&statement.counterparties.payee)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Total Amount</th><td>{} IRM</td></tr>\n",
+        html_esc(&format_irm(statement.commercial.total_amount))
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Milestones</th><td>{}</td></tr>\n",
+        html_esc(&statement.commercial.milestone_summary)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Release Path</th><td>{}</td></tr>\n",
+        html_esc(&statement.commercial.release_path_summary)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Refund Path</th><td>{}</td></tr>\n",
+        html_esc(&statement.commercial.refund_path_summary)
+    ));
+    if let Some(d) = statement.commercial.settlement_deadline {
+        rows.push_str(&format!("<tr><th>Settlement Deadline</th><td>{}</td></tr>\n", d));
+    }
+    if let Some(d) = statement.commercial.refund_deadline {
+        rows.push_str(&format!("<tr><th>Refund Deadline</th><td>{}</td></tr>\n", d));
+    }
+    rows.push_str(&format!(
+        "<tr><th>Funding Observed</th><td>{}</td></tr>\n",
+        statement.observed.funding_observed
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Release Observed</th><td>{}</td></tr>\n",
+        statement.observed.release_observed
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Refund Observed</th><td>{}</td></tr>\n",
+        statement.observed.refund_observed
+    ));
+    for txid in &statement.observed.linked_txids {
+        rows.push_str(&format!(
+            "<tr><th>Linked Txid</th><td><code>{}</code></td></tr>\n",
+            html_esc(txid)
+        ));
+    }
+    if let Some(w) = &statement.observed.ambiguity_warning {
+        rows.push_str(&format!(
+            "<tr><th>Ambiguity Warning</th><td class=\"warn\">{}</td></tr>\n",
+            html_esc(w)
+        ));
+    }
+    rows.push_str(&format!(
+        "<tr><th>Derived Status</th><td><strong>{}</strong></td></tr>\n",
+        html_esc(&statement.derived.derived_state_label)
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Funded Amount</th><td>{} IRM</td></tr>\n",
+        html_esc(&format_irm(statement.derived.funded_amount))
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Released Amount</th><td>{} IRM</td></tr>\n",
+        html_esc(&format_irm(statement.derived.released_amount))
+    ));
+    rows.push_str(&format!(
+        "<tr><th>Refunded Amount</th><td>{} IRM</td></tr>\n",
+        html_esc(&format_irm(statement.derived.refunded_amount))
+    ));
+    if !statement.derived.note.is_empty() {
+        rows.push_str(&format!(
+            "<tr><th>Note</th><td>{}</td></tr>\n",
+            html_esc(&statement.derived.note)
+        ));
+    }
+    if let Some(auth) = &statement.authenticity {
+        rows.push_str(&format!(
+            "<tr><th>Signatures</th><td>valid {} / invalid {} / unverifiable {}</td></tr>\n",
+            auth.valid_signatures, auth.invalid_signatures, auth.unverifiable_signatures
+        ));
+    }
+    rows.push_str(&format!(
+        "<tr><th>Generated At</th><td>{}</td></tr>\n",
+        statement.metadata.generated_at
+    ));
+    let canonical = html_esc(&statement.references.canonical_agreement_notice);
+    let mut html = String::new();
+    html.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    html.push_str("<title>Irium Settlement Receipt</title>\n<style>\n");
+    html.push_str("body{font-family:monospace;max-width:720px;margin:2em auto;padding:1em}\n");
+    html.push_str("h1{border-bottom:2px solid #333;padding-bottom:.4em}\n");
+    html.push_str("table{border-collapse:collapse;width:100%}\n");
+    html.push_str("th,td{text-align:left;padding:.4em .6em;border-bottom:1px solid #ddd;vertical-align:top}\n");
+    html.push_str("th{width:40%;color:#555;font-weight:normal}\n");
+    html.push_str("code{font-size:.9em;word-break:break-all}\n");
+    html.push_str(".notice{font-size:.85em;color:#666;margin:.5em 0}\n");
+    html.push_str(".warn{color:#b30000}\n");
+    html.push_str("</style>\n</head>\n<body>\n");
+    html.push_str("<h1>Irium Settlement Receipt</h1>\n");
+    html.push_str("<p class=\"notice\">This receipt is informational. ");
+    html.push_str("Canonical source of truth is the agreement hash plus on-chain / RPC state.</p>\n");
+    html.push_str("<table>\n");
+    html.push_str(&rows);
+    html.push_str("</table>\n");
+    html.push_str(&format!("<p class=\"notice\">Canonical notice: {}</p>\n", canonical));
+    html.push_str("</body>\n</html>");
+    html
+}
+
+
 fn validate_agreement_audit_export_format(
     export_format: &str,
     json_mode: bool,
@@ -8941,6 +9189,147 @@ mod tests {
         assert_eq!(value["identity"]["agreement_id"], "agr-wallet-statement");
         assert_eq!(value["derived"]["derived_state_label"], "proposed");
     }
+
+    fn make_receipt_test_statement() -> AgreementStatement {
+        AgreementStatement {
+            metadata: irium_node_rs::settlement::AgreementStatementMetadata {
+                version: 1,
+                generated_at: 1_710_001_000,
+                derived_notice: "derived only".to_string(),
+            },
+            identity: irium_node_rs::settlement::AgreementStatementIdentity {
+                agreement_id: "agr-receipt-test".to_string(),
+                agreement_hash: "bb".repeat(32),
+                template_type: AgreementTemplateType::SimpleReleaseRefund,
+            },
+            counterparties: irium_node_rs::settlement::AgreementStatementCounterparties {
+                payer: "Qpayer".to_string(),
+                payee: "Qpayee".to_string(),
+                parties_summary: vec!["payer: Alice <Qpayer>".to_string()],
+            },
+            commercial: irium_node_rs::settlement::AgreementStatementCommercialSummary {
+                total_amount: 250_000_000,
+                milestone_summary: "no milestones".to_string(),
+                settlement_deadline: Some(1_710_010_000),
+                refund_deadline: None,
+                release_path_summary: "htlc release".to_string(),
+                refund_path_summary: "htlc refund".to_string(),
+            },
+            observed: irium_node_rs::settlement::AgreementStatementObservedSummary {
+                funding_observed: true,
+                release_observed: false,
+                refund_observed: false,
+                ambiguity_warning: None,
+                linked_txids: vec!["txaabbcc".to_string()],
+            },
+            derived: irium_node_rs::settlement::AgreementStatementDerivedSummary {
+                derived_state_label: "funded".to_string(),
+                funded_amount: 250_000_000,
+                released_amount: 0,
+                refunded_amount: 0,
+                note: "funded; awaiting release or refund".to_string(),
+            },
+            authenticity: None,
+            trust_notice: irium_node_rs::settlement::AgreementStatementTrustNotice {
+                consensus_visible: vec!["anchor".to_string()],
+                htlc_enforced: vec!["htlc branch".to_string()],
+                derived_indexed: vec!["timeline".to_string()],
+                local_off_chain: vec!["exchange".to_string()],
+                canonical_notice: "canonical source is agreement hash".to_string(),
+            },
+            references: irium_node_rs::settlement::AgreementStatementReferences {
+                linked_txids: vec!["txaabbcc".to_string()],
+                selected_funding_txid: None,
+                canonical_agreement_notice: "verify via hash".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn receipt_text_render_contains_sections() {
+        let s = make_receipt_test_statement();
+        let out = render_agreement_receipt_text(&s);
+        assert!(out.contains("IRIUM SETTLEMENT RECEIPT"));
+        assert!(out.contains("AGREEMENT"));
+        assert!(out.contains("PARTIES"));
+        assert!(out.contains("COMMERCIAL TERMS"));
+        assert!(out.contains("OBSERVED ACTIVITY"));
+        assert!(out.contains("SETTLEMENT OUTCOME"));
+        assert!(out.contains("GENERATED"));
+        assert!(out.contains("NOTICE: This receipt is informational."));
+    }
+
+    #[test]
+    fn receipt_text_render_agreement_fields() {
+        let s = make_receipt_test_statement();
+        let out = render_agreement_receipt_text(&s);
+        assert!(out.contains("agr-receipt-test"));
+        assert!(out.contains("Qpayer"));
+        assert!(out.contains("Qpayee"));
+        assert!(out.contains("2.50000000 IRM"));
+        assert!(out.contains("funded"));
+        assert!(out.contains("txaabbcc"));
+        assert!(out.contains("1710001000"));
+        assert!(out.contains("verify via hash"));
+    }
+
+    #[test]
+    fn receipt_text_render_settlement_deadline_present() {
+        let s = make_receipt_test_statement();
+        let out = render_agreement_receipt_text(&s);
+        assert!(out.contains("Settlement Deadline"));
+        assert!(out.contains("1710010000"));
+        assert!(!out.contains("Refund Deadline"));
+    }
+
+    #[test]
+    fn receipt_html_render_structure() {
+        let s = make_receipt_test_statement();
+        let out = render_agreement_receipt_html(&s);
+        assert!(out.contains("<!DOCTYPE html>"));
+        assert!(out.contains("<title>Irium Settlement Receipt</title>"));
+        assert!(out.contains("<table>"));
+        assert!(out.contains("</table>"));
+        assert!(out.contains("Agreement ID"));
+        assert!(out.contains("Derived Status"));
+        assert!(out.contains("agr-receipt-test"));
+        assert!(out.contains("2.50000000 IRM"));
+    }
+
+    #[test]
+    fn receipt_html_esc_encodes_special_chars() {
+        assert_eq!(html_esc("a&b"), "a&amp;b");
+        assert_eq!(html_esc("<tag>"), "&lt;tag&gt;");
+        assert_eq!(html_esc("say \"hi\""), "say &quot;hi&quot;");
+        assert_eq!(html_esc("plain"), "plain");
+    }
+
+    #[test]
+    fn receipt_html_render_with_ambiguity_warning() {
+        let mut s = make_receipt_test_statement();
+        s.observed.ambiguity_warning = Some("duplicate funding txid".to_string());
+        let out = render_agreement_receipt_html(&s);
+        assert!(out.contains("warn"));
+        assert!(out.contains("duplicate funding txid"));
+    }
+
+    #[test]
+    fn receipt_text_render_with_authenticity_section() {
+        let mut s = make_receipt_test_statement();
+        s.authenticity = Some(irium_node_rs::settlement::AgreementStatementAuthenticitySummary {
+            valid_signatures: 2,
+            invalid_signatures: 0,
+            unverifiable_signatures: 1,
+            compact_summary: "2 valid".to_string(),
+            authenticity_notice: "notice".to_string(),
+        });
+        let out = render_agreement_receipt_text(&s);
+        assert!(out.contains("AUTHENTICITY"));
+        assert!(out.contains("2 / 0 / 1"));
+        assert!(out.contains("2 valid"));
+    }
+
+
     #[test]
     fn signature_verification_summary_render_is_stable() {
         let verification = AgreementSignatureVerification {
@@ -14063,6 +14452,7 @@ fn main() {
             };
             let mut rpc_url = default_rpc_url();
             let mut out_path = None::<String>;
+            let mut export_format = String::from("json");
             let mut agreement_signature_path = None::<String>;
             let mut bundle_signature_path = None::<String>;
             let json_mode = args.iter().any(|a| a == "--json");
@@ -14077,6 +14467,10 @@ fn main() {
                         out_path = args.get(i + 1).cloned();
                         i += 2;
                     }
+                    "--format" => {
+                        export_format = args.get(i + 1).cloned().unwrap_or_default().to_lowercase();
+                        i += 2;
+                    }
                     "--agreement-signature" => {
                         agreement_signature_path = args.get(i + 1).cloned();
                         i += 2;
@@ -14085,12 +14479,16 @@ fn main() {
                         bundle_signature_path = args.get(i + 1).cloned();
                         i += 2;
                     }
-                    "--json" => i += 1,
+                    "--json" => { export_format = String::from("json"); i += 1; }
                     other => {
                         eprintln!("Unknown argument {}", other);
                         std::process::exit(1);
                     }
                 }
+            }
+            if export_format != "json" && export_format != "text" && export_format != "html" {
+                eprintln!("unsupported --format {}; expected json, text, or html", export_format);
+                std::process::exit(1);
             }
             let out_path = match out_path {
                 Some(v) => v,
@@ -14141,18 +14539,156 @@ fn main() {
                 &detached_bundle_signatures,
             );
             let statement = build_agreement_statement(&audit);
-            let value = serde_json::to_value(&statement).unwrap();
-            if let Err(e) = save_json_output(Some(&out_path), &value) {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            }
-            if json_mode {
-                println!("{}", serde_json::to_string_pretty(&value).unwrap());
-            } else {
-                println!("{}", render_agreement_statement(&statement));
-                println!("exported_to {}", out_path);
+            match export_format.as_str() {
+                "text" => {
+                    let rendered = render_agreement_receipt_text(&statement);
+                    if let Err(e) = save_text_output(Some(&out_path), &rendered) {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                    println!("{}", rendered);
+                    println!("export_format text");
+                    println!("exported_to {}", out_path);
+                }
+                "html" => {
+                    let rendered = render_agreement_receipt_html(&statement);
+                    if let Err(e) = save_text_output(Some(&out_path), &rendered) {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                    println!("export_format html");
+                    println!("exported_to {}", out_path);
+                }
+                _ => {
+                    let value = serde_json::to_value(&statement).unwrap();
+                    if let Err(e) = save_json_output(Some(&out_path), &value) {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                    if json_mode {
+                        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+                    } else {
+                        println!("{}", render_agreement_statement(&statement));
+                        println!("exported_to {}", out_path);
+                    }
+                }
             }
         }
+
+        "agreement-receipt" => {
+            if args.len() < 2 {
+                usage();
+                std::process::exit(1);
+            }
+            let resolved = match resolve_agreement_input(&args[1]) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let mut rpc_url = default_rpc_url();
+            let mut receipt_format = String::from("text");
+            let mut out_path = None::<String>;
+            let mut agreement_signature_path = None::<String>;
+            let mut bundle_signature_path = None::<String>;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--rpc" => {
+                        rpc_url = args.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    "--format" => {
+                        receipt_format = args.get(i + 1).cloned().unwrap_or_default().to_lowercase();
+                        i += 2;
+                    }
+                    "--out" => {
+                        out_path = args.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--agreement-signature" => {
+                        agreement_signature_path = args.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--bundle-signature" => {
+                        bundle_signature_path = args.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--json" => { receipt_format = String::from("json"); i += 1; }
+                    other => {
+                        eprintln!("Unknown argument {}", other);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if receipt_format != "json" && receipt_format != "text" && receipt_format != "html" {
+                eprintln!("unsupported --format {}; expected text, html, or json", receipt_format);
+                std::process::exit(1);
+            }
+            let detached_agreement_signature = agreement_signature_path
+                .as_deref()
+                .map(|v| load_signature_from_path(Path::new(v)))
+                .transpose()
+                .unwrap_or_else(|e| {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                });
+            let detached_bundle_signature = bundle_signature_path
+                .as_deref()
+                .map(|v| load_signature_from_path(Path::new(v)))
+                .transpose()
+                .unwrap_or_else(|e| {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                });
+            let base = rpc_url.trim_end_matches('/');
+            let client = match rpc_client(base) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let mut audit = match fetch_agreement_audit(&client, base, &resolved) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+            let detached_agreement_signatures =
+                detached_agreement_signature.into_iter().collect::<Vec<_>>();
+            let detached_bundle_signatures =
+                detached_bundle_signature.into_iter().collect::<Vec<_>>();
+            attach_authenticity_to_audit(
+                &mut audit,
+                &resolved,
+                &detached_agreement_signatures,
+                &detached_bundle_signatures,
+            );
+            let statement = build_agreement_statement(&audit);
+            let rendered = match receipt_format.as_str() {
+                "html" => render_agreement_receipt_html(&statement),
+                "json" => serde_json::to_string_pretty(
+                    &serde_json::to_value(&statement).unwrap()
+                ).unwrap_or_default(),
+                _ => render_agreement_receipt_text(&statement),
+            };
+            if let Some(path) = out_path {
+                if let Err(e) = save_text_output(Some(&path), &rendered) {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+                if receipt_format != "html" {
+                    println!("{}", rendered);
+                }
+                println!("exported_to {}", path);
+            } else {
+                println!("{}", rendered);
+            }
+        }
+
         "agreement-verify-artifacts" => {
             let mut agreement_path = None::<String>;
             let mut bundle_path = None::<String>;
