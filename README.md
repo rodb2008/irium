@@ -70,7 +70,7 @@ Website https://iriumlabs.org
 
 Explorer https://www.iriumlabs.org/explorer
 
-Mining Pool stratum+tcp://pool.iriumlabs.org:3333
+Mining Pool pool.iriumlabs.org (3333 ASIC, 3335 CPU/GPU)
 
 Bitcointalk ANN https://bitcointalk.org/index.php?topic=5572239.0
 
@@ -165,18 +165,24 @@ Mining will begin once the node is synced.
 
 # Mining With a Pool (Optional)
 
-You can also mine using a public Stratum pool.
+You can also mine using the public Irium Stratum pool. Use only the public hostname; backend server IPs are not published.
 
-Pool URL:
+ASIC / modern firmware:
 
 ```
 stratum+tcp://pool.iriumlabs.org:3333
 ```
 
-Example CPU miner:
+CPU/GPU third-party software miners:
+
+```
+stratum+tcp://pool.iriumlabs.org:3335
+```
+
+Example CPU/GPU miner:
 
 ```bash
-cpuminer-opt -a sha256d -o stratum+tcp://pool.iriumlabs.org:3333 -u YOUR_ADDRESS.worker1 -p x
+cpuminer-opt -a sha256d -o stratum+tcp://pool.iriumlabs.org:3335 -u YOUR_ADDRESS.worker1 -p x
 ```
 
 Worker format:
@@ -187,6 +193,8 @@ IRM_ADDRESS.worker_name
 
 Pool mining is optional.
 You can always mine directly using the **official Irium miner**.
+
+More details: [`docs/POOL_STRATUM.md`](docs/POOL_STRATUM.md).
 
 ---
 
