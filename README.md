@@ -179,11 +179,15 @@ CPU/GPU third-party software miners:
 stratum+tcp://pool.iriumlabs.org:3335
 ```
 
-Example CPU/GPU miner:
+Example Windows CPU miner with cpuminer-opt:
 
 ```bash
-cpuminer-opt -a sha256d -o stratum+tcp://pool.iriumlabs.org:3335 -u YOUR_ADDRESS.worker1 -p x
+cpuminer-<your-cpu-build>.exe -a sha256d -o stratum+tcp://pool.iriumlabs.org:3335 -u YOUR_ADDRESS.worker1 -p x -t 4
 ```
+
+cpuminer-opt Windows binaries are named by CPU architecture, for example `cpuminer-avx2.exe`, `cpuminer-avx2-sha-vaes.exe`, or `cpuminer-sse2.exe`. Open the extracted folder, run `dir *.exe`, then replace `cpuminer-<your-cpu-build>.exe` with the executable you actually have.
+
+GPU miners should use a SHA-256d-capable Stratum client and the same pool URL on port `3335`.
 
 Worker format:
 

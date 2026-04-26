@@ -93,15 +93,19 @@ How to start on each OS:
 - Windows software miner: download SHA-256d miner binaries from:
   - `https://github.com/JayDDee/cpuminer-opt/releases`
   - Run:
-```bash
-minerd.exe -a sha256d -o stratum+tcp://pool.iriumlabs.org:3335 -u YOUR_IRIUM_WALLET_ADDRESS.worker1 -p x
+```powershell
+dir *.exe
+.\cpuminer-<your-cpu-build>.exe -a sha256d -o stratum+tcp://pool.iriumlabs.org:3335 -u YOUR_IRIUM_WALLET_ADDRESS.worker1 -p x -t 4
 ```
+  - Replace `cpuminer-<your-cpu-build>.exe` with the file you actually have, for example `cpuminer-avx2.exe`, `cpuminer-avx2-sha-vaes.exe`, or `cpuminer-sse2.exe`.
+  - If the fastest build crashes or reports an illegal instruction, try the safer `cpuminer-sse2.exe` build.
 - Linux/macOS software miner: build/install from:
   - `https://github.com/JayDDee/cpuminer-opt`
   - Run:
 ```bash
-./minerd -a sha256d -o stratum+tcp://pool.iriumlabs.org:3335 -u YOUR_IRIUM_WALLET_ADDRESS.worker1 -p x
+./cpuminer -a sha256d -o stratum+tcp://pool.iriumlabs.org:3335 -u YOUR_IRIUM_WALLET_ADDRESS.worker1 -p x -t 4
 ```
+- cpuminer-opt is a CPU miner. GPU miners need a separate SHA-256d-capable Stratum client, also pointed at `stratum+tcp://pool.iriumlabs.org:3335`.
 
 Using `irium-miner` in Stratum mode:
 ```bash
