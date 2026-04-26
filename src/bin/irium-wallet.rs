@@ -2129,6 +2129,13 @@ fn usage() {
     eprintln!(
         "  irium-wallet verify-agreement-link <agreement_hash> <tx_hex> [--rpc <url>] [--json]"
     );
+    eprintln!("  irium-wallet proof-sign --agreement <hash> --message <text> --key <hex|wif> [--proof-type <type>] [--attested-by <addr>] [--timestamp <unix>] [--out <file>] [--json]");
+    eprintln!("  irium-wallet proof-submit-json --file <proof.json> | --raw <json> [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet otc-create --seller <addr> --buyer <addr> --amount <irm> --asset <text> --payment-method <text> --timeout <height> [--agreement-id <id>] [--out <file>] [--json]");
+    eprintln!("  irium-wallet otc-attest --agreement <hash|id|path> --message <text> --address <addr> [--proof-type <type>] [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet otc-settle --agreement <hash|id|path> [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet otc-status --agreement <hash|id|path> [--rpc <url>]");
+    eprintln!("  irium-wallet flow-otc-demo");
 }
 
 fn node_rpc_base() -> String {
@@ -5557,6 +5564,9 @@ fn render_proof_submit_summary(resp: &SubmitProofRpcResponse) -> String {
     if !resp.status.is_empty() {
         lines.push(format!("status {}", resp.status));
     }
+    if resp.accepted || resp.duplicate {
+        lines.push("next_step  run agreement-policy-evaluate to check settlement eligibility".to_string());
+    }
     lines.join("\n")
 }
 
@@ -6968,6 +6978,61 @@ fn handle_otc_status(args: &[String]) -> Result<(), String> {
         eval_resp.release_eligible || eval_resp.refund_eligible
     );
     Ok(())
+}
+
+fn handle_flow_otc_demo() {
+    println!("=== Irium OTC Flow Demo ===");
+    println!();
+    println!("This demo shows the complete OTC settlement flow.");
+    println!("Replace placeholder values with real ones when running live.");
+    println!();
+
+    println!("--- Step 1: Create the OTC agreement ---");
+    println!("  irium-wallet otc-create \\");
+    println!("    --seller  Q<seller_address> \\");
+    println!("    --buyer   Q<buyer_address> \\");
+    println!("    --amount  1.0 \\");
+    println!("    --asset   BTC \\");
+    println!("    --payment-method bank_transfer \\");
+    println!("    --timeout 1000");
+    println!();
+    println!("  Output: agreement_id, agreement_hash, saved_path");
+    println!("  next_step: run otc-attest once the buyer confirms payment");
+    println!();
+
+    println!("--- Step 2: Buyer confirms payment (attestation) ---");
+    println!("  irium-wallet otc-attest \\");
+    println!("    --agreement <agreement_hash> \\");
+    println!("    --message   \"Payment of 1 BTC confirmed\" \\");
+    println!("    --address   Q<attestor_address>");
+    println!();
+    println!("  Output: proof submitted, policy evaluation result");
+    println!("  next_step: run otc-settle to build the release transaction");
+    println!();
+
+    println!("--- Step 3: Build and check settlement ---");
+    println!("  irium-wallet otc-settle --agreement <agreement_hash>");
+    println!();
+    println!("  Output: policy evaluation + settlement actions");
+    println!("  next_step: run agreement-release-build then broadcast the tx");
+    println!();
+
+    println!("--- Step 4: Monitor full agreement status ---");
+    println!("  irium-wallet otc-status --agreement <agreement_hash>");
+    println!();
+    println!("  Output: agreement, policy, proofs, evaluation, settlement, deadline");
+    println!();
+
+    println!("--- Alternative: Remote attestor (no local key) ---");
+    println!("  # Sign proof offline:");
+    println!("  irium-wallet proof-sign \\");
+    println!("    --agreement <hash> --message \"confirmed\" --key <hex_privkey>");
+    println!();
+    println!("  # Submit the signed proof JSON to the node:");
+    println!("  irium-wallet proof-submit-json --file proof.json");
+    println!();
+
+    println!("For help on any command, run it with no arguments.");
 }
 
 // ============================================================
@@ -18841,6 +18906,9 @@ fn main() {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
+        }
+        "flow-otc-demo" => {
+            handle_flow_otc_demo();
         }
         _ => {
             usage();
