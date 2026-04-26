@@ -2135,6 +2135,10 @@ fn usage() {
     eprintln!("  irium-wallet otc-attest --agreement <hash|id|path> --message <text> --address <addr> [--proof-type <type>] [--rpc <url>] [--json]");
     eprintln!("  irium-wallet otc-settle --agreement <hash|id|path> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet otc-status --agreement <hash|id|path> [--rpc <url>]");
+    eprintln!("  irium-wallet offer-create --seller <addr> --amount <irm> --payment-method <text> --timeout <height> [--price-note <text>] [--payment-instructions <text>] [--offer-id <id>] [--json]");
+    eprintln!("  irium-wallet offer-list [--status open|taken|settled] [--json]");
+    eprintln!("  irium-wallet offer-show --offer <offer_id> [--json]");
+    eprintln!("  irium-wallet offer-take --offer <offer_id> --buyer <addr> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet flow-otc-demo");
 }
 
@@ -6980,6 +6984,369 @@ fn handle_otc_status(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// ============================================================
+// IRM Offer flow (offer-create, offer-list, offer-show, offer-take)
+// ============================================================
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct IrmOffer {
+    offer_id: String,
+    seller_address: String,
+    amount_irm: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    price_note: Option<String>,
+    payment_method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payment_instructions: Option<String>,
+    timeout_height: u64,
+    created_at: u64,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agreement_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agreement_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    buyer_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    taken_at: Option<u64>,
+}
+
+fn offers_dir() -> PathBuf {
+    if let Ok(path) = env::var("IRIUM_OFFERS_DIR") {
+        return PathBuf::from(path);
+    }
+    irium_data_dir().join("offers")
+}
+
+fn save_offer(offer: &IrmOffer) -> Result<PathBuf, String> {
+    let dir = offers_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create offers dir: {e}"))?;
+    let path = dir.join(format!("offer-{}.json", offer.offer_id));
+    let json = serde_json::to_string_pretty(offer)
+        .map_err(|e| format!("serialize offer: {e}"))?;
+    std::fs::write(&path, &json).map_err(|e| format!("write offer: {e}"))?;
+    Ok(path)
+}
+
+fn load_offer(offer_id: &str) -> Result<IrmOffer, String> {
+    let dir = offers_dir();
+    let path = dir.join(format!("offer-{}.json", offer_id));
+    if !path.exists() {
+        return Err(format!("offer not found: {}", offer_id));
+    }
+    let data = std::fs::read_to_string(&path).map_err(|e| format!("read offer: {e}"))?;
+    serde_json::from_str(&data).map_err(|e| format!("parse offer: {e}"))
+}
+
+fn load_all_offers() -> Vec<IrmOffer> {
+    let dir = offers_dir();
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut offers = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                if let Ok(data) = std::fs::read_to_string(&path) {
+                    if let Ok(offer) = serde_json::from_str::<IrmOffer>(&data) {
+                        offers.push(offer);
+                    }
+                }
+            }
+        }
+    }
+    offers.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    offers
+}
+
+fn render_offer_summary(offer: &IrmOffer) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("offer_id         {}", offer.offer_id));
+    lines.push(format!("status           {}", offer.status));
+    lines.push(format!("seller           {}", offer.seller_address));
+    lines.push(format!("amount_irm       {} IRM", format_irm(offer.amount_irm)));
+    lines.push(format!("payment_method   {}", offer.payment_method));
+    if let Some(ref pn) = offer.price_note {
+        lines.push(format!("price_note       {}", pn));
+    }
+    if let Some(ref pi) = offer.payment_instructions {
+        lines.push(format!("payment_instructions  {}", pi));
+    }
+    lines.push(format!("timeout_height   {}", offer.timeout_height));
+    lines.push(format!("created_at       {}", offer.created_at));
+    if let Some(ref aid) = offer.agreement_id {
+        lines.push(format!("agreement_id     {}", aid));
+    }
+    if let Some(ref ah) = offer.agreement_hash {
+        lines.push(format!("agreement_hash   {}", ah));
+    }
+    if let Some(ref ba) = offer.buyer_address {
+        lines.push(format!("buyer_address    {}", ba));
+    }
+    if let Some(taken) = offer.taken_at {
+        lines.push(format!("taken_at         {}", taken));
+    }
+    lines.join("\n")
+}
+
+fn handle_offer_create(args: &[String]) -> Result<(), String> {
+    let mut seller: Option<String> = None;
+    let mut amount: Option<u64> = None;
+    let mut payment_method: Option<String> = None;
+    let mut timeout: Option<u64> = None;
+    let mut price_note: Option<String> = None;
+    let mut payment_instructions: Option<String> = None;
+    let mut offer_id: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seller"               => { seller               = Some(parse_required_string_flag(args, &mut i, "--seller")?); }
+            "--amount"               => { amount               = Some(parse_irm(&parse_required_string_flag(args, &mut i, "--amount")?)?); }
+            "--payment-method"       => { payment_method       = Some(parse_required_string_flag(args, &mut i, "--payment-method")?); }
+            "--timeout"              => {
+                timeout = Some(parse_required_string_flag(args, &mut i, "--timeout")?
+                    .parse::<u64>()
+                    .map_err(|_| "--timeout must be a non-negative integer".to_string())?);
+            }
+            "--price-note"           => { price_note           = Some(parse_required_string_flag(args, &mut i, "--price-note")?); }
+            "--payment-instructions" => { payment_instructions = Some(parse_required_string_flag(args, &mut i, "--payment-instructions")?); }
+            "--offer-id"             => { offer_id             = Some(parse_required_string_flag(args, &mut i, "--offer-id")?); }
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let seller_addr = seller.ok_or_else(|| "--seller is required".to_string())?;
+    let amount_val  = amount.ok_or_else(|| "--amount is required".to_string())?;
+    let pm_val      = payment_method.ok_or_else(|| "--payment-method is required".to_string())?;
+    let timeout_val = timeout.ok_or_else(|| "--timeout is required".to_string())?;
+
+    if base58_p2pkh_to_hash(&seller_addr).is_none() {
+        return Err(format!("--seller must be a valid Irium address: {}", seller_addr));
+    }
+
+    let now = now_unix();
+    let id = offer_id.unwrap_or_else(|| format!("offer-{}", now));
+
+    let offer = IrmOffer {
+        offer_id: id.clone(),
+        seller_address: seller_addr,
+        amount_irm: amount_val,
+        price_note,
+        payment_method: pm_val,
+        payment_instructions,
+        timeout_height: timeout_val,
+        created_at: now,
+        status: "open".to_string(),
+        agreement_id: None,
+        agreement_hash: None,
+        buyer_address: None,
+        taken_at: None,
+    };
+
+    let path = save_offer(&offer)?;
+
+    if json_mode {
+        let mut obj = serde_json::to_value(&offer).map_err(|e| format!("serialize: {e}"))?;
+        obj["saved_path"] = serde_json::Value::String(path.display().to_string());
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+    } else {
+        println!("{}", render_offer_summary(&offer));
+        println!();
+        println!("saved_path      {}", path.display());
+        println!();
+        println!("next_step  share this offer then run: irium-wallet offer-take --offer {} --buyer <buyer_address>", id);
+    }
+    Ok(())
+}
+
+fn handle_offer_list(args: &[String]) -> Result<(), String> {
+    let mut json_mode = false;
+    let mut status_filter: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json"   => { json_mode = true; i += 1; }
+            "--status" => { status_filter = Some(parse_required_string_flag(args, &mut i, "--status")?); }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let mut offers = load_all_offers();
+    if let Some(ref sf) = status_filter {
+        offers.retain(|o| &o.status == sf);
+    }
+    if json_mode {
+        let list: Vec<serde_json::Value> = offers.iter()
+            .map(|o| serde_json::to_value(o).unwrap_or_default())
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "count": list.len(),
+            "offers": list,
+        })).unwrap());
+    } else {
+        println!("count {}", offers.len());
+        if offers.is_empty() {
+            println!("(no offers found)");
+        }
+        for offer in &offers {
+            println!();
+            println!("offer_id       {}", offer.offer_id);
+            println!("status         {}", offer.status);
+            println!("seller         {}", offer.seller_address);
+            println!("amount_irm     {} IRM", format_irm(offer.amount_irm));
+            println!("payment_method {}", offer.payment_method);
+            if let Some(ref pn) = offer.price_note {
+                println!("price_note     {}", pn);
+            }
+            println!("timeout_height {}", offer.timeout_height);
+        }
+    }
+    Ok(())
+}
+
+fn handle_offer_show(args: &[String]) -> Result<(), String> {
+    let mut offer_ref: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--offer" => { offer_ref = Some(parse_required_string_flag(args, &mut i, "--offer")?); }
+            "--json"  => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let id = offer_ref.ok_or_else(|| "--offer is required".to_string())?;
+    let offer = load_offer(&id)?;
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&serde_json::to_value(&offer).unwrap()).unwrap());
+    } else {
+        println!("{}", render_offer_summary(&offer));
+        println!();
+        if offer.status == "open" {
+            println!("next_step  irium-wallet offer-take --offer {} --buyer <your_address>", offer.offer_id);
+        } else if offer.status == "taken" {
+            if let Some(ref ah) = offer.agreement_hash {
+                println!("next_step  irium-wallet otc-settle --agreement {}", ah);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_offer_take(args: &[String]) -> Result<(), String> {
+    let mut offer_ref: Option<String> = None;
+    let mut buyer: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--offer"  => { offer_ref = Some(parse_required_string_flag(args, &mut i, "--offer")?); }
+            "--buyer"  => { buyer     = Some(parse_required_string_flag(args, &mut i, "--buyer")?); }
+            "--rpc"    => { rpc_url   = parse_required_string_flag(args, &mut i, "--rpc")?; }
+            "--json"   => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let offer_id   = offer_ref.ok_or_else(|| "--offer is required".to_string())?;
+    let buyer_addr = buyer.ok_or_else(|| "--buyer is required".to_string())?;
+
+    let mut offer = load_offer(&offer_id)?;
+    if offer.status != "open" {
+        return Err(format!("offer {} is not open (status: {})", offer_id, offer.status));
+    }
+
+    if base58_p2pkh_to_hash(&buyer_addr).is_none() {
+        return Err(format!("--buyer must be a valid Irium address: {}", buyer_addr));
+    }
+
+    let now = now_unix();
+    let agreement_id = format!("offer-{}-{}", offer_id, now);
+    let seller_party = parse_party_spec(&format!("seller|Seller|{}|seller", offer.seller_address))?;
+    let buyer_party  = parse_party_spec(&format!("buyer|Buyer|{}|buyer", buyer_addr))?;
+
+    let secret_hash = hex::encode(Sha256::digest(
+        format!("offer-secret-{}-{}", agreement_id, now).as_bytes(),
+    ));
+    let doc_hash = hex::encode(Sha256::digest(
+        format!("offer-doc-{}-{}", agreement_id, now).as_bytes(),
+    ));
+
+    let agreement = build_otc_agreement(
+        agreement_id.clone(),
+        now,
+        buyer_party,
+        seller_party,
+        offer.amount_irm,
+        "IRM".to_string(),
+        offer.payment_method.clone(),
+        offer.timeout_height,
+        secret_hash,
+        doc_hash,
+        None,
+        None,
+    )?;
+
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let saved_path = save_agreement_to_store_at(&imported_agreements_dir(), &agreement)?;
+
+    offer.status         = "taken".to_string();
+    offer.agreement_id   = Some(agreement_id.clone());
+    offer.agreement_hash = Some(agreement_hash.clone());
+    offer.buyer_address  = Some(buyer_addr.clone());
+    offer.taken_at       = Some(now);
+    save_offer(&offer)?;
+
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "offer_id":       offer_id,
+            "agreement_id":   agreement_id,
+            "agreement_hash": agreement_hash,
+            "saved_path":     saved_path.display().to_string(),
+        })).unwrap());
+        return Ok(());
+    }
+
+    println!("=== Offer Taken ===");
+    println!();
+    println!("offer_id        {}", offer_id);
+    println!("agreement_id    {}", agreement_id);
+    println!("agreement_hash  {}", agreement_hash);
+    println!("seller          {}", offer.seller_address);
+    println!("buyer           {}", buyer_addr);
+    println!("amount_irm      {} IRM", format_irm(offer.amount_irm));
+    println!("saved_path      {}", saved_path.display());
+    println!();
+    println!("=== Seller instructions ===");
+    println!("1. Build and set OTC policy:");
+    println!("   irium-wallet policy-build-otc --policy-id pol-{} --agreement-hash {} --attestor <id>:<pubkey_or_addr> --release-proof-type otc_release", offer_id, agreement_hash);
+    println!("   irium-wallet agreement-policy-set --policy <policy.json> --rpc {}", rpc_url);
+    println!("2. Fund the escrow (lock IRM):");
+    println!("   irium-wallet agreement-fund {} --rpc {}", agreement_hash, rpc_url);
+    println!();
+    println!("=== Buyer instructions ===");
+    println!("payment_method  {}", offer.payment_method);
+    if let Some(ref pi) = offer.payment_instructions {
+        println!("instructions    {}", pi);
+    }
+    if let Some(ref pn) = offer.price_note {
+        println!("price_note      {}", pn);
+    }
+    println!("amount_irm      {} IRM to receive", format_irm(offer.amount_irm));
+    println!();
+    println!("After making external payment, confirm with an attestor:");
+    println!("  irium-wallet otc-attest --agreement {} --message \"payment confirmed\" --address <attestor_address> --rpc {}", agreement_hash, rpc_url);
+    println!();
+    println!("Or sign proof offline and submit separately:");
+    println!("  irium-wallet proof-sign --agreement {} --message \"payment confirmed\" --key <privkey>", agreement_hash);
+    println!("  irium-wallet proof-submit-json --file proof.json --rpc {}", rpc_url);
+    println!();
+    println!("next_step  seller: set policy and fund escrow; buyer: make external payment then submit proof");
+    Ok(())
+}
+
+
 fn handle_flow_otc_demo() {
     println!("=== Irium OTC Flow Demo ===");
     println!();
@@ -7252,6 +7619,19 @@ fn all_templates() -> Vec<TemplateSpec> {
             required_fields: &["--payer", "--payee", "--amount", "--timeout"],
             optional_fields: &[
                 ("--milestone-title", "Milestone 1"),
+                ("--agreement-id", "auto-generated"),
+                ("--json", "flag"),
+                ("--out", "write to file"),
+            ],
+        },
+        TemplateSpec {
+            template_id: "irm-sell-offer",
+            template_type: "otc_settlement",
+            description: "Seller locks IRM; buyer pays externally; release via proof/attestor",
+            required_fields: &["--seller", "--buyer", "--amount", "--timeout"],
+            optional_fields: &[
+                ("--payment-method", "off-chain"),
+                ("--price-note", "optional price metadata"),
                 ("--agreement-id", "auto-generated"),
                 ("--json", "flag"),
                 ("--out", "write to file"),
@@ -7533,6 +7913,33 @@ fn handle_agreement_create_from_template(args: &[String]) -> Result<(), String> 
                 payee_party,
                 vec![milestone],
                 timeout_val,
+                doc_hash,
+                None,
+                None,
+            )?
+        }
+        "irm-sell-offer" => {
+            let seller_addr =
+                seller.ok_or_else(|| "--seller is required for irm-sell-offer".to_string())?;
+            let buyer_addr =
+                buyer.ok_or_else(|| "--buyer is required for irm-sell-offer".to_string())?;
+            let amount_val = amount.ok_or_else(|| "--amount is required".to_string())?;
+            let timeout_val = timeout.ok_or_else(|| "--timeout is required".to_string())?;
+            let pm_val = payment_method.unwrap_or_else(|| "off-chain".to_string());
+            let seller_party =
+                parse_party_spec(&format!("seller|Seller|{}|seller", seller_addr))?;
+            let buyer_party =
+                parse_party_spec(&format!("buyer|Buyer|{}|buyer", buyer_addr))?;
+            build_otc_agreement(
+                id.clone(),
+                now,
+                buyer_party,
+                seller_party,
+                amount_val,
+                "IRM".to_string(),
+                pm_val,
+                timeout_val,
+                secret_hash,
                 doc_hash,
                 None,
                 None,
@@ -13474,9 +13881,9 @@ found true"
     }
 
     #[test]
-    fn template_list_returns_three_templates() {
+    fn template_list_returns_four_templates() {
         let templates = all_templates();
-        assert_eq!(templates.len(), 3);
+        assert_eq!(templates.len(), 4);
         let ids: Vec<&str> = templates.iter().map(|t| t.template_id).collect();
         assert!(ids.contains(&"otc-basic"));
         assert!(ids.contains(&"deposit-protection"));
@@ -14197,6 +14604,307 @@ found true"
         let result = handle_otc_attest(&args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("--address"));
+    }
+
+    // ================================================================
+    // Offer flow tests
+    // ================================================================
+
+    fn temp_offers_dir(tag: &str) -> PathBuf {
+        let mut dir = env::temp_dir();
+        dir.push(format!("irium-offers-{}-{}", tag, now_unix()));
+        dir
+    }
+
+    #[test]
+    fn offer_create_missing_seller_returns_error() {
+        let result = handle_offer_create(&[
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--payment-method".to_string(),
+            "bank-transfer".to_string(),
+            "--timeout".to_string(),
+            "1000".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--seller"));
+    }
+
+    #[test]
+    fn offer_create_missing_amount_returns_error() {
+        let result = handle_offer_create(&[
+            "--seller".to_string(),
+            "Qseller1111111111111111111111111111111".to_string(),
+            "--payment-method".to_string(),
+            "bank-transfer".to_string(),
+            "--timeout".to_string(),
+            "1000".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--amount"));
+    }
+
+    #[test]
+    fn offer_create_missing_payment_method_returns_error() {
+        let result = handle_offer_create(&[
+            "--seller".to_string(),
+            "Qseller1111111111111111111111111111111".to_string(),
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--timeout".to_string(),
+            "1000".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--payment-method"));
+    }
+
+    #[test]
+    fn offer_create_missing_timeout_returns_error() {
+        let result = handle_offer_create(&[
+            "--seller".to_string(),
+            "Qseller1111111111111111111111111111111".to_string(),
+            "--amount".to_string(),
+            "1.0".to_string(),
+            "--payment-method".to_string(),
+            "bank-transfer".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--timeout"));
+    }
+
+    #[test]
+    fn offer_create_unknown_flag_returns_error() {
+        let result = handle_offer_create(&["--bogus".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn offer_create_and_save_round_trip() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("create-rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let result = handle_offer_create(&[
+            "--seller".to_string(),
+            "Qseller1111111111111111111111111111111".to_string(),
+            "--amount".to_string(),
+            "2.5".to_string(),
+            "--payment-method".to_string(),
+            "bank-transfer".to_string(),
+            "--timeout".to_string(),
+            "1000".to_string(),
+            "--offer-id".to_string(),
+            "test-offer-rt".to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                assert!(
+                    e.contains("valid Irium address"),
+                    "unexpected error: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offer_list_empty_store_returns_zero() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("list-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let result = handle_offer_list(&[]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_list_json_mode_succeeds() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("list-json");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let result = handle_offer_list(&["--json".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_show_missing_offer_id_returns_error() {
+        let result = handle_offer_show(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--offer"));
+    }
+
+    #[test]
+    fn offer_show_unknown_offer_returns_error() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("show-unknown");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let result = handle_offer_show(&["--offer".to_string(), "nonexistent".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn offer_take_missing_offer_returns_error() {
+        let result = handle_offer_take(&["--buyer".to_string(), "Qbuyer1111111111111111111111111111111".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--offer"));
+    }
+
+    #[test]
+    fn offer_take_missing_buyer_returns_error() {
+        let result = handle_offer_take(&["--offer".to_string(), "some-offer".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--buyer"));
+    }
+
+    #[test]
+    fn offer_take_unknown_flag_returns_error() {
+        let result = handle_offer_take(&["--bogus".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn offer_list_unknown_flag_returns_error() {
+        let result = handle_offer_list(&["--bogus".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn render_offer_summary_contains_key_fields() {
+        let offer = IrmOffer {
+            offer_id: "test-offer-1".to_string(),
+            seller_address: "QsellerTest".to_string(),
+            amount_irm: 250_000_000,
+            price_note: Some("0.001 BTC per IRM".to_string()),
+            payment_method: "bank-transfer".to_string(),
+            payment_instructions: None,
+            timeout_height: 1000,
+            created_at: 1_000_000,
+            status: "open".to_string(),
+            agreement_id: None,
+            agreement_hash: None,
+            buyer_address: None,
+            taken_at: None,
+        };
+        let summary = render_offer_summary(&offer);
+        assert!(summary.contains("test-offer-1"), "must contain offer_id");
+        assert!(summary.contains("open"), "must contain status");
+        assert!(summary.contains("2.5"), "must contain formatted amount (2.5 IRM)");
+        assert!(summary.contains("bank-transfer"), "must contain payment_method");
+        assert!(summary.contains("0.001 BTC per IRM"), "must contain price_note");
+        assert!(summary.contains("1000"), "must contain timeout_height");
+    }
+
+    #[test]
+    fn offer_save_and_load_round_trip() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("save-load");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let offer = IrmOffer {
+            offer_id: "rt-offer".to_string(),
+            seller_address: "QsellerTest".to_string(),
+            amount_irm: 100_000_000,
+            price_note: None,
+            payment_method: "lightning".to_string(),
+            payment_instructions: Some("pay to lnbc...".to_string()),
+            timeout_height: 500,
+            created_at: 999,
+            status: "open".to_string(),
+            agreement_id: None,
+            agreement_hash: None,
+            buyer_address: None,
+            taken_at: None,
+        };
+        let path = save_offer(&offer).unwrap();
+        assert!(path.exists(), "offer file must exist after save");
+        let loaded = load_offer("rt-offer").unwrap();
+        assert_eq!(loaded.offer_id, "rt-offer");
+        assert_eq!(loaded.amount_irm, 100_000_000);
+        assert_eq!(loaded.payment_method, "lightning");
+        assert_eq!(loaded.payment_instructions.as_deref(), Some("pay to lnbc..."));
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_all_offers_sorted_newest_first() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("sort");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        for (id, ts) in [("older", 100u64), ("newer", 200u64)] {
+            let o = IrmOffer {
+                offer_id: id.to_string(),
+                seller_address: "Q".to_string(),
+                amount_irm: 1,
+                price_note: None,
+                payment_method: "test".to_string(),
+                payment_instructions: None,
+                timeout_height: 10,
+                created_at: ts,
+                status: "open".to_string(),
+                agreement_id: None,
+                agreement_hash: None,
+                buyer_address: None,
+                taken_at: None,
+            };
+            save_offer(&o).unwrap();
+        }
+        let offers = load_all_offers();
+        assert_eq!(offers.len(), 2);
+        assert_eq!(offers[0].offer_id, "newer", "most recent offer must be first");
+        assert_eq!(offers[1].offer_id, "older");
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn offer_take_not_open_returns_error() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("take-not-open");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let offer = IrmOffer {
+            offer_id: "closed-offer".to_string(),
+            seller_address: "QsellerTest".to_string(),
+            amount_irm: 100_000_000,
+            price_note: None,
+            payment_method: "bank-transfer".to_string(),
+            payment_instructions: None,
+            timeout_height: 1000,
+            created_at: 1,
+            status: "taken".to_string(),
+            agreement_id: Some("existing".to_string()),
+            agreement_hash: Some("aa".repeat(32)),
+            buyer_address: Some("Qbuyer1111111111111111111111111111111".to_string()),
+            taken_at: Some(2),
+        };
+        save_offer(&offer).unwrap();
+        let result = handle_offer_take(&[
+            "--offer".to_string(),
+            "closed-offer".to_string(),
+            "--buyer".to_string(),
+            "Qbuyer1111111111111111111111111111111".to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not open"));
     }
 
     #[test]
@@ -18903,6 +19611,30 @@ fn main() {
         }
         "otc-status" => {
             if let Err(e) = handle_otc_status(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "offer-create" => {
+            if let Err(e) = handle_offer_create(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "offer-list" => {
+            if let Err(e) = handle_offer_list(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "offer-show" => {
+            if let Err(e) = handle_offer_show(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "offer-take" => {
+            if let Err(e) = handle_offer_take(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
