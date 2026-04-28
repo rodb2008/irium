@@ -68,27 +68,18 @@ use std::{env, fs};
 // compression function directly.
 
 const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
-    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
 const SHA256_H0: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
 fn sha256_compress(state: &mut [u32; 8], msg: &[u32; 16]) {
@@ -426,7 +417,10 @@ struct SubmitBlockRequest {
 }
 
 fn fetch_template(client: &Client) -> Result<BlockTemplate, String> {
-    let url = format!("{}/rpc/getblocktemplate", node_rpc_base().trim_end_matches('/'));
+    let url = format!(
+        "{}/rpc/getblocktemplate",
+        node_rpc_base().trim_end_matches('/')
+    );
     let mut req = client.get(&url);
     if let Some(token) = rpc_token() {
         req = req.bearer_auth(token);
@@ -435,7 +429,8 @@ fn fetch_template(client: &Client) -> Result<BlockTemplate, String> {
     if !resp.status().is_success() {
         return Err(format!("fetch template: HTTP {}", resp.status()));
     }
-    resp.json::<BlockTemplate>().map_err(|e| format!("parse template: {e}"))
+    resp.json::<BlockTemplate>()
+        .map_err(|e| format!("parse template: {e}"))
 }
 
 fn submit_block(client: &Client, height: u64, block: &Block) -> Result<(), String> {
@@ -620,13 +615,13 @@ fn target_to_words(target: Target) -> [u32; 8] {
 // Buffers and kernel are allocated once and reused across batches to eliminate
 // per-batch GPU memory allocation overhead (was causing ~11% idle time).
 struct GpuMiner {
-    queue:       Queue,
-    kernel:      Kernel,
+    queue: Queue,
+    kernel: Kernel,
     midstate_buf: Buffer<u32>,
-    tail_buf:    Buffer<u32>,
-    target_buf:  Buffer<u32>,
-    result_buf:  Buffer<u32>,
-    batch_size:  usize,
+    tail_buf: Buffer<u32>,
+    target_buf: Buffer<u32>,
+    result_buf: Buffer<u32>,
+    batch_size: usize,
 }
 
 // GpuMiner owns its own OpenCL context/queue/kernel — no shared mutable state between
@@ -639,15 +634,12 @@ unsafe impl Send for GpuMiner {}
 impl GpuMiner {
     fn new(device_idx: usize, batch_size: usize) -> Result<Self, String> {
         let platform = Platform::default();
-        let devices =
-            Device::list_all(platform).map_err(|e| format!("OpenCL device list: {e}"))?;
+        let devices = Device::list_all(platform).map_err(|e| format!("OpenCL device list: {e}"))?;
         if devices.is_empty() {
-            return Err(
-                "No OpenCL devices found.\n\
+            return Err("No OpenCL devices found.\n\
                  Install your GPU driver and the ICD loader:\n\
                  apt install ocl-icd-opencl-dev"
-                    .into(),
-            );
+                .into());
         }
         let device = *devices.get(device_idx).ok_or_else(|| {
             format!(
@@ -666,8 +658,7 @@ impl GpuMiner {
             .devices(device)
             .build()
             .map_err(|e| format!("OpenCL context: {e}"))?;
-        let queue = Queue::new(&context, device, None)
-            .map_err(|e| format!("OpenCL queue: {e}"))?;
+        let queue = Queue::new(&context, device, None).map_err(|e| format!("OpenCL queue: {e}"))?;
         let program = Program::builder()
             .src(KERNEL_SRC)
             .devices(device)
@@ -678,17 +669,29 @@ impl GpuMiner {
 
         // Allocate persistent buffers once
         let midstate_buf = Buffer::<u32>::builder()
-            .queue(queue.clone()).flags(flags::MEM_READ_WRITE).len(8)
-            .build().map_err(ocl_err)?;
+            .queue(queue.clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(8)
+            .build()
+            .map_err(ocl_err)?;
         let tail_buf = Buffer::<u32>::builder()
-            .queue(queue.clone()).flags(flags::MEM_READ_WRITE).len(3)
-            .build().map_err(ocl_err)?;
+            .queue(queue.clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(3)
+            .build()
+            .map_err(ocl_err)?;
         let target_buf = Buffer::<u32>::builder()
-            .queue(queue.clone()).flags(flags::MEM_READ_WRITE).len(8)
-            .build().map_err(ocl_err)?;
+            .queue(queue.clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(8)
+            .build()
+            .map_err(ocl_err)?;
         let result_buf = Buffer::<u32>::builder()
-            .queue(queue.clone()).flags(flags::MEM_READ_WRITE).len(2)
-            .build().map_err(ocl_err)?;
+            .queue(queue.clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(2)
+            .build()
+            .map_err(ocl_err)?;
 
         // Build kernel once, referencing the persistent buffers
         let kernel = Kernel::builder()
@@ -696,15 +699,24 @@ impl GpuMiner {
             .name("sha256d_mine")
             .queue(queue.clone())
             .global_work_size(batch_size)
-            .arg(&midstate_buf)   // arg 0
-            .arg(&tail_buf)       // arg 1
-            .arg(0u32)            // arg 2: nonce_base (updated each batch via set_arg)
-            .arg(&target_buf)     // arg 3
-            .arg(&result_buf)     // arg 4
-            .build().map_err(ocl_err)?;
+            .arg(&midstate_buf) // arg 0
+            .arg(&tail_buf) // arg 1
+            .arg(0u32) // arg 2: nonce_base (updated each batch via set_arg)
+            .arg(&target_buf) // arg 3
+            .arg(&result_buf) // arg 4
+            .build()
+            .map_err(ocl_err)?;
 
         println!("[GPU] Kernel compiled successfully.");
-        Ok(Self { queue, kernel, midstate_buf, tail_buf, target_buf, result_buf, batch_size })
+        Ok(Self {
+            queue,
+            kernel,
+            midstate_buf,
+            tail_buf,
+            target_buf,
+            result_buf,
+            batch_size,
+        })
     }
 
     /// Upload a new midstate + tail + target (call once per template).
@@ -715,7 +727,10 @@ impl GpuMiner {
         target: &[u32; 8],
     ) -> Result<(), String> {
         let e = |e: ocl::Error| e.to_string();
-        self.midstate_buf.write(midstate as &[u32]).enq().map_err(e)?;
+        self.midstate_buf
+            .write(midstate as &[u32])
+            .enq()
+            .map_err(e)?;
         self.tail_buf.write(tail as &[u32]).enq().map_err(e)?;
         self.target_buf.write(target as &[u32]).enq().map_err(e)?;
         Ok(())
@@ -723,7 +738,10 @@ impl GpuMiner {
 
     /// Upload an updated tail only (call when timestamp changes).
     fn update_tail(&mut self, tail: &[u32; 3]) -> Result<(), String> {
-        self.tail_buf.write(tail as &[u32]).enq().map_err(|e: ocl::Error| e.to_string())
+        self.tail_buf
+            .write(tail as &[u32])
+            .enq()
+            .map_err(|e: ocl::Error| e.to_string())
     }
 
     /// Test nonces [nonce_base, nonce_base + batch_size).
@@ -732,7 +750,10 @@ impl GpuMiner {
         let e = |e: ocl::Error| e.to_string();
 
         // Reset result flag (only 2 words — minimal write)
-        self.result_buf.write(&[0u32, 0u32] as &[u32]).enq().map_err(e)?;
+        self.result_buf
+            .write(&[0u32, 0u32] as &[u32])
+            .enq()
+            .map_err(e)?;
 
         // Update the nonce_base scalar arg in the already-built kernel
         self.kernel.set_arg(2, nonce_base).map_err(e)?;
@@ -740,13 +761,19 @@ impl GpuMiner {
         // Safety: the kernel was built from verified source, all buffer args are valid
         // and alive for the duration of this call, and queue.finish() below ensures the
         // GPU work completes before we read back results.
-        unsafe { self.kernel.enq().map_err(e)?; }
+        unsafe {
+            self.kernel.enq().map_err(e)?;
+        }
         self.queue.finish().map_err(e)?;
 
         let mut result = [0u32; 2];
         self.result_buf.read(&mut result[..]).enq().map_err(e)?;
 
-        Ok(if result[0] != 0 { Some(result[1]) } else { None })
+        Ok(if result[0] != 0 {
+            Some(result[1])
+        } else {
+            None
+        })
     }
 }
 
@@ -792,12 +819,10 @@ fn gpu_device_indices() -> Result<Vec<usize>, String> {
     let platform = Platform::default();
     let devices = Device::list_all(platform).map_err(|e| format!("OpenCL device list: {e}"))?;
     if devices.is_empty() {
-        return Err(
-            "No OpenCL devices found.\n\
+        return Err("No OpenCL devices found.\n\
              Install your GPU driver and the ICD loader:\n\
              apt install ocl-icd-opencl-dev"
-                .into(),
-        );
+            .into());
     }
     Ok((0..devices.len()).collect())
 }
@@ -805,7 +830,10 @@ fn gpu_device_indices() -> Result<Vec<usize>, String> {
 /// Initialise one GpuMiner per requested device.
 fn init_gpus(batch_size: usize) -> Result<Vec<GpuMiner>, String> {
     let indices = gpu_device_indices()?;
-    indices.iter().map(|&idx| GpuMiner::new(idx, batch_size)).collect()
+    indices
+        .iter()
+        .map(|&idx| GpuMiner::new(idx, batch_size))
+        .collect()
 }
 
 // =============================================================================
@@ -872,12 +900,16 @@ fn stratum_normalize_url(url: &str) -> String {
 fn stratum_send(writer: &Mutex<TcpStream>, value: &serde_json::Value) -> Result<(), String> {
     let mut stream = writer.lock().unwrap_or_else(|e| e.into_inner());
     let line = format!("{}\n", value);
-    stream.write_all(line.as_bytes()).map_err(|e| format!("stratum send: {e}"))
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("stratum send: {e}"))
 }
 
 fn stratum_read_line(reader: &mut BufReader<TcpStream>) -> Result<serde_json::Value, String> {
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| format!("stratum read: {e}"))?;
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("stratum read: {e}"))?;
     if line.is_empty() {
         return Err("stratum EOF".into());
     }
@@ -898,7 +930,9 @@ fn stratum_target_from_difficulty(diff: f64) -> BigUint {
 }
 
 fn stratum_target_from_hex(hex_str: &str) -> Option<BigUint> {
-    hex::decode(hex_str).ok().map(|b| BigUint::from_bytes_be(&b))
+    hex::decode(hex_str)
+        .ok()
+        .map(|b| BigUint::from_bytes_be(&b))
 }
 
 fn parse_u32_hex(s: &str) -> Result<u32, String> {
@@ -914,7 +948,10 @@ fn merkle_root_from_stratum(
     extranonce1: &str,
     extranonce2: &str,
 ) -> Result<[u8; 32], String> {
-    let coinbase_hex = format!("{}{}{}{}", job.coinbase1, extranonce1, extranonce2, job.coinbase2);
+    let coinbase_hex = format!(
+        "{}{}{}{}",
+        job.coinbase1, extranonce1, extranonce2, job.coinbase2
+    );
     let coinbase = hex::decode(&coinbase_hex).map_err(|e| format!("coinbase decode: {e}"))?;
     let mut merkle = sha256d(&coinbase);
     for branch in &job.merkle_branch {
@@ -1029,7 +1066,14 @@ fn mine_stratum_job_gpu(
     let mut prev_hash = [0u8; 32];
     prev_hash.copy_from_slice(&prev_bytes);
 
-    let header = BlockHeader { version, prev_hash, merkle_root, time, bits, nonce: 0 };
+    let header = BlockHeader {
+        version,
+        prev_hash,
+        merkle_root,
+        time,
+        bits,
+        nonce: 0,
+    };
     let ser = header.serialize();
     let midstate = sha256_midstate(ser[..64].try_into().unwrap());
     let mut tail = tail_from_header(&ser);
@@ -1063,11 +1107,21 @@ fn mine_stratum_job_gpu(
                 let _ = stratum_send(writer, &submit);
 
                 // Check if it also meets network target
-                let header_found = BlockHeader { version, prev_hash, merkle_root, time: current_time, bits, nonce };
+                let header_found = BlockHeader {
+                    version,
+                    prev_hash,
+                    merkle_root,
+                    time: current_time,
+                    bits,
+                    nonce,
+                };
                 let hash = header_found.hash();
                 let hash_val = BigUint::from_bytes_be(&hash);
                 if hash_val <= network_target {
-                    println!("[GPU {gpu_idx}/Stratum] ✅ Share meets NETWORK target! hash={}", hex::encode(hash));
+                    println!(
+                        "[GPU {gpu_idx}/Stratum] ✅ Share meets NETWORK target! hash={}",
+                        hex::encode(hash)
+                    );
                 } else {
                     println!("[GPU {gpu_idx}/Stratum] Share submitted: nonce={nonce:08x}");
                 }
@@ -1086,11 +1140,22 @@ fn mine_stratum_job_gpu(
                 if guard.elapsed() >= Duration::from_secs(10) {
                     let elapsed = rate_start.elapsed().as_secs_f64();
                     let hashes = total_hashes.load(Ordering::Relaxed);
-                    let rate = if elapsed > 0.0 { hashes as f64 / elapsed } else { 0.0 };
-                    if json_log_enabled() {
-                        println!("{}", json!({"event":"progress","rate_hs":rate,"hashes":hashes,"ts":Utc::now().format("%H:%M:%S").to_string()}));
+                    let rate = if elapsed > 0.0 {
+                        hashes as f64 / elapsed
                     } else {
-                        println!("[GPU/Stratum] {}  ({} MH total)", fmt_rate(rate), hashes / 1_000_000);
+                        0.0
+                    };
+                    if json_log_enabled() {
+                        println!(
+                            "{}",
+                            json!({"event":"progress","rate_hs":rate,"hashes":hashes,"ts":Utc::now().format("%H:%M:%S").to_string()})
+                        );
+                    } else {
+                        println!(
+                            "[GPU/Stratum] {}  ({} MH total)",
+                            fmt_rate(rate),
+                            hashes / 1_000_000
+                        );
                     }
                     *guard = Instant::now();
                 }
@@ -1102,7 +1167,14 @@ fn mine_stratum_job_gpu(
         let (next, overflow) = nonce_base.overflowing_add(stride);
         if overflow {
             current_time = (Utc::now().timestamp() as u32).max(current_time + 1);
-            let header_t = BlockHeader { version, prev_hash, merkle_root, time: current_time, bits, nonce: 0 };
+            let header_t = BlockHeader {
+                version,
+                prev_hash,
+                merkle_root,
+                time: current_time,
+                bits,
+                nonce: 0,
+            };
             let new_ser = header_t.serialize();
             tail = tail_from_header(&new_ser);
             gpu.update_tail(&tail)?;
@@ -1124,11 +1196,18 @@ fn run_stratum_gpu(gpus: &mut [GpuMiner]) -> Result<(), String> {
     let _ = stream.set_nodelay(true);
     let writer = Arc::new(Mutex::new(stream));
     let mut reader = BufReader::new(
-        writer.lock().unwrap_or_else(|e| e.into_inner()).try_clone().map_err(|e| e.to_string())?,
+        writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_clone()
+            .map_err(|e| e.to_string())?,
     );
 
     // Subscribe
-    stratum_send(&writer, &json!({"id":1,"method":"mining.subscribe","params":["irium-miner-gpu/0.1"]}))?;
+    stratum_send(
+        &writer,
+        &json!({"id":1,"method":"mining.subscribe","params":["irium-miner-gpu/0.1"]}),
+    )?;
     let sub_resp = stratum_read_line(&mut reader)?;
     let (extranonce1, extranonce2_size) = match sub_resp.get("result").and_then(|v| v.as_array()) {
         Some(arr) if arr.len() >= 3 => (
@@ -1142,7 +1221,10 @@ fn run_stratum_gpu(gpus: &mut [GpuMiner]) -> Result<(), String> {
     // Authorize
     let user = stratum_user();
     let pass = stratum_pass();
-    stratum_send(&writer, &json!({"id":2,"method":"mining.authorize","params":[user.clone(), pass]}))?;
+    stratum_send(
+        &writer,
+        &json!({"id":2,"method":"mining.authorize","params":[user.clone(), pass]}),
+    )?;
     println!("[Stratum] Authorized as {user}");
 
     let state = Arc::new(Mutex::new(StratumState {
@@ -1169,9 +1251,16 @@ fn run_stratum_gpu(gpus: &mut [GpuMiner]) -> Result<(), String> {
     loop {
         let (job, extranonce1, extranonce2_size, share_target) = {
             let g = state.lock().unwrap_or_else(|e| e.into_inner());
-            let tgt = g.target.clone()
+            let tgt = g
+                .target
+                .clone()
                 .unwrap_or_else(|| stratum_target_from_difficulty(g.difficulty));
-            (g.job.clone(), g.extranonce1.clone(), g.extranonce2_size, tgt)
+            (
+                g.job.clone(),
+                g.extranonce1.clone(),
+                g.extranonce2_size,
+                tgt,
+            )
         };
 
         let job = match job {
@@ -1214,11 +1303,21 @@ fn run_stratum_gpu(gpus: &mut [GpuMiner]) -> Result<(), String> {
 
                 s.spawn(move || {
                     if let Err(e) = mine_stratum_job_gpu(
-                        gpu, gpu_idx, num_gpus,
-                        job, extranonce1, extranonce2,
-                        share_target, writer, user, submit_id,
-                        current_version, job_version_ref,
-                        total_hashes, rate_start, last_log,
+                        gpu,
+                        gpu_idx,
+                        num_gpus,
+                        job,
+                        extranonce1,
+                        extranonce2,
+                        share_target,
+                        writer,
+                        user,
+                        submit_id,
+                        current_version,
+                        job_version_ref,
+                        total_hashes,
+                        rate_start,
+                        last_log,
                     ) {
                         eprintln!("[GPU {gpu_idx}/Stratum] Error: {e}");
                         any_error.store(true, Ordering::SeqCst);
@@ -1275,15 +1374,24 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--pool" => {
-                let val = args.next().unwrap_or_else(|| { eprintln!("--pool requires a value"); std::process::exit(1); });
+                let val = args.next().unwrap_or_else(|| {
+                    eprintln!("--pool requires a value");
+                    std::process::exit(1);
+                });
                 env::set_var("IRIUM_STRATUM_URL", val);
             }
             "--wallet" => {
-                let val = args.next().unwrap_or_else(|| { eprintln!("--wallet requires a value"); std::process::exit(1); });
+                let val = args.next().unwrap_or_else(|| {
+                    eprintln!("--wallet requires a value");
+                    std::process::exit(1);
+                });
                 env::set_var("IRIUM_MINER_ADDRESS", val);
             }
             "--device" | "--devices" => {
-                let val = args.next().unwrap_or_else(|| { eprintln!("{arg} requires a value"); std::process::exit(1); });
+                let val = args.next().unwrap_or_else(|| {
+                    eprintln!("{arg} requires a value");
+                    std::process::exit(1);
+                });
                 // If the value contains a comma, treat it as a multi-GPU list.
                 if val.contains(',') {
                     env::set_var("IRIUM_GPU_DEVICES", val);
@@ -1292,15 +1400,28 @@ fn main() {
                 }
             }
             "--batch" => {
-                let val = args.next().unwrap_or_else(|| { eprintln!("--batch requires a value"); std::process::exit(1); });
+                let val = args.next().unwrap_or_else(|| {
+                    eprintln!("--batch requires a value");
+                    std::process::exit(1);
+                });
                 env::set_var("IRIUM_GPU_BATCH", val);
             }
             "--rpc" => {
-                let val = args.next().unwrap_or_else(|| { eprintln!("--rpc requires a value"); std::process::exit(1); });
+                let val = args.next().unwrap_or_else(|| {
+                    eprintln!("--rpc requires a value");
+                    std::process::exit(1);
+                });
                 env::set_var("IRIUM_NODE_RPC", val);
             }
-            "--help" | "-h" => { print_usage(); std::process::exit(0); }
-            other => { eprintln!("Unknown argument: {other}"); print_usage(); std::process::exit(1); }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                print_usage();
+                std::process::exit(1);
+            }
         }
     }
 
@@ -1360,8 +1481,8 @@ fn main() {
         };
 
         let height = template.height;
-        let bits = u32::from_str_radix(template.bits.trim_start_matches("0x"), 16)
-            .unwrap_or(0x1d00_ffff);
+        let bits =
+            u32::from_str_radix(template.bits.trim_start_matches("0x"), 16).unwrap_or(0x1d00_ffff);
         let target = Target { bits };
         let target_words = target_to_words(target);
 
@@ -1463,7 +1584,9 @@ fn main() {
                 upload_ok = false;
             }
         }
-        if !upload_ok { continue; }
+        if !upload_ok {
+            continue;
+        }
 
         if json_log_enabled() {
             println!(

@@ -20,9 +20,8 @@ use irium_node_rs::settlement::{
     AgreementStatement, AgreementSummary, AgreementTemplateType, ApprovedAttestor,
     HoldbackEvaluationResult, HoldbackOutcome, MilestoneEvaluationResult, NoResponseRule,
     NoResponseTrigger, PolicyOutcome, ProofPolicy, ProofRequirement, ProofResolution,
-    ProofSignatureEnvelope, SettlementProof, TypedProofPayload,
-    AGREEMENT_SIGNATURE_TYPE_SECP256K1, AGREEMENT_SIGNATURE_VERSION,
-    PROOF_POLICY_SCHEMA_ID, SETTLEMENT_PROOF_SCHEMA_ID,
+    ProofSignatureEnvelope, SettlementProof, TypedProofPayload, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+    AGREEMENT_SIGNATURE_VERSION, PROOF_POLICY_SCHEMA_ID, SETTLEMENT_PROOF_SCHEMA_ID,
 };
 use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
 use k256::ecdsa::signature::hazmat::PrehashSigner;
@@ -1566,7 +1565,10 @@ fn format_unix_timestamp(ts: u64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mo <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, mo, d, h, m, sec)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        y, mo, d, h, m, sec
+    )
 }
 
 fn now_unix() -> u64 {
@@ -2164,7 +2166,9 @@ fn usage() {
     eprintln!("  irium-wallet offer-export --offer <offer_id> --out <file>");
     eprintln!("  irium-wallet offer-import --file <file> [--json]");
     eprintln!("  irium-wallet offer-fetch --url <http-url> [--json]");
-    eprintln!("  irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]");
+    eprintln!(
+        "  irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]"
+    );
     eprintln!("  irium-wallet agreement-unpack --file <file> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet flow-otc-demo");
 }
@@ -5596,7 +5600,9 @@ fn render_proof_submit_summary(resp: &SubmitProofRpcResponse) -> String {
         lines.push(format!("status {}", resp.status));
     }
     if resp.accepted || resp.duplicate {
-        lines.push("next_step  run agreement-policy-evaluate to check settlement eligibility".to_string());
+        lines.push(
+            "next_step  run agreement-policy-evaluate to check settlement eligibility".to_string(),
+        );
     }
     lines.join("\n")
 }
@@ -5889,7 +5895,11 @@ fn parse_policy_evaluate_cli(args: &[String]) -> Result<PolicyEvaluateCliOptions
     })
 }
 
-fn flow_next_step_hint(outcome: &str, release_eligible: bool, refund_eligible: bool) -> &'static str {
+fn flow_next_step_hint(
+    outcome: &str,
+    release_eligible: bool,
+    refund_eligible: bool,
+) -> &'static str {
     if release_eligible {
         "run agreement-release-build to construct the release transaction"
     } else if refund_eligible {
@@ -6000,7 +6010,10 @@ fn render_policy_evaluate_summary(resp: &EvaluatePolicyRpcResponse) -> String {
             ));
         }
     }
-    lines.push(format!("next_step  {}", flow_next_step_hint(&resp.outcome, resp.release_eligible, resp.refund_eligible)));
+    lines.push(format!(
+        "next_step  {}",
+        flow_next_step_hint(&resp.outcome, resp.release_eligible, resp.refund_eligible)
+    ));
     lines.join("\n")
 }
 
@@ -7053,8 +7066,7 @@ fn save_offer(offer: &IrmOffer) -> Result<PathBuf, String> {
     let dir = offers_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create offers dir: {e}"))?;
     let path = dir.join(format!("offer-{}.json", offer.offer_id));
-    let json = serde_json::to_string_pretty(offer)
-        .map_err(|e| format!("serialize offer: {e}"))?;
+    let json = serde_json::to_string_pretty(offer).map_err(|e| format!("serialize offer: {e}"))?;
     std::fs::write(&path, &json).map_err(|e| format!("write offer: {e}"))?;
     Ok(path)
 }
@@ -7099,7 +7111,10 @@ fn render_offer_summary(offer: &IrmOffer) -> String {
         lines.push(format!("source           {}", src));
     }
     lines.push(format!("seller           {}", offer.seller_address));
-    lines.push(format!("amount_irm       {} IRM", format_irm(offer.amount_irm)));
+    lines.push(format!(
+        "amount_irm       {} IRM",
+        format_irm(offer.amount_irm)
+    ));
     lines.push(format!("payment_method   {}", offer.payment_method));
     if let Some(ref pn) = offer.price_note {
         lines.push(format!("price_note       {}", pn));
@@ -7108,7 +7123,11 @@ fn render_offer_summary(offer: &IrmOffer) -> String {
         lines.push(format!("payment_instructions  {}", pi));
     }
     lines.push(format!("timeout_height   {}", offer.timeout_height));
-    lines.push(format!("created_at       {} ({})", offer.created_at, format_unix_timestamp(offer.created_at)));
+    lines.push(format!(
+        "created_at       {} ({})",
+        offer.created_at,
+        format_unix_timestamp(offer.created_at)
+    ));
     if let Some(ref aid) = offer.agreement_id {
         lines.push(format!("agreement_id     {}", aid));
     }
@@ -7119,7 +7138,11 @@ fn render_offer_summary(offer: &IrmOffer) -> String {
         lines.push(format!("buyer_address    {}", ba));
     }
     if let Some(taken) = offer.taken_at {
-        lines.push(format!("taken_at         {} ({})", taken, format_unix_timestamp(taken)));
+        lines.push(format!(
+            "taken_at         {} ({})",
+            taken,
+            format_unix_timestamp(taken)
+        ));
     }
     lines.join("\n")
 }
@@ -7136,28 +7159,58 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--seller"               => { seller               = Some(parse_required_string_flag(args, &mut i, "--seller")?); }
-            "--amount"               => { amount               = Some(parse_irm(&parse_required_string_flag(args, &mut i, "--amount")?)?); }
-            "--payment-method"       => { payment_method       = Some(parse_required_string_flag(args, &mut i, "--payment-method")?); }
-            "--timeout"              => {
-                timeout = Some(parse_required_string_flag(args, &mut i, "--timeout")?
-                    .parse::<u64>()
-                    .map_err(|_| "--timeout must be a non-negative integer".to_string())?);
+            "--seller" => {
+                seller = Some(parse_required_string_flag(args, &mut i, "--seller")?);
             }
-            "--price-note"           => { price_note           = Some(parse_required_string_flag(args, &mut i, "--price-note")?); }
-            "--payment-instructions" => { payment_instructions = Some(parse_required_string_flag(args, &mut i, "--payment-instructions")?); }
-            "--offer-id"             => { offer_id             = Some(parse_required_string_flag(args, &mut i, "--offer-id")?); }
-            "--json" => { json_mode = true; i += 1; }
+            "--amount" => {
+                amount = Some(parse_irm(&parse_required_string_flag(
+                    args, &mut i, "--amount",
+                )?)?);
+            }
+            "--payment-method" => {
+                payment_method = Some(parse_required_string_flag(
+                    args,
+                    &mut i,
+                    "--payment-method",
+                )?);
+            }
+            "--timeout" => {
+                timeout = Some(
+                    parse_required_string_flag(args, &mut i, "--timeout")?
+                        .parse::<u64>()
+                        .map_err(|_| "--timeout must be a non-negative integer".to_string())?,
+                );
+            }
+            "--price-note" => {
+                price_note = Some(parse_required_string_flag(args, &mut i, "--price-note")?);
+            }
+            "--payment-instructions" => {
+                payment_instructions = Some(parse_required_string_flag(
+                    args,
+                    &mut i,
+                    "--payment-instructions",
+                )?);
+            }
+            "--offer-id" => {
+                offer_id = Some(parse_required_string_flag(args, &mut i, "--offer-id")?);
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
     let seller_addr = seller.ok_or_else(|| "--seller is required".to_string())?;
-    let amount_val  = amount.ok_or_else(|| "--amount is required".to_string())?;
-    let pm_val      = payment_method.ok_or_else(|| "--payment-method is required".to_string())?;
+    let amount_val = amount.ok_or_else(|| "--amount is required".to_string())?;
+    let pm_val = payment_method.ok_or_else(|| "--payment-method is required".to_string())?;
     let timeout_val = timeout.ok_or_else(|| "--timeout is required".to_string())?;
 
     if base58_p2pkh_to_hash(&seller_addr).is_none() {
-        return Err(format!("--seller must be a valid Irium address: {}", seller_addr));
+        return Err(format!(
+            "--seller must be a valid Irium address: {}",
+            seller_addr
+        ));
     }
 
     let now = now_unix();
@@ -7206,9 +7259,16 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--json"   => { json_mode = true; i += 1; }
-            "--status" => { status_filter = Some(parse_required_string_flag(args, &mut i, "--status")?); }
-            "--source" => { source_filter = Some(parse_required_string_flag(args, &mut i, "--source")?); }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            "--status" => {
+                status_filter = Some(parse_required_string_flag(args, &mut i, "--status")?);
+            }
+            "--source" => {
+                source_filter = Some(parse_required_string_flag(args, &mut i, "--source")?);
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
@@ -7220,13 +7280,18 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
         offers.retain(|o| o.source.as_deref().unwrap_or("local") == sf.as_str());
     }
     if json_mode {
-        let list: Vec<serde_json::Value> = offers.iter()
+        let list: Vec<serde_json::Value> = offers
+            .iter()
             .map(|o| serde_json::to_value(o).unwrap_or_default())
             .collect();
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "count": list.len(),
-            "offers": list,
-        })).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "count": list.len(),
+                "offers": list,
+            }))
+            .unwrap()
+        );
     } else {
         println!("count {}", offers.len());
         if offers.is_empty() {
@@ -7257,20 +7322,31 @@ fn handle_offer_show(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--offer" => { offer_ref = Some(parse_required_string_flag(args, &mut i, "--offer")?); }
-            "--json"  => { json_mode = true; i += 1; }
+            "--offer" => {
+                offer_ref = Some(parse_required_string_flag(args, &mut i, "--offer")?);
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
     let id = offer_ref.ok_or_else(|| "--offer is required".to_string())?;
     let offer = load_offer(&id)?;
     if json_mode {
-        println!("{}", serde_json::to_string_pretty(&serde_json::to_value(&offer).unwrap()).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::to_value(&offer).unwrap()).unwrap()
+        );
     } else {
         println!("{}", render_offer_summary(&offer));
         println!();
         if offer.status == "open" {
-            println!("next_step  irium-wallet offer-take --offer {} --buyer <your_address>", offer.offer_id);
+            println!(
+                "next_step  irium-wallet offer-take --offer {} --buyer <your_address>",
+                offer.offer_id
+            );
         } else if offer.status == "taken" {
             if let Some(ref ah) = offer.agreement_hash {
                 println!("next_step  irium-wallet otc-settle --agreement {}", ah);
@@ -7328,29 +7404,44 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--offer"  => { offer_ref = Some(parse_required_string_flag(args, &mut i, "--offer")?); }
-            "--buyer"  => { buyer     = Some(parse_required_string_flag(args, &mut i, "--buyer")?); }
-            "--rpc"    => { rpc_url   = parse_required_string_flag(args, &mut i, "--rpc")?; }
-            "--json"   => { json_mode = true; i += 1; }
+            "--offer" => {
+                offer_ref = Some(parse_required_string_flag(args, &mut i, "--offer")?);
+            }
+            "--buyer" => {
+                buyer = Some(parse_required_string_flag(args, &mut i, "--buyer")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
-    let offer_id   = offer_ref.ok_or_else(|| "--offer is required".to_string())?;
+    let offer_id = offer_ref.ok_or_else(|| "--offer is required".to_string())?;
     let buyer_addr = buyer.ok_or_else(|| "--buyer is required".to_string())?;
 
     let mut offer = load_offer(&offer_id)?;
     if offer.status != "open" {
-        return Err(format!("offer {} is not open (status: {})", offer_id, offer.status));
+        return Err(format!(
+            "offer {} is not open (status: {})",
+            offer_id, offer.status
+        ));
     }
 
     if base58_p2pkh_to_hash(&buyer_addr).is_none() {
-        return Err(format!("--buyer must be a valid Irium address: {}", buyer_addr));
+        return Err(format!(
+            "--buyer must be a valid Irium address: {}",
+            buyer_addr
+        ));
     }
 
     let now = now_unix();
     let agreement_id = format!("offer-{}-{}", offer_id, now);
     let seller_party = parse_party_spec(&format!("seller|Seller|{}|seller", offer.seller_address))?;
-    let buyer_party  = parse_party_spec(&format!("buyer|Buyer|{}|buyer", buyer_addr))?;
+    let buyer_party = parse_party_spec(&format!("buyer|Buyer|{}|buyer", buyer_addr))?;
 
     let secret_hash = hex::encode(Sha256::digest(
         format!("offer-secret-{}-{}", agreement_id, now).as_bytes(),
@@ -7377,26 +7468,35 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
     let saved_path = save_agreement_to_store_at(&imported_agreements_dir(), &agreement)?;
 
-    offer.status         = "taken".to_string();
-    offer.agreement_id   = Some(agreement_id.clone());
+    offer.status = "taken".to_string();
+    offer.agreement_id = Some(agreement_id.clone());
     offer.agreement_hash = Some(agreement_hash.clone());
-    offer.buyer_address  = Some(buyer_addr.clone());
-    offer.taken_at       = Some(now);
+    offer.buyer_address = Some(buyer_addr.clone());
+    offer.taken_at = Some(now);
     save_offer(&offer)?;
 
     // Auto-build and store OTC policy on local node if seller_pubkey is known.
     let mut auto_policy_id: Option<String> = None;
     if let Some(ref pubkey) = offer.seller_pubkey {
         let pol_id = format!("pol-{}", offer_id);
-        let policy = build_default_otc_policy(&pol_id, &agreement_hash, pubkey, offer.timeout_height);
+        let policy =
+            build_default_otc_policy(&pol_id, &agreement_hash, pubkey, offer.timeout_height);
         let base = rpc_url.trim_end_matches('/');
         match rpc_client(base).and_then(|client| {
-            let req = StorePolicyRpcRequest { policy, replace: false };
+            let req = StorePolicyRpcRequest {
+                policy,
+                replace: false,
+            };
             rpc_post_json::<StorePolicyRpcRequest, StorePolicyRpcResponse>(
-                &client, base, "/rpc/storepolicy", &req,
+                &client,
+                base,
+                "/rpc/storepolicy",
+                &req,
             )
         }) {
-            Ok(_) => { auto_policy_id = Some(pol_id); }
+            Ok(_) => {
+                auto_policy_id = Some(pol_id);
+            }
             Err(e) => {
                 eprintln!("[warn] auto-policy store failed: {}; set policy manually with policy-build-otc", e);
             }
@@ -7404,13 +7504,17 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     }
 
     if json_mode {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "offer_id":        offer_id,
-            "agreement_id":    agreement_id,
-            "agreement_hash":  agreement_hash,
-            "saved_path":      saved_path.display().to_string(),
-            "auto_policy_id":  auto_policy_id,
-        })).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "offer_id":        offer_id,
+                "agreement_id":    agreement_id,
+                "agreement_hash":  agreement_hash,
+                "saved_path":      saved_path.display().to_string(),
+                "auto_policy_id":  auto_policy_id,
+            }))
+            .unwrap()
+        );
         return Ok(());
     }
 
@@ -7430,12 +7534,18 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     println!("=== Next steps ===");
     println!();
     println!("1. Export this agreement for seller:");
-    println!("   irium-wallet agreement-pack --agreement {} --out agreement-pkg.json --rpc {}", agreement_hash, rpc_url);
+    println!(
+        "   irium-wallet agreement-pack --agreement {} --out agreement-pkg.json --rpc {}",
+        agreement_hash, rpc_url
+    );
     println!("   Send agreement-pkg.json to seller.");
     println!();
     println!("2. Seller imports the package:");
     println!("   irium-wallet agreement-unpack --file agreement-pkg.json --rpc <seller-rpc>");
-    println!("   irium-wallet agreement-fund {} --rpc <seller-rpc>", agreement_hash);
+    println!(
+        "   irium-wallet agreement-fund {} --rpc <seller-rpc>",
+        agreement_hash
+    );
     println!();
     println!("3. Make external payment:");
     println!("payment_method  {}", offer.payment_method);
@@ -7456,12 +7566,14 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     println!("   irium-wallet agreement-proof-submit --proof proof.json --rpc <seller-rpc>");
     println!();
     println!("5. Check release eligibility:");
-    println!("   irium-wallet agreement-policy-evaluate --agreement {} --rpc {}", agreement_hash, rpc_url);
+    println!(
+        "   irium-wallet agreement-policy-evaluate --agreement {} --rpc {}",
+        agreement_hash, rpc_url
+    );
     println!();
     println!("next_step  export agreement for seller: irium-wallet agreement-pack --agreement {} --out agreement-pkg.json --rpc {}", agreement_hash, rpc_url);
     Ok(())
 }
-
 
 fn validate_offer_for_import(offer: &IrmOffer) -> Result<(), String> {
     if offer.offer_id.is_empty() {
@@ -7527,16 +7639,15 @@ fn handle_offer_export(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--offer" => offer_ref = Some(parse_required_string_flag(args, &mut i, "--offer")?) ,
-            "--out"   => out_path  = Some(parse_required_string_flag(args, &mut i, "--out")?),
+            "--offer" => offer_ref = Some(parse_required_string_flag(args, &mut i, "--offer")?),
+            "--out" => out_path = Some(parse_required_string_flag(args, &mut i, "--out")?),
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
-    let id  = offer_ref.ok_or_else(|| "--offer is required".to_string())?;
+    let id = offer_ref.ok_or_else(|| "--offer is required".to_string())?;
     let out = out_path.ok_or_else(|| "--out is required".to_string())?;
     let offer = load_offer(&id)?;
-    let mut export =
-        serde_json::to_value(&offer).map_err(|e| format!("serialize offer: {e}"))?;
+    let mut export = serde_json::to_value(&offer).map_err(|e| format!("serialize offer: {e}"))?;
     if let Some(obj) = export.as_object_mut() {
         obj.remove("source");
         obj.remove("agreement_id");
@@ -7566,7 +7677,10 @@ fn handle_offer_import(args: &[String]) -> Result<(), String> {
     while i < args.len() {
         match args[i].as_str() {
             "--file" => file_path = Some(parse_required_string_flag(args, &mut i, "--file")?),
-            "--json" => { json_mode = true; i += 1; }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
@@ -7574,8 +7688,7 @@ fn handle_offer_import(args: &[String]) -> Result<(), String> {
     if !std::path::Path::new(&path).exists() {
         return Err(format!("file not found: {}", path));
     }
-    let json =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
+    let json = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
     import_offer_from_json(&json, json_mode)
 }
 
@@ -7585,8 +7698,11 @@ fn handle_offer_fetch(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--url"  => url      = Some(parse_required_string_flag(args, &mut i, "--url")?),
-            "--json" => { json_mode = true; i += 1; }
+            "--url" => url = Some(parse_required_string_flag(args, &mut i, "--url")?),
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
@@ -7614,10 +7730,19 @@ fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--agreement" => { agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?); }
-            "--out"       => { out_path      = Some(parse_required_string_flag(args, &mut i, "--out")?); }
-            "--rpc"       => { rpc_url       = parse_required_string_flag(args, &mut i, "--rpc")?; }
-            "--json"      => { json_mode = true; i += 1; }
+            "--agreement" => {
+                agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--out" => {
+                out_path = Some(parse_required_string_flag(args, &mut i, "--out")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
@@ -7633,9 +7758,14 @@ fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
     let policy: Option<ProofPolicy> = {
         let base = rpc_url.trim_end_matches('/');
         match rpc_client(base).and_then(|client| {
-            let req = GetPolicyRpcRequest { agreement_hash: agreement_hash.clone() };
+            let req = GetPolicyRpcRequest {
+                agreement_hash: agreement_hash.clone(),
+            };
             rpc_post_json::<GetPolicyRpcRequest, GetPolicyRpcResponse>(
-                &client, base, "/rpc/getpolicy", &req,
+                &client,
+                base,
+                "/rpc/getpolicy",
+                &req,
             )
         }) {
             Ok(resp) if resp.found => resp.policy,
@@ -7649,18 +7779,22 @@ fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
         "agreement": &agreement,
         "policy": &policy,
     });
-    let json = serde_json::to_string_pretty(&bundle)
-        .map_err(|e| format!("serialize package: {e}"))?;
+    let json =
+        serde_json::to_string_pretty(&bundle).map_err(|e| format!("serialize package: {e}"))?;
     std::fs::write(&out, &json).map_err(|e| format!("write {}: {}", out, e))?;
 
     eprintln!("written {}", out);
     if json_mode {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "agreement_id":    display_id,
-            "agreement_hash":  agreement_hash,
-            "policy_included": has_policy,
-            "out":             out,
-        })).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agreement_id":    display_id,
+                "agreement_hash":  agreement_hash,
+                "policy_included": has_policy,
+                "out":             out,
+            }))
+            .unwrap()
+        );
     } else {
         println!("agreement_id    {}", display_id);
         println!("agreement_hash  {}", agreement_hash);
@@ -7682,9 +7816,16 @@ fn handle_agreement_unpack(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--file" => { file_path = Some(parse_required_string_flag(args, &mut i, "--file")?); }
-            "--rpc"  => { rpc_url   = parse_required_string_flag(args, &mut i, "--rpc")?; }
-            "--json" => { json_mode = true; i += 1; }
+            "--file" => {
+                file_path = Some(parse_required_string_flag(args, &mut i, "--file")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
@@ -7714,12 +7855,20 @@ fn handle_agreement_unpack(args: &[String]) -> Result<(), String> {
             Ok(policy) => {
                 let base = rpc_url.trim_end_matches('/');
                 match rpc_client(base).and_then(|client| {
-                    let req = StorePolicyRpcRequest { policy, replace: true };
+                    let req = StorePolicyRpcRequest {
+                        policy,
+                        replace: true,
+                    };
                     rpc_post_json::<StorePolicyRpcRequest, StorePolicyRpcResponse>(
-                        &client, base, "/rpc/storepolicy", &req,
+                        &client,
+                        base,
+                        "/rpc/storepolicy",
+                        &req,
                     )
                 }) {
-                    Ok(_) => { policy_status = "stored"; }
+                    Ok(_) => {
+                        policy_status = "stored";
+                    }
                     Err(e) => {
                         eprintln!(
                             "[warn] policy store failed: {}; set manually with agreement-policy-set",
@@ -7737,28 +7886,37 @@ fn handle_agreement_unpack(args: &[String]) -> Result<(), String> {
     }
 
     if json_mode {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "agreement_id":   agreement.agreement_id,
-            "agreement_hash": agreement_hash,
-            "already_present": matches!(write_status, StoreWriteStatus::AlreadyPresent),
-            "saved_path":     saved_path.display().to_string(),
-            "policy_status":  policy_status,
-        })).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agreement_id":   agreement.agreement_id,
+                "agreement_hash": agreement_hash,
+                "already_present": matches!(write_status, StoreWriteStatus::AlreadyPresent),
+                "saved_path":     saved_path.display().to_string(),
+                "policy_status":  policy_status,
+            }))
+            .unwrap()
+        );
     } else {
         println!("agreement_id    {}", agreement.agreement_id);
         println!("agreement_hash  {}", agreement_hash);
-        println!("status          {}", match write_status {
-            StoreWriteStatus::Imported       => "imported",
-            StoreWriteStatus::AlreadyPresent => "already present",
-        });
+        println!(
+            "status          {}",
+            match write_status {
+                StoreWriteStatus::Imported => "imported",
+                StoreWriteStatus::AlreadyPresent => "already present",
+            }
+        );
         println!("saved_path      {}", saved_path.display());
         println!("policy_status   {}", policy_status);
         println!();
-        println!("next_step  fund the escrow: irium-wallet agreement-fund {} --rpc {}", agreement_hash, rpc_url);
+        println!(
+            "next_step  fund the escrow: irium-wallet agreement-fund {} --rpc {}",
+            agreement_hash, rpc_url
+        );
     }
     Ok(())
 }
-
 
 fn handle_flow_otc_demo() {
     println!("=== Irium OTC Flow Demo ===");
@@ -8347,10 +8505,8 @@ fn handle_agreement_create_from_template(args: &[String]) -> Result<(), String> 
             let amount_val = amount.ok_or_else(|| "--amount is required".to_string())?;
             let timeout_val = timeout.ok_or_else(|| "--timeout is required".to_string())?;
             let pm_val = payment_method.unwrap_or_else(|| "off-chain".to_string());
-            let seller_party =
-                parse_party_spec(&format!("seller|Seller|{}|seller", seller_addr))?;
-            let buyer_party =
-                parse_party_spec(&format!("buyer|Buyer|{}|buyer", buyer_addr))?;
+            let seller_party = parse_party_spec(&format!("seller|Seller|{}|seller", seller_addr))?;
+            let buyer_party = parse_party_spec(&format!("buyer|Buyer|{}|buyer", buyer_addr))?;
             build_otc_agreement(
                 id.clone(),
                 now,
@@ -15123,11 +15279,7 @@ found true"
         match result {
             Ok(_) => {}
             Err(e) => {
-                assert!(
-                    e.contains("valid Irium address"),
-                    "unexpected error: {}",
-                    e
-                );
+                assert!(e.contains("valid Irium address"), "unexpected error: {}", e);
             }
         }
     }
@@ -15178,7 +15330,10 @@ found true"
 
     #[test]
     fn offer_take_missing_offer_returns_error() {
-        let result = handle_offer_take(&["--buyer".to_string(), "Qbuyer1111111111111111111111111111111".to_string()]);
+        let result = handle_offer_take(&[
+            "--buyer".to_string(),
+            "Qbuyer1111111111111111111111111111111".to_string(),
+        ]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("--offer"));
     }
@@ -15226,9 +15381,18 @@ found true"
         let summary = render_offer_summary(&offer);
         assert!(summary.contains("test-offer-1"), "must contain offer_id");
         assert!(summary.contains("open"), "must contain status");
-        assert!(summary.contains("2.5"), "must contain formatted amount (2.5 IRM)");
-        assert!(summary.contains("bank-transfer"), "must contain payment_method");
-        assert!(summary.contains("0.001 BTC per IRM"), "must contain price_note");
+        assert!(
+            summary.contains("2.5"),
+            "must contain formatted amount (2.5 IRM)"
+        );
+        assert!(
+            summary.contains("bank-transfer"),
+            "must contain payment_method"
+        );
+        assert!(
+            summary.contains("0.001 BTC per IRM"),
+            "must contain price_note"
+        );
         assert!(summary.contains("1000"), "must contain timeout_height");
     }
 
@@ -15261,7 +15425,10 @@ found true"
         assert_eq!(loaded.offer_id, "rt-offer");
         assert_eq!(loaded.amount_irm, 100_000_000);
         assert_eq!(loaded.payment_method, "lightning");
-        assert_eq!(loaded.payment_instructions.as_deref(), Some("pay to lnbc..."));
+        assert_eq!(
+            loaded.payment_instructions.as_deref(),
+            Some("pay to lnbc...")
+        );
         env::remove_var("IRIUM_OFFERS_DIR");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -15294,7 +15461,10 @@ found true"
         }
         let offers = load_all_offers();
         assert_eq!(offers.len(), 2);
-        assert_eq!(offers[0].offer_id, "newer", "most recent offer must be first");
+        assert_eq!(
+            offers[0].offer_id, "newer",
+            "most recent offer must be first"
+        );
         assert_eq!(offers[1].offer_id, "older");
         env::remove_var("IRIUM_OFFERS_DIR");
         std::fs::remove_dir_all(&dir).ok();
@@ -15392,7 +15562,11 @@ found true"
             seller_pubkey: None,
         };
         let summary = render_offer_summary(&offer);
-        assert!(summary.contains("1970-01-01"), "summary must include human date: {}", summary);
+        assert!(
+            summary.contains("1970-01-01"),
+            "summary must include human date: {}",
+            summary
+        );
     }
     #[test]
     fn offer_export_creates_file_with_correct_content() {
@@ -15432,10 +15606,17 @@ found true"
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["offer_id"], "export-test");
         assert_eq!(parsed["seller_address"], "QsellerTest");
-        assert!(parsed.get("source").map(|v| v.is_null()).unwrap_or(true),
-            "source must be stripped from export");
-        assert!(parsed.get("agreement_id").map(|v| v.is_null()).unwrap_or(true),
-            "agreement_id must be stripped from export");
+        assert!(
+            parsed.get("source").map(|v| v.is_null()).unwrap_or(true),
+            "source must be stripped from export"
+        );
+        assert!(
+            parsed
+                .get("agreement_id")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "agreement_id must be stripped from export"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -15458,8 +15639,11 @@ found true"
         let result = import_offer_from_json(&json_str, false);
         assert!(result.is_ok(), "import must succeed: {:?}", result);
         let loaded = load_offer("imported-offer-rt").unwrap();
-        assert_eq!(loaded.source.as_deref(), Some("imported"),
-            "source must be imported");
+        assert_eq!(
+            loaded.source.as_deref(),
+            Some("imported"),
+            "source must be imported"
+        );
         assert_eq!(loaded.amount_irm, 100_000_000);
         env::remove_var("IRIUM_OFFERS_DIR");
         std::fs::remove_dir_all(&dir).ok();
@@ -15485,7 +15669,9 @@ found true"
         });
         let result = import_offer_from_json(&serde_json::to_string(&offer_json).unwrap(), false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("amount_irm must be greater than zero"));
+        assert!(result
+            .unwrap_err()
+            .contains("amount_irm must be greater than zero"));
     }
 
     #[test]
@@ -15501,7 +15687,9 @@ found true"
         });
         let result = import_offer_from_json(&serde_json::to_string(&offer_json).unwrap(), false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("only open offers can be imported"));
+        assert!(result
+            .unwrap_err()
+            .contains("only open offers can be imported"));
     }
 
     #[test]
@@ -15599,8 +15787,10 @@ found true"
         std::fs::create_dir_all(&dir).unwrap();
         env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
         let result = handle_offer_export(&[
-            "--offer".to_string(), "no-such-offer".to_string(),
-            "--out".to_string(), "/tmp/nope.json".to_string(),
+            "--offer".to_string(),
+            "no-such-offer".to_string(),
+            "--out".to_string(),
+            "/tmp/nope.json".to_string(),
         ]);
         env::remove_var("IRIUM_OFFERS_DIR");
         std::fs::remove_dir_all(&dir).ok();
@@ -15692,10 +15882,15 @@ found true"
             buyer_address: None,
             taken_at: None,
             source: Some("local".to_string()),
-            seller_pubkey: Some("03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string()),
+            seller_pubkey: Some(
+                "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string(),
+            ),
         };
         let json = serde_json::to_string(&offer).unwrap();
-        assert!(json.contains("seller_pubkey"), "seller_pubkey must be serialized when Some");
+        assert!(
+            json.contains("seller_pubkey"),
+            "seller_pubkey must be serialized when Some"
+        );
         let roundtrip: IrmOffer = serde_json::from_str(&json).unwrap();
         assert_eq!(
             roundtrip.seller_pubkey.as_deref(),
@@ -15724,13 +15919,17 @@ found true"
             buyer_address: None,
             taken_at: None,
             source: Some("local".to_string()),
-            seller_pubkey: Some("03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string()),
+            seller_pubkey: Some(
+                "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string(),
+            ),
         };
         save_offer(&offer).unwrap();
         let out = dir.join("pk-export-out.json");
         let result = handle_offer_export(&[
-            "--offer".to_string(), "pk-export".to_string(),
-            "--out".to_string(), out.display().to_string(),
+            "--offer".to_string(),
+            "pk-export".to_string(),
+            "--out".to_string(),
+            out.display().to_string(),
         ]);
         env::remove_var("IRIUM_OFFERS_DIR");
         assert!(result.is_ok(), "export must succeed");
@@ -15780,8 +15979,10 @@ found true"
         env::set_var("IRIUM_IMPORTED_AGREEMENTS_DIR", dir.display().to_string());
         env::set_var("IRIUM_AGREEMENT_BUNDLES_DIR", dir.display().to_string());
         let result = handle_agreement_pack(&[
-            "--agreement".to_string(), "no-such-agreement".to_string(),
-            "--out".to_string(), "/tmp/nope.json".to_string(),
+            "--agreement".to_string(),
+            "no-such-agreement".to_string(),
+            "--out".to_string(),
+            "/tmp/nope.json".to_string(),
         ]);
         env::remove_var("IRIUM_IMPORTED_AGREEMENTS_DIR");
         env::remove_var("IRIUM_AGREEMENT_BUNDLES_DIR");
@@ -15827,9 +16028,8 @@ found true"
         std::fs::create_dir_all(&dir).unwrap();
         let pkg_path = dir.join("bad.json");
         std::fs::write(&pkg_path, "{ not valid json {{").unwrap();
-        let result = handle_agreement_unpack(&[
-            "--file".to_string(), pkg_path.display().to_string(),
-        ]);
+        let result =
+            handle_agreement_unpack(&["--file".to_string(), pkg_path.display().to_string()]);
         std::fs::remove_dir_all(&dir).ok();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid package JSON"));
@@ -15847,9 +16047,8 @@ found true"
             "policy": null
         });
         std::fs::write(&pkg_path, serde_json::to_string(&pkg).unwrap()).unwrap();
-        let result = handle_agreement_unpack(&[
-            "--file".to_string(), pkg_path.display().to_string(),
-        ]);
+        let result =
+            handle_agreement_unpack(&["--file".to_string(), pkg_path.display().to_string()]);
         std::fs::remove_dir_all(&dir).ok();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unsupported package schema"));
@@ -15868,8 +16067,6 @@ found true"
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown argument"));
     }
-
-
 }
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();

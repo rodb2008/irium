@@ -654,9 +654,9 @@ impl PeerDirectory {
         }
         let value = serde_json::Value::Object(map);
         if let Ok(text) = serde_json::to_string_pretty(&value) {
-            let tmp = self.db_path.with_extension(
-                format!("json.tmp.{}", std::process::id()),
-            );
+            let tmp = self
+                .db_path
+                .with_extension(format!("json.tmp.{}", std::process::id()));
             if let Ok(mut file) = fs::File::create(&tmp) {
                 if file.write_all(text.as_bytes()).is_ok() && file.sync_all().is_ok() {
                     if let Err(e) = fs::rename(&tmp, &self.db_path) {

@@ -173,8 +173,14 @@ mod tests {
     fn non_mainnet_uses_lwma_v2_env_override() {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var("IRIUM_LWMA_V2_ACTIVATION_HEIGHT", "500");
-        assert_eq!(resolved_lwma_v2_activation_height(NetworkKind::Devnet), Some(500));
-        assert_eq!(resolved_lwma_v2_activation_height(NetworkKind::Testnet), Some(500));
+        assert_eq!(
+            resolved_lwma_v2_activation_height(NetworkKind::Devnet),
+            Some(500)
+        );
+        assert_eq!(
+            resolved_lwma_v2_activation_height(NetworkKind::Testnet),
+            Some(500)
+        );
         std::env::remove_var("IRIUM_LWMA_V2_ACTIVATION_HEIGHT");
     }
 }
