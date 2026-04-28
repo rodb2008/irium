@@ -2160,7 +2160,9 @@ fn usage() {
     eprintln!("  irium-wallet otc-settle --agreement <hash|id|path> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet otc-status --agreement <hash|id|path> [--rpc <url>]");
     eprintln!("  irium-wallet offer-create --seller <addr> --amount <irm> --payment-method <text> --timeout <height> [--price-note <text>] [--payment-instructions <text>] [--offer-id <id>] [--json]");
-    eprintln!("  irium-wallet offer-list [--status open|taken|settled] [--source local|imported|remote|all] [--seller <pubkey|addr>] [--json]");
+    eprintln!("  irium-wallet offer-list [--status open|taken|settled] [--source local|imported|remote|all] [--seller <pubkey|addr>]");
+    eprintln!("  irium-wallet offer-list [--payment <method>] [--min-amount <irm>] [--max-amount <irm>]");
+    eprintln!("  irium-wallet offer-list [--sort newest|amount|seller] [--limit <n>] [--summary] [--json]");
     eprintln!("  irium-wallet offer-show --offer <offer_id> [--json]");
     eprintln!("  irium-wallet offer-take --offer <offer_id> --buyer <addr> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet offer-export --offer <offer_id> --out <file>");
@@ -7267,14 +7269,24 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
 
 fn handle_offer_list(args: &[String]) -> Result<(), String> {
     let mut json_mode = false;
+    let mut summary_mode = false;
     let mut status_filter: Option<String> = None;
     let mut source_filter: Option<String> = None;
     let mut seller_filter: Option<String> = None;
+    let mut payment_filter: Option<String> = None;
+    let mut min_amount: Option<u64> = None;
+    let mut max_amount: Option<u64> = None;
+    let mut sort_by = "newest".to_string();
+    let mut limit: Option<usize> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--json" => {
                 json_mode = true;
+                i += 1;
+            }
+            "--summary" => {
+                summary_mode = true;
                 i += 1;
             }
             "--status" => {
@@ -7286,7 +7298,37 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
             "--seller" => {
                 seller_filter = Some(parse_required_string_flag(args, &mut i, "--seller")?);
             }
+            "--payment" => {
+                payment_filter = Some(parse_required_string_flag(args, &mut i, "--payment")?);
+            }
+            "--min-amount" => {
+                let s = parse_required_string_flag(args, &mut i, "--min-amount")?;
+                min_amount = Some(parse_irm(&s)?);
+            }
+            "--max-amount" => {
+                let s = parse_required_string_flag(args, &mut i, "--max-amount")?;
+                max_amount = Some(parse_irm(&s)?);
+            }
+            "--sort" => {
+                sort_by = parse_required_string_flag(args, &mut i, "--sort")?;
+            }
+            "--limit" => {
+                let s = parse_required_string_flag(args, &mut i, "--limit")?;
+                limit = Some(
+                    s.parse::<usize>()
+                        .map_err(|_| "--limit must be a positive integer".to_string())?,
+                );
+            }
             other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    match sort_by.as_str() {
+        "newest" | "amount" | "seller" => {}
+        other => {
+            return Err(format!(
+                "unknown --sort value: {}; expected newest, amount, or seller",
+                other
+            ))
         }
     }
     let mut offers = load_all_offers();
@@ -7312,6 +7354,25 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
                 || o.seller_address.as_str() == spk.as_str()
         });
     }
+    if let Some(ref pm) = payment_filter {
+        let pm_lower = pm.to_lowercase();
+        offers.retain(|o| o.payment_method.to_lowercase() == pm_lower);
+    }
+    if let Some(min) = min_amount {
+        offers.retain(|o| o.amount_irm >= min);
+    }
+    if let Some(max) = max_amount {
+        offers.retain(|o| o.amount_irm <= max);
+    }
+    // load_all_offers already sorts newest-first; only re-sort for other modes
+    match sort_by.as_str() {
+        "amount" => offers.sort_by(|a, b| b.amount_irm.cmp(&a.amount_irm)),
+        "seller" => offers.sort_by(|a, b| a.seller_address.cmp(&b.seller_address)),
+        _ => {}
+    }
+    if let Some(n) = limit {
+        offers.truncate(n);
+    }
     if json_mode {
         let list: Vec<serde_json::Value> = offers
             .iter()
@@ -7325,25 +7386,59 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
             }))
             .unwrap()
         );
+    } else if summary_mode {
+        let local_count = offers
+            .iter()
+            .filter(|o| o.source.as_deref().unwrap_or("local") == "local")
+            .count();
+        let imported_count = offers
+            .iter()
+            .filter(|o| o.source.as_deref().unwrap_or("") == "imported")
+            .count();
+        let remote_count = offers
+            .iter()
+            .filter(|o| o.source.as_deref().unwrap_or("").starts_with("remote:"))
+            .count();
+        let mut payment_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for offer in &offers {
+            *payment_counts
+                .entry(offer.payment_method.clone())
+                .or_insert(0) += 1;
+        }
+        let mut payment_list: Vec<(String, usize)> = payment_counts.into_iter().collect();
+        payment_list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        println!("Total offers: {}", offers.len());
+        println!("  Local:    {}", local_count);
+        println!("  Imported: {}", imported_count);
+        println!("  Remote:   {}", remote_count);
+        if !payment_list.is_empty() {
+            println!();
+            println!("Top payment methods:");
+            for (method, count) in &payment_list {
+                println!("  - {}: {}", method, count);
+            }
+        }
     } else {
-        println!("count {}", offers.len());
+        println!(
+            "Total: {} offer{}",
+            offers.len(),
+            if offers.len() == 1 { "" } else { "s" }
+        );
         if offers.is_empty() {
             println!("(no offers found)");
         }
-        for offer in &offers {
+        for (idx, offer) in offers.iter().enumerate() {
             println!();
-            println!("offer_id       {}", offer.offer_id);
-            println!("status         {}", offer.status);
-            if let Some(ref src) = offer.source {
-                println!("source         {}", src);
-            }
-            println!("seller         {}", offer.seller_address);
-            println!("amount_irm     {} IRM", format_irm(offer.amount_irm));
-            println!("payment_method {}", offer.payment_method);
+            println!("[{}] {}", idx + 1, offer.offer_id);
+            println!("    amount:   {} IRM", format_irm(offer.amount_irm));
+            println!("    seller:   {}", offer.seller_address);
+            println!("    payment:  {}", offer.payment_method);
             if let Some(ref pn) = offer.price_note {
-                println!("price_note     {}", pn);
+                println!("    note:     {}", pn);
             }
-            println!("timeout_height {}", offer.timeout_height);
+            println!("    source:   {}", offer.source.as_deref().unwrap_or("local"));
+            println!("    status:   {}", offer.status);
         }
     }
     Ok(())
@@ -16366,6 +16461,157 @@ found true"
         let result = handle_offer_list(&[
             "--seller".to_string(),
             "Qseller0000000000000000000000000000000".to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_list_sort_amount_succeeds() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("list-sort-amount");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let mut o1 = make_open_offer("sort-a-1", None, None);
+        o1.amount_irm = 5_000_000;
+        let mut o2 = make_open_offer("sort-a-2", None, None);
+        o2.amount_irm = 1_000_000;
+        save_offer(&o1).unwrap();
+        save_offer(&o2).unwrap();
+        let result = handle_offer_list(&["--sort".to_string(), "amount".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_list_sort_seller_succeeds() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("list-sort-seller");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        save_offer(&make_open_offer("sort-s-1", None, None)).unwrap();
+        let result = handle_offer_list(&["--sort".to_string(), "seller".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_list_sort_invalid_returns_error() {
+        let result = handle_offer_list(&["--sort".to_string(), "bogus".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown --sort value"));
+    }
+
+    #[test]
+    fn offer_list_limit_truncates() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("list-limit");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        for i in 0..5_u32 {
+            save_offer(&make_open_offer(&format!("lim-{}", i), None, None)).unwrap();
+        }
+        let result = handle_offer_list(&["--limit".to_string(), "2".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_list_limit_invalid_returns_error() {
+        let result = handle_offer_list(&["--limit".to_string(), "abc".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--limit must be a positive integer"));
+    }
+
+    #[test]
+    fn offer_list_summary_mode_succeeds() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("list-summary");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        save_offer(&make_open_offer("sum-1", None, None)).unwrap();
+        save_offer(&make_open_offer("sum-2", Some("imported"), None)).unwrap();
+        let mut remote_offer =
+            make_open_offer("sum-3", Some("remote:http://example.com/feed"), None);
+        remote_offer.payment_method = "cash".to_string();
+        save_offer(&remote_offer).unwrap();
+        let result = handle_offer_list(&["--summary".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_list_payment_filter_matches() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("list-payment");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        save_offer(&make_open_offer("pay-1", None, None)).unwrap();
+        let mut cash_offer = make_open_offer("pay-2", None, None);
+        cash_offer.payment_method = "cash".to_string();
+        save_offer(&cash_offer).unwrap();
+        let result = handle_offer_list(&[
+            "--payment".to_string(),
+            "bank-transfer".to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_list_min_amount_filter_succeeds() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("list-min-amount");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let mut small = make_open_offer("min-1", None, None);
+        small.amount_irm = 50_000_000;
+        let mut large = make_open_offer("min-2", None, None);
+        large.amount_irm = 500_000_000;
+        save_offer(&small).unwrap();
+        save_offer(&large).unwrap();
+        let result = handle_offer_list(&["--min-amount".to_string(), "1".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_list_max_amount_filter_succeeds() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("list-max-amount");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let mut o = make_open_offer("max-1", None, None);
+        o.amount_irm = 100_000_000;
+        save_offer(&o).unwrap();
+        let result = handle_offer_list(&["--max-amount".to_string(), "10".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_list_combined_filters_succeed() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("list-combined");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let mut o = make_open_offer("comb-1", None, None);
+        o.amount_irm = 200_000_000;
+        save_offer(&o).unwrap();
+        let result = handle_offer_list(&[
+            "--payment".to_string(), "bank-transfer".to_string(),
+            "--min-amount".to_string(), "1".to_string(),
+            "--max-amount".to_string(), "100".to_string(),
+            "--sort".to_string(), "amount".to_string(),
+            "--limit".to_string(), "5".to_string(),
         ]);
         env::remove_var("IRIUM_OFFERS_DIR");
         std::fs::remove_dir_all(&dir).ok();
