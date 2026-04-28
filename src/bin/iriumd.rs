@@ -7706,6 +7706,83 @@ async fn main() {
         }
     }
 
+
+const OFFERS_FEED_DEFAULT_LIMIT: usize = 500;
+
+fn offers_feed_dir() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("IRIUM_OFFERS_DIR") {
+        return std::path::PathBuf::from(path);
+    }
+    let data_dir = if let Ok(path) = std::env::var("IRIUM_DATA_DIR") {
+        std::path::PathBuf::from(path)
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        std::path::PathBuf::from(home).join(".irium")
+    };
+    data_dir.join("offers")
+}
+
+fn offers_feed_limit() -> usize {
+    std::env::var("IRIUM_OFFERS_FEED_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(OFFERS_FEED_DEFAULT_LIMIT)
+}
+
+async fn offers_feed(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    check_rate(&state, &addr)?;
+    let dir = offers_feed_dir();
+    let limit = offers_feed_limit();
+    let mut offers: Vec<serde_json::Value> = Vec::new();
+    if dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map(|e| e == "json").unwrap_or(false) {
+                    if let Ok(data) = std::fs::read_to_string(&path) {
+                        if let Ok(mut val) =
+                            serde_json::from_str::<serde_json::Value>(&data)
+                        {
+                            if val.get("status").and_then(|s| s.as_str()) != Some("open") {
+                                continue;
+                            }
+                            if let Some(obj) = val.as_object_mut() {
+                                obj.remove("source");
+                                obj.remove("agreement_id");
+                                obj.remove("agreement_hash");
+                                obj.remove("buyer_address");
+                                obj.remove("taken_at");
+                            }
+                            offers.push(val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    offers.sort_by(|a, b| {
+        let ta = a.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tb = b.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+        tb.cmp(&ta)
+    });
+    if offers.len() > limit {
+        offers.truncate(limit);
+    }
+    let exported_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(Json(serde_json::json!({
+        "version": "1",
+        "exported_at": exported_at,
+        "count": offers.len(),
+        "offers": offers,
+    })))
+}
+
     let mut app = Router::new()
         .route("/status", get(status))
         .route("/peers", get(peers))
@@ -7781,6 +7858,7 @@ async fn main() {
         .route("/wallet/export_seed", get(wallet_export_seed))
         .route("/wallet/import_seed", post(wallet_import_seed))
         .route("/wallet/send", post(wallet_send))
+        .route("/offers/feed", get(offers_feed))
         .layer(DefaultBodyLimit::max(rpc_body_limit_bytes()))
         .with_state(app_state.clone());
 
