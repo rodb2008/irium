@@ -716,20 +716,29 @@ fn agreement_header_markup(agreement: &AgreementObject, agreement_hash: &str) ->
             .join("");
         format!("<p><strong>Milestones:</strong></p><ul>{}</ul>", rows)
     };
+    let template_type_escaped = html_escape(&format!("{:?}", agreement.template_type));
+    let settlement_deadline_escaped = agreement
+        .deadlines
+        .settlement_deadline
+        .map_or_else(|| "none".to_string(), |v| v.to_string());
+    let refund_deadline_escaped = agreement
+        .deadlines
+        .refund_deadline
+        .map_or_else(|| "none".to_string(), |v| v.to_string());
     format!(
-        "<section><h1>Agreement {}</h1><p><strong>Agreement hash:</strong> <code>{}</code></p><p><strong>Schema:</strong> <code>{}</code></p><p><strong>Version:</strong> {}</p><p><strong>Template:</strong> {:?}</p><p><strong>Payer:</strong> {}</p><p><strong>Payee:</strong> {}</p><p><strong>Total amount:</strong> {}</p><p><strong>Document hash:</strong> <code>{}</code></p><p><strong>Metadata hash:</strong> {}</p><p><strong>Settlement deadline:</strong> {:?}</p><p><strong>Refund deadline:</strong> {:?}</p>{}</section>",
+        "<section><h1>Agreement {}</h1><p><strong>Agreement hash:</strong> <code>{}</code></p><p><strong>Schema:</strong> <code>{}</code></p><p><strong>Version:</strong> {}</p><p><strong>Template:</strong> {}</p><p><strong>Payer:</strong> {}</p><p><strong>Payee:</strong> {}</p><p><strong>Total amount:</strong> {}</p><p><strong>Document hash:</strong> <code>{}</code></p><p><strong>Metadata hash:</strong> {}</p><p><strong>Settlement deadline:</strong> {}</p><p><strong>Refund deadline:</strong> {}</p>{}</section>",
         html_escape(&agreement.agreement_id),
         html_escape(agreement_hash),
         html_escape(agreement.schema_id.as_deref().unwrap_or("legacy_unlabeled")),
         agreement.version,
-        agreement.template_type,
+        template_type_escaped,
         html_escape(&agreement.payer),
         html_escape(&agreement.payee),
         agreement.total_amount,
         html_escape(&agreement.document_hash),
         html_escape(agreement.metadata_hash.as_deref().unwrap_or("none")),
-        agreement.deadlines.settlement_deadline,
-        agreement.deadlines.refund_deadline,
+        settlement_deadline_escaped,
+        refund_deadline_escaped,
         milestones,
     )
 }
