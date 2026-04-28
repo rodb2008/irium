@@ -2171,7 +2171,8 @@ fn usage() {
     eprintln!("  irium-wallet offer-feed-export [--out <file>] [--limit <n>]");
     eprintln!("  irium-wallet offer-feed-fetch --url <feed-endpoint> [--url <feed-endpoint> ...] [--json]");
     eprintln!("  irium-wallet offer-feed-sync [--json]");
-    eprintln!("  irium-wallet offer-feed-prune [--older-than-days <n>] [--dry-run] [--json]");
+    eprintln!("  irium-wallet offer-feed-prune [--older-than-days <n>] [--dry-run] [--json]
+  irium-wallet reputation-show <seller_pubkey|address> [--json]");
     eprintln!(
         "  irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]"
     );
@@ -7440,6 +7441,8 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
             }
             println!("    source:   {}", offer.source.as_deref().unwrap_or("local"));
             println!("    status:   {}", offer.status);
+            let rep = compute_reputation(offer.seller_address.as_str());
+            println!("    reputation: {}", rep.display_short());
         }
     }
     Ok(())
@@ -8239,6 +8242,185 @@ fn handle_offer_feed_sync(args: &[String]) -> Result<(), String> {
     print_feed_results(&results, json_mode);
     Ok(())
 }
+
+fn reputation_dir() -> std::path::PathBuf {
+    irium_data_dir().join("reputation")
+}
+
+fn reputation_outcomes_path() -> std::path::PathBuf {
+    reputation_dir().join("outcomes.json")
+}
+
+#[derive(Debug, Clone)]
+struct ReputationScore {
+    total: usize,
+    satisfied: usize,
+    failed: usize,
+    has_outcome_data: bool,
+}
+
+impl ReputationScore {
+    fn success_rate(&self) -> Option<f64> {
+        if !self.has_outcome_data {
+            return None;
+        }
+        let denom = self.satisfied + self.failed;
+        if denom == 0 {
+            return None;
+        }
+        Some(self.satisfied as f64 / denom as f64 * 100.0)
+    }
+
+    fn display_short(&self) -> String {
+        if self.total == 0 {
+            return "unknown".to_string();
+        }
+        match self.success_rate() {
+            Some(rate) => {
+                let denom = self.satisfied + self.failed;
+                format!("{:.0}% ({}/{})", rate, self.satisfied, denom)
+            }
+            None => format!(
+                "{} agreement{}",
+                self.total,
+                if self.total == 1 { "" } else { "s" }
+            ),
+        }
+    }
+}
+
+fn resolve_seller_address(input: &str) -> String {
+    // If it looks like a 64-char hex pubkey, resolve via local offer store.
+    if input.len() == 64 && input.chars().all(|c| c.is_ascii_hexdigit()) {
+        let offers = load_all_offers();
+        for offer in &offers {
+            if offer.seller_pubkey.as_deref() == Some(input) {
+                return offer.seller_address.clone();
+            }
+        }
+    }
+    input.to_string()
+}
+
+fn compute_reputation(seller_addr: &str) -> ReputationScore {
+    let mut total: usize = 0;
+    let raw_dir = imported_agreements_dir();
+    if raw_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&raw_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.extension().map(|e| e == "json").unwrap_or(false) {
+                    continue;
+                }
+                let data = match std::fs::read_to_string(&path) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let val: serde_json::Value = match serde_json::from_str(&data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(parties) = val.get("parties").and_then(|p| p.as_array()) {
+                    for party in parties {
+                        if party.get("role").and_then(|r| r.as_str()) == Some("seller")
+                            && party
+                                .get("address")
+                                .and_then(|a| a.as_str())
+                                == Some(seller_addr)
+                        {
+                            total += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let outcomes_path = reputation_outcomes_path();
+    let mut satisfied: usize = 0;
+    let mut failed: usize = 0;
+    let mut has_outcome_data = false;
+    if outcomes_path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&outcomes_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(entry) = val.get(seller_addr) {
+                    has_outcome_data = true;
+                    satisfied = entry
+                        .get("satisfied")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    failed = entry
+                        .get("failed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                }
+            }
+        }
+    }
+
+    ReputationScore {
+        total,
+        satisfied,
+        failed,
+        has_outcome_data,
+    }
+}
+
+fn handle_reputation_show(args: &[String]) -> Result<(), String> {
+    let mut json_mode = false;
+    let mut seller: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            s if !s.starts_with("--") => {
+                seller = Some(s.to_string());
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let seller = seller.ok_or_else(|| "seller address or pubkey is required".to_string())?;
+    let resolved = resolve_seller_address(&seller);
+    let rep = compute_reputation(&resolved);
+
+    if json_mode {
+        let rate = rep.success_rate();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "seller": resolved,
+                "total_agreements": rep.total,
+                "satisfied": if rep.has_outcome_data { serde_json::json!(rep.satisfied) } else { serde_json::json!(null) },
+                "failed": if rep.has_outcome_data { serde_json::json!(rep.failed) } else { serde_json::json!(null) },
+                "success_rate": rate.map(|r| format!("{:.1}", r)),
+            }))
+            .unwrap()
+        );
+        return Ok(());
+    }
+
+    println!("Seller:           {}", resolved);
+    println!("Total agreements: {}", rep.total);
+    if rep.has_outcome_data {
+        println!("Successful:       {}", rep.satisfied);
+        println!("Failed:           {}", rep.failed);
+        match rep.success_rate() {
+            Some(rate) => println!("Success rate:     {:.1}%", rate),
+            None => println!("Success rate:     N/A (no completed outcomes recorded)"),
+        }
+    } else {
+        println!("Successful:       unknown");
+        println!("Failed:           unknown");
+        println!("Success rate:     unknown (outcome not yet tracked locally)");
+    }
+    Ok(())
+}
+
 
 fn handle_offer_feed_prune(args: &[String]) -> Result<(), String> {
     let mut dry_run = false;
@@ -16952,6 +17134,178 @@ found true"
 
 
     #[test]
+
+    // ── reputation layer tests ──────────────────────────────────────────────
+
+    #[test]
+    fn reputation_score_display_short_unknown_when_no_agreements() {
+        let rep = ReputationScore {
+            total: 0,
+            satisfied: 0,
+            failed: 0,
+            has_outcome_data: false,
+        };
+        assert_eq!(rep.display_short(), "unknown");
+    }
+
+    #[test]
+    fn reputation_score_display_short_count_when_no_outcomes() {
+        let rep = ReputationScore {
+            total: 3,
+            satisfied: 0,
+            failed: 0,
+            has_outcome_data: false,
+        };
+        assert_eq!(rep.display_short(), "3 agreements");
+    }
+
+    #[test]
+    fn reputation_score_display_short_singular() {
+        let rep = ReputationScore {
+            total: 1,
+            satisfied: 0,
+            failed: 0,
+            has_outcome_data: false,
+        };
+        assert_eq!(rep.display_short(), "1 agreement");
+    }
+
+    #[test]
+    fn reputation_score_display_short_percentage() {
+        let rep = ReputationScore {
+            total: 12,
+            satisfied: 10,
+            failed: 2,
+            has_outcome_data: true,
+        };
+        assert_eq!(rep.display_short(), "83% (10/12)");
+    }
+
+    #[test]
+    fn reputation_score_display_short_perfect_rate() {
+        let rep = ReputationScore {
+            total: 5,
+            satisfied: 5,
+            failed: 0,
+            has_outcome_data: true,
+        };
+        assert_eq!(rep.display_short(), "100% (5/5)");
+    }
+
+    #[test]
+    fn reputation_score_success_rate_none_when_no_outcome_data() {
+        let rep = ReputationScore {
+            total: 4,
+            satisfied: 0,
+            failed: 0,
+            has_outcome_data: false,
+        };
+        assert!(rep.success_rate().is_none());
+    }
+
+    #[test]
+    fn reputation_score_success_rate_none_when_zero_denom() {
+        let rep = ReputationScore {
+            total: 0,
+            satisfied: 0,
+            failed: 0,
+            has_outcome_data: true,
+        };
+        // has_outcome_data=true but both 0 → no division by zero
+        assert!(rep.success_rate().is_none());
+    }
+
+    #[test]
+    fn reputation_compute_empty_dir_returns_zero() {
+        let _guard = test_guard();
+        let mut dir = env::temp_dir();
+        dir.push(format!("irium-rep-empty-{}", now_unix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_IMPORTED_AGREEMENTS_DIR", dir.display().to_string());
+        let rep = compute_reputation("Qsomeaddress123");
+        env::remove_var("IRIUM_IMPORTED_AGREEMENTS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(rep.total, 0);
+        assert!(!rep.has_outcome_data);
+        assert_eq!(rep.display_short(), "unknown");
+    }
+
+    #[test]
+    fn reputation_compute_counts_matching_seller() {
+        let _guard = test_guard();
+        let mut dir = env::temp_dir();
+        dir.push(format!("irium-rep-count-{}", now_unix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agreement = serde_json::json!({
+            "agreement_id": "agr-test-001",
+            "version": 1,
+            "template_type": "otc_settlement",
+            "parties": [
+                {"party_id": "buyer", "display_name": "Buyer",
+                 "address": "QBuyerAddr", "role": "buyer"},
+                {"party_id": "seller", "display_name": "Seller",
+                 "address": "QSellerAddr", "role": "seller"}
+            ],
+            "payer": "buyer", "payee": "seller",
+            "total_amount": 1000000,
+            "network_marker": "IRIUM",
+            "creation_time": 0,
+            "deadlines": {},
+            "release_conditions": [],
+            "refund_conditions": [],
+            "document_hash": "aabb"
+        });
+        std::fs::write(
+            dir.join("agr-test-001.json"),
+            serde_json::to_string(&agreement).unwrap(),
+        )
+        .unwrap();
+        env::set_var("IRIUM_IMPORTED_AGREEMENTS_DIR", dir.display().to_string());
+        let rep_seller = compute_reputation("QSellerAddr");
+        let rep_other = compute_reputation("QOtherAddr");
+        env::remove_var("IRIUM_IMPORTED_AGREEMENTS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(rep_seller.total, 1);
+        assert_eq!(rep_other.total, 0);
+    }
+
+    #[test]
+    fn reputation_compute_skips_corrupted_json() {
+        let _guard = test_guard();
+        let mut dir = env::temp_dir();
+        dir.push(format!("irium-rep-corrupt-{}", now_unix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bad.json"), b"not valid json").unwrap();
+        env::set_var("IRIUM_IMPORTED_AGREEMENTS_DIR", dir.display().to_string());
+        let rep = compute_reputation("QAnyAddr");
+        env::remove_var("IRIUM_IMPORTED_AGREEMENTS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        // corrupted file is silently skipped, not a panic
+        assert_eq!(rep.total, 0);
+    }
+
+    #[test]
+    fn reputation_show_output_no_data() {
+        let _guard = test_guard();
+        let mut dir = env::temp_dir();
+        dir.push(format!("irium-rep-show-empty-{}", now_unix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_IMPORTED_AGREEMENTS_DIR", dir.display().to_string());
+        let result = handle_reputation_show(&["Qnosuchaddr".to_string()]);
+        env::remove_var("IRIUM_IMPORTED_AGREEMENTS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn reputation_show_requires_seller_arg() {
+        let result = handle_reputation_show(&[]);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("seller address or pubkey is required"),
+        );
+    }
+
     fn offer_feed_fetch_multiple_urls_both_valid_aggregates() {
         let _guard = test_guard();
         let dir = temp_offers_dir("multi-fetch-agg");
@@ -22115,6 +22469,12 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "offer-feed-prune" => {
             if let Err(e) = handle_offer_feed_prune(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "reputation-show" => {
+            if let Err(e) = handle_reputation_show(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
