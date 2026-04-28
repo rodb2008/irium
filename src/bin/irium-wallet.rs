@@ -8066,7 +8066,24 @@ fn handle_offer_feed_sync(args: &[String]) -> Result<(), String> {
         }
         return Ok(());
     }
-    let results: Vec<FeedFetchResult> = urls.iter().map(|u| fetch_single_feed(u)).collect();
+    let results: Vec<FeedFetchResult> = urls
+        .iter()
+        .map(|u| {
+            if !u.starts_with("http://") && !u.starts_with("https://") {
+                FeedFetchResult {
+                    url: u.clone(),
+                    imported: 0,
+                    skipped: 0,
+                    errors: 0,
+                    fetch_error: Some(
+                        "invalid URL: must start with http:// or https://".to_string(),
+                    ),
+                }
+            } else {
+                fetch_single_feed(u)
+            }
+        })
+        .collect();
     print_feed_results(&results, json_mode);
     Ok(())
 }
@@ -16362,7 +16379,8 @@ found true"
         let dir = temp_offers_dir("multi-fetch-agg");
         std::fs::create_dir_all(&dir).unwrap();
         env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
-        // multi-url with two invalid schemes should fail on each
+        // two valid http:// URLs that are unreachable; verify the command
+        // returns Ok (per-feed errors do not abort the full run)
         let result = handle_offer_feed_fetch(&[
             "--url".to_string(), "http://localhost:1/feed".to_string(),
             "--url".to_string(), "http://localhost:2/feed".to_string(),
