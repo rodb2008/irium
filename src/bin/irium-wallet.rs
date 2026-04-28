@@ -2160,12 +2160,14 @@ fn usage() {
     eprintln!("  irium-wallet otc-settle --agreement <hash|id|path> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet otc-status --agreement <hash|id|path> [--rpc <url>]");
     eprintln!("  irium-wallet offer-create --seller <addr> --amount <irm> --payment-method <text> --timeout <height> [--price-note <text>] [--payment-instructions <text>] [--offer-id <id>] [--json]");
-    eprintln!("  irium-wallet offer-list [--status open|taken|settled] [--source local|imported] [--json]");
+    eprintln!("  irium-wallet offer-list [--status open|taken|settled] [--source local|imported|remote|all] [--seller <pubkey|addr>] [--json]");
     eprintln!("  irium-wallet offer-show --offer <offer_id> [--json]");
     eprintln!("  irium-wallet offer-take --offer <offer_id> --buyer <addr> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet offer-export --offer <offer_id> --out <file>");
     eprintln!("  irium-wallet offer-import --file <file> [--json]");
     eprintln!("  irium-wallet offer-fetch --url <http-url> [--json]");
+    eprintln!("  irium-wallet offer-feed-export [--out <file>] [--limit <n>]");
+    eprintln!("  irium-wallet offer-feed-fetch --url <feed-endpoint> [--json]");
     eprintln!(
         "  irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]"
     );
@@ -7055,6 +7057,16 @@ struct IrmOffer {
     seller_pubkey: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct OfferFeed {
+    version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_url: Option<String>,
+    exported_at: u64,
+    count: usize,
+    offers: Vec<serde_json::Value>,
+}
+
 fn offers_dir() -> PathBuf {
     if let Ok(path) = env::var("IRIUM_OFFERS_DIR") {
         return PathBuf::from(path);
@@ -7256,6 +7268,7 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
     let mut json_mode = false;
     let mut status_filter: Option<String> = None;
     let mut source_filter: Option<String> = None;
+    let mut seller_filter: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -7269,6 +7282,9 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
             "--source" => {
                 source_filter = Some(parse_required_string_flag(args, &mut i, "--source")?);
             }
+            "--seller" => {
+                seller_filter = Some(parse_required_string_flag(args, &mut i, "--seller")?);
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
@@ -7277,7 +7293,23 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
         offers.retain(|o| &o.status == sf);
     }
     if let Some(ref sf) = source_filter {
-        offers.retain(|o| o.source.as_deref().unwrap_or("local") == sf.as_str());
+        match sf.as_str() {
+            "all" => {}
+            "remote" => {
+                offers.retain(|o| {
+                    o.source.as_deref().unwrap_or("").starts_with("remote:")
+                });
+            }
+            other => {
+                offers.retain(|o| o.source.as_deref().unwrap_or("local") == other);
+            }
+        }
+    }
+    if let Some(ref spk) = seller_filter {
+        offers.retain(|o| {
+            o.seller_pubkey.as_deref().unwrap_or("") == spk.as_str()
+                || o.seller_address.as_str() == spk.as_str()
+        });
     }
     if json_mode {
         let list: Vec<serde_json::Value> = offers
@@ -7720,6 +7752,158 @@ fn handle_offer_fetch(args: &[String]) -> Result<(), String> {
     }
     let json = response.text().map_err(|e| format!("read response: {e}"))?;
     import_offer_from_json(&json, json_mode)
+}
+
+
+// Returns Ok(true) if imported, Ok(false) if deduplicated, Err if invalid.
+fn import_single_offer_with_source(json: &str, source_tag: &str) -> Result<bool, String> {
+    let mut offer: IrmOffer =
+        serde_json::from_str(json).map_err(|e| format!("invalid offer JSON: {e}"))?;
+    validate_offer_for_import(&offer)?;
+    if load_offer(&offer.offer_id).is_ok() {
+        return Ok(false);
+    }
+    offer.source = Some(source_tag.to_string());
+    save_offer(&offer)?;
+    Ok(true)
+}
+
+fn handle_offer_feed_export(args: &[String]) -> Result<(), String> {
+    let mut out_path: Option<String> = None;
+    let mut limit: Option<usize> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => out_path = Some(parse_required_string_flag(args, &mut i, "--out")?),
+            "--limit" => {
+                let val = parse_required_string_flag(args, &mut i, "--limit")?;
+                limit = Some(
+                    val.parse::<usize>()
+                        .map_err(|_| "--limit must be a positive integer".to_string())?,
+                );
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let mut offers = load_all_offers();
+    offers.retain(|o| o.status == "open");
+    if let Some(n) = limit {
+        offers.truncate(n);
+    }
+    let offer_values: Vec<serde_json::Value> = offers
+        .iter()
+        .map(|offer| {
+            let mut export = serde_json::to_value(offer).unwrap_or_default();
+            if let Some(obj) = export.as_object_mut() {
+                obj.remove("source");
+                obj.remove("agreement_id");
+                obj.remove("agreement_hash");
+                obj.remove("buyer_address");
+                obj.remove("taken_at");
+            }
+            export
+        })
+        .collect();
+    let feed = OfferFeed {
+        version: "1".to_string(),
+        node_url: None,
+        exported_at: now_unix(),
+        count: offer_values.len(),
+        offers: offer_values,
+    };
+    let json =
+        serde_json::to_string_pretty(&feed).map_err(|e| format!("serialize feed: {e}"))?;
+    if let Some(ref path) = out_path {
+        std::fs::write(path, &json).map_err(|e| format!("write {path}: {e}"))?;
+        eprintln!("written {}", path);
+        println!("count  {}", feed.count);
+        println!("out    {}", path);
+    } else {
+        println!("{}", json);
+    }
+    Ok(())
+}
+
+fn handle_offer_feed_fetch(args: &[String]) -> Result<(), String> {
+    let mut url: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--url" => url = Some(parse_required_string_flag(args, &mut i, "--url")?),
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let url_val = url.ok_or_else(|| "--url is required".to_string())?;
+    if !url_val.starts_with("http://") && !url_val.starts_with("https://") {
+        return Err(format!("invalid URL: must start with http:// or https://"));
+    }
+    let source_tag = format!("remote:{}", url_val);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP client: {e}"))?;
+    let response = client
+        .get(&url_val)
+        .send()
+        .map_err(|e| format!("fetch {url_val}: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("fetch failed: HTTP {}", response.status()));
+    }
+    let body = response.text().map_err(|e| format!("read response: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid JSON from feed: {e}"))?;
+    let offer_values: Vec<serde_json::Value> = if let Some(arr) = v.as_array() {
+        arr.clone()
+    } else if let Some(obj) = v.as_object() {
+        obj.get("offers")
+            .and_then(|o| o.as_array())
+            .ok_or_else(|| "response missing offers array".to_string())?
+            .clone()
+    } else {
+        return Err("unexpected feed response format".to_string());
+    };
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = 0usize;
+    for val in &offer_values {
+        let json_str = serde_json::to_string(val).unwrap_or_default();
+        match import_single_offer_with_source(&json_str, &source_tag) {
+            Ok(true) => imported += 1,
+            Ok(false) => skipped += 1,
+            Err(_) => errors += 1,
+        }
+    }
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source": url_val,
+                "total": offer_values.len(),
+                "imported": imported,
+                "skipped": skipped,
+                "errors": errors,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("source   {}", url_val);
+        println!("total    {}", offer_values.len());
+        println!("imported {}", imported);
+        println!("skipped  {} (already in local store)", skipped);
+        if errors > 0 {
+            println!("errors   {}", errors);
+        }
+        if imported > 0 {
+            println!();
+            println!("next_step  irium-wallet offer-list --source remote");
+        }
+    }
+    Ok(())
 }
 
 fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
@@ -15780,6 +15964,248 @@ found true"
         assert!(result.is_ok());
     }
 
+
+    // ================================================================
+    // Offer Discovery Layer tests
+    // ================================================================
+
+    fn make_open_offer(id: &str, src: Option<&str>, seller_pk: Option<&str>) -> IrmOffer {
+        IrmOffer {
+            offer_id: id.to_string(),
+            seller_address: "Qseller0000000000000000000000000000000".to_string(),
+            amount_irm: 1_000_000,
+            price_note: None,
+            payment_method: "bank-transfer".to_string(),
+            payment_instructions: None,
+            timeout_height: 9999,
+            created_at: 1,
+            status: "open".to_string(),
+            agreement_id: None,
+            agreement_hash: None,
+            buyer_address: None,
+            taken_at: None,
+            source: src.map(|s| s.to_string()),
+            seller_pubkey: seller_pk.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn offer_feed_export_empty_returns_valid_feed() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("feed-export-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let result = handle_offer_feed_export(&[]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_feed_export_filters_to_open_only() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("feed-export-open");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let mut open_offer = make_open_offer("feed-open-1", None, None);
+        open_offer.status = "open".to_string();
+        save_offer(&open_offer).unwrap();
+        let mut taken_offer = make_open_offer("feed-taken-1", None, None);
+        taken_offer.status = "taken".to_string();
+        save_offer(&taken_offer).unwrap();
+        let out = dir.join("feed.json");
+        let result = handle_offer_feed_export(&[
+            "--out".to_string(),
+            out.display().to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        assert!(result.is_ok());
+        let feed_json = std::fs::read_to_string(&out).unwrap();
+        let feed: serde_json::Value = serde_json::from_str(&feed_json).unwrap();
+        assert_eq!(feed["count"].as_u64().unwrap(), 1);
+        assert_eq!(feed["offers"][0]["offer_id"].as_str().unwrap(), "feed-open-1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn offer_feed_export_limit_truncates_results() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("feed-export-limit");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        for i in 0..5 {
+            save_offer(&make_open_offer(&format!("feed-lim-{}", i), None, None)).unwrap();
+        }
+        let out = dir.join("feed-limited.json");
+        let result = handle_offer_feed_export(&[
+            "--out".to_string(),
+            out.display().to_string(),
+            "--limit".to_string(),
+            "2".to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        assert!(result.is_ok());
+        let feed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(feed["count"].as_u64().unwrap(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn offer_feed_export_strips_private_fields() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("feed-export-strip");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let mut offer = make_open_offer("feed-strip-1", Some("local"), None);
+        offer.agreement_id = Some("agr-123".to_string());
+        offer.buyer_address = Some("Qbuyer".to_string());
+        offer.taken_at = Some(999);
+        save_offer(&offer).unwrap();
+        let out = dir.join("feed-strip.json");
+        let result = handle_offer_feed_export(&[
+            "--out".to_string(),
+            out.display().to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        assert!(result.is_ok());
+        let feed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let offer_val = &feed["offers"][0];
+        assert!(offer_val.get("source").is_none());
+        assert!(offer_val.get("agreement_id").is_none());
+        assert!(offer_val.get("buyer_address").is_none());
+        assert!(offer_val.get("taken_at").is_none());
+        assert_eq!(offer_val["offer_id"].as_str().unwrap(), "feed-strip-1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn offer_feed_export_invalid_limit_returns_error() {
+        let result = handle_offer_feed_export(&["--limit".to_string(), "abc".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("positive integer"));
+    }
+
+    #[test]
+    fn offer_feed_fetch_missing_url_returns_error() {
+        let result = handle_offer_feed_fetch(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--url"));
+    }
+
+    #[test]
+    fn offer_feed_fetch_invalid_url_scheme_returns_error() {
+        let result =
+            handle_offer_feed_fetch(&["--url".to_string(), "ftp://bad.example".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid URL"));
+    }
+
+    #[test]
+    fn offer_feed_fetch_unknown_arg_returns_error() {
+        let result = handle_offer_feed_fetch(&["--bogus".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn import_single_offer_with_source_deduplicates() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("feed-dedup");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let offer = make_open_offer("feed-dedup-1", None, None);
+        let json = serde_json::to_string(&offer).unwrap();
+        let r1 = import_single_offer_with_source(&json, "remote:http://node-a:8080/feed");
+        assert!(matches!(r1, Ok(true)));
+        let r2 = import_single_offer_with_source(&json, "remote:http://node-a:8080/feed");
+        assert!(matches!(r2, Ok(false)));
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn import_single_offer_with_source_sets_source_tag() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("feed-src-tag");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let offer = make_open_offer("feed-src-tag-1", None, None);
+        let json = serde_json::to_string(&offer).unwrap();
+        let tag = "remote:http://node-b:8080/offers/feed";
+        import_single_offer_with_source(&json, tag).unwrap();
+        let loaded = load_offer("feed-src-tag-1").unwrap();
+        assert_eq!(loaded.source.as_deref().unwrap(), tag);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn offer_list_source_remote_filter_works() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("src-remote-filter");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        save_offer(&make_open_offer("rem-1", Some("remote:http://node-a/feed"), None)).unwrap();
+        save_offer(&make_open_offer("rem-2", Some("remote:http://node-b/feed"), None)).unwrap();
+        save_offer(&make_open_offer("loc-1", None, None)).unwrap();
+        let result = handle_offer_list(&["--source".to_string(), "remote".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_list_source_all_returns_all() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("src-all-filter");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        save_offer(&make_open_offer("all-1", None, None)).unwrap();
+        save_offer(&make_open_offer("all-2", Some("imported"), None)).unwrap();
+        save_offer(&make_open_offer("all-3", Some("remote:http://x/feed"), None)).unwrap();
+        let result = handle_offer_list(&["--source".to_string(), "all".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_list_seller_filter_by_address() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("seller-filter");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        save_offer(&make_open_offer("sel-1", None, None)).unwrap();
+        let mut other = make_open_offer("sel-2", None, None);
+        other.seller_address = "Qother000000000000000000000000000000".to_string();
+        save_offer(&other).unwrap();
+        let result = handle_offer_list(&[
+            "--seller".to_string(),
+            "Qseller0000000000000000000000000000000".to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_feed_export_version_field_is_one() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("feed-version");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        save_offer(&make_open_offer("ver-1", None, None)).unwrap();
+        let out = dir.join("feed-ver.json");
+        handle_offer_feed_export(&["--out".to_string(), out.display().to_string()]).unwrap();
+        env::remove_var("IRIUM_OFFERS_DIR");
+        let feed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(feed["version"].as_str().unwrap(), "1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn offer_export_missing_offer_returns_error() {
         let _guard = test_guard();
@@ -20826,6 +21252,18 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "offer-fetch" => {
             if let Err(e) = handle_offer_fetch(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "offer-feed-export" => {
+            if let Err(e) = handle_offer_feed_export(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "offer-feed-fetch" => {
+            if let Err(e) = handle_offer_feed_fetch(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
