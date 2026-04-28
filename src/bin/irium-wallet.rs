@@ -17,10 +17,12 @@ use irium_node_rs::settlement::{
     AgreementMilestone, AgreementObject, AgreementParty, AgreementSharePackage,
     AgreementSharePackageInspection, AgreementSharePackageVerificationResult,
     AgreementSignatureEnvelope, AgreementSignatureTargetType, AgreementSignatureVerification,
-    AgreementStatement, AgreementSummary, AgreementTemplateType, HoldbackEvaluationResult,
-    HoldbackOutcome, MilestoneEvaluationResult, PolicyOutcome, ProofPolicy, ProofSignatureEnvelope,
-    SettlementProof, TypedProofPayload, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
-    AGREEMENT_SIGNATURE_VERSION, SETTLEMENT_PROOF_SCHEMA_ID,
+    AgreementStatement, AgreementSummary, AgreementTemplateType, ApprovedAttestor,
+    HoldbackEvaluationResult, HoldbackOutcome, MilestoneEvaluationResult, NoResponseRule,
+    NoResponseTrigger, PolicyOutcome, ProofPolicy, ProofRequirement, ProofResolution,
+    ProofSignatureEnvelope, SettlementProof, TypedProofPayload,
+    AGREEMENT_SIGNATURE_TYPE_SECP256K1, AGREEMENT_SIGNATURE_VERSION,
+    PROOF_POLICY_SCHEMA_ID, SETTLEMENT_PROOF_SCHEMA_ID,
 };
 use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
 use k256::ecdsa::signature::hazmat::PrehashSigner;
@@ -2156,9 +2158,14 @@ fn usage() {
     eprintln!("  irium-wallet otc-settle --agreement <hash|id|path> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet otc-status --agreement <hash|id|path> [--rpc <url>]");
     eprintln!("  irium-wallet offer-create --seller <addr> --amount <irm> --payment-method <text> --timeout <height> [--price-note <text>] [--payment-instructions <text>] [--offer-id <id>] [--json]");
-    eprintln!("  irium-wallet offer-list [--status open|taken|settled] [--json]");
+    eprintln!("  irium-wallet offer-list [--status open|taken|settled] [--source local|imported] [--json]");
     eprintln!("  irium-wallet offer-show --offer <offer_id> [--json]");
     eprintln!("  irium-wallet offer-take --offer <offer_id> --buyer <addr> [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet offer-export --offer <offer_id> --out <file>");
+    eprintln!("  irium-wallet offer-import --file <file> [--json]");
+    eprintln!("  irium-wallet offer-fetch --url <http-url> [--json]");
+    eprintln!("  irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet agreement-unpack --file <file> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet flow-otc-demo");
 }
 
@@ -7029,6 +7036,10 @@ struct IrmOffer {
     buyer_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     taken_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seller_pubkey: Option<String>,
 }
 
 fn offers_dir() -> PathBuf {
@@ -7084,6 +7095,9 @@ fn render_offer_summary(offer: &IrmOffer) -> String {
     let mut lines = Vec::new();
     lines.push(format!("offer_id         {}", offer.offer_id));
     lines.push(format!("status           {}", offer.status));
+    if let Some(ref src) = offer.source {
+        lines.push(format!("source           {}", src));
+    }
     lines.push(format!("seller           {}", offer.seller_address));
     lines.push(format!("amount_irm       {} IRM", format_irm(offer.amount_irm)));
     lines.push(format!("payment_method   {}", offer.payment_method));
@@ -7149,6 +7163,8 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
     let now = now_unix();
     let id = offer_id.unwrap_or_else(|| format!("offer-{}", now));
 
+    let seller_pubkey = resolve_attestor_pubkey_hex(&seller_addr).ok();
+
     let offer = IrmOffer {
         offer_id: id.clone(),
         seller_address: seller_addr,
@@ -7163,6 +7179,8 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
         agreement_hash: None,
         buyer_address: None,
         taken_at: None,
+        source: Some("local".to_string()),
+        seller_pubkey,
     };
 
     let path = save_offer(&offer)?;
@@ -7176,7 +7194,7 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
         println!();
         println!("saved_path      {}", path.display());
         println!();
-        println!("next_step  share this offer then run: irium-wallet offer-take --offer {} --buyer <buyer_address>", id);
+        println!("next_step  export and share offer: irium-wallet offer-export --offer {} --out offer.json", id);
     }
     Ok(())
 }
@@ -7184,17 +7202,22 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
 fn handle_offer_list(args: &[String]) -> Result<(), String> {
     let mut json_mode = false;
     let mut status_filter: Option<String> = None;
+    let mut source_filter: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--json"   => { json_mode = true; i += 1; }
             "--status" => { status_filter = Some(parse_required_string_flag(args, &mut i, "--status")?); }
+            "--source" => { source_filter = Some(parse_required_string_flag(args, &mut i, "--source")?); }
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
     let mut offers = load_all_offers();
     if let Some(ref sf) = status_filter {
         offers.retain(|o| &o.status == sf);
+    }
+    if let Some(ref sf) = source_filter {
+        offers.retain(|o| o.source.as_deref().unwrap_or("local") == sf.as_str());
     }
     if json_mode {
         let list: Vec<serde_json::Value> = offers.iter()
@@ -7213,6 +7236,9 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
             println!();
             println!("offer_id       {}", offer.offer_id);
             println!("status         {}", offer.status);
+            if let Some(ref src) = offer.source {
+                println!("source         {}", src);
+            }
             println!("seller         {}", offer.seller_address);
             println!("amount_irm     {} IRM", format_irm(offer.amount_irm));
             println!("payment_method {}", offer.payment_method);
@@ -7252,6 +7278,46 @@ fn handle_offer_show(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn build_default_otc_policy(
+    policy_id: &str,
+    agreement_hash: &str,
+    seller_pubkey: &str,
+    timeout_height: u64,
+) -> ProofPolicy {
+    ProofPolicy {
+        policy_id: policy_id.to_string(),
+        schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+        agreement_hash: agreement_hash.to_string(),
+        required_proofs: vec![ProofRequirement {
+            requirement_id: "req-release".to_string(),
+            proof_type: "otc_release".to_string(),
+            required_by: Some(timeout_height),
+            required_attestor_ids: vec!["seller-attestor".to_string()],
+            resolution: ProofResolution::Release,
+            milestone_id: None,
+            threshold: None,
+        }],
+        no_response_rules: vec![NoResponseRule {
+            rule_id: "rule-timeout-refund".to_string(),
+            deadline_height: timeout_height,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: Some("refund if release proof not submitted by deadline".to_string()),
+        }],
+        attestors: vec![ApprovedAttestor {
+            attestor_id: "seller-attestor".to_string(),
+            pubkey_hex: seller_pubkey.to_string(),
+            display_name: None,
+            domain: None,
+        }],
+        notes: None,
+        expires_at_height: None,
+        milestones: vec![],
+        holdback: None,
+    }
 }
 
 fn handle_offer_take(args: &[String]) -> Result<(), String> {
@@ -7318,12 +7384,32 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     offer.taken_at       = Some(now);
     save_offer(&offer)?;
 
+    // Auto-build and store OTC policy on local node if seller_pubkey is known.
+    let mut auto_policy_id: Option<String> = None;
+    if let Some(ref pubkey) = offer.seller_pubkey {
+        let pol_id = format!("pol-{}", offer_id);
+        let policy = build_default_otc_policy(&pol_id, &agreement_hash, pubkey, offer.timeout_height);
+        let base = rpc_url.trim_end_matches('/');
+        match rpc_client(base).and_then(|client| {
+            let req = StorePolicyRpcRequest { policy, replace: false };
+            rpc_post_json::<StorePolicyRpcRequest, StorePolicyRpcResponse>(
+                &client, base, "/rpc/storepolicy", &req,
+            )
+        }) {
+            Ok(_) => { auto_policy_id = Some(pol_id); }
+            Err(e) => {
+                eprintln!("[warn] auto-policy store failed: {}; set policy manually with policy-build-otc", e);
+            }
+        }
+    }
+
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "offer_id":       offer_id,
-            "agreement_id":   agreement_id,
-            "agreement_hash": agreement_hash,
-            "saved_path":     saved_path.display().to_string(),
+            "offer_id":        offer_id,
+            "agreement_id":    agreement_id,
+            "agreement_hash":  agreement_hash,
+            "saved_path":      saved_path.display().to_string(),
+            "auto_policy_id":  auto_policy_id,
         })).unwrap());
         return Ok(());
     }
@@ -7337,15 +7423,21 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     println!("buyer           {}", buyer_addr);
     println!("amount_irm      {} IRM", format_irm(offer.amount_irm));
     println!("saved_path      {}", saved_path.display());
+    if let Some(ref pol_id) = auto_policy_id {
+        println!("policy_id       {} (auto-created)", pol_id);
+    }
     println!();
-    println!("=== Seller instructions ===");
-    println!("1. Build and set OTC policy:");
-    println!("   irium-wallet policy-build-otc --policy-id pol-{} --agreement-hash {} --attestor <id>:<pubkey_or_addr> --release-proof-type otc_release", offer_id, agreement_hash);
-    println!("   irium-wallet agreement-policy-set --policy <policy.json> --rpc {}", rpc_url);
-    println!("2. Fund the escrow (lock IRM):");
-    println!("   irium-wallet agreement-fund {} --rpc {}", agreement_hash, rpc_url);
+    println!("=== Next steps ===");
     println!();
-    println!("=== Buyer instructions ===");
+    println!("1. Export this agreement for seller:");
+    println!("   irium-wallet agreement-pack --agreement {} --out agreement-pkg.json --rpc {}", agreement_hash, rpc_url);
+    println!("   Send agreement-pkg.json to seller.");
+    println!();
+    println!("2. Seller imports the package:");
+    println!("   irium-wallet agreement-unpack --file agreement-pkg.json --rpc <seller-rpc>");
+    println!("   irium-wallet agreement-fund {} --rpc <seller-rpc>", agreement_hash);
+    println!();
+    println!("3. Make external payment:");
     println!("payment_method  {}", offer.payment_method);
     if let Some(ref pi) = offer.payment_instructions {
         println!("instructions    {}", pi);
@@ -7353,16 +7445,317 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     if let Some(ref pn) = offer.price_note {
         println!("price_note      {}", pn);
     }
-    println!("amount_irm      {} IRM to receive", format_irm(offer.amount_irm));
     println!();
-    println!("After making external payment, confirm with an attestor:");
-    println!("  irium-wallet otc-attest --agreement {} --message \"payment confirmed\" --address <attestor_address> --rpc {}", agreement_hash, rpc_url);
+    println!("4. Seller confirms payment with:");
+    println!("   irium-wallet agreement-proof-create \\");
+    println!("     --agreement-hash {} \\", agreement_hash);
+    println!("     --proof-type otc_release \\");
+    println!("     --attested-by seller-attestor \\");
+    println!("     --address <seller_address> \\");
+    println!("     --evidence-summary \"payment confirmed\" --out proof.json --rpc <seller-rpc>");
+    println!("   irium-wallet agreement-proof-submit --proof proof.json --rpc <seller-rpc>");
     println!();
-    println!("Or sign proof offline and submit separately:");
-    println!("  irium-wallet proof-sign --agreement {} --message \"payment confirmed\" --key <privkey>", agreement_hash);
-    println!("  irium-wallet proof-submit-json --file proof.json --rpc {}", rpc_url);
+    println!("5. Check release eligibility:");
+    println!("   irium-wallet agreement-policy-evaluate --agreement {} --rpc {}", agreement_hash, rpc_url);
     println!();
-    println!("next_step  seller: set policy and fund escrow; buyer: make external payment then submit proof");
+    println!("next_step  export agreement for seller: irium-wallet agreement-pack --agreement {} --out agreement-pkg.json --rpc {}", agreement_hash, rpc_url);
+    Ok(())
+}
+
+
+fn validate_offer_for_import(offer: &IrmOffer) -> Result<(), String> {
+    if offer.offer_id.is_empty() {
+        return Err("offer_id is missing or empty".to_string());
+    }
+    if offer.seller_address.is_empty() {
+        return Err("seller_address is missing or empty".to_string());
+    }
+    if offer.amount_irm == 0 {
+        return Err("amount_irm must be greater than zero".to_string());
+    }
+    if offer.payment_method.is_empty() {
+        return Err("payment_method is missing or empty".to_string());
+    }
+    if offer.timeout_height == 0 {
+        return Err("timeout_height must be greater than zero".to_string());
+    }
+    if offer.status != "open" {
+        return Err(format!(
+            "only open offers can be imported (status: {})",
+            offer.status
+        ));
+    }
+    Ok(())
+}
+
+fn import_offer_from_json(json: &str, json_mode: bool) -> Result<(), String> {
+    let mut offer: IrmOffer =
+        serde_json::from_str(json).map_err(|e| format!("invalid offer JSON: {e}"))?;
+    validate_offer_for_import(&offer)?;
+    if load_offer(&offer.offer_id).is_ok() {
+        return Err(format!(
+            "offer {} is already in local store",
+            offer.offer_id
+        ));
+    }
+    offer.source = Some("imported".to_string());
+    let saved_path = save_offer(&offer)?;
+    if json_mode {
+        let mut obj = serde_json::to_value(&offer).unwrap_or_default();
+        obj["saved_path"] = serde_json::Value::String(saved_path.display().to_string());
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap());
+    } else {
+        println!("imported        {}", offer.offer_id);
+        println!("source          imported");
+        println!("seller          {}", offer.seller_address);
+        println!("amount_irm      {} IRM", format_irm(offer.amount_irm));
+        println!("payment_method  {}", offer.payment_method);
+        println!("timeout_height  {}", offer.timeout_height);
+        println!("saved_path      {}", saved_path.display());
+        println!();
+        println!(
+            "next_step  irium-wallet offer-take --offer {} --buyer <your_address>",
+            offer.offer_id
+        );
+    }
+    Ok(())
+}
+
+fn handle_offer_export(args: &[String]) -> Result<(), String> {
+    let mut offer_ref: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--offer" => offer_ref = Some(parse_required_string_flag(args, &mut i, "--offer")?) ,
+            "--out"   => out_path  = Some(parse_required_string_flag(args, &mut i, "--out")?),
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let id  = offer_ref.ok_or_else(|| "--offer is required".to_string())?;
+    let out = out_path.ok_or_else(|| "--out is required".to_string())?;
+    let offer = load_offer(&id)?;
+    let mut export =
+        serde_json::to_value(&offer).map_err(|e| format!("serialize offer: {e}"))?;
+    if let Some(obj) = export.as_object_mut() {
+        obj.remove("source");
+        obj.remove("agreement_id");
+        obj.remove("agreement_hash");
+        obj.remove("buyer_address");
+        obj.remove("taken_at");
+    }
+    let json =
+        serde_json::to_string_pretty(&export).map_err(|e| format!("serialize offer: {e}"))?;
+    std::fs::write(&out, &json).map_err(|e| format!("write {out}: {e}"))?;
+    eprintln!("written {}", out);
+    println!("offer_id   {}", offer.offer_id);
+    println!("status     {}", offer.status);
+    println!("out        {}", out);
+    println!();
+    println!(
+        "next_step  share {} then recipient runs: irium-wallet offer-import --file <file>",
+        out
+    );
+    Ok(())
+}
+
+fn handle_offer_import(args: &[String]) -> Result<(), String> {
+    let mut file_path: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" => file_path = Some(parse_required_string_flag(args, &mut i, "--file")?),
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let path = file_path.ok_or_else(|| "--file is required".to_string())?;
+    if !std::path::Path::new(&path).exists() {
+        return Err(format!("file not found: {}", path));
+    }
+    let json =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
+    import_offer_from_json(&json, json_mode)
+}
+
+fn handle_offer_fetch(args: &[String]) -> Result<(), String> {
+    let mut url: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--url"  => url      = Some(parse_required_string_flag(args, &mut i, "--url")?),
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let url_val = url.ok_or_else(|| "--url is required".to_string())?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP client: {e}"))?;
+    let response = client
+        .get(&url_val)
+        .send()
+        .map_err(|e| format!("fetch {url_val}: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("fetch failed: HTTP {}", response.status()));
+    }
+    let json = response.text().map_err(|e| format!("read response: {e}"))?;
+    import_offer_from_json(&json, json_mode)
+}
+
+fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => { agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?); }
+            "--out"       => { out_path      = Some(parse_required_string_flag(args, &mut i, "--out")?); }
+            "--rpc"       => { rpc_url       = parse_required_string_flag(args, &mut i, "--rpc")?; }
+            "--json"      => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let agreement_id = agreement_ref.ok_or_else(|| "--agreement is required".to_string())?;
+    let out = out_path.ok_or_else(|| "--out is required".to_string())?;
+
+    let resolved = resolve_agreement_input(&agreement_id)?;
+    let agreement = resolved.agreement;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let display_id = agreement.agreement_id.clone();
+
+    // Try to fetch policy from RPC node (best-effort; None if unavailable).
+    let policy: Option<ProofPolicy> = {
+        let base = rpc_url.trim_end_matches('/');
+        match rpc_client(base).and_then(|client| {
+            let req = GetPolicyRpcRequest { agreement_hash: agreement_hash.clone() };
+            rpc_post_json::<GetPolicyRpcRequest, GetPolicyRpcResponse>(
+                &client, base, "/rpc/getpolicy", &req,
+            )
+        }) {
+            Ok(resp) if resp.found => resp.policy,
+            _ => None,
+        }
+    };
+
+    let has_policy = policy.is_some();
+    let bundle = serde_json::json!({
+        "schema": "irium.agreement_package.v1",
+        "agreement": &agreement,
+        "policy": &policy,
+    });
+    let json = serde_json::to_string_pretty(&bundle)
+        .map_err(|e| format!("serialize package: {e}"))?;
+    std::fs::write(&out, &json).map_err(|e| format!("write {}: {}", out, e))?;
+
+    eprintln!("written {}", out);
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "agreement_id":    display_id,
+            "agreement_hash":  agreement_hash,
+            "policy_included": has_policy,
+            "out":             out,
+        })).unwrap());
+    } else {
+        println!("agreement_id    {}", display_id);
+        println!("agreement_hash  {}", agreement_hash);
+        println!("policy_included {}", if has_policy { "yes" } else { "no" });
+        println!("out             {}", out);
+        println!();
+        println!(
+            "next_step  send {} to counterparty, they run: irium-wallet agreement-unpack --file <file> --rpc <url>",
+            out
+        );
+    }
+    Ok(())
+}
+
+fn handle_agreement_unpack(args: &[String]) -> Result<(), String> {
+    let mut file_path: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" => { file_path = Some(parse_required_string_flag(args, &mut i, "--file")?); }
+            "--rpc"  => { rpc_url   = parse_required_string_flag(args, &mut i, "--rpc")?; }
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let path = file_path.ok_or_else(|| "--file is required".to_string())?;
+    if !std::path::Path::new(&path).exists() {
+        return Err(format!("file not found: {}", path));
+    }
+    let data = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path, e))?;
+    let bundle: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| format!("invalid package JSON: {e}"))?;
+
+    let schema = bundle["schema"].as_str().unwrap_or("");
+    if !schema.is_empty() && schema != "irium.agreement_package.v1" {
+        return Err(format!("unsupported package schema: {}", schema));
+    }
+
+    let agreement: AgreementObject = serde_json::from_value(bundle["agreement"].clone())
+        .map_err(|e| format!("parse agreement from package: {e}"))?;
+
+    let (write_status, saved_path) =
+        save_agreement_to_store_checked(&imported_agreements_dir(), &agreement)?;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+
+    let mut policy_status = "none";
+    if let Some(policy_val) = bundle.get("policy").filter(|v| !v.is_null()) {
+        match serde_json::from_value::<ProofPolicy>(policy_val.clone()) {
+            Ok(policy) => {
+                let base = rpc_url.trim_end_matches('/');
+                match rpc_client(base).and_then(|client| {
+                    let req = StorePolicyRpcRequest { policy, replace: true };
+                    rpc_post_json::<StorePolicyRpcRequest, StorePolicyRpcResponse>(
+                        &client, base, "/rpc/storepolicy", &req,
+                    )
+                }) {
+                    Ok(_) => { policy_status = "stored"; }
+                    Err(e) => {
+                        eprintln!(
+                            "[warn] policy store failed: {}; set manually with agreement-policy-set",
+                            e
+                        );
+                        policy_status = "failed";
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[warn] policy in package is invalid: {}; skipped", e);
+                policy_status = "invalid";
+            }
+        }
+    }
+
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "agreement_id":   agreement.agreement_id,
+            "agreement_hash": agreement_hash,
+            "already_present": matches!(write_status, StoreWriteStatus::AlreadyPresent),
+            "saved_path":     saved_path.display().to_string(),
+            "policy_status":  policy_status,
+        })).unwrap());
+    } else {
+        println!("agreement_id    {}", agreement.agreement_id);
+        println!("agreement_hash  {}", agreement_hash);
+        println!("status          {}", match write_status {
+            StoreWriteStatus::Imported       => "imported",
+            StoreWriteStatus::AlreadyPresent => "already present",
+        });
+        println!("saved_path      {}", saved_path.display());
+        println!("policy_status   {}", policy_status);
+        println!();
+        println!("next_step  fund the escrow: irium-wallet agreement-fund {} --rpc {}", agreement_hash, rpc_url);
+    }
     Ok(())
 }
 
@@ -14827,6 +15220,8 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            source: None,
+            seller_pubkey: None,
         };
         let summary = render_offer_summary(&offer);
         assert!(summary.contains("test-offer-1"), "must contain offer_id");
@@ -14857,6 +15252,8 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            source: None,
+            seller_pubkey: None,
         };
         let path = save_offer(&offer).unwrap();
         assert!(path.exists(), "offer file must exist after save");
@@ -14890,6 +15287,8 @@ found true"
                 agreement_hash: None,
                 buyer_address: None,
                 taken_at: None,
+                source: None,
+                seller_pubkey: None,
             };
             save_offer(&o).unwrap();
         }
@@ -14921,6 +15320,8 @@ found true"
             agreement_hash: Some("aa".repeat(32)),
             buyer_address: Some("Qbuyer1111111111111111111111111111111".to_string()),
             taken_at: Some(2),
+            source: None,
+            seller_pubkey: None,
         };
         save_offer(&offer).unwrap();
         let result = handle_offer_take(&[
@@ -14987,10 +15388,488 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            source: None,
+            seller_pubkey: None,
         };
         let summary = render_offer_summary(&offer);
         assert!(summary.contains("1970-01-01"), "summary must include human date: {}", summary);
     }
+    #[test]
+    fn offer_export_creates_file_with_correct_content() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("export-rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let offer = IrmOffer {
+            offer_id: "export-test".to_string(),
+            seller_address: "QsellerTest".to_string(),
+            amount_irm: 500_000_000,
+            price_note: None,
+            payment_method: "bank".to_string(),
+            payment_instructions: None,
+            timeout_height: 2000,
+            created_at: 12345,
+            status: "open".to_string(),
+            agreement_id: None,
+            agreement_hash: None,
+            buyer_address: None,
+            taken_at: None,
+            source: Some("local".to_string()),
+            seller_pubkey: None,
+        };
+        save_offer(&offer).unwrap();
+        let out = dir.join("export-test-out.json");
+        let result = handle_offer_export(&[
+            "--offer".to_string(),
+            "export-test".to_string(),
+            "--out".to_string(),
+            out.display().to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        assert!(result.is_ok(), "export must succeed: {:?}", result);
+        assert!(out.exists(), "output file must be created");
+        let content = std::fs::read_to_string(&out).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["offer_id"], "export-test");
+        assert_eq!(parsed["seller_address"], "QsellerTest");
+        assert!(parsed.get("source").map(|v| v.is_null()).unwrap_or(true),
+            "source must be stripped from export");
+        assert!(parsed.get("agreement_id").map(|v| v.is_null()).unwrap_or(true),
+            "agreement_id must be stripped from export");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn offer_import_roundtrip_sets_source_imported() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("import-rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let offer_json = serde_json::json!({
+            "offer_id": "imported-offer-rt",
+            "seller_address": "QsellerTest",
+            "amount_irm": 100_000_000u64,
+            "payment_method": "bank-transfer",
+            "timeout_height": 5000u64,
+            "created_at": 9999u64,
+            "status": "open"
+        });
+        let json_str = serde_json::to_string(&offer_json).unwrap();
+        let result = import_offer_from_json(&json_str, false);
+        assert!(result.is_ok(), "import must succeed: {:?}", result);
+        let loaded = load_offer("imported-offer-rt").unwrap();
+        assert_eq!(loaded.source.as_deref(), Some("imported"),
+            "source must be imported");
+        assert_eq!(loaded.amount_irm, 100_000_000);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn offer_import_invalid_json_returns_error() {
+        let result = import_offer_from_json("not valid json {{", false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid offer JSON"));
+    }
+
+    #[test]
+    fn offer_import_zero_amount_returns_error() {
+        let offer_json = serde_json::json!({
+            "offer_id": "zero-amt",
+            "seller_address": "QsellerTest",
+            "amount_irm": 0u64,
+            "payment_method": "bank",
+            "timeout_height": 1000u64,
+            "created_at": 1u64,
+            "status": "open"
+        });
+        let result = import_offer_from_json(&serde_json::to_string(&offer_json).unwrap(), false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("amount_irm must be greater than zero"));
+    }
+
+    #[test]
+    fn offer_import_non_open_status_returns_error() {
+        let offer_json = serde_json::json!({
+            "offer_id": "taken-offer",
+            "seller_address": "QsellerTest",
+            "amount_irm": 100_000_000u64,
+            "payment_method": "bank",
+            "timeout_height": 1000u64,
+            "created_at": 1u64,
+            "status": "taken"
+        });
+        let result = import_offer_from_json(&serde_json::to_string(&offer_json).unwrap(), false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("only open offers can be imported"));
+    }
+
+    #[test]
+    fn offer_import_duplicate_returns_error() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("import-dup");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let offer_json = serde_json::json!({
+            "offer_id": "dup-offer",
+            "seller_address": "QsellerTest",
+            "amount_irm": 100_000_000u64,
+            "payment_method": "bank",
+            "timeout_height": 5000u64,
+            "created_at": 1u64,
+            "status": "open"
+        });
+        let json_str = serde_json::to_string(&offer_json).unwrap();
+        import_offer_from_json(&json_str, false).unwrap();
+        let result = import_offer_from_json(&json_str, false);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already in local store"));
+    }
+
+    #[test]
+    fn offer_list_source_filter_local_only() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("src-filter-local");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        for (id, src_val) in [("loc1", "local"), ("imp1", "imported")] {
+            let o = IrmOffer {
+                offer_id: id.to_string(),
+                seller_address: "Q".to_string(),
+                amount_irm: 1,
+                price_note: None,
+                payment_method: "test".to_string(),
+                payment_instructions: None,
+                timeout_height: 10,
+                created_at: 1,
+                status: "open".to_string(),
+                agreement_id: None,
+                agreement_hash: None,
+                buyer_address: None,
+                taken_at: None,
+                source: Some(src_val.to_string()),
+                seller_pubkey: None,
+            };
+            save_offer(&o).unwrap();
+        }
+        let result = handle_offer_list(&["--source".to_string(), "local".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_list_source_filter_imported_only() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("src-filter-imported");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        for (id, src_val) in [("loc2", "local"), ("imp2", "imported")] {
+            let o = IrmOffer {
+                offer_id: id.to_string(),
+                seller_address: "Q".to_string(),
+                amount_irm: 1,
+                price_note: None,
+                payment_method: "test".to_string(),
+                payment_instructions: None,
+                timeout_height: 10,
+                created_at: 1,
+                status: "open".to_string(),
+                agreement_id: None,
+                agreement_hash: None,
+                buyer_address: None,
+                taken_at: None,
+                source: Some(src_val.to_string()),
+                seller_pubkey: None,
+            };
+            save_offer(&o).unwrap();
+        }
+        let result = handle_offer_list(&["--source".to_string(), "imported".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_export_missing_offer_returns_error() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("export-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let result = handle_offer_export(&[
+            "--offer".to_string(), "no-such-offer".to_string(),
+            "--out".to_string(), "/tmp/nope.json".to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn offer_export_missing_out_returns_error() {
+        let result = handle_offer_export(&["--offer".to_string(), "some-offer".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--out is required"));
+    }
+
+    #[test]
+    fn offer_import_missing_file_flag_returns_error() {
+        let result = handle_offer_import(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--file is required"));
+    }
+
+    #[test]
+    fn offer_import_file_not_found_returns_error() {
+        let result = handle_offer_import(&[
+            "--file".to_string(),
+            "/tmp/nonexistent-irium-offer-99999.json".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("file not found"));
+    }
+
+    #[test]
+    fn offer_fetch_missing_url_returns_error() {
+        let result = handle_offer_fetch(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--url is required"));
+    }
+
+    #[test]
+    fn offer_fetch_invalid_url_returns_error() {
+        let result = handle_offer_fetch(&["--url".to_string(), "not-a-url".to_string()]);
+        assert!(result.is_err());
+    }
+
+    // ── New tests: OTC friction reduction ─────────────────────────────────────
+
+    #[test]
+    fn build_default_otc_policy_sets_correct_fields() {
+        let policy = build_default_otc_policy(
+            "pol-test-001",
+            "aabbccdd".repeat(8).as_str(),
+            "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233",
+            5000,
+        );
+        assert_eq!(policy.policy_id, "pol-test-001");
+        assert_eq!(policy.attestors.len(), 1);
+        assert_eq!(policy.attestors[0].attestor_id, "seller-attestor");
+        assert_eq!(
+            policy.attestors[0].pubkey_hex,
+            "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233"
+        );
+        assert_eq!(policy.required_proofs.len(), 1);
+        assert_eq!(policy.required_proofs[0].proof_type, "otc_release");
+        assert_eq!(policy.required_proofs[0].required_by, Some(5000));
+        assert_eq!(
+            policy.required_proofs[0].required_attestor_ids,
+            vec!["seller-attestor".to_string()]
+        );
+        assert_eq!(policy.no_response_rules.len(), 1);
+        assert_eq!(policy.no_response_rules[0].deadline_height, 5000);
+    }
+
+    #[test]
+    fn offer_create_sets_seller_pubkey_when_wallet_has_address() {
+        // seller_pubkey is populated when resolve_attestor_pubkey_hex succeeds.
+        // Without a real wallet we just verify the IrmOffer field serializes correctly.
+        let offer = IrmOffer {
+            offer_id: "pk-test".to_string(),
+            seller_address: "Qseller".to_string(),
+            amount_irm: 1_000_000,
+            price_note: None,
+            payment_method: "bank".to_string(),
+            payment_instructions: None,
+            timeout_height: 1000,
+            created_at: 1,
+            status: "open".to_string(),
+            agreement_id: None,
+            agreement_hash: None,
+            buyer_address: None,
+            taken_at: None,
+            source: Some("local".to_string()),
+            seller_pubkey: Some("03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string()),
+        };
+        let json = serde_json::to_string(&offer).unwrap();
+        assert!(json.contains("seller_pubkey"), "seller_pubkey must be serialized when Some");
+        let roundtrip: IrmOffer = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            roundtrip.seller_pubkey.as_deref(),
+            Some("03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233")
+        );
+    }
+
+    #[test]
+    fn offer_export_includes_seller_pubkey() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("export-pk");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let offer = IrmOffer {
+            offer_id: "pk-export".to_string(),
+            seller_address: "Qseller".to_string(),
+            amount_irm: 1_000_000,
+            price_note: None,
+            payment_method: "bank".to_string(),
+            payment_instructions: None,
+            timeout_height: 999,
+            created_at: 1,
+            status: "open".to_string(),
+            agreement_id: None,
+            agreement_hash: None,
+            buyer_address: None,
+            taken_at: None,
+            source: Some("local".to_string()),
+            seller_pubkey: Some("03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string()),
+        };
+        save_offer(&offer).unwrap();
+        let out = dir.join("pk-export-out.json");
+        let result = handle_offer_export(&[
+            "--offer".to_string(), "pk-export".to_string(),
+            "--out".to_string(), out.display().to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        assert!(result.is_ok(), "export must succeed");
+        let content = std::fs::read_to_string(&out).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["seller_pubkey"].as_str(),
+            Some("03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233"),
+            "seller_pubkey must be preserved in export"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn offer_import_preserves_seller_pubkey() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("import-pk");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let offer_json = serde_json::json!({
+            "offer_id": "imported-with-pk",
+            "seller_address": "Qseller",
+            "amount_irm": 1_000_000u64,
+            "payment_method": "bank",
+            "timeout_height": 2000u64,
+            "created_at": 1u64,
+            "status": "open",
+            "seller_pubkey": "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233"
+        });
+        let result = import_offer_from_json(&serde_json::to_string(&offer_json).unwrap(), false);
+        assert!(result.is_ok(), "import must succeed: {:?}", result);
+        let loaded = load_offer("imported-with-pk").unwrap();
+        assert_eq!(
+            loaded.seller_pubkey.as_deref(),
+            Some("03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233"),
+            "seller_pubkey must survive import roundtrip"
+        );
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agreement_pack_missing_agreement_returns_error() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("pack-miss-agr");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_IMPORTED_AGREEMENTS_DIR", dir.display().to_string());
+        env::set_var("IRIUM_AGREEMENT_BUNDLES_DIR", dir.display().to_string());
+        let result = handle_agreement_pack(&[
+            "--agreement".to_string(), "no-such-agreement".to_string(),
+            "--out".to_string(), "/tmp/nope.json".to_string(),
+        ]);
+        env::remove_var("IRIUM_IMPORTED_AGREEMENTS_DIR");
+        env::remove_var("IRIUM_AGREEMENT_BUNDLES_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn agreement_pack_missing_agreement_flag_returns_error() {
+        let result = handle_agreement_pack(&["--out".to_string(), "/tmp/nope.json".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--agreement is required"));
+    }
+
+    #[test]
+    fn agreement_pack_missing_out_flag_returns_error() {
+        let result = handle_agreement_pack(&["--agreement".to_string(), "some-id".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--out is required"));
+    }
+
+    #[test]
+    fn agreement_unpack_missing_file_flag_returns_error() {
+        let result = handle_agreement_unpack(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--file is required"));
+    }
+
+    #[test]
+    fn agreement_unpack_file_not_found_returns_error() {
+        let result = handle_agreement_unpack(&[
+            "--file".to_string(),
+            "/tmp/nonexistent-irium-pkg-99999.json".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("file not found"));
+    }
+
+    #[test]
+    fn agreement_unpack_invalid_json_returns_error() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("unpack-bad-json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pkg_path = dir.join("bad.json");
+        std::fs::write(&pkg_path, "{ not valid json {{").unwrap();
+        let result = handle_agreement_unpack(&[
+            "--file".to_string(), pkg_path.display().to_string(),
+        ]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid package JSON"));
+    }
+
+    #[test]
+    fn agreement_unpack_wrong_schema_returns_error() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("unpack-bad-schema");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pkg_path = dir.join("wrong-schema.json");
+        let pkg = serde_json::json!({
+            "schema": "irium.some_other_format.v99",
+            "agreement": {},
+            "policy": null
+        });
+        std::fs::write(&pkg_path, serde_json::to_string(&pkg).unwrap()).unwrap();
+        let result = handle_agreement_unpack(&[
+            "--file".to_string(), pkg_path.display().to_string(),
+        ]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unsupported package schema"));
+    }
+
+    #[test]
+    fn agreement_pack_unknown_flag_returns_error() {
+        let result = handle_agreement_pack(&["--bogus".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn agreement_unpack_unknown_flag_returns_error() {
+        let result = handle_agreement_unpack(&["--bogus".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+
 }
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -19732,6 +20611,36 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "offer-take" => {
             if let Err(e) = handle_offer_take(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "offer-export" => {
+            if let Err(e) = handle_offer_export(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "offer-import" => {
+            if let Err(e) = handle_offer_import(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "offer-fetch" => {
+            if let Err(e) = handle_offer_fetch(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-pack" => {
+            if let Err(e) = handle_agreement_pack(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-unpack" => {
+            if let Err(e) = handle_agreement_unpack(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
