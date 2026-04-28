@@ -2167,7 +2167,8 @@ fn usage() {
     eprintln!("  irium-wallet offer-import --file <file> [--json]");
     eprintln!("  irium-wallet offer-fetch --url <http-url> [--json]");
     eprintln!("  irium-wallet offer-feed-export [--out <file>] [--limit <n>]");
-    eprintln!("  irium-wallet offer-feed-fetch --url <feed-endpoint> [--json]");
+    eprintln!("  irium-wallet offer-feed-fetch --url <feed-endpoint> [--url <feed-endpoint> ...] [--json]");
+    eprintln!("  irium-wallet offer-feed-sync [--json]");
     eprintln!(
         "  irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]"
     );
@@ -7824,13 +7825,193 @@ fn handle_offer_feed_export(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+struct FeedFetchResult {
+    url: String,
+    imported: usize,
+    skipped: usize,
+    errors: usize,
+    fetch_error: Option<String>,
+}
+
+fn fetch_single_feed(url: &str) -> FeedFetchResult {
+    let mut result = FeedFetchResult {
+        url: url.to_string(),
+        imported: 0,
+        skipped: 0,
+        errors: 0,
+        fetch_error: None,
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            result.fetch_error = Some(format!("HTTP client: {e}"));
+            return result;
+        }
+    };
+    let response = match client.get(url).send() {
+        Ok(r) => r,
+        Err(e) => {
+            result.fetch_error = Some(format!("fetch {url}: {e}"));
+            return result;
+        }
+    };
+    if !response.status().is_success() {
+        result.fetch_error = Some(format!("HTTP {}", response.status()));
+        return result;
+    }
+    let body = match response.text() {
+        Ok(b) => b,
+        Err(e) => {
+            result.fetch_error = Some(format!("read response: {e}"));
+            return result;
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            result.fetch_error = Some(format!("invalid JSON: {e}"));
+            return result;
+        }
+    };
+    let offer_values: Vec<serde_json::Value> = if let Some(arr) = v.as_array() {
+        arr.clone()
+    } else if let Some(obj) = v.as_object() {
+        match obj.get("offers").and_then(|o| o.as_array()) {
+            Some(arr) => arr.clone(),
+            None => {
+                result.fetch_error = Some("response missing offers array".to_string());
+                return result;
+            }
+        }
+    } else {
+        result.fetch_error = Some("unexpected feed response format".to_string());
+        return result;
+    };
+    let source_tag = format!("remote:{}", url);
+    for val in &offer_values {
+        let json_str = serde_json::to_string(val).unwrap_or_default();
+        match import_single_offer_with_source(&json_str, &source_tag) {
+            Ok(true) => result.imported += 1,
+            Ok(false) => result.skipped += 1,
+            Err(_) => result.errors += 1,
+        }
+    }
+    result
+}
+
+fn feeds_config_path() -> std::path::PathBuf {
+    irium_data_dir().join("feeds.json")
+}
+
+fn load_feeds_config() -> Result<Vec<String>, String> {
+    let path = feeds_config_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| format!("invalid feeds.json: {e}"))?;
+    let arr = v
+        .get("feeds")
+        .and_then(|f| f.as_array())
+        .ok_or_else(|| "feeds.json must have a \"feeds\" array".to_string())?;
+    let mut urls = Vec::new();
+    for entry in arr {
+        if let Some(s) = entry.as_str() {
+            urls.push(s.to_string());
+        }
+    }
+    Ok(urls)
+}
+
+fn print_feed_results(results: &[FeedFetchResult], json_mode: bool) {
+    let total_imported: usize = results.iter().map(|r| r.imported).sum();
+    let total_skipped: usize = results.iter().map(|r| r.skipped).sum();
+    let total_errors: usize = results
+        .iter()
+        .map(|r| r.errors + if r.fetch_error.is_some() { 1 } else { 0 })
+        .sum();
+
+    if json_mode {
+        let per_feed: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                if let Some(ref e) = r.fetch_error {
+                    serde_json::json!({
+                        "url": r.url,
+                        "error": e,
+                    })
+                } else {
+                    serde_json::json!({
+                        "url": r.url,
+                        "imported": r.imported,
+                        "skipped": r.skipped,
+                        "errors": r.errors,
+                    })
+                }
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "feeds_processed": results.len(),
+                "total_imported": total_imported,
+                "total_skipped": total_skipped,
+                "total_errors": total_errors,
+                "feeds": per_feed,
+            }))
+            .unwrap()
+        );
+    } else {
+        if results.len() == 1 {
+            let r = &results[0];
+            if let Some(ref e) = r.fetch_error {
+                println!("source   {}", r.url);
+                println!("error    {}", e);
+            } else {
+                println!("source   {}", r.url);
+                println!("total    {}", r.imported + r.skipped + r.errors);
+                println!("imported {}", r.imported);
+                println!("skipped  {} (already in local store)", r.skipped);
+                if r.errors > 0 {
+                    println!("errors   {}", r.errors);
+                }
+            }
+        } else {
+            println!("Processed {} feeds:", results.len());
+            for r in results {
+                if let Some(ref e) = r.fetch_error {
+                    println!("  {} -> error: {}", r.url, e);
+                } else {
+                    println!(
+                        "  {} -> imported: {} skipped: {} errors: {}",
+                        r.url, r.imported, r.skipped, r.errors
+                    );
+                }
+            }
+            println!();
+            println!("Total imported: {}", total_imported);
+            println!("Total skipped:  {}", total_skipped);
+            println!("Total errors:   {}", total_errors);
+        }
+        if total_imported > 0 {
+            println!();
+            println!("next_step  irium-wallet offer-list --source remote");
+        }
+    }
+}
+
 fn handle_offer_feed_fetch(args: &[String]) -> Result<(), String> {
-    let mut url: Option<String> = None;
+    let mut urls: Vec<String> = Vec::new();
     let mut json_mode = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--url" => url = Some(parse_required_string_flag(args, &mut i, "--url")?),
+            "--url" => urls.push(parse_required_string_flag(args, &mut i, "--url")?),
             "--json" => {
                 json_mode = true;
                 i += 1;
@@ -7838,71 +8019,72 @@ fn handle_offer_feed_fetch(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
-    let url_val = url.ok_or_else(|| "--url is required".to_string())?;
-    if !url_val.starts_with("http://") && !url_val.starts_with("https://") {
-        return Err(format!("invalid URL: must start with http:// or https://"));
+    if urls.is_empty() {
+        return Err("--url is required".to_string());
     }
-    let source_tag = format!("remote:{}", url_val);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("HTTP client: {e}"))?;
-    let response = client
-        .get(&url_val)
-        .send()
-        .map_err(|e| format!("fetch {url_val}: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("fetch failed: HTTP {}", response.status()));
-    }
-    let body = response.text().map_err(|e| format!("read response: {e}"))?;
-    let v: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("invalid JSON from feed: {e}"))?;
-    let offer_values: Vec<serde_json::Value> = if let Some(arr) = v.as_array() {
-        arr.clone()
-    } else if let Some(obj) = v.as_object() {
-        obj.get("offers")
-            .and_then(|o| o.as_array())
-            .ok_or_else(|| "response missing offers array".to_string())?
-            .clone()
-    } else {
-        return Err("unexpected feed response format".to_string());
-    };
-    let mut imported = 0usize;
-    let mut skipped = 0usize;
-    let mut errors = 0usize;
-    for val in &offer_values {
-        let json_str = serde_json::to_string(val).unwrap_or_default();
-        match import_single_offer_with_source(&json_str, &source_tag) {
-            Ok(true) => imported += 1,
-            Ok(false) => skipped += 1,
-            Err(_) => errors += 1,
+    for url in &urls {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(format!("invalid URL: must start with http:// or https://"));
         }
     }
-    if json_mode {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "source": url_val,
-                "total": offer_values.len(),
-                "imported": imported,
-                "skipped": skipped,
-                "errors": errors,
-            }))
-            .unwrap()
-        );
-    } else {
-        println!("source   {}", url_val);
-        println!("total    {}", offer_values.len());
-        println!("imported {}", imported);
-        println!("skipped  {} (already in local store)", skipped);
-        if errors > 0 {
-            println!("errors   {}", errors);
+    let results: Vec<FeedFetchResult> = urls.iter().map(|u| fetch_single_feed(u)).collect();
+    print_feed_results(&results, json_mode);
+    Ok(())
+}
+
+fn handle_offer_feed_sync(args: &[String]) -> Result<(), String> {
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
         }
-        if imported > 0 {
+    }
+    let urls = load_feeds_config()?;
+    if urls.is_empty() {
+        if json_mode {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "feeds_processed": 0,
+                    "total_imported": 0,
+                    "total_skipped": 0,
+                    "total_errors": 0,
+                    "feeds": [],
+                    "note": "no feeds configured",
+                }))
+                .unwrap()
+            );
+        } else {
+            println!("no feeds configured");
             println!();
-            println!("next_step  irium-wallet offer-list --source remote");
+            println!("next_step  add feeds to {}", feeds_config_path().display());
         }
+        return Ok(());
     }
+    let results: Vec<FeedFetchResult> = urls
+        .iter()
+        .map(|u| {
+            if !u.starts_with("http://") && !u.starts_with("https://") {
+                FeedFetchResult {
+                    url: u.clone(),
+                    imported: 0,
+                    skipped: 0,
+                    errors: 0,
+                    fetch_error: Some(
+                        "invalid URL: must start with http:// or https://".to_string(),
+                    ),
+                }
+            } else {
+                fetch_single_feed(u)
+            }
+        })
+        .collect();
+    print_feed_results(&results, json_mode);
     Ok(())
 }
 
@@ -16190,6 +16372,85 @@ found true"
         assert!(result.is_ok());
     }
 
+
+    #[test]
+    fn offer_feed_fetch_multiple_urls_both_valid_aggregates() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("multi-fetch-agg");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        // two valid http:// URLs that are unreachable; verify the command
+        // returns Ok (per-feed errors do not abort the full run)
+        let result = handle_offer_feed_fetch(&[
+            "--url".to_string(), "http://localhost:1/feed".to_string(),
+            "--url".to_string(), "http://localhost:2/feed".to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        // No crash, returns Ok (errors are per-feed, not fatal)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_feed_fetch_empty_urls_returns_error() {
+        let result = handle_offer_feed_fetch(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("--url"));
+    }
+
+    #[test]
+    fn offer_feed_fetch_invalid_scheme_in_multi_returns_error() {
+        let result = handle_offer_feed_fetch(&[
+            "--url".to_string(), "http://good.example/feed".to_string(),
+            "--url".to_string(), "ftp://bad.example/feed".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid URL"));
+    }
+
+    #[test]
+    fn offer_feed_sync_empty_config_returns_ok() {
+        let _guard = test_guard();
+        let tmp = temp_offers_dir("sync-empty-cfg");
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        // No feeds.json -> Ok with zero feeds
+        let result = handle_offer_feed_sync(&[]);
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_feed_sync_invalid_feeds_json_returns_error() {
+        let _guard = test_guard();
+        let tmp = temp_offers_dir("sync-bad-cfg");
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        std::fs::write(tmp.join("feeds.json"), b"{not valid json").unwrap();
+        let result = handle_offer_feed_sync(&[]);
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn offer_feed_sync_valid_config_unreachable_urls_ok() {
+        let _guard = test_guard();
+        let tmp = temp_offers_dir("sync-unreachable");
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        env::set_var("IRIUM_OFFERS_DIR", tmp.display().to_string());
+        let cfg = r#"{"feeds":["http://localhost:19999/feed","http://localhost:19998/feed"]}"#;
+        std::fs::write(tmp.join("feeds.json"), cfg).unwrap();
+        // Unreachable URLs -> fetch errors stored per-feed, command returns Ok
+        let result = handle_offer_feed_sync(&[]);
+        env::remove_var("IRIUM_DATA_DIR");
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(result.is_ok());
+    }
+
     #[test]
     fn offer_feed_export_version_field_is_one() {
         let _guard = test_guard();
@@ -21264,6 +21525,12 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "offer-feed-fetch" => {
             if let Err(e) = handle_offer_feed_fetch(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "offer-feed-sync" => {
+            if let Err(e) = handle_offer_feed_sync(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
