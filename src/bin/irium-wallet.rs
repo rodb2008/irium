@@ -2171,6 +2171,7 @@ fn usage() {
     eprintln!("  irium-wallet offer-feed-export [--out <file>] [--limit <n>]");
     eprintln!("  irium-wallet offer-feed-fetch --url <feed-endpoint> [--url <feed-endpoint> ...] [--json]");
     eprintln!("  irium-wallet offer-feed-sync [--json]");
+    eprintln!("  irium-wallet offer-feed-prune [--older-than-days <n>] [--dry-run] [--json]");
     eprintln!(
         "  irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]"
     );
@@ -7928,6 +7929,13 @@ struct FeedFetchResult {
     fetch_error: Option<String>,
 }
 
+fn offer_feed_max_bytes() -> usize {
+    std::env::var("IRIUM_OFFER_FEED_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1_048_576)
+}
+
 fn fetch_single_feed(url: &str) -> FeedFetchResult {
     let mut result = FeedFetchResult {
         url: url.to_string(),
@@ -7957,10 +7965,26 @@ fn fetch_single_feed(url: &str) -> FeedFetchResult {
         result.fetch_error = Some(format!("HTTP {}", response.status()));
         return result;
     }
-    let body = match response.text() {
+    let max_bytes = offer_feed_max_bytes();
+    let bytes = match response.bytes() {
         Ok(b) => b,
         Err(e) => {
             result.fetch_error = Some(format!("read response: {e}"));
+            return result;
+        }
+    };
+    if bytes.len() > max_bytes {
+        result.fetch_error = Some(format!(
+            "response too large: {} bytes (max {})",
+            bytes.len(),
+            max_bytes
+        ));
+        return result;
+    }
+    let body = match std::str::from_utf8(&bytes) {
+        Ok(s) => s.to_string(),
+        Err(e) => {
+            result.fetch_error = Some(format!("response not valid UTF-8: {e}"));
             return result;
         }
     };
@@ -8023,6 +8047,51 @@ fn load_feeds_config() -> Result<Vec<String>, String> {
     Ok(urls)
 }
 
+fn validate_and_dedupe_sync_feeds(
+    urls: &[String],
+) -> (Vec<String>, Vec<FeedFetchResult>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut valid: Vec<String> = Vec::new();
+    let mut rejected: Vec<FeedFetchResult> = Vec::new();
+    for url in urls {
+        if url.trim().is_empty() {
+            rejected.push(FeedFetchResult {
+                url: "(empty)".to_string(),
+                imported: 0,
+                skipped: 0,
+                errors: 0,
+                fetch_error: Some("empty URL skipped".to_string()),
+            });
+            continue;
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            rejected.push(FeedFetchResult {
+                url: url.clone(),
+                imported: 0,
+                skipped: 0,
+                errors: 0,
+                fetch_error: Some(
+                    "invalid URL: must start with http:// or https://".to_string(),
+                ),
+            });
+            continue;
+        }
+        if seen.contains(url) {
+            rejected.push(FeedFetchResult {
+                url: url.clone(),
+                imported: 0,
+                skipped: 0,
+                errors: 0,
+                fetch_error: Some("duplicate feed URL skipped".to_string()),
+            });
+            continue;
+        }
+        seen.insert(url.clone());
+        valid.push(url.clone());
+    }
+    (valid, rejected)
+}
+
 fn print_feed_results(results: &[FeedFetchResult], json_mode: bool) {
     let total_imported: usize = results.iter().map(|r| r.imported).sum();
     let total_skipped: usize = results.iter().map(|r| r.skipped).sum();
@@ -8080,10 +8149,10 @@ fn print_feed_results(results: &[FeedFetchResult], json_mode: bool) {
             println!("Processed {} feeds:", results.len());
             for r in results {
                 if let Some(ref e) = r.fetch_error {
-                    println!("  {} -> error: {}", r.url, e);
+                    println!("  [ERROR] {} -> {}", r.url, e);
                 } else {
                     println!(
-                        "  {} -> imported: {} skipped: {} errors: {}",
+                        "  [OK]    {} -> imported: {}  skipped: {}  errors: {}",
                         r.url, r.imported, r.skipped, r.errors
                     );
                 }
@@ -8139,8 +8208,8 @@ fn handle_offer_feed_sync(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
-    let urls = load_feeds_config()?;
-    if urls.is_empty() {
+    let raw_urls = load_feeds_config()?;
+    if raw_urls.is_empty() {
         if json_mode {
             println!(
                 "{}",
@@ -8161,25 +8230,151 @@ fn handle_offer_feed_sync(args: &[String]) -> Result<(), String> {
         }
         return Ok(());
     }
-    let results: Vec<FeedFetchResult> = urls
+    let (valid_urls, mut rejected) = validate_and_dedupe_sync_feeds(&raw_urls);
+    let mut results: Vec<FeedFetchResult> = valid_urls
         .iter()
-        .map(|u| {
-            if !u.starts_with("http://") && !u.starts_with("https://") {
-                FeedFetchResult {
-                    url: u.clone(),
-                    imported: 0,
-                    skipped: 0,
-                    errors: 0,
-                    fetch_error: Some(
-                        "invalid URL: must start with http:// or https://".to_string(),
-                    ),
-                }
-            } else {
-                fetch_single_feed(u)
-            }
-        })
+        .map(|u| fetch_single_feed(u))
         .collect();
+    results.append(&mut rejected);
     print_feed_results(&results, json_mode);
+    Ok(())
+}
+
+fn handle_offer_feed_prune(args: &[String]) -> Result<(), String> {
+    let mut dry_run = false;
+    let mut older_than_days: u64 = 7;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            "--older-than-days" => {
+                let s = parse_required_string_flag(args, &mut i, "--older-than-days")?;
+                older_than_days = s
+                    .parse::<u64>()
+                    .map_err(|_| "--older-than-days must be a positive integer".to_string())?;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let threshold_secs = older_than_days * 86400;
+    let offers = load_all_offers();
+    let mut candidates: Vec<&IrmOffer> = Vec::new();
+    let mut skipped_non_open: usize = 0;
+    for offer in &offers {
+        let src = offer.source.as_deref().unwrap_or("local");
+        if !src.starts_with("remote:") {
+            continue;
+        }
+        if offer.status != "open" {
+            skipped_non_open += 1;
+            continue;
+        }
+        if offer.created_at == 0
+            || now_secs.saturating_sub(offer.created_at) < threshold_secs
+        {
+            continue;
+        }
+        candidates.push(offer);
+    }
+    if dry_run {
+        if json_mode {
+            let items: Vec<serde_json::Value> = candidates
+                .iter()
+                .map(|o| {
+                    serde_json::json!({
+                        "offer_id": o.offer_id,
+                        "source": o.source,
+                        "created_at": o.created_at,
+                        "age_days": now_secs.saturating_sub(o.created_at) / 86400,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "dry_run": true,
+                    "would_prune": candidates.len(),
+                    "skipped_non_open": skipped_non_open,
+                    "older_than_days": older_than_days,
+                    "offers": items,
+                }))
+                .unwrap()
+            );
+        } else {
+            println!(
+                "Dry run: {} remote offer{} would be pruned (older than {} days):",
+                candidates.len(),
+                if candidates.len() == 1 { "" } else { "s" },
+                older_than_days
+            );
+            if candidates.is_empty() {
+                println!("  (none)");
+            }
+            for o in &candidates {
+                let age_days = now_secs.saturating_sub(o.created_at) / 86400;
+                println!(
+                    "  {} (age {}d, source: {})",
+                    o.offer_id,
+                    age_days,
+                    o.source.as_deref().unwrap_or("?")
+                );
+            }
+            if skipped_non_open > 0 {
+                println!(
+                    "{} non-open remote offer{} protected (status != open)",
+                    skipped_non_open,
+                    if skipped_non_open == 1 { "" } else { "s" }
+                );
+            }
+        }
+        return Ok(());
+    }
+    let dir = offers_dir();
+    let mut pruned: usize = 0;
+    for offer in &candidates {
+        let path = dir.join(format!("offer-{}.json", offer.offer_id));
+        match std::fs::remove_file(&path) {
+            Ok(_) => pruned += 1,
+            Err(e) => eprintln!("warn: could not remove {}: {e}", path.display()),
+        }
+    }
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "pruned": pruned,
+                "skipped_non_open": skipped_non_open,
+                "older_than_days": older_than_days,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!(
+            "Pruned {} remote offer{} older than {} days.",
+            pruned,
+            if pruned == 1 { "" } else { "s" },
+            older_than_days
+        );
+        if skipped_non_open > 0 {
+            println!(
+                "{} non-open remote offer{} skipped.",
+                skipped_non_open,
+                if skipped_non_open == 1 { "" } else { "s" }
+            );
+        }
+    }
     Ok(())
 }
 
@@ -16618,6 +16813,143 @@ found true"
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn offer_feed_sync_duplicate_urls_skipped() {
+        let (valid, rejected) = validate_and_dedupe_sync_feeds(&[
+            "http://node1.example/feed".to_string(),
+            "http://node2.example/feed".to_string(),
+            "http://node1.example/feed".to_string(), // duplicate
+        ]);
+        assert_eq!(valid.len(), 2);
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0]
+            .fetch_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("duplicate"));
+    }
+
+    #[test]
+    fn offer_feed_sync_empty_url_rejected() {
+        let (valid, rejected) = validate_and_dedupe_sync_feeds(&[
+            "http://node1.example/feed".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+        ]);
+        assert_eq!(valid.len(), 1);
+        assert_eq!(rejected.len(), 2);
+        for r in &rejected {
+            assert!(r.fetch_error.as_deref().unwrap_or("").contains("empty"));
+        }
+    }
+
+    #[test]
+    fn offer_feed_sync_invalid_scheme_rejected() {
+        let (valid, rejected) = validate_and_dedupe_sync_feeds(&[
+            "http://ok.example/feed".to_string(),
+            "ftp://bad.example/feed".to_string(),
+            "file:///local/feed.json".to_string(),
+        ]);
+        assert_eq!(valid.len(), 1);
+        assert_eq!(rejected.len(), 2);
+        for r in &rejected {
+            assert!(r
+                .fetch_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("invalid URL"));
+        }
+    }
+
+    #[test]
+    fn offer_feed_max_bytes_default_is_one_mb() {
+        env::remove_var("IRIUM_OFFER_FEED_MAX_BYTES");
+        assert_eq!(offer_feed_max_bytes(), 1_048_576);
+    }
+
+    #[test]
+    fn offer_feed_max_bytes_env_override() {
+        env::set_var("IRIUM_OFFER_FEED_MAX_BYTES", "512000");
+        assert_eq!(offer_feed_max_bytes(), 512_000);
+        env::remove_var("IRIUM_OFFER_FEED_MAX_BYTES");
+    }
+
+    #[test]
+    fn offer_feed_prune_dry_run_only_targets_remote_open() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("prune-dry-run");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        // Local offer: must NOT be pruned
+        let mut local = make_open_offer("prune-local", None, None);
+        local.created_at = 1; // very old
+        save_offer(&local).unwrap();
+        // Imported offer: must NOT be pruned
+        let mut imported = make_open_offer("prune-imported", Some("imported"), None);
+        imported.created_at = 1;
+        save_offer(&imported).unwrap();
+        // Remote open old offer: SHOULD be pruned
+        let mut remote_old =
+            make_open_offer("prune-remote-old", Some("remote:http://x.example/feed"), None);
+        remote_old.created_at = 1;
+        save_offer(&remote_old).unwrap();
+        // Remote taken offer: must NOT be pruned
+        let mut remote_taken =
+            make_open_offer("prune-remote-taken", Some("remote:http://x.example/feed"), None);
+        remote_taken.created_at = 1;
+        remote_taken.status = "taken".to_string();
+        save_offer(&remote_taken).unwrap();
+        let result = handle_offer_feed_prune(&[
+            "--dry-run".to_string(),
+            "--older-than-days".to_string(),
+            "0".to_string(),
+        ]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_feed_prune_does_not_remove_local_or_imported() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("prune-safety");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let mut local = make_open_offer("safety-local", None, None);
+        local.created_at = 1;
+        save_offer(&local).unwrap();
+        let mut imported = make_open_offer("safety-imported", Some("imported"), None);
+        imported.created_at = 1;
+        save_offer(&imported).unwrap();
+        // Prune with 0-day threshold: only remote open would be removed
+        let result = handle_offer_feed_prune(&["--older-than-days".to_string(), "0".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        // Files must still exist
+        assert!(dir.join("offer-safety-local.json").exists());
+        assert!(dir.join("offer-safety-imported.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offer_feed_prune_unknown_flag_returns_error() {
+        let result = handle_offer_feed_prune(&["--bogus".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn offer_feed_prune_invalid_days_returns_error() {
+        let result = handle_offer_feed_prune(&[
+            "--older-than-days".to_string(),
+            "abc".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("--older-than-days must be a positive integer"));
+    }
+
 
     #[test]
     fn offer_feed_fetch_multiple_urls_both_valid_aggregates() {
@@ -21777,6 +22109,12 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "offer-feed-sync" => {
             if let Err(e) = handle_offer_feed_sync(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "offer-feed-prune" => {
+            if let Err(e) = handle_offer_feed_prune(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
