@@ -14342,7 +14342,7 @@ found true"
             "1000".to_string(),
         ];
         let result = handle_proof_sign(&args);
-        assert!(result.is_ok(), "expected ok, got: {:?}", result);
+        assert!(result.is_ok(), "proof_sign returned error");
     }
 
     #[test]
@@ -14367,7 +14367,7 @@ found true"
             "1000".to_string(),
         ];
         let result = handle_proof_sign(&args);
-        assert!(result.is_ok(), "expected ok, got: {:?}", result);
+        assert!(result.is_ok(), "proof_sign returned error");
     }
 
     #[test]
