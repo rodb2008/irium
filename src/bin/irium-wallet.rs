@@ -2172,6 +2172,9 @@ fn usage() {
     eprintln!("  irium-wallet offer-feed-fetch --url <feed-endpoint> [--url <feed-endpoint> ...] [--json]");
     eprintln!("  irium-wallet offer-feed-sync [--json]");
     eprintln!("  irium-wallet offer-feed-prune [--older-than-days <n>] [--dry-run] [--json]
+  irium-wallet feed-add <url>
+  irium-wallet feed-remove <url>
+  irium-wallet feed-list [--json]
   irium-wallet reputation-show <seller_pubkey|address> [--json]");
     eprintln!(
         "  irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]"
@@ -8092,6 +8095,20 @@ fn load_feeds_config() -> Result<Vec<String>, String> {
     Ok(urls)
 }
 
+fn save_feeds_config(urls: &[String]) -> Result<(), String> {
+    let path = feeds_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create config dir: {e}"))?;
+    }
+    let doc = serde_json::json!({ "feeds": urls });
+    let json = serde_json::to_string_pretty(&doc)
+        .map_err(|e| format!("serialize feeds: {e}"))?;
+    std::fs::write(&path, &json)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
 fn validate_and_dedupe_sync_feeds(
     urls: &[String],
 ) -> (Vec<String>, Vec<FeedFetchResult>) {
@@ -8602,6 +8619,81 @@ fn handle_reputation_show(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+
+fn handle_feed_add(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("usage: irium-wallet feed-add <url>".to_string());
+    }
+    let url = args[0].trim().to_string();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("invalid URL: must start with http:// or https://".to_string());
+    }
+    let mut feeds = load_feeds_config()?;
+    if feeds.iter().any(|f| f == &url) {
+        println!("already configured: {}", url);
+        return Ok(());
+    }
+    feeds.push(url.clone());
+    save_feeds_config(&feeds)?;
+    println!("added:        {}", url);
+    println!("total feeds:  {}", feeds.len());
+    Ok(())
+}
+
+fn handle_feed_remove(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("usage: irium-wallet feed-remove <url>".to_string());
+    }
+    let url = args[0].trim().to_string();
+    let mut feeds = load_feeds_config()?;
+    let before = feeds.len();
+    feeds.retain(|f| f != &url);
+    if feeds.len() == before {
+        return Err(format!("not found in feed list: {}", url));
+    }
+    save_feeds_config(&feeds)?;
+    println!("removed:      {}", url);
+    println!("total feeds:  {}", feeds.len());
+    Ok(())
+}
+
+fn handle_feed_list(args: &[String]) -> Result<(), String> {
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let feeds = load_feeds_config()?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "feeds": feeds,
+                "total": feeds.len(),
+            }))
+            .unwrap()
+        );
+        return Ok(());
+    }
+    if feeds.is_empty() {
+        println!("no feeds configured");
+        println!();
+        println!("next_step  irium-wallet feed-add <url>");
+    } else {
+        for (i, url) in feeds.iter().enumerate() {
+            println!("[{}] {}", i + 1, url);
+        }
+        println!();
+        println!("total: {}", feeds.len());
+    }
+    Ok(())
+}
 
 fn handle_offer_feed_prune(args: &[String]) -> Result<(), String> {
     let mut dry_run = false;
@@ -18142,6 +18234,127 @@ found true"
     }
 
     #[test]
+    fn feed_add_adds_url() {
+        let _guard = test_guard();
+        let tmp = temp_offers_dir("feed-add-basic");
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        let result = handle_feed_add(&["http://node1.example.com:38300/offers/feed".to_string()]);
+        assert!(result.is_ok(), "feed-add must succeed: {:?}", result);
+        let feeds = load_feeds_config().unwrap();
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert_eq!(feeds.len(), 1);
+        assert_eq!(feeds[0], "http://node1.example.com:38300/offers/feed");
+    }
+
+    #[test]
+    fn feed_add_deduplicates() {
+        let _guard = test_guard();
+        let tmp = temp_offers_dir("feed-add-dedup");
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        let url = "http://node1.example.com:38300/offers/feed".to_string();
+        handle_feed_add(&[url.clone()]).unwrap();
+        handle_feed_add(&[url.clone()]).unwrap();
+        let feeds = load_feeds_config().unwrap();
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert_eq!(feeds.len(), 1, "duplicate must not be stored");
+    }
+
+    #[test]
+    fn feed_add_rejects_invalid_scheme() {
+        let result = handle_feed_add(&["ftp://bad.example/feed".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid URL"));
+    }
+
+    #[test]
+    fn feed_add_requires_url_arg() {
+        let result = handle_feed_add(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("usage"));
+    }
+
+    #[test]
+    fn feed_remove_removes_url() {
+        let _guard = test_guard();
+        let tmp = temp_offers_dir("feed-remove-basic");
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        let url = "http://node1.example.com:38300/offers/feed".to_string();
+        handle_feed_add(&[url.clone()]).unwrap();
+        let result = handle_feed_remove(&[url.clone()]);
+        assert!(result.is_ok(), "feed-remove must succeed: {:?}", result);
+        let feeds = load_feeds_config().unwrap();
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(feeds.is_empty(), "feed must be removed");
+    }
+
+    #[test]
+    fn feed_remove_not_found_returns_error() {
+        let _guard = test_guard();
+        let tmp = temp_offers_dir("feed-remove-missing");
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        let result = handle_feed_remove(&["http://nonexistent.example/feed".to_string()]);
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found in feed list"));
+    }
+
+    #[test]
+    fn feed_list_shows_configured_feeds() {
+        let _guard = test_guard();
+        let tmp = temp_offers_dir("feed-list-basic");
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        handle_feed_add(&["http://node1.example.com:38300/offers/feed".to_string()]).unwrap();
+        handle_feed_add(&["http://node2.example.com:38300/offers/feed".to_string()]).unwrap();
+        let result = handle_feed_list(&[]);
+        let feeds = load_feeds_config().unwrap();
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(result.is_ok());
+        assert_eq!(feeds.len(), 2);
+    }
+
+    #[test]
+    fn feed_list_empty_returns_ok() {
+        let _guard = test_guard();
+        let tmp = temp_offers_dir("feed-list-empty");
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        let result = handle_feed_list(&[]);
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn feed_list_json_mode_returns_ok() {
+        let _guard = test_guard();
+        let tmp = temp_offers_dir("feed-list-json");
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        handle_feed_add(&["http://node1.example.com:38300/offers/feed".to_string()]).unwrap();
+        let result = handle_feed_list(&["--json".to_string()]);
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn feed_list_unknown_flag_returns_error() {
+        let result = handle_feed_list(&["--bogus".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
     fn offer_feed_export_version_field_is_one() {
         let _guard = test_guard();
         let dir = temp_offers_dir("feed-version");
@@ -23227,6 +23440,24 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "offer-feed-prune" => {
             if let Err(e) = handle_offer_feed_prune(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "feed-add" => {
+            if let Err(e) = handle_feed_add(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "feed-remove" => {
+            if let Err(e) = handle_feed_remove(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "feed-list" => {
+            if let Err(e) = handle_feed_list(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
