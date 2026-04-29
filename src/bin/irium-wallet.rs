@@ -7444,6 +7444,7 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
             let rep = compute_reputation(offer.seller_address.as_str());
             println!("    reputation: {}", rep.display_short());
             println!("    risk:       {}", rep.risk_signal());
+            println!("    recent:     {}", rep.recent_risk_signal());
         }
     }
     Ok(())
@@ -8259,6 +8260,11 @@ struct ReputationScore {
     failed: usize,
     default_count: usize,
     has_outcome_data: bool,
+    recent_satisfied: usize,
+    recent_failed: usize,
+    recent_default_count: usize,
+    recent_total: usize,
+    has_recent_data: bool,
 }
 
 impl ReputationScore {
@@ -8298,6 +8304,32 @@ impl ReputationScore {
             return "low";
         }
         let ratio = self.default_count as f64 / self.total as f64;
+        if ratio <= 0.20 {
+            "moderate"
+        } else {
+            "high"
+        }
+    }
+
+    fn recent_success_rate(&self) -> Option<f64> {
+        if !self.has_recent_data {
+            return None;
+        }
+        let denom = self.recent_satisfied + self.recent_failed;
+        if denom == 0 {
+            return None;
+        }
+        Some(self.recent_satisfied as f64 / denom as f64 * 100.0)
+    }
+
+    fn recent_risk_signal(&self) -> &'static str {
+        if !self.has_recent_data || self.recent_total == 0 {
+            return "unknown";
+        }
+        if self.recent_default_count == 0 {
+            return "low";
+        }
+        let ratio = self.recent_default_count as f64 / self.recent_total as f64;
         if ratio <= 0.20 {
             "moderate"
         } else {
@@ -8362,6 +8394,11 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
     let mut failed: usize = 0;
     let mut default_count: usize = 0;
     let mut has_outcome_data = false;
+    let mut recent_satisfied: usize = 0;
+    let mut recent_failed: usize = 0;
+    let mut recent_default_count: usize = 0;
+    let mut recent_total: usize = 0;
+    let mut has_recent_data = false;
     if outcomes_path.exists() {
         if let Ok(data) = std::fs::read_to_string(&outcomes_path) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
@@ -8388,6 +8425,30 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
                     } else {
                         failed
                     };
+                    recent_satisfied = entry
+                        .get("recent_satisfied")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    recent_failed = entry
+                        .get("recent_failed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    let recent_timeout = entry
+                        .get("recent_timeout")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    let recent_unsatisfied_count = entry
+                        .get("recent_unsatisfied")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    recent_default_count = if recent_timeout > 0 || recent_unsatisfied_count > 0 {
+                        recent_timeout + recent_unsatisfied_count
+                    } else {
+                        recent_failed
+                    };
+                    recent_total = recent_satisfied + recent_failed
+                        + recent_timeout + recent_unsatisfied_count;
+                    has_recent_data = recent_total > 0;
                 }
             }
         }
@@ -8399,6 +8460,11 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
         failed,
         default_count,
         has_outcome_data,
+        recent_satisfied,
+        recent_failed,
+        recent_default_count,
+        recent_total,
+        has_recent_data,
     }
 }
 
@@ -8425,6 +8491,7 @@ fn handle_reputation_show(args: &[String]) -> Result<(), String> {
 
     if json_mode {
         let rate = rep.success_rate();
+        let recent_rate = rep.recent_success_rate();
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -8434,6 +8501,13 @@ fn handle_reputation_show(args: &[String]) -> Result<(), String> {
                 "defaults": if rep.has_outcome_data { serde_json::json!(rep.default_count) } else { serde_json::json!(null) },
                 "success_rate": rate.map(|r| format!("{:.1}", r)),
                 "risk": rep.risk_signal(),
+                "recent": serde_json::json!({
+                    "satisfied": if rep.has_recent_data { serde_json::json!(rep.recent_satisfied) } else { serde_json::json!(null) },
+                    "defaults": if rep.has_recent_data { serde_json::json!(rep.recent_default_count) } else { serde_json::json!(null) },
+                    "success_rate": recent_rate.map(|r| format!("{:.1}", r)),
+                    "risk": rep.recent_risk_signal(),
+                    "window": if rep.has_recent_data { serde_json::json!(rep.recent_total) } else { serde_json::json!(null) },
+                }),
             }))
             .unwrap()
         );
@@ -8455,6 +8529,21 @@ fn handle_reputation_show(args: &[String]) -> Result<(), String> {
         println!("Success rate:     unknown (outcome not yet tracked locally)");
     }
     println!("Risk:             {}", rep.risk_signal());
+    println!();
+    println!("Recent (last 10):");
+    if rep.has_recent_data {
+        println!("  Successful:   {}", rep.recent_satisfied);
+        println!("  Defaults:     {}", rep.recent_default_count);
+        match rep.recent_success_rate() {
+            Some(rate) => println!("  Success rate: {:.1}%", rate),
+            None => println!("  Success rate: N/A"),
+        }
+    } else {
+        println!("  Successful:   unknown");
+        println!("  Defaults:     unknown");
+        println!("  Success rate: unknown");
+    }
+    println!("  Risk:         {}", rep.recent_risk_signal());
     Ok(())
 }
 
@@ -17182,6 +17271,11 @@ found true"
             failed: 0,
             default_count: 0,
             has_outcome_data: false,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
         };
         assert_eq!(rep.display_short(), "unknown");
     }
@@ -17194,6 +17288,11 @@ found true"
             failed: 0,
             default_count: 0,
             has_outcome_data: false,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
         };
         assert_eq!(rep.display_short(), "3 agreements");
     }
@@ -17206,6 +17305,11 @@ found true"
             failed: 0,
             default_count: 0,
             has_outcome_data: false,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
         };
         assert_eq!(rep.display_short(), "1 agreement");
     }
@@ -17218,6 +17322,11 @@ found true"
             failed: 2,
             default_count: 0,
             has_outcome_data: true,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
         };
         assert_eq!(rep.display_short(), "83% (10/12)");
     }
@@ -17230,6 +17339,11 @@ found true"
             failed: 0,
             default_count: 0,
             has_outcome_data: true,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
         };
         assert_eq!(rep.display_short(), "100% (5/5)");
     }
@@ -17242,6 +17356,11 @@ found true"
             failed: 0,
             default_count: 0,
             has_outcome_data: false,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
         };
         assert!(rep.success_rate().is_none());
     }
@@ -17254,6 +17373,11 @@ found true"
             failed: 0,
             default_count: 0,
             has_outcome_data: true,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
         };
         // has_outcome_data=true but both 0 → no division by zero
         assert!(rep.success_rate().is_none());
@@ -17405,6 +17529,11 @@ found true"
             failed: 0,
             default_count: 0,
             has_outcome_data: true,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
         };
         assert_eq!(rep.risk_signal(), "unknown");
     }
@@ -17417,6 +17546,11 @@ found true"
             failed: 0,
             default_count: 0,
             has_outcome_data: false,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
         };
         assert_eq!(rep.risk_signal(), "unknown");
     }
@@ -17429,6 +17563,11 @@ found true"
             failed: 0,
             default_count: 0,
             has_outcome_data: true,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
         };
         assert_eq!(rep.risk_signal(), "low");
     }
@@ -17442,6 +17581,11 @@ found true"
             failed: 2,
             default_count: 2,
             has_outcome_data: true,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
         };
         assert_eq!(rep.risk_signal(), "moderate");
     }
@@ -17455,6 +17599,11 @@ found true"
             failed: 3,
             default_count: 3,
             has_outcome_data: true,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
         };
         assert_eq!(rep.risk_signal(), "high");
     }
@@ -17511,6 +17660,110 @@ found true"
         // no timeout/unsatisfied fields -> falls back to failed=2
         assert_eq!(rep.default_count, 2);
         assert_eq!(rep.has_outcome_data, true);
+    }
+
+    #[test]
+    fn recent_risk_signal_unknown_when_no_data() {
+        let rep = ReputationScore {
+            total: 5,
+            satisfied: 5,
+            failed: 0,
+            default_count: 0,
+            has_outcome_data: true,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
+        };
+        assert_eq!(rep.recent_risk_signal(), "unknown");
+    }
+
+    #[test]
+    fn recent_risk_signal_low_when_zero_defaults() {
+        let rep = ReputationScore {
+            total: 10,
+            satisfied: 10,
+            failed: 0,
+            default_count: 0,
+            has_outcome_data: true,
+            recent_satisfied: 5,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 5,
+            has_recent_data: true,
+        };
+        assert_eq!(rep.recent_risk_signal(), "low");
+    }
+
+    #[test]
+    fn recent_risk_signal_moderate_at_twenty_percent() {
+        // 2/10 = 20% boundary: <= 20% is moderate
+        let rep = ReputationScore {
+            total: 20,
+            satisfied: 18,
+            failed: 2,
+            default_count: 2,
+            has_outcome_data: true,
+            recent_satisfied: 8,
+            recent_failed: 2,
+            recent_default_count: 2,
+            recent_total: 10,
+            has_recent_data: true,
+        };
+        assert_eq!(rep.recent_risk_signal(), "moderate");
+    }
+
+    #[test]
+    fn recent_risk_signal_high_above_twenty_percent() {
+        // 4/10 = 40% -> high
+        let rep = ReputationScore {
+            total: 20,
+            satisfied: 16,
+            failed: 4,
+            default_count: 4,
+            has_outcome_data: true,
+            recent_satisfied: 6,
+            recent_failed: 4,
+            recent_default_count: 4,
+            recent_total: 10,
+            has_recent_data: true,
+        };
+        assert_eq!(rep.recent_risk_signal(), "high");
+    }
+
+    #[test]
+    fn compute_reputation_reads_recent_fields() {
+        let _guard = test_guard();
+        let tmp = {
+            let mut d = env::temp_dir();
+            d.push(format!("irium-rep-recent-{}", now_unix()));
+            d
+        };
+        let rep_dir = tmp.join("reputation");
+        std::fs::create_dir_all(&rep_dir).unwrap();
+        let outcomes = serde_json::json!({
+            "QTestRecentSeller": {
+                "satisfied": 20,
+                "failed": 5,
+                "recent_satisfied": 3,
+                "recent_failed": 7
+            }
+        });
+        std::fs::write(
+            rep_dir.join("outcomes.json"),
+            serde_json::to_string(&outcomes).unwrap(),
+        ).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        let rep = compute_reputation("QTestRecentSeller");
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert_eq!(rep.recent_satisfied, 3);
+        assert_eq!(rep.recent_failed, 7);
+        assert_eq!(rep.recent_default_count, 7);
+        assert_eq!(rep.recent_total, 10);
+        assert!(rep.has_recent_data);
+        assert_eq!(rep.recent_risk_signal(), "high");
     }
 
     fn offer_feed_fetch_multiple_urls_both_valid_aggregates() {
