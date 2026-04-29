@@ -7493,6 +7493,7 @@ fn handle_offer_show(args: &[String]) -> Result<(), String> {
         }
     }
     let id = offer_ref.ok_or_else(|| "--offer is required".to_string())?;
+    validate_offer_id(&id)?;
     let offer = load_offer(&id)?;
     if json_mode {
         println!(
@@ -7582,6 +7583,7 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     }
     let offer_id = offer_ref.ok_or_else(|| "--offer is required".to_string())?;
     let buyer_addr = buyer.ok_or_else(|| "--buyer is required".to_string())?;
+    validate_offer_id(&offer_id)?;
 
     let mut offer = load_offer(&offer_id)?;
     if offer.status != "open" {
@@ -7817,6 +7819,7 @@ fn handle_offer_export(args: &[String]) -> Result<(), String> {
     }
     let id = offer_ref.ok_or_else(|| "--offer is required".to_string())?;
     let out = out_path.ok_or_else(|| "--out is required".to_string())?;
+    validate_offer_id(&id)?;
     let offer = load_offer(&id)?;
     let mut export = serde_json::to_value(&offer).map_err(|e| format!("serialize offer: {e}"))?;
     if let Some(obj) = export.as_object_mut() {
@@ -16366,6 +16369,92 @@ found true"
         let result = handle_offer_take(&["--bogus".to_string()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn offer_show_rejects_invalid_offer_id() {
+        // validate_offer_id fires before load_offer; no filesystem setup required
+        for bad_id in &["../evil", "abc/def", "test..id", "bad id", "id#123"] {
+            let result = handle_offer_show(&[
+                "--offer".to_string(),
+                bad_id.to_string(),
+            ]);
+            assert!(result.is_err(), "expected error for id: {}", bad_id);
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("invalid characters"),
+                "wrong error for {}: {}",
+                bad_id,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn offer_take_rejects_invalid_offer_id() {
+        // --buyer must be supplied; validate_offer_id fires before any load_offer call
+        for bad_id in &["../evil", "abc/def", "test..id", "bad id", "id#123"] {
+            let result = handle_offer_take(&[
+                "--offer".to_string(),
+                bad_id.to_string(),
+                "--buyer".to_string(),
+                "QbuyerDummyAddress".to_string(),
+            ]);
+            assert!(result.is_err(), "expected error for id: {}", bad_id);
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("invalid characters"),
+                "wrong error for {}: {}",
+                bad_id,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn offer_export_rejects_invalid_offer_id() {
+        // --out must be supplied; validate_offer_id fires before load_offer and before any file write
+        for bad_id in &["../evil", "abc/def", "test..id", "bad id", "id#123"] {
+            let result = handle_offer_export(&[
+                "--offer".to_string(),
+                bad_id.to_string(),
+                "--out".to_string(),
+                "/tmp/should-not-be-written.json".to_string(),
+            ]);
+            assert!(result.is_err(), "expected error for id: {}", bad_id);
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("invalid characters"),
+                "wrong error for {}: {}",
+                bad_id,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn read_path_valid_ids_pass_validation() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("read-valid-ids");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        // Valid IDs must clear validate_offer_id and reach load_offer
+        // (which returns "not found" since no files exist — not "invalid characters")
+        for good_id in &["offer-123", "flow_test_001", "A1B2C3"] {
+            let result = handle_offer_show(&[
+                "--offer".to_string(),
+                good_id.to_string(),
+            ]);
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("not found") && !err.contains("invalid characters"),
+                "valid id {} should reach load_offer, got: {}",
+                good_id,
+                err
+            );
+        }
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
