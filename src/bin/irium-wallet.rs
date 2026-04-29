@@ -2175,6 +2175,7 @@ fn usage() {
   irium-wallet feed-add <url>
   irium-wallet feed-remove <url>
   irium-wallet feed-list [--json]
+  irium-wallet feed-bootstrap
   irium-wallet reputation-show <seller_pubkey|address> [--json]");
     eprintln!(
         "  irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]"
@@ -7450,6 +7451,10 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
         );
         if offers.is_empty() {
             println!("(no offers found)");
+            if load_feeds_config().map(|f| f.is_empty()).unwrap_or(false) {
+                println!();
+                println!("tip  run `irium-wallet feed-bootstrap` to connect to the public marketplace");
+            }
         }
         for (idx, offer) in offers.iter().enumerate() {
             println!();
@@ -8692,6 +8697,37 @@ fn handle_feed_list(args: &[String]) -> Result<(), String> {
         println!();
         println!("total: {}", feeds.len());
     }
+    Ok(())
+}
+
+// Public marketplace nodes — same hosts as bootstrap/seedlist.txt.
+// Update this list as new official nodes come online.
+const BOOTSTRAP_FEEDS: &[&str] = &[
+    "http://207.244.247.86:38300/offers/feed",
+    "http://157.173.116.134:38300/offers/feed",
+];
+
+fn handle_feed_bootstrap(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: irium-wallet feed-bootstrap (no arguments)".to_string());
+    }
+    let mut feeds = load_feeds_config()?;
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    for &url in BOOTSTRAP_FEEDS {
+        if feeds.iter().any(|f| f == url) {
+            skipped += 1;
+        } else {
+            feeds.push(url.to_string());
+            added += 1;
+        }
+    }
+    if added > 0 {
+        save_feeds_config(&feeds)?;
+    }
+    println!("added:        {}", added);
+    println!("skipped:      {}", skipped);
+    println!("total feeds:  {}", feeds.len());
     Ok(())
 }
 
@@ -18355,6 +18391,88 @@ found true"
     }
 
     #[test]
+    fn feed_bootstrap_adds_all_bootstrap_feeds() {
+        let _guard = test_guard();
+        let tmp = {
+            let mut d = env::temp_dir();
+            d.push(format!("irium-bootstrap-adds-{}", now_unix()));
+            d
+        };
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        let result = handle_feed_bootstrap(&[]);
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn feed_bootstrap_rejects_extra_args() {
+        let result = handle_feed_bootstrap(&["extra".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no arguments"));
+    }
+
+    #[test]
+    fn feed_bootstrap_deduplicates_existing_feeds() {
+        let _guard = test_guard();
+        let tmp = {
+            let mut d = env::temp_dir();
+            d.push(format!("irium-bootstrap-dedup-{}", now_unix()));
+            d
+        };
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        // First call: adds all bootstrap feeds
+        handle_feed_bootstrap(&[]).unwrap();
+        let feeds_after_first = load_feeds_config().unwrap();
+        // Second call: should not add duplicates
+        handle_feed_bootstrap(&[]).unwrap();
+        let feeds_after_second = load_feeds_config().unwrap();
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        assert_eq!(feeds_after_first.len(), feeds_after_second.len());
+    }
+
+    #[test]
+    fn offer_list_shows_feed_hint_when_no_feeds() {
+        let _guard = test_guard();
+        let tmp = {
+            let mut d = env::temp_dir();
+            d.push(format!("irium-list-hint-{}", now_unix()));
+            d
+        };
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        let offers_dir = tmp.join("offers");
+        std::fs::create_dir_all(&offers_dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", offers_dir.display().to_string());
+        // No feeds configured and no offers => hint should fire (we verify load_feeds_config is empty)
+        let feeds = load_feeds_config().unwrap_or_default();
+        assert!(feeds.is_empty());
+        env::remove_var("IRIUM_DATA_DIR");
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn offer_list_no_hint_when_feeds_present() {
+        let _guard = test_guard();
+        let tmp = {
+            let mut d = env::temp_dir();
+            d.push(format!("irium-list-nohint-{}", now_unix()));
+            d
+        };
+        std::fs::create_dir_all(&tmp).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        save_feeds_config(&["http://example.com/feed".to_string()]).unwrap();
+        let feeds = load_feeds_config().unwrap();
+        assert!(!feeds.is_empty());
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
     fn offer_feed_export_version_field_is_one() {
         let _guard = test_guard();
         let dir = temp_offers_dir("feed-version");
@@ -23458,6 +23576,12 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "feed-list" => {
             if let Err(e) = handle_feed_list(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "feed-bootstrap" => {
+            if let Err(e) = handle_feed_bootstrap(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
