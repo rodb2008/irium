@@ -227,7 +227,7 @@ fn coinbase_metadata_output() -> Option<TxOutput> {
 
 #[cfg(test)]
 mod tests {
-    use super::script_from_relay_address;
+    use super::{build_coinbase, build_coinbase_with_pkh, script_from_relay_address};
     use irium_node_rs::activation::{resolved_htlcv1_activation_height, NetworkKind};
     use irium_node_rs::activation::{
         resolved_lwma_v2_activation_height, MAINNET_LWMA_V2_ACTIVATION_HEIGHT,
@@ -316,6 +316,84 @@ mod tests {
         assert_eq!(v1.window, 60, "v1 LWMA window must be 60 blocks");
         assert_eq!(v2.window, 30, "v2 LWMA window must be 30 blocks");
     }
+
+    #[test]
+    fn coinbase_with_pkh_produces_standard_25_byte_p2pkh_script() {
+        let pkh = [0xabu8; 20];
+        let tx = build_coinbase_with_pkh(5_000_000_000, &pkh, b"Block 1".to_vec());
+        let spk = &tx.outputs[0].script_pubkey;
+        assert_eq!(spk.len(), 25, "P2PKH script must be exactly 25 bytes");
+        assert_eq!(spk[0], 0x76, "OP_DUP");
+        assert_eq!(spk[1], 0xa9, "OP_HASH160");
+        assert_eq!(spk[2], 0x14, "push 20 bytes");
+        assert_eq!(&spk[3..23], &pkh[..], "pkh bytes match");
+        assert_eq!(spk[23], 0x88, "OP_EQUALVERIFY");
+        assert_eq!(spk[24], 0xac, "OP_CHECKSIG");
+    }
+
+    #[test]
+    fn coinbase_with_pkh_value_is_exact() {
+        let reward: u64 = 5_000_000_000;
+        let tx = build_coinbase_with_pkh(reward, &[1u8; 20], b"Block 999".to_vec());
+        assert_eq!(tx.outputs[0].value, reward);
+        assert!(!tx.outputs[0].script_pubkey.is_empty());
+    }
+
+    #[test]
+    fn coinbase_script_never_empty_for_any_valid_pkh() {
+        for fill in [0x00u8, 0x01, 0xff] {
+            let pkh = [fill; 20];
+            let tx = build_coinbase_with_pkh(1, &pkh, b"test".to_vec());
+            assert_eq!(tx.outputs[0].script_pubkey.len(), 25);
+        }
+    }
+
+    #[test]
+    fn build_coinbase_returns_error_when_address_unset() {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let saved_addr  = std::env::var("IRIUM_MINER_ADDRESS").ok();
+        let saved_relay = std::env::var("IRIUM_RELAY_ADDRESS").ok();
+        let saved_pkh   = std::env::var("IRIUM_MINER_PKH").ok();
+        std::env::remove_var("IRIUM_MINER_ADDRESS");
+        std::env::remove_var("IRIUM_RELAY_ADDRESS");
+        std::env::remove_var("IRIUM_MINER_PKH");
+        let result = build_coinbase(1, 5_000_000_000);
+        if let Some(v) = saved_addr  { std::env::set_var("IRIUM_MINER_ADDRESS", v); }
+        if let Some(v) = saved_relay { std::env::set_var("IRIUM_RELAY_ADDRESS", v); }
+        if let Some(v) = saved_pkh   { std::env::set_var("IRIUM_MINER_PKH", v); }
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("missing or invalid miner payout address"),
+            "error message must name the problem"
+        );
+    }
+
+    #[test]
+    fn build_coinbase_returns_error_for_invalid_base58_address() {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let saved_addr  = std::env::var("IRIUM_MINER_ADDRESS").ok();
+        let saved_relay = std::env::var("IRIUM_RELAY_ADDRESS").ok();
+        let saved_pkh   = std::env::var("IRIUM_MINER_PKH").ok();
+        std::env::set_var("IRIUM_MINER_ADDRESS", "not_a_valid_address_!!!");
+        std::env::remove_var("IRIUM_RELAY_ADDRESS");
+        std::env::remove_var("IRIUM_MINER_PKH");
+        let result = build_coinbase(1, 5_000_000_000);
+        if let Some(v) = saved_addr  { std::env::set_var("IRIUM_MINER_ADDRESS", v); }
+            else { std::env::remove_var("IRIUM_MINER_ADDRESS"); }
+        if let Some(v) = saved_relay { std::env::set_var("IRIUM_RELAY_ADDRESS", v); }
+        if let Some(v) = saved_pkh   { std::env::set_var("IRIUM_MINER_PKH", v); }
+        assert!(result.is_err(), "invalid address must be rejected");
+    }
 }
 
 fn miner_address_info() -> Option<(String, Vec<u8>)> {
@@ -348,7 +426,7 @@ fn miner_pubkey_hash() -> Option<Vec<u8>> {
 
 fn build_coinbase_with_pkh(
     reward: u64,
-    payout_pkh: Option<&[u8]>,
+    payout_pkh: &[u8],
     script_sig: Vec<u8>,
 ) -> Transaction {
     let coinbase_input = TxInput {
@@ -358,24 +436,18 @@ fn build_coinbase_with_pkh(
         sequence: 0xffff_ffff,
     };
 
-    let script_pubkey = if let Some(pkh) = payout_pkh {
-        // P2PKH: OP_DUP OP_HASH160 0x14 <20-byte-pkh> OP_EQUALVERIFY OP_CHECKSIG
-        let mut s = Vec::with_capacity(25);
-        s.push(0x76);
-        s.push(0xa9);
-        s.push(0x14);
-        s.extend_from_slice(pkh);
-        s.push(0x88);
-        s.push(0xac);
-        s
-    } else {
-        // Fallback: empty script (unspendable reward)
-        Vec::new()
-    };
+    // P2PKH: OP_DUP OP_HASH160 <push-20> <20-byte-pkh> OP_EQUALVERIFY OP_CHECKSIG
+    let mut s = Vec::with_capacity(25);
+    s.push(0x76);
+    s.push(0xa9);
+    s.push(0x14);
+    s.extend_from_slice(payout_pkh);
+    s.push(0x88);
+    s.push(0xac);
 
     let coinbase_output = TxOutput {
         value: reward,
-        script_pubkey,
+        script_pubkey: s,
     };
 
     Transaction {
@@ -386,13 +458,16 @@ fn build_coinbase_with_pkh(
     }
 }
 
-fn build_coinbase(height: u64, reward: u64) -> Transaction {
-    let pkh = miner_pubkey_hash();
-    build_coinbase_with_pkh(
+fn build_coinbase(height: u64, reward: u64) -> Result<Transaction, String> {
+    let pkh = miner_pubkey_hash().ok_or_else(|| {
+        "missing or invalid miner payout address; set IRIUM_MINER_ADDRESS to a valid Irium address"
+            .to_string()
+    })?;
+    Ok(build_coinbase_with_pkh(
         reward,
-        pkh.as_deref(),
+        &pkh,
         format!("Block {}", height).into_bytes(),
-    )
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1472,7 +1547,7 @@ fn mine_once(
     let relay_total: u64 = relay_commitments.iter().map(|c| c.amount).sum();
     let reward = block_reward(height as u64);
     let miner_reward = reward + (total_fees as u64).saturating_sub(relay_total);
-    let mut coinbase = build_coinbase(height as u64, miner_reward);
+    let mut coinbase = build_coinbase(height as u64, miner_reward)?;
 
     // Append relay commitment outputs to coinbase.
     for rc in relay_commitments {
@@ -2337,7 +2412,7 @@ fn build_solo_stratum_job(
     script_sig.extend(std::iter::repeat(0u8).take(extranonce1_bytes.len() + extranonce2_size));
 
     let mut coinbase =
-        build_coinbase_with_pkh(miner_reward, Some(auth.payout_pkh.as_slice()), script_sig);
+        build_coinbase_with_pkh(miner_reward, auth.payout_pkh.as_slice(), script_sig);
     coinbase.outputs.extend(relay_outputs);
     if let Some(output) = coinbase_metadata_output() {
         coinbase.outputs.push(output);
@@ -2898,15 +2973,16 @@ fn main() {
         }
     } else {
         if json_log_enabled() {
-            println!(
+            eprintln!(
                 "{}",
-                json!({"event": "miner_pkh_missing", "ts": Utc::now().format("%H:%M:%S").to_string()})
+                json!({"event": "fatal", "error": "missing or invalid miner payout address; set IRIUM_MINER_ADDRESS or IRIUM_MINER_PKH", "ts": Utc::now().format("%H:%M:%S").to_string()})
             );
         } else {
-            println!(
-                "[⚠️] WARNING: Set IRIUM_MINER_ADDRESS (base58) or IRIUM_MINER_PKH (40-hex) so rewards are spendable"
+            eprintln!(
+                "error: missing or invalid miner payout address; set IRIUM_MINER_ADDRESS (base58) or IRIUM_MINER_PKH (40-hex)"
             );
         }
+        std::process::exit(1);
     }
 
     let threads = miner_thread_count();

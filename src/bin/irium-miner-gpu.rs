@@ -569,17 +569,16 @@ fn script_from_relay_address(addr: &str) -> Result<Vec<u8>, String> {
     Ok(script)
 }
 
-fn build_coinbase(height: u64, reward: u64) -> Transaction {
-    let script_pubkey = if let Some(pkh) = miner_pubkey_hash() {
-        let mut s = Vec::with_capacity(25);
-        s.extend_from_slice(&[0x76, 0xa9, 0x14]);
-        s.extend_from_slice(&pkh);
-        s.extend_from_slice(&[0x88, 0xac]);
-        s
-    } else {
-        Vec::new()
-    };
-    Transaction {
+fn build_coinbase(height: u64, reward: u64) -> Result<Transaction, String> {
+    let pkh = miner_pubkey_hash().ok_or_else(|| {
+        "missing or invalid miner payout address; set IRIUM_MINER_ADDRESS to a valid Irium address"
+            .to_string()
+    })?;
+    let mut s = Vec::with_capacity(25);
+    s.extend_from_slice(&[0x76, 0xa9, 0x14]);
+    s.extend_from_slice(&pkh);
+    s.extend_from_slice(&[0x88, 0xac]);
+    Ok(Transaction {
         version: 1,
         inputs: vec![TxInput {
             prev_txid: [0u8; 32],
@@ -589,10 +588,10 @@ fn build_coinbase(height: u64, reward: u64) -> Transaction {
         }],
         outputs: vec![TxOutput {
             value: reward,
-            script_pubkey,
+            script_pubkey: s,
         }],
         locktime: 0,
-    }
+    })
 }
 
 // =============================================================================
@@ -1425,6 +1424,13 @@ fn main() {
         }
     }
 
+    if miner_pubkey_hash().is_none() {
+        eprintln!(
+            "error: missing or invalid miner payout address; set IRIUM_MINER_ADDRESS (base58) or IRIUM_MINER_PKH (40-hex)"
+        );
+        std::process::exit(1);
+    }
+
     let batch_size: usize = env::var("IRIUM_GPU_BATCH")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1544,7 +1550,13 @@ fn main() {
         let reward = block_reward(height);
         let miner_reward = reward + (total_fees as u64).saturating_sub(relay_total);
 
-        let mut coinbase = build_coinbase(height, miner_reward);
+        let mut coinbase = match build_coinbase(height, miner_reward) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[GPU] fatal: {e}");
+                std::process::exit(1);
+            }
+        };
         for rc in &relay_commitments {
             if let Ok(outputs) = rc.build_outputs(|addr| script_from_relay_address(addr)) {
                 coinbase.outputs.extend(outputs);
