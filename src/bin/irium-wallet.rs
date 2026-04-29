@@ -8290,8 +8290,11 @@ impl ReputationScore {
 }
 
 fn resolve_seller_address(input: &str) -> String {
-    // If it looks like a 64-char hex pubkey, resolve via local offer store.
-    if input.len() == 64 && input.chars().all(|c| c.is_ascii_hexdigit()) {
+    let is_pubkey = (input.len() == 66
+        && (input.starts_with("02") || input.starts_with("03"))
+        && input.chars().all(|c| c.is_ascii_hexdigit()))
+        || (input.len() == 64 && input.chars().all(|c| c.is_ascii_hexdigit()));
+    if is_pubkey {
         let offers = load_all_offers();
         for offer in &offers {
             if offer.seller_pubkey.as_deref() == Some(input) {
@@ -17304,6 +17307,54 @@ found true"
         assert!(
             result.unwrap_err().contains("seller address or pubkey is required"),
         );
+    }
+    #[test]
+    fn resolve_seller_address_compressed_pubkey_found() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("rep-resolve-pk-found");
+        std::fs::create_dir_all(&dir).unwrap();
+        let offer = serde_json::json!({
+            "offer_id": "rep-pk-test-001",
+            "seller_address": "QResolvedAddr123",
+            "seller_pubkey": "03e918af472e63de044c983df9f09bae57d4c78a70998d5d5fded408672886f868",
+            "payment_method": "bank_transfer",
+            "amount_irm": 1000000,
+            "status": "open",
+            "source": "local",
+            "created_at": 0,
+            "timeout_height": 100
+        });
+        std::fs::write(
+            dir.join("rep-pk-test-001.json"),
+            serde_json::to_string(&offer).unwrap(),
+        ).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let resolved = resolve_seller_address(
+            "03e918af472e63de044c983df9f09bae57d4c78a70998d5d5fded408672886f868",
+        );
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(resolved, "QResolvedAddr123");
+    }
+
+    #[test]
+    fn resolve_seller_address_unknown_pubkey_returns_input() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("rep-resolve-pk-unknown");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        let unknown_pk =
+            "02aabbccddee11223344556677889900aabbccddee11223344556677889900aabbcc";
+        let resolved = resolve_seller_address(unknown_pk);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(resolved, unknown_pk);
+    }
+
+    #[test]
+    fn resolve_seller_address_plain_address_passthrough() {
+        let resolved = resolve_seller_address("Q9KxBRfrnb6v9Vb8vuHjwkZaxj3ZRhJWpg");
+        assert_eq!(resolved, "Q9KxBRfrnb6v9Vb8vuHjwkZaxj3ZRhJWpg");
     }
 
     fn offer_feed_fetch_multiple_urls_both_valid_aggregates() {
