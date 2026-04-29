@@ -17181,7 +17181,7 @@ found true"
             satisfied: 0,
             failed: 0,
             default_count: 0,
-        has_outcome_data: false,
+            has_outcome_data: false,
         };
         assert_eq!(rep.display_short(), "unknown");
     }
@@ -17193,7 +17193,7 @@ found true"
             satisfied: 0,
             failed: 0,
             default_count: 0,
-        has_outcome_data: false,
+            has_outcome_data: false,
         };
         assert_eq!(rep.display_short(), "3 agreements");
     }
@@ -17205,7 +17205,7 @@ found true"
             satisfied: 0,
             failed: 0,
             default_count: 0,
-        has_outcome_data: false,
+            has_outcome_data: false,
         };
         assert_eq!(rep.display_short(), "1 agreement");
     }
@@ -17217,7 +17217,7 @@ found true"
             satisfied: 10,
             failed: 2,
             default_count: 0,
-        has_outcome_data: true,
+            has_outcome_data: true,
         };
         assert_eq!(rep.display_short(), "83% (10/12)");
     }
@@ -17229,7 +17229,7 @@ found true"
             satisfied: 5,
             failed: 0,
             default_count: 0,
-        has_outcome_data: true,
+            has_outcome_data: true,
         };
         assert_eq!(rep.display_short(), "100% (5/5)");
     }
@@ -17241,7 +17241,7 @@ found true"
             satisfied: 0,
             failed: 0,
             default_count: 0,
-        has_outcome_data: false,
+            has_outcome_data: false,
         };
         assert!(rep.success_rate().is_none());
     }
@@ -17253,7 +17253,7 @@ found true"
             satisfied: 0,
             failed: 0,
             default_count: 0,
-        has_outcome_data: true,
+            has_outcome_data: true,
         };
         // has_outcome_data=true but both 0 → no division by zero
         assert!(rep.success_rate().is_none());
