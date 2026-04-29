@@ -7443,6 +7443,7 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
             println!("    status:   {}", offer.status);
             let rep = compute_reputation(offer.seller_address.as_str());
             println!("    reputation: {}", rep.display_short());
+            println!("    risk:       {}", rep.risk_signal());
         }
     }
     Ok(())
@@ -8256,6 +8257,7 @@ struct ReputationScore {
     total: usize,
     satisfied: usize,
     failed: usize,
+    default_count: usize,
     has_outcome_data: bool,
 }
 
@@ -8285,6 +8287,21 @@ impl ReputationScore {
                 self.total,
                 if self.total == 1 { "" } else { "s" }
             ),
+        }
+    }
+
+    fn risk_signal(&self) -> &'static str {
+        if self.total == 0 || !self.has_outcome_data {
+            return "unknown";
+        }
+        if self.default_count == 0 {
+            return "low";
+        }
+        let ratio = self.default_count as f64 / self.total as f64;
+        if ratio <= 0.20 {
+            "moderate"
+        } else {
+            "high"
         }
     }
 }
@@ -8343,6 +8360,7 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
     let outcomes_path = reputation_outcomes_path();
     let mut satisfied: usize = 0;
     let mut failed: usize = 0;
+    let mut default_count: usize = 0;
     let mut has_outcome_data = false;
     if outcomes_path.exists() {
         if let Ok(data) = std::fs::read_to_string(&outcomes_path) {
@@ -8357,6 +8375,19 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
                         .get("failed")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as usize;
+                    let timeout_count = entry
+                        .get("timeout")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    let unsatisfied_count = entry
+                        .get("unsatisfied")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    default_count = if timeout_count > 0 || unsatisfied_count > 0 {
+                        timeout_count + unsatisfied_count
+                    } else {
+                        failed
+                    };
                 }
             }
         }
@@ -8366,6 +8397,7 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
         total,
         satisfied,
         failed,
+        default_count,
         has_outcome_data,
     }
 }
@@ -8399,8 +8431,9 @@ fn handle_reputation_show(args: &[String]) -> Result<(), String> {
                 "seller": resolved,
                 "total_agreements": rep.total,
                 "satisfied": if rep.has_outcome_data { serde_json::json!(rep.satisfied) } else { serde_json::json!(null) },
-                "failed": if rep.has_outcome_data { serde_json::json!(rep.failed) } else { serde_json::json!(null) },
+                "defaults": if rep.has_outcome_data { serde_json::json!(rep.default_count) } else { serde_json::json!(null) },
                 "success_rate": rate.map(|r| format!("{:.1}", r)),
+                "risk": rep.risk_signal(),
             }))
             .unwrap()
         );
@@ -8411,16 +8444,17 @@ fn handle_reputation_show(args: &[String]) -> Result<(), String> {
     println!("Total agreements: {}", rep.total);
     if rep.has_outcome_data {
         println!("Successful:       {}", rep.satisfied);
-        println!("Failed:           {}", rep.failed);
+        println!("Defaults:         {}", rep.default_count);
         match rep.success_rate() {
             Some(rate) => println!("Success rate:     {:.1}%", rate),
             None => println!("Success rate:     N/A (no completed outcomes recorded)"),
         }
     } else {
         println!("Successful:       unknown");
-        println!("Failed:           unknown");
+        println!("Defaults:         unknown");
         println!("Success rate:     unknown (outcome not yet tracked locally)");
     }
+    println!("Risk:             {}", rep.risk_signal());
     Ok(())
 }
 
@@ -17146,6 +17180,7 @@ found true"
             total: 0,
             satisfied: 0,
             failed: 0,
+            default_count: 0,
             has_outcome_data: false,
         };
         assert_eq!(rep.display_short(), "unknown");
@@ -17157,6 +17192,7 @@ found true"
             total: 3,
             satisfied: 0,
             failed: 0,
+            default_count: 0,
             has_outcome_data: false,
         };
         assert_eq!(rep.display_short(), "3 agreements");
@@ -17168,6 +17204,7 @@ found true"
             total: 1,
             satisfied: 0,
             failed: 0,
+            default_count: 0,
             has_outcome_data: false,
         };
         assert_eq!(rep.display_short(), "1 agreement");
@@ -17179,6 +17216,7 @@ found true"
             total: 12,
             satisfied: 10,
             failed: 2,
+            default_count: 0,
             has_outcome_data: true,
         };
         assert_eq!(rep.display_short(), "83% (10/12)");
@@ -17190,6 +17228,7 @@ found true"
             total: 5,
             satisfied: 5,
             failed: 0,
+            default_count: 0,
             has_outcome_data: true,
         };
         assert_eq!(rep.display_short(), "100% (5/5)");
@@ -17201,6 +17240,7 @@ found true"
             total: 4,
             satisfied: 0,
             failed: 0,
+            default_count: 0,
             has_outcome_data: false,
         };
         assert!(rep.success_rate().is_none());
@@ -17212,6 +17252,7 @@ found true"
             total: 0,
             satisfied: 0,
             failed: 0,
+            default_count: 0,
             has_outcome_data: true,
         };
         // has_outcome_data=true but both 0 → no division by zero
@@ -17355,6 +17396,121 @@ found true"
     fn resolve_seller_address_plain_address_passthrough() {
         let resolved = resolve_seller_address("Q9KxBRfrnb6v9Vb8vuHjwkZaxj3ZRhJWpg");
         assert_eq!(resolved, "Q9KxBRfrnb6v9Vb8vuHjwkZaxj3ZRhJWpg");
+    }
+    #[test]
+    fn risk_signal_unknown_when_no_total() {
+        let rep = ReputationScore {
+            total: 0,
+            satisfied: 0,
+            failed: 0,
+            default_count: 0,
+            has_outcome_data: true,
+        };
+        assert_eq!(rep.risk_signal(), "unknown");
+    }
+
+    #[test]
+    fn risk_signal_unknown_when_no_outcome_data() {
+        let rep = ReputationScore {
+            total: 5,
+            satisfied: 0,
+            failed: 0,
+            default_count: 0,
+            has_outcome_data: false,
+        };
+        assert_eq!(rep.risk_signal(), "unknown");
+    }
+
+    #[test]
+    fn risk_signal_low_when_zero_defaults() {
+        let rep = ReputationScore {
+            total: 10,
+            satisfied: 10,
+            failed: 0,
+            default_count: 0,
+            has_outcome_data: true,
+        };
+        assert_eq!(rep.risk_signal(), "low");
+    }
+
+    #[test]
+    fn risk_signal_moderate_at_exactly_twenty_percent() {
+        // 2/10 = 20% boundary: <= 20% is moderate
+        let rep = ReputationScore {
+            total: 10,
+            satisfied: 8,
+            failed: 2,
+            default_count: 2,
+            has_outcome_data: true,
+        };
+        assert_eq!(rep.risk_signal(), "moderate");
+    }
+
+    #[test]
+    fn risk_signal_high_above_twenty_percent() {
+        // 3/10 = 30% -> high
+        let rep = ReputationScore {
+            total: 10,
+            satisfied: 7,
+            failed: 3,
+            default_count: 3,
+            has_outcome_data: true,
+        };
+        assert_eq!(rep.risk_signal(), "high");
+    }
+
+    #[test]
+    fn compute_reputation_reads_timeout_and_unsatisfied() {
+        let _guard = test_guard();
+        let tmp = {
+            let mut d = env::temp_dir();
+            d.push(format!("irium-rep-tu-{}", now_unix()));
+            d
+        };
+        let rep_dir = tmp.join("reputation");
+        std::fs::create_dir_all(&rep_dir).unwrap();
+        let outcomes = serde_json::json!({
+            "QTestSellerTU": {
+                "satisfied": 7,
+                "failed": 0,
+                "timeout": 2,
+                "unsatisfied": 1
+            }
+        });
+        std::fs::write(rep_dir.join("outcomes.json"), serde_json::to_string(&outcomes).unwrap()).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        let rep = compute_reputation("QTestSellerTU");
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        // timeout(2) + unsatisfied(1) = 3 defaults
+        assert_eq!(rep.default_count, 3);
+        assert_eq!(rep.has_outcome_data, true);
+    }
+
+    #[test]
+    fn compute_reputation_falls_back_to_failed_field() {
+        let _guard = test_guard();
+        let tmp = {
+            let mut d = env::temp_dir();
+            d.push(format!("irium-rep-fb-{}", now_unix()));
+            d
+        };
+        let rep_dir = tmp.join("reputation");
+        std::fs::create_dir_all(&rep_dir).unwrap();
+        let outcomes = serde_json::json!({
+            "QTestSellerFB": {
+                "satisfied": 8,
+                "failed": 2
+            }
+        });
+        std::fs::write(rep_dir.join("outcomes.json"), serde_json::to_string(&outcomes).unwrap()).unwrap();
+        env::set_var("IRIUM_DATA_DIR", tmp.display().to_string());
+        let rep = compute_reputation("QTestSellerFB");
+        env::remove_var("IRIUM_DATA_DIR");
+        std::fs::remove_dir_all(&tmp).ok();
+        // no timeout/unsatisfied fields -> falls back to failed=2
+        assert_eq!(rep.default_count, 2);
+        assert_eq!(rep.has_outcome_data, true);
     }
 
     fn offer_feed_fetch_multiple_urls_both_valid_aggregates() {
