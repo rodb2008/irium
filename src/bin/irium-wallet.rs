@@ -7366,10 +7366,23 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
     if let Some(max) = max_amount {
         offers.retain(|o| o.amount_irm <= max);
     }
+    let mut rep_cache: std::collections::HashMap<String, ReputationScore> =
+        std::collections::HashMap::new();
+    for offer in &offers {
+        if !rep_cache.contains_key(&offer.seller_address) {
+            rep_cache.insert(
+                offer.seller_address.clone(),
+                compute_reputation(offer.seller_address.as_str()),
+            );
+        }
+    }
     // load_all_offers already sorts newest-first; only re-sort for other modes
     match sort_by.as_str() {
         "score" => offers.sort_by_cached_key(|o| {
-            let s = compute_reputation(o.seller_address.as_str()).ranking_score();
+            let s = rep_cache
+                .get(&o.seller_address)
+                .map(|r| r.ranking_score())
+                .unwrap_or(0);
             (std::cmp::Reverse(s), std::cmp::Reverse(o.amount_irm))
         }),
         "amount" => offers.sort_by(|a, b| b.amount_irm.cmp(&a.amount_irm)),
@@ -7445,7 +7458,14 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
             }
             println!("    source:   {}", offer.source.as_deref().unwrap_or("local"));
             println!("    status:   {}", offer.status);
-            let rep = compute_reputation(offer.seller_address.as_str());
+            let fallback_rep;
+            let rep = match rep_cache.get(&offer.seller_address) {
+                Some(r) => r,
+                None => {
+                    fallback_rep = compute_reputation(offer.seller_address.as_str());
+                    &fallback_rep
+                }
+            };
             println!("    reputation: {}", rep.display_short());
             println!("    risk:       {}", rep.risk_signal());
             println!("    recent:     {}", rep.recent_risk_signal());
