@@ -2162,7 +2162,7 @@ fn usage() {
     eprintln!("  irium-wallet offer-create --seller <addr> --amount <irm> --payment-method <text> --timeout <height> [--price-note <text>] [--payment-instructions <text>] [--offer-id <id>] [--json]");
     eprintln!("  irium-wallet offer-list [--status open|taken|settled] [--source local|imported|remote|all] [--seller <pubkey|addr>]");
     eprintln!("  irium-wallet offer-list [--payment <method>] [--min-amount <irm>] [--max-amount <irm>]");
-    eprintln!("  irium-wallet offer-list [--sort newest|amount|seller] [--limit <n>] [--summary] [--json]");
+    eprintln!("  irium-wallet offer-list [--sort score|newest|amount|seller] [--limit <n>] [--summary] [--json]");
     eprintln!("  irium-wallet offer-show --offer <offer_id> [--json]");
     eprintln!("  irium-wallet offer-take --offer <offer_id> --buyer <addr> [--rpc <url>] [--json]");
     eprintln!("  irium-wallet offer-export --offer <offer_id> --out <file>");
@@ -7278,7 +7278,7 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
     let mut payment_filter: Option<String> = None;
     let mut min_amount: Option<u64> = None;
     let mut max_amount: Option<u64> = None;
-    let mut sort_by = "newest".to_string();
+    let mut sort_by = "score".to_string();
     let mut limit: Option<usize> = None;
     let mut i = 0;
     while i < args.len() {
@@ -7325,10 +7325,10 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
         }
     }
     match sort_by.as_str() {
-        "newest" | "amount" | "seller" => {}
+        "score" | "newest" | "amount" | "seller" => {}
         other => {
             return Err(format!(
-                "unknown --sort value: {}; expected newest, amount, or seller",
+                "unknown --sort value: {}; expected score, newest, amount, or seller",
                 other
             ))
         }
@@ -7368,6 +7368,10 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
     }
     // load_all_offers already sorts newest-first; only re-sort for other modes
     match sort_by.as_str() {
+        "score" => offers.sort_by_cached_key(|o| {
+            let s = compute_reputation(o.seller_address.as_str()).ranking_score();
+            (std::cmp::Reverse(s), std::cmp::Reverse(o.amount_irm))
+        }),
         "amount" => offers.sort_by(|a, b| b.amount_irm.cmp(&a.amount_irm)),
         "seller" => offers.sort_by(|a, b| a.seller_address.cmp(&b.seller_address)),
         _ => {}
@@ -7445,6 +7449,7 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
             println!("    reputation: {}", rep.display_short());
             println!("    risk:       {}", rep.risk_signal());
             println!("    recent:     {}", rep.recent_risk_signal());
+            println!("    score:      {}", rep.ranking_score());
         }
     }
     Ok(())
@@ -8335,6 +8340,21 @@ impl ReputationScore {
         } else {
             "high"
         }
+    }
+
+    fn ranking_score(&self) -> u32 {
+        let mut score: u32 = 0;
+        match self.risk_signal() {
+            "low" => score += 50,
+            "moderate" => score += 20,
+            _ => {}
+        }
+        match self.recent_risk_signal() {
+            "low" => score += 30,
+            "moderate" => score += 10,
+            _ => {}
+        }
+        score
     }
 }
 
@@ -17009,6 +17029,20 @@ found true"
     }
 
     #[test]
+    fn offer_list_sort_score_succeeds() {
+        let _guard = test_guard();
+        let dir = temp_offers_dir("list-sort-score");
+        std::fs::create_dir_all(&dir).unwrap();
+        env::set_var("IRIUM_OFFERS_DIR", dir.display().to_string());
+        save_offer(&make_open_offer("sort-sc-1", None, None)).unwrap();
+        save_offer(&make_open_offer("sort-sc-2", None, None)).unwrap();
+        let result = handle_offer_list(&["--sort".to_string(), "score".to_string()]);
+        env::remove_var("IRIUM_OFFERS_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn offer_list_limit_truncates() {
         let _guard = test_guard();
         let dir = temp_offers_dir("list-limit");
@@ -17764,6 +17798,91 @@ found true"
         assert_eq!(rep.recent_total, 10);
         assert!(rep.has_recent_data);
         assert_eq!(rep.recent_risk_signal(), "high");
+    }
+
+    #[test]
+    fn ranking_score_zero_when_unknown() {
+        let rep = ReputationScore {
+            total: 0,
+            satisfied: 0,
+            failed: 0,
+            default_count: 0,
+            has_outcome_data: false,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
+        };
+        assert_eq!(rep.ranking_score(), 0);
+    }
+
+    #[test]
+    fn ranking_score_max_when_both_low() {
+        let rep = ReputationScore {
+            total: 10,
+            satisfied: 10,
+            failed: 0,
+            default_count: 0,
+            has_outcome_data: true,
+            recent_satisfied: 5,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 5,
+            has_recent_data: true,
+        };
+        assert_eq!(rep.ranking_score(), 80);
+    }
+
+    #[test]
+    fn ranking_score_moderate_overall_low_recent() {
+        let rep = ReputationScore {
+            total: 10,
+            satisfied: 8,
+            failed: 2,
+            default_count: 2,
+            has_outcome_data: true,
+            recent_satisfied: 5,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 5,
+            has_recent_data: true,
+        };
+        assert_eq!(rep.ranking_score(), 50);
+    }
+
+    #[test]
+    fn ranking_score_low_overall_unknown_recent() {
+        let rep = ReputationScore {
+            total: 10,
+            satisfied: 10,
+            failed: 0,
+            default_count: 0,
+            has_outcome_data: true,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
+        };
+        assert_eq!(rep.ranking_score(), 50);
+    }
+
+    #[test]
+    fn ranking_score_high_overall_low_recent_is_thirty() {
+        let rep = ReputationScore {
+            total: 10,
+            satisfied: 6,
+            failed: 4,
+            default_count: 4,
+            has_outcome_data: true,
+            recent_satisfied: 3,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 3,
+            has_recent_data: true,
+        };
+        assert_eq!(rep.ranking_score(), 30);
     }
 
     fn offer_feed_fetch_multiple_urls_both_valid_aggregates() {
