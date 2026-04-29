@@ -7278,7 +7278,7 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
     let mut payment_filter: Option<String> = None;
     let mut min_amount: Option<u64> = None;
     let mut max_amount: Option<u64> = None;
-    let mut sort_by = "score".to_string();
+    let mut sort_by = "newest".to_string();
     let mut limit: Option<usize> = None;
     let mut i = 0;
     while i < args.len() {
