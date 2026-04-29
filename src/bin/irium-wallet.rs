@@ -7232,6 +7232,7 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
 
     let now = now_unix();
     let id = offer_id.unwrap_or_else(|| format!("offer-{}", now));
+    validate_offer_id(&id)?;
 
     let seller_pubkey = resolve_attestor_pubkey_hex(&seller_addr).ok();
 
@@ -7734,10 +7735,21 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_offer_for_import(offer: &IrmOffer) -> Result<(), String> {
-    if offer.offer_id.is_empty() {
+fn validate_offer_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
         return Err("offer_id is missing or empty".to_string());
     }
+    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(format!(
+            "offer_id contains invalid characters: '{}'; only a-z, A-Z, 0-9, hyphen, underscore are allowed",
+            id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_offer_for_import(offer: &IrmOffer) -> Result<(), String> {
+    validate_offer_id(&offer.offer_id)?;
     if offer.seller_address.is_empty() {
         return Err("seller_address is missing or empty".to_string());
     }
@@ -16718,6 +16730,64 @@ found true"
         std::fs::remove_dir_all(&dir).ok();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in local store"));
+    }
+
+    #[test]
+    fn validate_offer_id_accepts_valid_ids() {
+        assert!(validate_offer_id("offer-123").is_ok());
+        assert!(validate_offer_id("flow_test_001").is_ok());
+        assert!(validate_offer_id("A1B2C3").is_ok());
+        assert!(validate_offer_id("a-b_c-D").is_ok());
+        assert!(validate_offer_id("UPPER-LOWER_123").is_ok());
+    }
+
+    #[test]
+    fn validate_offer_id_rejects_path_traversal() {
+        let err = validate_offer_id("abc/def").unwrap_err();
+        assert!(err.contains("invalid characters"), "got: {}", err);
+        let err = validate_offer_id("../evil").unwrap_err();
+        assert!(err.contains("invalid characters"), "got: {}", err);
+    }
+
+    #[test]
+    fn validate_offer_id_rejects_dots_and_spaces() {
+        let err = validate_offer_id("test..id").unwrap_err();
+        assert!(err.contains("invalid characters"), "got: {}", err);
+        let err = validate_offer_id("bad id").unwrap_err();
+        assert!(err.contains("invalid characters"), "got: {}", err);
+    }
+
+    #[test]
+    fn validate_offer_id_rejects_special_chars() {
+        let err = validate_offer_id("id#123").unwrap_err();
+        assert!(err.contains("invalid characters"), "got: {}", err);
+        let err = validate_offer_id("id@host").unwrap_err();
+        assert!(err.contains("invalid characters"), "got: {}", err);
+        let err = validate_offer_id(r"id\path").unwrap_err();
+        assert!(err.contains("invalid characters"), "got: {}", err);
+    }
+
+    #[test]
+    fn validate_offer_id_rejects_empty() {
+        let err = validate_offer_id("").unwrap_err();
+        assert!(err.contains("missing or empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn offer_import_rejects_invalid_offer_id() {
+        let offer_json = serde_json::json!({
+            "offer_id": "../evil/path",
+            "seller_address": "QsellerTest",
+            "amount_irm": 100_000_000u64,
+            "payment_method": "bank",
+            "timeout_height": 1000u64,
+            "created_at": 1u64,
+            "status": "open"
+        });
+        let result = import_offer_from_json(&serde_json::to_string(&offer_json).unwrap(), false);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("invalid characters"), "got: {}", err);
     }
 
     #[test]
