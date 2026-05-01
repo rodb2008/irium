@@ -2185,6 +2185,10 @@ fn usage() {
         "  irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]"
     );
     eprintln!("  irium-wallet agreement-unpack --file <file> [--rpc <url>] [--json]");
+    eprintln!("  irium-wallet seller-status [--address <addr>] [--json] [--rpc <url>]");
+    eprintln!("  irium-wallet buyer-status [--address <addr>] [--json] [--rpc <url>]");
+    eprintln!("  irium-wallet invoice-generate --recipient <addr> --amount <irm> --reference <text> [--expires-blocks <n>] [--out <file>] [--json]");
+    eprintln!("  irium-wallet invoice-import --file <file> [--json]");
     eprintln!("  irium-wallet flow-otc-demo");
 }
 
@@ -9759,6 +9763,342 @@ fn handle_offer_feed_prune(args: &[String]) -> Result<(), String> {
             );
         }
     }
+    Ok(())
+}
+
+
+// -- Phase F: seller-status ------------------------------------------------
+fn handle_seller_status(args: &[String]) -> Result<(), String> {
+    let mut address: Option<String> = None;
+    let mut json_mode = false;
+    let mut _rpc_url = default_rpc_url();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--address" => { address = args.get(i + 1).cloned(); i += 2; }
+            "--json" => { json_mode = true; i += 1; }
+            "--rpc" => { _rpc_url = args.get(i + 1).cloned().unwrap_or_default(); i += 2; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let addr = match address {
+        Some(a) => a,
+        None => {
+            let path = wallet_path();
+            let wallet = load_wallet(&path).map_err(|e| format!("load wallet: {}", e))?;
+            wallet.keys.into_iter().next().map(|k| k.address)
+                .ok_or_else(|| "no addresses in wallet; use --address <addr>".to_string())?
+        }
+    };
+    let active_offers = load_all_offers().into_iter().filter(|o| o.seller_address == addr).count();
+    let raw_dir = imported_agreements_dir();
+    let mut active_agreements: usize = 0;
+    if raw_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&raw_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if !p.extension().map(|e| e == "json").unwrap_or(false) { continue; }
+                if let Ok(data) = std::fs::read_to_string(&p) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if let Some(parties) = val.get("parties").and_then(|p| p.as_array()) {
+                            for party in parties {
+                                if party.get("role").and_then(|r| r.as_str()) == Some("seller")
+                                    && party.get("address").and_then(|a| a.as_str()) == Some(addr.as_str())
+                                {
+                                    active_agreements += 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut completed: usize = 0;
+    let outcomes_path = reputation_outcomes_path();
+    if outcomes_path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&outcomes_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(entry) = val.get(&addr) {
+                    let sat = entry.get("satisfied").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let fail = entry.get("failed").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let timeout = entry.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let unsat = entry.get("unsatisfied").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    completed = sat + fail + timeout + unsat;
+                }
+            }
+        }
+    }
+    let rep = compute_reputation(&addr);
+    let summary = rep.display_summary_line();
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "address": addr,
+            "active_offers": active_offers,
+            "active_agreements": active_agreements,
+            "completed": completed,
+            "reputation": summary,
+        })).unwrap());
+        return Ok(());
+    }
+    println!("{:<18}{}", "address", addr);
+    println!("{:<18}{}", "active_offers", active_offers);
+    println!("{:<18}{}", "active_agreements", active_agreements);
+    println!("{:<18}{}", "completed", completed);
+    println!("{:<18}{}", "reputation", summary);
+    Ok(())
+}
+
+// -- Phase F: buyer-status -------------------------------------------------
+fn handle_buyer_status(args: &[String]) -> Result<(), String> {
+    let mut address: Option<String> = None;
+    let mut json_mode = false;
+    let mut rpc_url = default_rpc_url();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--address" => { address = args.get(i + 1).cloned(); i += 2; }
+            "--json" => { json_mode = true; i += 1; }
+            "--rpc" => { rpc_url = args.get(i + 1).cloned().unwrap_or_default(); i += 2; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let addr = match address {
+        Some(a) => a,
+        None => {
+            let path = wallet_path();
+            let wallet = load_wallet(&path).map_err(|e| format!("load wallet: {}", e))?;
+            wallet.keys.into_iter().next().map(|k| k.address)
+                .ok_or_else(|| "no addresses in wallet; use --address <addr>".to_string())?
+        }
+    };
+    let raw_dir = imported_agreements_dir();
+    let mut active_agreements: usize = 0;
+    if raw_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&raw_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if !p.extension().map(|e| e == "json").unwrap_or(false) { continue; }
+                if let Ok(data) = std::fs::read_to_string(&p) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if let Some(parties) = val.get("parties").and_then(|p| p.as_array()) {
+                            for party in parties {
+                                let role = party.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                                if (role == "buyer" || role == "payer")
+                                    && party.get("address").and_then(|a| a.as_str()) == Some(addr.as_str())
+                                {
+                                    active_agreements += 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let proofs_submitted: Option<usize> = if !rpc_url.is_empty() {
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "address": addr,
+                        "active_agreements": active_agreements,
+                        "proofs_submitted": null,
+                    })).unwrap());
+                } else {
+                    println!("{:<18}{}", "address", addr);
+                    println!("{:<18}{}", "active_agreements", active_agreements);
+                    println!("{:<18}N/A", "proofs_submitted");
+                }
+                return Ok(());
+            }
+        };
+        let req = ListProofsRpcRequest {
+            agreement_hash: Some("*".to_string()),
+            active_only: false,
+            offset: 0,
+            limit: Some(1),
+        };
+        match rpc_post_json::<ListProofsRpcRequest, ListProofsRpcResponse>(
+            &client, &rpc_url, "/rpc/listproofs", &req,
+        ) {
+            Ok(resp) => Some(resp.total_count),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    if json_mode {
+        let ps_val = match proofs_submitted {
+            Some(n) => serde_json::json!(n),
+            None => serde_json::json!(null),
+        };
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "address": addr,
+            "active_agreements": active_agreements,
+            "proofs_submitted": ps_val,
+        })).unwrap());
+        return Ok(());
+    }
+    println!("{:<18}{}", "address", addr);
+    println!("{:<18}{}", "active_agreements", active_agreements);
+    match proofs_submitted {
+        Some(n) => println!("{:<18}{}", "proofs_submitted", n),
+        None => println!("{:<18}N/A", "proofs_submitted"),
+    }
+    Ok(())
+}
+
+// -- Phase F: FNV-1a 64-bit checksum --------------------------------------
+fn fnv1a_64(s: &str) -> u64 {
+    let mut hash: u64 = 14695981039346656037;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash
+}
+
+// -- Phase F: invoice-generate --------------------------------------------
+fn handle_invoice_generate(args: &[String]) -> Result<(), String> {
+    let mut recipient: Option<String> = None;
+    let mut amount_str: Option<String> = None;
+    let mut reference: Option<String> = None;
+    let mut expires_blocks: Option<u64> = None;
+    let mut out_path: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--recipient" => { recipient = args.get(i + 1).cloned(); i += 2; }
+            "--amount" => { amount_str = args.get(i + 1).cloned(); i += 2; }
+            "--reference" => { reference = args.get(i + 1).cloned(); i += 2; }
+            "--expires-blocks" => { expires_blocks = args.get(i + 1).and_then(|v| v.parse::<u64>().ok()); i += 2; }
+            "--out" => { out_path = args.get(i + 1).cloned(); i += 2; }
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let recipient = recipient.ok_or_else(|| "--recipient is required".to_string())?;
+    let amount_str = amount_str.ok_or_else(|| "--amount is required".to_string())?;
+    let reference = reference.ok_or_else(|| "--reference is required".to_string())?;
+    if base58_p2pkh_to_hash(&recipient).is_none() {
+        return Err(format!("invalid recipient address: {}", recipient));
+    }
+    parse_irm(&amount_str).map_err(|e| format!("invalid --amount: {}", e))?;
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let canonical = format!(
+        "recipient={}&amount_irm={}&reference={}&created_at={}",
+        recipient, amount_str, reference, created_at
+    );
+    let checksum = format!("{:016x}", fnv1a_64(&canonical));
+    let invoice = serde_json::json!({
+        "irium_invoice": "1",
+        "recipient": recipient,
+        "amount_irm": amount_str,
+        "reference": reference,
+        "created_at": created_at,
+        "expires_blocks": expires_blocks,
+        "checksum": checksum,
+    });
+    let invoice_json = serde_json::to_string_pretty(&invoice)
+        .map_err(|e| format!("serialize invoice: {}", e))?;
+    if let Some(ref path) = out_path {
+        std::fs::write(path, &invoice_json)
+            .map_err(|e| format!("write invoice file: {}", e))?;
+    }
+    if json_mode {
+        println!("{}", invoice_json);
+        return Ok(());
+    }
+    println!("invoice generated");
+    println!("{:<12}{}", "recipient", recipient);
+    println!("{:<12}{} IRM", "amount", amount_str);
+    println!("{:<12}{}", "reference", reference);
+    println!("{:<12}{}", "checksum", checksum);
+    if let Some(ref path) = out_path {
+        println!("{:<12}share this invoice or run irium-wallet invoice-import --file {}", "next_step", path);
+    } else {
+        println!("{:<12}save with --out <file>, then share or run irium-wallet invoice-import --file <path>", "next_step");
+    }
+    Ok(())
+}
+
+// -- Phase F: invoice-import ----------------------------------------------
+fn handle_invoice_import(args: &[String]) -> Result<(), String> {
+    let mut file_path: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" => { file_path = args.get(i + 1).cloned(); i += 2; }
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let file_path = file_path.ok_or_else(|| "--file is required".to_string())?;
+    let data = std::fs::read_to_string(&file_path)
+        .map_err(|e| format!("read invoice file: {}", e))?;
+    let val: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| format!("parse invoice JSON: {}", e))?;
+    let version = val.get("irium_invoice").and_then(|v| v.as_str()).unwrap_or("");
+    if version != "1" {
+        return Err(format!("unsupported invoice version: '{}'", version));
+    }
+    let recipient = val.get("recipient").and_then(|v| v.as_str())
+        .ok_or_else(|| "invoice missing recipient".to_string())?;
+    let amount_str = val.get("amount_irm").and_then(|v| v.as_str())
+        .ok_or_else(|| "invoice missing amount_irm".to_string())?;
+    let reference = val.get("reference").and_then(|v| v.as_str())
+        .ok_or_else(|| "invoice missing reference".to_string())?;
+    let created_at = val.get("created_at").and_then(|v| v.as_u64())
+        .ok_or_else(|| "invoice missing created_at".to_string())?;
+    let stored_checksum = val.get("checksum").and_then(|v| v.as_str())
+        .ok_or_else(|| "invoice missing checksum".to_string())?;
+    let canonical = format!(
+        "recipient={}&amount_irm={}&reference={}&created_at={}",
+        recipient, amount_str, reference, created_at
+    );
+    let expected = format!("{:016x}", fnv1a_64(&canonical));
+    let verified = expected == stored_checksum;
+    if !verified {
+        if json_mode {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "verification": "FAILED",
+                "error": "checksum mismatch -- invoice may be tampered",
+            })).unwrap());
+        } else {
+            eprintln!("verification FAILED -- invoice may be tampered");
+        }
+        std::process::exit(1);
+    }
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "invoice_loaded": true,
+            "recipient": recipient,
+            "amount_irm": amount_str,
+            "reference": reference,
+            "created_at": created_at,
+            "verification": "ok",
+            "next_step": format!("irium-wallet send <your_addr> {} {} [--rpc <url>]", recipient, amount_str),
+        })).unwrap());
+        return Ok(());
+    }
+    println!("invoice loaded");
+    println!("{:<14}{}", "recipient", recipient);
+    println!("{:<14}{} IRM", "amount", amount_str);
+    println!("{:<14}{}", "reference", reference);
+    println!("{:<14}ok -- checksum matches", "verification");
+    println!("{:<14}irium-wallet send <your_addr> {} {} [--rpc <url>]", "next_step", recipient, amount_str);
     Ok(())
 }
 
@@ -20527,6 +20867,66 @@ fn main() {
                 usage();
                 std::process::exit(1);
             }
+            // Phase F: business settlement templates -- output JSON scaffold and exit.
+            match args[1].as_str() {
+                "escrow_on_delivery" => {
+                    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let scaffold = serde_json::json!({
+                        "template": "escrow_on_delivery",
+                        "description": "Funds locked in escrow until delivery proof is received.",
+                        "parties": [{"role": "buyer", "address": "<buyer_addr>"}, {"role": "seller", "address": "<seller_addr>"}],
+                        "total_amount_irm": "<amount>",
+                        "network_marker": "IRIUM",
+                        "creation_time": ts,
+                        "milestones": [{"milestone_id": "ms-delivery", "title": "Delivery", "amount_irm": "<amount>", "required_proof_type": "physical_delivery", "notes": "Set to software_delivery for digital goods."}],
+                        "release_policy": "proof_verified",
+                        "refund_policy": "proof_absent_after_timeout"
+                    });
+                    println!("{}", serde_json::to_string_pretty(&scaffold).unwrap());
+                    std::process::exit(0);
+                }
+                "recurring_payment" => {
+                    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let scaffold = serde_json::json!({
+                        "template": "recurring_payment",
+                        "description": "Periodic payment structure. Each interval triggers a milestone release.",
+                        "parties": [{"role": "payer", "address": "<payer_addr>"}, {"role": "payee", "address": "<payee_addr>"}],
+                        "total_amount_irm": "<total>",
+                        "network_marker": "IRIUM",
+                        "creation_time": ts,
+                        "payment_interval_blocks": 144,
+                        "milestones": [
+                            {"milestone_id": "ms-1", "title": "Period 1", "amount_irm": "<period_amount>", "release_at_block": "<start + 144>"},
+                            {"milestone_id": "ms-2", "title": "Period 2", "amount_irm": "<period_amount>", "release_at_block": "<start + 288>"}
+                        ],
+                        "release_policy": "time_based",
+                        "notes": "Add more milestones for additional payment periods."
+                    });
+                    println!("{}", serde_json::to_string_pretty(&scaffold).unwrap());
+                    std::process::exit(0);
+                }
+                "partial_release" => {
+                    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let scaffold = serde_json::json!({
+                        "template": "partial_release",
+                        "description": "Incremental fund release. Each milestone releases a fraction of total escrow.",
+                        "parties": [{"role": "payer", "address": "<payer_addr>"}, {"role": "payee", "address": "<payee_addr>"}],
+                        "total_amount_irm": "<total>",
+                        "network_marker": "IRIUM",
+                        "creation_time": ts,
+                        "milestones": [
+                            {"milestone_id": "ms-1", "title": "Phase 1 -- 33%", "amount_irm": "<total * 0.33>", "required_proof_type": "service_completion"},
+                            {"milestone_id": "ms-2", "title": "Phase 2 -- 33%", "amount_irm": "<total * 0.33>", "required_proof_type": "service_completion"},
+                            {"milestone_id": "ms-3", "title": "Phase 3 -- 34%", "amount_irm": "<total * 0.34>", "required_proof_type": "service_completion"}
+                        ],
+                        "release_policy": "per_milestone_proof",
+                        "notes": "Adjust fractions and proof types as needed."
+                    });
+                    println!("{}", serde_json::to_string_pretty(&scaffold).unwrap());
+                    std::process::exit(0);
+                }
+                _ => {}
+            }
             let template_type = match parse_template_type(&args[1]) {
                 Ok(v) => v,
                 Err(e) => {
@@ -24677,6 +25077,30 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "flow-otc-demo" => {
             handle_flow_otc_demo();
+        }
+        "seller-status" => {
+            if let Err(e) = handle_seller_status(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "buyer-status" => {
+            if let Err(e) = handle_buyer_status(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "invoice-generate" => {
+            if let Err(e) = handle_invoice_generate(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "invoice-import" => {
+            if let Err(e) = handle_invoice_import(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
         }
         _ => {
             usage();
