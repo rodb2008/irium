@@ -127,6 +127,10 @@ pub struct HandshakePayload {
     pub tip_hash: Option<String>,
     #[serde(default)]
     pub capabilities: Option<Vec<String>>,
+    /// Optional URL of this node's marketplace offer feed (e.g. http://host:port/offers/feed).
+    /// Propagated via P2P handshake so peers can discover feeds without manual configuration.
+    #[serde(default)]
+    pub marketplace_feed: Option<String>,
 }
 
 impl HandshakePayload {

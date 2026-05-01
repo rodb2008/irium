@@ -2339,6 +2339,52 @@ async fn getblocks_request_allowed(
     true
 }
 
+fn p2p_data_dir() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("IRIUM_DATA_DIR") {
+        return std::path::PathBuf::from(path);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".irium")
+}
+
+fn record_discovered_feed(url: &str) {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return;
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return;
+    }
+    let path = p2p_data_dir().join("discovered_feeds.json");
+    let mut feeds: Vec<String> = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| {
+                v.get("feeds")
+                    .and_then(|f| f.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if feeds.iter().any(|f| f == &url) {
+        return;
+    }
+    feeds.push(url);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&serde_json::json!({ "feeds": feeds })) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 #[derive(Clone)]
 pub struct P2PNode {
     bind_addr: SocketAddr,
@@ -2364,6 +2410,7 @@ pub struct P2PNode {
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
     agent: String,
     relay_address: Option<String>,
+    marketplace_feed: Option<String>,
     node_id: Vec<u8>,
     trusted_seed_ips: Arc<HashSet<IpAddr>>,
 
@@ -2880,6 +2927,7 @@ impl P2PNode {
         chain: Option<Arc<StdMutex<ChainState>>>,
         mempool: Option<Arc<StdMutex<MempoolManager>>>,
         relay_address: Option<String>,
+        marketplace_feed: Option<String>,
     ) -> Self {
         P2PNode {
             bind_addr,
@@ -2905,6 +2953,7 @@ impl P2PNode {
             mempool,
             agent,
             relay_address,
+            marketplace_feed,
             node_id: Self::load_or_create_node_id(),
             trusted_seed_ips: Self::load_trusted_seed_ips(),
             banned_ips: Self::load_banned_ips(),
@@ -2928,6 +2977,7 @@ impl P2PNode {
         let mempool = self.mempool.clone();
         let agent = self.agent.clone();
         let relay_address = self.relay_address.clone();
+        let marketplace_feed = self.marketplace_feed.clone();
         let accept_log = self.accept_log.clone();
         let sync_requests = self.sync_requests.clone();
         let block_requests = self.block_requests.clone();
@@ -3044,6 +3094,7 @@ impl P2PNode {
                         let mempool_peer = mempool.clone();
                         let agent_peer = agent.clone();
                         let relay_peer = relay_address.clone();
+                        let marketplace_feed_peer = marketplace_feed.clone();
                         let node_id_peer = node_id.clone();
                         let self_ip_peer = self_ips.clone();
                         let sync_peer = sync_requests.clone();
@@ -3075,6 +3126,7 @@ impl P2PNode {
                                 mempool_peer,
                                 agent_peer,
                                 relay_peer,
+                                marketplace_feed_peer,
                                 node_id_peer,
                                 trusted,
                             )
@@ -3836,6 +3888,7 @@ impl P2PNode {
             node_id: Some(hex::encode(&self.node_id)),
             tip_hash: Some(hex::encode(&P2PNode::tip_hash(&self.chain))),
             capabilities: local_capabilities(),
+            marketplace_feed: self.marketplace_feed.clone(),
         };
 
         let msg = payload
@@ -3879,6 +3932,7 @@ impl P2PNode {
         let ping_chain = self.chain.clone();
         let ping_agent = agent.to_string();
         let ping_relay = self.relay_address.clone();
+        let ping_marketplace_feed = self.marketplace_feed.clone();
         let ping_port = self.bind_addr.port();
         let ping_node_id = self.node_id.clone();
         let ping_peer_state = peer_state.clone();
@@ -3944,6 +3998,7 @@ impl P2PNode {
                         node_id: Some(hex::encode(&ping_node_id)),
                         tip_hash: Some(hex::encode(&P2PNode::tip_hash(&ping_chain))),
                         capabilities: local_capabilities(),
+                        marketplace_feed: ping_marketplace_feed.clone(),
                     };
                     if let Ok(msg) = payload.to_message() {
                         if !send_message_or_disconnect(
@@ -4118,6 +4173,7 @@ impl P2PNode {
 
         let dir = self.peers_directory.clone();
         let relay_addr = self.relay_address.clone();
+        let _marketplace_feed_url = self.marketplace_feed.clone();
         let chain_for_sync = self.chain.clone();
         let mempool_for_sync = self.mempool.clone();
         let reputation = self.reputation.clone();
@@ -4299,6 +4355,9 @@ impl P2PNode {
                             }
                             last_handshake_height = Some(payload.height);
                             last_handshake_agent = Some(agent_str.clone());
+                            if let Some(ref feed_url) = payload.marketplace_feed {
+                                record_discovered_feed(feed_url);
+                            }
                             {
                                 let mut state = peer_state.lock().await;
                                 state.tip = parsed_tip;
@@ -5919,6 +5978,7 @@ async fn handle_incoming_with_sybil(
     mempool: Option<Arc<StdMutex<MempoolManager>>>,
     agent: String,
     relay_address: Option<String>,
+    marketplace_feed_url: Option<String>,
     node_id: Vec<u8>,
     trusted_seed: bool,
 ) -> Result<(), String> {
@@ -6024,6 +6084,7 @@ async fn handle_incoming_with_sybil(
     let ping_chain = chain.clone();
     let ping_agent = agent.clone();
     let ping_relay = relay_address.clone();
+    let ping_marketplace_feed = marketplace_feed_url.clone();
     let ping_port = bind_addr.port();
     let ping_node_id = node_id.clone();
     let ping_peer_state = peer_state.clone();
@@ -6085,6 +6146,7 @@ async fn handle_incoming_with_sybil(
                     node_id: Some(hex::encode(&ping_node_id)),
                     tip_hash: Some(hex::encode(&P2PNode::tip_hash(&ping_chain))),
                     capabilities: local_capabilities(),
+                    marketplace_feed: ping_marketplace_feed.clone(),
                 };
                 if let Ok(msg) = payload.to_message() {
                     let _ = send_message(&ping_writer, msg, ping_addr).await;
@@ -6176,6 +6238,7 @@ async fn handle_incoming_with_sybil(
         node_id: Some(hex::encode(&node_id)),
         tip_hash: Some(hex::encode(&P2PNode::tip_hash(&chain))),
         capabilities: local_capabilities(),
+        marketplace_feed: marketplace_feed_url.clone(),
     };
     if let Ok(msg) = payload.to_message() {
         send_message_detached(&writer, msg, addr);
@@ -6355,6 +6418,9 @@ async fn handle_incoming_with_sybil(
                         state.supports_uptime = supports_uptime;
                     }
                     last_handshake_height = Some(payload.height);
+                    if let Some(ref feed_url) = payload.marketplace_feed {
+                        record_discovered_feed(feed_url);
+                    }
 
                     let (checkpoint_height, checkpoint_hash) = best_checkpoint(&chain);
                     let response = HandshakePayload {
@@ -6369,6 +6435,7 @@ async fn handle_incoming_with_sybil(
                         node_id: Some(hex::encode(&node_id)),
                         tip_hash: Some(hex::encode(&P2PNode::tip_hash(&chain))),
                         capabilities: local_capabilities(),
+                        marketplace_feed: marketplace_feed_url.clone(),
                     };
                     if let Ok(handshake_msg) = response.to_message() {
                         let _ = send_message(&writer, handshake_msg, addr).await;
@@ -7964,6 +8031,7 @@ mod tests {
             let node = P2PNode::new(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 38291),
                 "test-agent".to_string(),
+                None,
                 None,
                 None,
                 None,

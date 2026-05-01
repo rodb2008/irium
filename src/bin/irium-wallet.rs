@@ -7288,6 +7288,7 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
     let mut max_amount: Option<u64> = None;
     let mut sort_by = "newest".to_string();
     let mut limit: Option<usize> = None;
+    let mut trusted_only = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -7310,6 +7311,10 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
             }
             "--payment" => {
                 payment_filter = Some(parse_required_string_flag(args, &mut i, "--payment")?);
+            }
+            "--trusted-only" => {
+                trusted_only = true;
+                i += 1;
             }
             "--min-amount" => {
                 let s = parse_required_string_flag(args, &mut i, "--min-amount")?;
@@ -7373,6 +7378,26 @@ fn handle_offer_list(args: &[String]) -> Result<(), String> {
     }
     if let Some(max) = max_amount {
         offers.retain(|o| o.amount_irm <= max);
+    }
+    // Build reputation cache first so trusted_only filter can use risk signal
+    let mut rep_cache: std::collections::HashMap<String, ReputationScore> =
+        std::collections::HashMap::new();
+    for offer in &offers {
+        if !rep_cache.contains_key(&offer.seller_address) {
+            rep_cache.insert(
+                offer.seller_address.clone(),
+                compute_reputation(offer.seller_address.as_str()),
+            );
+        }
+    }
+    if trusted_only {
+        offers.retain(|o| {
+            let risk = rep_cache
+                .get(&o.seller_address)
+                .map(|r| r.risk_signal())
+                .unwrap_or("unknown");
+            risk != "high"
+        });
     }
     let mut rep_cache: std::collections::HashMap<String, ReputationScore> =
         std::collections::HashMap::new();
@@ -8278,7 +8303,25 @@ fn handle_offer_feed_sync(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
-    let raw_urls = load_feeds_config()?;
+    let mut raw_urls = load_feeds_config()?;
+    // Also include any feeds discovered via P2P handshake
+    let discovered_path = irium_data_dir().join("discovered_feeds.json");
+    if discovered_path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&discovered_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(arr) = v.get("feeds").and_then(|f| f.as_array()) {
+                    for entry in arr {
+                        if let Some(url) = entry.as_str() {
+                            let url = url.to_string();
+                            if !raw_urls.contains(&url) {
+                                raw_urls.push(url);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if raw_urls.is_empty() {
         if json_mode {
             println!(
@@ -8289,14 +8332,15 @@ fn handle_offer_feed_sync(args: &[String]) -> Result<(), String> {
                     "total_skipped": 0,
                     "total_errors": 0,
                     "feeds": [],
-                    "note": "no feeds configured",
+                    "note": "no feeds configured — connect to the P2P network or add a feed manually with: irium-wallet feed-add <url>",
                 }))
                 .unwrap()
             );
         } else {
             println!("no feeds configured");
             println!();
-            println!("next_step  add feeds to {}", feeds_config_path().display());
+            println!("tip  Connect to the P2P network — feed URLs are shared automatically between peers.");
+            println!("tip  Or add a feed manually: irium-wallet feed-add <url>");
         }
         return Ok(());
     }
@@ -8307,6 +8351,76 @@ fn handle_offer_feed_sync(args: &[String]) -> Result<(), String> {
         .collect();
     results.append(&mut rejected);
     print_feed_results(&results, json_mode);
+    Ok(())
+}
+
+fn handle_offer_feed_discover(args: &[String]) -> Result<(), String> {
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let discovered_path = irium_data_dir().join("discovered_feeds.json");
+    let feeds: Vec<String> = if discovered_path.exists() {
+        std::fs::read_to_string(&discovered_path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+            .and_then(|v| {
+                v.get("feeds").and_then(|f| f.as_array()).map(|arr| {
+                    arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect()
+                })
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "discovered_feeds": feeds,
+                "count": feeds.len(),
+            }))
+            .unwrap()
+        );
+    } else if feeds.is_empty() {
+        println!("no feeds discovered via P2P yet");
+        println!();
+        println!("tip  Connect to the network and wait for peers to share their feed URLs.");
+        println!("tip  Feed URLs are exchanged automatically during P2P handshake.");
+    } else {
+        println!("discovered feeds ({}):", feeds.len());
+        for url in &feeds {
+            println!("  {}", url);
+        }
+        println!();
+        println!("tip  Run `irium-wallet offer-feed-sync` to fetch offers from all discovered feeds.");
+    }
+    Ok(())
+}
+
+fn handle_marketplace_sync(args: &[String]) -> Result<(), String> {
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    if !json_mode {
+        println!("step 1/2  syncing offers from all feeds (manual + P2P-discovered)...");
+    }
+    handle_offer_feed_sync(&if json_mode { vec!["--json".to_string()] } else { vec![] })?;
+    if !json_mode {
+        println!();
+        println!("step 2/2  listing remote offers...");
+        println!();
+        handle_offer_list(&["--source".to_string(), "remote".to_string()])?;
+    }
     Ok(())
 }
 
@@ -23552,6 +23666,18 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "offer-feed-sync" => {
             if let Err(e) = handle_offer_feed_sync(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "offer-feed-discover" => {
+            if let Err(e) = handle_offer_feed_discover(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "marketplace-sync" => {
+            if let Err(e) = handle_marketplace_sync(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
