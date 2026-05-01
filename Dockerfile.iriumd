@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+
+# Stage 1: Build
+FROM rust:latest AS builder
+
+WORKDIR /opt/irium
+COPY . .
+
+RUN cargo build --release --bin iriumd && \
+    strip target/release/iriumd
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r irium \
+    && useradd -r -g irium -s /bin/false -d /home/irium -m irium \
+    && mkdir -p /home/irium/.irium \
+    && chown irium:irium /home/irium/.irium
+
+WORKDIR /opt/irium
+
+COPY --from=builder /opt/irium/target/release/iriumd ./iriumd
+COPY --chown=irium:irium configs/ ./configs/
+COPY --chown=irium:irium bootstrap/ ./bootstrap/
+
+# All ports and paths are configurable via environment variables.
+# These are defaults only — override in docker run -e or docker-compose.yml.
+ENV IRIUM_DATA_DIR=/home/irium/.irium \
+    IRIUM_NODE_HOST=0.0.0.0 \
+    IRIUM_NODE_PORT=38300 \
+    IRIUM_P2P_BIND=0.0.0.0:38291
+
+VOLUME ["/home/irium/.irium"]
+
+# P2P port and RPC port — both configurable via env vars above.
+EXPOSE 38291 38300
+
+USER irium
+
+ENTRYPOINT ["/opt/irium/iriumd"]

@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+
+# Stage 1: Build
+FROM rust:latest AS builder
+
+WORKDIR /opt/irium
+COPY . .
+
+RUN cargo build --release --bin irium-miner && \
+    strip target/release/irium-miner
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r irium \
+    && useradd -r -g irium -s /bin/false -d /home/irium -m irium
+
+COPY --from=builder /opt/irium/target/release/irium-miner /usr/local/bin/irium-miner
+
+# Required: set IRIUM_MINER_ADDRESS and IRIUM_NODE_RPC at runtime.
+# These have no default — the miner will refuse to start without them.
+ENV IRIUM_MINER_ADDRESS="" \
+    IRIUM_NODE_RPC="" \
+    IRIUM_MINER_THREADS=2
+
+USER irium
+
+ENTRYPOINT ["/usr/local/bin/irium-miner"]

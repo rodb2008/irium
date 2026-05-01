@@ -599,6 +599,7 @@ async fn settlement_build(
 
 #[tokio::main]
 async fn main() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let node_base =
         env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string());
     let client = match build_client(&node_base) {
