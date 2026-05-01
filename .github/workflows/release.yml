@@ -36,7 +36,7 @@ jobs:
             build_gpu: "false"
 
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             archive_ext: tar.gz
             use_cross: "false"
             build_gpu: "false"
