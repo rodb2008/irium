@@ -5202,8 +5202,17 @@ async fn submit_proof_rpc(
         None => false,
         Some(h) => tip_height >= h,
     };
+    let proof_for_gossip = req.proof.clone();
     let mut store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
     let outcome = store.submit(req.proof).map_err(|e| bad(&e))?;
+    if outcome.accepted {
+        if let Some(ref node) = state.p2p {
+            if let Ok(json) = serde_json::to_string(&proof_for_gossip) {
+                let node = node.clone();
+                tokio::spawn(async move { node.broadcast_proof(&json).await; });
+            }
+        }
+    }
     let status = proof_lifecycle_status(expires_at_height, tip_height).to_string();
     Ok(Json(SubmitProofResponse {
         proof_id: outcome.proof_id,
@@ -7680,6 +7689,35 @@ async fn main() {
             storage::state_dir().join("policies.json"),
         ))),
     };
+
+    // Background task: drain P2P proof gossip inbox and submit locally.
+    if let Some(ref gossip_p2p) = app_state.p2p {
+        let drain_node = gossip_p2p.clone();
+        let drain_proof_store = app_state.proof_store.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let proofs = drain_node.drain_proof_gossip().await;
+                if proofs.is_empty() {
+                    continue;
+                }
+                let mut store = drain_proof_store.lock().unwrap_or_else(|e| e.into_inner());
+                for json in proofs {
+                    if let Ok(proof) = serde_json::from_str(&json) {
+                        if let Ok(outcome) = store.submit(proof) {
+                            if outcome.accepted {
+                                let rebroadcast = drain_node.clone();
+                                let j = json.clone();
+                                tokio::spawn(async move {
+                                    rebroadcast.broadcast_proof(&j).await;
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let persist_drain_secs = std::env::var("IRIUM_PERSIST_DRAIN_SECS")
         .ok()

@@ -2411,6 +2411,7 @@ pub struct P2PNode {
     agent: String,
     relay_address: Option<String>,
     marketplace_feed: Option<String>,
+    proof_gossip_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     node_id: Vec<u8>,
     trusted_seed_ips: Arc<HashSet<IpAddr>>,
 
@@ -2929,6 +2930,7 @@ impl P2PNode {
         relay_address: Option<String>,
         marketplace_feed: Option<String>,
     ) -> Self {
+        let proof_gossip_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         P2PNode {
             bind_addr,
             peers: Arc::new(Mutex::new(Vec::new())),
@@ -2954,6 +2956,7 @@ impl P2PNode {
             agent,
             relay_address,
             marketplace_feed,
+            proof_gossip_inbox,
             node_id: Self::load_or_create_node_id(),
             trusted_seed_ips: Self::load_trusted_seed_ips(),
             banned_ips: Self::load_banned_ips(),
@@ -2978,6 +2981,7 @@ impl P2PNode {
         let agent = self.agent.clone();
         let relay_address = self.relay_address.clone();
         let marketplace_feed = self.marketplace_feed.clone();
+        let proof_gossip_inbox = self.proof_gossip_inbox.clone();
         let accept_log = self.accept_log.clone();
         let sync_requests = self.sync_requests.clone();
         let block_requests = self.block_requests.clone();
@@ -3095,6 +3099,7 @@ impl P2PNode {
                         let agent_peer = agent.clone();
                         let relay_peer = relay_address.clone();
                         let marketplace_feed_peer = marketplace_feed.clone();
+                        let proof_gossip_inbox_peer = proof_gossip_inbox.clone();
                         let node_id_peer = node_id.clone();
                         let self_ip_peer = self_ips.clone();
                         let sync_peer = sync_requests.clone();
@@ -3127,6 +3132,7 @@ impl P2PNode {
                                 agent_peer,
                                 relay_peer,
                                 marketplace_feed_peer,
+                                proof_gossip_inbox_peer,
                                 node_id_peer,
                                 trusted,
                             )
@@ -3745,6 +3751,21 @@ impl P2PNode {
         Ok(())
     }
 
+    /// Broadcast a settlement proof to all connected peers.
+    pub async fn broadcast_proof(&self, proof_json: &str) {
+        let payload = crate::protocol::ProofGossipPayload {
+            proof_json: proof_json.as_bytes().to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
+    /// Drain all proof JSON strings received via P2P gossip since last call.
+    pub async fn drain_proof_gossip(&self) -> Vec<String> {
+        let mut inbox = self.proof_gossip_inbox.lock().await;
+        std::mem::take(&mut *inbox)
+    }
+
     /// Establish an outbound connection to a peer and send a handshake
     /// message describing this node's view of the chain.
     ///
@@ -4174,6 +4195,7 @@ impl P2PNode {
         let dir = self.peers_directory.clone();
         let relay_addr = self.relay_address.clone();
         let _marketplace_feed_url = self.marketplace_feed.clone();
+        let proof_gossip_inbox_outbound = self.proof_gossip_inbox.clone();
         let chain_for_sync = self.chain.clone();
         let mempool_for_sync = self.mempool.clone();
         let reputation = self.reputation.clone();
@@ -4243,7 +4265,8 @@ impl P2PNode {
                         | MessageType::Headers
                         | MessageType::Block
                         | MessageType::UptimeChallenge
-                        | MessageType::UptimeProof => {}
+                        | MessageType::UptimeProof
+                        | MessageType::ProofGossip => {}
                         _ => {
                             P2PNode::log_event(
                                 "info",
@@ -5775,6 +5798,14 @@ impl P2PNode {
                             }
                         }
                     }
+                    MessageType::ProofGossip => {
+                        if let Ok(pg) = crate::protocol::ProofGossipPayload::from_message(&msg) {
+                            if let Ok(json) = String::from_utf8(pg.proof_json) {
+                                let mut inbox = proof_gossip_inbox_outbound.lock().await;
+                                inbox.push(json);
+                            }
+                        }
+                    }
                     MessageType::Disconnect => break,
                     _ => {}
                 }
@@ -5979,6 +6010,7 @@ async fn handle_incoming_with_sybil(
     agent: String,
     relay_address: Option<String>,
     marketplace_feed_url: Option<String>,
+    proof_gossip_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     node_id: Vec<u8>,
     trusted_seed: bool,
 ) -> Result<(), String> {
@@ -7739,6 +7771,14 @@ async fn handle_incoming_with_sybil(
                             let mut dir = directory.lock().await;
                             dir.register_connection(multiaddr, None, Some(relay.address), None);
                         }
+                    }
+                }
+            }
+            MessageType::ProofGossip => {
+                if let Ok(pg) = crate::protocol::ProofGossipPayload::from_message(&msg) {
+                    if let Ok(json) = String::from_utf8(pg.proof_json) {
+                        let mut inbox = proof_gossip_inbox.lock().await;
+                        inbox.push(json);
                     }
                 }
             }
