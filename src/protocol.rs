@@ -33,6 +33,7 @@ pub enum MessageType {
     GetData = 16,
     UptimeChallenge = 17,
     UptimeProof = 18,
+    ProofGossip = 19,
     Disconnect = 99,
 }
 
@@ -60,6 +61,7 @@ impl TryFrom<u8> for MessageType {
             16 => GetData,
             17 => UptimeChallenge,
             18 => UptimeProof,
+            19 => ProofGossip,
             99 => Disconnect,
             other => return Err(format!("Unknown message type: {}", other)),
         };
@@ -127,7 +129,7 @@ pub struct HandshakePayload {
     pub tip_hash: Option<String>,
     #[serde(default)]
     pub capabilities: Option<Vec<String>>,
-    /// Optional URL of this node's marketplace offer feed (e.g. http://host:port/offers/feed).
+/// Optional URL of this node's marketplace offer feed (e.g. http://host:port/offers/feed).
     /// Propagated via P2P handshake so peers can discover feeds without manual configuration.
     #[serde(default)]
     pub marketplace_feed: Option<String>,
@@ -155,6 +157,29 @@ impl HandshakePayload {
 pub struct PingPayload {
     pub nonce: u64,
 }
+/// Gossip payload for settlement proofs. Raw JSON bytes of a SettlementProof.
+pub struct ProofGossipPayload {
+    pub proof_json: Vec<u8>,
+}
+
+impl ProofGossipPayload {
+    pub fn to_message(&self) -> Message {
+        Message {
+            msg_type: MessageType::ProofGossip,
+            payload: self.proof_json.clone(),
+        }
+    }
+
+    pub fn from_message(msg: &Message) -> Result<Self, String> {
+        if msg.msg_type != MessageType::ProofGossip {
+            return Err("Not a proof gossip message".to_string());
+        }
+        Ok(ProofGossipPayload {
+            proof_json: msg.payload.clone(),
+        })
+    }
+}
+
 
 impl PingPayload {
     pub fn to_message(&self) -> Message {

@@ -6805,6 +6805,7 @@ fn handle_otc_attest(args: &[String]) -> Result<(), String> {
     let mut proof_type = "otc_release".to_string();
     let mut rpc_url: Option<String> = None;
     let mut json_mode = false;
+    let mut include_proofs = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -8424,6 +8425,345 @@ fn handle_marketplace_sync(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn disputes_dir() -> std::path::PathBuf {
+    irium_data_dir().join("disputes")
+}
+
+fn dispute_path(agreement_hash: &str) -> std::path::PathBuf {
+    disputes_dir().join(format!("{}.json", agreement_hash))
+}
+
+fn handle_attestor_list(args: &[String]) -> Result<(), String> {
+    let mut json_mode = false;
+    let mut rpc_url = default_rpc_url();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => { json_mode = true; i += 1; }
+            "--rpc" => { rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let base = rpc_url.trim_end_matches('/');
+    let policies: Vec<ProofPolicy> = match rpc_client(base).and_then(|client| {
+        rpc_post_json::<serde_json::Value, serde_json::Value>(
+            &client, base, "/rpc/listpolicies",
+            &serde_json::json!({ "active_only": false }),
+        )
+    }) {
+        Ok(resp) => {
+            resp.get("policies").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    };
+    use std::collections::HashMap;
+    let mut seen: HashMap<String, irium_node_rs::settlement::ApprovedAttestor> = HashMap::new();
+    for policy in &policies {
+        for att in &policy.attestors {
+            seen.entry(att.attestor_id.clone()).or_insert_with(|| att.clone());
+        }
+    }
+    let attestors: Vec<&irium_node_rs::settlement::ApprovedAttestor> =
+        seen.values().collect();
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "attestors": attestors.iter().map(|a| serde_json::json!({
+                    "attestor_id": a.attestor_id,
+                    "pubkey_hex": a.pubkey_hex,
+                    "display_name": a.display_name,
+                    "domain": a.domain,
+                })).collect::<Vec<_>>(),
+                "count": attestors.len(),
+            }))
+            .unwrap()
+        );
+    } else if attestors.is_empty() {
+        println!("no attestors found in local policies");
+        println!();
+        println!("tip  Attestors are extracted from proof policies stored on this node.");
+        println!("tip  Run agreement-proof-submit to add proofs, which reference attestors.");
+    } else {
+        println!("attestors ({}):", attestors.len());
+        for att in &attestors {
+            print!("  {} ({})", att.attestor_id, att.pubkey_hex);
+            if let Some(ref name) = att.display_name {
+                print!(" — {}", name);
+            }
+            if let Some(ref domain) = att.domain {
+                print!(" [{}]", domain);
+            }
+            println!();
+        }
+    }
+    Ok(())
+}
+
+fn handle_proof_template_list(args: &[String]) -> Result<(), String> {
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let templates = serde_json::json!([
+        {
+            "kind": "software_delivery",
+            "description": "Software artifact delivery — artifact hash + optional attestor sign-off",
+            "required_fields": ["content_hash"],
+            "optional_fields": ["reference_id", "attributes.build_id", "attributes.repo_url", "attributes.tag"],
+        },
+        {
+            "kind": "service_completion",
+            "description": "Service completion — timestamp range + optional attestor confirmation",
+            "required_fields": ["attributes.started_at", "attributes.completed_at"],
+            "optional_fields": ["reference_id", "attributes.service_name", "attributes.deliverable"],
+        },
+        {
+            "kind": "physical_delivery",
+            "description": "Physical delivery — tracking reference + optional carrier details",
+            "required_fields": ["reference_id"],
+            "optional_fields": ["attributes.carrier", "attributes.delivered_at", "attributes.recipient"],
+        },
+    ]);
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&templates).unwrap());
+    } else {
+        println!("available proof templates:");
+        println!();
+        println!("  software_delivery");
+        println!("    Software artifact delivery. Required: content_hash (SHA-256 of artifact).");
+        println!("    Optional: reference_id (build/release ID), attributes.build_id, attributes.repo_url");
+        println!();
+        println!("  service_completion");
+        println!("    Service work completion. Required: attributes.started_at, attributes.completed_at");
+        println!("    Optional: reference_id (ticket/contract ID), attributes.service_name");
+        println!();
+        println!("  physical_delivery");
+        println!("    Physical parcel delivery. Required: reference_id (tracking number).");
+        println!("    Optional: attributes.carrier, attributes.delivered_at, attributes.recipient");
+        println!();
+        println!("use: irium-wallet proof-template-create --kind <name> --agreement <hash> --attested-by <id>");
+    }
+    Ok(())
+}
+
+fn handle_proof_template_create(args: &[String]) -> Result<(), String> {
+    let mut kind: Option<String> = None;
+    let mut agreement_hash: Option<String> = None;
+    let mut attested_by: Option<String> = None;
+    let mut reference_id: Option<String> = None;
+    let mut content_hash: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--kind" => { kind = Some(parse_required_string_flag(args, &mut i, "--kind")?); }
+            "--agreement" => { agreement_hash = Some(parse_required_string_flag(args, &mut i, "--agreement")?); }
+            "--attested-by" => { attested_by = Some(parse_required_string_flag(args, &mut i, "--attested-by")?); }
+            "--reference-id" => { reference_id = Some(parse_required_string_flag(args, &mut i, "--reference-id")?); }
+            "--content-hash" => { content_hash = Some(parse_required_string_flag(args, &mut i, "--content-hash")?); }
+            "--out" => { out_path = Some(parse_required_string_flag(args, &mut i, "--out")?); }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let k = kind.ok_or_else(|| "--kind is required (software_delivery | service_completion | physical_delivery)".to_string())?;
+    let hash = agreement_hash.ok_or_else(|| "--agreement is required".to_string())?;
+    let att_by = attested_by.unwrap_or_else(|| "self".to_string());
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (typed_payload, notes) = match k.as_str() {
+        "software_delivery" => {
+            let ch = content_hash.ok_or_else(|| "--content-hash is required for software_delivery".to_string())?;
+            (
+                serde_json::json!({
+                    "proof_kind": "software_delivery",
+                    "content_hash": ch,
+                    "reference_id": reference_id,
+                    "attributes": { "build_id": null, "repo_url": null, "tag": null },
+                }),
+                "Replace null attribute values with actual build metadata before submitting.",
+            )
+        }
+        "service_completion" => (
+            serde_json::json!({
+                "proof_kind": "service_completion",
+                "reference_id": reference_id,
+                "attributes": {
+                    "started_at": null,
+                    "completed_at": now_secs,
+                    "service_name": null,
+                    "deliverable": null,
+                },
+            }),
+            "Fill in started_at (Unix timestamp) and replace nulls before submitting.",
+        ),
+        "physical_delivery" => {
+            let rid = reference_id.ok_or_else(|| "--reference-id (tracking number) is required for physical_delivery".to_string())?;
+            (
+                serde_json::json!({
+                    "proof_kind": "physical_delivery",
+                    "reference_id": rid,
+                    "attributes": { "carrier": null, "delivered_at": now_secs, "recipient": null },
+                }),
+                "Fill in carrier and recipient before submitting.",
+            )
+        }
+        other => return Err(format!("unknown proof kind: {}; use software_delivery, service_completion, or physical_delivery", other)),
+    };
+    let proof_id = format!("proof_{}", now_secs);
+    let scaffold = serde_json::json!({
+        "proof_id": proof_id,
+        "schema_id": "irium.proof.v1",
+        "proof_type": k,
+        "agreement_hash": hash,
+        "milestone_id": null,
+        "attested_by": att_by,
+        "attestation_time": now_secs,
+        "evidence_hash": null,
+        "evidence_summary": null,
+        "signature": {
+            "signature_type": "ed25519",
+            "pubkey_hex": "FILL_IN_PUBKEY",
+            "signature_hex": "FILL_IN_SIGNATURE",
+            "payload_hash": "FILL_IN_HASH"
+        },
+        "typed_payload": typed_payload,
+        "_note": notes,
+    });
+    let json = serde_json::to_string_pretty(&scaffold).unwrap();
+    if let Some(ref path) = out_path {
+        std::fs::write(path, &json).map_err(|e| format!("write {}: {}", path, e))?;
+        println!("scaffold written to {}", path);
+    } else {
+        println!("{}", json);
+    }
+    println!();
+    println!("note  Fill in signature fields, then submit with:");
+    println!("      irium-wallet agreement-proof-submit --proof <file> --rpc <url>");
+    Ok(())
+}
+
+fn handle_agreement_dispute(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--reason" => { reason = Some(parse_required_string_flag(args, &mut i, "--reason")?); }
+            "--json" => { json_mode = true; i += 1; }
+            other => {
+                if agreement_ref.is_none() && !other.starts_with("--") {
+                    agreement_ref = Some(other.to_string());
+                    i += 1;
+                } else {
+                    return Err(format!("unknown argument: {}", other));
+                }
+            }
+        }
+    }
+    let agreement_id = agreement_ref.ok_or_else(|| "agreement hash or ID is required".to_string())?;
+    let resolved = resolve_agreement_input(&agreement_id)?;
+    let agreement = resolved.agreement;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let dispute = serde_json::json!({
+        "agreement_hash": agreement_hash,
+        "agreement_id": agreement.agreement_id,
+        "raised_at": now_secs,
+        "reason": reason,
+        "resolver_reference": agreement.resolver_reference,
+        "status": "open",
+    });
+    let dir = disputes_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create disputes dir: {}", e))?;
+    let path = dispute_path(&agreement_hash);
+    if path.exists() {
+        return Err(format!("dispute already open for agreement {}", agreement_hash));
+    }
+    let json = serde_json::to_string_pretty(&dispute).unwrap();
+    std::fs::write(&path, &json).map_err(|e| format!("write dispute: {}", e))?;
+    if json_mode {
+        println!("{}", json);
+    } else {
+        println!("dispute raised");
+        println!("agreement_hash  {}", agreement_hash);
+        if let Some(ref r) = agreement.resolver_reference {
+            println!("resolver        {}", r);
+            println!();
+            println!("tip  Share this dispute record with the resolver: {}", path.display());
+        } else {
+            println!();
+            println!("note  No resolver is configured on this agreement.");
+            println!("      Add a resolver_reference when creating agreements to enable resolver sign-off.");
+        }
+        println!();
+        println!("note  Automatic release is blocked while dispute is open.");
+    }
+    Ok(())
+}
+
+fn handle_agreement_dispute_list(args: &[String]) -> Result<(), String> {
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let dir = disputes_dir();
+    if !dir.exists() {
+        if json_mode {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({"disputes": [], "count": 0})).unwrap());
+        } else {
+            println!("no disputes on record");
+        }
+        return Ok(());
+    }
+    let mut disputes: Vec<serde_json::Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Ok(data) = std::fs::read_to_string(entry.path()) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                        disputes.push(v);
+                    }
+                }
+            }
+        }
+    }
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "disputes": disputes,
+                "count": disputes.len(),
+            })).unwrap()
+        );
+    } else if disputes.is_empty() {
+        println!("no disputes on record");
+    } else {
+        println!("disputes ({}):", disputes.len());
+        for d in &disputes {
+            let hash = d.get("agreement_hash").and_then(|v| v.as_str()).unwrap_or("?");
+            let status = d.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+            let reason = d.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            println!("  {} [{}]{}", hash, status, if reason.is_empty() { "".to_string() } else { format!(" — {}", reason) });
+        }
+    }
+    Ok(())
+}
+
 fn reputation_dir() -> std::path::PathBuf {
     irium_data_dir().join("reputation")
 }
@@ -8988,6 +9328,7 @@ fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
     let mut out_path: Option<String> = None;
     let mut rpc_url = default_rpc_url();
     let mut json_mode = false;
+    let mut include_proofs = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -9002,6 +9343,10 @@ fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
             }
             "--json" => {
                 json_mode = true;
+                i += 1;
+            }
+            "--include-proofs" => {
+                include_proofs = true;
                 i += 1;
             }
             other => return Err(format!("unknown argument: {}", other)),
@@ -9035,10 +9380,32 @@ fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
     };
 
     let has_policy = policy.is_some();
+    let proofs: Option<Vec<serde_json::Value>> = if include_proofs {
+        let base = rpc_url.trim_end_matches('/');
+        match rpc_client(base).and_then(|client| {
+            let req = ListProofsRpcRequest {
+                agreement_hash: Some(agreement_hash.clone()),
+                active_only: false,
+                offset: 0,
+                limit: None,
+            };
+            rpc_post_json::<ListProofsRpcRequest, ListProofsRpcResponse>(
+                &client, base, "/rpc/listproofs", &req,
+            )
+        }) {
+            Ok(resp) => Some(resp.proofs.iter().map(|p| serde_json::to_value(p).unwrap_or_default()).collect()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let proofs_count: usize = proofs.as_ref().map(|p| p.len()).unwrap_or(0);
+    let has_policy = policy.is_some();
     let bundle = serde_json::json!({
         "schema": "irium.agreement_package.v1",
         "agreement": &agreement,
         "policy": &policy,
+        "proofs": &proofs,
     });
     let json =
         serde_json::to_string_pretty(&bundle).map_err(|e| format!("serialize package: {e}"))?;
@@ -9052,6 +9419,7 @@ fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
                 "agreement_id":    display_id,
                 "agreement_hash":  agreement_hash,
                 "policy_included": has_policy,
+                "proofs_included": proofs_count,
                 "out":             out,
             }))
             .unwrap()
@@ -23666,6 +24034,36 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "offer-feed-sync" => {
             if let Err(e) = handle_offer_feed_sync(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "attestor-list" => {
+            if let Err(e) = handle_attestor_list(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "proof-template-list" => {
+            if let Err(e) = handle_proof_template_list(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "proof-template-create" => {
+            if let Err(e) = handle_proof_template_create(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-dispute" => {
+            if let Err(e) = handle_agreement_dispute(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-dispute-list" => {
+            if let Err(e) = handle_agreement_dispute_list(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
