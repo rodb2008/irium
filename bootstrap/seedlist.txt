@@ -1,3 +1,3 @@
 # Official signed bootstrap seeds only
-207.244.247.86
-157.173.116.134
+# No hardcoded IPs — peers are discovered dynamically through the P2P layer.
+# Use IRIUM_ADDNODE env var or --addnode flag for manual peer bootstrapping.

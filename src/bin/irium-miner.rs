@@ -2171,7 +2171,6 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn solo_stratum_listen_addr() -> Option<String> {
-    let default = "0.0.0.0:3333".to_string();
     let mut enabled = env_flag("IRIUM_SOLO_STRATUM");
     let mut listen = env::var("IRIUM_SOLO_STRATUM_LISTEN")
         .ok()
@@ -2209,7 +2208,11 @@ fn solo_stratum_listen_addr() -> Option<String> {
     }
 
     if enabled {
-        Some(listen.unwrap_or(default))
+        if listen.is_none() {
+            eprintln!("Error: IRIUM_SOLO_STRATUM_LISTEN must be set when --solo-stratum is enabled");
+            std::process::exit(1);
+        }
+        listen
     } else {
         listen
     }

@@ -2185,13 +2185,13 @@ fn usage() {
 }
 
 fn node_rpc_base() -> String {
-    env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "http://127.0.0.1:38300".to_string())
+    env::var("IRIUM_NODE_RPC")
+        .or_else(|_| env::var("IRIUM_RPC_URL"))
+        .unwrap_or_default()
 }
 
 fn default_rpc_url() -> String {
-    env::var("IRIUM_NODE_RPC")
-        .or_else(|_| env::var("IRIUM_RPC_URL"))
-        .unwrap_or_else(|_| node_rpc_base())
+    node_rpc_base()
 }
 
 fn color_enabled() -> bool {
@@ -2271,6 +2271,9 @@ where
 }
 
 fn rpc_client(base: &str) -> Result<Client, String> {
+    if base.is_empty() {
+        return Err("RPC URL not configured. Set IRIUM_NODE_RPC or use --rpc <url>".to_string());
+    }
     let mut builder = Client::builder().timeout(Duration::from_secs(10));
     let ca_path = env::var("IRIUM_RPC_CA").ok().or_else(|| {
         let fallback = Path::new("/etc/irium/tls/irium-ca.crt");
@@ -8700,12 +8703,9 @@ fn handle_feed_list(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-// Public marketplace nodes — same hosts as bootstrap/seedlist.txt.
-// Update this list as new official nodes come online.
-const BOOTSTRAP_FEEDS: &[&str] = &[
-    "http://207.244.247.86:38300/offers/feed",
-    "http://157.173.116.134:38300/offers/feed",
-];
+// Feed bootstrap uses P2P-based peer discovery — no hardcoded endpoints.
+// New nodes discover marketplace feeds dynamically through the P2P layer.
+const BOOTSTRAP_FEEDS: &[&str] = &[];
 
 fn handle_feed_bootstrap(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {

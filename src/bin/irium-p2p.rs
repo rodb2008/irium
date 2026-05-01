@@ -51,7 +51,10 @@ async fn main() {
     let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));
 
     let bind: SocketAddr = std::env::var("IRIUM_P2P_BIND")
-        .unwrap_or_else(|_| "0.0.0.0:38291".to_string())
+        .unwrap_or_else(|_| {
+            eprintln!("Error: IRIUM_P2P_BIND must be set (e.g. export IRIUM_P2P_BIND=0.0.0.0:38291)");
+            std::process::exit(1);
+        })
         .parse()
         .expect("valid bind address");
     let agent = std::env::var("IRIUM_NODE_AGENT").unwrap_or_else(|_| "Irium-Rust".to_string());

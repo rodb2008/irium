@@ -6937,51 +6937,52 @@ async fn main() {
         .and_then(|c| c.relay_address.clone())
         .or_else(|| std::env::var("IRIUM_RELAY_ADDRESS").ok());
 
-    // Set up P2P node if configured.
-    let p2p: Option<P2PNode> = if let Some(ref cfg) = node_cfg {
-        if let Some(bind) = &cfg.p2p_bind {
-            match bind.parse::<SocketAddr>() {
-                Ok(addr) => {
-                    let node = P2PNode::new(
-                        addr,
-                        agent_string.clone(),
-                        Some(shared_state.clone()),
-                        Some(mempool.clone()),
-                        relay_address.clone(),
-                    );
-                    // Start listener in the background.
-                    if let Err(e) = node.start().await {
-                        eprintln!("Failed to start P2P listener on {}: {}", addr, e);
-                        None
-                    } else {
-                        Some(node)
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Invalid P2P bind address {}: {}", bind, e);
+    // Set up P2P node if configured via IRIUM_P2P_BIND env var or node config.
+    let p2p_bind_str: Option<String> = std::env::var("IRIUM_P2P_BIND").ok()
+        .or_else(|| node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.clone()));
+    let p2p: Option<P2PNode> = if let Some(bind) = p2p_bind_str {
+        match bind.parse::<SocketAddr>() {
+            Ok(addr) => {
+                let node = P2PNode::new(
+                    addr,
+                    agent_string.clone(),
+                    Some(shared_state.clone()),
+                    Some(mempool.clone()),
+                    relay_address.clone(),
+                );
+                // Start listener in the background.
+                if let Err(e) = node.start().await {
+                    eprintln!("Failed to start P2P listener on {}: {}", addr, e);
                     None
+                } else {
+                    Some(node)
                 }
             }
-        } else {
-            None
+            Err(e) => {
+                eprintln!("Invalid P2P bind address {}: {}", bind, e);
+                None
+            }
         }
     } else {
         None
     };
 
     // Build seed list: merge config, signed, and runtime seeds; filter locals.
-    let default_seed_port: u16 = node_cfg
-        .as_ref()
-        .and_then(|cfg| cfg.p2p_bind.as_ref())
-        .and_then(|b| b.split(":").last())
+    // Derive default seed port from the configured P2P bind address; 0 = no default.
+    let default_seed_port: u16 = std::env::var("IRIUM_P2P_BIND").ok()
+        .or_else(|| node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.clone()))
+        .as_deref()
+        .and_then(|b| b.split(':').last())
         .and_then(|p| p.parse().ok())
-        .unwrap_or(38291);
+        .unwrap_or(0);
 
     let manual_seeds = load_manual_seeds(node_cfg.as_ref());
     let fallback_seeds = load_builtin_fallback_seeds();
     let dns_seed_hosts = load_dns_seed_hosts(node_cfg.as_ref());
     let signed_seeds = load_signed_seeds();
-    let local_ips = local_ip_set(node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.as_ref()));
+    let p2p_bind_for_local = std::env::var("IRIUM_P2P_BIND").ok()
+        .or_else(|| node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.clone()));
+    let local_ips = local_ip_set(p2p_bind_for_local.as_ref());
 
     let startup_missing_window = storage::missing_persisted_in_window();
 
@@ -7873,7 +7874,10 @@ async fn offers_feed(
     let status_port: u16 = std::env::var("IRIUM_STATUS_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(8080);
+        .unwrap_or_else(|| {
+            eprintln!("Error: IRIUM_STATUS_PORT must be set");
+            std::process::exit(1);
+        });
     let status_addr: SocketAddr = format!("{}:{}", status_host, status_port)
         .parse()
         .expect("valid status bind address");
@@ -7903,7 +7907,10 @@ async fn offers_feed(
     let port: u16 = std::env::var("IRIUM_NODE_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(38300);
+        .unwrap_or_else(|| {
+            eprintln!("Error: IRIUM_NODE_PORT must be set");
+            std::process::exit(1);
+        });
 
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()

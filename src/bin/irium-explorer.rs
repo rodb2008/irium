@@ -3828,7 +3828,10 @@ async fn main() {
     let port: u16 = env::var("IRIUM_EXPLORER_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(38310);
+        .unwrap_or_else(|| {
+            eprintln!("Error: IRIUM_EXPLORER_PORT must be set");
+            std::process::exit(1);
+        });
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .expect("valid bind address");
