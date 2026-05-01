@@ -14,9 +14,14 @@
 //!   IRIUM_RPC_INSECURE, IRIUM_JSON_LOG, IRIUM_COINBASE_METADATA
 //!
 //! GPU-specific env vars:
-//!   IRIUM_GPU_BATCH    nonces per GPU dispatch      (default: 4194304 = 2^22)
-//!   IRIUM_GPU_DEVICE   OpenCL device index           (default: 0)
-//!   IRIUM_GPU_DEVICES  comma-separated device list   (e.g. 0,1,2; overrides IRIUM_GPU_DEVICE)
+//!   IRIUM_GPU_BATCH     nonces per GPU dispatch                       (default: 4194304 = 2^22)
+//!   IRIUM_GPU_PLATFORM  OpenCL platform index or vendor name substring (default: auto, prefers NVIDIA/AMD)
+//!   IRIUM_GPU_DEVICE    OpenCL device index within selected platform   (default: 0)
+//!   IRIUM_GPU_DEVICES   comma-separated device indices within platform (overrides IRIUM_GPU_DEVICE)
+//!
+//! CLI flags:
+//!   --platform <n|name>  select OpenCL platform by index or vendor name substring
+//!   --list-platforms     print all detected OpenCL platforms and devices, then exit
 
 fn fmt_rate(hs: f64) -> String {
     if hs >= 1_000_000_000.0 {
@@ -314,7 +319,7 @@ fn rpc_token() -> Option<String> {
 }
 
 fn node_rpc_base() -> String {
-    env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string())
+    env::var("IRIUM_NODE_RPC").unwrap_or_default()
 }
 
 fn json_log_enabled() -> bool {
@@ -631,26 +636,26 @@ struct GpuMiner {
 unsafe impl Send for GpuMiner {}
 
 impl GpuMiner {
-    fn new(device_idx: usize, batch_size: usize) -> Result<Self, String> {
-        let platform = Platform::default();
+    fn new(platform: Platform, platform_idx: usize, device_idx: usize, batch_size: usize) -> Result<Self, String> {
         let devices = Device::list_all(platform).map_err(|e| format!("OpenCL device list: {e}"))?;
         if devices.is_empty() {
-            return Err("No OpenCL devices found.\n\
+            return Err(format!(
+                "No OpenCL devices found on platform {platform_idx}.\n\
                  Install your GPU driver and the ICD loader:\n\
                  apt install ocl-icd-opencl-dev"
-                .into());
+            ));
         }
         let device = *devices.get(device_idx).ok_or_else(|| {
             format!(
-                "device index {device_idx} out of range (found {} device(s))",
+                "device index {device_idx} out of range on platform {platform_idx} \
+                 (found {} device(s)); run --list-platforms to see available devices",
                 devices.len()
             )
         })?;
 
-        println!(
-            "[GPU] Device {device_idx}: {}",
-            device.name().unwrap_or_else(|_| "?".into())
-        );
+        let plat_name = platform.name().unwrap_or_else(|_| "?".into());
+        let dev_name  = device.name().unwrap_or_else(|_| "?".into());
+        println!("[GPU] Platform {platform_idx} ({plat_name}), Device {device_idx}: {dev_name}");
 
         let context = Context::builder()
             .platform(platform)
@@ -793,45 +798,150 @@ fn tail_from_header(ser: &[u8]) -> [u32; 3] {
 // Multi-GPU initialisation
 // =============================================================================
 
-/// Returns the list of OpenCL device indices to use.
-///
-/// Priority:
-///   1. IRIUM_GPU_DEVICES / --devices (comma-separated list)
-///   2. IRIUM_GPU_DEVICE  / --device  (single index)
-///   3. Default: all available devices on the default platform
-fn gpu_device_indices() -> Result<Vec<usize>, String> {
+// =============================================================================
+// Platform and device enumeration
+// =============================================================================
+
+/// Returns true if the platform vendor looks like a discrete GPU (NVIDIA or AMD).
+fn vendor_is_discrete(vendor: &str) -> bool {
+    let v = vendor.to_lowercase();
+    v.contains("nvidia") || v.contains("amd") || v.contains("advanced micro")
+}
+
+/// Enumerate every OpenCL platform and the display names of its devices.
+fn enumerate_platforms() -> Vec<(Platform, String, Vec<String>)> {
+    Platform::list()
+        .into_iter()
+        .map(|p| {
+            let vendor = p.name().unwrap_or_else(|_| "Unknown".into());
+            let dev_names = Device::list_all(p)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|d| d.name().unwrap_or_else(|_| "Unknown".into()))
+                .collect();
+            (p, vendor, dev_names)
+        })
+        .collect()
+}
+
+/// Print all detected platforms and devices (for --list-platforms).
+fn print_platforms(platforms: &[(Platform, String, Vec<String>)]) {
+    if platforms.is_empty() {
+        println!("[GPU] No OpenCL platforms found.");
+        println!("      Install your GPU driver and: apt install ocl-icd-opencl-dev");
+        return;
+    }
+    println!("[GPU] OpenCL platforms detected:");
+    for (i, (_, vendor, devices)) in platforms.iter().enumerate() {
+        println!("  Platform {i}: {vendor} ({} device(s))", devices.len());
+        for (j, name) in devices.iter().enumerate() {
+            println!("    Device {j}: {name}");
+        }
+    }
+}
+
+/// Auto-select the best platform: prefer NVIDIA/AMD discrete GPUs over Intel iGPU.
+fn auto_select_platform(platforms: &[(Platform, String, Vec<String>)]) -> usize {
+    for (i, (_, vendor, devs)) in platforms.iter().enumerate() {
+        if !devs.is_empty() && vendor_is_discrete(vendor) {
+            return i;
+        }
+    }
+    for (i, (_, _, devs)) in platforms.iter().enumerate() {
+        if !devs.is_empty() {
+            return i;
+        }
+    }
+    0
+}
+
+/// Resolve a platform selection: numeric index or vendor name substring.
+fn resolve_platform_idx(
+    platforms: &[(Platform, String, Vec<String>)],
+    sel: Option<&str>,
+) -> Result<usize, String> {
+    match sel {
+        None => Ok(auto_select_platform(platforms)),
+        Some(s) => {
+            if let Ok(n) = s.parse::<usize>() {
+                if n >= platforms.len() {
+                    return Err(format!(
+                        "platform index {n} out of range (found {} platform(s)); \
+                         run --list-platforms to see available platforms",
+                        platforms.len()
+                    ));
+                }
+                Ok(n)
+            } else {
+                let lo = s.to_lowercase();
+                platforms
+                    .iter()
+                    .position(|(_, vendor, _)| vendor.to_lowercase().contains(&lo))
+                    .ok_or_else(|| format!("no OpenCL platform matching '{s}'; run --list-platforms to see options"))
+            }
+        }
+    }
+}
+
+/// Resolve which (platform_idx, device_idx) pairs to mine on.
+fn resolve_devices(
+    platforms: &[(Platform, String, Vec<String>)],
+    platform_sel: Option<&str>,
+) -> Result<Vec<(usize, usize)>, String> {
+    if platforms.is_empty() {
+        return Err(
+            "No OpenCL platforms found.\n\
+             Install your GPU driver and the ICD loader:\n\
+             apt install ocl-icd-opencl-dev"
+                .into(),
+        );
+    }
+    let plat_idx = resolve_platform_idx(platforms, platform_sel)?;
+    let dev_count = platforms[plat_idx].2.len();
+    if dev_count == 0 {
+        return Err(format!(
+            "Platform {plat_idx} ({}) has no devices; run --list-platforms to see options",
+            platforms[plat_idx].1
+        ));
+    }
     if let Ok(val) = env::var("IRIUM_GPU_DEVICES") {
-        let indices: Vec<usize> = val
+        let idxs: Vec<usize> = val
             .split(',')
             .filter_map(|s| s.trim().parse().ok())
             .collect();
-        if !indices.is_empty() {
-            return Ok(indices);
+        if !idxs.is_empty() {
+            for &d in &idxs {
+                if d >= dev_count {
+                    return Err(format!(
+                        "device index {d} out of range (platform {plat_idx} has {dev_count} device(s))"
+                    ));
+                }
+            }
+            return Ok(idxs.into_iter().map(|d| (plat_idx, d)).collect());
         }
     }
     if let Ok(val) = env::var("IRIUM_GPU_DEVICE") {
-        if let Ok(idx) = val.trim().parse::<usize>() {
-            return Ok(vec![idx]);
+        if let Ok(d) = val.trim().parse::<usize>() {
+            if d >= dev_count {
+                return Err(format!(
+                    "device index {d} out of range (platform {plat_idx} has {dev_count} device(s))"
+                ));
+            }
+            return Ok(vec![(plat_idx, d)]);
         }
     }
-    // Default: enumerate all devices on the default platform.
-    let platform = Platform::default();
-    let devices = Device::list_all(platform).map_err(|e| format!("OpenCL device list: {e}"))?;
-    if devices.is_empty() {
-        return Err("No OpenCL devices found.\n\
-             Install your GPU driver and the ICD loader:\n\
-             apt install ocl-icd-opencl-dev"
-            .into());
-    }
-    Ok((0..devices.len()).collect())
+    Ok((0..dev_count).map(|d| (plat_idx, d)).collect())
 }
 
-/// Initialise one GpuMiner per requested device.
-fn init_gpus(batch_size: usize) -> Result<Vec<GpuMiner>, String> {
-    let indices = gpu_device_indices()?;
-    indices
+/// Initialise one GpuMiner per resolved (platform_idx, device_idx) pair.
+fn init_gpus(
+    platforms: &[(Platform, String, Vec<String>)],
+    device_refs: &[(usize, usize)],
+    batch_size: usize,
+) -> Result<Vec<GpuMiner>, String> {
+    device_refs
         .iter()
-        .map(|&idx| GpuMiner::new(idx, batch_size))
+        .map(|&(plat_idx, dev_idx)| GpuMiner::new(platforms[plat_idx].0, plat_idx, dev_idx, batch_size))
         .collect()
 }
 
@@ -1341,21 +1451,42 @@ fn run_stratum_gpu(gpus: &mut [GpuMiner]) -> Result<(), String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: irium-miner-gpu [OPTIONS]\n\
-         \n\
-         Options:\n\
-           --pool    <url>      Stratum pool URL  (e.g. stratum+tcp://pool.iriumlabs.org:3335)\n\
-           --wallet  <addr>     Mining/payout address\n\
-           --device  <n>        OpenCL device index (default: 0)\n\
-           --devices <n,n,…>    Comma-separated list of OpenCL device indices (multi-GPU)\n\
-           --batch   <n>        Nonces per GPU dispatch (default: 4194304)\n\
-           --rpc     <url>      Node RPC URL for solo mining (default: https://127.0.0.1:38300)\n\
-           --help               Show this message\n\
-         \n\
-         All options can also be set via environment variables:\n\
-           IRIUM_STRATUM_URL, IRIUM_MINER_ADDRESS, IRIUM_GPU_DEVICE,\n\
-           IRIUM_GPU_DEVICES, IRIUM_GPU_BATCH, IRIUM_NODE_RPC\n\
-         \n\
+        "Usage: irium-miner-gpu [OPTIONS]
+\
+         
+\
+         Options:
+\
+           --pool            <url>     Stratum pool URL
+\
+           --wallet          <addr>    Mining/payout address
+\
+           --platform        <n|name>  OpenCL platform index or vendor name substring
+\
+                                       (default: auto, prefers NVIDIA/AMD over Intel)
+\
+           --device          <n>       Device index within selected platform (default: 0)
+\
+           --devices         <n,n,...> Comma-separated device indices (multi-GPU)
+\
+           --batch           <n>       Nonces per GPU dispatch (default: 4194304)
+\
+           --rpc             <url>     Node RPC URL for solo mining (env: IRIUM_NODE_RPC)
+\
+           --list-platforms            List all OpenCL platforms and devices, then exit
+\
+           --help                      Show this message
+\
+         
+\
+         Environment variables:
+\
+           IRIUM_STRATUM_URL, IRIUM_MINER_ADDRESS, IRIUM_GPU_PLATFORM,
+\
+           IRIUM_GPU_DEVICE, IRIUM_GPU_DEVICES, IRIUM_GPU_BATCH, IRIUM_NODE_RPC
+\
+         
+\
          CLI flags take priority over environment variables."
     );
 }
@@ -1370,6 +1501,7 @@ fn main() {
 
     // Parse CLI args and override env vars
     let mut args = std::env::args().skip(1).peekable();
+    let mut list_platforms_flag = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--pool" => {
@@ -1397,6 +1529,16 @@ fn main() {
                 } else {
                     env::set_var("IRIUM_GPU_DEVICE", val);
                 }
+            }
+            "--platform" => {
+                let val = args.next().unwrap_or_else(|| {
+                    eprintln!("--platform requires a value (index or vendor name substring)");
+                    std::process::exit(1);
+                });
+                env::set_var("IRIUM_GPU_PLATFORM", val);
+            }
+            "--list-platforms" => {
+                list_platforms_flag = true;
             }
             "--batch" => {
                 let val = args.next().unwrap_or_else(|| {
@@ -1442,7 +1584,20 @@ fn main() {
         batch_size as f64 / 1_000_000.0
     );
 
-    let mut gpus = match init_gpus(batch_size) {
+    let platforms = enumerate_platforms();
+    if list_platforms_flag {
+        print_platforms(&platforms);
+        std::process::exit(0);
+    }
+    let platform_sel = env::var("IRIUM_GPU_PLATFORM").ok();
+    let device_refs = match resolve_devices(&platforms, platform_sel.as_deref()) {
+        Ok(refs) => refs,
+        Err(e) => {
+            eprintln!("[GPU] Device selection error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut gpus = match init_gpus(&platforms, &device_refs, batch_size) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("[GPU] Initialisation failed: {e}");
