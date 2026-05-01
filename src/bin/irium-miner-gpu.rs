@@ -809,8 +809,18 @@ fn vendor_is_discrete(vendor: &str) -> bool {
 }
 
 /// Enumerate every OpenCL platform and the display names of its devices.
+/// Returns an empty Vec when no OpenCL platforms are available (no GPU drivers installed).
 fn enumerate_platforms() -> Vec<(Platform, String, Vec<String>)> {
-    Platform::list()
+    // Platform::list() panics when the ICD loader finds no platform drivers.
+    // Wrap with AssertUnwindSafe so --list-platforms prints a friendly message
+    // instead of crashing on machines without a GPU OpenCL runtime.
+    let platform_list = match std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(Platform::list),
+    ) {
+        Ok(list) => list,
+        Err(_) => return Vec::new(),
+    };
+    platform_list
         .into_iter()
         .map(|p| {
             let vendor = p.name().unwrap_or_else(|_| "Unknown".into());
