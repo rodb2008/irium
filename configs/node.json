@@ -1,5 +1,8 @@
 {
   "p2p_bind": null,
-  "p2p_seeds": [],
+  "p2p_seeds": [
+    "207.244.247.86:38291",
+    "157.173.116.134:38291"
+  ],
   "relay_address": null
 }
