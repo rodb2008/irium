@@ -9079,6 +9079,15 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
         }
     }
 
+    // Use outcomes count as a floor for total so sybil check works
+    // even when agreement bundle files are not present locally.
+    if has_outcome_data {
+        let outcome_total = satisfied + failed;
+        if outcome_total > total {
+            total = outcome_total;
+        }
+    }
+
     ReputationScore {
         total,
         satisfied,
