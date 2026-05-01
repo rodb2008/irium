@@ -13,8 +13,8 @@ This document is ready to copy and send to exchange listing teams, pool aggregat
 | **Algorithm** | SHA-256d (double SHA256, identical to Bitcoin) |
 | **Consensus** | Proof of Work |
 | **Block time target** | 600 seconds (10 minutes) |
-| **Difficulty algorithm** | LWMA (Linear Weighted Moving Average, 60-block window) |
-| **Block header format** | Standard Bitcoin 80-byte header |
+| **Difficulty algorithm** | LWMA v2 (Linear Weighted Moving Average, 30-block window) |
+| **Block header format** | Standard Bitcoin 80-byte header (+ AuxPoW extension when merged mining) |
 | **Block reward** | 50 IRM |
 | **Halving interval** | 210,000 blocks |
 | **Max supply** | 100,000,000 IRM |
@@ -22,6 +22,7 @@ This document is ready to copy and send to exchange listing teams, pool aggregat
 | **Address prefix** | Q (version byte 0x39, Base58Check) |
 | **P2P port** | 38291 (configurable) |
 | **RPC port** | 38300 (configurable) |
+| **AuxPoW merged mining** | Activates at height 26,347 (~12 June 2026) |
 | **Premine** | None |
 | **Admin keys** | None |
 | **Freeze/censor capability** | None |
@@ -31,10 +32,10 @@ This document is ready to copy and send to exchange listing teams, pool aggregat
 
 | Halving | Start block | Block reward | Cumulative supply |
 |---------|-------------|--------------|-------------------|
-| Era 0 | 1 | 50 IRM | 0 → 10,500,000 IRM |
-| Era 1 | 210,001 | 25 IRM | 10,500,000 → 15,750,000 IRM |
-| Era 2 | 420,001 | 12.5 IRM | 15,750,000 → 18,375,000 IRM |
-| Era 3 | 630,001 | 6.25 IRM | 18,375,000 → 19,687,500 IRM |
+| Era 0 | 1 | 50 IRM | 0 to 10,500,000 IRM |
+| Era 1 | 210,001 | 25 IRM | 10,500,000 to 15,750,000 IRM |
+| Era 2 | 420,001 | 12.5 IRM | 15,750,000 to 18,375,000 IRM |
+| Era 3 | 630,001 | 6.25 IRM | 18,375,000 to 19,687,500 IRM |
 | ... | ... | ... | ... |
 | Terminal | ~6,930,000 | ~0 | ~100,000,000 IRM |
 
@@ -42,13 +43,12 @@ This document is ready to copy and send to exchange listing teams, pool aggregat
 
 | Metric | Value |
 |--------|-------|
-| Chain height | 20,296 |
+| Chain height | 20,299 |
 | Genesis hash | `0000000028f25d65557e9d8d9e991f516c00d68f5aeae10b750645b398bd10a3` |
 | Network era | Early Miner Era |
 | Block reward | 50 IRM (first era; no halvings yet) |
-| Network hashrate (est.) | ~157 MH/s |
 | Connected peers | 5 |
-| Circulating supply | ~1,014,800 IRM (height × 50 IRM) |
+| Circulating supply | ~1,014,950 IRM (height x 50 IRM) |
 
 ## What Is Live Today
 
@@ -63,12 +63,17 @@ This document is ready to copy and send to exchange listing teams, pool aggregat
 - Docker images: `ghcr.io/iriumlabs/irium:latest`
 - Pre-built release binaries: Linux x86_64/ARM64, macOS Intel/ARM, Windows
 
+## Upcoming: AuxPoW Merged Mining
+
+AuxPoW merged mining activates at block height 26,347 (estimated 12 June 2026). After activation, any SHA-256d pool mining Bitcoin can simultaneously mine Irium at zero additional energy cost by embedding the Irium block commitment in the parent coinbase transaction.
+
+The full AuxPoW implementation is in the current codebase. See `docs/MERGED-MINING.md` for technical details.
+
 ## What Is on the Roadmap
 
-- AuxPoW merged mining (mine alongside Bitcoin with no extra energy)
 - Desktop/web/mobile wallet applications (separate development track)
-- Exchange listing integration guides
 - Additional community mining pools
+- Hardware wallet integration (after BIP44 coin type registration)
 
 ## Links
 
@@ -83,6 +88,8 @@ This document is ready to copy and send to exchange listing teams, pool aggregat
 | RPC API reference | https://github.com/iriumlabs/irium/blob/main/docs/API.md |
 | Wallet CLI reference | https://github.com/iriumlabs/irium/blob/main/docs/WALLET-CLI.md |
 | Settlement dev guide | https://github.com/iriumlabs/irium/blob/main/docs/SETTLEMENT-DEV.md |
+| Merged mining guide | https://github.com/iriumlabs/irium/blob/main/docs/MERGED-MINING.md |
+| Pool operator guide | https://github.com/iriumlabs/irium/blob/main/docs/POOL-OPERATOR.md |
 | Docker guide | https://github.com/iriumlabs/irium/blob/main/docs/DOCKER.md |
 | Developer quickstart | https://github.com/iriumlabs/irium/blob/main/docs/DEVELOPER-QUICKSTART.md |
 
@@ -102,7 +109,9 @@ This document is ready to copy and send to exchange listing teams, pool aggregat
 
 **Transaction format:** Standard Bitcoin transaction serialisation (version, inputs, outputs, locktime). P2PKH locking scripts. SHA256d transaction IDs.
 
-**Mining integration:** Standard Bitcoin getblocktemplate protocol via `GET /rpc/getblocktemplate`. Submit blocks via `POST /rpc/submit_block`. SHA-256d algorithm, standard 80-byte header.
+**Mining integration:** Standard Bitcoin getblocktemplate protocol via `GET /rpc/getblocktemplate`. Submit blocks via `POST /rpc/submit_block`. SHA-256d algorithm, standard 80-byte header. AuxPoW blocks additionally include `auxpow_hex` field.
+
+**Merged mining:** AuxPoW activates at height 26,347. Commitment magic: `0xfa 0xbe 0x6d 0x6d`. Version bit: `1 << 8`. Full protocol documented in `docs/MERGED-MINING.md`.
 
 ## Contact
 
