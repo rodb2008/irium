@@ -1566,6 +1566,13 @@ fn main() {
         }
     }
 
+    // --list-platforms does not need a mining address; check it before the address guard.
+    let platforms = enumerate_platforms();
+    if list_platforms_flag {
+        print_platforms(&platforms);
+        std::process::exit(0);
+    }
+
     if miner_pubkey_hash().is_none() {
         eprintln!(
             "error: missing or invalid miner payout address; set IRIUM_MINER_ADDRESS (base58) or IRIUM_MINER_PKH (40-hex)"
@@ -1584,11 +1591,6 @@ fn main() {
         batch_size as f64 / 1_000_000.0
     );
 
-    let platforms = enumerate_platforms();
-    if list_platforms_flag {
-        print_platforms(&platforms);
-        std::process::exit(0);
-    }
     let platform_sel = env::var("IRIUM_GPU_PLATFORM").ok();
     let device_refs = match resolve_devices(&platforms, platform_sel.as_deref()) {
         Ok(refs) => refs,
