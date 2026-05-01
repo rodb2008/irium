@@ -1,67 +1,215 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+GITHUB_REPO="iriumlabs/irium"
+INSTALL_DIR="/usr/local/bin"
+CORE_BINS="iriumd irium-wallet irium-miner irium-spv"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+detect_platform() {
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+  case "${os}" in
+    Linux)
+      case "${arch}" in
+        x86_64)  echo "x86_64-unknown-linux-gnu" ;;
+        aarch64) echo "aarch64-unknown-linux-gnu" ;;
+        *)       echo "" ;;
+      esac ;;
+    Darwin)
+      case "${arch}" in
+        x86_64) echo "x86_64-apple-darwin" ;;
+        arm64)  echo "aarch64-apple-darwin" ;;
+        *)      echo "" ;;
+      esac ;;
+    *)
+      echo "" ;;
+  esac
+}
+
+# ── init ─────────────────────────────────────────────────────────────────────
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SERVICE_USER="${IRIUM_SERVICE_USER:-}"
-if [ -z "$SERVICE_USER" ]; then
-  if [ -n "${SUDO_USER:-}" ]; then
-    SERVICE_USER="$SUDO_USER"
+if [ -z "${SERVICE_USER}" ]; then
+  SERVICE_USER="${SUDO_USER:-$(whoami)}"
+fi
+
+if [ "$(id -u)" = "0" ]; then
+  SUDO=""
+else
+  SUDO="sudo"
+fi
+
+echo ""
+echo "==> Irium Installer"
+echo ""
+
+PLATFORM="$(detect_platform)"
+BUILT_FROM_SOURCE="false"
+
+# ── try pre-built binary ──────────────────────────────────────────────────────
+
+if [ -n "${PLATFORM}" ]; then
+  echo "==> Platform: ${PLATFORM}"
+  echo "==> Fetching latest release..."
+
+  LATEST_TAG="$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
+    | grep '"tag_name"' | head -1 \
+    | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
+
+  if [ -n "${LATEST_TAG}" ]; then
+    ARCHIVE_NAME="irium-${LATEST_TAG}-${PLATFORM}.tar.gz"
+    BASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_TAG}"
+    DOWNLOAD_URL="${BASE_URL}/${ARCHIVE_NAME}"
+    CHECKSUM_URL="${BASE_URL}/checksums.txt"
+
+    echo "==> Release:  ${LATEST_TAG}"
+    echo "==> Archive:  ${ARCHIVE_NAME}"
+
+    TMPDIR_IRM="$(mktemp -d)"
+    trap 'rm -rf "${TMPDIR_IRM}"' EXIT
+
+    echo "==> Downloading ${ARCHIVE_NAME}..."
+    if curl -fL --progress-bar -o "${TMPDIR_IRM}/${ARCHIVE_NAME}" "${DOWNLOAD_URL}"; then
+      echo "==> Downloading checksums.txt..."
+      if curl -fsSL -o "${TMPDIR_IRM}/checksums.txt" "${CHECKSUM_URL}"; then
+        EXPECTED_HASH="$(grep "${ARCHIVE_NAME}" "${TMPDIR_IRM}/checksums.txt" | awk '{print $1}')"
+        if [ -n "${EXPECTED_HASH}" ]; then
+          echo "==> Verifying SHA256..."
+          ACTUAL_HASH="$(sha256_file "${TMPDIR_IRM}/${ARCHIVE_NAME}")"
+          if [ "${ACTUAL_HASH}" = "${EXPECTED_HASH}" ]; then
+            echo "==> Checksum OK: ${ACTUAL_HASH}"
+            echo "==> Extracting..."
+            mkdir -p "${TMPDIR_IRM}/bin"
+            tar -xzf "${TMPDIR_IRM}/${ARCHIVE_NAME}" -C "${TMPDIR_IRM}/bin"
+            echo "==> Installing to ${INSTALL_DIR}..."
+            for bin in ${CORE_BINS}; do
+              if [ -f "${TMPDIR_IRM}/bin/${bin}" ]; then
+                ${SUDO} install -m 0755 "${TMPDIR_IRM}/bin/${bin}" "${INSTALL_DIR}/${bin}"
+                echo "    + ${bin}"
+              fi
+            done
+            if [ -f "${TMPDIR_IRM}/bin/irium-miner-gpu" ]; then
+              ${SUDO} install -m 0755 "${TMPDIR_IRM}/bin/irium-miner-gpu" "${INSTALL_DIR}/irium-miner-gpu"
+              echo "    + irium-miner-gpu"
+            fi
+            echo ""
+            echo "==> Installed from pre-built release ${LATEST_TAG}."
+          else
+            echo "==> WARNING: Checksum mismatch."
+            echo "    Expected: ${EXPECTED_HASH}"
+            echo "    Got:      ${ACTUAL_HASH}"
+            echo "==> Falling back to source build."
+            BUILT_FROM_SOURCE="true"
+          fi
+        else
+          echo "==> WARNING: No checksum entry for ${ARCHIVE_NAME}. Falling back to source build."
+          BUILT_FROM_SOURCE="true"
+        fi
+      else
+        echo "==> WARNING: Could not download checksums.txt. Falling back to source build."
+        BUILT_FROM_SOURCE="true"
+      fi
+    else
+      echo "==> No pre-built binary for ${PLATFORM} in this release. Falling back to source build."
+      BUILT_FROM_SOURCE="true"
+    fi
   else
-    SERVICE_USER="$(whoami)"
+    echo "==> WARNING: Could not determine latest release. Falling back to source build."
+    BUILT_FROM_SOURCE="true"
   fi
+else
+  echo "==> Platform not supported for pre-built binaries. Building from source."
+  BUILT_FROM_SOURCE="true"
 fi
 
-echo "🚀 Installing Irium (Rust)"
+# ── source build fallback ─────────────────────────────────────────────────────
 
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "❌ Rust toolchain not found. Install Rust from https://rustup.rs"
-  exit 1
+if [ "${BUILT_FROM_SOURCE}" = "true" ]; then
+  echo ""
+  echo "==> Building from source..."
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "ERROR: Rust toolchain not found. Install from https://rustup.rs"
+    exit 1
+  fi
+  cd "${ROOT_DIR}"
+  echo "==> cargo build --release (this may take several minutes)..."
+  cargo build --release
+  echo "==> Installing to ${INSTALL_DIR}..."
+  for bin in ${CORE_BINS}; do
+    if [ -f "target/release/${bin}" ]; then
+      ${SUDO} install -m 0755 "target/release/${bin}" "${INSTALL_DIR}/${bin}"
+      echo "    + ${bin}"
+    fi
+  done
+  if [ -f "target/release/irium-miner-gpu" ]; then
+    ${SUDO} install -m 0755 "target/release/irium-miner-gpu" "${INSTALL_DIR}/irium-miner-gpu"
+    echo "    + irium-miner-gpu"
+  fi
+  echo "==> Binaries installed from source."
 fi
 
-cd "$ROOT_DIR"
-
-echo "📦 Building release binaries..."
-cargo build --release
+# ── systemd setup ─────────────────────────────────────────────────────────────
 
 if ! command -v systemctl >/dev/null 2>&1; then
-  echo "⚠️ systemctl not found; skipping systemd setup."
+  echo ""
+  echo "==> systemctl not found; skipping systemd setup."
+  echo "==> Start iriumd manually: ${INSTALL_DIR}/iriumd"
   exit 0
 fi
 
-echo "🧩 Installing systemd units..."
-echo "Using systemd service user: $SERVICE_USER (override with IRIUM_SERVICE_USER)"
-sudo mkdir -p /etc/irium
-sudo cp systemd/iriumd.service /etc/systemd/system/iriumd.service
-sudo cp systemd/irium-miner.service /etc/systemd/system/irium-miner.service
-sudo cp systemd/irium-explorer.service /etc/systemd/system/irium-explorer.service
-sudo cp systemd/irium-wallet-api.service /etc/systemd/system/irium-wallet-api.service
-sudo sed -i "s|@IRIUM_HOME@|$ROOT_DIR|g" /etc/systemd/system/iriumd.service /etc/systemd/system/irium-miner.service /etc/systemd/system/irium-explorer.service /etc/systemd/system/irium-wallet-api.service
-sudo sed -i "s|@IRIUM_USER@|$SERVICE_USER|g" /etc/systemd/system/iriumd.service /etc/systemd/system/irium-miner.service /etc/systemd/system/irium-explorer.service /etc/systemd/system/irium-wallet-api.service
-
-if [ ! -f /etc/irium/iriumd.env ]; then
-  sudo cp systemd/iriumd.env.example /etc/irium/iriumd.env
-fi
-if [ ! -f /etc/irium/miner.env ]; then
-  sudo cp systemd/miner.env.example /etc/irium/miner.env
-fi
-if [ ! -f /etc/irium/explorer.env ]; then
-  sudo cp systemd/explorer.env.example /etc/irium/explorer.env
-fi
-if [ ! -f /etc/irium/wallet-api.env ]; then
-  sudo cp systemd/wallet-api.env.example /etc/irium/wallet-api.env
+if [ ! -f "${ROOT_DIR}/systemd/iriumd.service" ]; then
+  echo ""
+  echo "==> Systemd unit files not found in ${ROOT_DIR}/systemd/."
+  echo "==> Skipping service setup. Run install.sh from the repository directory to configure services."
+  exit 0
 fi
 
-sudo sed -i "s|^IRIUM_HOME=.*|IRIUM_HOME=$ROOT_DIR|" /etc/irium/iriumd.env
-sudo sed -i "s|^IRIUM_NODE_CONFIG=.*|IRIUM_NODE_CONFIG=$ROOT_DIR/configs/node.json|" /etc/irium/iriumd.env
-sudo sed -i "s|^IRIUM_HOME=.*|IRIUM_HOME=$ROOT_DIR|" /etc/irium/miner.env
-sudo sed -i "s|^IRIUM_NODE_RPC=.*|IRIUM_NODE_RPC=http://127.0.0.1:38300|" /etc/irium/explorer.env /etc/irium/wallet-api.env
+echo ""
+echo "==> Installing systemd services (user: ${SERVICE_USER})..."
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now iriumd.service
+${SUDO} mkdir -p /etc/irium
+for unit in iriumd irium-miner irium-explorer irium-wallet-api; do
+  ${SUDO} cp "${ROOT_DIR}/systemd/${unit}.service" "/etc/systemd/system/${unit}.service"
+done
+${SUDO} sed -i "s|@IRIUM_HOME@|${ROOT_DIR}|g" \
+  /etc/systemd/system/iriumd.service \
+  /etc/systemd/system/irium-miner.service \
+  /etc/systemd/system/irium-explorer.service \
+  /etc/systemd/system/irium-wallet-api.service
+${SUDO} sed -i "s|@IRIUM_USER@|${SERVICE_USER}|g" \
+  /etc/systemd/system/iriumd.service \
+  /etc/systemd/system/irium-miner.service \
+  /etc/systemd/system/irium-explorer.service \
+  /etc/systemd/system/irium-wallet-api.service
 
-echo "✅ Node service installed and started."
-echo "➡️ Edit /etc/irium/miner.env to set IRIUM_MINER_ADDRESS."
-echo "➡️ Then enable the miner: sudo systemctl enable --now irium-miner.service"
-echo "➡️ Optional: configure /etc/irium/explorer.env and enable irium-explorer.service"
-echo "➡️ Optional: configure /etc/irium/wallet-api.env and enable irium-wallet-api.service"
+[ -f /etc/irium/iriumd.env ]     || ${SUDO} cp "${ROOT_DIR}/systemd/iriumd.env.example"     /etc/irium/iriumd.env
+[ -f /etc/irium/miner.env ]      || ${SUDO} cp "${ROOT_DIR}/systemd/miner.env.example"       /etc/irium/miner.env
+[ -f /etc/irium/explorer.env ]   || ${SUDO} cp "${ROOT_DIR}/systemd/explorer.env.example"    /etc/irium/explorer.env
+[ -f /etc/irium/wallet-api.env ] || ${SUDO} cp "${ROOT_DIR}/systemd/wallet-api.env.example"  /etc/irium/wallet-api.env
+
+${SUDO} sed -i "s|^IRIUM_HOME=.*|IRIUM_HOME=${ROOT_DIR}|" /etc/irium/iriumd.env
+${SUDO} sed -i "s|^IRIUM_NODE_CONFIG=.*|IRIUM_NODE_CONFIG=${ROOT_DIR}/configs/node.json|" /etc/irium/iriumd.env
+${SUDO} sed -i "s|^IRIUM_HOME=.*|IRIUM_HOME=${ROOT_DIR}|" /etc/irium/miner.env
+
+${SUDO} systemctl daemon-reload
+${SUDO} systemctl enable --now iriumd.service
+
+echo ""
+echo "==> Node service installed and started."
+echo "    Edit /etc/irium/miner.env and set IRIUM_MINER_ADDRESS, then:"
+echo "    sudo systemctl enable --now irium-miner.service"
+echo "    Optional: sudo systemctl enable --now irium-explorer.service"
+echo "    Optional: sudo systemctl enable --now irium-wallet-api.service"

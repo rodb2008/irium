@@ -1,0 +1,188 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_ext: tar.gz
+            use_cross: "false"
+            build_gpu: "true"
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_ext: tar.gz
+            use_cross: "true"
+            build_gpu: "false"
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive_ext: zip
+            use_cross: "false"
+            build_gpu: "false"
+
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive_ext: tar.gz
+            use_cross: "false"
+            build_gpu: "false"
+
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive_ext: tar.gz
+            use_cross: "false"
+            build_gpu: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Install cross
+        if: matrix.use_cross == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Install OpenCL headers
+        if: matrix.build_gpu == 'true'
+        run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
+
+      - name: Build core binaries
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} \
+              --bin iriumd --bin irium-wallet --bin irium-miner --bin irium-spv
+          else
+            cargo build --release --target ${{ matrix.target }} \
+              --bin iriumd --bin irium-wallet --bin irium-miner --bin irium-spv
+          fi
+
+      - name: Build GPU miner
+        if: matrix.build_gpu == 'true'
+        run: |
+          cargo build --release --target ${{ matrix.target }} --features gpu --bin irium-miner-gpu
+
+      - name: Package archive (Unix)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          TARGET="${{ matrix.target }}"
+          ARCHIVE="irium-${VERSION}-${TARGET}.tar.gz"
+          STAGING="dist-${TARGET}"
+          mkdir -p "${STAGING}"
+          for bin in iriumd irium-wallet irium-miner irium-spv; do
+            cp "target/${TARGET}/release/${bin}" "${STAGING}/"
+          done
+          if [ "${{ matrix.build_gpu }}" = "true" ] && [ -f "target/${TARGET}/release/irium-miner-gpu" ]; then
+            cp "target/${TARGET}/release/irium-miner-gpu" "${STAGING}/"
+          fi
+          tar -czf "${ARCHIVE}" -C "${STAGING}" .
+          echo "ARCHIVE=${ARCHIVE}" >> "${GITHUB_ENV}"
+
+      - name: Package archive (Windows)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME
+          $target = "${{ matrix.target }}"
+          $archive = "irium-${version}-${target}.zip"
+          $staging = "dist-${target}"
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          foreach ($bin in @("iriumd", "irium-wallet", "irium-miner", "irium-spv")) {
+            Copy-Item "target/${target}/release/${bin}.exe" "${staging}/"
+          }
+          Compress-Archive -Path "${staging}/*" -DestinationPath $archive -Force
+          "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate SHA256 checksums
+        working-directory: dist
+        run: |
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: dist/**
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          body: |
+            ## Irium ${{ github.ref_name }}
+
+            See [CHANGELOG.md](https://github.com/iriumlabs/irium/blob/main/CHANGELOG.md) for the full list of changes.
+
+            ### Download
+
+            | Platform | Archive |
+            |----------|---------|
+            | Linux 64-bit (x86_64) | `irium-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz` |
+            | Linux ARM64 | `irium-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz` |
+            | Windows 64-bit | `irium-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip` |
+            | macOS Intel | `irium-${{ github.ref_name }}-x86_64-apple-darwin.tar.gz` |
+            | macOS Apple Silicon | `irium-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz` |
+
+            ### Verify your download
+
+            ```sh
+            sha256sum -c checksums.txt 2>&1 | grep OK
+            ```
+
+            ### Quick install
+
+            ```sh
+            curl -sSL https://raw.githubusercontent.com/iriumlabs/irium/main/install.sh | bash
+            ```

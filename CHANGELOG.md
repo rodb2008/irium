@@ -1,0 +1,124 @@
+# Changelog
+
+All notable changes to Irium are documented in this file.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+## [1.1.0] - 2026-05-01
+
+This release documents everything built across Phases A–F of the Irium chain
+upgrade and marks the first official tagged release of the codebase.
+
+### Added
+
+**Core chain**
+- SHA-256d proof-of-work consensus — fully compatible with Bitcoin ASIC hardware and merged mining
+- P2PKH address scheme with custom version byte; IRM addresses begin with `I`
+- Block reward of 50 IRM per block, halving every 210,000 blocks; maximum supply 100,000,000 IRM
+- 600-second target block interval, difficulty retarget every 2,016 blocks
+- COINBASE_MATURITY of 100 blocks before coinbase outputs are spendable
+- Genesis block locked and immutable in `configs/genesis-locked.json`
+- LWMA (Linearly Weighted Moving Average) difficulty algorithm, window N=60, active from mainnet height 16,462
+- LWMA v2 with reduced window (N=30) and larger solvetime clamp (10×T) for faster post-hashrate-collapse recovery, active from mainnet height 19,740
+- HTLCv1 (Hash Time-Locked Contracts v1) active from mainnet height 18,677
+- All activation heights configurable via environment variable overrides for testnet and devnet
+
+**Settlement layer**
+- Offer creation, listing, filtering, sorting, and ranked display via CLI and REST API
+- Agreement formation: offer-take locks both parties into a verifiable on-chain agreement object
+- Three built-in policy templates: basic OTC escrow, contractor milestone, preorder deposit
+- Proof submission against active agreements with configurable policy evaluation
+- Full agreement lifecycle: offer → agreement → funded → proof submitted → released or expired
+- Agreement anchor outputs embedded in chain transactions for independent on-chain verifiability
+- Agreement audit trail with full timestamped activity timeline and linked transaction references
+- Timelock-enforced refund paths when agreements expire without a valid proof
+- Settlement receipt export in plain text and HTML
+- `POST /rpc/submitproof` — submit a proof against an active agreement
+- `POST /rpc/sendtx` — broadcast a signed raw transaction
+- `GET /api/offers` — list offers with filter and sort support
+- `POST /api/offers` — create a new offer
+- `POST /api/agreements` — take an offer and form an agreement
+- `GET /api/agreements/:id` — query agreement status and full detail
+- `POST /api/proofs` — submit a proof via REST
+- `GET /offers/feed` — public unauthenticated offer feed for cross-node discovery
+
+**Reputation system**
+- Per-seller trust scoring derived entirely from on-chain agreement history
+- Recency weighting: outcomes from the past 30 days carry more weight than older history
+- Sybil resistance: new identities begin with a lower trust ceiling until outcome history accumulates
+- Dispute rate, late-proof rate, and default tracking as explicit risk signals
+- Reputation portability: scores follow the seller public key, not a centralised account
+- `GET /api/reputation/:pubkey` — query reputation and risk signals for any public key
+- Offer ranking score computed from seller reputation, surfaced in `offer-list` output
+
+**P2P marketplace discovery**
+- Multi-source offer feed aggregation: nodes pull, validate, and merge feeds from configured sources
+- Feed registry commands: `feed-add`, `feed-remove`, `feed-list`, `feed-bootstrap`
+- Feed validation: response size cap, malformed-entry rejection, health status output
+- Feed pruning command to remove stale entries and reclaim space
+- Peer-to-peer proof gossip: submitted proofs propagate to all connected nodes
+- Proof templates for common escrow patterns with variable substitution
+- Attestor discovery: nodes advertise willingness to act as third-party proof witnesses
+
+**Wallet CLI (`irium-wallet`)**
+- Key generation, import, and encrypted wallet store backup
+- Balance and UTXO queries against a live node
+- Transaction construction, signing, and broadcast
+- Offer commands: `offer-create`, `offer-list`, `offer-show`, `offer-take`, `offer-export`
+- Agreement commands: `agreement-pack`, `agreement-unpack`, `agreement-show`
+- Proof commands: `proof-build`, `proof-submit`
+- Reputation command: `reputation-show` with full risk signal breakdown
+- Feed commands: `feed-add`, `feed-remove`, `feed-list`, `feed-fetch`, `feed-bootstrap`
+- Policy commands: `policy-build-otc`, `raw-policy`
+- Guided OTC demo flow: `flow-otc-demo`
+- Settlement receipt export: `receipt-export` outputs text and HTML
+- Phase 4 Rust integration layer: wallet reads UTXO set and broadcasts directly against node state
+- Human-readable timestamps on all agreement and proof outputs
+- Next-step hints after each command guide users through the complete flow
+
+**Miners**
+- CPU miner (`irium-miner`) with configurable address, RPC endpoint, and thread count
+- GPU miner (`irium-miner-gpu`) using OpenCL; enumerates available platforms and devices at startup
+- GPU miner degrades gracefully to a clear error when no OpenCL platform is found (`--list-platforms`)
+- Miner coinbase address validation: refuses to mine without a valid, funded payout address
+- LWMA v2 activation-boundary detection in miner prevents stale `bits` mismatch at activation height
+
+**Node daemon (`iriumd`)**
+- Full node with persistent block storage and state recovery across restarts
+- P2P peer discovery via signed seedlist in `bootstrap/seedlist.txt`
+- Bootstrap trust framework: anchor signers verified against `bootstrap/trust/allowed_anchor_signers`
+- Rate limiter on all RPC and P2P endpoints to resist abuse
+- CORS headers on all HTTP endpoints for browser-based tooling
+- TLS support via rustls with opt-in configuration
+- Network era display on startup (currently: Early Miner Era)
+- All ports and addresses configurable via environment variables — no hardcoded values in source
+
+**SPV client (`irium-spv`)**
+- Lightweight client for balance and transaction queries without downloading full block history
+
+**Wallet API server (`irium-wallet-api`)**
+- HTTP server exposing settlement, balance, and transaction endpoints for wallet front-ends
+
+**Infrastructure**
+- systemd unit files for `iriumd`, `irium-miner`, `irium-explorer`, `irium-wallet-api`
+- Environment variable templates for all services in `systemd/*.env.example`
+- Rust SDK stub in `sdk/` as the integration surface for third-party applications
+- Business templates for invoice generation, seller status, and buyer status flows
+
+### Fixed
+
+- Late-proof vulnerability: proofs submitted after the agreement deadline are now rejected
+- LWMA v2 boundary edge case in miner causing incorrect `bits` value on the activation block
+- Offer ID path traversal: IDs validated to alphanumeric characters, hyphens, and underscores only on both read and write paths
+- Reputation pubkey resolution for 66-character compressed pubkeys (was silently returning no data)
+- `offer-list` default sort order restored to newest-first after offer ranking refactor changed it
+- `ring` CryptoProvider not being installed before TLS initialisation in `iriumd`
+- HTTP RPC scheme defaulting to the wrong protocol in wallet CLI
+
+### Security
+
+- All source files audited and cleaned of hardcoded IP addresses and port numbers
+- Miner coinbase address validation hardened; empty-script fallback removed entirely
+- Offer ID write-path and read-path validation hardened against path traversal attacks
+- Dependency update: `rustls-webpki` DoS vulnerability patched (Dependabot advisory)
+- Cleartext session data logging removed from all log paths
+- XSS vulnerability in explorer output sanitised
