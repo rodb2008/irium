@@ -1,0 +1,874 @@
+# irium-wallet CLI Reference
+
+`irium-wallet` is the command-line wallet for Irium. It manages keys, queries the chain, creates and funds agreements, and handles the full OTC marketplace lifecycle.
+
+All chain query and broadcast commands accept `--rpc <url>` to specify a custom node. The default is `http://127.0.0.1:38300`.
+
+---
+
+## Wallet Initialisation and Key Management
+
+### `irium-wallet init [--seed <64hex>]`
+
+Initialises a new wallet. If `--seed` is provided, initialises from the given 64-character hex seed. Otherwise generates a new random seed.
+
+```
+irium-wallet init
+irium-wallet init --seed a3f1...64hexchars...
+```
+
+---
+
+### `irium-wallet new-address`
+
+Derives the next address from the wallet seed and stores it.
+
+```
+irium-wallet new-address
+```
+
+Output: the new address in Q-prefix format.
+
+---
+
+### `irium-wallet list-addresses`
+
+Lists all addresses stored in the wallet.
+
+```
+irium-wallet list-addresses
+```
+
+---
+
+### `irium-wallet export-wif <addr> --out <file>`
+
+Exports the private key for `<addr>` in WIF (Wallet Import Format) to a file.
+
+```
+irium-wallet export-wif Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa --out privkey.wif
+```
+
+Keep the output file secure. Anyone with this file can spend funds from that address.
+
+---
+
+### `irium-wallet import-wif <wif>`
+
+Imports an address from a WIF-encoded private key.
+
+```
+irium-wallet import-wif 5HueCGU8rMjxECyDigwEXBH...
+```
+
+---
+
+### `irium-wallet export-seed --out <file>`
+
+Exports the wallet seed (32 bytes, hex-encoded) to a file.
+
+```
+irium-wallet export-seed --out seed.txt
+```
+
+The seed is the master secret. Anyone with the seed can derive all wallet addresses.
+
+---
+
+### `irium-wallet import-seed <64hex> [--force]`
+
+Imports a seed, replacing the current wallet seed. Use `--force` to overwrite without confirmation.
+
+```
+irium-wallet import-seed a3f1...64hexchars...
+irium-wallet import-seed a3f1...64hexchars... --force
+```
+
+---
+
+### `irium-wallet backup [--out <file>]`
+
+Creates a wallet backup. If `--out` is omitted, writes to a default location.
+
+```
+irium-wallet backup --out wallet-backup.json
+```
+
+---
+
+### `irium-wallet restore-backup <file> [--force]`
+
+Restores wallet from a backup file.
+
+```
+irium-wallet restore-backup wallet-backup.json
+irium-wallet restore-backup wallet-backup.json --force
+```
+
+---
+
+### `irium-wallet address-to-pkh <addr>`
+
+Converts an Irium address to its public key hash (hex). Useful for constructing scripts manually.
+
+```
+irium-wallet address-to-pkh Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa
+```
+
+Output: `79dbb6fd908884fc994b8aa34dcef392fe2d9d65`
+
+---
+
+## Chain Queries
+
+All commands accept `--rpc <url>` to override the default node URL (`http://127.0.0.1:38300`).
+
+### `irium-wallet balance <addr> [--rpc <url>]`
+
+Returns the balance for an address.
+
+```
+irium-wallet balance Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa
+irium-wallet balance Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa --rpc http://192.0.2.1:38300
+```
+
+---
+
+### `irium-wallet list-unspent <addr> [--rpc <url>]`
+
+Returns all UTXOs for an address.
+
+```
+irium-wallet list-unspent Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa
+```
+
+---
+
+### `irium-wallet history <addr> [--rpc <url>]`
+
+Returns the transaction history for an address.
+
+```
+irium-wallet history Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa
+```
+
+---
+
+### `irium-wallet estimate-fee [--rpc <url>]`
+
+Returns the current minimum fee per byte from the node.
+
+```
+irium-wallet estimate-fee
+```
+
+---
+
+## Sending
+
+### `irium-wallet send <from_addr> <to_addr> <amount_irm> [options]`
+
+Builds and broadcasts a transaction.
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--fee <irm>` | Fee in IRM (default: auto from fee estimate) |
+| `--coin-select smallest\|largest` | UTXO selection strategy |
+| `--rpc <url>` | Node URL |
+
+**Examples:**
+```
+irium-wallet send Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa QDestinationAddr... 1.5
+
+irium-wallet send Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa QDestinationAddr... 1.5 \
+  --fee 0.0001 \
+  --coin-select smallest
+```
+
+Amount is in IRM (decimal). 1.5 IRM = 150,000,000 satoshis.
+
+---
+
+## Offer Lifecycle (OTC Marketplace)
+
+### `irium-wallet offer-create`
+
+Creates a new OTC sell offer.
+
+**Flags:**
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--seller <addr>` | Yes | Seller's Irium address |
+| `--amount <irm>` | Yes | Amount in IRM |
+| `--payment-method <text>` | Yes | Payment method (e.g. `bank-transfer`, `cash`) |
+| `--timeout <height>` | Yes | Block height at which the offer expires |
+| `--price-note <text>` | No | Human-readable price note (e.g. current rate) |
+| `--payment-instructions <text>` | No | Instructions for the buyer |
+| `--offer-id <id>` | No | Custom offer ID (auto-generated if omitted) |
+
+```
+irium-wallet offer-create \
+  --seller Q9KxBRfrnb6v9Vb8vuHjwkZaxj3ZRhJWpg \
+  --amount 1.0 \
+  --payment-method bank-transfer \
+  --timeout 25000 \
+  --price-note "1 IRM = 0.10 USD at time of listing" \
+  --payment-instructions "IBAN: DE89 ..."
+```
+
+---
+
+### `irium-wallet offer-list [options]`
+
+Lists offers known to the wallet.
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--status open\|taken\|settled` | Filter by status |
+| `--source local\|imported\|remote\|all` | Filter by source (default: all) |
+| `--sort score\|newest\|amount\|seller` | Sort order |
+| `--limit <n>` | Maximum number of results |
+
+```
+irium-wallet offer-list --status open --sort newest --limit 20
+irium-wallet offer-list --source local
+```
+
+---
+
+### `irium-wallet offer-show --offer <offer_id>`
+
+Shows full details of a single offer.
+
+```
+irium-wallet offer-show --offer d1-gossip-t4
+```
+
+---
+
+### `irium-wallet offer-take --offer <offer_id> --buyer <addr> [--rpc <url>]`
+
+Takes an open offer as buyer. This initiates the agreement creation process.
+
+```
+irium-wallet offer-take --offer d1-gossip-t4 --buyer QBuyerAddress...
+```
+
+---
+
+### `irium-wallet offer-export --offer <offer_id> --out <file>`
+
+Exports an offer to a JSON file for sharing with a counterparty.
+
+```
+irium-wallet offer-export --offer d1-gossip-t4 --out offer-d1-gossip-t4.json
+```
+
+---
+
+### `irium-wallet offer-import --file <file>`
+
+Imports an offer from a JSON file.
+
+```
+irium-wallet offer-import --file offer-d1-gossip-t4.json
+```
+
+---
+
+### `irium-wallet offer-fetch --url <url>`
+
+Fetches a single offer from a URL.
+
+```
+irium-wallet offer-fetch --url https://example.com/offers/my-offer.json
+```
+
+---
+
+### `irium-wallet offer-feed-fetch --url <feed-endpoint>`
+
+Fetches all offers from a feed endpoint URL.
+
+```
+irium-wallet offer-feed-fetch --url http://node.example.com:38300/offers/feed
+```
+
+---
+
+### `irium-wallet offer-feed-sync`
+
+Syncs offers from all configured feed URLs.
+
+```
+irium-wallet offer-feed-sync
+```
+
+---
+
+## Feed Management
+
+### `irium-wallet feed-add <url>`
+
+Adds a feed URL to the list of feeds synced by `offer-feed-sync`.
+
+```
+irium-wallet feed-add http://node.example.com:38300/offers/feed
+```
+
+---
+
+### `irium-wallet feed-remove <url>`
+
+Removes a feed URL.
+
+```
+irium-wallet feed-remove http://node.example.com:38300/offers/feed
+```
+
+---
+
+### `irium-wallet feed-list`
+
+Lists all configured feed URLs.
+
+```
+irium-wallet feed-list
+```
+
+---
+
+### `irium-wallet feed-bootstrap`
+
+Adds default bootstrap feed URLs from the built-in seed list.
+
+```
+irium-wallet feed-bootstrap
+```
+
+---
+
+## Reputation
+
+### `irium-wallet reputation-show <seller_pubkey|address>`
+
+Shows the reputation record for a seller, including outcome history.
+
+```
+irium-wallet reputation-show Q9KxBRfrnb6v9Vb8vuHjwkZaxj3ZRhJWpg
+irium-wallet reputation-show 03e918af472e63de044c983df9f09bae57d4c78a70998d5d5fded408672886f868
+```
+
+---
+
+### `irium-wallet reputation-record-outcome`
+
+Records a trade outcome for a seller. Used after an agreement concludes.
+
+**Flags:**
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--seller <addr>` | Yes | Seller's address |
+| `--outcome <type>` | Yes | One of: `satisfied`, `failed`, `disputed`, `timeout` |
+
+```
+irium-wallet reputation-record-outcome \
+  --seller Q9KxBRfrnb6v9Vb8vuHjwkZaxj3ZRhJWpg \
+  --outcome satisfied
+```
+
+---
+
+## Agreement Creation
+
+### `irium-wallet agreement-create-simple-settlement`
+
+Creates a simple two-party settlement agreement.
+
+**Required flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--agreement-id <id>` | Unique agreement ID |
+| `--creation-time <unix>` | Unix timestamp |
+| `--party-a <id\|name\|addr\|role>` | First party identifier |
+| `--party-b <id\|name\|addr\|role>` | Second party identifier |
+| `--amount <irm>` | Amount in IRM |
+| `--secret-hash <32bytehex>` | Hash of the unlock secret |
+| `--refund-timeout <height>` | Block height for refund eligibility |
+| `--document-hash <32bytehex>` | SHA256 of the agreement document |
+| `--out <file>` | Output file path (optional) |
+
+```
+irium-wallet agreement-create-simple-settlement \
+  --agreement-id settle-001 \
+  --creation-time 1777624133 \
+  --party-a addr=QPartyAAddress... \
+  --party-b addr=QPartyBAddress... \
+  --amount 1.0 \
+  --secret-hash abcdef01234567890abcdef01234567890abcdef01234567890abcdef01234567 \
+  --refund-timeout 20500 \
+  --document-hash fedcba98765432100fedcba98765432100fedcba98765432100fedcba98765432 \
+  --out settle-001.json
+```
+
+---
+
+### `irium-wallet agreement-create-otc`
+
+Creates an OTC trade agreement (buyer and seller, asset reference, payment reference).
+
+**Required flags:** (same structure as `agreement-create-simple-settlement` plus):
+
+| Flag | Description |
+|------|-------------|
+| `--buyer <...>` | Buyer identifier |
+| `--seller <...>` | Seller identifier |
+| `--asset-reference <text>` | Asset being traded (e.g. `50 USDT`) |
+| `--payment-reference <text>` | Payment reference (e.g. bank transfer ref) |
+
+```
+irium-wallet agreement-create-otc \
+  --agreement-id otc-002 \
+  --creation-time 1777624133 \
+  --buyer addr=QBuyerAddress... \
+  --seller addr=QSellerAddress... \
+  --amount 1.0 \
+  --asset-reference "50 USDT" \
+  --payment-reference "SEPA transfer ref #12345" \
+  --secret-hash abcdef01234567890abcdef01234567890abcdef01234567890abcdef01234567 \
+  --refund-timeout 20500 \
+  --document-hash fedcba98765432100fedcba98765432100fedcba98765432100fedcba98765432 \
+  --out otc-002.json
+```
+
+---
+
+### `irium-wallet agreement-create-deposit`
+
+Creates a deposit agreement. Same flag structure as `agreement-create-otc` but for payer/payee deposit flows with a purpose reference and refund summary.
+
+---
+
+### `irium-wallet agreement-create-milestone`
+
+Creates a milestone-based agreement. Milestones each have their own amount and timeout height, allowing partial release at multiple checkpoints.
+
+---
+
+## Agreement Operations
+
+All commands accept `--rpc <url>`.
+
+### `irium-wallet agreement-fund <ref> [--broadcast] [--rpc <url>]`
+
+Builds the funding transaction for an agreement. Pass `--broadcast` to submit it immediately.
+
+`<ref>` can be a path to an `agreement.json`, a `bundle.json`, an agreement ID, or an agreement hash.
+
+```
+irium-wallet agreement-fund otc-002.json --broadcast --rpc http://localhost:38300
+```
+
+---
+
+### `irium-wallet agreement-status <ref> [--rpc <url>]`
+
+Returns the current on-chain status.
+
+```
+irium-wallet agreement-status otc-002.json --rpc http://localhost:38300
+```
+
+---
+
+### `irium-wallet agreement-timeline <ref> [--rpc <url>]`
+
+Returns the full event timeline.
+
+```
+irium-wallet agreement-timeline otc-002.json
+```
+
+---
+
+### `irium-wallet agreement-release <ref> [--secret <hex>] [--broadcast] [--rpc <url>]`
+
+Builds (and optionally broadcasts) the release transaction. Requires the unlock secret.
+
+```
+irium-wallet agreement-release otc-002.json \
+  --secret abcdef01234567890abcdef01234567890abcdef01234567890abcdef01234567 \
+  --broadcast
+```
+
+---
+
+### `irium-wallet agreement-refund <ref> [--broadcast] [--rpc <url>]`
+
+Builds (and optionally broadcasts) the refund transaction. Only valid after the refund timeout height.
+
+```
+irium-wallet agreement-refund otc-002.json --broadcast
+```
+
+---
+
+### `irium-wallet agreement-release-eligibility <ref> [--rpc <url>]`
+
+Checks whether the agreement is currently eligible for release.
+
+```
+irium-wallet agreement-release-eligibility otc-002.json
+```
+
+---
+
+### `irium-wallet agreement-refund-eligibility <ref> [--rpc <url>]`
+
+Checks whether the agreement is currently eligible for refund.
+
+```
+irium-wallet agreement-refund-eligibility otc-002.json
+```
+
+---
+
+### `irium-wallet agreement-milestones <ref> [--rpc <url>]`
+
+Returns milestone status for milestone-type agreements.
+
+```
+irium-wallet agreement-milestones milestone-003.json
+```
+
+---
+
+### `irium-wallet agreement-hash <ref>`
+
+Computes and prints the deterministic hash of an agreement.
+
+```
+irium-wallet agreement-hash otc-002.json
+```
+
+---
+
+### `irium-wallet agreement-inspect <ref>`
+
+Prints the parsed fields of an agreement for verification.
+
+```
+irium-wallet agreement-inspect otc-002.json
+```
+
+---
+
+### `irium-wallet agreement-list`
+
+Lists all agreements stored locally in the wallet.
+
+```
+irium-wallet agreement-list
+```
+
+---
+
+### `irium-wallet agreement-save <ref> [--label <label>]`
+
+Saves an agreement to local wallet storage.
+
+```
+irium-wallet agreement-save otc-002.json --label "USDT trade Nov 2026"
+```
+
+---
+
+### `irium-wallet agreement-audit <ref> [--rpc <url>]`
+
+Returns a full audit record including on-chain events, proofs, and policy evaluations.
+
+```
+irium-wallet agreement-audit otc-002.json
+```
+
+---
+
+## Proof Operations
+
+### `irium-wallet agreement-proof-create`
+
+Creates a signed proof attesting that a condition has been met.
+
+**Flags:**
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--agreement-hash <hex>` | Yes | Agreement hash |
+| `--proof-type <type>` | Yes | Type of proof (e.g. `delivery_confirmed`) |
+| `--attested-by <id>` | Yes | Attester identifier |
+| `--address <addr>` | Yes | Attester's Irium address |
+| `--evidence-summary <text>` | No | Human-readable description of evidence |
+| `--evidence-hash <hex>` | No | SHA256 hash of evidence file |
+| `--out <file>` | No | Output file path |
+
+```
+irium-wallet agreement-proof-create \
+  --agreement-hash abcdef01...32bytehex... \
+  --proof-type delivery_confirmed \
+  --attested-by attestor-id \
+  --address QAttestorAddress... \
+  --evidence-summary "Goods delivered, tracking #ABC123" \
+  --out proof.json
+```
+
+---
+
+### `irium-wallet agreement-proof-submit --proof <proof.json|-> [--rpc <url>]`
+
+Submits a proof to the node. Use `-` to read from stdin.
+
+```
+irium-wallet agreement-proof-submit --proof proof.json --rpc http://localhost:38300
+```
+
+---
+
+### `irium-wallet agreement-proof-list [--agreement-hash <hex>] [--rpc <url>]`
+
+Lists proofs. If `--agreement-hash` is provided, filters to that agreement.
+
+```
+irium-wallet agreement-proof-list --agreement-hash abcdef01...
+```
+
+---
+
+### `irium-wallet agreement-proof-get --proof-id <id> [--rpc <url>]`
+
+Returns a single proof by ID.
+
+```
+irium-wallet agreement-proof-get --proof-id proof-abc123
+```
+
+---
+
+## Policy Operations
+
+### `irium-wallet policy-build-otc`
+
+Builds a release policy for an OTC agreement.
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--policy-id <id>` | Policy identifier |
+| `--agreement-hash <hash>` | Agreement hash |
+| `--attestor <id>:<pubkey_or_addr>` | Required attestor |
+| `--release-proof-type <type>` | Required proof type to trigger release |
+
+```
+irium-wallet policy-build-otc \
+  --policy-id policy-001 \
+  --agreement-hash abcdef01...32bytehex... \
+  --attestor attestor-id:QAttestorAddress... \
+  --release-proof-type delivery_confirmed
+```
+
+---
+
+### `irium-wallet agreement-policy-set --policy <policy.json> [--rpc <url>]`
+
+Stores a policy on the node.
+
+```
+irium-wallet agreement-policy-set --policy policy.json
+```
+
+---
+
+### `irium-wallet agreement-policy-get --agreement-hash <hex> [--rpc <url>]`
+
+Returns the stored policy for an agreement.
+
+```
+irium-wallet agreement-policy-get --agreement-hash abcdef01...
+```
+
+---
+
+### `irium-wallet agreement-policy-evaluate --agreement <hash|id> [--rpc <url>]`
+
+Evaluates the policy against currently submitted proofs.
+
+```
+irium-wallet agreement-policy-evaluate --agreement abcdef01...
+```
+
+---
+
+### `irium-wallet agreement-policy-list [--active-only] [--rpc <url>]`
+
+Lists stored policies.
+
+```
+irium-wallet agreement-policy-list --active-only
+```
+
+---
+
+## Signing and Bundles
+
+### `irium-wallet agreement-sign --agreement <agreement.json|-> --signer <addr>`
+
+Signs an agreement with the private key of `<addr>`.
+
+```
+irium-wallet agreement-sign --agreement otc-002.json --signer QSellerAddress...
+```
+
+---
+
+### `irium-wallet agreement-bundle-create <ref> --out <file>`
+
+Creates a bundle wrapping an agreement and its signatures.
+
+```
+irium-wallet agreement-bundle-create otc-002.json --out bundle-002.json
+```
+
+---
+
+### `irium-wallet agreement-bundle-inspect <ref>`
+
+Prints the contents of a bundle.
+
+```
+irium-wallet agreement-bundle-inspect bundle-002.json
+```
+
+---
+
+### `irium-wallet agreement-bundle-verify <ref>`
+
+Verifies all signatures in a bundle.
+
+```
+irium-wallet agreement-bundle-verify bundle-002.json
+```
+
+---
+
+### `irium-wallet agreement-bundle-sign --bundle <ref> --signer <addr>`
+
+Adds a signature to a bundle.
+
+```
+irium-wallet agreement-bundle-sign --bundle bundle-002.json --signer QBuyerAddress...
+```
+
+---
+
+## Share Packages
+
+Share packages are used to exchange agreements and bundles between counterparties.
+
+```
+# Create a share package
+irium-wallet agreement-share-package --out package.json
+
+# Inspect a received package
+irium-wallet agreement-share-package-inspect package.json
+
+# Verify a package against the chain
+irium-wallet agreement-share-package-verify package.json --rpc http://localhost:38300
+
+# Import a package
+irium-wallet agreement-share-package-import package.json --rpc http://localhost:38300
+
+# List received packages
+irium-wallet agreement-share-package-list
+```
+
+---
+
+## OTC Shortcuts
+
+These commands wrap the full agreement lifecycle into simpler single commands for common OTC flows.
+
+### `irium-wallet otc-create`
+
+Creates an OTC agreement with minimal flags.
+
+```
+irium-wallet otc-create \
+  --seller QSellerAddress... \
+  --buyer QBuyerAddress... \
+  --amount 1.0 \
+  --asset "50 USDT" \
+  --payment-method bank-transfer \
+  --timeout 20500
+```
+
+---
+
+### `irium-wallet otc-attest`
+
+Adds an attestation message to an OTC agreement.
+
+```
+irium-wallet otc-attest \
+  --agreement otc-002.json \
+  --message "Payment received in full" \
+  --address QAttestorAddress...
+```
+
+---
+
+### `irium-wallet otc-settle`
+
+Executes the full settlement flow for an OTC agreement.
+
+```
+irium-wallet otc-settle --agreement otc-002.json --rpc http://localhost:38300
+```
+
+---
+
+### `irium-wallet otc-status`
+
+Returns the status of an OTC agreement.
+
+```
+irium-wallet otc-status --agreement otc-002.json
+```
+
+---
+
+## Seller and Buyer Status
+
+### `irium-wallet seller-status [--address <addr>] [--rpc <url>]`
+
+Returns active agreements and reputation summary for a seller.
+
+```
+irium-wallet seller-status --address QSellerAddress...
+```
+
+---
+
+### `irium-wallet buyer-status [--address <addr>] [--rpc <url>]`
+
+Returns active agreements for a buyer.
+
+```
+irium-wallet buyer-status --address QBuyerAddress...
+```
