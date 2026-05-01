@@ -53,8 +53,9 @@ cp .env.example .env
 
 | Variable | Default | Description |
 |---|---|---|
-| `IRIUM_P2P_EXTERNAL_PORT` | `38291` | Host port mapped to the P2P listener |
-| `IRIUM_RPC_EXTERNAL_PORT` | `38300` | Host port mapped to the RPC endpoint |
+| `IRIUM_P2P_EXTERNAL_PORT` | `38291` | Host port mapped to the P2P listener. The node always binds internally on 38291 — change this only if that port is already in use on your host. |
+| `IRIUM_RPC_EXTERNAL_PORT` | `38300` | Host port mapped to the RPC/API endpoint |
+| `IRIUM_STATUS_EXTERNAL_PORT` | `8080` | Host port mapped to the status endpoint (`GET /status`) |
 | `IRIUM_MINER_THREADS` | `2` | CPU threads the miner uses |
 | `IRIUM_RPC_TOKEN` | _(empty)_ | Shared secret for RPC authentication |
 

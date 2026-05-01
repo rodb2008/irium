@@ -1,24 +1,17 @@
 # syntax=docker/dockerfile:1
 
 # Stage 1: Build
-FROM rust:latest AS builder
+FROM rust:bookworm AS builder
 
 WORKDIR /opt/irium
 COPY . .
 
-RUN cargo build --release --bin iriumd && \
-    strip target/release/iriumd
+RUN cargo build --release --bin iriumd &&     strip target/release/iriumd
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd -r irium \
-    && useradd -r -g irium -s /bin/false -d /home/irium -m irium \
-    && mkdir -p /home/irium/.irium \
-    && chown irium:irium /home/irium/.irium
+RUN apt-get update     && apt-get install -y --no-install-recommends ca-certificates curl openssh-client     && rm -rf /var/lib/apt/lists/*     && groupadd -r irium     && useradd -r -g irium -s /bin/false -d /home/irium -m irium     && mkdir -p /home/irium/.irium     && chown irium:irium /home/irium/.irium
 
 WORKDIR /opt/irium
 
@@ -28,15 +21,12 @@ COPY --chown=irium:irium bootstrap/ ./bootstrap/
 
 # All ports and paths are configurable via environment variables.
 # These are defaults only — override in docker run -e or docker-compose.yml.
-ENV IRIUM_DATA_DIR=/home/irium/.irium \
-    IRIUM_NODE_HOST=0.0.0.0 \
-    IRIUM_NODE_PORT=38300 \
-    IRIUM_P2P_BIND=0.0.0.0:38291
+ENV IRIUM_DATA_DIR=/home/irium/.irium     IRIUM_NODE_HOST=0.0.0.0     IRIUM_NODE_PORT=38300     IRIUM_P2P_BIND=0.0.0.0:38291     IRIUM_STATUS_HOST=0.0.0.0     IRIUM_STATUS_PORT=8080
 
 VOLUME ["/home/irium/.irium"]
 
-# P2P port and RPC port — both configurable via env vars above.
-EXPOSE 38291 38300
+# P2P port, RPC/API port, and status port — all configurable via env vars above.
+EXPOSE 38291 38300 8080
 
 USER irium
 

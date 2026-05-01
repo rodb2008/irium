@@ -2518,8 +2518,8 @@ fn rpc_body_limit_bytes() -> usize {
 
 fn require_rpc_auth(headers: &HeaderMap) -> Result<(), StatusCode> {
     let token = match env::var("IRIUM_RPC_TOKEN") {
-        Ok(t) => t,
-        Err(_) => return Ok(()),
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => return Ok(()),
     };
     let expected = format!("Bearer {}", token);
     let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
@@ -2532,8 +2532,8 @@ fn require_rpc_auth(headers: &HeaderMap) -> Result<(), StatusCode> {
 
 fn rpc_authorized(headers: &HeaderMap) -> bool {
     let token = match env::var("IRIUM_RPC_TOKEN") {
-        Ok(t) => t,
-        Err(_) => return false,
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => return false,
     };
     let expected = format!("Bearer {}", token);
     let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
