@@ -2176,7 +2176,11 @@ fn usage() {
   irium-wallet feed-remove <url>
   irium-wallet feed-list [--json]
   irium-wallet feed-bootstrap
-  irium-wallet reputation-show <seller_pubkey|address> [--json]");
+  irium-wallet reputation-show <seller_pubkey|address> [--json]
+  irium-wallet reputation-record-outcome --seller <addr> --outcome <satisfied|failed|disputed|timeout> [--proof-response-secs <n>] [--self-trade] [--json]
+  irium-wallet reputation-export --seller <addr> [--out <file>] [--json]
+  irium-wallet reputation-import --file <file> [--json]
+  irium-wallet reputation-self-trade-check --seller <addr> --buyer <addr> [--json]");
     eprintln!(
         "  irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]"
     );
@@ -8764,6 +8768,8 @@ fn handle_agreement_dispute_list(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+const SYBIL_MIN_AGREEMENTS: usize = 3;
+
 fn reputation_dir() -> std::path::PathBuf {
     irium_data_dir().join("reputation")
 }
@@ -8784,6 +8790,10 @@ struct ReputationScore {
     recent_default_count: usize,
     recent_total: usize,
     has_recent_data: bool,
+    dispute_count: usize,
+    total_proof_response_secs: u64,
+    proof_response_count: u64,
+    self_trade_count: usize,
 }
 
 impl ReputationScore {
@@ -8870,6 +8880,79 @@ impl ReputationScore {
         }
         score
     }
+
+    fn dispute_rate(&self) -> Option<f64> {
+        if !self.has_outcome_data || self.total == 0 {
+            return None;
+        }
+        Some(self.dispute_count as f64 / self.total as f64 * 100.0)
+    }
+
+    fn avg_proof_response_time(&self) -> Option<f64> {
+        if self.proof_response_count == 0 {
+            return None;
+        }
+        Some(self.total_proof_response_secs as f64 / self.proof_response_count as f64)
+    }
+
+    fn sybil_suppressed(&self) -> bool {
+        self.total < SYBIL_MIN_AGREEMENTS
+    }
+
+    fn display_summary_line(&self) -> String {
+        if self.total == 0 {
+            return "Unknown -- no trade history on this node".to_string();
+        }
+        if self.sybil_suppressed() {
+            return format!(
+                "New seller -- {} trade{} (not yet ranked, minimum {} required)",
+                self.total,
+                if self.total == 1 { "" } else { "s" },
+                SYBIL_MIN_AGREEMENTS
+            );
+        }
+        let risk = self.risk_signal();
+        let prefix = match risk {
+            "low" => "Trusted",
+            "moderate" => "Caution",
+            _ => "Risk: HIGH",
+        };
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(format!("{} trade{}", self.total, if self.total == 1 { "" } else { "s" }));
+        if let Some(cr) = self.success_rate() {
+            parts.push(format!("{:.1}% completion", cr));
+        }
+        if self.dispute_count == 0 {
+            parts.push("no disputes".to_string());
+        } else {
+            let dr_str = if let Some(dr) = self.dispute_rate() {
+                format!(" ({:.1}% dispute rate)", dr)
+            } else {
+                String::new()
+            };
+            parts.push(format!(
+                "{} dispute{}{}",
+                self.dispute_count,
+                if self.dispute_count == 1 { "" } else { "s" },
+                dr_str
+            ));
+        }
+        if let Some(avg) = self.avg_proof_response_time() {
+            if avg < 3600.0 {
+                parts.push(format!("{:.0}s avg proof response", avg));
+            } else {
+                parts.push(format!("{:.1}h avg proof response", avg / 3600.0));
+            }
+        }
+        if self.self_trade_count > 0 {
+            parts.push(format!(
+                "WARNING: {} self-trade flag{}",
+                self.self_trade_count,
+                if self.self_trade_count == 1 { "" } else { "s" }
+            ));
+        }
+        format!("{} -- {}", prefix, parts.join(", "))
+    }
 }
 
 fn resolve_seller_address(input: &str) -> String {
@@ -8933,6 +9016,10 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
     let mut recent_default_count: usize = 0;
     let mut recent_total: usize = 0;
     let mut has_recent_data = false;
+    let mut dispute_count: usize = 0;
+    let mut total_proof_response_secs: u64 = 0;
+    let mut proof_response_count: u64 = 0;
+    let mut self_trade_count: usize = 0;
     if outcomes_path.exists() {
         if let Ok(data) = std::fs::read_to_string(&outcomes_path) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
@@ -8983,8 +9070,21 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
                     recent_total = recent_satisfied + recent_failed
                         + recent_timeout + recent_unsatisfied_count;
                     has_recent_data = recent_total > 0;
+                    dispute_count = entry.get("disputes").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    total_proof_response_secs = entry.get("total_proof_response_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                    proof_response_count = entry.get("proof_response_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    self_trade_count = entry.get("self_trade_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 }
             }
+        }
+    }
+
+    // Use outcomes count as a floor for total so sybil check works
+    // even when agreement bundle files are not present locally.
+    if has_outcome_data {
+        let outcome_total = satisfied + failed;
+        if outcome_total > total {
+            total = outcome_total;
         }
     }
 
@@ -8999,6 +9099,10 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
         recent_default_count,
         recent_total,
         has_recent_data,
+        dispute_count,
+        total_proof_response_secs,
+        proof_response_count,
+        self_trade_count,
     }
 }
 
@@ -9034,6 +9138,13 @@ fn handle_reputation_show(args: &[String]) -> Result<(), String> {
                 "satisfied": if rep.has_outcome_data { serde_json::json!(rep.satisfied) } else { serde_json::json!(null) },
                 "defaults": if rep.has_outcome_data { serde_json::json!(rep.default_count) } else { serde_json::json!(null) },
                 "success_rate": rate.map(|r| format!("{:.1}", r)),
+                "completion_rate": rate.map(|r| format!("{:.1}", r)),
+                "dispute_rate": rep.dispute_rate().map(|r| format!("{:.1}", r)),
+                "avg_proof_response_secs": rep.avg_proof_response_time(),
+                "disputes": if rep.has_outcome_data { serde_json::json!(rep.dispute_count) } else { serde_json::json!(null) },
+                "self_trade_count": rep.self_trade_count,
+                "sybil_suppressed": rep.sybil_suppressed(),
+                "summary": rep.display_summary_line(),
                 "risk": rep.risk_signal(),
                 "recent": serde_json::json!({
                     "satisfied": if rep.has_recent_data { serde_json::json!(rep.recent_satisfied) } else { serde_json::json!(null) },
@@ -9048,19 +9159,40 @@ fn handle_reputation_show(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
+    println!("Summary:          {}", rep.display_summary_line());
+    println!();
     println!("Seller:           {}", resolved);
     println!("Total agreements: {}", rep.total);
+    if rep.sybil_suppressed() && rep.total > 0 {
+        println!("Ranking:          not yet established (minimum {} agreements required)", SYBIL_MIN_AGREEMENTS);
+    }
     if rep.has_outcome_data {
         println!("Successful:       {}", rep.satisfied);
         println!("Defaults:         {}", rep.default_count);
+        println!("Disputes:         {}", rep.dispute_count);
         match rep.success_rate() {
-            Some(rate) => println!("Success rate:     {:.1}%", rate),
-            None => println!("Success rate:     N/A (no completed outcomes recorded)"),
+            Some(rate) => println!("Completion rate:  {:.1}%", rate),
+            None => println!("Completion rate:  N/A"),
+        }
+        match rep.dispute_rate() {
+            Some(dr) => println!("Dispute rate:     {:.1}%", dr),
+            None => println!("Dispute rate:     0.0%"),
+        }
+        match rep.avg_proof_response_time() {
+            Some(avg) if avg < 3600.0 => println!("Avg proof resp:   {:.0}s", avg),
+            Some(avg) => println!("Avg proof resp:   {:.1}h", avg / 3600.0),
+            None => println!("Avg proof resp:   N/A"),
         }
     } else {
         println!("Successful:       unknown");
         println!("Defaults:         unknown");
-        println!("Success rate:     unknown (outcome not yet tracked locally)");
+        println!("Disputes:         unknown");
+        println!("Completion rate:  unknown (outcome not yet tracked locally)");
+        println!("Dispute rate:     unknown");
+        println!("Avg proof resp:   unknown");
+    }
+    if rep.self_trade_count > 0 {
+        println!("Self-trade flags: {} (WARNING: possible self-trading detected)", rep.self_trade_count);
     }
     println!("Risk:             {}", rep.risk_signal());
     println!();
@@ -9081,6 +9213,313 @@ fn handle_reputation_show(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+
+fn handle_reputation_record_outcome(args: &[String]) -> Result<(), String> {
+    let mut seller: Option<String> = None;
+    let mut outcome: Option<String> = None;
+    let mut proof_response_secs: Option<u64> = None;
+    let mut self_trade = false;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seller" => { seller = Some(parse_required_string_flag(args, &mut i, "--seller")?); }
+            "--outcome" => { outcome = Some(parse_required_string_flag(args, &mut i, "--outcome")?); }
+            "--proof-response-secs" => {
+                let v = parse_required_string_flag(args, &mut i, "--proof-response-secs")?;
+                proof_response_secs = Some(v.parse::<u64>().map_err(|_| "--proof-response-secs must be an integer".to_string())?);
+            }
+            "--self-trade" => { self_trade = true; i += 1; }
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let seller_addr = seller.ok_or_else(|| "--seller is required".to_string())?;
+    let outcome_str = outcome.ok_or_else(|| "--outcome is required (satisfied|failed|disputed|timeout)".to_string())?;
+    match outcome_str.as_str() {
+        "satisfied" | "failed" | "disputed" | "timeout" => {}
+        other => return Err(format!("invalid outcome '{}': use satisfied, failed, disputed, or timeout", other)),
+    }
+
+    let dir = reputation_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create reputation dir: {}", e))?;
+    let path = reputation_outcomes_path();
+    let mut root: serde_json::Value = if path.exists() {
+        let data = std::fs::read_to_string(&path).map_err(|e| format!("read outcomes: {}", e))?;
+        serde_json::from_str(&data).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    {
+        let map = root.as_object_mut().ok_or("outcomes.json is not an object")?;
+        let entry = map.entry(seller_addr.clone()).or_insert_with(|| serde_json::json!({
+            "satisfied": 0u64, "failed": 0u64, "timeout": 0u64, "unsatisfied": 0u64,
+            "disputes": 0u64, "total_proof_response_secs": 0u64, "proof_response_count": 0u64,
+            "self_trade_count": 0u64,
+            "recent_satisfied": 0u64, "recent_failed": 0u64, "recent_timeout": 0u64, "recent_unsatisfied": 0u64,
+        }));
+
+        let get_u64 = |e: &serde_json::Value, k: &str| -> u64 { e.get(k).and_then(|v| v.as_u64()).unwrap_or(0) };
+
+        let mut sat = get_u64(entry, "satisfied");
+        let mut fail = get_u64(entry, "failed");
+        let mut tmo = get_u64(entry, "timeout");
+        let mut disputes = get_u64(entry, "disputes");
+        let mut prs = get_u64(entry, "total_proof_response_secs");
+        let mut prc = get_u64(entry, "proof_response_count");
+        let mut stc = get_u64(entry, "self_trade_count");
+        let mut r_sat = get_u64(entry, "recent_satisfied");
+        let mut r_fail = get_u64(entry, "recent_failed");
+        let mut r_tmo = get_u64(entry, "recent_timeout");
+
+        match outcome_str.as_str() {
+            "satisfied" => { sat += 1; r_sat += 1; }
+            "failed" => { fail += 1; r_fail += 1; }
+            "disputed" => { disputes += 1; fail += 1; r_fail += 1; }
+            "timeout" => { tmo += 1; r_tmo += 1; }
+            _ => {}
+        }
+        if let Some(secs) = proof_response_secs {
+            prs += secs;
+            prc += 1;
+        }
+        if self_trade {
+            stc += 1;
+        }
+
+        let r_total = r_sat + r_fail + r_tmo;
+        if r_total > 10 {
+            let excess = r_total - 10;
+            if r_tmo >= excess { r_tmo -= excess; }
+            else if r_fail >= excess { r_fail -= excess; }
+            else { r_sat = r_sat.saturating_sub(excess); }
+        }
+
+        *entry = serde_json::json!({
+            "satisfied": sat, "failed": fail, "timeout": tmo, "unsatisfied": 0u64,
+            "disputes": disputes, "total_proof_response_secs": prs, "proof_response_count": prc,
+            "self_trade_count": stc,
+            "recent_satisfied": r_sat, "recent_failed": r_fail, "recent_timeout": r_tmo, "recent_unsatisfied": 0u64,
+        });
+    }
+
+    let json_out = serde_json::to_string_pretty(&root).unwrap();
+    std::fs::write(&path, &json_out).map_err(|e| format!("write outcomes: {}", e))?;
+
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "seller": seller_addr, "outcome": outcome_str,
+            "proof_response_secs": proof_response_secs,
+            "self_trade": self_trade,
+        })).unwrap());
+    } else {
+        println!("recorded  outcome={} seller={}", outcome_str, seller_addr);
+        if let Some(secs) = proof_response_secs {
+            println!("          proof_response_secs={}", secs);
+        }
+        if self_trade { println!("          WARNING: self-trade flag recorded"); }
+        if outcome_str == "disputed" { println!("          dispute count incremented"); }
+    }
+    Ok(())
+}
+
+fn handle_reputation_export(args: &[String]) -> Result<(), String> {
+    let mut seller: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seller" => { seller = Some(parse_required_string_flag(args, &mut i, "--seller")?); }
+            "--out" => { out_path = Some(parse_required_string_flag(args, &mut i, "--out")?); }
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let seller_addr = seller.ok_or_else(|| "--seller is required".to_string())?;
+    let rep = compute_reputation(&seller_addr);
+
+    let exported_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let payload = serde_json::json!({
+        "version": "1",
+        "seller": seller_addr,
+        "exported_at": exported_at,
+        "total_agreements": rep.total,
+        "satisfied": rep.satisfied,
+        "defaults": rep.default_count,
+        "disputes": rep.dispute_count,
+        "completion_rate": rep.success_rate().map(|r| (r * 10.0).round() / 10.0),
+        "dispute_rate": rep.dispute_rate().map(|r| (r * 10.0).round() / 10.0),
+        "avg_proof_response_secs": rep.avg_proof_response_time().map(|r| r.round() as u64),
+        "risk": rep.risk_signal(),
+        "sybil_suppressed": rep.sybil_suppressed(),
+        "summary": rep.display_summary_line(),
+    });
+    let payload_str = serde_json::to_string(&payload).unwrap();
+
+    let mut h: u64 = 14695981039346656037u64;
+    for b in payload_str.as_bytes() {
+        h = h.wrapping_mul(1099511628211u64);
+        h ^= *b as u64;
+    }
+    let content_hash = format!("{:016x}", h);
+
+    let export = serde_json::json!({
+        "version": "1",
+        "seller": seller_addr,
+        "exported_at": exported_at,
+        "total_agreements": rep.total,
+        "satisfied": rep.satisfied,
+        "defaults": rep.default_count,
+        "disputes": rep.dispute_count,
+        "completion_rate": rep.success_rate().map(|r| (r * 10.0).round() / 10.0),
+        "dispute_rate": rep.dispute_rate().map(|r| (r * 10.0).round() / 10.0),
+        "avg_proof_response_secs": rep.avg_proof_response_time().map(|r| r.round() as u64),
+        "risk": rep.risk_signal(),
+        "sybil_suppressed": rep.sybil_suppressed(),
+        "summary": rep.display_summary_line(),
+        "integrity": {
+            "algorithm": "fnv1a-64",
+            "content_hash": content_hash,
+        }
+    });
+    let json_out = serde_json::to_string_pretty(&export).unwrap();
+
+    if let Some(ref p) = out_path {
+        std::fs::write(p, &json_out).map_err(|e| format!("write export: {}", e))?;
+        if !json_mode {
+            println!("exported  seller={}", seller_addr);
+            println!("          file={}", p);
+            println!("          content_hash={}", content_hash);
+            println!("          summary={}", rep.display_summary_line());
+        } else {
+            println!("{}", json_out);
+        }
+    } else {
+        println!("{}", json_out);
+    }
+    Ok(())
+}
+
+fn handle_reputation_import(args: &[String]) -> Result<(), String> {
+    let mut file_path: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--file" => { file_path = Some(parse_required_string_flag(args, &mut i, "--file")?); }
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let fp = file_path.ok_or_else(|| "--file is required".to_string())?;
+    let data = std::fs::read_to_string(&fp).map_err(|e| format!("read file: {}", e))?;
+    let val: serde_json::Value = serde_json::from_str(&data).map_err(|e| format!("parse JSON: {}", e))?;
+
+    let seller = val.get("seller").and_then(|v| v.as_str()).ok_or("missing seller field")?;
+    let integrity = val.get("integrity").ok_or("missing integrity block")?;
+    let stored_hash = integrity.get("content_hash").and_then(|v| v.as_str()).ok_or("missing content_hash")?;
+
+    let payload = serde_json::json!({
+        "version": val.get("version").unwrap_or(&serde_json::json!("1")),
+        "seller": seller,
+        "exported_at": val.get("exported_at").unwrap_or(&serde_json::json!(0)),
+        "total_agreements": val.get("total_agreements").unwrap_or(&serde_json::json!(0)),
+        "satisfied": val.get("satisfied").unwrap_or(&serde_json::json!(0)),
+        "defaults": val.get("defaults").unwrap_or(&serde_json::json!(0)),
+        "disputes": val.get("disputes").unwrap_or(&serde_json::json!(0)),
+        "completion_rate": val.get("completion_rate"),
+        "dispute_rate": val.get("dispute_rate"),
+        "avg_proof_response_secs": val.get("avg_proof_response_secs"),
+        "risk": val.get("risk").unwrap_or(&serde_json::json!("unknown")),
+        "sybil_suppressed": val.get("sybil_suppressed").unwrap_or(&serde_json::json!(false)),
+        "summary": val.get("summary").unwrap_or(&serde_json::json!("")),
+    });
+    let payload_str = serde_json::to_string(&payload).unwrap();
+    let mut h: u64 = 14695981039346656037u64;
+    for b in payload_str.as_bytes() {
+        h = h.wrapping_mul(1099511628211u64);
+        h ^= *b as u64;
+    }
+    let computed_hash = format!("{:016x}", h);
+    let verified = computed_hash == stored_hash;
+
+    let summary = val.get("summary").and_then(|v| v.as_str()).unwrap_or("N/A");
+    let total = val.get("total_agreements").and_then(|v| v.as_u64()).unwrap_or(0);
+    let disputes_val = val.get("disputes").and_then(|v| v.as_u64()).unwrap_or(0);
+    let risk = val.get("risk").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let sybil = val.get("sybil_suppressed").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "seller": seller,
+            "verification": if verified { "ok" } else { "FAILED" },
+            "computed_hash": computed_hash,
+            "stored_hash": stored_hash,
+            "summary": summary,
+            "total_agreements": total,
+            "disputes": disputes_val,
+            "risk": risk,
+            "sybil_suppressed": sybil,
+        })).unwrap());
+    } else {
+        println!("seller            {}", seller);
+        println!("verification      {}", if verified { "ok -- content hash matches" } else { "FAILED -- content hash mismatch, data may be tampered" });
+        println!("summary           {}", summary);
+        println!("total_agreements  {}", total);
+        println!("disputes          {}", disputes_val);
+        println!("risk              {}", risk);
+        println!("sybil_suppressed  {}", sybil);
+    }
+    if !verified {
+        return Err("integrity verification failed: content hash does not match".to_string());
+    }
+    Ok(())
+}
+
+fn handle_reputation_self_trade_check(args: &[String]) -> Result<(), String> {
+    let mut seller: Option<String> = None;
+    let mut buyer: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seller" => { seller = Some(parse_required_string_flag(args, &mut i, "--seller")?); }
+            "--buyer" => { buyer = Some(parse_required_string_flag(args, &mut i, "--buyer")?); }
+            "--json" => { json_mode = true; i += 1; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let s = seller.ok_or_else(|| "--seller is required".to_string())?;
+    let b = buyer.ok_or_else(|| "--buyer is required".to_string())?;
+
+    let resolved_s = resolve_seller_address(&s);
+    let resolved_b = resolve_seller_address(&b);
+    let detected = resolved_s.trim().to_lowercase() == resolved_b.trim().to_lowercase();
+
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "seller": s,
+            "buyer": b,
+            "resolved_seller": resolved_s,
+            "resolved_buyer": resolved_b,
+            "self_trade_detected": detected,
+            "reason": if detected { "seller and buyer resolve to the same address" } else { "no self-trade detected" },
+        })).unwrap());
+    } else {
+        println!("seller            {}", s);
+        println!("buyer             {}", b);
+        println!("resolved_seller   {}", resolved_s);
+        println!("resolved_buyer    {}", resolved_b);
+        println!("self_trade        {}", if detected { "DETECTED -- seller and buyer are the same party" } else { "none detected" });
+    }
+    Ok(())
+}
 
 fn handle_feed_add(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
@@ -18099,6 +18538,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.display_short(), "unknown");
     }
@@ -18116,6 +18559,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.display_short(), "3 agreements");
     }
@@ -18133,6 +18580,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.display_short(), "1 agreement");
     }
@@ -18150,6 +18601,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.display_short(), "83% (10/12)");
     }
@@ -18167,6 +18622,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.display_short(), "100% (5/5)");
     }
@@ -18184,6 +18643,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert!(rep.success_rate().is_none());
     }
@@ -18201,6 +18664,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         // has_outcome_data=true but both 0 → no division by zero
         assert!(rep.success_rate().is_none());
@@ -18357,6 +18824,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.risk_signal(), "unknown");
     }
@@ -18374,6 +18845,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.risk_signal(), "unknown");
     }
@@ -18391,6 +18866,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.risk_signal(), "low");
     }
@@ -18409,6 +18888,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.risk_signal(), "moderate");
     }
@@ -18427,6 +18910,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.risk_signal(), "high");
     }
@@ -18498,6 +18985,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.recent_risk_signal(), "unknown");
     }
@@ -18515,6 +19006,10 @@ found true"
             recent_default_count: 0,
             recent_total: 5,
             has_recent_data: true,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.recent_risk_signal(), "low");
     }
@@ -18533,6 +19028,10 @@ found true"
             recent_default_count: 2,
             recent_total: 10,
             has_recent_data: true,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.recent_risk_signal(), "moderate");
     }
@@ -18551,6 +19050,10 @@ found true"
             recent_default_count: 4,
             recent_total: 10,
             has_recent_data: true,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.recent_risk_signal(), "high");
     }
@@ -18602,6 +19105,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.ranking_score(), 0);
     }
@@ -18619,6 +19126,10 @@ found true"
             recent_default_count: 0,
             recent_total: 5,
             has_recent_data: true,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.ranking_score(), 80);
     }
@@ -18636,6 +19147,10 @@ found true"
             recent_default_count: 0,
             recent_total: 5,
             has_recent_data: true,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.ranking_score(), 50);
     }
@@ -18653,6 +19168,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.ranking_score(), 50);
     }
@@ -18670,6 +19189,10 @@ found true"
             recent_default_count: 0,
             recent_total: 3,
             has_recent_data: true,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.ranking_score(), 30);
     }
@@ -24112,6 +24635,30 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "reputation-show" => {
             if let Err(e) = handle_reputation_show(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "reputation-record-outcome" => {
+            if let Err(e) = handle_reputation_record_outcome(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "reputation-export" => {
+            if let Err(e) = handle_reputation_export(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "reputation-import" => {
+            if let Err(e) = handle_reputation_import(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "reputation-self-trade-check" => {
+            if let Err(e) = handle_reputation_self_trade_check(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
