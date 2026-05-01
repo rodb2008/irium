@@ -179,6 +179,17 @@ struct NetworkHashrateResponse {
     sample_blocks: usize,
 }
 
+#[derive(Serialize)]
+struct NetworkStatusResponse {
+    height: u64,
+    tip_hash: String,
+    peer_count: usize,
+    difficulty: f64,
+    hashrate_estimate: Option<f64>,
+    seconds_since_last_block: Option<u64>,
+    node_version: &'static str,
+}
+
 #[derive(Deserialize)]
 struct MiningMetricsQuery {
     window: Option<usize>,
@@ -2650,6 +2661,65 @@ async fn network_hashrate(
         avg_block_time,
         window,
         sample_blocks,
+    }))
+}
+
+async fn network_status(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Result<Json<NetworkStatusResponse>, StatusCode> {
+    check_rate(&state, &addr)?;
+    let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let height = guard.tip_height();
+    let tip_hash = guard
+        .chain
+        .last()
+        .map(|b| {
+            let mut h = irium_node_rs::pow::sha256d(&b.header.serialize());
+            h.reverse();
+            hex::encode(h)
+        })
+        .unwrap_or_else(|| "0".repeat(64));
+    let tip_target = guard
+        .chain
+        .last()
+        .map(|b| b.header.target())
+        .unwrap_or_else(|| guard.params.genesis_block.header.target());
+    let difficulty = difficulty_from_target(guard.params.pow_limit, tip_target);
+
+    let (hashrate_estimate, seconds_since_last_block) = if guard.chain.len() >= 2 {
+        let end_index = guard.chain.len() - 1;
+        let window = 120usize.min(end_index);
+        let start_index = end_index - window;
+        let start_time = guard.chain[start_index].header.time as i64;
+        let end_time = guard.chain[end_index].header.time as i64;
+        let elapsed = end_time - start_time;
+        let hashrate = if elapsed > 0 {
+            let avg_time = (elapsed as f64) / (window as f64);
+            Some(difficulty * 4294967296.0 / avg_time)
+        } else {
+            None
+        };
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let secs = now_secs.saturating_sub(end_time as u64);
+        (hashrate, Some(secs))
+    } else {
+        (None, None)
+    };
+    let peer_count = state.status_peer_count_cache.load(std::sync::atomic::Ordering::Relaxed);
+    drop(guard);
+
+    Ok(Json(NetworkStatusResponse {
+        height,
+        tip_hash,
+        peer_count,
+        difficulty,
+        hashrate_estimate,
+        seconds_since_last_block,
+        node_version: env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -7863,6 +7933,7 @@ async fn offers_feed(
         .route("/peers", get(peers))
         .route("/metrics", get(metrics))
         .route("/rpc/network_hashrate", get(network_hashrate))
+        .route("/network-status", get(network_status))
         .route("/rpc/mining_metrics", get(mining_metrics))
         .route("/rpc/balance", get(get_balance))
         .route("/rpc/utxos", get(get_utxos))
