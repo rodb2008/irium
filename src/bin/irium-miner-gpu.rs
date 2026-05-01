@@ -1452,42 +1452,42 @@ fn run_stratum_gpu(gpus: &mut [GpuMiner]) -> Result<(), String> {
 fn print_usage() {
     eprintln!(
         "Usage: irium-miner-gpu [OPTIONS]
-\
-         
-\
-         Options:
-\
-           --pool            <url>     Stratum pool URL
-\
-           --wallet          <addr>    Mining/payout address
-\
-           --platform        <n|name>  OpenCL platform index or vendor name substring
-\
-                                       (default: auto, prefers NVIDIA/AMD over Intel)
-\
-           --device          <n>       Device index within selected platform (default: 0)
-\
-           --devices         <n,n,...> Comma-separated device indices (multi-GPU)
-\
-           --batch           <n>       Nonces per GPU dispatch (default: 4194304)
-\
-           --rpc             <url>     Node RPC URL for solo mining (env: IRIUM_NODE_RPC)
-\
-           --list-platforms            List all OpenCL platforms and devices, then exit
-\
-           --help                      Show this message
-\
-         
-\
-         Environment variables:
-\
-           IRIUM_STRATUM_URL, IRIUM_MINER_ADDRESS, IRIUM_GPU_PLATFORM,
-\
-           IRIUM_GPU_DEVICE, IRIUM_GPU_DEVICES, IRIUM_GPU_BATCH, IRIUM_NODE_RPC
-\
-         
-\
-         CLI flags take priority over environment variables."
+
+
+
+Options:
+
+  --pool            <url>     Stratum pool URL
+
+  --wallet          <addr>    Mining/payout address
+
+  --platform        <n|name>  OpenCL platform index or vendor name substring
+
+                              (default: auto, prefers NVIDIA/AMD over Intel)
+
+  --device          <n>       Device index within selected platform (default: 0)
+
+  --devices         <n,n,...> Comma-separated device indices (multi-GPU)
+
+  --batch           <n>       Nonces per GPU dispatch (default: 4194304)
+
+  --rpc             <url>     Node RPC URL for solo mining (env: IRIUM_NODE_RPC)
+
+  --list-platforms            List all OpenCL platforms and devices, then exit
+
+  --help                      Show this message
+
+
+
+Environment variables:
+
+  IRIUM_STRATUM_URL, IRIUM_MINER_ADDRESS, IRIUM_GPU_PLATFORM,
+
+  IRIUM_GPU_DEVICE, IRIUM_GPU_DEVICES, IRIUM_GPU_BATCH, IRIUM_NODE_RPC
+
+
+
+CLI flags take priority over environment variables."
     );
 }
 
