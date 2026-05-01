@@ -6936,6 +6936,7 @@ async fn main() {
         .as_ref()
         .and_then(|c| c.relay_address.clone())
         .or_else(|| std::env::var("IRIUM_RELAY_ADDRESS").ok());
+    let marketplace_feed_url: Option<String> = std::env::var("IRIUM_MARKETPLACE_FEED_URL").ok();
 
     // Set up P2P node if configured via IRIUM_P2P_BIND env var or node config.
     let p2p_bind_str: Option<String> = std::env::var("IRIUM_P2P_BIND").ok()
@@ -6949,6 +6950,7 @@ async fn main() {
                     Some(shared_state.clone()),
                     Some(mempool.clone()),
                     relay_address.clone(),
+                    marketplace_feed_url.clone(),
                 );
                 // Start listener in the background.
                 if let Err(e) = node.start().await {
