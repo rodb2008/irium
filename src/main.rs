@@ -1,4 +1,5 @@
 mod activation;
+mod auxpow;
 mod anchors;
 mod block;
 mod chain;
@@ -41,6 +42,7 @@ fn main() {
         lwma: LwmaParams::new(resolved_lwma_activation_height(network), pow_limit),
         lwma_v2: resolved_lwma_v2_activation_height(network)
             .map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
+        auxpow_activation_height: crate::activation::resolved_auxpow_activation_height(network),
     };
 
     let state = ChainState::new(params);

@@ -128,6 +128,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             nonce: 0,
         },
         transactions: txs.clone(),
+        auxpow: None,
     };
 
     let target = block.header.target();

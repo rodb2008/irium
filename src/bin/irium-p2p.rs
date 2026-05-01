@@ -46,6 +46,7 @@ async fn main() {
         lwma: LwmaParams::new(resolved_lwma_activation_height(network), pow_limit),
         lwma_v2: resolved_lwma_v2_activation_height(network)
             .map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
+        auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
     };
     let chain = Arc::new(Mutex::new(ChainState::new(params)));
     let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));

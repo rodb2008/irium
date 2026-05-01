@@ -379,6 +379,8 @@ struct JsonBlock {
     header: JsonHeader,
     tx_hex: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    auxpow_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     miner_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     submit_source: Option<String>,
@@ -682,6 +684,7 @@ fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
             .iter()
             .map(|tx| hex::encode(tx.serialize()))
             .collect(),
+        auxpow_hex: block.auxpow.as_ref().map(|ap| hex::encode(crate::auxpow::serialize(ap))),
         miner_address: miner_address_from_block(block),
         submit_source: None,
     };

@@ -95,6 +95,7 @@ pub struct ChainParams {
     /// Optional LWMA v2 params. When Some and height >= v2.activation_height,
     /// replaces v1. None keeps v1 behavior indefinitely.
     pub lwma_v2: Option<LwmaParams>,
+    pub auxpow_activation_height: Option<u64>,
 }
 
 /// Reference to a specific transaction output.
@@ -665,12 +666,17 @@ impl ChainState {
         };
 
         // Basic PoW check.
-        if !meets_target(&hash, header.target()) {
+        let height = parent_height + 1;
+        let auxpow_active = self.params.auxpow_activation_height
+            .map(|ah| height >= ah)
+            .unwrap_or(false);
+        if header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 && auxpow_active {
+            // Full AuxPoW validation requires the complete block; deferred to process_block.
+        } else if !meets_target(&hash, header.target()) {
             return Err("header does not meet target".to_string());
         }
 
         let work = parent_work + Self::work_for_target(header.target());
-        let height = parent_height + 1;
         self.headers.insert(
             hash,
             HeaderWork {
@@ -800,7 +806,15 @@ impl ChainState {
         if block.header.target().bits != target.bits {
             return Err("Block bits mismatch".to_string());
         }
-        if !meets_target(&header_hash, target) {
+        let auxpow_active = self.params.auxpow_activation_height
+            .map(|ah| height >= ah)
+            .unwrap_or(false);
+        if block.header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 && auxpow_active {
+            let header_bytes = block.header.serialize();
+            let ap = block.auxpow.as_ref()
+                .ok_or_else(|| "AuxPoW block is missing AuxPoW data".to_string())?;
+            crate::auxpow::validate(ap, &header_bytes, target)?;
+        } else if !meets_target(&header_hash, target) {
             return Err("Block does not satisfy proof-of-work target".to_string());
         }
 
@@ -1043,7 +1057,20 @@ impl ChainState {
             return Err("block stored as orphan (prev hash unknown)".to_string());
         }
 
-        if !meets_target(&hash, block.header.target()) {
+        let block_height = if parent_hash == [0u8; 32] {
+            0
+        } else {
+            self.heights.get(&parent_hash).copied().unwrap_or(0) + 1
+        };
+        let auxpow_active = self.params.auxpow_activation_height
+            .map(|ah| block_height >= ah)
+            .unwrap_or(false);
+        if block.header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 && auxpow_active {
+            let header_bytes = block.header.serialize();
+            let ap = block.auxpow.as_ref()
+                .ok_or_else(|| "AuxPoW block is missing AuxPoW data".to_string())?;
+            crate::auxpow::validate(ap, &header_bytes, block.header.target())?;
+        } else if !meets_target(&hash, block.header.target()) {
             return Err("block does not satisfy proof-of-work target".to_string());
         }
 
@@ -1525,6 +1552,7 @@ pub fn block_from_locked(gen: &LockedGenesis) -> Result<Block, String> {
     Ok(Block {
         header: block_header,
         transactions: txs,
+        auxpow: None,
     })
 }
 
@@ -1625,6 +1653,7 @@ mod tests {
             mpsov1_activation_height: None,
             lwma: LwmaParams::new(None, pow_limit),
             lwma_v2: None,
+        auxpow_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -1698,6 +1727,7 @@ mod tests {
             mpsov1_activation_height: None,
             lwma: LwmaParams::new(lwma_activation, pow_limit),
             lwma_v2: None,
+        auxpow_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -1714,6 +1744,7 @@ mod tests {
                 nonce: chain.chain.len() as u32,
             },
             transactions: Vec::new(),
+            auxpow: None,
         });
         chain.height = chain.chain.len() as u64;
     }
@@ -2395,6 +2426,7 @@ mod tests {
             mpsov1_activation_height: None,
             lwma: LwmaParams::new(lwma_v1_activation, pow_limit),
             lwma_v2: v2,
+            auxpow_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -2642,6 +2674,7 @@ mod tests {
             mpsov1_activation_height: activation,
             lwma: LwmaParams::new(None, pow_limit),
             lwma_v2: None,
+        auxpow_activation_height: None,
         };
         ChainState::new(params)
     }

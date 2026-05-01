@@ -7853,6 +7853,7 @@ mod tests {
             mpsov1_activation_height: None,
             lwma: crate::chain::LwmaParams::new(None, pow_limit),
             lwma_v2: None,
+            auxpow_activation_height: None,
         };
         let mut chain = ChainState::new(params);
 
@@ -7909,6 +7910,7 @@ mod tests {
             mpsov1_activation_height: None,
             lwma: crate::chain::LwmaParams::new(None, pow_limit),
             lwma_v2: None,
+            auxpow_activation_height: None,
         };
         let chain = ChainState::new(params);
 
@@ -7950,6 +7952,7 @@ mod tests {
             mpsov1_activation_height: None,
             lwma: crate::chain::LwmaParams::new(None, pow_limit),
             lwma_v2: None,
+            auxpow_activation_height: None,
         };
         let chain = ChainState::new(params);
 

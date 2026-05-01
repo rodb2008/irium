@@ -979,6 +979,8 @@ struct SubmitBlockRequest {
     header: SubmitBlockHeader,
     tx_hex: Vec<String>,
     #[serde(default)]
+    auxpow_hex: Option<String>,
+    #[serde(default)]
     submit_source: Option<String>,
 }
 
@@ -1847,6 +1849,18 @@ fn parse_persisted_block_file(
         None => Vec::new(),
     };
 
+    let auxpow = if version & irium_node_rs::auxpow::AUXPOW_VERSION_BIT != 0 {
+        parsed.get("auxpow_hex")
+            .and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s).ok())
+            .and_then(|bytes| {
+                let mut off = 0;
+                irium_node_rs::auxpow::deserialize(&bytes, &mut off).ok()
+            })
+    } else {
+        None
+    };
+
     let block = Block {
         header: BlockHeader {
             version,
@@ -1857,6 +1871,7 @@ fn parse_persisted_block_file(
             nonce,
         },
         transactions: txs,
+        auxpow,
     };
 
     if height == 0 {
@@ -6318,6 +6333,7 @@ fn block_json_for(height: u64, block: &Block) -> Value {
             "hash": hex::encode(header.hash()),
         },
         "tx_hex": block.transactions.iter().map(|tx| hex::encode(tx.serialize())).collect::<Vec<_>>(),
+        "auxpow_hex": block.auxpow.as_ref().map(|ap| hex::encode(irium_node_rs::auxpow::serialize(ap))),
         "miner_address": miner_address_from_block(block),
         "submit_source": storage::read_block_submit_source(height),
     })
@@ -6561,9 +6577,26 @@ async fn submit_block(
         txs.push(tx);
     }
 
+    let auxpow = if block_header.version & irium_node_rs::auxpow::AUXPOW_VERSION_BIT != 0 {
+        let hex_str = req.auxpow_hex.as_deref().ok_or_else(|| {
+            eprintln!("[submit_block] AuxPoW block missing auxpow_hex");
+            StatusCode::BAD_REQUEST
+        })?;
+        let bytes = hex::decode(hex_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let mut off = 0usize;
+        let ap = irium_node_rs::auxpow::deserialize(&bytes, &mut off).map_err(|e| {
+            eprintln!("[submit_block] auxpow decode error: {e}");
+            StatusCode::BAD_REQUEST
+        })?;
+        Some(ap)
+    } else {
+        None
+    };
+
     let block = Block {
         header: block_header,
         transactions: txs,
+        auxpow,
     };
 
     // Apply to chain state under lock, enforcing consensus rules.
@@ -6877,6 +6910,7 @@ async fn main() {
         mpsov1_activation_height: None,
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
+        auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
     };
     let mut state = ChainState::new(params);
     if load_persisted {
@@ -8060,6 +8094,7 @@ mod tests {
             mpsov1_activation_height: None,
             lwma: LwmaParams::new(None, pow_limit),
             lwma_v2: None,
+            auxpow_activation_height: None,
         };
         let chain = Arc::new(Mutex::new(ChainState::new(params)));
 
@@ -8960,6 +8995,7 @@ mod tests {
             mpsov1_activation_height: None,
             lwma: LwmaParams::new(None, pow_limit),
             lwma_v2: None,
+            auxpow_activation_height: None,
         };
         let chain = ChainState::new(params);
         let genesis_hash = hex::encode(chain.tip_hash());

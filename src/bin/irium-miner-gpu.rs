@@ -1747,6 +1747,7 @@ fn main() {
                 nonce: 0,
             },
             transactions: txs.clone(),
+            auxpow: None,
         };
         block.header.merkle_root = block.merkle_root();
 

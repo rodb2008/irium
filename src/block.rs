@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::auxpow::AuxPoW;
 use crate::pow::{header_hash, Target};
 use crate::tx::Transaction;
 
@@ -88,6 +89,8 @@ impl BlockHeader {
 pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Transaction>,
+    /// AuxPoW extension present when `header.version & AUXPOW_VERSION_BIT` is set.
+    pub auxpow: Option<AuxPoW>,
 }
 
 impl Block {
@@ -119,13 +122,18 @@ impl Block {
         leaves[0]
     }
 
-    /// Deserialize a block encoded as header + concatenated transactions.
-    /// Returns the block and the number of bytes consumed from the input slice.
+    /// Deserialize a block: 80-byte header + optional AuxPoW + transactions.
     #[allow(dead_code)]
     pub fn deserialize(raw: &[u8]) -> Result<(Self, usize), String> {
         let (header, mut offset) = BlockHeader::deserialize(raw)?;
-        let mut txs = Vec::new();
 
+        let auxpow = if header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 {
+            Some(crate::auxpow::deserialize(raw, &mut offset)?)
+        } else {
+            None
+        };
+
+        let mut txs = Vec::new();
         while offset < raw.len() {
             let tx = crate::tx::decode_full_tx_at(raw, &mut offset)?;
             txs.push(tx);
@@ -135,15 +143,19 @@ impl Block {
             Block {
                 header,
                 transactions: txs,
+                auxpow,
             },
             offset,
         ))
     }
 
-    /// Serialize the block as header + concatenated transactions.
+    /// Serialize the block: 80-byte header + optional AuxPoW + transactions.
     #[allow(dead_code)]
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = self.header.serialize();
+        if let Some(ap) = &self.auxpow {
+            out.extend_from_slice(&crate::auxpow::serialize(ap));
+        }
         for tx in &self.transactions {
             out.extend_from_slice(&tx.serialize());
         }

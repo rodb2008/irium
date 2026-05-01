@@ -946,6 +946,7 @@ fn load_persisted_blocks(state: &mut ChainState) {
                         nonce,
                     },
                     transactions: txs,
+                    auxpow: None,
                 };
                 // Recompute merkle to be safe.
                 block.header.merkle_root = block.merkle_root();
@@ -1243,6 +1244,7 @@ fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Res
             nonce,
         },
         transactions: txs,
+        auxpow: None,
     };
     block.header.merkle_root = block.merkle_root();
     state.connect_block(block).map(|_| ())
@@ -1576,6 +1578,7 @@ fn mine_once(
     let mut block = Block {
         header,
         transactions: txs.clone(),
+        auxpow: None,
     };
     let merkle = block.merkle_root();
     block.header.merkle_root = merkle;
@@ -2609,6 +2612,7 @@ fn submit_solo_share(
         let block = Block {
             header,
             transactions: txs,
+            auxpow: None,
         };
         if block.merkle_root() != merkle_root {
             return Err("submitted share merkle mismatch".to_string());
@@ -2913,6 +2917,7 @@ fn main() {
         mpsov1_activation_height: None,
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
+        auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
     };
 
     let mut state = ChainState::new(params.clone());
