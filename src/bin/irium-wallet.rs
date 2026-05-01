@@ -18538,6 +18538,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.display_short(), "unknown");
     }
@@ -18555,6 +18559,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.display_short(), "3 agreements");
     }
@@ -18572,6 +18580,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.display_short(), "1 agreement");
     }
@@ -18589,6 +18601,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.display_short(), "83% (10/12)");
     }
@@ -18606,6 +18622,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.display_short(), "100% (5/5)");
     }
@@ -18623,6 +18643,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert!(rep.success_rate().is_none());
     }
@@ -18640,6 +18664,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         // has_outcome_data=true but both 0 → no division by zero
         assert!(rep.success_rate().is_none());
@@ -18796,6 +18824,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.risk_signal(), "unknown");
     }
@@ -18813,6 +18845,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.risk_signal(), "unknown");
     }
@@ -18830,6 +18866,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.risk_signal(), "low");
     }
@@ -18848,6 +18888,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.risk_signal(), "moderate");
     }
@@ -18866,6 +18910,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.risk_signal(), "high");
     }
@@ -18937,6 +18985,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.recent_risk_signal(), "unknown");
     }
@@ -18954,6 +19006,10 @@ found true"
             recent_default_count: 0,
             recent_total: 5,
             has_recent_data: true,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.recent_risk_signal(), "low");
     }
@@ -18972,6 +19028,10 @@ found true"
             recent_default_count: 2,
             recent_total: 10,
             has_recent_data: true,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.recent_risk_signal(), "moderate");
     }
@@ -18990,6 +19050,10 @@ found true"
             recent_default_count: 4,
             recent_total: 10,
             has_recent_data: true,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.recent_risk_signal(), "high");
     }
@@ -19041,6 +19105,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.ranking_score(), 0);
     }
@@ -19058,6 +19126,10 @@ found true"
             recent_default_count: 0,
             recent_total: 5,
             has_recent_data: true,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.ranking_score(), 80);
     }
@@ -19075,6 +19147,10 @@ found true"
             recent_default_count: 0,
             recent_total: 5,
             has_recent_data: true,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.ranking_score(), 50);
     }
@@ -19092,6 +19168,10 @@ found true"
             recent_default_count: 0,
             recent_total: 0,
             has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.ranking_score(), 50);
     }
@@ -19109,6 +19189,10 @@ found true"
             recent_default_count: 0,
             recent_total: 3,
             has_recent_data: true,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
         };
         assert_eq!(rep.ranking_score(), 30);
     }
