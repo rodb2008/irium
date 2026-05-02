@@ -71,6 +71,16 @@ use irium_node_rs::tx::{
 use irium_node_rs::wallet_store::{WalletKey, WalletManager};
 use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use k256::ecdsa::{Signature, SigningKey};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::IntoResponse;
+use futures_util::stream::StreamExt as FuturesStreamExt;
+use futures_util::SinkExt as FuturesSinkExt;
+use tokio::sync::broadcast;
+use std::convert::Infallible;
+
+const WS_BROADCAST_CAPACITY: usize = 1024;
+type EventTx = broadcast::Sender<std::sync::Arc<String>>;
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
 const MAX_SUBMIT_BLOCK_TXS: usize = 10_000;
@@ -99,7 +109,195 @@ struct AppState {
     status_best_header_hash_cache: Arc<Mutex<String>>,
     proof_store: Arc<Mutex<ProofStore>>,
     policy_store: Arc<Mutex<PolicyStore>>,
+    event_tx: EventTx,
 }
+
+fn emit_event(tx: &EventTx, event_type: &str, data: serde_json::Value) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let json = serde_json::json!({
+        "type": event_type,
+        "ts": ts,
+        "data": data,
+    })
+    .to_string();
+    let _ = tx.send(std::sync::Arc::new(json));
+}
+
+fn ws_event_matches(event_type: &str, subscribed: &HashSet<String>) -> bool {
+    if subscribed.contains(event_type) {
+        return true;
+    }
+    for pattern in subscribed {
+        if pattern == "*" {
+            return true;
+        }
+        if let Some(prefix) = pattern.strip_suffix(".*") {
+            if event_type.starts_with(&format!("{}.", prefix)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn ws_is_public_event(event_type: &str) -> bool {
+    matches!(event_type, "block.new" | "offer.created")
+}
+
+async fn ws_handle_socket(mut socket: WebSocket, state: AppState, is_public_conn: bool) {
+    let mut rx = state.event_tx.subscribe();
+    let mut subscribed: HashSet<String> = HashSet::new();
+    let mut agreement_filter: Option<String> = None;
+    let mut has_subscribed = false;
+
+    loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if val.get("action").and_then(|a| a.as_str()) == Some("subscribe") {
+                                if let Some(events) = val.get("events").and_then(|e| e.as_array()) {
+                                    subscribed.clear();
+                                    for ev in events {
+                                        if let Some(s) = ev.as_str() {
+                                            subscribed.insert(s.to_string());
+                                        }
+                                    }
+                                    has_subscribed = true;
+                                }
+                                if let Some(filter) = val.get("filter")
+                                    .and_then(|f| f.get("agreement_hash"))
+                                    .and_then(|h| h.as_str()) {
+                                    agreement_filter = Some(filter.to_string());
+                                }
+                                let ack = serde_json::json!({
+                                    "type": "subscribed",
+                                    "events": subscribed.iter().collect::<Vec<_>>()
+                                });
+                                if socket.send(Message::Text(ack.to_string())).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = socket.send(Message::Pong(data)).await;
+                    }
+                    _ => {}
+                }
+            }
+            event_result = rx.recv() => {
+                match event_result {
+                    Ok(json_arc) => {
+                        if has_subscribed && !subscribed.is_empty() {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&*json_arc) {
+                                let et = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                if !ws_event_matches(et, &subscribed) {
+                                    continue;
+                                }
+                                if is_public_conn && !ws_is_public_event(et) {
+                                    continue;
+                                }
+                                if let Some(ref af) = agreement_filter {
+                                    let ah = val.get("data")
+                                        .and_then(|d| d.get("agreement_hash"))
+                                        .and_then(|h| h.as_str());
+                                    if ah != Some(af.as_str()) {
+                                        continue;
+                                    }
+                                }
+                            }
+                        } else if is_public_conn {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&*json_arc) {
+                                let et = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                if !ws_is_public_event(et) {
+                                    continue;
+                                }
+                            }
+                        }
+                        if socket.send(Message::Text((*json_arc).clone())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        let warn = serde_json::json!({"type":"warn","msg":format!("lagged, {} events dropped",n)});
+                        let _ = socket.send(Message::Text(warn.to_string())).await;
+                    }
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    let ws_public = std::env::var("IRIUM_WS_PUBLIC")
+        .map(|v| v.trim().to_lowercase() == "true")
+        .unwrap_or(false);
+    let token_required = std::env::var("IRIUM_RPC_TOKEN")
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false);
+    if token_required && !ws_public {
+        if require_rpc_auth(&headers).is_err() {
+            return (StatusCode::UNAUTHORIZED, "Bearer token required").into_response();
+        }
+    }
+    let is_public_conn = ws_public && require_rpc_auth(&headers).is_err();
+    ws.on_upgrade(move |socket| ws_handle_socket(socket, state, is_public_conn))
+}
+
+async fn sse_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let ws_public = std::env::var("IRIUM_WS_PUBLIC")
+        .map(|v| v.trim().to_lowercase() == "true")
+        .unwrap_or(false);
+    let token_required = std::env::var("IRIUM_RPC_TOKEN")
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false);
+    if token_required && !ws_public {
+        require_rpc_auth(&headers)?;
+    }
+    let is_public_conn = ws_public && require_rpc_auth(&headers).is_err();
+    let rx = state.event_tx.subscribe();
+    let stream = futures_util::stream::unfold(
+        (rx, is_public_conn),
+        |(mut rx, is_pub)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(json_arc) => {
+                        if is_pub {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&*json_arc) {
+                                let et = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                if !ws_is_public_event(et) {
+                                    continue;
+                                }
+                            }
+                        }
+                        let ev = Event::default().data((*json_arc).clone());
+                        return Some((Ok::<Event, Infallible>(ev), (rx, is_pub)));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return None,
+                }
+            }
+        },
+    );
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
 
 #[derive(Serialize)]
 struct PeerInfo {
@@ -4249,6 +4447,13 @@ async fn fund_agreement(
         }
     }
 
+    if accepted {
+        emit_event(&state.event_tx, "agreement.funded", serde_json::json!({
+            "agreement_hash": agreement_hash,
+            "txid": txid_hex,
+        }));
+    }
+
     Ok(Json(FundAgreementResponse {
         agreement_hash,
         txid: txid_hex,
@@ -5251,6 +5456,13 @@ async fn agreement_release_eligibility(
     let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
     let resp = evaluate_agreement_spend_eligibility(true, &chain, &req.agreement, &req)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if resp.eligible {
+        if let Ok(ah) = compute_agreement_hash_hex(&req.agreement) {
+            emit_event(&state.event_tx, "agreement.satisfied", serde_json::json!({
+                "agreement_hash": ah,
+            }));
+        }
+    }
     Ok(Json(resp))
 }
 
@@ -5265,6 +5477,13 @@ async fn agreement_refund_eligibility(
     let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
     let resp = evaluate_agreement_spend_eligibility(false, &chain, &req.agreement, &req)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if resp.eligible {
+        if let Ok(ah) = compute_agreement_hash_hex(&req.agreement) {
+            emit_event(&state.event_tx, "agreement.timeout", serde_json::json!({
+                "agreement_hash": ah,
+            }));
+        }
+    }
     Ok(Json(resp))
 }
 
@@ -5291,6 +5510,10 @@ async fn submit_proof_rpc(
     let mut store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
     let outcome = store.submit(req.proof).map_err(|e| bad(&e))?;
     if outcome.accepted {
+        emit_event(&state.event_tx, "agreement.proof_submitted", serde_json::json!({
+            "agreement_hash": outcome.agreement_hash,
+            "proof_id": outcome.proof_id,
+        }));
         if let Some(ref node) = state.p2p {
             if let Ok(json) = serde_json::to_string(&proof_for_gossip) {
                 let node = node.clone();
@@ -6742,6 +6965,11 @@ async fn submit_block(
         }
     }
 
+    emit_event(&state.event_tx, "block.new", serde_json::json!({
+        "height": new_height,
+        "hash": new_tip_hash,
+    }));
+
     Ok(Json(json!({
         "accepted": true,
         "height": req.height,
@@ -7764,6 +7992,8 @@ async fn main() {
             }
         });
     }
+    let (event_tx, _) = broadcast::channel::<std::sync::Arc<String>>(WS_BROADCAST_CAPACITY);
+
     let app_state = AppState {
         chain: shared_state.clone(),
         genesis_hash: genesis_hash.clone(),
@@ -7792,12 +8022,43 @@ async fn main() {
         policy_store: Arc::new(Mutex::new(PolicyStore::new(
             storage::state_dir().join("policies.json"),
         ))),
+        event_tx: event_tx.clone(),
     };
+
+    // Background task: emit block.new events when chain height advances.
+    {
+        let block_event_tx = event_tx.clone();
+        let block_chain = app_state.chain.clone();
+        tokio::spawn(async move {
+            let mut last_known_height: u64 = 0;
+            let mut last_known_hash = String::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let (h, hash) = {
+                    let g = block_chain.lock().unwrap_or_else(|e| e.into_inner());
+                    let height = g.tip_height();
+                    let hash = g.chain.last().map(|b| hex::encode(b.header.hash())).unwrap_or_default();
+                    (height, hash)
+                };
+                if h > last_known_height || (h == last_known_height && hash != last_known_hash && !hash.is_empty()) {
+                    if last_known_height > 0 {
+                        emit_event(&block_event_tx, "block.new", serde_json::json!({
+                            "height": h,
+                            "hash": hash,
+                        }));
+                    }
+                    last_known_height = h;
+                    last_known_hash = hash;
+                }
+            }
+        });
+    }
 
     // Background task: drain P2P proof gossip inbox and submit locally.
     if let Some(ref gossip_p2p) = app_state.p2p {
         let drain_node = gossip_p2p.clone();
         let drain_proof_store = app_state.proof_store.clone();
+        let drain_event_tx = event_tx.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -7807,14 +8068,87 @@ async fn main() {
                 }
                 let mut store = drain_proof_store.lock().unwrap_or_else(|e| e.into_inner());
                 for json in proofs {
-                    if let Ok(proof) = serde_json::from_str(&json) {
+                    if let Ok(proof) = serde_json::from_str::<SettlementProof>(&json) {
+                        let ah_for_evt = proof.agreement_hash.clone();
+                        let pid_for_evt = proof.proof_id.clone();
                         if let Ok(outcome) = store.submit(proof) {
                             if outcome.accepted {
+                                emit_event(&drain_event_tx, "proof.gossip_received", serde_json::json!({
+                                    "agreement_hash": ah_for_evt,
+                                    "proof_id": pid_for_evt,
+                                }));
                                 let rebroadcast = drain_node.clone();
                                 let j = json.clone();
                                 tokio::spawn(async move {
                                     rebroadcast.broadcast_proof(&j).await;
                                 });
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Background task: detect peer connect/disconnect events.
+    {
+        let peer_event_tx = event_tx.clone();
+        let peer_p2p = app_state.p2p.clone();
+        tokio::spawn(async move {
+            let mut known_peers: HashSet<String> = HashSet::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if let Some(ref node) = peer_p2p {
+                    let current = node.peers_snapshot().await;
+                    let current_set: HashSet<String> =
+                        current.iter().map(|p| p.multiaddr.clone()).collect();
+                    for addr in current_set.difference(&known_peers) {
+                        emit_event(&peer_event_tx, "peer.connected", serde_json::json!({
+                            "multiaddr": addr,
+                        }));
+                    }
+                    for addr in known_peers.difference(&current_set) {
+                        emit_event(&peer_event_tx, "peer.disconnected", serde_json::json!({
+                            "multiaddr": addr,
+                        }));
+                    }
+                    known_peers = current_set;
+                }
+            }
+        });
+    }
+
+    // Background task: detect new/taken offers from local offer store.
+    {
+        let offer_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            let mut seen: HashMap<String, String> = HashMap::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let dir = offers_feed_dir();
+                if !dir.exists() { continue; }
+                let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map(|e| e == "json").unwrap_or(false) {
+                        if let Ok(data) = std::fs::read_to_string(&path) {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
+                                let id = val.get("offer_id")
+                                    .and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                                if id.is_empty() { continue; }
+                                let status = val.get("status")
+                                    .and_then(|s| s.as_str()).unwrap_or("open").to_string();
+                                let prev = seen.get(&id).cloned();
+                                if prev.is_none() && status == "open" {
+                                    emit_event(&offer_event_tx, "offer.created", serde_json::json!({
+                                        "offer_id": id,
+                                    }));
+                                } else if prev.as_deref() == Some("open") && status == "taken" {
+                                    emit_event(&offer_event_tx, "offer.taken", serde_json::json!({
+                                        "offer_id": id,
+                                    }));
+                                }
+                                seen.insert(id, status);
                             }
                         }
                     }
@@ -8005,6 +8339,8 @@ async fn offers_feed(
         .route("/wallet/import_seed", post(wallet_import_seed))
         .route("/wallet/send", post(wallet_send))
         .route("/offers/feed", get(offers_feed))
+        .route("/ws", get(ws_handler))
+        .route("/events", get(sse_handler))
         .layer(DefaultBodyLimit::max(rpc_body_limit_bytes()))
         .with_state(app_state.clone());
 
@@ -8066,6 +8402,7 @@ async fn offers_feed(
         "[i] HTTP status: http://{}:{}/status",
         status_host, status_port
     );
+    println!("[i] WebSocket: ws://{}:{}/ws  SSE: http://{}:{}/events", host, port, host, port);
 
     let tls_cert = std::env::var("IRIUM_TLS_CERT").ok();
     let tls_key = std::env::var("IRIUM_TLS_KEY").ok();
@@ -8219,6 +8556,7 @@ mod tests {
                 "irium_policies",
                 "json",
             )))),
+            event_tx: tokio::sync::broadcast::channel::<std::sync::Arc<String>>(WS_BROADCAST_CAPACITY).0,
         };
 
         (state, sender, recipient, refund)

@@ -18,7 +18,8 @@ chrono = { version = "0.4", features = ["clock"] }
 libc = "0.2"
 k256 = { version = "0.13", features = ["ecdsa"] }
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.7", features = ["macros"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+axum = { version = "0.7", features = ["macros", "ws"] }
 
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false }
