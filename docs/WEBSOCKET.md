@@ -92,12 +92,11 @@ The server responds immediately with:
 ```json
 {
   "type": "subscribed",
-  "events": ["agreement.funded", "agreement.proof_submitted", "agreement.satisfied",
-             "agreement.timeout", "agreement.disputed"]
+  "events": ["agreement.*"]
 }
 ```
 
-The `events` array in the response is the fully expanded list (wildcards resolved).
+The `events` array in the response reflects your subscription patterns exactly as sent. Wildcards such as `agreement.*` are stored as patterns and matched against incoming events — they are not expanded in the acknowledgement.
 
 ---
 
