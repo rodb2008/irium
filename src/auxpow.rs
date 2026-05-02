@@ -301,16 +301,13 @@ mod tests {
     use super::*;
 
     fn make_coinbase(aux_hash: &[u8; 32], chain_count: u32) -> Vec<u8> {
-        // codeql[rust/hard-coded-cryptographic-value] - test fixture for unit tests, not a production secret
-        build_commitment(aux_hash, chain_count, 0).to_vec()
+        build_commitment(aux_hash, chain_count, 0).to_vec() // codeql[rust/hard-coded-cryptographic-value]
     }
 
     #[test]
     fn build_commitment_format() {
-        // codeql[rust/hard-coded-cryptographic-value] - test fixture for unit tests, not a production secret
         let h = [0x42u8; 32];
-        // codeql[rust/hard-coded-cryptographic-value] - test fixture for unit tests, not a production secret
-        let c = build_commitment(&h, 1, 99);
+        let c = build_commitment(&h, 1, 99); // codeql[rust/hard-coded-cryptographic-value]
         assert_eq!(&c[..4], &AUXPOW_COMMIT_MAGIC);
         assert_eq!(&c[4..36], &h);
         assert_eq!(&c[36..40], &1u32.to_le_bytes());
@@ -319,7 +316,6 @@ mod tests {
 
     #[test]
     fn find_commitment_success() {
-        // codeql[rust/hard-coded-cryptographic-value] - test fixture for unit tests, not a production secret
         let h = [0xabu8; 32];
         let cb = make_coinbase(&h, 3);
         let (root, count) = find_commitment(&cb).unwrap();
@@ -329,10 +325,8 @@ mod tests {
 
     #[test]
     fn find_commitment_embedded_in_larger_coinbase() {
-        // codeql[rust/hard-coded-cryptographic-value] - test fixture for unit tests, not a production secret
         let h = [0x77u8; 32];
-        // codeql[rust/hard-coded-cryptographic-value] - test fixture for unit tests, not a production secret
-        let commitment = build_commitment(&h, 1, 0);
+        let commitment = build_commitment(&h, 1, 0); // codeql[rust/hard-coded-cryptographic-value]
         let mut cb = vec![0u8; 10];
         cb.extend_from_slice(&commitment);
         cb.extend_from_slice(&[0u8; 5]);
