@@ -34,6 +34,7 @@ qrcode = "0.14"
 aes-gcm = "0.10"
 
 pbkdf2 = "0.12"
+bip39 = { version = "2", features = ["rand"] }
 ocl = { version = "0.19", optional = true }
 
 [dev-dependencies]

@@ -33,7 +33,11 @@ use reqwest::blocking::Client;
 use ripemd::Ripemd160;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
+use hmac::{Hmac, Mac};
+use bip39::Mnemonic;
+use num_bigint::BigUint;
+use num_traits::Zero;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -50,6 +54,8 @@ struct WalletFile {
     version: u32,
     #[serde(default)]
     seed_hex: Option<String>,
+    #[serde(default)]
+    bip32_seed: Option<String>,
     #[serde(default)]
     next_index: u32,
     keys: Vec<WalletKey>,
@@ -119,6 +125,7 @@ fn maybe_migrate_legacy_wallet(path: &Path, data: &str) -> Result<Option<WalletF
         return Ok(Some(WalletFile {
             version: 1,
             seed_hex: None,
+            bip32_seed: None,
             next_index: 0,
             keys: Vec::new(),
         }));
@@ -155,6 +162,7 @@ fn maybe_migrate_legacy_wallet(path: &Path, data: &str) -> Result<Option<WalletF
     let wallet = WalletFile {
         version: 1,
         seed_hex: None,
+        bip32_seed: None,
         next_index: keys.len() as u32,
         keys,
     };
@@ -1976,6 +1984,7 @@ fn ensure_wallet(path: &Path) -> Result<WalletFile, String> {
         WalletFile {
             version: 1,
             seed_hex: None,
+            bip32_seed: None,
             next_index: 0,
             keys: Vec::new(),
         }
@@ -2055,6 +2064,74 @@ fn derive_secret_from_seed_hex(seed_hex: &str, index: u32) -> Result<SecretKey, 
     Err("failed to derive valid key from seed".to_string())
 }
 
+
+const SECP256K1_N: [u8; 32] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+    0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
+    0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+];
+
+fn bip32_master_key(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
+    type HmacSha512 = Hmac<Sha512>;
+    let mut mac = HmacSha512::new_from_slice(b"Bitcoin seed").expect("HMAC accepts any key length");
+    mac.update(seed);
+    let result = mac.finalize().into_bytes();
+    let mut key = [0u8; 32];
+    let mut chain_code = [0u8; 32];
+    key.copy_from_slice(&result[..32]);
+    chain_code.copy_from_slice(&result[32..]);
+    (key, chain_code)
+}
+
+fn bip32_ckd_priv(
+    parent_key: &[u8; 32],
+    chain_code: &[u8; 32],
+    index: u32,
+) -> Result<([u8; 32], [u8; 32]), String> {
+    type HmacSha512 = Hmac<Sha512>;
+    let mut mac = HmacSha512::new_from_slice(chain_code).map_err(|e| e.to_string())?;
+    if index >= 0x80000000 {
+        mac.update(&[0x00]);
+        mac.update(parent_key);
+    } else {
+        let secret = SecretKey::from_slice(parent_key).map_err(|e| e.to_string())?;
+        let ep = secret.public_key().to_encoded_point(true);
+        mac.update(ep.as_bytes());
+    }
+    mac.update(&index.to_be_bytes());
+    let result = mac.finalize().into_bytes();
+    let il = &result[..32];
+    let cc: [u8; 32] = result[32..].try_into().map_err(|_| "chain code slice".to_string())?;
+    let n = BigUint::from_bytes_be(&SECP256K1_N);
+    let il_int = BigUint::from_bytes_be(il);
+    let pk_int = BigUint::from_bytes_be(parent_key);
+    if il_int >= n {
+        return Err("IL >= n, invalid key".to_string());
+    }
+    let child_int = (il_int + pk_int) % &n;
+    if child_int.is_zero() {
+        return Err("child key is zero, invalid".to_string());
+    }
+    let cb = child_int.to_bytes_be();
+    let mut child_key = [0u8; 32];
+    let start = 32usize.saturating_sub(cb.len());
+    child_key[start..].copy_from_slice(&cb);
+    Ok((child_key, cc))
+}
+
+// Derive key at m/44'/1'/0'/0/<index>. Coin type 1 until official BIP44 registration for IRM.
+fn bip32_derive_irium(seed_bytes: &[u8], address_index: u32) -> Result<SecretKey, String> {
+    let (mut key, mut cc) = bip32_master_key(seed_bytes);
+    (key, cc) = bip32_ckd_priv(&key, &cc, 0x8000_0000 + 44)?;
+    (key, cc) = bip32_ckd_priv(&key, &cc, 0x8000_0000 + 1)?;
+    (key, cc) = bip32_ckd_priv(&key, &cc, 0x8000_0000)?;
+    (key, cc) = bip32_ckd_priv(&key, &cc, 0)?;
+    (key, cc) = bip32_ckd_priv(&key, &cc, address_index)?;
+    let _ = cc;
+    SecretKey::from_slice(&key).map_err(|e| e.to_string())
+}
+
 fn find_key<'a>(wallet: &'a WalletFile, addr: &str) -> Option<&'a WalletKey> {
     wallet.keys.iter().find(|k| k.address == addr)
 }
@@ -2062,6 +2139,8 @@ fn find_key<'a>(wallet: &'a WalletFile, addr: &str) -> Option<&'a WalletKey> {
 fn usage() {
     eprintln!("Usage:");
     eprintln!("  irium-wallet init [--seed <64hex>]");
+    eprintln!("  irium-wallet create-wallet [--bip32]");
+    eprintln!("  irium-wallet import-mnemonic \"<24 words>\"");
     eprintln!("  irium-wallet new-address");
     eprintln!("  irium-wallet list-addresses");
     eprintln!("  irium-wallet export-wif <base58_addr> --out <file>");
@@ -20162,6 +20241,7 @@ fn main() {
             let wallet = WalletFile {
                 version: 1,
                 seed_hex: Some(seed_hex.clone()),
+                bip32_seed: None,
                 next_index: 1,
                 keys: vec![key.clone()],
             };
@@ -20169,6 +20249,101 @@ fn main() {
             println!(
                 "seed saved in wallet metadata; export with: irium-wallet export-seed --out <file>"
             );
+            if let Err(e) = save_wallet(&path, &wallet) {
+                eprintln!("Failed to save wallet: {}", e);
+                std::process::exit(1);
+            }
+            println!("wallet {}", path.display());
+        }
+        "create-wallet" => {
+            let bip32 = args.contains(&"--bip32".to_string());
+            let path = wallet_path();
+            if path.exists() {
+                eprintln!("Wallet already exists: {}", path.display());
+                std::process::exit(1);
+            }
+            if bip32 {
+                let mnemonic = match Mnemonic::generate(24) {
+                    Ok(m) => m,
+                    Err(e) => { eprintln!("Failed to generate mnemonic: {}", e); std::process::exit(1); }
+                };
+                let seed_bytes = mnemonic.to_seed("");
+                let secret = match bip32_derive_irium(&seed_bytes, 0) {
+                    Ok(v) => v,
+                    Err(e) => { eprintln!("BIP32 derivation failed: {}", e); std::process::exit(1); }
+                };
+                let key = wallet_key_from_secret(&secret, true);
+                let wallet = WalletFile {
+                    version: 1,
+                    seed_hex: None,
+                    bip32_seed: Some(hex::encode(seed_bytes)),
+                    next_index: 1,
+                    keys: vec![key.clone()],
+                };
+                println!("BIP32 wallet created");
+                println!("mnemonic: {}", mnemonic);
+                println!("derivation path: m/44'/1'/0'/0/0");
+                println!("IMPORTANT: write down your mnemonic -- it cannot be recovered");
+                println!("address: {}", key.address);
+                if let Err(e) = save_wallet(&path, &wallet) {
+                    eprintln!("Failed to save wallet: {}", e);
+                    std::process::exit(1);
+                }
+                println!("wallet {}", path.display());
+            } else {
+                let seed_hex = generate_seed_hex();
+                let secret = match derive_secret_from_seed_hex(&seed_hex, 0) {
+                    Ok(v) => v,
+                    Err(e) => { eprintln!("Failed to derive key: {}", e); std::process::exit(1); }
+                };
+                let key = wallet_key_from_secret(&secret, true);
+                let wallet = WalletFile {
+                    version: 1,
+                    seed_hex: Some(seed_hex),
+                    bip32_seed: None,
+                    next_index: 1,
+                    keys: vec![key.clone()],
+                };
+                println!("wallet created (custom derivation scheme)");
+                println!("address: {}", key.address);
+                if let Err(e) = save_wallet(&path, &wallet) {
+                    eprintln!("Failed to save wallet: {}", e);
+                    std::process::exit(1);
+                }
+                println!("wallet {}", path.display());
+            }
+        }
+        "import-mnemonic" => {
+            if args.len() < 2 {
+                eprintln!("Usage: irium-wallet import-mnemonic \"<24 words>\"");
+                std::process::exit(1);
+            }
+            let phrase = args[1..].join(" ");
+            let mnemonic = match Mnemonic::parse(&phrase) {
+                Ok(m) => m,
+                Err(e) => { eprintln!("Invalid mnemonic: {}", e); std::process::exit(1); }
+            };
+            let path = wallet_path();
+            if path.exists() {
+                eprintln!("Wallet already exists: {}", path.display());
+                std::process::exit(1);
+            }
+            let seed_bytes = mnemonic.to_seed("");
+            let secret = match bip32_derive_irium(&seed_bytes, 0) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("BIP32 derivation failed: {}", e); std::process::exit(1); }
+            };
+            let key = wallet_key_from_secret(&secret, true);
+            let wallet = WalletFile {
+                version: 1,
+                seed_hex: None,
+                bip32_seed: Some(hex::encode(seed_bytes)),
+                next_index: 1,
+                keys: vec![key.clone()],
+            };
+            println!("BIP32 wallet imported from mnemonic");
+            println!("derivation path: m/44'/1'/0'/0/0");
+            println!("address: {}", key.address);
             if let Err(e) = save_wallet(&path, &wallet) {
                 eprintln!("Failed to save wallet: {}", e);
                 std::process::exit(1);
@@ -20184,7 +20359,19 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let key = if let Some(seed_hex) = wallet.seed_hex.as_deref() {
+            let key = if let Some(bip32_seed) = wallet.bip32_seed.as_deref() {
+                let index = wallet.next_index;
+                let seed_bytes = match hex::decode(bip32_seed) {
+                    Ok(b) => b,
+                    Err(e) => { eprintln!("Failed to decode BIP32 seed: {}", e); std::process::exit(1); }
+                };
+                let secret = match bip32_derive_irium(&seed_bytes, index) {
+                    Ok(v) => v,
+                    Err(e) => { eprintln!("Failed BIP32 derivation: {}", e); std::process::exit(1); }
+                };
+                wallet.next_index = wallet.next_index.saturating_add(1);
+                wallet_key_from_secret(&secret, true)
+            } else if let Some(seed_hex) = wallet.seed_hex.as_deref() {
                 let index = wallet.next_index;
                 let secret = match derive_secret_from_seed_hex(seed_hex, index) {
                     Ok(v) => v,

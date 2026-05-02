@@ -187,3 +187,108 @@ def address_from_pkh(pkh: bytes) -> str:
 ```
 
 This pseudocode illustrates the derivation. A production implementation requires a correct secp256k1 library for public key computation.
+
+---
+
+## Key Derivation: BIP32/BIP39 Hierarchical Deterministic Scheme
+
+Starting from Phase 2, Irium wallets can optionally use BIP32 hierarchical deterministic key derivation with BIP39 mnemonic phrases. This scheme is compatible with standard hardware wallets and third-party BIP32 tools.
+
+The custom derivation scheme described above continues to work and is unchanged. BIP32 is an additional option for new wallets.
+
+### BIP39 Mnemonic
+
+- The wallet generates a 24-word English mnemonic phrase using the BIP39 standard wordlist.
+- The seed is derived from the mnemonic using PBKDF2-HMAC-SHA512 with "mnemonic" as the salt and 2048 iterations, producing a 64-byte seed.
+- No passphrase is applied by default (empty passphrase string).
+- The mnemonic phrase is the complete backup material. Anyone with it can derive all wallet addresses.
+
+### BIP32 Master Key
+
+From the 64-byte BIP39 seed, the BIP32 master key is derived as:
+
+```
+I = HMAC-SHA512(key="Bitcoin seed", data=seed_bytes)
+master_key        = I[0:32]   (left 32 bytes)
+master_chain_code = I[32:64]  (right 32 bytes)
+```
+
+### Child Key Derivation
+
+Child keys are derived using the standard BIP32 CKDpriv function:
+
+```
+For hardened child (index >= 0x80000000):
+    I = HMAC-SHA512(key=chain_code, data=0x00 || parent_key || index_be)
+
+For normal child (index < 0x80000000):
+    I = HMAC-SHA512(key=chain_code, data=compressed_pubkey || index_be)
+
+IL             = I[0:32]
+chain_code_new = I[32:64]
+child_key      = (IL + parent_key) mod n    (secp256k1 curve order n)
+```
+
+### Derivation Path
+
+Irium uses the BIP44 path structure:
+
+```
+m/44'/1'/0'/0/<index>
+```
+
+| Level | Value | Description |
+|-------|-------|-------------|
+| Purpose | 44' | BIP44 multi-account hierarchy |
+| Coin type | 1' | Coin type 1 (testnet / IRM pending BIP44 registration) |
+| Account | 0' | Default account |
+| Change | 0 | External (receiving) chain |
+| Index | 0, 1, 2, ... | Individual address index |
+
+**Note on coin type:** Coin type 1 is used until official SLIP-0044 registration for IRM. Once registered, the coin type will be updated. Wallets created before registration can be imported using the old path — they are not automatically migrated.
+
+### Address Derivation
+
+BIP32-derived keys produce Irium addresses using the same encoding as custom-scheme keys:
+
+1. Derive the secp256k1 private key at the path above.
+2. Compute the compressed public key (33 bytes).
+3. `HASH160 = RIPEMD160(SHA256(compressed_pubkey))` — 20 bytes.
+4. Prepend version byte `0x39` — 21 bytes.
+5. Checksum: first 4 bytes of `SHA256(SHA256(version || pkh))`.
+6. Base58Check-encode the 25 bytes.
+
+This produces a standard Irium Q-address, indistinguishable in format from a custom-scheme address.
+
+### Wallet Commands
+
+| Command | Description |
+|---------|-------------|
+| `irium-wallet create-wallet --bip32` | Create BIP32/BIP39 wallet; prints 24-word mnemonic |
+| `irium-wallet import-mnemonic "<24 words>"` | Restore BIP32 wallet from mnemonic |
+| `irium-wallet create-wallet` | Create wallet using the custom derivation scheme |
+| `irium-wallet new-address` | Derive next address (uses BIP32 path or custom, depending on wallet type) |
+
+### Cross-Tool Verification
+
+Any standard BIP32 tool using path `m/44'/1'/0'/0/0` with coin type 1 will derive the same private key and address from the same mnemonic.
+
+Python verification example:
+```python
+import hmac, hashlib, struct
+
+mnemonic = "<your 24 words>"
+seed = hashlib.pbkdf2_hmac("sha512", mnemonic.encode(), b"mnemonic", 2048)
+I = hmac.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
+# then apply CKDpriv for each level of m/44h/1h/0h/0/0
+```
+
+### Security Comparison
+
+| Property | Custom scheme | BIP32/BIP39 |
+|----------|--------------|-------------|
+| Backup material | 64-char hex seed | 24-word English mnemonic |
+| Hardware wallet support | No | Yes (once coin type registered) |
+| Standard compatibility | No | Yes (BIP32, BIP44) |
+| Key independence | Full | Full (hardened path levels) |
+| Existing wallets affected | N/A | None — custom scheme unchanged |

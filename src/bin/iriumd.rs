@@ -7041,6 +7041,15 @@ async fn submit_tx(
     let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
     let hex_txid = hex::encode(txid);
     if mempool.contains(&txid) {
+        drop(mempool);
+        if let Some(p2p) = state.p2p.clone() {
+            let raw_bytes = bytes;
+            tokio::spawn(async move {
+                if let Err(e) = p2p.broadcast_tx(&raw_bytes).await {
+                    eprintln!("submit_tx rebroadcast failed: {}", e);
+                }
+            });
+        }
         return Ok(Json(SubmitTxResponse {
             txid: hex_txid,
             accepted: false,
@@ -7048,12 +7057,22 @@ async fn submit_tx(
     }
 
     let raw = bytes;
+    let raw_for_broadcast = raw.clone();
     if let Err(e) = mempool.add_transaction(tx, raw, fee) {
         eprintln!("Failed to add tx to mempool: {}", e);
         return Ok(Json(SubmitTxResponse {
             txid: hex_txid,
             accepted: false,
         }));
+    }
+    drop(mempool);
+
+    if let Some(p2p) = state.p2p.clone() {
+        tokio::spawn(async move {
+            if let Err(e) = p2p.broadcast_tx(&raw_for_broadcast).await {
+                eprintln!("submit_tx: broadcast_tx failed: {}", e);
+            }
+        });
     }
 
     Ok(Json(SubmitTxResponse {
