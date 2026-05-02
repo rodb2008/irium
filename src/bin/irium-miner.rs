@@ -508,6 +508,7 @@ fn mempool_entries_from_template(
     template: &BlockTemplate,
 ) -> Vec<irium_node_rs::mempool::MempoolEntry> {
     let mut out = Vec::new();
+    let mut claimed_inputs: HashSet<irium_node_rs::chain::OutPoint> = HashSet::new();
     for tx in &template.txs {
         let raw = match hex::decode(&tx.hex) {
             Ok(v) => v,
@@ -517,9 +518,26 @@ fn mempool_entries_from_template(
             }
         };
         let tx_obj = decode_compact_tx(&raw);
+        // Skip TXs that conflict with already-selected TXs in this block.
+        let conflicts = tx_obj.inputs.iter().any(|inp| {
+            claimed_inputs.contains(&irium_node_rs::chain::OutPoint {
+                txid: inp.prev_txid,
+                index: inp.prev_index,
+            })
+        });
+        if conflicts {
+            eprintln!("Skipping conflicting template tx (double-spend within block)");
+            continue;
+        }
         if let Err(e) = chain.validate_transaction(&tx_obj) {
             eprintln!("Skipping invalid template tx: {e}");
             continue;
+        }
+        for inp in &tx_obj.inputs {
+            claimed_inputs.insert(irium_node_rs::chain::OutPoint {
+                txid: inp.prev_txid,
+                index: inp.prev_index,
+            });
         }
         let fee = tx.fee.unwrap_or(0);
         let size = raw.len();
