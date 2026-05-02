@@ -8025,6 +8025,35 @@ async fn main() {
         event_tx: event_tx.clone(),
     };
 
+    // Background task: emit block.new events when chain height advances.
+    {
+        let block_event_tx = event_tx.clone();
+        let block_chain = app_state.chain.clone();
+        tokio::spawn(async move {
+            let mut last_known_height: u64 = 0;
+            let mut last_known_hash = String::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let (h, hash) = {
+                    let g = block_chain.lock().unwrap_or_else(|e| e.into_inner());
+                    let height = g.tip_height();
+                    let hash = g.chain.last().map(|b| hex::encode(b.header.hash())).unwrap_or_default();
+                    (height, hash)
+                };
+                if h > last_known_height || (h == last_known_height && hash != last_known_hash && !hash.is_empty()) {
+                    if last_known_height > 0 {
+                        emit_event(&block_event_tx, "block.new", serde_json::json!({
+                            "height": h,
+                            "hash": hash,
+                        }));
+                    }
+                    last_known_height = h;
+                    last_known_hash = hash;
+                }
+            }
+        });
+    }
+
     // Background task: drain P2P proof gossip inbox and submit locally.
     if let Some(ref gossip_p2p) = app_state.p2p {
         let drain_node = gossip_p2p.clone();
