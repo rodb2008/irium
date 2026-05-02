@@ -8556,6 +8556,7 @@ mod tests {
                 "irium_policies",
                 "json",
             )))),
+            event_tx: tokio::sync::broadcast::channel::<std::sync::Arc<String>>(WS_BROADCAST_CAPACITY).0,
         };
 
         (state, sender, recipient, refund)
