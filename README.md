@@ -155,6 +155,13 @@ Mining will begin once the node is synced.
 
 ---
 
+## Code Signing
+
+Windows binaries are signed by the SignPath Foundation.
+See https://signpath.org for more information.
+
+---
+
 # Check Your Balance
 
 ```bash
