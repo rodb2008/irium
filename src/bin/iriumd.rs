@@ -7375,7 +7375,6 @@ async fn main() {
         let shared_clone = shared_state.clone();
         tokio::spawn(async move {
             let node = node;
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             let mut no_seed_logged = false;
             let mut bootstrap_logged = false;
 
@@ -7384,7 +7383,7 @@ async fn main() {
                 let persisted_seeds =
                     load_persisted_startup_seeds(&persisted_peers, default_seed_port);
                 let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_secs(5),
                     node.connect_known_peers(5),
                 )
                 .await;
@@ -7426,7 +7425,8 @@ async fn main() {
                         }
                         no_seed_logged = true;
                     }
-                    interval.tick().await;
+                    let cur_peers = node.peer_count().await;
+                    tokio::time::sleep(if cur_peers < 2 { std::time::Duration::from_secs(5) } else { std::time::Duration::from_secs(30) }).await;
                     continue;
                 }
                 no_seed_logged = false;
@@ -7437,6 +7437,11 @@ async fn main() {
                 let mut seeds_ip_seen: std::collections::HashSet<std::net::IpAddr> =
                     std::collections::HashSet::new();
 
+                let height = {
+                    let chain = shared_clone.lock().unwrap_or_else(|e| e.into_inner());
+                    chain.tip_height()
+                };
+                let mut seeds_to_dial: Vec<std::net::SocketAddr> = Vec::new();
                 for addr in &seeds {
                     if !seeds_seen.insert(*addr) {
                         continue;
@@ -7453,50 +7458,55 @@ async fn main() {
                     if node.is_ip_connected(addr.ip()).await {
                         continue;
                     }
-
                     if !node.outbound_dial_allowed(addr).await {
                         continue;
                     }
+                    seeds_to_dial.push(*addr);
+                }
 
-                    let height = {
-                        let chain = shared_clone.lock().unwrap_or_else(|e| e.into_inner());
-                        chain.tip_height()
-                    };
-                    if let Some(suppressed) = dial_seed_log_allowed(0, addr.ip()) {
-                        let mut line = format!(
-                            "[{}] dialing seed {} (h={})",
-                            Utc::now().format("%H:%M:%S"),
-                            addr,
-                            height
-                        );
-                        if suppressed > 0 {
-                            line.push_str(&format!(" (suppressed {} repeats)", suppressed));
-                        }
-                        println!("{}", line);
-                    }
-                    if let Err(e) = node
-                        .connect_and_handshake(*addr, height, &agent_clone)
-                        .await
-                    {
-                        let msg = format!("{}", e);
-                        if msg.contains("dial backoff") || msg.contains("dial in progress") {
-                            continue;
-                        }
-                        if let Some(suppressed) = dial_seed_log_allowed(1, addr.ip()) {
+                // Dial all eligible seeds in parallel so a slow/timed-out seed
+                // does not delay connections to the others.
+                let mut join_set = tokio::task::JoinSet::new();
+                for addr in seeds_to_dial {
+                    let node_c = node.clone();
+                    let agent_c = agent_clone.clone();
+                    join_set.spawn(async move {
+                        if let Some(suppressed) = dial_seed_log_allowed(0, addr.ip()) {
                             let mut line = format!(
-                                "[{}] outbound {} failed: {}",
+                                "[{}] dialing seed {} (h={})",
                                 Utc::now().format("%H:%M:%S"),
                                 addr,
-                                msg
+                                height
                             );
                             if suppressed > 0 {
                                 line.push_str(&format!(" (suppressed {} repeats)", suppressed));
                             }
-                            eprintln!("{}", line);
+                            println!("{}", line);
                         }
-                    }
+                        if let Err(e) = node_c.connect_and_handshake(addr, height, &agent_c).await {
+                            let msg = format!("{}", e);
+                            if !msg.contains("dial backoff") && !msg.contains("dial in progress") {
+                                if let Some(suppressed) = dial_seed_log_allowed(1, addr.ip()) {
+                                    let mut line = format!(
+                                        "[{}] outbound {} failed: {}",
+                                        Utc::now().format("%H:%M:%S"),
+                                        addr,
+                                        msg
+                                    );
+                                    if suppressed > 0 {
+                                        line.push_str(&format!(" (suppressed {} repeats)", suppressed));
+                                    }
+                                    eprintln!("{}", line);
+                                }
+                            }
+                        }
+                    });
                 }
-                interval.tick().await;
+                while join_set.join_next().await.is_some() {}
+
+                // Adaptive wait: reconnect faster when low on peers.
+                let cur_peers = node.peer_count().await;
+                tokio::time::sleep(if cur_peers < 2 { std::time::Duration::from_secs(5) } else { std::time::Duration::from_secs(30) }).await;
             }
         });
     }
@@ -7584,17 +7594,18 @@ async fn main() {
                 .await
                 .unwrap_or_else(|_| peers.len());
                 maintenance_ticks = maintenance_ticks.wrapping_add(1);
-                if maintenance_ticks % 6 == 0 {
+                // Emergency reconnect when 0 peers; also routine reconnect every 30s.
+                if current_peer_count == 0 || maintenance_ticks % 6 == 0 {
                     let maintenance_node = node_clone.clone();
                     tokio::spawn(async move {
                         let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
+                            std::time::Duration::from_secs(5),
                             maintenance_node.refresh_seedlist(),
                         )
                         .await;
                         let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
-                            maintenance_node.connect_known_peers(3),
+                            std::time::Duration::from_secs(5),
+                            maintenance_node.connect_known_peers(5),
                         )
                         .await;
                     });
@@ -7804,7 +7815,7 @@ async fn main() {
                         stalled_ticks = 0;
                     }
 
-                    if stalled_ticks >= 12 {
+                    if stalled_ticks >= 6 {
                         eprintln!(
                             "[{}] [🔁 sync] WARN stalled (local={}, best_header={}, best_peer={}, headers_inflight={}, getblocks_inflight={}); clearing sync throttles and reconnecting",
                             Utc::now().format("%H:%M:%S"),
@@ -7819,7 +7830,7 @@ async fn main() {
                             stalled_node.clear_sync_throttles().await;
                             stalled_node.clear_transient_headers().await;
                             let _ = tokio::time::timeout(
-                                std::time::Duration::from_secs(2),
+                                std::time::Duration::from_secs(5),
                                 stalled_node.connect_known_peers(5),
                             )
                             .await;
