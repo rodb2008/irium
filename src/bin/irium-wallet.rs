@@ -23,7 +23,10 @@ use irium_node_rs::settlement::{
     ProofSignatureEnvelope, SettlementProof, TypedProofPayload, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
     AGREEMENT_SIGNATURE_VERSION, PROOF_POLICY_SCHEMA_ID, SETTLEMENT_PROOF_SCHEMA_ID,
 };
-use irium_node_rs::tx::{Transaction, TxInput, TxOutput};
+use irium_node_rs::tx::{
+    decode_full_tx, encode_mpso_claim_witness, encode_mpso_refund_witness, encode_mpso_script,
+    MpsoV1Output, Transaction, TxInput, TxOutput,
+};
 use k256::ecdsa::signature::hazmat::PrehashSigner;
 use k256::ecdsa::{Signature, SigningKey};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -47,6 +50,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
+const IRIUM_MULTISIG_VERSION: u8 = 0x28;
 const DEFAULT_FEE_PER_BYTE: u64 = 1;
 
 #[derive(Serialize, Deserialize)]
@@ -2024,6 +2028,95 @@ fn base58check_encode(body: &[u8]) -> String {
     full.extend_from_slice(&second[0..4]);
     bs58::encode(full).into_string()
 }
+
+
+// ---- Multisig address helpers (Phase 4) ----
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct MultisigInputMeta {
+    index: usize,
+    script_pubkey: String,
+    timeout_height: u64,
+    m: u8,
+    claim_pubkeys: Vec<String>,
+    refund_pubkeys: Vec<String>,
+    path: String,
+    sigs: std::collections::HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct MultisigPartialTx {
+    version: u32,
+    tx_hex: String,
+    inputs: Vec<MultisigInputMeta>,
+}
+
+fn multisig_address_encode(m: u8, pubkeys: &[[u8; 33]]) -> String {
+    let n = pubkeys.len() as u8;
+    let mut body = Vec::with_capacity(3 + pubkeys.len() * 33);
+    body.push(IRIUM_MULTISIG_VERSION);
+    body.push(m);
+    body.push(n);
+    for pk in pubkeys {
+        body.extend_from_slice(pk);
+    }
+    base58check_encode(&body)
+}
+
+fn multisig_address_decode(addr: &str) -> Option<(u8, Vec<[u8; 33]>)> {
+    let raw = base58check_decode(addr)?;
+    if raw.len() < 4 {
+        return None;
+    }
+    if raw[0] != IRIUM_MULTISIG_VERSION {
+        return None;
+    }
+    let m = raw[1];
+    let n = raw[2] as usize;
+    if m == 0 || n == 0 || m as usize > n || n > 8 {
+        return None;
+    }
+    if raw.len() != 3 + n * 33 {
+        return None;
+    }
+    let mut pubkeys = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut pk = [0u8; 33];
+        pk.copy_from_slice(&raw[3 + i * 33..3 + (i + 1) * 33]);
+        pubkeys.push(pk);
+    }
+    Some((m, pubkeys))
+}
+
+fn multisig_build_mpso_output(
+    m: u8,
+    claim_pubkeys: &[[u8; 33]],
+    refund_pubkeys: &[[u8; 33]],
+    timeout_height: u64,
+    agreement_hash: [u8; 32],
+) -> MpsoV1Output {
+    MpsoV1Output {
+        flags: 0,
+        claim_n: claim_pubkeys.len() as u8,
+        claim_m: m,
+        refund_n: refund_pubkeys.len() as u8,
+        refund_m: m,
+        agreement_hash,
+        claim_pubkeys: claim_pubkeys.to_vec(),
+        refund_pubkeys: refund_pubkeys.to_vec(),
+        timeout_height,
+        optional_hash: None,
+    }
+}
+
+fn multisig_script_to_mpso(script_pubkey_hex: &str) -> Result<MpsoV1Output, String> {
+    let script = hex::decode(script_pubkey_hex)
+        .map_err(|_| "invalid script_pubkey hex".to_string())?;
+    irium_node_rs::tx::parse_mpso_script(&script)
+        .ok_or_else(|| "failed to parse MPSO script".to_string())
+}
+
+// ---- end multisig helpers ----
 
 fn secret_to_wif(secret: &[u8; 32], compressed: bool) -> String {
     let mut body = Vec::with_capacity(34);
@@ -25291,6 +25384,252 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
+        }
+        "multisig-create" => {
+            let mut m_val: Option<u8> = None;
+            let mut pubkeys_hex: Vec<String> = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--m" => {
+                        if i + 1 >= args.len() { eprintln!("Missing --m"); std::process::exit(1); }
+                        m_val = Some(args[i + 1].parse::<u8>().unwrap_or_else(|_| { eprintln!("--m must be 1-8"); std::process::exit(1); }));
+                        i += 2;
+                    }
+                    "--pubkeys" => {
+                        i += 1;
+                        while i < args.len() && !args[i].starts_with("--") { pubkeys_hex.push(args[i].clone()); i += 1; }
+                    }
+                    _ => { eprintln!("Unknown flag: {}", args[i]); std::process::exit(1); }
+                }
+            }
+            let m = m_val.unwrap_or_else(|| { eprintln!("--m required"); std::process::exit(1); });
+            if pubkeys_hex.is_empty() { eprintln!("--pubkeys required"); std::process::exit(1); }
+            if m == 0 || m as usize > pubkeys_hex.len() { eprintln!("m must be 1..N"); std::process::exit(1); }
+            let mut pubkeys: Vec<[u8; 33]> = Vec::new();
+            for ph in &pubkeys_hex {
+                let raw = hex::decode(ph).unwrap_or_else(|_| { eprintln!("Invalid pubkey hex: {}", ph); std::process::exit(1); });
+                if raw.len() != 33 { eprintln!("Pubkey must be 33 bytes: {}", ph); std::process::exit(1); }
+                let mut pk = [0u8; 33]; pk.copy_from_slice(&raw); pubkeys.push(pk);
+            }
+            let addr = multisig_address_encode(m, &pubkeys);
+            println!("Multisig address ({}-of-{}): {}", m, pubkeys.len(), addr);
+            for (i, ph) in pubkeys_hex.iter().enumerate() { println!("  [{}] {}", i, ph); }
+        }
+        "multisig-send" => {
+            if args.len() < 2 { eprintln!("usage: multisig-send <amount> --from <addr> --to <multisig-addr> --timeout-height <h>"); std::process::exit(1); }
+            let amount = parse_irm(&args[1]).unwrap_or_else(|e| { eprintln!("Invalid amount: {}", e); std::process::exit(1); });
+            let mut from_addr = String::new(); let mut to_addr = String::new(); let mut timeout_height: Option<u64> = None;
+            let mut agreement_hash = [0u8; 32]; let mut fee_override: Option<u64> = None; let mut rpc_url = default_rpc_url();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--from" => { from_addr = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--to" => { to_addr = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--timeout-height" => { timeout_height = args.get(i+1).and_then(|v| v.parse().ok()); i += 2; }
+                    "--agreement-hash" => {
+                        if let Some(h) = args.get(i+1).and_then(|s| hex::decode(s).ok()) {
+                            if h.len() == 32 { agreement_hash.copy_from_slice(&h); }
+                        }
+                        i += 2;
+                    }
+                    "--fee" => { fee_override = args.get(i+1).and_then(|v| parse_irm(v).ok()); i += 2; }
+                    "--rpc" => { rpc_url = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    _ => { eprintln!("Unknown flag: {}", args[i]); std::process::exit(1); }
+                }
+            }
+            if from_addr.is_empty() { eprintln!("--from required"); std::process::exit(1); }
+            if to_addr.is_empty() { eprintln!("--to required"); std::process::exit(1); }
+            let timeout_h = timeout_height.unwrap_or_else(|| { eprintln!("--timeout-height required"); std::process::exit(1); });
+            let (m, pubkeys) = multisig_address_decode(&to_addr).unwrap_or_else(|| { eprintln!("Invalid multisig address: {}", to_addr); std::process::exit(1); });
+            let from_pkh_vec = base58_p2pkh_to_hash(&from_addr).unwrap_or_else(|| { eprintln!("Invalid --from"); std::process::exit(1); });
+            let mut from_pkh_arr = [0u8; 20]; from_pkh_arr.copy_from_slice(&from_pkh_vec);
+            let mpso = multisig_build_mpso_output(m, &pubkeys, &pubkeys, timeout_h, agreement_hash);
+            let mpso_script = encode_mpso_script(&mpso);
+            let wpath = wallet_path();
+            let wallet = load_wallet(&wpath).unwrap_or_else(|e| { eprintln!("Load wallet: {}", e); std::process::exit(1); });
+            let key = find_key(&wallet, &from_addr).unwrap_or_else(|| { eprintln!("Address not in wallet"); std::process::exit(1); }).clone();
+            let base = rpc_url.trim_end_matches('/');
+            let client = rpc_client(base).unwrap_or_else(|e| { eprintln!("HTTP client: {}", e); std::process::exit(1); });
+            let payload = fetch_utxos(&client, base, &from_addr).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
+            let mut utxos = payload.utxos.clone(); utxos.sort_by_key(|u| u.value);
+            let mut fee_per_byte = DEFAULT_FEE_PER_BYTE;
+            if fee_override.is_none() { if let Ok(est) = fetch_fee_estimate(&client, base) { let ef = est.min_fee_per_byte.ceil() as u64; if ef > fee_per_byte { fee_per_byte = ef; } } }
+            let mut selected = Vec::new(); let mut total = 0u64; let mut fee = fee_override.unwrap_or(0);
+            for utxo in &utxos {
+                let confs = payload.height.saturating_sub(utxo.height);
+                if utxo.is_coinbase && confs < COINBASE_MATURITY { continue; }
+                selected.push(utxo.clone()); total = total.saturating_add(utxo.value);
+                if fee_override.is_none() { fee = estimate_tx_size(selected.len(), 2).saturating_mul(fee_per_byte); }
+                if total >= amount.saturating_add(fee) { break; }
+            }
+            if total < amount.saturating_add(fee) { eprintln!("Insufficient funds"); std::process::exit(1); }
+            let priv_bytes = hex::decode(&key.privkey).unwrap_or_else(|_| { eprintln!("Invalid privkey"); std::process::exit(1); });
+            let signing_key = SigningKey::from_bytes(priv_bytes.as_slice().into()).unwrap_or_else(|e| { eprintln!("SigningKey: {}", e); std::process::exit(1); });
+            let pub_bytes = signing_key.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+            let change_script = p2pkh_script(&from_pkh_arr);
+            let inputs: Vec<TxInput> = selected.iter().map(|u| {
+                let mut raw = hex::decode(&u.txid).unwrap_or_default(); raw.resize(32, 0);
+                let mut prev = [0u8; 32]; prev.copy_from_slice(&raw);
+                TxInput { prev_txid: prev, prev_index: u.index, script_sig: Vec::new(), sequence: 0xffff_ffff }
+            }).collect();
+            let mut change = total.saturating_sub(amount).saturating_sub(fee);
+            let mut outputs = vec![TxOutput { value: amount, script_pubkey: mpso_script }];
+            if change > 0 { outputs.push(TxOutput { value: change, script_pubkey: change_script.clone() }); }
+            let mut tx = Transaction { version: 1, inputs, outputs, locktime: 0 };
+            for _ in 0..2 {
+                for (idx, utxo) in selected.iter().enumerate() {
+                    let sp = hex::decode(&utxo.script_pubkey).unwrap_or_default();
+                    let digest = signature_digest(&tx, idx, &sp);
+                    let sig: Signature = signing_key.sign_prehash(&digest).unwrap();
+                    let sig = sig.normalize_s().unwrap_or(sig);
+                    let mut sb = sig.to_der().as_bytes().to_vec(); sb.push(0x01);
+                    let mut sc = Vec::new(); sc.push(sb.len() as u8); sc.extend(&sb); sc.push(pub_bytes.len() as u8); sc.extend(&pub_bytes);
+                    tx.inputs[idx].script_sig = sc;
+                }
+                if fee_override.is_some() { break; }
+                let needed = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+                if needed > fee { let extra = needed - fee; if change >= extra { fee = needed; change -= extra; if tx.outputs.len() > 1 { tx.outputs[1].value = change; } continue; } else { eprintln!("Insufficient funds for fee"); std::process::exit(1); } }
+                break;
+            }
+            if let Err(e) = submit_tx(&client, base, &tx) { eprintln!("{}", e); std::process::exit(1); }
+            println!("txid {}", hex::encode(tx.txid()));
+            println!("Sent {} satoshis to multisig {}", amount, to_addr);
+        }
+        "multisig-spend-build" => {
+            let mut spend_txid = String::new(); let mut spend_vout: u32 = 0; let mut spend_value: u64 = 0;
+            let mut spend_to = String::new(); let mut spend_script = String::new(); let mut spend_fee: u64 = 500; let mut spend_path = "claim".to_string();
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--txid" => { spend_txid = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--vout" => { spend_vout = args.get(i+1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 2; }
+                    "--value" => { spend_value = args.get(i+1).and_then(|v| v.parse().ok()).unwrap_or(0); i += 2; }
+                    "--to" => { spend_to = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--script-pubkey" => { spend_script = args.get(i+1).cloned().unwrap_or_default(); i += 2; }
+                    "--fee" => { spend_fee = args.get(i+1).and_then(|v| v.parse().ok()).unwrap_or(500); i += 2; }
+                    "--path" => { spend_path = args.get(i+1).cloned().unwrap_or("claim".to_string()); i += 2; }
+                    _ => { eprintln!("Unknown flag: {}", args[i]); std::process::exit(1); }
+                }
+            }
+            if spend_txid.is_empty() || spend_to.is_empty() || spend_script.is_empty() || spend_value == 0 {
+                eprintln!("Required: --txid --vout --value --to --script-pubkey"); std::process::exit(1);
+            }
+            let to_pkh = base58_p2pkh_to_hash(&spend_to).unwrap_or_else(|| { eprintln!("Invalid --to"); std::process::exit(1); });
+            let mut to_arr = [0u8; 20]; to_arr.copy_from_slice(&to_pkh);
+            let mpso = multisig_script_to_mpso(&spend_script).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
+            let mut tb = hex::decode(&spend_txid).unwrap_or_else(|_| { eprintln!("Invalid txid"); std::process::exit(1); });
+            if tb.len() == 32 { tb.reverse(); }
+            let mut prev_txid = [0u8; 32]; prev_txid.copy_from_slice(&tb);
+            let out_value = spend_value.saturating_sub(spend_fee);
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![TxInput { prev_txid, prev_index: spend_vout, script_sig: Vec::new(), sequence: 0xffff_ffff }],
+                outputs: vec![TxOutput { value: out_value, script_pubkey: p2pkh_script(&to_arr) }],
+                locktime: 0,
+            };
+            let claim_pks: Vec<String> = mpso.claim_pubkeys.iter().map(|pk| hex::encode(pk)).collect();
+            let refund_pks: Vec<String> = mpso.refund_pubkeys.iter().map(|pk| hex::encode(pk)).collect();
+            let partial = MultisigPartialTx {
+                version: 1, tx_hex: hex::encode(tx.serialize()),
+                inputs: vec![MultisigInputMeta {
+                    index: 0, script_pubkey: spend_script,
+                    timeout_height: mpso.timeout_height,
+                    m: if spend_path == "refund" { mpso.refund_m } else { mpso.claim_m },
+                    claim_pubkeys: claim_pks, refund_pubkeys: refund_pks,
+                    path: spend_path, sigs: std::collections::HashMap::new(),
+                }],
+            };
+            println!("{}", serde_json::to_string_pretty(&partial).unwrap());
+        }
+        "multisig-sign" => {
+            if args.len() < 2 { eprintln!("usage: multisig-sign <partial.json> --wallet <addr>"); std::process::exit(1); }
+            let partial_path = &args[1]; let mut wallet_addr = String::new();
+            let mut i = 2;
+            while i < args.len() { if args[i] == "--wallet" && i+1 < args.len() { wallet_addr = args[i+1].clone(); i += 2; } else { i += 1; } }
+            if wallet_addr.is_empty() { eprintln!("--wallet required"); std::process::exit(1); }
+            let partial_json = std::fs::read_to_string(partial_path).unwrap_or_else(|e| { eprintln!("Read {}: {}", partial_path, e); std::process::exit(1); });
+            let mut partial: MultisigPartialTx = serde_json::from_str(&partial_json).unwrap_or_else(|e| { eprintln!("Parse partial tx: {}", e); std::process::exit(1); });
+            let tx_bytes = hex::decode(&partial.tx_hex).unwrap_or_else(|_| { eprintln!("Invalid tx_hex"); std::process::exit(1); });
+            let tx = decode_full_tx(&tx_bytes).unwrap_or_else(|e| { eprintln!("Decode tx: {}", e); std::process::exit(1); });
+            let wpath = wallet_path();
+            let wdata = load_wallet(&wpath).unwrap_or_else(|e| { eprintln!("Load wallet: {}", e); std::process::exit(1); });
+            let key = find_key(&wdata, &wallet_addr).unwrap_or_else(|| { eprintln!("Address not in wallet: {}", wallet_addr); std::process::exit(1); }).clone();
+            let priv_bytes = hex::decode(&key.privkey).unwrap_or_else(|_| { eprintln!("Invalid privkey"); std::process::exit(1); });
+            let signing_key = SigningKey::from_bytes(priv_bytes.as_slice().into()).unwrap_or_else(|e| { eprintln!("SigningKey: {}", e); std::process::exit(1); });
+            let pubkey_hex = hex::encode(signing_key.verifying_key().to_encoded_point(true).as_bytes());
+            let mut signed = 0usize;
+            for inp in partial.inputs.iter_mut() {
+                let sp = hex::decode(&inp.script_pubkey).unwrap_or_else(|_| { eprintln!("Invalid script_pubkey"); std::process::exit(1); });
+                let relevant = if inp.path == "refund" { &inp.refund_pubkeys } else { &inp.claim_pubkeys };
+                if !relevant.contains(&pubkey_hex) { eprintln!("Pubkey not in input {} {} keys, skipping", inp.index, inp.path); continue; }
+                let digest = signature_digest(&tx, inp.index, &sp);
+                let sig: Signature = signing_key.sign_prehash(&digest).unwrap();
+                let sig = sig.normalize_s().unwrap_or(sig);
+                let mut sb = sig.to_der().as_bytes().to_vec(); sb.push(0x01);
+                inp.sigs.insert(pubkey_hex.clone(), hex::encode(&sb));
+                signed += 1;
+                eprintln!("Signed input {} ({} path)", inp.index, inp.path);
+            }
+            if signed == 0 { eprintln!("Warning: no inputs signed"); }
+            println!("{}", serde_json::to_string_pretty(&partial).unwrap());
+        }
+        "multisig-combine" => {
+            if args.len() < 2 { eprintln!("usage: multisig-combine <partial1.json> [partial2.json ...] [--out <file>]"); std::process::exit(1); }
+            let mut files: Vec<String> = Vec::new(); let mut out_file: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() { if args[i] == "--out" && i+1 < args.len() { out_file = Some(args[i+1].clone()); i += 2; } else { files.push(args[i].clone()); i += 1; } }
+            if files.is_empty() { eprintln!("No partial files"); std::process::exit(1); }
+            let fj = std::fs::read_to_string(&files[0]).unwrap_or_else(|e| { eprintln!("Read {}: {}", files[0], e); std::process::exit(1); });
+            let mut combined: MultisigPartialTx = serde_json::from_str(&fj).unwrap_or_else(|e| { eprintln!("Parse: {}", e); std::process::exit(1); });
+            for f in &files[1..] {
+                let j = std::fs::read_to_string(f).unwrap_or_else(|e| { eprintln!("Read {}: {}", f, e); std::process::exit(1); });
+                let p: MultisigPartialTx = serde_json::from_str(&j).unwrap_or_else(|e| { eprintln!("Parse: {}", e); std::process::exit(1); });
+                if p.tx_hex != combined.tx_hex { eprintln!("Error: {} different tx_hex", f); std::process::exit(1); }
+                for (fi, pi) in p.inputs.iter().enumerate() {
+                    if fi < combined.inputs.len() { for (pk, sig) in &pi.sigs { combined.inputs[fi].sigs.insert(pk.clone(), sig.clone()); } }
+                }
+            }
+            let tx_bytes = hex::decode(&combined.tx_hex).unwrap_or_else(|_| { eprintln!("Invalid tx_hex"); std::process::exit(1); });
+            let mut tx = decode_full_tx(&tx_bytes).unwrap_or_else(|e| { eprintln!("Decode tx: {}", e); std::process::exit(1); });
+            for im in &combined.inputs {
+                let relevant = if im.path == "refund" { &im.refund_pubkeys } else { &im.claim_pubkeys };
+                let m = im.m as usize;
+                let mut ordered: Vec<Vec<u8>> = Vec::new(); let mut bitmap: u8 = 0; let mut count = 0usize;
+                for (bi, pk) in relevant.iter().enumerate() {
+                    if count >= m { break; }
+                    if let Some(sh) = im.sigs.get(pk) {
+                        ordered.push(hex::decode(sh).unwrap_or_default());
+                        if bi < 8 { bitmap |= 1u8 << bi; }
+                        count += 1;
+                    }
+                }
+                if ordered.len() < m { eprintln!("Input {}: need {} sigs, have {}", im.index, m, ordered.len()); std::process::exit(1); }
+                let witness = if im.path == "refund" {
+                    encode_mpso_refund_witness(bitmap, &ordered).unwrap_or_else(|| { eprintln!("Encode refund witness failed"); std::process::exit(1); })
+                } else {
+                    encode_mpso_claim_witness(bitmap, &ordered, None).unwrap_or_else(|| { eprintln!("Encode claim witness failed"); std::process::exit(1); })
+                };
+                if im.index < tx.inputs.len() { tx.inputs[im.index].script_sig = witness; }
+            }
+            let final_hex = hex::encode(tx.serialize());
+            if let Some(p) = &out_file { std::fs::write(p, &final_hex).unwrap_or_else(|e| { eprintln!("Write {}: {}", p, e); std::process::exit(1); }); eprintln!("Written to {}", p); }
+            println!("{}", final_hex);
+        }
+        "multisig-broadcast" => {
+            if args.len() < 2 { eprintln!("usage: multisig-broadcast <txhex|file> [--rpc <url>]"); std::process::exit(1); }
+            let input = &args[1]; let mut rpc_url = default_rpc_url();
+            let mut i = 2;
+            while i < args.len() { if args[i] == "--rpc" && i+1 < args.len() { rpc_url = args[i+1].clone(); i += 2; } else { i += 1; } }
+            let tx_hex = if std::path::Path::new(input.as_str()).exists() {
+                std::fs::read_to_string(input).unwrap_or_else(|e| { eprintln!("Read {}: {}", input, e); std::process::exit(1); }).trim().to_string()
+            } else { input.clone() };
+            let tx_bytes = hex::decode(&tx_hex).unwrap_or_else(|_| { eprintln!("Invalid tx hex"); std::process::exit(1); });
+            let tx = decode_full_tx(&tx_bytes).unwrap_or_else(|e| { eprintln!("Decode tx: {}", e); std::process::exit(1); });
+            let base = rpc_url.trim_end_matches('/');
+            let client = rpc_client(base).unwrap_or_else(|e| { eprintln!("HTTP client: {}", e); std::process::exit(1); });
+            if let Err(e) = submit_tx(&client, base, &tx) { eprintln!("{}", e); std::process::exit(1); }
+            println!("txid {}", hex::encode(tx.txid()));
         }
         _ => {
             usage();

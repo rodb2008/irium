@@ -32,7 +32,8 @@ use bs58;
 use get_if_addrs::get_if_addrs;
 use irium_node_rs::activation::{
     network_kind_from_env, resolved_htlcv1_activation_height, resolved_lwma_activation_height,
-    resolved_lwma_v2_activation_height, runtime_htlcv1_env_override, runtime_lwma_env_override,
+    resolved_lwma_v2_activation_height, resolved_mpsov1_activation_height,
+    runtime_htlcv1_env_override, runtime_lwma_env_override,
     NetworkKind,
 };
 use irium_node_rs::anchors::AnchorManager;
@@ -7241,7 +7242,7 @@ async fn main() {
         genesis_block: genesis_block.clone(),
         pow_limit,
         htlcv1_activation_height: htlc_activation,
-        mpsov1_activation_height: None,
+        mpsov1_activation_height: resolved_mpsov1_activation_height(network),
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),

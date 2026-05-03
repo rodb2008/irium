@@ -106,6 +106,24 @@ pub fn resolved_auxpow_activation_height(network: NetworkKind) -> Option<u64> {
     }
 }
 
+/// Mainnet MPSOv1 (M-of-N multisig output) activation height.
+///
+/// Activated at block 20,000. No MPSO outputs exist before this height.
+pub const MAINNET_MPSOV1_ACTIVATION_HEIGHT: Option<u64> = Some(20_000);
+
+pub fn runtime_mpsov1_env_override() -> Option<u64> {
+    env::var("IRIUM_MPSOV1_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+pub fn resolved_mpsov1_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_MPSOV1_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_mpsov1_env_override(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

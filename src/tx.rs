@@ -304,13 +304,6 @@ pub fn parse_mpso_script(script: &[u8]) -> Option<MpsoV1Output> {
             }
         }
     }
-    for cpk in &claim_pubkeys {
-        for rpk in &refund_pubkeys {
-            if cpk == rpk {
-                return None;
-            }
-        }
-    }
     let mut timeout_bytes = [0u8; 8];
     timeout_bytes.copy_from_slice(&script[pos..pos + 8]);
     let timeout_height = u64::from_le_bytes(timeout_bytes);
@@ -799,7 +792,10 @@ mod tests {
     }
 
     #[test]
-    fn mpso_script_reject_claim_refund_overlap() {
+    fn mpso_script_allow_claim_refund_overlap() {
+        // Overlapping claim/refund keys are intentionally allowed for symmetric multisig escrow,
+        // where the same M-of-N signers control both the claim path (before timeout)
+        // and the refund path (after timeout).
         let shared = valid_compressed_pubkey(1);
         let cp2 = valid_compressed_pubkey(2);
         let o = MpsoV1Output {
@@ -815,6 +811,6 @@ mod tests {
             optional_hash: None,
         };
         let script = encode_mpso_script(&o);
-        assert!(parse_mpso_script(&script).is_none());
+        assert!(parse_mpso_script(&script).is_some());
     }
 }

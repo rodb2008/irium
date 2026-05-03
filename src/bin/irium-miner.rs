@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use irium_node_rs::activation::{
     network_kind_from_env, resolved_htlcv1_activation_height, resolved_lwma_activation_height,
-    resolved_lwma_v2_activation_height, runtime_lwma_env_override,
+    resolved_lwma_v2_activation_height, resolved_mpsov1_activation_height, runtime_lwma_env_override,
 };
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
@@ -2932,7 +2932,7 @@ fn main() {
         genesis_block: block,
         pow_limit,
         htlcv1_activation_height: htlc_activation,
-        mpsov1_activation_height: None,
+        mpsov1_activation_height: resolved_mpsov1_activation_height(network),
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),

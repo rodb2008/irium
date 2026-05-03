@@ -31,20 +31,31 @@ pub enum GenesisError {
     Json(#[from] serde_json::Error),
 }
 
+// Genesis locked at build time so the binary is self-contained on all platforms.
+// External file takes precedence (for testing overrides), then falls back to embedded.
+const GENESIS_LOCKED_BYTES: &[u8] = include_bytes!("../configs/genesis-locked.json");
+
 pub fn repo_root() -> PathBuf {
-    // Prefer the manifest dir if it already contains configs/.
+    // Try CARGO_MANIFEST_DIR (works during development with source present).
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if manifest_dir
-        .join("configs")
-        .join("genesis-locked.json")
-        .exists()
-    {
+    if manifest_dir.join("configs").join("genesis-locked.json").exists() {
         return manifest_dir;
     }
+    // Try relative to the running executable (handles installed binaries).
+    if let Ok(exe) = std::env::current_exe() {
+        for candidate in exe.ancestors().skip(1).take(3) {
+            if candidate.join("configs").join("genesis-locked.json").exists() {
+                return candidate.to_path_buf();
+            }
+        }
+    }
+    // Try current working directory.
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join("configs").join("genesis-locked.json").exists() {
+            return cwd;
+        }
+    }
     manifest_dir
-        .parent()
-        .unwrap_or_else(|| manifest_dir.as_path())
-        .to_path_buf()
 }
 
 pub fn locked_genesis_path() -> PathBuf {
@@ -52,8 +63,12 @@ pub fn locked_genesis_path() -> PathBuf {
 }
 
 pub fn load_locked_genesis() -> Result<LockedGenesis, GenesisError> {
+    // Prefer external file (allows environment-specific overrides for testing).
     let path = locked_genesis_path();
-    let data = fs::read_to_string(&path)?;
-    let genesis: LockedGenesis = serde_json::from_str(&data)?;
-    Ok(genesis)
+    if path.exists() {
+        let data = fs::read_to_string(&path)?;
+        return Ok(serde_json::from_str(&data)?);
+    }
+    // Fall back to genesis compiled into the binary — works with no external files.
+    Ok(serde_json::from_slice(GENESIS_LOCKED_BYTES)?)
 }
