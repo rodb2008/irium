@@ -59,8 +59,8 @@ use irium_node_rs::settlement::{
     AgreementAuditRecord, AgreementBundle, AgreementFundingLegRef, AgreementLifecycleView,
     AgreementLinkedTx, AgreementMilestoneStatus, AgreementObject, AgreementSummary,
     HoldbackEvaluationResult, MilestoneEvaluationResult, MilestoneSpec, PolicyOutcome, PolicyStore,
-    ProofPolicy, ProofStore, RequirementThresholdResult, SettlementProof, StorePolicyOutcome,
-    TemplateAttestor, TypedProofPayload,
+    ProofPolicy, ProofStore, RequirementThresholdResult, SettlementProof,
+    TemplateAttestor,
 };
 use irium_node_rs::storage;
 use irium_node_rs::tx::{
@@ -74,8 +74,7 @@ use k256::ecdsa::{Signature, SigningKey};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
-use futures_util::stream::StreamExt as FuturesStreamExt;
-use futures_util::SinkExt as FuturesSinkExt;
+// futures_util stream/sink imports removed (unused)
 use tokio::sync::broadcast;
 use std::convert::Infallible;
 
@@ -8421,10 +8420,7 @@ async fn offers_feed(
     let port: u16 = std::env::var("IRIUM_NODE_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            eprintln!("Error: IRIUM_NODE_PORT must be set");
-            std::process::exit(1);
-        });
+        .unwrap_or(38300); // default 38300 if IRIUM_NODE_PORT not set
 
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
@@ -8478,6 +8474,7 @@ async fn offers_feed(
 
 #[cfg(test)]
 mod tests {
+    use irium_node_rs::settlement::TypedProofPayload;
     use super::*;
     use axum::extract::{ConnectInfo, Query, State};
     use axum::http::HeaderMap;

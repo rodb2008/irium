@@ -11,7 +11,7 @@ use irium_node_rs::settlement::{
     compute_agreement_signature_payload_hash, inspect_agreement_share_package,
     inspect_agreement_signature, render_agreement_audit_csv, settlement_proof_payload_bytes,
     summarize_agreement_authenticity, validate_agreement_signature_envelope,
-    validate_typed_proof_payload, verify_agreement_bundle, verify_agreement_share_package,
+    verify_agreement_bundle, verify_agreement_share_package,
     verify_bundle_signatures, AgreementArtifactVerificationResult, AgreementAuditRecord,
     AgreementBundle, AgreementBundleChainObservationSnapshot, AgreementLifecycleView,
     AgreementMilestone, AgreementObject, AgreementParty, AgreementSharePackage,
@@ -257,11 +257,13 @@ struct VerifyAgreementLinkRequestBody {
 }
 
 #[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
 struct AgreementHashResponse {
     agreement_hash: String,
 }
 
 #[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
 struct AgreementInspectResponse {
     agreement_hash: String,
     summary: AgreementSummary,
@@ -1279,6 +1281,7 @@ fn local_housekeeping_untouched_notice() -> String {
     "Local archive, remove, or prune actions do not revoke artifacts elsewhere and do not change chain state, trust roots, or agreement/bundle verification roots.".to_string()
 }
 
+#[allow(dead_code)]
 fn target_type_label(target_type: &AgreementSignatureTargetType) -> &'static str {
     match target_type {
         AgreementSignatureTargetType::Agreement => "agreement",
@@ -6478,6 +6481,7 @@ fn parse_agreement_spend_cli(args: &[String]) -> Result<AgreementSpendCliOptions
     Ok(opts)
 }
 
+#[allow(dead_code)]
 fn agreement_spend_request_body(
     agreement: AgreementObject,
     opts: &AgreementSpendCliOptions,
@@ -6892,7 +6896,7 @@ fn handle_otc_attest(args: &[String]) -> Result<(), String> {
     let mut proof_type = "otc_release".to_string();
     let mut rpc_url: Option<String> = None;
     let mut json_mode = false;
-    let mut include_proofs = false;
+    let _include_proofs = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -10237,7 +10241,6 @@ fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
         }
     };
 
-    let has_policy = policy.is_some();
     let proofs: Option<Vec<serde_json::Value>> = if include_proofs {
         let base = rpc_url.trim_end_matches('/');
         match rpc_client(base).and_then(|client| {
@@ -11478,7 +11481,7 @@ fn handle_agreement_bundle_pack(args: &[String], create_only: bool) -> Result<()
         .as_ref()
         .map(|bundle| bundle.metadata.linked_funding_txids.clone())
         .unwrap_or_default();
-    let mut milestone_hints = resolved
+    let milestone_hints = resolved
         .bundle
         .as_ref()
         .map(|bundle| bundle.metadata.milestone_hints.clone())

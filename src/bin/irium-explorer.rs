@@ -131,6 +131,7 @@ struct AgreementTemplateForm {
     milestones_text: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 struct TxLookupResponse {
     txid: String,

@@ -159,6 +159,7 @@ impl RecentHashCache {
         true
     }
 
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.seen_at.len()
     }
@@ -690,6 +691,7 @@ fn inbound_bulk_queue_capacity() -> usize {
     })
 }
 
+#[allow(dead_code)]
 fn inbound_block_busy_wait_ms() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -701,6 +703,7 @@ fn inbound_block_busy_wait_ms() -> u64 {
     })
 }
 
+#[allow(dead_code)]
 fn inbound_headers_busy_wait_ms() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -712,6 +715,7 @@ fn inbound_headers_busy_wait_ms() -> u64 {
     })
 }
 
+#[allow(dead_code)]
 fn inbound_block_busy_log_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -723,12 +727,14 @@ fn inbound_block_busy_log_cooldown_secs() -> u64 {
     })
 }
 
+#[allow(dead_code)]
 fn inbound_block_busy_log() -> Arc<Mutex<HashMap<IpAddr, Instant>>> {
     static LOGS: OnceLock<Arc<Mutex<HashMap<IpAddr, Instant>>>> = OnceLock::new();
     LOGS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
         .clone()
 }
 
+#[allow(dead_code)]
 fn inbound_headers_busy_log_cooldown_secs() -> u64 {
     static VAL: OnceLock<u64> = OnceLock::new();
     *VAL.get_or_init(|| {
@@ -740,6 +746,7 @@ fn inbound_headers_busy_log_cooldown_secs() -> u64 {
     })
 }
 
+#[allow(dead_code)]
 fn inbound_headers_busy_log() -> Arc<Mutex<HashMap<IpAddr, Instant>>> {
     static LOGS: OnceLock<Arc<Mutex<HashMap<IpAddr, Instant>>>> = OnceLock::new();
     LOGS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
@@ -1845,6 +1852,7 @@ async fn maybe_request_sync(
     };
 
     let mut recovery_triggered = false;
+    #[allow(unused_assignments)]
     let mut recovery_exp = 0u8;
     {
         let mut state = peer_state.lock().await;
