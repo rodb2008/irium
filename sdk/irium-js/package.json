@@ -1,0 +1,41 @@
+{
+  "name": "irium-js",
+  "version": "1.0.0",
+  "description": "JavaScript/TypeScript SDK for the Irium settlement blockchain",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iriumlabs/irium"
+  },
+  "keywords": [
+    "irium",
+    "blockchain",
+    "settlement",
+    "escrow",
+    "trustless"
+  ],
+  "dependencies": {
+    "@types/ws": "^8.18.1",
+    "ws": "^8.20.0"
+  }
+}
