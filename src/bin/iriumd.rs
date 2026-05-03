@@ -1733,8 +1733,9 @@ fn dial_log_rate_limit_enabled() -> bool {
     *FLAG.get_or_init(|| {
         std::env::var("IRIUM_P2P_DIAL_LOG_RATE_LIMIT")
             .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .map(|disabled| !disabled)
+            .unwrap_or(true)
     })
 }
 
@@ -7197,21 +7198,21 @@ async fn main() {
     let htlc_activation = resolved_htlcv1_activation_height(network);
     let lwma_activation = resolved_lwma_activation_height(network);
     match (network, htlc_activation) {
-        (NetworkKind::Mainnet, Some(h)) => {
-            println!("HTLCv1 mainnet activation height (code-defined): {}", h)
+        (NetworkKind::Mainnet, Some(_)) => {
+            // Already activated on mainnet; no startup message needed.
         }
         (NetworkKind::Mainnet, None) => {
-            println!("HTLCv1 mainnet activation disabled in code (no activation height set)")
+            // Not configured for mainnet.
         }
         (_, Some(h)) => println!("HTLCv1 non-mainnet activation height from env: {}", h),
         (_, None) => println!("HTLCv1 non-mainnet activation unset (env not provided)"),
     }
     match (network, lwma_activation) {
-        (NetworkKind::Mainnet, Some(h)) => {
-            println!("LWMA active on mainnet since height {}", h)
+        (NetworkKind::Mainnet, Some(_)) => {
+            // Already active on mainnet; no startup message needed.
         }
         (NetworkKind::Mainnet, None) => {
-            println!("LWMA mainnet activation disabled in code (no activation height set)")
+            // Not configured for mainnet.
         }
         (_, Some(h)) => println!("LWMA non-mainnet activation height from env: {}", h),
         (_, None) => println!("LWMA non-mainnet activation unset (env not provided)"),
@@ -7224,11 +7225,11 @@ async fn main() {
     }
     let lwma_v2_activation = resolved_lwma_v2_activation_height(network);
     match (network, lwma_v2_activation) {
-        (NetworkKind::Mainnet, Some(h)) => {
-            println!("LWMA v2 activates on mainnet at height {}", h)
+        (NetworkKind::Mainnet, Some(_)) => {
+            // Already activated on mainnet; no startup message needed.
         }
         (NetworkKind::Mainnet, None) => {
-            println!("LWMA v2 not yet activated on mainnet")
+            // Not configured for mainnet.
         }
         (_, Some(h)) => println!("LWMA v2 non-mainnet activation height from env: {}", h),
         (_, None) => println!("LWMA v2 non-mainnet activation unset (env not provided)"),
