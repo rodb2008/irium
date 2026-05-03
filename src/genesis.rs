@@ -1,5 +1,4 @@
 use serde::Deserialize;
-use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
@@ -31,17 +30,11 @@ pub enum GenesisError {
     Json(#[from] serde_json::Error),
 }
 
-// Genesis locked at build time so the binary is self-contained on all platforms.
-// External file takes precedence (for testing overrides), then falls back to embedded.
-const GENESIS_LOCKED_BYTES: &[u8] = include_bytes!("../configs/genesis-locked.json");
-
 pub fn repo_root() -> PathBuf {
-    // Try CARGO_MANIFEST_DIR (works during development with source present).
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if manifest_dir.join("configs").join("genesis-locked.json").exists() {
         return manifest_dir;
     }
-    // Try relative to the running executable (handles installed binaries).
     if let Ok(exe) = std::env::current_exe() {
         for candidate in exe.ancestors().skip(1).take(3) {
             if candidate.join("configs").join("genesis-locked.json").exists() {
@@ -49,7 +42,6 @@ pub fn repo_root() -> PathBuf {
             }
         }
     }
-    // Try current working directory.
     if let Ok(cwd) = std::env::current_dir() {
         if cwd.join("configs").join("genesis-locked.json").exists() {
             return cwd;
@@ -63,12 +55,6 @@ pub fn locked_genesis_path() -> PathBuf {
 }
 
 pub fn load_locked_genesis() -> Result<LockedGenesis, GenesisError> {
-    // Prefer external file (allows environment-specific overrides for testing).
-    let path = locked_genesis_path();
-    if path.exists() {
-        let data = fs::read_to_string(&path)?;
-        return Ok(serde_json::from_str(&data)?);
-    }
-    // Fall back to genesis compiled into the binary — works with no external files.
-    Ok(serde_json::from_slice(GENESIS_LOCKED_BYTES)?)
+    static GENESIS_JSON: &str = include_str!("../configs/genesis-locked.json");
+    Ok(serde_json::from_str(GENESIS_JSON)?)
 }

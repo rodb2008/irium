@@ -1,0 +1,23 @@
+name: NPM token expiry reminder
+
+on:
+  schedule:
+    - cron: "0 9 18 7 *"  # 09:00 UTC on July 18 each year
+  workflow_dispatch:
+
+jobs:
+  open-reminder-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open renewal reminder issue
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "NPM_TOKEN expires August 1 — renew now",
+              labels: ["maintenance"],
+              body: `## NPM token renewal required\n\nThe \`NPM_TOKEN\` secret used by the npm-publish workflow expires **August 1**. Renew it now to avoid a broken publish.\n\n### Steps\n\n1. Go to https://www.npmjs.com/settings/~/tokens\n2. Delete the old \`irium-github-actions\` token\n3. Generate a new **Granular** token with read-write permissions and **90 day expiry**\n4. Go to https://github.com/iriumlabs/irium/settings/secrets/actions\n5. Update \`NPM_TOKEN\` with the new value\n6. Re-run the npm-publish workflow to confirm it works\n\n_This issue was opened automatically by the token-reminder workflow._`
+            });
