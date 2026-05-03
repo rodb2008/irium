@@ -6583,6 +6583,23 @@ async fn get_block_template(
             mempool_entries.truncate(max);
         }
     }
+    // Remove conflicting TXs: keep the highest-fee TX for each spent outpoint.
+    // ordered_entries() is sorted fee_per_byte desc so first claimer wins.
+    {
+        let mut claimed: HashSet<([u8; 32], u32)> = HashSet::new();
+        mempool_entries.retain(|e| {
+            let conflicts = e.tx.inputs.iter().any(|inp| {
+                claimed.contains(&(inp.prev_txid, inp.prev_index))
+            });
+            if conflicts {
+                return false;
+            }
+            for inp in &e.tx.inputs {
+                claimed.insert((inp.prev_txid, inp.prev_index));
+            }
+            true
+        });
+    }
     let mempool_count = mempool_entries.len();
     let mut total_fees = 0u64;
     let txs = mempool_entries
