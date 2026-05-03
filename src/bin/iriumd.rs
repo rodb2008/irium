@@ -8426,7 +8426,7 @@ async fn offers_feed(
         .parse()
         .expect("valid bind address");
 
-    println!("[i] RPC status: https://{}:{}/status", host, port);
+    println!("[i] RPC status: http://{}:{}/status", host, port);
     println!(
         "[i] HTTP status: http://{}:{}/status",
         status_host, status_port
