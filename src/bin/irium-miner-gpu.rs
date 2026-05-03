@@ -319,7 +319,72 @@ fn rpc_token() -> Option<String> {
 }
 
 fn node_rpc_base() -> String {
-    env::var("IRIUM_NODE_RPC").unwrap_or_default()
+    env::var("IRIUM_NODE_RPC").unwrap_or_else(|_| "https://127.0.0.1:38300".to_string())
+}
+
+fn is_tls_mismatch(err: &str) -> bool {
+    err.to_lowercase().contains("invalid http version")
+}
+
+fn is_https_scheme_mismatch(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("wrong version number")
+        || lower.contains("first record does not look like a tls handshake")
+        || lower.contains("received http/0.9 when not allowed")
+        || lower.contains("invalid http version")
+        || lower.contains("tls handshake")
+        || lower.contains("unexpected eof while reading")
+}
+
+fn with_rpc_base<T, F>(f: F) -> Result<T, String>
+where
+    F: Fn(&str) -> Result<T, String>,
+{
+    fn should_log_fallback() -> bool {
+        static LAST_LOG: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+        let lock = LAST_LOG.get_or_init(|| Mutex::new(None));
+        if let Ok(mut guard) = lock.lock() {
+            let now = Instant::now();
+            let allow = guard
+                .as_ref()
+                .map(|t| now.duration_since(*t) >= Duration::from_secs(60))
+                .unwrap_or(true);
+            if allow {
+                *guard = Some(now);
+            }
+            allow
+        } else {
+            true
+        }
+    }
+
+    let base = node_rpc_base();
+    match f(&base) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if base.starts_with("https://") && is_https_scheme_mismatch(&e) {
+                let http = base.replacen("https://", "http://", 1);
+                if let Ok(v) = f(&http) {
+                    std::env::set_var("IRIUM_NODE_RPC", &http);
+                    if should_log_fallback() {
+                        eprintln!("[GPU] RPC scheme mismatch; switched to {http}");
+                    }
+                    return Ok(v);
+                }
+            }
+            if base.starts_with("http://") && is_tls_mismatch(&e) {
+                let https = base.replacen("http://", "https://", 1);
+                if let Ok(v) = f(&https) {
+                    std::env::set_var("IRIUM_NODE_RPC", &https);
+                    if should_log_fallback() {
+                        eprintln!("[GPU] RPC scheme mismatch; switched to {https}");
+                    }
+                    return Ok(v);
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 fn json_log_enabled() -> bool {
@@ -421,21 +486,25 @@ struct SubmitBlockRequest {
     submit_source: Option<String>,
 }
 
-fn fetch_template(client: &Client) -> Result<BlockTemplate, String> {
-    let url = format!(
-        "{}/rpc/getblocktemplate",
-        node_rpc_base().trim_end_matches('/')
-    );
+fn fetch_template_with_base(client: &Client, base: &str) -> Result<BlockTemplate, String> {
+    let url = format!("{}/rpc/getblocktemplate", base.trim_end_matches('/'));
     let mut req = client.get(&url);
     if let Some(token) = rpc_token() {
         req = req.bearer_auth(token);
     }
-    let resp = req.send().map_err(|e| format!("fetch template: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("fetch template: HTTP {}", resp.status()));
+    let resp = req.send().map_err(|e| format!("{e}"))?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("HTTP 401 Unauthorized — set IRIUM_RPC_TOKEN to match the node token".to_string());
     }
-    resp.json::<BlockTemplate>()
-        .map_err(|e| format!("parse template: {e}"))
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.json::<BlockTemplate>().map_err(|e| format!("parse template: {e}"))
+}
+
+fn fetch_template(client: &Client) -> Result<BlockTemplate, String> {
+    with_rpc_base(|base| fetch_template_with_base(client, base))
+        .map_err(|e| format!("fetch template: {e}"))
 }
 
 fn submit_block(client: &Client, height: u64, block: &Block) -> Result<(), String> {
