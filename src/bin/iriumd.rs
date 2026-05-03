@@ -8391,10 +8391,7 @@ async fn offers_feed(
     let status_port: u16 = std::env::var("IRIUM_STATUS_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            eprintln!("Error: IRIUM_STATUS_PORT must be set");
-            std::process::exit(1);
-        });
+        .unwrap_or(8080); // default 8080 if IRIUM_STATUS_PORT not set
     let status_addr: SocketAddr = format!("{}:{}", status_host, status_port)
         .parse()
         .expect("valid status bind address");
