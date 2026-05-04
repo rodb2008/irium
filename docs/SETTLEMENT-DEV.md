@@ -358,3 +358,83 @@ Check milestone status:
 ```bash
 irium-wallet agreement-milestones milestone-001.json --rpc http://localhost:38300
 ```
+
+
+---
+
+## Attestor Bonding
+
+Attestors can register an on-chain economic bond to signal accountability. Agreements
+that reference unbonded attestors are accepted but produce a warning to counterparties.
+
+### Registering a Bond
+
+```bash
+irium-wallet attestor-register --bond 10 --from QMyAttestorAddress...
+```
+
+This publishes a transaction with an OP_RETURN output:
+```
+bond1:<pkh_hex_40>:<atoms_decimal>
+```
+
+The bond amount is declared publicly on-chain. The IRM remains in the attestor's
+wallet but is publicly committed. Any counterparty can verify the bond is active.
+
+### Viewing Bond Status
+
+```bash
+# All bonds on this node
+irium-wallet attestor-bond-status
+
+# Bond for a specific address
+irium-wallet attestor-bond-status --address QMyAttestorAddress...
+
+# JSON output
+irium-wallet attestor-bond-status --json
+```
+
+Bonds are also shown inline when running `irium-wallet attestor-list`:
+```
+alice-attestor (02abc...) — Alice [bond: 10 IRM active]
+bob-attestor (03def...) — Bob [bond: none — unbonded]
+```
+
+When building a policy (`policy-build-otc`, `policy-build-contractor`,
+`policy-build-preorder`), a warning is printed to stderr if any specified
+attestor has no active bond:
+```
+warn  attestor 02def... has no registered bond — agreement counterparties have no economic protection
+```
+
+### Slashing
+
+If an attestor submits two contradicting proofs for the same agreement (one claiming
+satisfied, another claiming unsatisfied), any party can record a slash:
+
+```bash
+irium-wallet attestor-slash \
+  --attestor QAttestorAddress... \
+  --proof1 proof-id-1 \
+  --proof2 proof-id-2 \
+  --agreement <agreement_hash>
+```
+
+This publishes a `slash1:<pkh>:<agreement_hash>` OP_RETURN and updates the local
+bond store. The slash count appears in `attestor-list` and `attestor-bond-status`
+output.
+
+### Withdrawal Cooldown
+
+The minimum cooldown before withdrawal is 1000 blocks, measured from:
+- The registration height, if the attestor has never attested; or
+- The most recent attestation height, if the attestor has signed proofs
+
+```bash
+# Withdraw after cooldown
+irium-wallet attestor-withdraw-bond --from QMyAttestorAddress...
+```
+
+This publishes `bond1w:<pkh>` on-chain and marks the bond as withdrawn locally.
+
+See `docs/ATTESTOR-GUIDE.md` for the full attestor bonding reference.
