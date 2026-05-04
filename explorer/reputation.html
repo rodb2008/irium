@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="irium-node" content="https://node.iriumlabs.org">
+<title>Reputation — Irium Explorer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #0d1117; color: #e6edf3; min-height: 100vh; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header { background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 18px; font-weight: 600; color: #f0f6fc; }
+  header nav a { color: #8b949e; font-size: 14px; margin-left: 16px; }
+  .container { max-width: 800px; margin: 0 auto; padding: 24px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+  .card h2 { font-size: 15px; font-weight: 600; color: #f0f6fc; margin-bottom: 16px; border-bottom: 1px solid #30363d; padding-bottom: 8px; }
+  .kv-grid { display: grid; grid-template-columns: 200px 1fr; gap: 10px 16px; font-size: 14px; }
+  .kv-grid .key { color: #8b949e; }
+  .kv-grid .val { color: #e6edf3; font-weight: 600; }
+  code { font-family: monospace; font-size: 12px; color: #79c0ff; word-break: break-all; }
+  .stat-big { font-size: 36px; font-weight: 700; color: #58a6ff; }
+  .loading { color: #8b949e; font-size: 14px; padding: 24px 0; }
+  .error { color: #f85149; font-size: 14px; padding: 12px; background: #2d0e0e; border-radius: 6px; }
+  .note { color: #8b949e; font-size: 12px; margin-top: 16px; padding: 12px; background: #0d1117; border-radius: 6px; border: 1px solid #21262d; }
+  .search-bar { display: flex; gap: 8px; margin-bottom: 24px; }
+  .search-bar input { flex: 1; background: #0d1117; border: 1px solid #30363d; color: #e6edf3; padding: 8px 12px; border-radius: 6px; font-size: 14px; }
+  .search-bar button { background: #238636; color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  .search-bar button:hover { background: #2ea043; }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="index.html" style="color:inherit;">Irium Explorer</a></h1>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="agreement.html">Agreements</a>
+    <a href="reputation.html">Reputation</a>
+  </nav>
+</header>
+<div class="container">
+  <div class="search-bar">
+    <input id="pubkey-input" type="text" placeholder="Address or pubkey hex…">
+    <button onclick="loadReputation()">Lookup</button>
+  </div>
+  <div id="content"><div class="loading">Enter an address or pubkey above to look up reputation.</div></div>
+</div>
+<script src="app.js"></script>
+<script>
+  const fmt = IriumExplorer.fmt;
+  const params = new URLSearchParams(location.search);
+  const initPubkey = params.get('pubkey');
+
+  if (initPubkey) {
+    document.getElementById('pubkey-input').value = initPubkey;
+  }
+
+  async function loadReputation() {
+    const pubkey = document.getElementById('pubkey-input').value.trim();
+    if (!pubkey) return;
+    history.replaceState(null, '', `?pubkey=${encodeURIComponent(pubkey)}`);
+    document.getElementById('content').innerHTML = '<div class="loading">Loading…</div>';
+    try {
+      const d = await IriumExplorer.api.reputation(pubkey);
+      if (d.error) { document.getElementById('content').innerHTML = `<div class="error">${d.error}</div>`; return; }
+      document.getElementById('content').innerHTML = `
+        <div class="card">
+          <h2>Reputation Profile</h2>
+          <div class="kv-grid">
+            <span class="key">Address / Pubkey</span><span class="val"><code>${d.pubkey}</code></span>
+            <span class="key">Agreements as Seller</span><span class="val">${d.total_agreements_as_seller}</span>
+            <span class="key">Proofs Submitted</span><span class="val">${d.proofs_submitted}</span>
+          </div>
+          <div class="note">${d.note}</div>
+        </div>
+      `;
+      document.title = `${pubkey.slice(0, 12)}… Reputation — Irium Explorer`;
+    } catch (e) {
+      document.getElementById('content').innerHTML = `<div class="error">Failed to load reputation: ${e.message}</div>`;
+    }
+  }
+
+  document.getElementById('pubkey-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') loadReputation();
+  });
+
+  if (initPubkey) loadReputation();
+</script>
+</body>
+</html>

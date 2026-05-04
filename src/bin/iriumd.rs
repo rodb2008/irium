@@ -10,7 +10,7 @@ use std::sync::{
 use std::{env, fs};
 
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, Json as AxumJson, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Json as AxumJson, Path as AxumPath, Query, State},
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE},
         HeaderMap, HeaderValue, Method, StatusCode,
@@ -8310,6 +8310,290 @@ async fn offers_feed(
     })))
 }
 
+
+// --- Explorer endpoints (public, no auth, CORS * always on) -------------------
+
+fn explorer_agreements_dir() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("IRIUM_AGREEMENT_BUNDLES_DIR") {
+        return std::path::PathBuf::from(p).join("raw");
+    }
+    if let Ok(p) = std::env::var("IRIUM_DATA_DIR") {
+        return std::path::PathBuf::from(p).join("agreements").join("raw");
+    }
+    // state_dir is {data_dir}/state/ so parent is {data_dir}
+    irium_node_rs::storage::state_dir()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("agreements")
+        .join("raw")
+}
+
+fn explorer_cors_headers() -> HeaderMap {
+    let mut map = HeaderMap::new();
+    map.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
+    map.insert("Access-Control-Allow-Methods", HeaderValue::from_static("GET, OPTIONS"));
+    map
+}
+
+#[derive(Deserialize)]
+struct ExplorerPageQuery {
+    #[serde(default = "explorer_default_page")]
+    page: usize,
+    #[serde(default = "explorer_default_limit")]
+    limit: usize,
+}
+fn explorer_default_page() -> usize { 1 }
+fn explorer_default_limit() -> usize { 20 }
+
+#[derive(Deserialize)]
+struct ExplorerProofsQuery {
+    #[serde(default = "explorer_default_page")]
+    page: usize,
+    #[serde(default = "explorer_default_limit")]
+    limit: usize,
+    agreement_hash: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ExplorerAgreementSummary {
+    hash: String,
+    agreement_id: String,
+    template_type: String,
+    total_amount: u64,
+    creation_time: u64,
+    parties: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct ExplorerAgreementsResponse {
+    agreements: Vec<ExplorerAgreementSummary>,
+    total: usize,
+    page: usize,
+    limit: usize,
+}
+
+#[derive(Serialize)]
+struct ExplorerProofEntry {
+    proof_id: String,
+    proof_type: String,
+    agreement_hash: String,
+    attested_by: String,
+    attestation_time: u64,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct ExplorerProofsResponse {
+    proofs: Vec<ExplorerProofEntry>,
+    total: usize,
+    page: usize,
+    limit: usize,
+}
+
+#[derive(Serialize)]
+struct ExplorerReputationResponse {
+    pubkey: String,
+    total_agreements_as_seller: usize,
+    proofs_submitted: usize,
+    note: String,
+}
+
+#[derive(Serialize)]
+struct ExplorerStatsResponse {
+    chain_height: u64,
+    total_agreements: usize,
+    total_proofs: usize,
+    peer_count: usize,
+    proof_types: std::collections::HashMap<String, usize>,
+}
+
+#[derive(Serialize)]
+struct ExplorerAgreementDetailResponse {
+    hash: String,
+    agreement: serde_json::Value,
+    lifecycle: AgreementLifecycleView,
+    proofs: Vec<ExplorerProofEntry>,
+}
+
+async fn explorer_agreements(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Query(q): Query<ExplorerPageQuery>,
+) -> impl axum::response::IntoResponse {
+    check_rate(&state, &addr).unwrap_or(());
+    let dir = explorer_agreements_dir();
+    let mut entries: Vec<(u64, ExplorerAgreementSummary)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !path.extension().map(|e| e == "json").unwrap_or(false) { continue; }
+            let hash = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(h) => h.to_string(),
+                None => continue,
+            };
+            let Ok(data) = std::fs::read_to_string(&path) else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
+            let agreement_id = v.get("agreement_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let template_type = v.get("template_type").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let total_amount = v.get("total_amount").and_then(|x| x.as_u64()).unwrap_or(0);
+            let creation_time = v.get("creation_time").and_then(|x| x.as_u64()).unwrap_or(0);
+            let parties: Vec<serde_json::Value> = v.get("parties")
+                .and_then(|x| x.as_array())
+                .map(|arr| arr.iter().map(|p| serde_json::json!({
+                    "role": p.get("role").and_then(|r| r.as_str()).unwrap_or(""),
+                    "display_name": p.get("display_name").and_then(|r| r.as_str()).unwrap_or(""),
+                    "address": p.get("address").and_then(|r| r.as_str()).unwrap_or(""),
+                })).collect())
+                .unwrap_or_default();
+            entries.push((creation_time, ExplorerAgreementSummary {
+                hash, agreement_id, template_type, total_amount, creation_time, parties,
+            }));
+        }
+    }
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    let total = entries.len();
+    let limit = q.limit.clamp(1, 100);
+    let page = q.page.max(1);
+    let skip = (page - 1) * limit;
+    let agreements: Vec<ExplorerAgreementSummary> = entries.into_iter()
+        .skip(skip).take(limit).map(|(_, s)| s).collect();
+    (explorer_cors_headers(), Json(ExplorerAgreementsResponse { agreements, total, page, limit }))
+}
+
+async fn explorer_agreement_detail(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    AxumPath(hash): AxumPath<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    check_rate(&state, &addr).unwrap_or(());
+    let hash = hash.to_lowercase();
+    let dir = explorer_agreements_dir();
+    let path = dir.join(format!("{}.json", hash));
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return (explorer_cors_headers(), Json(serde_json::json!({"error": "agreement not found"}))).into_response();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return (explorer_cors_headers(), Json(serde_json::json!({"error": "parse error"}))).into_response();
+    };
+    let agreement: irium_node_rs::settlement::AgreementObject = match serde_json::from_value(v.clone()) {
+        Ok(a) => a,
+        Err(_) => return (explorer_cors_headers(), Json(serde_json::json!({"error": "invalid agreement"}))).into_response(),
+    };
+    let lifecycle = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let linked = scan_agreement_linked_txs(&chain, &agreement, &hash);
+        let tip = chain.tip_height();
+        irium_node_rs::settlement::derive_lifecycle(&agreement, &hash, linked, tip)
+    };
+    let tip_height = state.status_height_cache.load(std::sync::atomic::Ordering::Relaxed);
+    let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+    let proofs: Vec<ExplorerProofEntry> = store.list_by_agreement(&hash).into_iter().map(|p| {
+        ExplorerProofEntry {
+            proof_id: p.proof_id.clone(),
+            proof_type: p.proof_type.clone(),
+            agreement_hash: p.agreement_hash.clone(),
+            attested_by: p.attested_by.clone(),
+            attestation_time: p.attestation_time,
+            status: proof_lifecycle_status(p.expires_at_height, tip_height).to_string(),
+        }
+    }).collect();
+    (explorer_cors_headers(), Json(ExplorerAgreementDetailResponse { hash, agreement: v, lifecycle, proofs })).into_response()
+}
+
+async fn explorer_proofs(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Query(q): Query<ExplorerProofsQuery>,
+) -> impl axum::response::IntoResponse {
+    check_rate(&state, &addr).unwrap_or(());
+    let tip_height = state.status_height_cache.load(std::sync::atomic::Ordering::Relaxed);
+    let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+    let all: Vec<ExplorerProofEntry> = match q.agreement_hash.as_deref() {
+        Some(h) => store.list_by_agreement(h).into_iter().map(|p| ExplorerProofEntry {
+            proof_id: p.proof_id.clone(), proof_type: p.proof_type.clone(),
+            agreement_hash: p.agreement_hash.clone(), attested_by: p.attested_by.clone(),
+            attestation_time: p.attestation_time,
+            status: proof_lifecycle_status(p.expires_at_height, tip_height).to_string(),
+        }).collect(),
+        None => store.list_all().into_iter().map(|p| ExplorerProofEntry {
+            proof_id: p.proof_id.clone(), proof_type: p.proof_type.clone(),
+            agreement_hash: p.agreement_hash.clone(), attested_by: p.attested_by.clone(),
+            attestation_time: p.attestation_time,
+            status: proof_lifecycle_status(p.expires_at_height, tip_height).to_string(),
+        }).collect(),
+    };
+    let total = all.len();
+    let limit = q.limit.clamp(1, 100);
+    let page = q.page.max(1);
+    let skip = (page - 1) * limit;
+    let proofs: Vec<ExplorerProofEntry> = all.into_iter().skip(skip).take(limit).collect();
+    (explorer_cors_headers(), Json(ExplorerProofsResponse { proofs, total, page, limit }))
+}
+
+async fn explorer_reputation(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    AxumPath(pubkey): AxumPath<String>,
+) -> impl axum::response::IntoResponse {
+    check_rate(&state, &addr).unwrap_or(());
+    let dir = explorer_agreements_dir();
+    let mut total_seller: usize = 0;
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !path.extension().map(|e| e == "json").unwrap_or(false) { continue; }
+            let Ok(data) = std::fs::read_to_string(&path) else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
+            if let Some(parties) = v.get("parties").and_then(|p| p.as_array()) {
+                for party in parties {
+                    let role = party.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    let addr = party.get("address").and_then(|a| a.as_str()).unwrap_or("");
+                    if (role == "seller" || role == "payee") && addr == pubkey.as_str() {
+                        total_seller += 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+    let proofs_submitted = store.list_all().into_iter()
+        .filter(|p| p.attested_by == pubkey)
+        .count();
+    (explorer_cors_headers(), Json(ExplorerReputationResponse {
+        pubkey,
+        total_agreements_as_seller: total_seller,
+        proofs_submitted,
+        note: "Reputation derived from locally stored agreement and proof data on this node.".to_string(),
+    }))
+}
+
+async fn explorer_stats(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    check_rate(&state, &addr).unwrap_or(());
+    let chain_height = state.status_height_cache.load(std::sync::atomic::Ordering::Relaxed);
+    let peer_count = state.status_peer_count_cache.load(std::sync::atomic::Ordering::Relaxed);
+    let dir = explorer_agreements_dir();
+    let total_agreements = std::fs::read_dir(&dir)
+        .map(|rd| rd.flatten().filter(|e| {
+            e.path().extension().map(|ex| ex == "json").unwrap_or(false)
+        }).count())
+        .unwrap_or(0);
+    let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+    let total_proofs = store.count();
+    let mut proof_types: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for p in store.list_all() {
+        *proof_types.entry(p.proof_type.clone()).or_insert(0) += 1;
+    }
+    (explorer_cors_headers(), Json(ExplorerStatsResponse {
+        chain_height, total_agreements, total_proofs, peer_count, proof_types,
+    }))
+}
+
     let mut app = Router::new()
         .route("/status", get(status))
         .route("/peers", get(peers))
@@ -8386,6 +8670,11 @@ async fn offers_feed(
         .route("/wallet/export_seed", get(wallet_export_seed))
         .route("/wallet/import_seed", post(wallet_import_seed))
         .route("/wallet/send", post(wallet_send))
+        .route("/explorer/agreements", get(explorer_agreements))
+        .route("/explorer/agreement/:hash", get(explorer_agreement_detail))
+        .route("/explorer/proofs", get(explorer_proofs))
+        .route("/explorer/reputation/:pubkey", get(explorer_reputation))
+        .route("/explorer/stats", get(explorer_stats))
         .route("/offers/feed", get(offers_feed))
         .route("/ws", get(ws_handler))
         .route("/events", get(sse_handler))
@@ -8445,6 +8734,7 @@ async fn offers_feed(
         status_host, status_port
     );
     println!("[i] WebSocket: ws://{}:{}/ws  SSE: http://{}:{}/events", host, port, host, port);
+    println!("[i] Explorer: http://{}:{}/explorer/stats | /explorer/agreements | /explorer/proofs", host, port);
 
     let tls_cert = std::env::var("IRIUM_TLS_CERT").ok();
     let tls_key = std::env::var("IRIUM_TLS_KEY").ok();
