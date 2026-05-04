@@ -547,3 +547,121 @@ To monitor proof finality progression in real time:
 Use `agreement.satisfied` as the final confirmation that a settlement is complete and
 release-eligible. If `agreement.proof_reorged` arrives, resubmit the proof and wait
 again.
+
+## Private Agreements (Off-Chain Storage)
+
+All agreement content is visible locally by default. Business users negotiating
+sensitive contracts can keep the full agreement content private by using the
+`--private` flag. Only the agreement hash is anchored on-chain; the content stays in
+`~/.irium/private-agreements/` on the local machine.
+
+### Creating a Private Agreement
+
+Add `--private` to any `agreement-create-*` command:
+
+```sh
+irium-wallet agreement-create-otc \
+  --agreement-id "order-2026-001" \
+  --buyer "buyer-id|Buyer Name|QBuyerAddr..." \
+  --seller "seller-id|Seller Name|QSellerAddr..." \
+  --amount 5.0 \
+  --asset-reference "Confidential goods" \
+  --payment-reference "Wire REF-001" \
+  --secret-hash <32bytehex> \
+  --refund-timeout 30000 \
+  --document-hash <32bytehex> \
+  --private
+```
+
+Output:
+
+```
+[private] agreement stored: /home/irium/.irium/private-agreements/7d52a7fe...json
+```
+
+The full agreement JSON is stored locally. The RPC endpoint returns 404 for this hash
+because the content was never broadcast to the network.
+
+### Selective Disclosure — Sharing with a Counterparty
+
+To share the agreement content with a specific recipient, encrypt it using their
+secp256k1 public key (ECIES with AES-256-GCM):
+
+```sh
+irium-wallet agreement-share <agreement_hash> <recipient_pubkey_hex> [--out blob.json]
+```
+
+Example:
+
+```sh
+irium-wallet agreement-share \
+  7d52a7fe80f5c676d52a4ae1234617a0252418ddff1bcea02e80f0294c15716d \
+  03e918af472e63de044c983df9f09bae57d4c78a70998d5d5fded408672886f868 \
+  --out shared-agreement.json
+```
+
+This produces a self-describing encrypted blob:
+
+```json
+{
+  "version": 1,
+  "scheme": "ecies-secp256k1-aes256gcm",
+  "ephemeral_pubkey": "03c5fc129c...",
+  "nonce": "9aa2f08a7595c65b15c669d4",
+  "ciphertext": "16182935cd..."
+}
+```
+
+Send this blob to the recipient by any channel (email, Signal, etc.). The blob contains
+no plaintext — only the recipient private key can decrypt it.
+
+### Decrypting a Received Blob
+
+The recipient decrypts using their wallet:
+
+```sh
+irium-wallet agreement-decrypt shared-agreement.json \
+  --wallet ~/.irium/wallet.json \
+  [--store-private] [--json]
+```
+
+- Without `--store-private`: prints the agreement to stdout.
+- With `--store-private`: stores it in `~/.irium/private-agreements/` for later use.
+
+The command tries every key in the wallet until one succeeds. If no key matches,
+it exits with an error.
+
+### Proof Submission for Private Agreements
+
+No change is needed for proof submission. The proof references the agreement hash
+which is already on-chain. The full agreement content is not required for proof
+validation.
+
+```sh
+irium-wallet agreement-proof-submit --proof proof.json [--rpc <url>]
+```
+
+### Network Privacy
+
+When `--private` is used, the agreement content is never transmitted over the network.
+The only on-chain anchor is the 32-byte hash. The P2P gossip layer never sees the
+full agreement terms.
+
+To verify: iriumd gossip logs show only proof and offer messages. Agreement content
+for private agreements does not appear in any gossip log entry.
+
+### Encryption Scheme
+
+The ECIES scheme used is:
+
+1. Generate a random ephemeral secp256k1 key pair.
+2. ECDH: shared secret = ephemeral_secret x recipient_pubkey (x-coordinate).
+3. Derive AES key: SHA256(shared_secret_x_bytes).
+4. Encrypt plaintext with AES-256-GCM using a random 12-byte nonce.
+5. Output: JSON blob with ephemeral_pubkey, nonce, ciphertext.
+
+Decryption reverses step 2 using the recipient private key:
+shared_secret = recipient_secret x ephemeral_pubkey.
+
+The shared secret is identical in both directions (ECDH property), so the same
+AES key is derived and the ciphertext can be decrypted.
