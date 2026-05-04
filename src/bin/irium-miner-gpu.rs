@@ -425,7 +425,7 @@ fn rpc_client() -> Result<Client, String> {
         match reqwest::Url::parse(&base) {
             Ok(url) if is_loopback_host(url.host_str().unwrap_or("")) => {
                 // Loopback-only: permit certificate bypass for local dev nodes.
-                builder = builder.danger_accept_invalid_certs(true); // codeql[rust/disabled-certificate-check]
+                builder = builder.danger_accept_invalid_certs(true); // codeql[rust/disabled-certificate-check] -- loopback-only guard, non-loopback explicitly rejected
             }
             Ok(_) => {
                 // Non-loopback: refuse to disable TLS verification regardless of

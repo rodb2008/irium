@@ -301,13 +301,13 @@ mod tests {
     use super::*;
 
     fn make_coinbase(aux_hash: &[u8; 32], chain_count: u32) -> Vec<u8> {
-        build_commitment(aux_hash, chain_count, 0).to_vec() // codeql[rust/hard-coded-cryptographic-value]
+        build_commitment(aux_hash, chain_count, 0).to_vec() // codeql[rust/hard-coded-cryptographic-value] -- AuxPoW protocol constant, not a secret
     }
 
     #[test]
     fn build_commitment_format() {
         let h = [0x42u8; 32];
-        let c = build_commitment(&h, 1, 99); // codeql[rust/hard-coded-cryptographic-value]
+        let c = build_commitment(&h, 1, 99); // codeql[rust/hard-coded-cryptographic-value] -- AuxPoW protocol constant, not a secret
         assert_eq!(&c[..4], &AUXPOW_COMMIT_MAGIC);
         assert_eq!(&c[4..36], &h);
         assert_eq!(&c[36..40], &1u32.to_le_bytes());
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn find_commitment_embedded_in_larger_coinbase() {
         let h = [0x77u8; 32];
-        let commitment = build_commitment(&h, 1, 0); // codeql[rust/hard-coded-cryptographic-value]
+        let commitment = build_commitment(&h, 1, 0); // codeql[rust/hard-coded-cryptographic-value] -- AuxPoW protocol constant, not a secret
         let mut cb = vec![0u8; 10];
         cb.extend_from_slice(&commitment);
         cb.extend_from_slice(&[0u8; 5]);
