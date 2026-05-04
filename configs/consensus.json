@@ -1,7 +1,7 @@
 {
   "ticker": "IRM",
   "consensus": "pow-sha256d",
-  "max_supply": 24500000,
+  "max_supply": 100000000,
   "block_time_target_seconds": 600,
   "initial_block_subsidy": 50,
   "halving_interval_blocks": 210000,

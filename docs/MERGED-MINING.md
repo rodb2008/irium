@@ -187,7 +187,7 @@ cpuminer-opt --algo sha256d \
 | Max difficulty step per block | 2x in either direction |
 | Block reward (current era) | 50 IRM |
 | Halving interval | 210,000 blocks |
-| Max supply | ~24,500,000 IRM |
+| Max supply | 100,000,000 IRM |
 | Coinbase maturity | 100 blocks |
 | AuxPoW version bit | bit 8 (value 256) |
 | AuxPoW commitment magic | `0xfa 0xbe 0x6d 0x6d` |

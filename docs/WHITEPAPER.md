@@ -278,12 +278,12 @@ CLTV (Check Lock Time Verify) script that prevents spending until the defined ti
 heights are reached. This is not a freely spendable premine — the coins cannot be
 moved until on-chain conditions are satisfied.
 
-Total maximum supply: approximately **24,500,000 IRM** (21,000,000 from block
-rewards + 3,500,000 from the genesis CLTV vesting output).
+Total fixed supply: **100,000,000 IRM** (96,500,000 from block rewards
++ 3,500,000 from the genesis CLTV vesting output).
 
 The `MAX_MONEY` constant (`src/constants.rs: MAX_MONEY = 100_000_000 * 100_000_000`)
-defines the maximum value permitted in any single transaction output — a
-per-output validation cap, not a monetary supply figure.
+enforces the 100,000,000 IRM hard supply cap. No block reward can cause the total
+minted supply to exceed this limit.
 
 ### Transaction Fees
 

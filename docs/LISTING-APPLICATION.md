@@ -17,7 +17,7 @@ This document is ready to copy and send to exchange listing teams, pool aggregat
 | **Block header format** | Standard Bitcoin 80-byte header (+ AuxPoW extension when merged mining) |
 | **Block reward** | 50 IRM |
 | **Halving interval** | 210,000 blocks |
-| **Max supply** | ~24,500,000 IRM |
+| **Max supply** | 100,000,000 IRM |
 | **Coinbase maturity** | 100 blocks |
 | **Address prefix** | Q (version byte 0x39, Base58Check) |
 | **P2P port** | 38291 (configurable) |
@@ -37,7 +37,7 @@ This document is ready to copy and send to exchange listing teams, pool aggregat
 | Era 2 | 420,001 | 12.5 IRM | 15,750,000 to 18,375,000 IRM |
 | Era 3 | 630,001 | 6.25 IRM | 18,375,000 to 19,687,500 IRM |
 | ... | ... | ... | ... |
-| Terminal | ~6,930,000 | ~0 | ~24,500,000 IRM |
+| Terminal | ~1,930,000+ | ~0 | 100,000,000 IRM |
 
 ## Current Network State (as of May 2026)
 

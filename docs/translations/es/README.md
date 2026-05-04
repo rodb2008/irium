@@ -17,7 +17,7 @@ La red se lanza con:
 - Sin red de pruebas
 - Sin dependencia de DNS (bootstrap con lista de semillas firmada)
 - Génesis bloqueado que aplica el calendario de adquisición del fundador
-- Suministro fijo máximo de **~24,500,000 IRM**
+- Suministro fijo máximo de **100,000,000 IRM**
 
 Este repositorio contiene la **implementación en Rust del nodo completo, minero, herramientas de billetera y utilidades SPV**.
 
@@ -31,7 +31,7 @@ Este repositorio contiene la **implementación en Rust del nodo completo, minero
 - Subsidio inicial: 50 IRM
 - Intervalo de reducción a la mitad: 210,000 bloques
 - Madurez de coinbase: 100 bloques
-- Suministro máximo: ~24,500,000 IRM
+- Suministro máximo: 100,000,000 IRM
 - Asignación génesis: **3,500,000 IRM bloqueados con CLTV**
 
 ---

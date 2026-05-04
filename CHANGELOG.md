@@ -13,7 +13,7 @@ upgrade and marks the first official tagged release of the codebase.
 **Core chain**
 - SHA-256d proof-of-work consensus — fully compatible with Bitcoin ASIC hardware and merged mining
 - P2PKH address scheme with custom version byte; IRM addresses begin with `I`
-- Block reward of 50 IRM per block, halving every 210,000 blocks; maximum supply ~24,500,000 IRM
+- Block reward of 50 IRM per block, halving every 210,000 blocks; maximum supply 100,000,000 IRM
 - 600-second target block interval, difficulty retarget every 2,016 blocks
 - COINBASE_MATURITY of 100 blocks before coinbase outputs are spendable
 - Genesis block locked and immutable in `configs/genesis-locked.json`

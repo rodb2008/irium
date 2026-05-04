@@ -13,7 +13,7 @@ Irium is a SHA-256d proof-of-work blockchain with a built-in settlement layer fo
 - Algorithm: SHA-256d
 - Block time: 600 seconds
 - Block reward: 50 IRM (halves every 210,000 blocks, same schedule as Bitcoin)
-- Max supply: ~24,500,000 IRM
+- Max supply: 100,000,000 IRM
 - Current height: 20,299
 - No premine. No admin keys. MIT licence.
 

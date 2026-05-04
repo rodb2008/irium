@@ -13,7 +13,7 @@
 
 Irium is a proof-of-work blockchain built for trustless escrow and proof-based commerce. Instead of smart contracts, it uses a deterministic settlement layer: buyer and seller lock funds on-chain, an attestor submits a cryptographic proof of delivery, and the chain enforces release or refund automatically. No lawyers, no chargebacks, no intermediaries.
 
-SHA-256d consensus. No premine. No admin keys. ~24,500,000 IRM total supply (21M from mining + 3.5M genesis CLTV vesting). Mainnet live since January 5, 2026.
+SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.5M from mining + 3.5M genesis CLTV vesting). Mainnet live since January 5, 2026.
 
 ---
 
