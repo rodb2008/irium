@@ -438,3 +438,112 @@ irium-wallet attestor-withdraw-bond --from QMyAttestorAddress...
 This publishes `bond1w:<pkh>` on-chain and marks the bond as withdrawn locally.
 
 See `docs/ATTESTOR-GUIDE.md` for the full attestor bonding reference.
+
+
+---
+
+## Proof Finality and Reorg Protection
+
+### What is Proof Finality Depth?
+
+When a proof is submitted, it is included in a block and that block enters the chain.
+However, any block can theoretically be reorganized away if a longer competing chain
+appears. Until a block is buried deep enough under subsequent blocks, it is not
+considered final.
+
+Irium uses a configurable **proof finality depth** (default: 6 blocks) to protect
+settlement agreements from ambiguous states caused by reorgs.
+
+A proof is only considered final — and release eligibility is only granted — after the
+block containing the proof is at least `PROOF_FINALITY_DEPTH` blocks deep.
+
+### Configuring Finality Depth
+
+Set the `IRIUM_PROOF_FINALITY_DEPTH` environment variable before starting iriumd:
+
+```bash
+# Use a shorter depth for testing (faster confirmation)
+IRIUM_PROOF_FINALITY_DEPTH=2 ./iriumd
+
+# Use a deeper finality for high-value agreements (more conservative)
+IRIUM_PROOF_FINALITY_DEPTH=12 ./iriumd
+```
+
+The default of 6 blocks matches the conventional finality threshold for SHA-256d PoW
+chains. For most commercial agreements, 6 blocks is sufficient.
+
+### Agreement Status Fields
+
+The `agreement-status` RPC now returns three finality fields:
+
+```json
+{
+  "agreement_hash": "...",
+  "lifecycle": { ... },
+  "proof_depth": 4,
+  "proof_final": false,
+  "release_eligible": false
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `proof_depth` | `number \| null` | How many blocks deep the proof is. `null` if no proof submitted yet. |
+| `proof_final` | `bool` | `true` when `proof_depth >= PROOF_FINALITY_DEPTH`. |
+| `release_eligible` | `bool` | `true` when `proof_final` is `true` and the agreement is in a releasable state (Funded or PartiallyReleased). |
+
+**Agreement parties should wait for `release_eligible: true` before considering a
+settlement complete.** Do not act on `proof_final: false` as the proof may be rolled
+back by a chain reorg.
+
+### Progression Example
+
+With `PROOF_FINALITY_DEPTH=6`:
+
+| Blocks after proof | proof_depth | proof_final | release_eligible |
+|---|---|---|---|
+| 0 (just submitted) | 0 | false | false |
+| 1 | 1 | false | false |
+| 2 | 2 | false | false |
+| 3 | 3 | false | false |
+| 4 | 4 | false | false |
+| 5 | 5 | false | false |
+| 6 | 6 | true | true |
+
+### Reorg Recovery
+
+If a chain reorganization occurs and the block containing a submitted proof is
+reorganized away, iriumd detects this automatically.
+
+When a reorg is detected:
+1. Any proof whose submission block is no longer in the canonical chain is re-evaluated.
+2. If the proof no longer appears in the chain, the agreement's `proof_depth` resets.
+3. A `agreement.proof_reorged` WebSocket event is emitted for each affected agreement.
+4. The seller should resubmit the proof once the network stabilizes.
+
+The `agreement.proof_reorged` event payload:
+
+```json
+{
+  "event": "agreement.proof_reorged",
+  "agreement_hash": "abc123...",
+  "reorged_at_height": 20491,
+  "new_tip_height": 20490
+}
+```
+
+### WebSocket Subscription for Finality Events
+
+To monitor proof finality progression in real time:
+
+```json
+{
+  "action": "subscribe",
+  "events": ["agreement.proof_submitted", "agreement.satisfied", "agreement.proof_reorged"],
+  "filter": { "agreement_hash": "your_agreement_hash_here" }
+}
+```
+
+Use `agreement.satisfied` as the final confirmation that a settlement is complete and
+release-eligible. If `agreement.proof_reorged` arrives, resubmit the proof and wait
+again.
