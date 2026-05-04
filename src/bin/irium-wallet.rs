@@ -8629,17 +8629,29 @@ fn handle_attestor_list(args: &[String]) -> Result<(), String> {
         }
     }
     let base = rpc_url.trim_end_matches('/');
-    let policies: Vec<ProofPolicy> = match rpc_client(base).and_then(|client| {
-        rpc_post_json::<serde_json::Value, serde_json::Value>(
+    // listpolicies returns summaries (attestors as count); we then call getpolicy
+    // for each agreement_hash to retrieve the full attestor list.
+    let policies: Vec<ProofPolicy> = (|| -> Option<Vec<ProofPolicy>> {
+        let client = rpc_client(base).ok()?;
+        let summary_resp = rpc_post_json::<serde_json::Value, serde_json::Value>(
             &client, base, "/rpc/listpolicies",
             &serde_json::json!({ "active_only": false }),
-        )
-    }) {
-        Ok(resp) => {
-            resp.get("policies").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default()
+        ).ok()?;
+        let summaries = summary_resp.get("policies")?.as_array()?;
+        let mut out = Vec::new();
+        for s in summaries {
+            let hash = s.get("agreement_hash")?.as_str()?;
+            if let Ok(resp) = rpc_post_json::<GetPolicyRpcRequest, GetPolicyRpcResponse>(
+                &client, base, "/rpc/getpolicy",
+                &GetPolicyRpcRequest { agreement_hash: hash.to_string() },
+            ) {
+                if let Some(p) = resp.policy {
+                    out.push(p);
+                }
+            }
         }
-        Err(_) => Vec::new(),
-    };
+        Some(out)
+    })().unwrap_or_default();
     use std::collections::HashMap;
     let mut seen: HashMap<String, irium_node_rs::settlement::ApprovedAttestor> = HashMap::new();
     for policy in &policies {

@@ -19,6 +19,16 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
+      - name: Check token
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN secret is NOT set — publish will fail"
+            exit 1
+          fi
+          echo "NPM_TOKEN secret is set (length: ${#NODE_AUTH_TOKEN})"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Install dependencies
         run: npm ci
 
