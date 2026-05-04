@@ -21038,10 +21038,10 @@ fn main() {
                     keys: vec![key.clone()],
                 };
                 println!("BIP32 wallet created");
-                println!("mnemonic: {}", mnemonic); // codeql[rust/clear-text-logging-sensitive-data]
+                println!("mnemonic: {}", mnemonic); // codeql[rust/clear-text-logging-sensitive-data] -- intentional: shown once at wallet creation so user can record it
                 println!("derivation path: m/44'/1'/0'/0/0");
                 println!("IMPORTANT: write down your mnemonic -- it cannot be recovered");
-                println!("address: {}", key.address); // codeql[rust/clear-text-logging-sensitive-data]
+                println!("address: {}", key.address); // codeql[rust/clear-text-logging-sensitive-data] -- public address, not sensitive data
                 if let Err(e) = save_wallet(&path, &wallet) {
                     eprintln!("Failed to save wallet: {}", e);
                     std::process::exit(1);
@@ -21062,7 +21062,7 @@ fn main() {
                     keys: vec![key.clone()],
                 };
                 println!("wallet created (custom derivation scheme)");
-                println!("address: {}", key.address); // codeql[rust/clear-text-logging-sensitive-data]
+                println!("address: {}", key.address); // codeql[rust/clear-text-logging-sensitive-data] -- public address, not sensitive data
                 if let Err(e) = save_wallet(&path, &wallet) {
                     eprintln!("Failed to save wallet: {}", e);
                     std::process::exit(1);
@@ -21100,7 +21100,7 @@ fn main() {
             };
             println!("BIP32 wallet imported from mnemonic");
             println!("derivation path: m/44'/1'/0'/0/0");
-            println!("address: {}", key.address); // codeql[rust/clear-text-logging-sensitive-data]
+            println!("address: {}", key.address); // codeql[rust/clear-text-logging-sensitive-data] -- public address, not sensitive data
             if let Err(e) = save_wallet(&path, &wallet) {
                 eprintln!("Failed to save wallet: {}", e);
                 std::process::exit(1);
