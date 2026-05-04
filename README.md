@@ -74,7 +74,8 @@ cargo build --release --features gpu --bin irium-miner-gpu
 iriumd                              # start the node (syncs automatically)
 curl http://127.0.0.1:38300/status  # confirm it is running
 irium-wallet new-address            # generate your first address
-irium-wallet balance                # check balance once synced
+irium-wallet list-addresses         # see your addresses
+irium-wallet balance <YOUR_ADDRESS> # check balance once synced
 ```
 
 The node connects to the two official seed nodes and begins syncing. No configuration needed for a basic setup. Default P2P port: 38291. Default RPC port: 38300.
