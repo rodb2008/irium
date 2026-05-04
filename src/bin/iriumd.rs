@@ -110,6 +110,15 @@ struct AppState {
     proof_store: Arc<Mutex<ProofStore>>,
     policy_store: Arc<Mutex<PolicyStore>>,
     event_tx: EventTx,
+    /// Maps proof_id → chain tip height at submission time (Phase 7 finality tracking).
+    proof_heights: Arc<Mutex<std::collections::HashMap<String, u64>>>,
+}
+
+fn proof_finality_depth() -> u64 {
+    std::env::var("IRIUM_PROOF_FINALITY_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(6)
 }
 
 fn emit_event(tx: &EventTx, event_type: &str, data: serde_json::Value) {
@@ -144,7 +153,7 @@ fn ws_event_matches(event_type: &str, subscribed: &HashSet<String>) -> bool {
 }
 
 fn ws_is_public_event(event_type: &str) -> bool {
-    matches!(event_type, "block.new" | "offer.created")
+    matches!(event_type, "block.new" | "offer.created" | "agreement.proof_reorged")
 }
 
 async fn ws_handle_socket(mut socket: WebSocket, state: AppState, is_public_conn: bool) {
@@ -726,6 +735,13 @@ struct AgreementTxsResponse {
 struct AgreementStatusResponse {
     agreement_hash: String,
     lifecycle: AgreementLifecycleView,
+    /// Number of blocks since the most recent proof for this agreement was submitted.
+    /// None when no proofs exist.
+    proof_depth: Option<u64>,
+    /// True when proof_depth >= IRIUM_PROOF_FINALITY_DEPTH (default 6).
+    proof_final: bool,
+    /// True when the lifecycle indicates release eligibility AND proof_final is true.
+    release_eligible: bool,
 }
 
 #[derive(Serialize)]
@@ -4185,14 +4201,47 @@ async fn agreement_status(
     require_rpc_auth(&headers)?;
     let agreement_hash =
         compute_agreement_hash_hex(&req.agreement).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let lifecycle = {
+    let (lifecycle, tip_height) = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip = chain.tip_height();
         let linked = scan_agreement_linked_txs(&chain, &req.agreement, &agreement_hash);
-        derive_lifecycle(&req.agreement, &agreement_hash, linked, chain.tip_height())
+        (derive_lifecycle(&req.agreement, &agreement_hash, linked, tip), tip)
     };
+    // Compute proof finality depth for this agreement.
+    let finality_depth = proof_finality_depth();
+    let (proof_depth, proof_final) = {
+        let heights = state.proof_heights.lock().unwrap_or_else(|e| e.into_inner());
+        let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+        let proof_ids: Vec<String> = store
+            .list_by_agreement(&agreement_hash)
+            .into_iter()
+            .map(|p| p.proof_id.clone())
+            .collect();
+        // Find the minimum submitted_at_height across all proofs for this agreement
+        // (the shallowest proof needs to reach finality depth first).
+        let min_height = proof_ids
+            .iter()
+            .filter_map(|id| heights.get(id).copied())
+            .reduce(u64::min);
+        match min_height {
+            None => (None, false),
+            Some(h) => {
+                let depth = tip_height.saturating_sub(h);
+                (Some(depth), depth >= finality_depth)
+            }
+        }
+    };
+    let release_eligible = proof_final && matches!(
+        lifecycle.state,
+        irium_node_rs::settlement::AgreementLifecycleState::Funded
+            | irium_node_rs::settlement::AgreementLifecycleState::PartiallyReleased
+    );
     Ok(Json(AgreementStatusResponse {
         agreement_hash,
         lifecycle,
+        proof_depth,
+        proof_final,
+        release_eligible,
     }))
 }
 
@@ -5508,6 +5557,11 @@ async fn submit_proof_rpc(
         Some(h) => tip_height >= h,
     };
     let proof_for_gossip = req.proof.clone();
+    // Phase 7: record submission height for finality tracking before consuming req.proof.
+    {
+        let mut heights = state.proof_heights.lock().unwrap_or_else(|e| e.into_inner());
+        heights.insert(proof_for_gossip.proof_id.clone(), tip_height);
+    }
     let mut store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
     let outcome = store.submit(req.proof).map_err(|e| bad(&e))?;
     if outcome.accepted {
@@ -8071,12 +8125,15 @@ async fn main() {
             storage::state_dir().join("policies.json"),
         ))),
         event_tx: event_tx.clone(),
+        proof_heights: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     // Background task: emit block.new events when chain height advances.
     {
         let block_event_tx = event_tx.clone();
         let block_chain = app_state.chain.clone();
+        let reorg_proof_heights = app_state.proof_heights.clone();
+        let reorg_proof_store = app_state.proof_store.clone();
         tokio::spawn(async move {
             let mut last_known_height: u64 = 0;
             let mut last_known_hash = String::new();
@@ -8088,6 +8145,32 @@ async fn main() {
                     let hash = g.chain.last().map(|b| hex::encode(b.header.hash())).unwrap_or_default();
                     (height, hash)
                 };
+                if h < last_known_height && last_known_height > 0 {
+                    // Reorg detected: tip rewound. Emit proof_reorged for any proof
+                    // submitted at a height now above the new tip.
+                    let reorged_agreements = {
+                        let heights = reorg_proof_heights.lock().unwrap_or_else(|e| e.into_inner());
+                        let store = reorg_proof_store.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut agreements: std::collections::HashSet<String> = Default::default();
+                        for (proof_id, &submitted_at) in heights.iter() {
+                            if submitted_at > h {
+                                // This proof was submitted at a height that is now reorganized.
+                                if let Some(proof) = store.list_all().into_iter().find(|p| p.proof_id == *proof_id) {
+                                    agreements.insert(proof.agreement_hash.clone());
+                                }
+                            }
+                        }
+                        agreements
+                    };
+                    for agreement_hash in reorged_agreements {
+                        emit_event(&block_event_tx, "agreement.proof_reorged", serde_json::json!({
+                            "agreement_hash": agreement_hash,
+                            "reorg_tip": h,
+                            "previous_tip": last_known_height,
+                            "note": "One or more proofs for this agreement were submitted at a height that has been reorganized. Resubmit the proof once the chain stabilizes.",
+                        }));
+                    }
+                }
                 if h > last_known_height || (h == last_known_height && hash != last_known_hash && !hash.is_empty()) {
                     if last_known_height > 0 {
                         emit_event(&block_event_tx, "block.new", serde_json::json!({
@@ -8107,6 +8190,8 @@ async fn main() {
         let drain_node = gossip_p2p.clone();
         let drain_proof_store = app_state.proof_store.clone();
         let drain_event_tx = event_tx.clone();
+        let drain_heights = app_state.proof_heights.clone();
+        let drain_chain_for_gossip = app_state.chain.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -8114,6 +8199,10 @@ async fn main() {
                 if proofs.is_empty() {
                     continue;
                 }
+                let gossip_tip_height = {
+                    let g = drain_chain_for_gossip.lock().unwrap_or_else(|e| e.into_inner());
+                    g.tip_height()
+                };
                 let mut store = drain_proof_store.lock().unwrap_or_else(|e| e.into_inner());
                 for json in proofs {
                     if let Ok(proof) = serde_json::from_str::<SettlementProof>(&json) {
@@ -8121,6 +8210,11 @@ async fn main() {
                         let pid_for_evt = proof.proof_id.clone();
                         if let Ok(outcome) = store.submit(proof) {
                             if outcome.accepted {
+                                // Phase 7: record gossip proof receipt height.
+                                {
+                                    let mut heights = drain_heights.lock().unwrap_or_else(|e| e.into_inner());
+                                    heights.insert(pid_for_evt.clone(), gossip_tip_height);
+                                }
                                 emit_event(&drain_event_tx, "proof.gossip_received", serde_json::json!({
                                     "agreement_hash": ah_for_evt,
                                     "proof_id": pid_for_evt,
@@ -8735,6 +8829,7 @@ async fn explorer_stats(
     );
     println!("[i] WebSocket: ws://{}:{}/ws  SSE: http://{}:{}/events", host, port, host, port);
     println!("[i] Explorer: http://{}:{}/explorer/stats | /explorer/agreements | /explorer/proofs", host, port);
+    println!("[i] Proof finality depth: {} blocks (IRIUM_PROOF_FINALITY_DEPTH)", proof_finality_depth());
 
     let tls_cert = std::env::var("IRIUM_TLS_CERT").ok();
     let tls_key = std::env::var("IRIUM_TLS_KEY").ok();
@@ -8890,6 +8985,7 @@ mod tests {
                 "json",
             )))),
             event_tx: tokio::sync::broadcast::channel::<std::sync::Arc<String>>(WS_BROADCAST_CAPACITY).0,
+            proof_heights: Arc::new(Mutex::new(std::collections::HashMap::new())),
         };
 
         (state, sender, recipient, refund)
