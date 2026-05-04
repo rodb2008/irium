@@ -30,6 +30,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use bs58;
 use get_if_addrs::get_if_addrs;
+use subtle::ConstantTimeEq;
 use irium_node_rs::activation::{
     network_kind_from_env, resolved_htlcv1_activation_height, resolved_lwma_activation_height,
     resolved_lwma_v2_activation_height, resolved_mpsov1_activation_height,
@@ -2763,8 +2764,11 @@ fn require_rpc_auth(headers: &HeaderMap) -> Result<(), StatusCode> {
         _ => return Ok(()),
     };
     let expected = format!("Bearer {}", token);
-    let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
-    if header == Some(expected.as_str()) {
+    let provided = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if provided.as_bytes().ct_eq(expected.as_bytes()).into() {
         Ok(())
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -2777,8 +2781,11 @@ fn rpc_authorized(headers: &HeaderMap) -> bool {
         _ => return false,
     };
     let expected = format!("Bearer {}", token);
-    let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
-    header == Some(expected.as_str())
+    let provided = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    provided.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 fn check_rate_with_auth(

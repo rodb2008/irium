@@ -275,10 +275,10 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let sem = p2p_blocking_sem();
-    let permit = sem
-        .acquire_owned()
-        .await
-        .expect("blocking semaphore closed");
+    let permit = match sem.acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return tokio::task::spawn_blocking(f).await,
+    };
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         f()

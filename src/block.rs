@@ -107,9 +107,10 @@ impl Block {
                 h
             })
             .collect();
+        if leaves.is_empty() { return [0u8; 32]; }
         while leaves.len() > 1 {
             if leaves.len() % 2 == 1 {
-                let last = *leaves.last().unwrap();
+                let last = leaves[leaves.len() - 1]; // safe: len > 1 by while guard
                 leaves.push(last);
             }
             let mut next = Vec::with_capacity(leaves.len() / 2);

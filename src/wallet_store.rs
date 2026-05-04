@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
+use zeroize::Zeroize;
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
 const WIF_VERSION: u8 = 0x80;
@@ -33,7 +34,7 @@ pub struct WalletCrypto {
     cipher: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
 pub struct WalletPlain {
     pub keys: Vec<WalletKey>,
     #[serde(default)]
@@ -42,7 +43,7 @@ pub struct WalletPlain {
     pub next_index: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
 pub struct WalletKey {
     pub address: String,
     pub pkh: String,
@@ -55,6 +56,13 @@ struct WalletState {
     unlocked: Option<WalletPlain>,
     passphrase: Option<String>,
     last_touch: Option<Instant>,
+}
+
+impl Drop for WalletState {
+    fn drop(&mut self) {
+        if let Some(ref mut p) = self.passphrase { p.zeroize(); }
+        if let Some(ref mut w) = self.unlocked { w.zeroize(); }
+    }
 }
 
 pub struct WalletManager {
