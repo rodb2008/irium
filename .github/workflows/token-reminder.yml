@@ -5,6 +5,9 @@ on:
     - cron: "0 9 18 7 *"  # 09:00 UTC on July 18 each year
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   open-reminder-issue:
     runs-on: ubuntu-latest

@@ -176,6 +176,7 @@ jobs:
           files: dist/**
           fail_on_unmatched_files: true
           generate_release_notes: false
+          update_only_unreleased: false
           body: |
             ## Irium ${{ github.ref_name }}
 
