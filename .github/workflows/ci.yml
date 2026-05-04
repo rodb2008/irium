@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, testing-codes-before-merging]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: cargo test --all
+        run: cargo test --all
+
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --quiet
+          cargo audit

@@ -35,6 +35,8 @@ aes-gcm = "0.10"
 
 pbkdf2 = "0.12"
 bip39 = { version = "2", features = ["rand"] }
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
 ocl = { version = "0.19", optional = true }
 
 [dev-dependencies]

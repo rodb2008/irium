@@ -159,7 +159,7 @@ impl MempoolManager {
             if let Some((lowest_txid, lowest)) = self
                 .entries
                 .iter()
-                .min_by(|a, b| a.1.fee_per_byte.partial_cmp(&b.1.fee_per_byte).unwrap())
+                .min_by(|a, b| a.1.fee_per_byte.total_cmp(&b.1.fee_per_byte))
             {
                 if fee_per_byte <= lowest.fee_per_byte {
                     return Err("Mempool full and fee too low".to_string());
