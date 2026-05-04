@@ -10393,9 +10393,9 @@ fn handle_feed_list(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-// Feed bootstrap uses P2P-based peer discovery — no hardcoded endpoints.
-// New nodes discover marketplace feeds dynamically through the P2P layer.
-const BOOTSTRAP_FEEDS: &[&str] = &[];
+const BOOTSTRAP_FEEDS: &[&str] = &[
+    "https://api.iriumlabs.org/offers/feed",
+];
 
 fn handle_feed_bootstrap(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
@@ -10414,11 +10414,16 @@ fn handle_feed_bootstrap(args: &[String]) -> Result<(), String> {
     }
     if added > 0 {
         save_feeds_config(&feeds)?;
+        println!("Connected to {} public marketplace feed{}.", added, if added == 1 { "" } else { "s" });
+    } else if skipped > 0 {
+        println!("Already connected to the public marketplace.");
+    } else {
+        println!("No bootstrap feeds configured.");
+        return Ok(());
     }
-    println!("added:        {}", added);
-    println!("skipped:      {}", skipped);
-    println!("total feeds:  {}", feeds.len());
-    Ok(())
+    println!("Syncing offers...");
+    println!();
+    handle_offer_feed_sync(&[])
 }
 
 fn handle_offer_feed_prune(args: &[String]) -> Result<(), String> {
