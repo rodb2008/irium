@@ -1,4 +1,5 @@
 pub mod activation;
+pub mod attestor_bond;
 pub mod auxpow;
 pub mod anchors;
 pub mod block;

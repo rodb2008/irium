@@ -8669,6 +8669,8 @@ fn handle_attestor_list(args: &[String]) -> Result<(), String> {
         println!("tip  Attestors are extracted from proof policies stored on this node.");
         println!("tip  Run agreement-proof-submit to add proofs, which reference attestors.");
     } else {
+        use irium_node_rs::attestor_bond::AttestorBondStore;
+        let bond_store = AttestorBondStore::load(&irium_node_rs::attestor_bond::bond_store_path());
         println!("attestors ({}):", attestors.len());
         for att in &attestors {
             print!("  {} ({})", att.attestor_id, att.pubkey_hex);
@@ -8678,9 +8680,522 @@ fn handle_attestor_list(args: &[String]) -> Result<(), String> {
             if let Some(ref domain) = att.domain {
                 print!(" [{}]", domain);
             }
+            // Show bond status: derive pkh from pubkey_hex to look up bond record
+            if let Some(pkh_hex) = hex::decode(&att.pubkey_hex).ok().and_then(|b| {
+                use sha2::{Digest, Sha256};
+                use ripemd::Ripemd160;
+                if b.len() == 33 || b.len() == 65 {
+                    let sha = Sha256::digest(&b);
+                    let ripe = Ripemd160::digest(sha);
+                    Some(hex::encode(ripe))
+                } else { None }
+            }) {
+                if let Some(rec) = bond_store.find_by_pkh(&pkh_hex) {
+                    if rec.withdrawn {
+                        print!(" [bond: withdrawn]");
+                    } else if rec.slash_count > 0 {
+                        print!(" [bond: {} IRM SLASHED x{}]", format_irm(rec.bond_atoms), rec.slash_count);
+                    } else {
+                        print!(" [bond: {} IRM active]", format_irm(rec.bond_atoms));
+                    }
+                } else {
+                    print!(" [bond: none — unbonded]");
+                }
+            }
+            println!();
+        }
+        println!();
+        println!("tip  Run attestor-bond-status to see full bond details.");
+    }
+    Ok(())
+}
+
+
+fn attestor_bond_store_path() -> std::path::PathBuf {
+    irium_node_rs::attestor_bond::bond_store_path()
+}
+
+fn warn_unbonded_attestors(pubkey_hexes: &[String]) {
+    use irium_node_rs::attestor_bond::AttestorBondStore;
+    let store = AttestorBondStore::load(&irium_node_rs::attestor_bond::bond_store_path());
+    for pubkey_hex in pubkey_hexes {
+        let pkh_hex = hex::decode(pubkey_hex).ok().and_then(|b| {
+            use sha2::{Digest, Sha256};
+            use ripemd::Ripemd160;
+            if b.len() == 33 || b.len() == 65 {
+                let sha = Sha256::digest(&b);
+                let ripe = Ripemd160::digest(sha);
+                Some(hex::encode(ripe))
+            } else { None }
+        });
+        if let Some(ref pkh) = pkh_hex {
+            match store.find_by_pkh(pkh) {
+                None => eprintln!("warn  attestor {} has no registered bond — agreement counterparties have no economic protection", pubkey_hex),
+                Some(rec) if rec.withdrawn => eprintln!("warn  attestor {} bond is withdrawn — counterparties have no active bond protection", pubkey_hex),
+                Some(rec) if rec.slash_count > 0 => eprintln!("warn  attestor {} has been slashed {} time(s) — review attestor trust before using", pubkey_hex, rec.slash_count),
+                _ => {}
+            }
+        } else {
+            eprintln!("warn  could not derive pkh for attestor {} — bond status unknown", pubkey_hex);
+        }
+    }
+}
+
+fn handle_attestor_register(args: &[String]) -> Result<(), String> {
+    use irium_node_rs::attestor_bond::{
+        build_bond_anchor_script, AttestorBondRecord, AttestorBondStore,
+    };
+    let mut bond_amount: Option<u64> = None;
+    let mut from_addr: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bond" => { bond_amount = Some(parse_irm(&parse_required_string_flag(args, &mut i, "--bond")?)?); }
+            "--from" => { from_addr = Some(parse_required_string_flag(args, &mut i, "--from")?); }
+            "--rpc" => { rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let bond_atoms = bond_amount.ok_or_else(|| "--bond <amount_irm> is required".to_string())?;
+    if bond_atoms == 0 { return Err("bond amount must be greater than zero".to_string()); }
+    let path = wallet_path();
+    let wallet = load_wallet(&path)?;
+    let addr = match from_addr {
+        Some(ref a) => a.clone(),
+        None => wallet.keys.first().map(|k| k.address.clone())
+            .ok_or_else(|| "wallet has no addresses; run new-address first".to_string())?,
+    };
+    let key = find_key(&wallet, &addr)
+        .ok_or_else(|| format!("address {} not found in wallet", addr))?.clone();
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let payload = fetch_utxos(&client, base, &addr)?;
+    let current_height = payload.height;
+    let mut utxos = payload.utxos.clone();
+    utxos.sort_by_key(|u| u.value);
+    let mut fee_per_byte = DEFAULT_FEE_PER_BYTE;
+    if let Ok(est) = fetch_fee_estimate(&client, base) {
+        let est_fee = est.min_fee_per_byte.ceil() as u64;
+        if est_fee > fee_per_byte { fee_per_byte = est_fee; }
+    }
+    let fee = estimate_tx_size(1, 2).saturating_mul(fee_per_byte).max(500);
+    let mut selected = Vec::new();
+    let mut total = 0u64;
+    for utxo in utxos.iter() {
+        let confirmations = current_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < COINBASE_MATURITY { continue; }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.value);
+        if total >= fee { break; }
+    }
+    if total < fee {
+        return Err(format!("insufficient funds for registration fee ({} IRM needed)", format_irm(fee)));
+    }
+    let wallet_total: u64 = payload.utxos.iter().map(|u| u.value).sum();
+    if wallet_total < bond_atoms {
+        return Err(format!(
+            "wallet balance ({} IRM) is less than declared bond ({} IRM)",
+            format_irm(wallet_total), format_irm(bond_atoms)
+        ));
+    }
+    let pkh_vec = base58_p2pkh_to_hash(&addr).ok_or_else(|| "invalid from address".to_string())?;
+    let mut pkh_arr = [0u8; 20];
+    pkh_arr.copy_from_slice(&pkh_vec);
+    let pkh_hex = hex::encode(pkh_arr);
+    let priv_bytes = hex::decode(&key.privkey).map_err(|e| format!("invalid private key: {e}"))?;
+    let signing_key = SigningKey::from_bytes(priv_bytes.as_slice().into())
+        .map_err(|e| format!("invalid signing key: {e}"))?;
+    let vk = signing_key.verifying_key();
+    let pk_comp = vk.to_encoded_point(true);
+    let pk_uncomp = vk.to_encoded_point(false);
+    let pub_bytes = if hash160(pk_comp.as_bytes()) == pkh_arr {
+        pk_comp.as_bytes().to_vec()
+    } else if hash160(pk_uncomp.as_bytes()) == pkh_arr {
+        pk_uncomp.as_bytes().to_vec()
+    } else {
+        return Err("wallet key mismatch: address does not match private key".to_string());
+    };
+    let pubkey_hex = hex::encode(&pub_bytes);
+    let bond_script = build_bond_anchor_script(&pkh_hex, bond_atoms);
+    let change_script = p2pkh_script(&pkh_arr);
+    let mut inputs: Vec<TxInput> = Vec::new();
+    for utxo in &selected {
+        let txid = hex_to_32(&utxo.txid)?;
+        inputs.push(TxInput { prev_txid: txid, prev_index: utxo.index, script_sig: Vec::new(), sequence: 0xffff_ffff });
+    }
+    let outputs = vec![
+        TxOutput { value: 0, script_pubkey: bond_script },
+        TxOutput { value: total.saturating_sub(fee), script_pubkey: change_script },
+    ];
+    let mut tx = Transaction { version: 1, inputs, outputs, locktime: 0 };
+    for _ in 0..2 {
+        for (idx, utxo) in selected.iter().enumerate() {
+            let script_pubkey = hex::decode(&utxo.script_pubkey).map_err(|e| format!("invalid utxo: {e}"))?;
+            let digest = signature_digest(&tx, idx, &script_pubkey);
+            let sig: Signature = signing_key.sign_prehash(&digest).map_err(|e| format!("{e}"))?;
+            let sig = sig.normalize_s().unwrap_or(sig);
+            let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+            sig_bytes.push(0x01);
+            let mut script = Vec::new();
+            script.push(sig_bytes.len() as u8);
+            script.extend_from_slice(&sig_bytes);
+            script.push(pub_bytes.len() as u8);
+            script.extend_from_slice(&pub_bytes);
+            tx.inputs[idx].script_sig = script;
+        }
+        let actual_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte).max(500);
+        tx.outputs[1].value = total.saturating_sub(actual_fee);
+    }
+    submit_tx(&client, base, &tx)?;
+    let txid = hex::encode(tx.txid());
+    let bond_store_file = attestor_bond_store_path();
+    let mut store = AttestorBondStore::load(&bond_store_file);
+    if let Some(existing) = store.find_by_address_mut(&addr) {
+        existing.bond_atoms = bond_atoms;
+        existing.registered_height = current_height;
+        existing.registration_txid = txid.clone();
+        existing.withdrawn = false;
+        existing.withdraw_height = None;
+        existing.slash_count = 0;
+        existing.slashed_atoms = 0;
+        existing.slash_records.clear();
+    } else {
+        store.bonds.push(AttestorBondRecord {
+            pubkey_hex,
+            pkh_hex: pkh_hex.clone(),
+            address: addr.clone(),
+            bond_atoms,
+            registered_height: current_height,
+            last_attestation_height: None,
+            slash_count: 0,
+            slashed_atoms: 0,
+            registration_txid: txid.clone(),
+            withdrawn: false,
+            withdraw_height: None,
+            slash_records: vec![],
+        });
+    }
+    store.save(&bond_store_file)?;
+    println!("bond_registered");
+    println!("address          {}", addr);
+    println!("pkh_hex          {}", pkh_hex);
+    println!("bond_amount      {} IRM", format_irm(bond_atoms));
+    println!("registration_tx  {}", txid);
+    println!("registered_at    height {}", current_height);
+    println!("withdraw_eligible_after  height {}", current_height + irium_node_rs::attestor_bond::BOND_COOLDOWN_BLOCKS);
+    Ok(())
+}
+
+fn handle_attestor_withdraw_bond(args: &[String]) -> Result<(), String> {
+    use irium_node_rs::attestor_bond::{build_withdraw_anchor_script, AttestorBondStore, BOND_COOLDOWN_BLOCKS};
+    let mut from_addr: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--from" => { from_addr = Some(parse_required_string_flag(args, &mut i, "--from")?); }
+            "--rpc" => { rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let path = wallet_path();
+    let wallet = load_wallet(&path)?;
+    let addr = match from_addr {
+        Some(ref a) => a.clone(),
+        None => wallet.keys.first().map(|k| k.address.clone())
+            .ok_or_else(|| "wallet has no addresses".to_string())?,
+    };
+    let bond_store_file = attestor_bond_store_path();
+    let mut store = AttestorBondStore::load(&bond_store_file);
+    let record = store.find_by_address(&addr)
+        .ok_or_else(|| format!("no bond record for {}; run attestor-register first", addr))?.clone();
+    if record.withdrawn {
+        return Err(format!("bond for {} is already withdrawn (height {})",
+            addr, record.withdraw_height.unwrap_or(0)));
+    }
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let current_height = fetch_tip_height(&client, base)?;
+    let cooldown_from = record.last_attestation_height.unwrap_or(record.registered_height).max(record.registered_height);
+    let eligible_at = cooldown_from + BOND_COOLDOWN_BLOCKS;
+    if current_height < eligible_at {
+        return Err(format!(
+            "bond withdrawal not yet eligible. Current height: {}. Eligible at: {} ({} blocks remaining).",
+            current_height, eligible_at, eligible_at - current_height
+        ));
+    }
+    let key = find_key(&wallet, &addr).ok_or_else(|| format!("address {} not found in wallet", addr))?.clone();
+    let payload = fetch_utxos(&client, base, &addr)?;
+    let mut utxos = payload.utxos.clone();
+    utxos.sort_by_key(|u| u.value);
+    let mut fee_per_byte = DEFAULT_FEE_PER_BYTE;
+    if let Ok(est) = fetch_fee_estimate(&client, base) {
+        let est_fee = est.min_fee_per_byte.ceil() as u64;
+        if est_fee > fee_per_byte { fee_per_byte = est_fee; }
+    }
+    let fee = estimate_tx_size(1, 2).saturating_mul(fee_per_byte).max(500);
+    let mut selected = Vec::new();
+    let mut total = 0u64;
+    for utxo in utxos.iter() {
+        let confirmations = current_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < COINBASE_MATURITY { continue; }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.value);
+        if total >= fee { break; }
+    }
+    if total < fee {
+        return Err(format!("insufficient funds for withdrawal fee ({} IRM needed)", format_irm(fee)));
+    }
+    let pkh_vec = base58_p2pkh_to_hash(&addr).ok_or_else(|| "invalid address".to_string())?;
+    let mut pkh_arr = [0u8; 20];
+    pkh_arr.copy_from_slice(&pkh_vec);
+    let pkh_hex = hex::encode(pkh_arr);
+    let priv_bytes = hex::decode(&key.privkey).map_err(|e| format!("{e}"))?;
+    let signing_key = SigningKey::from_bytes(priv_bytes.as_slice().into()).map_err(|e| format!("{e}"))?;
+    let vk = signing_key.verifying_key();
+    let pk_comp = vk.to_encoded_point(true);
+    let pk_uncomp = vk.to_encoded_point(false);
+    let pub_bytes = if hash160(pk_comp.as_bytes()) == pkh_arr { pk_comp.as_bytes().to_vec() }
+        else { pk_uncomp.as_bytes().to_vec() };
+    let withdraw_script = build_withdraw_anchor_script(&pkh_hex);
+    let change_script = p2pkh_script(&pkh_arr);
+    let mut inputs: Vec<TxInput> = Vec::new();
+    for utxo in &selected {
+        let txid = hex_to_32(&utxo.txid)?;
+        inputs.push(TxInput { prev_txid: txid, prev_index: utxo.index, script_sig: Vec::new(), sequence: 0xffff_ffff });
+    }
+    let outputs = vec![
+        TxOutput { value: 0, script_pubkey: withdraw_script },
+        TxOutput { value: total.saturating_sub(fee), script_pubkey: change_script },
+    ];
+    let mut tx = Transaction { version: 1, inputs, outputs, locktime: 0 };
+    for _ in 0..2 {
+        for (idx, utxo) in selected.iter().enumerate() {
+            let script_pubkey = hex::decode(&utxo.script_pubkey).map_err(|e| format!("{e}"))?;
+            let digest = signature_digest(&tx, idx, &script_pubkey);
+            let sig: Signature = signing_key.sign_prehash(&digest).map_err(|e| format!("{e}"))?;
+            let sig = sig.normalize_s().unwrap_or(sig);
+            let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+            sig_bytes.push(0x01);
+            let mut script = Vec::new();
+            script.push(sig_bytes.len() as u8);
+            script.extend_from_slice(&sig_bytes);
+            script.push(pub_bytes.len() as u8);
+            script.extend_from_slice(&pub_bytes);
+            tx.inputs[idx].script_sig = script;
+        }
+        let actual_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte).max(500);
+        tx.outputs[1].value = total.saturating_sub(actual_fee);
+    }
+    submit_tx(&client, base, &tx)?;
+    let txid = hex::encode(tx.txid());
+    if let Some(rec) = store.find_by_address_mut(&addr) {
+        rec.withdrawn = true;
+        rec.withdraw_height = Some(current_height);
+    }
+    store.save(&bond_store_file)?;
+    println!("bond_withdrawn");
+    println!("address          {}", addr);
+    println!("bond_amount      {} IRM", format_irm(record.bond_atoms));
+    println!("withdraw_tx      {}", txid);
+    println!("withdrawn_at     height {}", current_height);
+    Ok(())
+}
+
+fn handle_attestor_bond_status(args: &[String]) -> Result<(), String> {
+    use irium_node_rs::attestor_bond::{AttestorBondStore, BOND_COOLDOWN_BLOCKS};
+    let mut address_filter: Option<String> = None;
+    let mut json_mode = false;
+    let mut rpc_url = default_rpc_url();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--address" => { address_filter = Some(parse_required_string_flag(args, &mut i, "--address")?); }
+            "--json" => { json_mode = true; i += 1; }
+            "--rpc" => { rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let bond_store_file = attestor_bond_store_path();
+    let store = AttestorBondStore::load(&bond_store_file);
+    let base = rpc_url.trim_end_matches('/');
+    let current_height = rpc_client(base).and_then(|c| fetch_tip_height(&c, base)).unwrap_or(0);
+    let bonds: Vec<&irium_node_rs::attestor_bond::AttestorBondRecord> = store.bonds.iter()
+        .filter(|b| address_filter.as_ref().map_or(true, |a| &b.address == a))
+        .collect();
+    if json_mode {
+        let items: Vec<_> = bonds.iter().map(|b| {
+            let cooldown_from = b.last_attestation_height.unwrap_or(b.registered_height).max(b.registered_height);
+            let eligible_at = cooldown_from + BOND_COOLDOWN_BLOCKS;
+            serde_json::json!({
+                "address": b.address,
+                "pkh_hex": b.pkh_hex,
+                "bond_atoms": b.bond_atoms,
+                "bond_irm": format_irm(b.bond_atoms),
+                "registered_height": b.registered_height,
+                "registration_txid": b.registration_txid,
+                "last_attestation_height": b.last_attestation_height,
+                "withdraw_eligible_at": eligible_at,
+                "withdraw_eligible": current_height >= eligible_at,
+                "withdrawn": b.withdrawn,
+                "withdraw_height": b.withdraw_height,
+                "slash_count": b.slash_count,
+                "slashed_atoms": b.slashed_atoms,
+            })
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({"bonds": items, "count": bonds.len()})).unwrap());
+    } else if bonds.is_empty() {
+        println!("no bond records found");
+        println!();
+        println!("tip  Run: irium-wallet attestor-register --bond <amount_irm>");
+    } else {
+        for b in &bonds {
+            let cooldown_from = b.last_attestation_height.unwrap_or(b.registered_height).max(b.registered_height);
+            let eligible_at = cooldown_from + BOND_COOLDOWN_BLOCKS;
+            let status = if b.withdrawn { "withdrawn" } else if b.slash_count > 0 { "slashed" } else { "active" };
+            println!("address          {}", b.address);
+            println!("bond_amount      {} IRM", format_irm(b.bond_atoms));
+            println!("status           {}", status);
+            println!("registered_at    height {}", b.registered_height);
+            println!("registration_tx  {}", b.registration_txid);
+            if let Some(h) = b.last_attestation_height { println!("last_attestation height {}", h); }
+            if b.withdrawn {
+                println!("withdrawn_at     height {}", b.withdraw_height.unwrap_or(0));
+            } else if current_height >= eligible_at {
+                println!("withdraw_eligible yes (cooldown passed at height {})", eligible_at);
+            } else {
+                println!("withdraw_eligible no ({} blocks remaining; eligible at height {})",
+                    eligible_at.saturating_sub(current_height), eligible_at);
+            }
+            if b.slash_count > 0 {
+                println!("slash_count      {}", b.slash_count);
+                println!("slashed_atoms    {} IRM", format_irm(b.slashed_atoms));
+            }
             println!();
         }
     }
+    Ok(())
+}
+
+fn handle_attestor_slash(args: &[String]) -> Result<(), String> {
+    use irium_node_rs::attestor_bond::{build_slash_anchor_script, AttestorBondStore, SlashRecord};
+    let mut attestor_addr: Option<String> = None;
+    let mut proof1_id: Option<String> = None;
+    let mut proof2_id: Option<String> = None;
+    let mut agreement_hash_opt: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--attestor" => { attestor_addr = Some(parse_required_string_flag(args, &mut i, "--attestor")?); }
+            "--proof1" => { proof1_id = Some(parse_required_string_flag(args, &mut i, "--proof1")?); }
+            "--proof2" => { proof2_id = Some(parse_required_string_flag(args, &mut i, "--proof2")?); }
+            "--agreement" => { agreement_hash_opt = Some(parse_required_string_flag(args, &mut i, "--agreement")?); }
+            "--rpc" => { rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?; }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let attestor_address = attestor_addr.ok_or_else(|| "--attestor <address> is required".to_string())?;
+    let p1 = proof1_id.ok_or_else(|| "--proof1 <proof_id> is required".to_string())?;
+    let p2 = proof2_id.ok_or_else(|| "--proof2 <proof_id> is required".to_string())?;
+    if p1 == p2 { return Err("--proof1 and --proof2 must be different proofs".to_string()); }
+    let bond_store_file = attestor_bond_store_path();
+    let mut store = AttestorBondStore::load(&bond_store_file);
+    let record = store.find_by_address(&attestor_address)
+        .ok_or_else(|| format!("no bond record for attestor {}", attestor_address))?.clone();
+    if record.withdrawn { return Err("attestor bond is already withdrawn; cannot slash".to_string()); }
+    let combined = format!("{}{}", p1, p2);
+    let agreement_hash = agreement_hash_opt.unwrap_or_else(|| combined[..combined.len().min(64)].to_string());
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let current_height = fetch_tip_height(&client, base)?;
+    let pkh_vec = base58_p2pkh_to_hash(&attestor_address).ok_or_else(|| "invalid attestor address".to_string())?;
+    let mut pkh_arr = [0u8; 20];
+    pkh_arr.copy_from_slice(&pkh_vec);
+    let attestor_pkh_hex = hex::encode(pkh_arr);
+    let path = wallet_path();
+    let wallet = load_wallet(&path)?;
+    let slash_from = wallet.keys.first().map(|k| k.address.clone())
+        .ok_or_else(|| "wallet has no addresses".to_string())?;
+    let key = find_key(&wallet, &slash_from)
+        .ok_or_else(|| "no wallet key for slash sender".to_string())?.clone();
+    let payload = fetch_utxos(&client, base, &slash_from)?;
+    let mut utxos = payload.utxos.clone();
+    utxos.sort_by_key(|u| u.value);
+    let fee = estimate_tx_size(1, 2).saturating_mul(DEFAULT_FEE_PER_BYTE).max(500);
+    let mut selected = Vec::new();
+    let mut total = 0u64;
+    for utxo in utxos.iter() {
+        let confirmations = current_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < COINBASE_MATURITY { continue; }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.value);
+        if total >= fee { break; }
+    }
+    if total < fee { return Err(format!("insufficient funds for slash tx ({} IRM needed)", format_irm(fee))); }
+    let from_pkh_vec = base58_p2pkh_to_hash(&slash_from).ok_or_else(|| "invalid from address".to_string())?;
+    let mut from_pkh_arr = [0u8; 20];
+    from_pkh_arr.copy_from_slice(&from_pkh_vec);
+    let priv_bytes = hex::decode(&key.privkey).map_err(|e| format!("{e}"))?;
+    let signing_key = SigningKey::from_bytes(priv_bytes.as_slice().into()).map_err(|e| format!("{e}"))?;
+    let vk = signing_key.verifying_key();
+    let pk_comp = vk.to_encoded_point(true);
+    let pk_uncomp = vk.to_encoded_point(false);
+    let pub_bytes = if hash160(pk_comp.as_bytes()) == from_pkh_arr { pk_comp.as_bytes().to_vec() }
+        else { pk_uncomp.as_bytes().to_vec() };
+    let slash_script = build_slash_anchor_script(&attestor_pkh_hex, &agreement_hash);
+    let change_script = p2pkh_script(&from_pkh_arr);
+    let mut inputs: Vec<TxInput> = Vec::new();
+    for utxo in &selected {
+        let txid = hex_to_32(&utxo.txid)?;
+        inputs.push(TxInput { prev_txid: txid, prev_index: utxo.index, script_sig: Vec::new(), sequence: 0xffff_ffff });
+    }
+    let outputs = vec![
+        TxOutput { value: 0, script_pubkey: slash_script },
+        TxOutput { value: total.saturating_sub(fee), script_pubkey: change_script },
+    ];
+    let mut tx = Transaction { version: 1, inputs, outputs, locktime: 0 };
+    for _ in 0..2 {
+        for (idx, utxo) in selected.iter().enumerate() {
+            let script_pubkey = hex::decode(&utxo.script_pubkey).map_err(|e| format!("{e}"))?;
+            let digest = signature_digest(&tx, idx, &script_pubkey);
+            let sig: Signature = signing_key.sign_prehash(&digest).map_err(|e| format!("{e}"))?;
+            let sig = sig.normalize_s().unwrap_or(sig);
+            let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+            sig_bytes.push(0x01);
+            let mut script = Vec::new();
+            script.push(sig_bytes.len() as u8);
+            script.extend_from_slice(&sig_bytes);
+            script.push(pub_bytes.len() as u8);
+            script.extend_from_slice(&pub_bytes);
+            tx.inputs[idx].script_sig = script;
+        }
+        let actual_fee = (tx.serialize().len() as u64).saturating_mul(DEFAULT_FEE_PER_BYTE).max(500);
+        tx.outputs[1].value = total.saturating_sub(actual_fee);
+    }
+    submit_tx(&client, base, &tx)?;
+    let slash_txid = hex::encode(tx.txid());
+    if let Some(rec) = store.find_by_address_mut(&attestor_address) {
+        rec.slash_count += 1;
+        rec.slashed_atoms = rec.slashed_atoms.saturating_add(rec.bond_atoms);
+        rec.slash_records.push(SlashRecord {
+            agreement_hash: agreement_hash.clone(),
+            slash_txid: slash_txid.clone(),
+            proof1_id: p1.clone(),
+            proof2_id: p2.clone(),
+        });
+    }
+    store.save(&bond_store_file)?;
+    println!("slash_recorded");
+    println!("attestor         {}", attestor_address);
+    println!("bond_slashed     {} IRM", format_irm(record.bond_atoms));
+    println!("slash_count_new  {}", record.slash_count + 1);
+    println!("proof1           {}", p1);
+    println!("proof2           {}", p2);
+    println!("agreement        {}", agreement_hash);
+    println!("slash_tx         {}", slash_txid);
+    println!("height           {}", current_height);
     Ok(())
 }
 
@@ -24236,6 +24751,8 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
                 eprintln!("{}", e);
                 std::process::exit(1);
             });
+            // Warn if any attestors are unbonded
+            warn_unbonded_attestors(&attestors.iter().map(|a| a.pubkey_hex.clone()).collect::<Vec<_>>());
             let req = BuildOtcTemplateRpcRequest {
                 policy_id,
                 agreement_hash,
@@ -25246,6 +25763,30 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "attestor-list" => {
             if let Err(e) = handle_attestor_list(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "attestor-register" => {
+            if let Err(e) = handle_attestor_register(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "attestor-withdraw-bond" => {
+            if let Err(e) = handle_attestor_withdraw_bond(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "attestor-bond-status" => {
+            if let Err(e) = handle_attestor_bond_status(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "attestor-slash" => {
+            if let Err(e) = handle_attestor_slash(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
