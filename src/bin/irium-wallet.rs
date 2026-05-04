@@ -25518,8 +25518,8 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
             let to_pkh = base58_p2pkh_to_hash(&spend_to).unwrap_or_else(|| { eprintln!("Invalid --to"); std::process::exit(1); });
             let mut to_arr = [0u8; 20]; to_arr.copy_from_slice(&to_pkh);
             let mpso = multisig_script_to_mpso(&spend_script).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
-            let mut tb = hex::decode(&spend_txid).unwrap_or_else(|_| { eprintln!("Invalid txid"); std::process::exit(1); });
-            if tb.len() == 32 { tb.reverse(); }
+            let tb = hex::decode(&spend_txid).unwrap_or_else(|_| { eprintln!("Invalid txid"); std::process::exit(1); });
+            // txid is already in display-byte order (matching txid() output); no reversal needed
             let mut prev_txid = [0u8; 32]; prev_txid.copy_from_slice(&tb);
             let out_value = spend_value.saturating_sub(spend_fee);
             let tx = Transaction {
