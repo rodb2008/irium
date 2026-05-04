@@ -6805,6 +6805,96 @@ fn bundle_chain_snapshot_from_audit(
     }
 }
 
+
+fn private_agreements_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("IRIUM_PRIVATE_AGREEMENTS_DIR") {
+        return PathBuf::from(p);
+    }
+    irium_data_dir().join("private-agreements")
+}
+
+fn save_private_agreement(agreement: &AgreementObject) -> Result<String, String> {
+    let hash = irium_node_rs::settlement::compute_agreement_hash_hex(agreement)?;
+    let dir = private_agreements_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("create private-agreements dir: {e}"))?;
+    let path = dir.join(format!("{}.json", hash));
+    let json = serde_json::to_string_pretty(agreement).map_err(|e| format!("serialize: {e}"))?;
+    fs::write(&path, &json).map_err(|e| format!("write private agreement: {e}"))?;
+    Ok(path.display().to_string())
+}
+
+fn load_private_agreement_by_hash(hash: &str) -> Result<AgreementObject, String> {
+    let dir = private_agreements_dir();
+    let path = dir.join(format!("{}.json", hash));
+    if path.exists() {
+        return load_agreement_json_from_path(&path);
+    }
+    Err(format!("no private agreement stored for hash {}", hash))
+}
+
+fn ecies_encrypt_agreement(plaintext: &[u8], recipient_pubkey_hex: &str) -> Result<String, String> {
+    use k256::ecdh::diffie_hellman;
+    use k256::PublicKey;
+    use sha2::Digest as _;
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
+    let pubkey_bytes = hex::decode(recipient_pubkey_hex)
+        .map_err(|_| "invalid recipient pubkey hex".to_string())?;
+    let recipient_pk = PublicKey::from_sec1_bytes(&pubkey_bytes)
+        .map_err(|_| "invalid recipient secp256k1 pubkey".to_string())?;
+    let eph_secret = SecretKey::random(&mut OsRng);
+    let eph_pubkey_hex = hex::encode(eph_secret.public_key().to_sec1_bytes());
+    let shared = diffie_hellman(eph_secret.to_nonzero_scalar(), recipient_pk.as_affine());
+    let aes_key = sha2::Sha256::digest(shared.raw_secret_bytes());
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| e.to_string())?;
+    let nonce = AesNonce::from_slice(&nonce_bytes);
+    let ciphertext_bytes = cipher.encrypt(nonce, plaintext)
+        .map_err(|_| "encryption failed".to_string())?;
+    serde_json::to_string_pretty(&json!({
+        "version": 1,
+        "scheme": "ecies-secp256k1-aes256gcm",
+        "ephemeral_pubkey": eph_pubkey_hex,
+        "nonce": hex::encode(nonce_bytes),
+        "ciphertext": hex::encode(ciphertext_bytes),
+    })).map_err(|e| e.to_string())
+}
+
+fn ecies_decrypt_agreement(blob_json: &str, secret_key: &SecretKey) -> Result<Vec<u8>, String> {
+    use k256::ecdh::diffie_hellman;
+    use k256::PublicKey;
+    use sha2::Digest as _;
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
+    let val: serde_json::Value = serde_json::from_str(blob_json)
+        .map_err(|_| "invalid blob JSON".to_string())?;
+    let scheme = val["scheme"].as_str().unwrap_or("");
+    if scheme != "ecies-secp256k1-aes256gcm" {
+        return Err(format!("unsupported scheme: {}", scheme));
+    }
+    let eph_hex = val["ephemeral_pubkey"].as_str()
+        .ok_or_else(|| "missing ephemeral_pubkey".to_string())?;
+    let nonce_hex = val["nonce"].as_str()
+        .ok_or_else(|| "missing nonce".to_string())?;
+    let ct_hex = val["ciphertext"].as_str()
+        .ok_or_else(|| "missing ciphertext".to_string())?;
+    let eph_bytes = hex::decode(eph_hex)
+        .map_err(|_| "invalid ephemeral_pubkey hex".to_string())?;
+    let eph_pk = PublicKey::from_sec1_bytes(&eph_bytes)
+        .map_err(|_| "invalid ephemeral pubkey".to_string())?;
+    let shared = diffie_hellman(secret_key.to_nonzero_scalar(), eph_pk.as_affine());
+    let aes_key = sha2::Sha256::digest(shared.raw_secret_bytes());
+    let nonce_bytes = hex::decode(nonce_hex)
+        .map_err(|_| "invalid nonce hex".to_string())?;
+    let cipher_bytes = hex::decode(ct_hex)
+        .map_err(|_| "invalid ciphertext hex".to_string())?;
+    let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| e.to_string())?;
+    let nonce = AesNonce::from_slice(&nonce_bytes);
+    cipher.decrypt(nonce, cipher_bytes.as_ref())
+        .map_err(|_| "decryption failed (wrong key or corrupt blob)".to_string())
+}
+
 fn emit_agreement_object_output(
     agreement: &AgreementObject,
     out_path: Option<&str>,
@@ -11680,6 +11770,7 @@ fn handle_agreement_create_simple(args: &[String]) -> Result<(), String> {
     let mut notes = None;
     let mut out_path = None;
     let mut json_mode = false;
+    let mut private_store = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -11755,6 +11846,10 @@ fn handle_agreement_create_simple(args: &[String]) -> Result<(), String> {
                 json_mode = true;
                 i += 1;
             }
+            "--private" => {
+                private_store = true;
+                i += 1;
+            }
             other => return Err(format!("unknown argument {}", other)),
         }
     }
@@ -11777,6 +11872,12 @@ fn handle_agreement_create_simple(args: &[String]) -> Result<(), String> {
         refund_summary,
         notes,
     )?;
+    if private_store {
+        match save_private_agreement(&agreement) {
+            Ok(p) => eprintln!("[private] agreement stored: {}", p),
+            Err(e) => return Err(e),
+        }
+    }
     emit_agreement_object_output(&agreement, out_path.as_deref(), json_mode)
 }
 
@@ -11795,6 +11896,7 @@ fn handle_agreement_create_otc(args: &[String]) -> Result<(), String> {
     let mut notes = None;
     let mut out_path = None;
     let mut json_mode = false;
+    let mut private_store = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -11859,6 +11961,10 @@ fn handle_agreement_create_otc(args: &[String]) -> Result<(), String> {
                 json_mode = true;
                 i += 1;
             }
+            "--private" => {
+                private_store = true;
+                i += 1;
+            }
             other => return Err(format!("unknown argument {}", other)),
         }
     }
@@ -11880,6 +11986,12 @@ fn handle_agreement_create_otc(args: &[String]) -> Result<(), String> {
         parse_optional_hex_hash(metadata_hash, "metadata_hash")?,
         notes,
     )?;
+    if private_store {
+        match save_private_agreement(&agreement) {
+            Ok(p) => eprintln!("[private] agreement stored: {}", p),
+            Err(e) => return Err(e),
+        }
+    }
     emit_agreement_object_output(&agreement, out_path.as_deref(), json_mode)
 }
 
@@ -11898,6 +12010,7 @@ fn handle_agreement_create_deposit(args: &[String]) -> Result<(), String> {
     let mut notes = None;
     let mut out_path = None;
     let mut json_mode = false;
+    let mut private_store = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -11962,6 +12075,10 @@ fn handle_agreement_create_deposit(args: &[String]) -> Result<(), String> {
                 json_mode = true;
                 i += 1;
             }
+            "--private" => {
+                private_store = true;
+                i += 1;
+            }
             other => return Err(format!("unknown argument {}", other)),
         }
     }
@@ -11983,6 +12100,12 @@ fn handle_agreement_create_deposit(args: &[String]) -> Result<(), String> {
         parse_optional_hex_hash(metadata_hash, "metadata_hash")?,
         notes,
     )?;
+    if private_store {
+        match save_private_agreement(&agreement) {
+            Ok(p) => eprintln!("[private] agreement stored: {}", p),
+            Err(e) => return Err(e),
+        }
+    }
     emit_agreement_object_output(&agreement, out_path.as_deref(), json_mode)
 }
 
@@ -11998,6 +12121,7 @@ fn handle_agreement_create_milestone(args: &[String]) -> Result<(), String> {
     let mut notes = None;
     let mut out_path = None;
     let mut json_mode = false;
+    let mut private_store = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -12050,6 +12174,10 @@ fn handle_agreement_create_milestone(args: &[String]) -> Result<(), String> {
                 json_mode = true;
                 i += 1;
             }
+            "--private" => {
+                private_store = true;
+                i += 1;
+            }
             other => return Err(format!("unknown argument {}", other)),
         }
     }
@@ -12066,6 +12194,12 @@ fn handle_agreement_create_milestone(args: &[String]) -> Result<(), String> {
         parse_optional_hex_hash(metadata_hash, "metadata_hash")?,
         notes,
     )?;
+    if private_store {
+        match save_private_agreement(&agreement) {
+            Ok(p) => eprintln!("[private] agreement stored: {}", p),
+            Err(e) => return Err(e),
+        }
+    }
     emit_agreement_object_output(&agreement, out_path.as_deref(), json_mode)
 }
 
@@ -22154,6 +22288,130 @@ fn main() {
                 );
             } else {
                 println!("exported {}", out_path);
+            }
+        }
+        "agreement-store-private" => {
+            if args.len() < 2 {
+                eprintln!("usage: irium-wallet agreement-store-private <agreement.json>");
+                std::process::exit(1);
+            }
+            let json_mode = args.iter().any(|a| a == "--json");
+            let agreement = match load_agreement_json_from_path(Path::new(&args[1])) {
+                Ok(a) => a,
+                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+            };
+            match save_private_agreement(&agreement) {
+                Ok(path) => {
+                    if json_mode {
+                        let hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)
+                            .unwrap_or_default();
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "stored": true, "path": path, "agreement_hash": hash
+                        })).unwrap());
+                    } else {
+                        println!("stored privately: {}", path);
+                    }
+                }
+                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+            }
+        }
+        "agreement-share" => {
+            if args.len() < 3 {
+                eprintln!("usage: irium-wallet agreement-share <agreement_hash> <recipient_pubkey_hex> [--out <file>]");
+                std::process::exit(1);
+            }
+            let hash = args[1].clone();
+            let recipient_pubkey_hex = args[2].clone();
+            let out_path: Option<String> = args.windows(2)
+                .find(|w| w[0] == "--out")
+                .map(|w| w[1].clone());
+            let json_mode = args.iter().any(|a| a == "--json");
+            let agreement = match load_private_agreement_by_hash(&hash) {
+                Ok(a) => a,
+                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+            };
+            let plaintext = serde_json::to_vec(&agreement).unwrap();
+            let blob = match ecies_encrypt_agreement(&plaintext, &recipient_pubkey_hex) {
+                Ok(b) => b,
+                Err(e) => { eprintln!("encrypt: {}", e); std::process::exit(1); }
+            };
+            if let Some(ref p) = out_path {
+                if let Err(e) = fs::write(p, &blob) {
+                    eprintln!("write: {}", e); std::process::exit(1);
+                }
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&json!({
+                        "written": p, "agreement_hash": hash,
+                        "recipient_pubkey": recipient_pubkey_hex
+                    })).unwrap());
+                } else {
+                    println!("encrypted blob written to {}", p);
+                }
+            } else {
+                println!("{}", blob);
+            }
+        }
+        "agreement-decrypt" => {
+            if args.len() < 2 {
+                eprintln!("usage: irium-wallet agreement-decrypt <blob.json> --wallet <wallet_file> [--store-private] [--json]");
+                std::process::exit(1);
+            }
+            let mut wallet_path = None::<String>;
+            let mut store_private = false;
+            let json_mode = args.iter().any(|a| a == "--json");
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--wallet" => { wallet_path = args.get(i + 1).cloned(); i += 2; }
+                    "--store-private" => { store_private = true; i += 1; }
+                    "--json" => { i += 1; }
+                    other => { eprintln!("unknown argument {}", other); std::process::exit(1); }
+                }
+            }
+            let wallet_path = match wallet_path.or_else(|| std::env::var("IRIUM_WALLET").ok()) {
+                Some(p) => p,
+                None => { eprintln!("--wallet <wallet_file> required"); std::process::exit(1); }
+            };
+            let blob_json = match fs::read_to_string(&args[1]) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("read blob: {}", e); std::process::exit(1); }
+            };
+            let wallet = match load_wallet(Path::new(&wallet_path)) {
+                Ok(w) => w,
+                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+            };
+            let mut decrypted: Option<Vec<u8>> = None;
+            for key in &wallet.keys {
+                if let Ok(priv_bytes) = hex::decode(&key.privkey) {
+                    if let Ok(secret) = SecretKey::from_slice(&priv_bytes) {
+                        if let Ok(plain) = ecies_decrypt_agreement(&blob_json, &secret) {
+                            decrypted = Some(plain);
+                            break;
+                        }
+                    }
+                }
+            }
+            let plain = match decrypted {
+                Some(b) => b,
+                None => { eprintln!("decryption failed: no wallet key matched"); std::process::exit(1); }
+            };
+            let agreement: AgreementObject = match serde_json::from_slice(&plain) {
+                Ok(a) => a,
+                Err(e) => { eprintln!("parse decrypted agreement: {}", e); std::process::exit(1); }
+            };
+            if store_private {
+                match save_private_agreement(&agreement) {
+                    Ok(p) => eprintln!("[private] stored: {}", p),
+                    Err(e) => { eprintln!("store private: {}", e); std::process::exit(1); }
+                }
+            }
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&agreement).unwrap());
+            } else {
+                let hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)
+                    .unwrap_or_default();
+                println!("decrypted: {}", hash);
+                println!("{}", render_agreement_summary(&agreement, &hash));
             }
         }
         "agreement-import" => {

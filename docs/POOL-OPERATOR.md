@@ -25,7 +25,7 @@ The Irium node (`iriumd`) itself needs 1 CPU core and 512 MB RAM. The remaining 
 | Algorithm | SHA-256d |
 | Block time target | 600 seconds |
 | Difficulty algorithm | LWMA v2 (30-block window) |
-| Max supply | 100,000,000 IRM |
+| Max supply | ~24,500,000 IRM |
 | Block reward | 50 IRM (current); halves every 210,000 blocks |
 | Coinbase maturity | 100 blocks |
 | AuxPoW activation height | 26,347 (~12 June 2026) |
