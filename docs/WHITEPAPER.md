@@ -129,6 +129,22 @@ objective metrics before entering an agreement.
 
 ## 4. Consensus Mechanism
 
+### Technical Specifications
+
+| Parameter | Value |
+|---|---|
+| Ticker | IRM |
+| Algorithm | SHA-256d (Bitcoin-compatible) |
+| Max Supply | 100,000,000 IRM |
+| Genesis Vesting | 3,500,000 IRM (3.5%) |
+| Mineable Supply | 96,500,000 IRM (96.5%) |
+| Block Time | 600 seconds (10 minutes) |
+| Initial Reward | 50 IRM |
+| Halving Interval | 210,000 blocks (~4 years) |
+| Difficulty Retarget | 2,016-block retarget until height 16,462, then LWMA v2 |
+| Coinbase Maturity | 100 blocks |
+| Min Fee Rate | 1 sat/byte (~250 sat for a typical transaction) |
+
 ### SHA-256d Proof of Work
 
 Block hashing uses SHA-256d: two sequential applications of SHA-256 over the
@@ -288,8 +304,11 @@ minted supply to exceed this limit.
 ### Transaction Fees
 
 Miners collect transaction fees in addition to block rewards. The minimum fee rate
-is enforced by the node's mempool policy. Fee revenue becomes increasingly important
-after multiple halvings, providing long-term miner incentive without inflation.
+is **1 satoshi per byte** (`min_fee_per_byte = 1.0` in `src/bin/iriumd.rs`), enforced
+by the node mempool policy. A typical single-input two-output transaction of approximately
+250 bytes requires a minimum fee of ~250 satoshis (0.0000025 IRM). Fee revenue becomes
+increasingly important after multiple halvings, providing long-term miner incentive
+without inflation.
 
 ### Coinbase Maturity
 

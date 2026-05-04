@@ -19,6 +19,7 @@ This document is ready to copy and send to exchange listing teams, pool aggregat
 | **Halving interval** | 210,000 blocks |
 | **Max supply** | 100,000,000 IRM |
 | **Coinbase maturity** | 100 blocks |
+| **Min fee rate** | 1 sat/byte (~250 sat for a typical transaction) |
 | **Address prefix** | Q (version byte 0x39, Base58Check) |
 | **P2P port** | 38291 (configurable) |
 | **RPC port** | 38300 (configurable) |
