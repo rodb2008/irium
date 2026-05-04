@@ -17,7 +17,7 @@ The network launches with:
 - No testnet
 - No DNS dependency (signed seedlist bootstrap)
 - Locked genesis enforcing founder vesting
-- Fixed **100,000,000 IRM** supply cap
+- Fixed **~24,500,000 IRM** supply cap
 
 This repository contains the **Rust implementation of the full node, miner, wallet tools, and SPV utilities.**
 
@@ -31,7 +31,7 @@ This repository contains the **Rust implementation of the full node, miner, wall
 - Starting subsidy: 50 IRM
 - Halving interval: 210,000 blocks
 - Coinbase maturity: 100 blocks
-- Max supply: 100,000,000 IRM
+- Max supply: ~24,500,000 IRM
 - Genesis allocation: **3.5M IRM CLTV-locked**
 
 ---
