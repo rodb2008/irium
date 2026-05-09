@@ -6849,8 +6849,8 @@ fn ecies_encrypt_agreement(plaintext: &[u8], recipient_pubkey_hex: &str) -> Resu
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| e.to_string())?;
-    let nonce = AesNonce::from_slice(&nonce_bytes);
-    let ciphertext_bytes = cipher.encrypt(nonce, plaintext)
+    let nonce = AesNonce::from(nonce_bytes);
+    let ciphertext_bytes = cipher.encrypt(&nonce, plaintext)
         .map_err(|_| "encryption failed".to_string())?;
     serde_json::to_string_pretty(&json!({
         "version": 1,
@@ -6890,8 +6890,10 @@ fn ecies_decrypt_agreement(blob_json: &str, secret_key: &SecretKey) -> Result<Ve
     let cipher_bytes = hex::decode(ct_hex)
         .map_err(|_| "invalid ciphertext hex".to_string())?;
     let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| e.to_string())?;
-    let nonce = AesNonce::from_slice(&nonce_bytes);
-    cipher.decrypt(nonce, cipher_bytes.as_ref())
+    let nonce_arr: [u8; 12] = nonce_bytes.try_into()
+        .map_err(|_| "invalid nonce: must be 12 bytes".to_string())?;
+    let nonce = AesNonce::from(nonce_arr);
+    cipher.decrypt(&nonce, cipher_bytes.as_ref())
         .map_err(|_| "decryption failed (wrong key or corrupt blob)".to_string())
 }
 
@@ -14127,7 +14129,7 @@ mod tests {
     }
 
     fn import_sample_share_package_for_housekeeping(
-        root: &Path,
+        _root: &Path,
         tag: &str,
         agreement: AgreementObject,
         bundle: AgreementBundle,
@@ -15006,7 +15008,6 @@ mod tests {
 
     #[test]
     fn render_build_template_summary_contractor() {
-        use irium_node_rs::settlement::ProofPolicy;
         // Construct a minimal BuildTemplateRpcResponse
         let resp = BuildTemplateRpcResponse {
             policy: {
@@ -16276,7 +16277,6 @@ mod tests {
 
     #[test]
     fn render_policy_get_summary_shows_expiry_info() {
-        use irium_node_rs::settlement::{ApprovedAttestor, ProofRequirement};
         let resp = GetPolicyRpcResponse {
             agreement_hash: "aabbcc".to_string(),
             found: true,
@@ -16305,7 +16305,6 @@ mod tests {
 
     #[test]
     fn render_policy_get_summary_shows_expired_true() {
-        use irium_node_rs::settlement::{ApprovedAttestor, ProofRequirement};
         let resp = GetPolicyRpcResponse {
             agreement_hash: "ddeeff".to_string(),
             found: true,
@@ -18866,7 +18865,6 @@ found true"
 
     #[test]
     fn policy_build_otc_unknown_flag_returns_error() {
-        use std::process::Command;
         // Just verify the argument parser returns an error for unknown flags
         // We can't call the dispatch block directly, but we can check via a fake args slice.
         // This is a structural smoke test via argument counting.
@@ -19702,7 +19700,6 @@ found true"
     }
 
 
-    #[test]
 
     // ── reputation layer tests ──────────────────────────────────────────────
 
@@ -20378,6 +20375,7 @@ found true"
         assert_eq!(rep.ranking_score(), 30);
     }
 
+    #[allow(dead_code)] // test function body without #[test]; retained for manual invocation
     fn offer_feed_fetch_multiple_urls_both_valid_aggregates() {
         let _guard = test_guard();
         let dir = temp_offers_dir("multi-fetch-agg");

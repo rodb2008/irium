@@ -10028,6 +10028,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)] // test helper; used by test setup utilities
     fn make_test_agreement(agreement_hash_hint: &str) -> AgreementObject {
         let addr = "iRLeMFpzwVhvDBkfXFqMFLhAUoTQVuSmma".to_string();
         AgreementObject {
@@ -10360,7 +10361,7 @@ mod tests {
         let p_mid = make_proof_with_time("prf-ord-b", "hash-ord", 2_000, &sk2);
         let p_early = make_proof_with_time("prf-ord-a", "hash-ord", 1_000, &sk1);
         for p in [p_late, p_mid, p_early] {
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -10403,7 +10404,7 @@ mod tests {
         let p_zzz = make_proof_with_time("prf-tie-zzz", "hash-tie", 5_000, &sk1);
         let p_aaa = make_proof_with_time("prf-tie-aaa", "hash-tie", 5_000, &sk2);
         for p in [p_zzz, p_aaa] {
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -10444,7 +10445,7 @@ mod tests {
         let pa1 = make_proof_with_time("prf-sc-a1", "hash-scope-a", 1_000, &sk1);
         let pb1 = make_proof_with_time("prf-sc-b1", "hash-scope-b", 500, &sk3);
         for p in [pa2, pb1, pa1] {
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -10496,7 +10497,7 @@ mod tests {
         let mut p4 = make_proof_with_time("prf-ao-4", "hash-ao", 4_000, &sk4);
         p4.expires_at_height = Some(0); // tip=0 >= 0 -> expired, filtered out
         for p in [p1, p2, p3, p4] {
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -10630,7 +10631,7 @@ mod tests {
         let (state, _, _, _) = create_test_state(Some(0));
         let sk = SigningKey::from_bytes((&[17u8; 32]).into()).unwrap();
         let proof = make_signed_proof_for_rpc("cafecafe", &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -10786,7 +10787,7 @@ mod tests {
     async fn get_policy_rpc_returns_stored_policy() {
         let (state, _, _, _) = create_test_state(Some(0));
         let policy = make_rpc_policy("getpol-hash-001", "pk-get");
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -10847,7 +10848,7 @@ mod tests {
 
         // Store policy
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -10861,7 +10862,7 @@ mod tests {
 
         // Store proof (attested_by matches rpc-attestor in policy)
         let proof = make_rpc_proof(&agreement_hash, &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -10937,7 +10938,7 @@ mod tests {
         let sk = rpc_signing_key();
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -10976,7 +10977,7 @@ mod tests {
         let pubkey_hex = rpc_pubkey_hex(&sk);
 
         let policy_b = make_rpc_policy(&hash_b, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -10993,7 +10994,7 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &sk,
         );
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11032,7 +11033,7 @@ mod tests {
         let sk = rpc_signing_key();
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11044,7 +11045,7 @@ mod tests {
         .await
         .expect("store policy");
         let proof = make_rpc_proof(&agreement_hash, &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11078,7 +11079,7 @@ mod tests {
         let sk = rpc_signing_key();
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11091,7 +11092,7 @@ mod tests {
         .expect("store policy");
         let mut proof = make_rpc_proof(&agreement_hash, &sk);
         proof.expires_at_height = Some(0);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11126,7 +11127,7 @@ mod tests {
         let sk2 = SigningKey::from_bytes((&[77u8; 32]).into()).unwrap();
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11138,7 +11139,7 @@ mod tests {
         .await
         .expect("store policy");
         let active_proof = make_rpc_proof(&agreement_hash, &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11150,7 +11151,7 @@ mod tests {
         .expect("submit active");
         let mut expired_proof = make_proof_with_time("prf-expired-mix", &agreement_hash, 500, &sk2);
         expired_proof.expires_at_height = Some(0);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11186,7 +11187,7 @@ mod tests {
         let sk = rpc_signing_key();
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11226,7 +11227,7 @@ mod tests {
         let sk = rpc_signing_key();
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11238,7 +11239,7 @@ mod tests {
         .await
         .expect("store policy");
         let proof = make_rpc_proof(&agreement_hash, &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11271,7 +11272,7 @@ mod tests {
         let sk = rpc_signing_key();
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11307,7 +11308,7 @@ mod tests {
         let sk = rpc_signing_key();
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11320,7 +11321,7 @@ mod tests {
         .expect("store policy");
         let mut proof = make_proof_with_time("prf-exp-out", &agreement_hash, 1_000, &sk);
         proof.expires_at_height = Some(5);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11367,7 +11368,7 @@ mod tests {
             milestone_id: None,
             notes: None,
         });
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11417,7 +11418,7 @@ mod tests {
             milestone_id: None,
             threshold: None,
         }];
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11467,7 +11468,7 @@ mod tests {
             milestone_id: None,
             notes: None,
         });
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11483,7 +11484,7 @@ mod tests {
         let mut proof = make_rpc_proof(&agreement_hash, &sk);
         proof.attestation_time = 5;
         proof.signature = sign_rpc_proof(&proof, &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11579,7 +11580,6 @@ mod tests {
         milestone_id: &str,
         sk: &SigningKey,
     ) -> SettlementProof {
-        use irium_node_rs::settlement::agreement_canonical_bytes;
         let pubkey_hex = rpc_pubkey_hex(sk);
         let mut proof = SettlementProof {
             proof_id: format!("prf-ms-{}", milestone_id),
@@ -11627,7 +11627,7 @@ mod tests {
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy =
             make_rpc_policy_with_milestones(&agreement_hash, &pubkey_hex, &["ms-a", "ms-b"]);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11640,7 +11640,7 @@ mod tests {
         .expect("store policy");
         let proof_a = make_rpc_milestone_proof(&agreement_hash, "ms-a", &sk);
         let proof_b = make_rpc_milestone_proof(&agreement_hash, "ms-b", &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11648,7 +11648,7 @@ mod tests {
         )
         .await
         .expect("submit proof a");
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11683,7 +11683,7 @@ mod tests {
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy =
             make_rpc_policy_with_milestones(&agreement_hash, &pubkey_hex, &["ms-a", "ms-b"]);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11695,7 +11695,7 @@ mod tests {
         .await
         .expect("store policy");
         let proof_a = make_rpc_milestone_proof(&agreement_hash, "ms-a", &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11745,7 +11745,7 @@ mod tests {
             milestone_id: Some("ms-b".to_string()),
             notes: None,
         });
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11792,7 +11792,7 @@ mod tests {
         let sk = rpc_signing_key();
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11804,7 +11804,7 @@ mod tests {
         .await
         .expect("store policy");
         let proof = make_rpc_proof(&agreement_hash, &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11860,7 +11860,7 @@ mod tests {
         let hash_b = hex::encode(Sha256::digest(&bytes_b));
 
         let policy_a = make_rpc_policy(&hash_a, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11873,7 +11873,7 @@ mod tests {
         .expect("store policy a");
 
         let policy_b = make_rpc_policy(&hash_b, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11916,7 +11916,7 @@ mod tests {
         let bytes = agreement_canonical_bytes(&agreement).unwrap();
         let agreement_hash = hex::encode(Sha256::digest(&bytes));
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -11968,7 +11968,7 @@ mod tests {
             milestone_id: None,
             threshold: None,
         }];
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12036,7 +12036,7 @@ mod tests {
                 milestone_id: None,
                 notes: None,
             });
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12054,7 +12054,7 @@ mod tests {
         let mut proof = make_rpc_proof(&agreement_hash, &sk);
         proof.attestation_time = 5;
         proof.signature = sign_rpc_proof(&proof, &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12092,7 +12092,7 @@ mod tests {
     async fn store_policy_rpc_rejects_overwrite_without_replace() {
         let (state, _, _, _) = create_test_state(Some(0));
         let policy_a = make_rpc_policy("overwrite-hash-01", "pk-a");
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12132,7 +12132,7 @@ mod tests {
     async fn store_policy_rpc_replaces_with_flag() {
         let (state, _, _, _) = create_test_state(Some(0));
         let policy_a = make_rpc_policy("overwrite-hash-02", "pk-b");
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12179,7 +12179,7 @@ mod tests {
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
         policy.expires_at_height = Some(1); // tip=0 < 1 -> not expired
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12215,7 +12215,7 @@ mod tests {
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
         policy.expires_at_height = Some(0); // tip=0 >= 0 -> expired
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12257,7 +12257,7 @@ mod tests {
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let mut policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
         policy.expires_at_height = Some(0); // tip=0 >= 0 -> expired
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12287,7 +12287,7 @@ mod tests {
         let (state, _, _, _) = create_test_state(Some(0));
         let mut policy = make_rpc_policy("exp-get-hash-01", "pk-get-exp");
         policy.expires_at_height = Some(50);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12319,7 +12319,7 @@ mod tests {
         let (state, _, _, _) = create_test_state(Some(100));
         let mut policy = make_rpc_policy("exp-get-hash-02", "pk-get-exp2");
         policy.expires_at_height = Some(0); // tip=0 >= 0 -> expired
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12355,7 +12355,7 @@ mod tests {
         expired_p.expires_at_height = Some(0); // tip=0 >= 0 -> expired
         let no_expiry = make_rpc_policy("list-exp-none", "pk-ln");
         for p in [active, expired_p, no_expiry] {
-            store_policy_rpc(
+            let _ = store_policy_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -12550,7 +12550,7 @@ mod tests {
         // no expiry: always active
         let no_exp = make_rpc_policy("ao-none", "pk-ao-n");
         for p in [active, expired_p, no_exp] {
-            store_policy_rpc(
+            let _ = store_policy_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -12608,7 +12608,7 @@ mod tests {
         let mut expired_p = make_rpc_policy("def-expired", "pk-def-e");
         expired_p.expires_at_height = Some(0);
         for p in [active, expired_p] {
-            store_policy_rpc(
+            let _ = store_policy_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -12645,7 +12645,7 @@ mod tests {
         let mut p2 = make_rpc_policy("allexp-2", "pk-ae-2");
         p2.expires_at_height = Some(0);
         for p in [p1, p2] {
-            store_policy_rpc(
+            let _ = store_policy_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -12676,7 +12676,7 @@ mod tests {
         let no_exp1 = make_rpc_policy("noexp-1", "pk-ne-1");
         let no_exp2 = make_rpc_policy("noexp-2", "pk-ne-2");
         for p in [no_exp1, no_exp2] {
-            store_policy_rpc(
+            let _ = store_policy_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -12706,7 +12706,7 @@ mod tests {
         let sk = SigningKey::from_bytes((&[19u8; 32]).into()).unwrap();
         // Submit one proof; make_signed_proof_for_rpc hardcodes proof_id so only one unique proof.
         let proof_a = make_signed_proof_for_rpc("hash-aaa", &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12749,7 +12749,7 @@ mod tests {
         let sk = SigningKey::from_bytes((&[21u8; 32]).into()).unwrap();
         // Submit one proof for hash-filter-a.
         let proof_a = make_signed_proof_for_rpc("hash-filter-a", &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12822,7 +12822,7 @@ mod tests {
         let (state, _, _, _) = create_test_state(Some(0));
         let sk = SigningKey::from_bytes((&[23u8; 32]).into()).unwrap();
         let proof = make_signed_proof_for_rpc("th-test", &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12858,7 +12858,7 @@ mod tests {
         // Build a proof with expires_at_height set.
         let mut proof = make_signed_proof_for_rpc("exp-carry-hash", &sk);
         proof.expires_at_height = Some(500);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12898,7 +12898,7 @@ mod tests {
         let sk = rpc_signing_key();
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12912,7 +12912,7 @@ mod tests {
         // expires_at_height=0, tip=0 => 0 >= 0 => expired immediately.
         let mut proof = make_rpc_proof(&agreement_hash, &sk);
         proof.expires_at_height = Some(0);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12963,7 +12963,7 @@ mod tests {
         let sk = rpc_signing_key();
         let pubkey_hex = rpc_pubkey_hex(&sk);
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -12977,7 +12977,7 @@ mod tests {
         // expires_at_height=1, tip=0 => 0 < 1 => not expired, proof is active.
         let mut proof = make_rpc_proof(&agreement_hash, &sk);
         proof.expires_at_height = Some(1);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -13013,7 +13013,7 @@ mod tests {
         let sk = SigningKey::from_bytes((&[24u8; 32]).into()).unwrap();
         let mut expired_proof = make_signed_proof_for_rpc("ao-expired", &sk);
         expired_proof.expires_at_height = Some(0);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -13049,7 +13049,7 @@ mod tests {
         let (state, _, _, _) = create_test_state(Some(0));
         let sk = SigningKey::from_bytes((&[26u8; 32]).into()).unwrap();
         let proof = make_signed_proof_for_rpc("ao-no-expiry", &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -13084,7 +13084,7 @@ mod tests {
         let sk = SigningKey::from_bytes((&[27u8; 32]).into()).unwrap();
         let mut proof = make_signed_proof_for_rpc("ao-default", &sk);
         proof.expires_at_height = Some(0);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -13206,7 +13206,7 @@ mod tests {
         let sk = SigningKey::from_bytes((&[31u8; 32]).into()).unwrap();
         let mut proof = make_signed_proof_for_rpc("dup-lc-test", &sk);
         proof.expires_at_height = Some(0);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -13244,7 +13244,7 @@ mod tests {
         let (state, _, _, _) = create_test_state(Some(0));
         let sk = SigningKey::from_bytes((&[32u8; 32]).into()).unwrap();
         let proof = make_signed_proof_for_rpc("st-ne", &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -13277,7 +13277,7 @@ mod tests {
         let sk = SigningKey::from_bytes((&[33u8; 32]).into()).unwrap();
         let mut proof = make_signed_proof_for_rpc("st-fe", &sk);
         proof.expires_at_height = Some(1000);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -13310,7 +13310,7 @@ mod tests {
         let sk = SigningKey::from_bytes((&[34u8; 32]).into()).unwrap();
         let mut proof = make_signed_proof_for_rpc("st-ae", &sk);
         proof.expires_at_height = Some(0);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -13653,7 +13653,7 @@ mod tests {
                 (i as u64 + 1) * 1000,
                 sk,
             );
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -13704,7 +13704,7 @@ mod tests {
                 (i as u64 + 1) * 1000,
                 sk,
             );
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -13752,7 +13752,7 @@ mod tests {
                 (i as u64 + 1) * 1000,
                 sk,
             );
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -13802,7 +13802,7 @@ mod tests {
                 (i as u64 + 1) * 1000,
                 sk,
             );
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -13843,7 +13843,7 @@ mod tests {
                 (i as u64 + 1) * 1000,
                 sk,
             );
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -13887,7 +13887,7 @@ mod tests {
         let p3 = make_proof_with_time("prf-aop-3", "hash-aop", 3_000, &sk3); // active
         let p4 = make_proof_with_time("prf-aop-4", "hash-aop", 4_000, &sk4); // active
         for p in [p1, p2, p3, p4] {
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -13936,7 +13936,7 @@ mod tests {
                 (i as u64 + 1) * 1000,
                 sk,
             );
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -13952,7 +13952,7 @@ mod tests {
                 (i as u64 + 1) * 1000,
                 sk,
             );
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -14002,7 +14002,7 @@ mod tests {
                 (i as u64 + 1) * 1000,
                 sk,
             );
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -14043,7 +14043,7 @@ mod tests {
                 (i as u64 + 1) * 1000,
                 sk,
             );
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -14157,7 +14157,7 @@ mod tests {
 
         // 4. evaluatepolicy - store policy and evaluate; must reflect proof as matched
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -14207,7 +14207,7 @@ mod tests {
         let mut rpc_proof = make_rpc_proof(&agreement_hash, &sk);
         rpc_proof.expires_at_height = Some(0);
         let proof_id = rpc_proof.proof_id.clone();
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -14282,7 +14282,7 @@ mod tests {
 
         // evaluatepolicy: same exclusion must apply — proof_count=0
         let policy = make_rpc_policy(&agreement_hash, &pubkey_hex);
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -14332,7 +14332,7 @@ mod tests {
             let sk = rpc_signing_key();
             let pubkey_hex = rpc_pubkey_hex(&sk);
             let proof = make_rpc_proof(&agreement_hash, &sk);
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -14340,7 +14340,7 @@ mod tests {
             )
             .await
             .expect("submit");
-            store_policy_rpc(
+            let _ = store_policy_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -14379,7 +14379,7 @@ mod tests {
             let agreement_hash = hex::encode(Sha256::digest(&bytes));
             let sk = rpc_signing_key();
             let pubkey_hex = rpc_pubkey_hex(&sk);
-            store_policy_rpc(
+            let _ = store_policy_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -14431,7 +14431,7 @@ mod tests {
                 milestone_id: None,
                 notes: None,
             });
-            store_policy_rpc(
+            let _ = store_policy_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -14489,7 +14489,7 @@ mod tests {
         p4.expires_at_height = Some(0);
         let p5 = make_proof_with_time("prf-tt-5", "hash-tt", 5_000, &sk5);
         for p in [p1, p2, p3, p4, p5] {
-            submit_proof_rpc(
+            let _ = submit_proof_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -14576,7 +14576,7 @@ mod tests {
         let sk3 = SigningKey::from_bytes((&[116u8; 32]).into()).unwrap();
         let sk4 = SigningKey::from_bytes((&[117u8; 32]).into()).unwrap();
         let active1 = make_rpc_proof(&agreement_hash, &sk);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -14586,7 +14586,7 @@ mod tests {
         .expect("submit active1");
         let mut expired1 = make_proof_with_time("prf-cross-exp1", &agreement_hash, 2_000, &sk2);
         expired1.expires_at_height = Some(0);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -14596,7 +14596,7 @@ mod tests {
         .expect("submit expired1");
         let mut expired2 = make_proof_with_time("prf-cross-exp2", &agreement_hash, 3_000, &sk3);
         expired2.expires_at_height = Some(0);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -14605,7 +14605,7 @@ mod tests {
         .await
         .expect("submit expired2");
         let active2 = make_proof_with_time("prf-cross-act2", &agreement_hash, 4_000, &sk4);
-        submit_proof_rpc(
+        let _ = submit_proof_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -14634,7 +14634,7 @@ mod tests {
         assert_eq!(list_active.total_count, 2, "2 active proofs expected");
 
         // evaluatepolicy: proof_count must equal listproofs active total_count
-        store_policy_rpc(
+        let _ = store_policy_rpc(
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
@@ -14689,7 +14689,7 @@ mod tests {
                 milestone_id: None,
                 notes: None,
             });
-            store_policy_rpc(
+            let _ = store_policy_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -14739,7 +14739,7 @@ mod tests {
                 milestone_id: None,
                 notes: None,
             });
-            store_policy_rpc(
+            let _ = store_policy_rpc(
                 ConnectInfo(test_socket()),
                 State(state.clone()),
                 HeaderMap::new(),
@@ -14778,7 +14778,6 @@ mod tests {
 
     #[tokio::test]
     async fn build_contractor_template_rpc_returns_policy_and_summary() {
-        use irium_node_rs::settlement::TemplateAttestor;
         let (state, _, _, _) = create_test_state(None);
         let req = BuildContractorTemplateRequest {
             policy_id: "pol-contractor-1".to_string(),
