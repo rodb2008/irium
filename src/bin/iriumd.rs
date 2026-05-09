@@ -1498,8 +1498,8 @@ fn load_manual_seeds(node_cfg: Option<&NodeConfig>) -> Vec<String> {
 }
 
 fn load_extra_seeds() -> Vec<String> {
-    let path = std::path::Path::new("bootstrap/seedlist.extra");
-    std::fs::read_to_string(path)
+    let path = storage::bootstrap_dir().join("seedlist.extra");
+    std::fs::read_to_string(&path)
         .map(|raw| parse_seed_lines(&raw))
         .unwrap_or_default()
 }

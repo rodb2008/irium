@@ -13,7 +13,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::storage;
 
 const DEFAULT_SEEDLIST_BASELINE: &str = "bootstrap/seedlist.txt";
-const DEFAULT_SEEDLIST_EXTRA: &str = "bootstrap/seedlist.extra";
 const DEFAULT_SEEDLIST_RUNTIME: &str = "bootstrap/seedlist.runtime";
 const DEFAULT_SEEDLIST_STATIC: &str = "bootstrap/static_peers.txt";
 const DEFAULT_PEER_DB: &str = "state/peers.json";
@@ -127,7 +126,7 @@ impl SeedlistManager {
         let root = repo_root();
         let bootstrap = storage::bootstrap_dir();
         let baseline = bootstrap.join("seedlist.txt");
-        let extra = root.join(DEFAULT_SEEDLIST_EXTRA);
+        let extra = bootstrap.join("seedlist.extra");
         let runtime = root.join(DEFAULT_SEEDLIST_RUNTIME);
         if let Some(parent) = runtime.parent() {
             let _ = fs::create_dir_all(parent);
