@@ -468,6 +468,10 @@ pub fn state_dir() -> PathBuf {
     configured_dir("IRIUM_STATE_DIR").unwrap_or_else(|| runtime_root_dir().join("state"))
 }
 
+pub fn bootstrap_dir() -> PathBuf {
+    configured_dir("IRIUM_BOOTSTRAP_DIR").unwrap_or_else(|| runtime_root_dir().join("bootstrap"))
+}
+
 pub fn ensure_runtime_dirs() -> std::io::Result<(PathBuf, PathBuf)> {
     let blocks = blocks_dir();
     fs::create_dir_all(&blocks)?;

@@ -38,6 +38,7 @@ use sha2::{Digest, Sha256};
 const DEFAULT_MAX_PEERS: usize = 100;
 /// Cap on peers returned per GetPeers response to prevent unbounded serialisation.
 const MAX_PEERS_IN_RESPONSE: usize = 50;
+const MAX_ADDR_PUSH: usize = 1000;
 const MAX_MSGS_PER_SEC: u32 = 200;
 const MAX_BULK_MSGS_PER_SEC: u32 = 2000;
 
@@ -3005,6 +3006,7 @@ impl P2PNode {
         let trusted_seed_ips = self.trusted_seed_ips.clone();
         let node_id = self.node_id.clone();
         let banned_ips = self.banned_ips.clone();
+        let dir_arc_for_periodic = self.peers_directory.clone();
 
         tokio::spawn(async move {
             loop {
@@ -3189,7 +3191,22 @@ impl P2PNode {
             }
         });
 
+        // Periodic seedlist.runtime save every 10 minutes.
+        {
+            let dir = dir_arc_for_periodic;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                    dir.lock().await.refresh_seedlist_with_policy();
+                }
+            });
+        }
+
         Ok(())
+    }
+
+    pub async fn flush_peers_to_runtime(&self) {
+        self.peers_directory.lock().await.refresh_seedlist_with_policy();
     }
 
     /// Broadcast a raw serialized block to all currently known peers.
@@ -4418,6 +4435,18 @@ impl P2PNode {
                                 )
                                 .await;
                             }
+                            // Proactive addr push: send up to 1000 dialable peers on connect.
+                            {
+                                let to_push: Vec<String> = {
+                                    let d = dir.lock().await;
+                                    d.peers().iter().filter(|p| p.dialable).take(MAX_ADDR_PUSH).map(|p| p.multiaddr.clone()).collect()
+                                };
+                                if !to_push.is_empty() {
+                                    if let Ok(push_msg) = (PeersPayload { peers: to_push }).to_message() {
+                                        send_message_detached(&writer, push_msg, addr);
+                                    }
+                                }
+                            }
                             // Basic header-first sync trigger: if peer is ahead, request blocks.
                             let local_height = {
                                 if let Some(ref c) = chain_for_sync {
@@ -4739,8 +4768,19 @@ impl P2PNode {
                     MessageType::Peers => {
                         if let Ok(list) = PeersPayload::from_message(&msg) {
                             let source = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
+                            let filtered: Vec<String> = list.peers.into_iter()
+                                .filter(|p| {
+                                    if let Some(port_str) = p.split("/tcp/").nth(1) {
+                                        port_str.trim().parse::<u16>().map(|port| port != 0).unwrap_or(true)
+                                    } else if let Ok(sa) = p.parse::<std::net::SocketAddr>() {
+                                        sa.port() != 0
+                                    } else {
+                                        true
+                                    }
+                                })
+                                .collect();
                             let mut dir = dir.lock().await;
-                            dir.register_peer_hints(list.peers, Some(&source));
+                            dir.register_peer_hints(filtered, Some(&source));
                         }
                     }
                     MessageType::GetHeaders => {
@@ -6493,6 +6533,18 @@ async fn handle_incoming_with_sybil(
                         )
                         .await;
                     }
+                    // Proactive addr push: send up to 1000 dialable peers on connect.
+                    {
+                        let to_push: Vec<String> = {
+                            let d = directory.lock().await;
+                            d.peers().iter().filter(|p| p.dialable).take(MAX_ADDR_PUSH).map(|p| p.multiaddr.clone()).collect()
+                        };
+                        if !to_push.is_empty() {
+                            if let Ok(push_msg) = (PeersPayload { peers: to_push }).to_message() {
+                                send_message_detached(&writer, push_msg, addr);
+                            }
+                        }
+                    }
                     let local_height = local_height(&chain);
                     let peer_tip = payload
                         .tip_hash
@@ -6803,8 +6855,19 @@ async fn handle_incoming_with_sybil(
             MessageType::Peers => {
                 if let Ok(list) = PeersPayload::from_message(&msg) {
                     let source = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
+                    let filtered: Vec<String> = list.peers.into_iter()
+                        .filter(|p| {
+                            if let Some(port_str) = p.split("/tcp/").nth(1) {
+                                port_str.trim().parse::<u16>().map(|port| port != 0).unwrap_or(true)
+                            } else if let Ok(sa) = p.parse::<std::net::SocketAddr>() {
+                                sa.port() != 0
+                            } else {
+                                true
+                            }
+                        })
+                        .collect();
                     let mut dir = directory.lock().await;
-                    dir.register_peer_hints(list.peers, Some(&source));
+                    dir.register_peer_hints(filtered, Some(&source));
                 }
             }
 
@@ -7851,6 +7914,7 @@ mod tests {
 
     #[test]
     fn attaches_out_of_order_orphan_headers() {
+        let _serial = orphan_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let locked = load_locked_genesis().expect("load locked genesis");
         let genesis = block_from_locked(&locked).expect("build genesis block");
         let pow_limit = crate::pow::Target { bits: 0x207fffff };
