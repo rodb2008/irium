@@ -1,9 +1,16 @@
 ## Source Repository
 
-- Stratum source repo: https://github.com/iriumlabs/irium-stratum
-- Build/deploy the public pool from that repository, not from this irium repo.
-- Public users should connect through the Stratum DNS hostname `pool.iriumlabs.org` after DNS and services are cut over to the active pool host. This is not a browser website.
-- Backend host IPs must not be published in public miner guides.
+The Stratum pool server is built from the main Irium repository:
+https://github.com/iriumlabs/irium
+
+The Stratum binaries (`irium-stratum` and `irium-stratum-legacy`) are compiled
+from the same source as iriumd. Build with:
+
+    cd irium
+    cargo build --release
+
+The binaries will be at `target/release/irium-stratum` and
+`target/release/irium-stratum-legacy`.
 
 # Irium Public Stratum Pool
 
