@@ -1356,6 +1356,39 @@ fn mask_seed_label(seed: &str) -> String {
     }
 }
 
+fn scan_blocks_for_peers(chain: &ChainState, max_blocks: usize) -> (usize, Vec<SocketAddr>) {
+    let total = chain.chain.len();
+    if total == 0 {
+        return (0, Vec::new());
+    }
+    let start = total.saturating_sub(max_blocks);
+    let scan_count = total - start;
+    let prefix = b"IRIUM_PEER ";
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for block in &chain.chain[start..] {
+        for tx in &block.transactions {
+            for output in &tx.outputs {
+                let s = &output.script_pubkey;
+                if s.len() > 2 && s[0] == 0x6a {
+                    let payload = &s[2..];
+                    if payload.starts_with(prefix) {
+                        if let Ok(addr_str) = std::str::from_utf8(&payload[prefix.len()..]) {
+                            let addr_str = addr_str.trim();
+                            if let Ok(sa) = addr_str.parse::<SocketAddr>() {
+                                if sa.port() != 0 && seen.insert(sa) {
+                                    result.push(sa);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (scan_count, result)
+}
+
 fn load_runtime_seeds() -> Vec<String> {
     let path = storage::bootstrap_dir().join("seedlist.runtime");
     std::fs::read_to_string(&path)
@@ -7490,6 +7523,32 @@ async fn main() {
     for addr in &add_seed_args {
         if !manual_seeds.iter().any(|s| s == addr) {
             manual_seeds.push(addr.clone());
+        }
+    }
+    // Phase 3: cold-start blockchain peer scan
+    if load_runtime_seeds().len() < 5 {
+        let (scanned, block_peers) = {
+            let guard = shared_state.lock().unwrap_or_else(|e| e.into_inner());
+            scan_blocks_for_peers(&guard, 2016)
+        };
+        let m = block_peers.len();
+        eprintln!("[bootstrap] scanned {} blocks, found {} peer announcements", scanned, m);
+        if m == 0 {
+            eprintln!("[bootstrap] no peer announcements found in chain yet — falling back to signed seedlist");
+        } else {
+            let runtime_path = storage::bootstrap_dir().join("seedlist.runtime");
+            if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&runtime_path) {
+                use std::io::Write;
+                for addr in &block_peers {
+                    let _ = writeln!(file, "{}", addr);
+                }
+            }
+            for addr in &block_peers {
+                let addr_str = addr.to_string();
+                if !manual_seeds.iter().any(|s| s == &addr_str) {
+                    manual_seeds.push(addr_str);
+                }
+            }
         }
     }
     let fallback_seeds = load_builtin_fallback_seeds();

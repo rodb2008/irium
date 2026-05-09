@@ -225,6 +225,24 @@ fn coinbase_metadata_output() -> Option<TxOutput> {
     Some(op_return_output(bytes))
 }
 
+fn advertise_peer_output() -> Option<TxOutput> {
+    let addr_str = std::env::var("IRIUM_ADVERTISE_ADDR").ok()?;
+    let addr_str = addr_str.trim();
+    if addr_str.is_empty() {
+        return None;
+    }
+    let sa: std::net::SocketAddr = addr_str.parse().ok()?;
+    if sa.port() == 0 {
+        return None;
+    }
+    let payload = format!("IRIUM_PEER {}", addr_str);
+    let bytes = payload.as_bytes();
+    if bytes.len() > 75 {
+        return None;
+    }
+    Some(op_return_output(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{build_coinbase, build_coinbase_with_pkh, script_from_relay_address};
@@ -1578,6 +1596,9 @@ fn mine_once(
     if let Some(output) = coinbase_metadata_output() {
         coinbase.outputs.push(output);
     }
+    if let Some(output) = advertise_peer_output() {
+        coinbase.outputs.push(output);
+    }
 
     txs.push(coinbase);
     for entry in mempool_entries {
@@ -2441,6 +2462,9 @@ fn build_solo_stratum_job(
     if let Some(output) = coinbase_metadata_output() {
         coinbase.outputs.push(output);
     }
+    if let Some(output) = advertise_peer_output() {
+        coinbase.outputs.push(output);
+    }
 
     let raw_coinbase = coinbase.serialize();
     let script_start = 4 + 1 + 1 + 32 + 4 + 1;
@@ -2962,6 +2986,22 @@ fn main() {
             );
         } else {
             println!("[🪝] Anchors digest: {}", manager.payload_digest());
+        }
+    }
+
+    match std::env::var("IRIUM_ADVERTISE_ADDR") {
+        Ok(ref v) if !v.trim().is_empty() => {
+            match v.trim().parse::<std::net::SocketAddr>() {
+                Ok(sa) if sa.port() != 0 => {
+                    eprintln!("[advertise] embedding peer address {} in coinbase outputs", sa);
+                }
+                _ => {
+                    eprintln!("[advertise] IRIUM_ADVERTISE_ADDR={} is not a valid ip:port — peer embedding disabled", v.trim());
+                }
+            }
+        }
+        _ => {
+            eprintln!("[advertise] IRIUM_ADVERTISE_ADDR not set — peer embedding disabled");
         }
     }
 
