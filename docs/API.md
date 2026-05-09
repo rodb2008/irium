@@ -121,6 +121,35 @@ curl http://localhost:38300/peers
 
 ---
 
+### `POST /admin/add-seed`
+
+Adds a peer address to the runtime seed list and attempts an immediate connection.
+Requires `IRIUM_RPC_TOKEN` authentication if configured.
+
+**Request body:** JSON object with the peer address.
+
+**Example request:**
+```
+curl -X POST http://localhost:38300/admin/add-seed \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <token>' \
+  -d '{"addr": "1.2.3.4:38291"}'
+```
+
+**Example response:**
+```json
+{ "added": true }
+```
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| 400 | Invalid address format |
+| 401 | Missing or invalid authentication token |
+
+---
+
 ### `GET /metrics`
 
 Returns Prometheus-format plain-text metrics for use with monitoring systems.

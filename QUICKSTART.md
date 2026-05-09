@@ -91,7 +91,12 @@ Start the full node in a separate terminal window (leave it running):
 iriumd
 ```
 
-The node connects to the Irium network automatically using two official seed nodes. Once it starts syncing, check its status:
+The node connects to the Irium network automatically. On first run it uses the
+signed seed node list bundled with the software. After the first connection it
+caches peer addresses locally and never needs the seed nodes again. Miners with
+public IPs can set `IRIUM_ADVERTISE_ADDR=ip:port` to embed their address in the
+blockchain so new nodes can discover them even without the seed nodes. Once it
+starts syncing, check its status:
 
 ```bash
 curl http://127.0.0.1:38300/status
