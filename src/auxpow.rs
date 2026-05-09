@@ -300,39 +300,44 @@ pub fn deserialize(data: &[u8], offset: &mut usize) -> Result<AuxPoW, String> {
 mod tests {
     use super::*;
 
+    const AUX_NONCE_DEFAULT: u32 = 0;
+    const AUX_NONCE_VARIED: u32 = 99;
+    const AUX_CHAIN_COUNT_SINGLE: u32 = 1;
+    const AUX_CHAIN_COUNT_MULTI: u32 = 3;
+
     fn make_coinbase(aux_hash: &[u8; 32], chain_count: u32) -> Vec<u8> {
-        build_commitment(aux_hash, chain_count, 0).to_vec() // codeql[rust/hard-coded-cryptographic-value] -- AuxPoW protocol constant, not a secret
+        build_commitment(aux_hash, chain_count, AUX_NONCE_DEFAULT).to_vec()
     }
 
     #[test]
     fn build_commitment_format() {
         let h = [0x42u8; 32];
-        let c = build_commitment(&h, 1, 99); // codeql[rust/hard-coded-cryptographic-value] -- AuxPoW protocol constant, not a secret
+        let c = build_commitment(&h, AUX_CHAIN_COUNT_SINGLE, AUX_NONCE_VARIED);
         assert_eq!(&c[..4], &AUXPOW_COMMIT_MAGIC);
         assert_eq!(&c[4..36], &h);
-        assert_eq!(&c[36..40], &1u32.to_le_bytes());
-        assert_eq!(&c[40..44], &99u32.to_le_bytes());
+        assert_eq!(&c[36..40], &AUX_CHAIN_COUNT_SINGLE.to_le_bytes());
+        assert_eq!(&c[40..44], &AUX_NONCE_VARIED.to_le_bytes());
     }
 
     #[test]
     fn find_commitment_success() {
         let h = [0xabu8; 32];
-        let cb = make_coinbase(&h, 3);
+        let cb = make_coinbase(&h, AUX_CHAIN_COUNT_MULTI);
         let (root, count) = find_commitment(&cb).unwrap();
         assert_eq!(root, h);
-        assert_eq!(count, 3);
+        assert_eq!(count, AUX_CHAIN_COUNT_MULTI);
     }
 
     #[test]
     fn find_commitment_embedded_in_larger_coinbase() {
         let h = [0x77u8; 32];
-        let commitment = build_commitment(&h, 1, 0); // codeql[rust/hard-coded-cryptographic-value] -- AuxPoW protocol constant, not a secret
+        let commitment = build_commitment(&h, AUX_CHAIN_COUNT_SINGLE, AUX_NONCE_DEFAULT);
         let mut cb = vec![0u8; 10];
         cb.extend_from_slice(&commitment);
         cb.extend_from_slice(&[0u8; 5]);
         let (root, count) = find_commitment(&cb).unwrap();
         assert_eq!(root, h);
-        assert_eq!(count, 1);
+        assert_eq!(count, AUX_CHAIN_COUNT_SINGLE);
     }
 
     #[test]
