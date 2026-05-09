@@ -1357,8 +1357,8 @@ fn mask_seed_label(seed: &str) -> String {
 }
 
 fn load_runtime_seeds() -> Vec<String> {
-    let path = std::path::Path::new("bootstrap/seedlist.runtime");
-    std::fs::read_to_string(path)
+    let path = storage::bootstrap_dir().join("seedlist.runtime");
+    std::fs::read_to_string(&path)
         .map(|raw| parse_seed_lines(&raw))
         .unwrap_or_default()
 }
@@ -1571,13 +1571,30 @@ struct SeedDialInfo {
     signed: usize,
 }
 
+const BUNDLED_SEEDLIST: &str = include_str!("../../bootstrap/seedlist.txt");
+const BUNDLED_SEEDLIST_SIG: &str = include_str!("../../bootstrap/seedlist.txt.sig");
+
+fn ensure_seedlist_in_bootstrap_dir() {
+    let dir = storage::bootstrap_dir();
+    let _ = fs::create_dir_all(&dir);
+    let seed_path = dir.join("seedlist.txt");
+    let sig_path = dir.join("seedlist.txt.sig");
+    if !seed_path.exists() {
+        let _ = fs::write(&seed_path, BUNDLED_SEEDLIST);
+    }
+    if !sig_path.exists() {
+        let _ = fs::write(&sig_path, BUNDLED_SEEDLIST_SIG);
+    }
+}
+
 fn load_signed_seeds() -> Vec<String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let seed_path = std::path::Path::new("bootstrap/seedlist.txt");
-    let sig_path = std::path::Path::new("bootstrap/seedlist.txt.sig");
-    let Ok(seed_data) = std::fs::read_to_string(seed_path) else {
+    let dir = storage::bootstrap_dir();
+    let seed_path = dir.join("seedlist.txt");
+    let sig_path = dir.join("seedlist.txt.sig");
+    let Ok(seed_data) = std::fs::read_to_string(&seed_path) else {
         eprintln!(
             "[warn] bootstrap signed seedlist missing: {}",
             seed_path.display()
@@ -1595,7 +1612,7 @@ fn load_signed_seeds() -> Vec<String> {
         .unwrap_or_else(|| "file".to_string());
     let allowed_signers_path = std::env::var("IRIUM_SEEDLIST_ALLOWED_SIGNERS")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::Path::new("bootstrap/trust/allowed_signers").to_path_buf());
+        .unwrap_or_else(|_| storage::bootstrap_dir().join("trust/allowed_signers"));
     let mut child = match Command::new("ssh-keygen")
         .arg("-Y")
         .arg("verify")
@@ -4021,6 +4038,41 @@ fn spend_htlc_from_params(
         raw_tx_hex: hex::encode(raw),
         fee: fee_checked,
     })
+}
+
+#[derive(Deserialize)]
+struct AddSeedRequest {
+    addr: String,
+}
+
+async fn admin_add_seed(
+    ConnectInfo(_conn): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<AddSeedRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    require_rpc_auth(&headers)?;
+    let addr_str = req.addr.trim().to_string();
+    if addr_str.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    {
+        let runtime_path = storage::bootstrap_dir().join("seedlist.runtime");
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&runtime_path) {
+            use std::io::Write;
+            let _ = writeln!(file, "{}", addr_str);
+        }
+    }
+    if let Some(ref node) = state.p2p {
+        if let Ok(sa) = addr_str.parse::<SocketAddr>() {
+            let node_c = node.clone();
+            let height = state.chain.lock().unwrap_or_else(|e| e.into_inner()).tip_height();
+            tokio::spawn(async move {
+                let _ = node_c.connect_and_handshake(sa, height, "Irium-Node").await;
+            });
+        }
+    }
+    Ok(Json(json!({ "added": true })))
 }
 
 async fn create_agreement(
@@ -7417,10 +7469,36 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(0);
 
-    let manual_seeds = load_manual_seeds(node_cfg.as_ref());
+    ensure_seedlist_in_bootstrap_dir();
+    let add_seed_args: Vec<String> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.windows(2)
+            .filter(|w| w[0] == "--add-seed")
+            .map(|w| w[1].clone())
+            .collect()
+    };
+    if !add_seed_args.is_empty() {
+        let runtime_path = storage::bootstrap_dir().join("seedlist.runtime");
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&runtime_path) {
+            use std::io::Write;
+            for addr in &add_seed_args {
+                let _ = writeln!(file, "{}", addr);
+            }
+        }
+    }
+    let mut manual_seeds = load_manual_seeds(node_cfg.as_ref());
+    for addr in &add_seed_args {
+        if !manual_seeds.iter().any(|s| s == addr) {
+            manual_seeds.push(addr.clone());
+        }
+    }
     let fallback_seeds = load_builtin_fallback_seeds();
     let dns_seed_hosts = load_dns_seed_hosts(node_cfg.as_ref());
-    let signed_seeds = load_signed_seeds();
+    let signed_seeds = if load_runtime_seeds().len() >= 5 {
+        Vec::new()
+    } else {
+        load_signed_seeds()
+    };
     let p2p_bind_for_local = std::env::var("IRIUM_P2P_BIND").ok()
         .or_else(|| node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.clone()));
     let local_ips = local_ip_set(p2p_bind_for_local.as_ref());
@@ -8314,6 +8392,7 @@ async fn main() {
     if persist_drain_secs > 0 {
         #[cfg(unix)]
         {
+            let p2p_for_shutdown = app_state.p2p.clone();
             tokio::spawn(async move {
                 use tokio::signal::unix::{signal, SignalKind};
                 let mut sigterm = match signal(SignalKind::terminate()) {
@@ -8321,6 +8400,9 @@ async fn main() {
                     Err(_) => return,
                 };
                 let _ = sigterm.recv().await;
+                if let Some(ref node) = p2p_for_shutdown {
+                    node.flush_peers_to_runtime().await;
+                }
                 let ok = storage::drain_persist_queue(Duration::from_secs(persist_drain_secs));
                 if ok {
                     eprintln!("[i] persist queue drained on shutdown");
@@ -8779,6 +8861,7 @@ async fn explorer_stats(
         .route("/offers/feed", get(offers_feed))
         .route("/ws", get(ws_handler))
         .route("/events", get(sse_handler))
+        .route("/admin/add-seed", post(admin_add_seed))
         .layer(DefaultBodyLimit::max(rpc_body_limit_bytes()))
         .with_state(app_state.clone());
 

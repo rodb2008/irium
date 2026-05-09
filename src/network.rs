@@ -125,7 +125,8 @@ pub struct SeedlistManager {
 impl SeedlistManager {
     pub fn new(limit: usize) -> SeedlistManager {
         let root = repo_root();
-        let baseline = root.join(DEFAULT_SEEDLIST_BASELINE);
+        let bootstrap = storage::bootstrap_dir();
+        let baseline = bootstrap.join("seedlist.txt");
         let extra = root.join(DEFAULT_SEEDLIST_EXTRA);
         let runtime = root.join(DEFAULT_SEEDLIST_RUNTIME);
         if let Some(parent) = runtime.parent() {
@@ -185,7 +186,7 @@ impl SeedlistManager {
     fn seedlist_allowed_signers() -> PathBuf {
         std::env::var("IRIUM_SEEDLIST_ALLOWED_SIGNERS")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| repo_root().join("bootstrap/trust/allowed_signers"))
+            .unwrap_or_else(|_| storage::bootstrap_dir().join("trust/allowed_signers"))
     }
 
     fn seedlist_sig_path(&self) -> PathBuf {
@@ -554,7 +555,7 @@ impl PeerDirectory {
             PeerRecord {
                 multiaddr,
                 agent: None,
-                source: Some("peer_exchange".to_string()),
+                source: Some("gossip".to_string()),
                 last_seen: 0.0,
                 first_seen: t,
                 seen_days: Vec::new(),
