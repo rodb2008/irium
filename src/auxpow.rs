@@ -134,6 +134,7 @@ pub fn compute_merkle_root(leaf: &[u8; 32], branch: &[[u8; 32]], index: u32) -> 
 /// Build a 44-byte merged-mining commitment for embedding in a Bitcoin coinbase.
 ///
 /// `aux_hash` is sha256d(block_header.serialize()) — natural order, not reversed.
+#[allow(dead_code)] // merged-mining commitment builder; used by mining infrastructure when merge mining is enabled
 pub fn build_commitment(aux_hash: &[u8; 32], chain_count: u32, nonce: u32) -> [u8; 44] {
     let mut out = [0u8; 44];
     out[..4].copy_from_slice(&AUXPOW_COMMIT_MAGIC);

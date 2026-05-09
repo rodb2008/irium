@@ -130,6 +130,7 @@ pub enum InputWitness {
     Unknown,
 }
 
+#[allow(dead_code)] // P2PKH script builder; used by wallet and test utilities
 pub fn p2pkh_script(pkh: &[u8; 20]) -> Vec<u8> {
     let mut script = Vec::with_capacity(25);
     script.push(0x76);
@@ -360,6 +361,7 @@ fn parse_legacy_p2pkh_witness(script_sig: &[u8]) -> Option<InputWitness> {
     Some(InputWitness::P2pkh { sig, pubkey })
 }
 
+#[allow(dead_code)] // HTLCv1 claim witness encoder; used by wallet when spending HTLC outputs
 pub fn encode_htlcv1_claim_witness(sig: &[u8], pubkey: &[u8], preimage: &[u8]) -> Option<Vec<u8>> {
     if sig.is_empty()
         || sig.len() > 255
@@ -381,6 +383,7 @@ pub fn encode_htlcv1_claim_witness(sig: &[u8], pubkey: &[u8], preimage: &[u8]) -
     Some(out)
 }
 
+#[allow(dead_code)] // HTLCv1 refund witness encoder; used by wallet when reclaiming expired HTLCs
 pub fn encode_htlcv1_refund_witness(sig: &[u8], pubkey: &[u8]) -> Option<Vec<u8>> {
     if sig.is_empty() || sig.len() > 255 || pubkey.is_empty() || pubkey.len() > 255 {
         return None;
@@ -394,6 +397,7 @@ pub fn encode_htlcv1_refund_witness(sig: &[u8], pubkey: &[u8]) -> Option<Vec<u8>
     Some(out)
 }
 
+#[allow(dead_code)] // MPSO claim witness encoder; used by wallet for M-of-N multisig claim spending
 pub fn encode_mpso_claim_witness(
     bitmap: u8,
     sigs: &[Vec<u8>],
@@ -419,6 +423,7 @@ pub fn encode_mpso_claim_witness(
     Some(out)
 }
 
+#[allow(dead_code)] // MPSO refund witness encoder; used by wallet for M-of-N multisig refund spending
 pub fn encode_mpso_refund_witness(bitmap: u8, sigs: &[Vec<u8>]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     out.push(0x02u8);

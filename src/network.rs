@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::storage;
 
+#[allow(dead_code)] // baseline path kept for reference; runtime uses seedlist.runtime
 const DEFAULT_SEEDLIST_BASELINE: &str = "bootstrap/seedlist.txt";
 const DEFAULT_SEEDLIST_RUNTIME: &str = "bootstrap/seedlist.runtime";
 const DEFAULT_SEEDLIST_STATIC: &str = "bootstrap/static_peers.txt";

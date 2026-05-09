@@ -30,6 +30,7 @@ pub enum GenesisError {
     Json(#[from] serde_json::Error),
 }
 
+#[allow(dead_code)] // dev/test utility for locating repo root at runtime; kept for tooling
 pub fn repo_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if manifest_dir.join("configs").join("genesis-locked.json").exists() {
@@ -50,6 +51,7 @@ pub fn repo_root() -> PathBuf {
     manifest_dir
 }
 
+#[allow(dead_code)] // path-based genesis loader; production uses include_str! but kept for external tooling
 pub fn locked_genesis_path() -> PathBuf {
     repo_root().join("configs").join("genesis-locked.json")
 }

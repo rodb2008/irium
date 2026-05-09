@@ -109,14 +109,17 @@ pub fn resolved_auxpow_activation_height(network: NetworkKind) -> Option<u64> {
 /// Mainnet MPSOv1 (M-of-N multisig output) activation height.
 ///
 /// Activated at block 20,000. No MPSO outputs exist before this height.
+#[allow(dead_code)] // protocol constant: MPSOv1 activation height on mainnet
 pub const MAINNET_MPSOV1_ACTIVATION_HEIGHT: Option<u64> = Some(20_000);
 
+#[allow(dead_code)] // env override for testing MPSOv1 activation on non-mainnet networks
 pub fn runtime_mpsov1_env_override() -> Option<u64> {
     env::var("IRIUM_MPSOV1_ACTIVATION_HEIGHT")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
+#[allow(dead_code)] // public resolver for MPSOv1 activation height; used by wallet and block validators once MPSOv1 ships
 pub fn resolved_mpsov1_activation_height(network: NetworkKind) -> Option<u64> {
     match network {
         NetworkKind::Mainnet => MAINNET_MPSOV1_ACTIVATION_HEIGHT,
