@@ -965,33 +965,56 @@ Full message type table:
 | ProofGossip | 19 | Settlement proof gossip |
 | Disconnect | 99 | Graceful disconnect notification |
 
-### Seed Node Bootstrap
+### DNS-Free Bootstrap System
 
-Peer discovery begins with seed nodes. The official seed nodes (from
-`bootstrap/seedlist.txt`) are:
+Irium uses a three-layer DNS-free peer discovery system. No DNS resolution
+occurs at any layer. No domain names are hardcoded anywhere in the software.
 
-```
-207.244.247.86
-157.173.116.134
-```
+**Layer 1 — Peer Gossip and Runtime Cache**
 
-New nodes dial these addresses at startup to obtain a peer list. From there,
-additional peers are discovered via `GetPeers`/`Peers` exchanges. Once a node
-has established connections, it no longer depends on the seed nodes.
+When a node connects to any peer, it immediately receives up to 1000 known
+dialable peer addresses. These addresses are stored in a local runtime peer
+cache (`~/.irium/bootstrap/seedlist.runtime`) which is written to disk every
+10 minutes and on clean shutdown. On subsequent startups the node loads from
+this cache first. Once a node has connected to the network even once, it becomes
+self-sufficient and never requires seed nodes or any external infrastructure again.
+
+**Layer 2 — Signed Seedlist**
+
+For nodes starting for the first time with an empty peer cache, a
+cryptographically signed IP seedlist (`seedlist.txt`) is bundled with the
+software. The signature (Ed25519 via `ssh-keygen`) prevents eclipse attacks by
+ensuring the seedlist cannot be tampered with. The seedlist is read from the
+user's data directory (`~/.irium/bootstrap/seedlist.txt`) rather than embedded
+in the binary, allowing it to be updated without a software release. Node
+operators can also inject peers directly at startup using the
+`--add-seed <ip:port>` flag or at runtime via the `POST /admin/add-seed` RPC
+endpoint, bypassing the signed seedlist entirely.
+
+**Layer 3 — Blockchain-Embedded Peer Discovery**
+
+Miners and node operators who wish to be publicly discoverable can set the
+`IRIUM_ADVERTISE_ADDR=<ip:port>` environment variable. When set, the miner
+embeds the listen address in every coinbase transaction as a zero-value
+`OP_RETURN` output with the payload `IRIUM_PEER <ip:port>`. On cold start, if
+the runtime peer cache has fewer than 5 entries, iriumd scans the last 2016
+blocks for `IRIUM_PEER` announcements and bootstraps directly from addresses
+found in the chain. As the network grows and more miners advertise their
+addresses, the blockchain itself becomes the peer directory.
+
+**Progressive self-sufficiency**
+
+This architecture means the network becomes progressively more self-sustaining
+over time. Early nodes rely on the signed seedlist. As more nodes connect and
+populate their peer caches, the gossip layer takes over. As miners embed their
+addresses in the chain, even brand new nodes with empty caches can bootstrap
+without any seed infrastructure — creating a network that can survive
+indefinitely without any centrally operated seed servers.
 
 Seed node records are managed in three files:
-- `bootstrap/seedlist.txt` — official signed baseline seeds
-- `bootstrap/seedlist.extra` — operator-added extra seeds
-- `bootstrap/seedlist.runtime` — dynamically discovered peers, auto-generated
-
-Nodes operating as community seed nodes are encouraged to register with the
-Irium community to be added to the baseline seed list.
-
-### DNS-Free Discovery
-
-No DNS lookups are required at any point during normal operation. All peer
-discovery uses IP addresses directly. This eliminates a class of censorship
-and availability attacks that affect DNS-dependent networks.
+- `~/.irium/bootstrap/seedlist.txt` — signed baseline seeds (copied from binary on first run)
+- `~/.irium/bootstrap/seedlist.extra` — operator-added extra seeds
+- `~/.irium/bootstrap/seedlist.runtime` — dynamically discovered peers, auto-generated
 
 ### Marketplace Feed Discovery via Handshake
 
@@ -1198,7 +1221,10 @@ mine and then reorganizing it away after receiving goods.
 
 No hardcoded peer IP addresses appear in any source file other than
 `bootstrap/seedlist.txt` and `configs/node.json`. All ports are configurable via
-environment variables. No DNS lookups are required for operation.
+environment variables. No DNS lookups are required for operation. The three-layer
+bootstrap system (gossip cache, signed seedlist, blockchain-embedded peer
+announcements) ensures nodes can discover peers and rejoin the network without
+any DNS infrastructure or centrally operated seed servers.
 
 ### Open Source
 
@@ -1270,6 +1296,9 @@ proceeds without a clean test run.
 | Stratum pool mining | Live |
 | Python SDK | Live |
 | JavaScript/TypeScript SDK | Live |
+| Three-layer DNS-free bootstrap (gossip, signed seedlist, blockchain-embedded) | Live |
+| Blockchain-embedded peer discovery (`IRIUM_ADVERTISE_ADDR`) | Live |
+| Runtime peer injection (`--add-seed` flag, `POST /admin/add-seed` RPC) | Live |
 | AuxPoW merged mining | Activating at block 26,347 |
 
 ### In Development

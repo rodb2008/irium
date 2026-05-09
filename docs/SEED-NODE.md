@@ -2,9 +2,29 @@
 
 ## Overview
 
-Seed nodes are the entry points new nodes use to join the Irium network. A fresh installation reads `bootstrap/seedlist.txt`, connects to the listed IPs, and discovers the rest of the network from there. The current seedlist has two nodes. Adding more reduces the risk of a new node being unable to bootstrap if one seed is temporarily offline.
+Seed nodes are entry points that help new nodes join the Irium network. Irium uses
+a three-layer DNS-free bootstrap system:
 
-This guide covers running a permanent publicly reachable seed node and applying to be added to the official seedlist.
+- **Layer 1 — Peer Gossip**: On every new connection iriumd sends up to 1000 known
+  dialable peer addresses. Once a node has connected even once it caches those
+  addresses locally and becomes self-sufficient.
+- **Layer 2 — Signed Seedlist**: For nodes starting cold with an empty peer cache,
+  a cryptographically signed IP seedlist (`seedlist.txt`) provides the initial
+  contact points. This is where seed nodes serve their role.
+- **Layer 3 — Blockchain-Embedded Discovery**: Miners running with
+  `IRIUM_ADVERTISE_ADDR=<ip:port>` embed their listen address in coinbase
+  transactions. New nodes scan the last 2016 blocks on cold start and bootstrap
+  directly from addresses found in the chain.
+
+Seed nodes serve Layer 2 of this system — providing the initial contact point for
+nodes whose runtime peer cache is empty or has fewer than 5 entries. Adding more
+seed nodes reduces the risk of a new node failing to bootstrap if one seed is
+temporarily offline. As the network grows and more miners advertise via the
+blockchain (Layer 3) and gossip (Layer 1) propagates peers widely, dependence on
+seed nodes decreases naturally.
+
+This guide covers running a permanent publicly reachable seed node and applying to
+be added to the official seedlist.
 
 ## Minimum Requirements
 

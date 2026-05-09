@@ -78,7 +78,32 @@ irium-wallet list-addresses         # see your addresses
 irium-wallet balance <YOUR_ADDRESS> # check balance once synced
 ```
 
-The node connects to the two official seed nodes and begins syncing. No configuration needed for a basic setup. Default P2P port: 38291. Default RPC port: 38300.
+The node connects to the Irium network automatically. On first run it uses the signed seed list bundled with the software. After the first connection it caches peer addresses locally and never needs the seed nodes again. No configuration needed for a basic setup. Default P2P port: 38291. Default RPC port: 38300.
+
+---
+
+## Running a Public Node
+
+If your node has a public IP address, you can help new users bootstrap by
+advertising your address in the blockchain. Set the following environment
+variable before starting the miner:
+
+```bash
+export IRIUM_ADVERTISE_ADDR=<your-public-ip>:38291
+```
+
+Your miner will embed your listen address in every coinbase transaction.
+New nodes scanning the chain will discover your node automatically without
+needing DNS or a central seed server.
+
+To add your node as a seed for a running node without restarting:
+
+```bash
+curl -X POST http://localhost:38300/admin/add-seed \
+  -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"addr": "<your-public-ip>:38291"}'
+```
 
 ---
 
