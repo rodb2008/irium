@@ -61,6 +61,8 @@ struct WalletFile {
     #[serde(default)]
     bip32_seed: Option<String>,
     #[serde(default)]
+    mnemonic: Option<String>,
+    #[serde(default)]
     next_index: u32,
     keys: Vec<WalletKey>,
 }
@@ -130,6 +132,7 @@ fn maybe_migrate_legacy_wallet(path: &Path, data: &str) -> Result<Option<WalletF
             version: 1,
             seed_hex: None,
             bip32_seed: None,
+            mnemonic: None,
             next_index: 0,
             keys: Vec::new(),
         }));
@@ -167,6 +170,7 @@ fn maybe_migrate_legacy_wallet(path: &Path, data: &str) -> Result<Option<WalletF
         version: 1,
         seed_hex: None,
         bip32_seed: None,
+        mnemonic: None,
         next_index: keys.len() as u32,
         keys,
     };
@@ -1992,6 +1996,7 @@ fn ensure_wallet(path: &Path) -> Result<WalletFile, String> {
             version: 1,
             seed_hex: None,
             bip32_seed: None,
+            mnemonic: None,
             next_index: 0,
             keys: Vec::new(),
         }
@@ -2242,6 +2247,7 @@ fn usage() {
     eprintln!("  irium-wallet export-wif <base58_addr> --out <file>");
     eprintln!("  irium-wallet import-wif <wif>");
     eprintln!("  irium-wallet export-seed --out <file>");
+  eprintln!("  irium-wallet export-mnemonic --out <file>");
     eprintln!("  irium-wallet import-seed <64hex> [--force]");
     eprintln!("  irium-wallet backup [--out <file>]");
     eprintln!("  irium-wallet restore-backup <file> [--force]");
@@ -21002,6 +21008,7 @@ fn main() {
                 version: 1,
                 seed_hex: Some(seed_hex.clone()),
                 bip32_seed: None,
+                mnemonic: None,
                 next_index: 1,
                 keys: vec![key.clone()],
             };
@@ -21037,12 +21044,13 @@ fn main() {
                     version: 1,
                     seed_hex: None,
                     bip32_seed: Some(hex::encode(seed_bytes)),
+                    mnemonic: Some(mnemonic.to_string()),
                     next_index: 1,
                     keys: vec![key.clone()],
                 };
                 println!("BIP32 wallet created");
                 println!("derivation path: m/44'/1'/0'/0/0");
-                println!("IMPORTANT: write down your mnemonic -- it cannot be recovered");
+                println!("mnemonic stored in wallet; export with: irium-wallet export-mnemonic --out <file>");
                 if let Err(e) = save_wallet(&path, &wallet) {
                     eprintln!("Failed to save wallet: {}", e);
                     std::process::exit(1);
@@ -21059,6 +21067,7 @@ fn main() {
                     version: 1,
                     seed_hex: Some(seed_hex),
                     bip32_seed: None,
+                    mnemonic: None,
                     next_index: 1,
                     keys: vec![key.clone()],
                 };
@@ -21095,6 +21104,7 @@ fn main() {
                 version: 1,
                 seed_hex: None,
                 bip32_seed: Some(hex::encode(seed_bytes)),
+                mnemonic: Some(mnemonic.to_string()),
                 next_index: 1,
                 keys: vec![key.clone()],
             };
@@ -21254,7 +21264,7 @@ fn main() {
             let seed = match wallet.seed_hex {
                 Some(seed) => seed,
                 None => {
-                    eprintln!("No seed stored in wallet (legacy/imported key-only wallet)");
+                    eprintln!("No seed_hex stored in wallet (BIP32 wallet -- use: irium-wallet export-mnemonic --out <file>)");
                     std::process::exit(1);
                 }
             };
@@ -21274,6 +21284,45 @@ fn main() {
                 let _ = fs::set_permissions(&out, fs::Permissions::from_mode(0o600));
             }
             println!("seed exported to {}", out.display());
+        }
+        "export-mnemonic" => {
+            if args.len() != 3 || args[1] != "--out" {
+                usage();
+                std::process::exit(1);
+            }
+            let out = PathBuf::from(&args[2]);
+            let path = wallet_path();
+            let wallet = match load_wallet(&path) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Failed to load wallet: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let phrase = match wallet.mnemonic {
+                Some(m) => m,
+                None => {
+                    eprintln!("No mnemonic stored in wallet (custom-derivation or key-only wallet)");
+                    std::process::exit(1);
+                }
+            };
+            if let Some(parent) = out.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!("Failed to create output dir: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            if let Err(e) = fs::write(&out, format!("{}
+", phrase)) {
+                eprintln!("Failed to write mnemonic file: {}", e);
+                std::process::exit(1);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&out, fs::Permissions::from_mode(0o600));
+            }
+            println!("mnemonic exported to {}", out.display());
         }
         "import-seed" => {
             if args.len() != 2 && args.len() != 3 {
