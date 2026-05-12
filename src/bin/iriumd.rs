@@ -510,6 +510,12 @@ struct BlockQuery {
 }
 
 #[derive(Deserialize)]
+struct BlocksQuery {
+    from: u64,
+    count: u64,
+}
+
+#[derive(Deserialize)]
 struct BlockHashQuery {
     hash: String,
 }
@@ -6811,6 +6817,35 @@ async fn get_block(
     Ok(Json(block_json_for(q.height, block)))
 }
 
+async fn get_blocks(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<BlocksQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    // Cap at 500 blocks per request to bound response size and chain-lock duration.
+    let count = q.count.min(500);
+    if count == 0 {
+        return Ok(Json(serde_json::json!({"from": q.from, "count": 0, "blocks": []})));
+    }
+    let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let start = q.from as usize;
+    if start >= guard.chain.len() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let end = (start + count as usize).min(guard.chain.len());
+    let mut out = Vec::with_capacity(end - start);
+    for h in start..end {
+        out.push(block_json_for(h as u64, &guard.chain[h]));
+    }
+    Ok(Json(serde_json::json!({
+        "from": q.from,
+        "count": out.len(),
+        "blocks": out,
+    })))
+}
+
 async fn get_block_by_hash(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -8850,6 +8885,7 @@ async fn explorer_stats(
         .route("/rpc/utxo", get(get_utxo))
         .route("/rpc/getblocktemplate", get(get_block_template))
         .route("/rpc/block", get(get_block))
+        .route("/rpc/blocks", get(get_blocks))
         .route("/rpc/block_by_hash", get(get_block_by_hash))
         .route("/rpc/tx", get(get_tx))
         .route("/rpc/submit_block", post(submit_block))
