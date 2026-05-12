@@ -1110,6 +1110,56 @@ fn fetch_block_json_with_base(
         .map_err(|e| format!("block {height} parse: {e}"))
 }
 
+/// Fetch a batch of blocks. Returns Ok(Some(blocks)) on success, Ok(None) on
+/// 404 (older iriumd without /rpc/blocks — caller falls back to per-block),
+/// Err(_) for any other error.
+fn fetch_blocks_batch(
+    client: &Client,
+    from: u64,
+    count: u64,
+) -> Result<Option<Vec<serde_json::Value>>, String> {
+    with_rpc_base(|base| fetch_blocks_batch_with_base(client, base, from, count))
+}
+
+fn fetch_blocks_batch_with_base(
+    client: &Client,
+    base: &str,
+    from: u64,
+    count: u64,
+) -> Result<Option<Vec<serde_json::Value>>, String> {
+    let url = format!(
+        "{}/rpc/blocks?from={}&count={}",
+        base.trim_end_matches('/'),
+        from,
+        count
+    );
+    let mut req = client.get(url);
+    if let Some(token) = rpc_token() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
+        .send()
+        .map_err(|e| format!("get blocks {from}..+{count} failed: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        // /rpc/blocks not present on this iriumd. Signal fallback.
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(rpc_status_error(
+            &format!("get blocks {from}..+{count} failed"),
+            resp.status(),
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("blocks batch parse: {e}"))?;
+    let arr = v
+        .get("blocks")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| "blocks batch: missing 'blocks' array".to_string())?;
+    Ok(Some(arr.clone()))
+}
+
 fn miner_sync_guard_enabled() -> bool {
     env::var("IRIUM_MINER_SYNC_GUARD")
         .ok()
@@ -1380,27 +1430,51 @@ fn reconcile_with_template(
         start, target
     );
 
-    for h in start..=target {
-        match fetch_block_json(client, h as u64) {
-            Ok(v) => {
-                if let Err(e) = connect_block_from_json(state, &v) {
-                    eprintln!("[warn] Miner failed to connect block {}: {}", h, e);
-                    if e.contains("does not extend the current tip") {
-                        eprintln!("[warn] Miner chain diverged during sync; resetting to node");
-                        prune_blocks_above(0);
-                        *state = ChainState::new(params.clone());
-                    } else if e.contains("bits mismatch") {
-                        eprintln!("[warn] Miner difficulty algorithm mismatch at height {} ({}); resetting chain state", h, e);
-                        prune_blocks_above(0);
-                        *state = ChainState::new(params.clone());
+    // Batched download via /rpc/blocks (Option A). Falls back to per-block
+    // fetches when the server doesn't expose the batch endpoint. Validation
+    // path is unchanged: each block still flows through connect_block_from_json
+    // -> state.connect_block -> validate_block_header + validate_and_apply_transactions.
+    const BLOCK_BATCH: u64 = 500;
+    let mut h = start;
+    'sync: while h <= target {
+        let want = (target.saturating_sub(h).saturating_add(1)).min(BLOCK_BATCH);
+        let blocks_to_apply: Vec<serde_json::Value> = match fetch_blocks_batch(client, h, want) {
+            Ok(Some(arr)) => arr,
+            Ok(None) => {
+                // Older iriumd: single-block fallback for just this iteration.
+                match fetch_block_json(client, h) {
+                    Ok(v) => vec![v],
+                    Err(e) => {
+                        eprintln!("[warn] Miner failed to download block {}: {}", h, e);
+                        break 'sync;
                     }
-                    break;
                 }
             }
             Err(e) => {
-                eprintln!("[warn] Miner failed to download block {}: {}", h, e);
-                break;
+                eprintln!("[warn] Miner failed to download blocks {}..+{}: {}", h, want, e);
+                break 'sync;
             }
+        };
+
+        if blocks_to_apply.is_empty() {
+            break 'sync;
+        }
+
+        for v in blocks_to_apply {
+            if let Err(e) = connect_block_from_json(state, &v) {
+                eprintln!("[warn] Miner failed to connect block {}: {}", h, e);
+                if e.contains("does not extend the current tip") {
+                    eprintln!("[warn] Miner chain diverged during sync; resetting to node");
+                    prune_blocks_above(0);
+                    *state = ChainState::new(params.clone());
+                } else if e.contains("bits mismatch") {
+                    eprintln!("[warn] Miner difficulty algorithm mismatch at height {} ({}); resetting chain state", h, e);
+                    prune_blocks_above(0);
+                    *state = ChainState::new(params.clone());
+                }
+                break 'sync;
+            }
+            h += 1;
         }
     }
 
