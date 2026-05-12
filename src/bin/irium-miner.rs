@@ -99,6 +99,7 @@ fn blocks_dir() -> PathBuf {
     }
 }
 
+#[allow(dead_code)]
 fn prune_blocks_above(height: u64) {
     let dir = blocks_dir();
     if !dir.exists() {
@@ -522,7 +523,7 @@ struct PeersResponse {
 /// Load mempool transactions, accepting either the new structured mempool
 /// file or the legacy hex-only format.
 fn mempool_entries_from_template(
-    chain: &ChainState,
+    _chain: &ChainState,
     template: &BlockTemplate,
 ) -> Vec<irium_node_rs::mempool::MempoolEntry> {
     let mut out = Vec::new();
@@ -547,10 +548,7 @@ fn mempool_entries_from_template(
             eprintln!("Skipping conflicting template tx (double-spend within block)");
             continue;
         }
-        if let Err(e) = chain.validate_transaction(&tx_obj) {
-            eprintln!("Skipping invalid template tx: {e}");
-            continue;
-        }
+        // Trust template: iriumd already validated these txs against its full UTXO set.
         for inp in &tx_obj.inputs {
             claimed_inputs.insert(irium_node_rs::chain::OutPoint {
                 txid: inp.prev_txid,
@@ -887,6 +885,7 @@ fn submit_block_to_node_with_base(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn load_persisted_blocks(state: &mut ChainState) {
     let dir = blocks_dir();
     if !dir.exists() {
@@ -1110,6 +1109,7 @@ fn fetch_block_json_with_base(
         .map_err(|e| format!("block {height} parse: {e}"))
 }
 
+#[allow(dead_code)]
 fn miner_sync_guard_enabled() -> bool {
     env::var("IRIUM_MINER_SYNC_GUARD")
         .ok()
@@ -1120,6 +1120,7 @@ fn miner_sync_guard_enabled() -> bool {
         .unwrap_or(true)
 }
 
+#[allow(dead_code)]
 fn miner_guard_peer_fallback_enabled() -> bool {
     env::var("IRIUM_MINER_GUARD_PEER_FALLBACK")
         .ok()
@@ -1130,6 +1131,7 @@ fn miner_guard_peer_fallback_enabled() -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 fn miner_max_behind() -> u64 {
     env::var("IRIUM_MINER_MAX_BEHIND")
         .ok()
@@ -1137,6 +1139,7 @@ fn miner_max_behind() -> u64 {
         .unwrap_or(0)
 }
 
+#[allow(dead_code)]
 fn fetch_best_peer_height(client: &Client) -> Result<Option<u64>, String> {
     with_rpc_base(|base| {
         let url = format!("{}/peers", base.trim_end_matches('/'));
@@ -1152,6 +1155,7 @@ fn fetch_best_peer_height(client: &Client) -> Result<Option<u64>, String> {
     })
 }
 
+#[allow(dead_code)]
 fn fetch_best_network_height(client: &Client) -> Result<Option<u64>, String> {
     with_rpc_base(|base| {
         let url = format!("{}/status", base.trim_end_matches('/'));
@@ -1173,6 +1177,7 @@ fn fetch_best_network_height(client: &Client) -> Result<Option<u64>, String> {
     })
 }
 
+#[allow(dead_code)]
 fn guard_miner_sync(client: &Client, local_tip: u64) -> Result<bool, String> {
     if !miner_sync_guard_enabled() {
         return Ok(true);
@@ -1222,7 +1227,7 @@ fn parse_bits(bits_str: &str) -> Result<u32, String> {
     u32::from_str_radix(trimmed, 16).map_err(|e| format!("invalid bits field: {e}"))
 }
 
-fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Result<(), String> {
+fn parse_block_from_json(v: &serde_json::Value) -> Result<Block, String> {
     let header_obj = v.get("header").ok_or("missing header")?;
     let get_hex32 = |key: &str| -> Result<[u8; 32], String> {
         let s = header_obj
@@ -1283,6 +1288,12 @@ fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Res
         auxpow: None,
     };
     block.header.merkle_root = block.merkle_root();
+    Ok(block)
+}
+
+#[allow(dead_code)]
+fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Result<(), String> {
+    let block = parse_block_from_json(v)?;
     state.connect_block(block).map(|_| ())
 }
 
@@ -1292,7 +1303,6 @@ fn reconcile_with_template(
     template: &BlockTemplate,
     client: &Client,
 ) {
-    let remote_tip = template.height.saturating_sub(1);
     let prev_bytes = match hex::decode(&template.prev_hash) {
         Ok(v) => v,
         Err(e) => {
@@ -1310,112 +1320,43 @@ fn reconcile_with_template(
     let mut remote_prev = [0u8; 32];
     remote_prev.copy_from_slice(&prev_bytes);
 
-    let mut local_tip = state.tip_height();
+    // Shallow chain: if our in-memory tip already matches the template prev, nothing to do.
     let local_hash = state
         .chain
         .last()
         .map(|b| b.header.hash())
         .unwrap_or([0u8; 32]);
-
-    if local_tip > 0 {
-        if let Ok(v) = fetch_block_json(client, local_tip) {
-            if let Some(remote_hash) = v
-                .get("header")
-                .and_then(|h| h.get("hash"))
-                .and_then(|v| v.as_str())
-            {
-                let local_hex = hex::encode(local_hash);
-                if remote_hash != local_hex {
-                    eprintln!(
-                        "[warn] Miner chain mismatch at height {} (local {} != remote {}); pruning persisted blocks above {}",
-                        local_tip,
-                        local_hex,
-                        remote_hash,
-                        local_tip.saturating_sub(1)
-                    );
-                    prune_blocks_above(local_tip.saturating_sub(1));
-                    local_tip = state.tip_height();
-                }
-            }
-        }
-    }
-
-    if local_tip == remote_tip && local_hash != remote_prev {
-        eprintln!(
-            "[warn] Miner chain diverged at height {} (local {} != remote {}); pruning persisted blocks above {}",
-            local_tip,
-            hex::encode(local_hash),
-            template.prev_hash,
-            local_tip.saturating_sub(1)
-        );
-        prune_blocks_above(local_tip.saturating_sub(1));
-        local_tip = state.tip_height();
-    }
-
-    if remote_tip < local_tip {
-        let allow_ahead = env::var("IRIUM_MINER_ALLOW_LOCAL_AHEAD")
-            .ok()
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
-        if !allow_ahead {
-            eprintln!(
-                "[warn] Miner ahead of node (local {} > remote {}), resetting to node",
-                local_tip, remote_tip
-            );
-            prune_blocks_above(remote_tip);
-            *state = ChainState::new(params.clone());
-        } else {
-            return;
-        }
-    }
-
-    if remote_tip <= state.tip_height() {
+    if !state.chain.is_empty() && local_hash == remote_prev {
         return;
     }
 
-    let start = state.tip_height().saturating_add(1);
-    let target = remote_tip;
-    println!(
-        "[sync] Miner downloading blocks {}..{} from node",
-        start, target
-    );
-
-    for h in start..=target {
-        match fetch_block_json(client, h as u64) {
-            Ok(v) => {
-                if let Err(e) = connect_block_from_json(state, &v) {
-                    eprintln!("[warn] Miner failed to connect block {}: {}", h, e);
-                    if e.contains("does not extend the current tip") {
-                        eprintln!("[warn] Miner chain diverged during sync at height {}; pruning above {} and resetting", h, h.saturating_sub(1));
-                        prune_blocks_above(h.saturating_sub(1));
-                        *state = ChainState::new(params.clone());
-                    } else if e.contains("bits mismatch") {
-                        eprintln!("[warn] Miner difficulty algorithm mismatch at height {} ({}); pruning above {} and resetting", h, e, h.saturating_sub(1));
-                        prune_blocks_above(h.saturating_sub(1));
-                        *state = ChainState::new(params.clone());
-                    }
-                    break;
-                }
-            }
-            Err(e) => {
-                eprintln!("[warn] Miner failed to download block {}: {}", h, e);
-                break;
-            }
+    // Otherwise fetch only the single prev block and seat it as the lone tip.
+    let prev_height = template.height.saturating_sub(1);
+    let v = match fetch_block_json(client, prev_height) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[warn] Miner could not fetch prev block at height {}: {}",
+                prev_height, e
+            );
+            return;
         }
-    }
-
-    if state.tip_height() < target {
-        eprintln!(
-            "[warn] Miner sync incomplete (local height {} < remote {})",
-            state.tip_height(),
-            target
-        );
-    } else {
-        println!(
-            "[ok] Miner caught up to node at height {}",
-            state.tip_height()
-        );
-    }
+    };
+    let prev_block = match parse_block_from_json(&v) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "[warn] Miner could not parse prev block at height {}: {}",
+                prev_height, e
+            );
+            return;
+        }
+    };
+    let mut fresh = ChainState::new(params.clone());
+    fresh.chain.clear();
+    fresh.chain.push(prev_block);
+    fresh.height = template.height;
+    *state = fresh;
 }
 
 fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
@@ -1488,13 +1429,6 @@ fn mine_once(
     }
 
     let bits = parse_bits(&template.bits)?;
-    let expected = chain.target_for_height(height);
-    if expected.bits != bits {
-        eprintln!(
-            "[warn] Template bits {:08x} != expected {:08x}",
-            bits, expected.bits
-        );
-    }
     let target = Target { bits };
 
     let prev_time = chain.chain.last().map(|b| b.header.time).unwrap_or(0);
@@ -1507,32 +1441,11 @@ fn mine_once(
         mempool_entries.len()
     );
 
-    // Compute total fees from mempool transactions by comparing input and
-    // output totals against the current UTXO set.
+    // Fees are pre-computed by iriumd and stored in the template; trust them.
     let mut total_fees: i64 = 0;
     for entry in &mempool_entries {
-        let fee = if entry.fee > 0 {
-            entry.fee as i64
-        } else {
-            // Fallback compute if fee not stored.
-            let mut input_total: i64 = 0;
-            for txin in &entry.tx.inputs {
-                let key = irium_node_rs::chain::OutPoint {
-                    txid: txin.prev_txid,
-                    index: txin.prev_index,
-                };
-                if let Some(utxo) = chain.utxos.get(&key) {
-                    input_total += utxo.output.value as i64;
-                }
-            }
-            let mut output_total: i64 = 0;
-            for out in &entry.tx.outputs {
-                output_total += out.value as i64;
-            }
-            input_total.saturating_sub(output_total)
-        };
-        if fee > 0 {
-            total_fees = total_fees.saturating_add(fee);
+        if entry.fee > 0 {
+            total_fees = total_fees.saturating_add(entry.fee as i64);
         }
     }
 
@@ -1775,7 +1688,11 @@ fn mine_once(
             }
         }
 
-        chain.connect_block(block.clone())?;
+        // Shallow advance: skip full validation/UTXO application here.
+        // Iriumd validates authoritatively on submit_block_to_node.
+        chain.chain.clear();
+        chain.chain.push(block.clone());
+        chain.height = chain.height.saturating_add(1);
         write_block_json(height as u64, &block).map_err(|e| e.to_string())?;
 
         match submit_block_to_node(height as u64, &block) {
@@ -3027,8 +2944,8 @@ fn main() {
         return;
     }
 
-    // Load any persisted blocks so we resume from last mined height.
-    load_persisted_blocks(&mut state);
+    // Shallow chain: miner no longer loads its full chain history at startup.
+    // The single prev block is fetched lazily by reconcile_with_template each iteration.
 
     if let Some((addr, pkh)) = miner_address_info() {
         let pkh_hex = hex::encode(pkh);
@@ -3093,17 +3010,7 @@ fn main() {
 
         reconcile_with_template(&mut state, &params, &template, &client);
 
-        let local_tip = template.height.saturating_sub(1);
-        match guard_miner_sync(&client, local_tip) {
-            Ok(true) => {}
-            Ok(false) => {
-                std::thread::sleep(Duration::from_secs(5));
-                continue;
-            }
-            Err(e) => {
-                eprintln!("[warn] Miner sync guard error: {e}");
-            }
-        }
+        // Sync guard removed: shallow chain always matches template.height-1.
 
         if state.height != template.height {
             eprintln!(
