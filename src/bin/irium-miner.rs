@@ -1701,6 +1701,7 @@ fn mine_once(
                                 attempts_total,
                                 attempts_total as f64 / elapsed
                             );
+                            let _ = std::io::stdout().flush();
                         } else {
                             println!(
                                 "[⏱️] next height {} tip {} hashes {}",
@@ -1770,6 +1771,7 @@ fn mine_once(
             println!("   🎯 nonce  = {}", nonce);
             if elapsed > 0.0 {
                 println!("   ⚡ rate   = {:.2} H/s", attempts_total as f64 / elapsed);
+                let _ = std::io::stdout().flush();
             }
         }
 
@@ -2057,6 +2059,7 @@ fn mine_stratum_job(
                     nonce,
                     nonce as f64 / elapsed
                 );
+                let _ = std::io::stdout().flush();
             }
         }
     }
