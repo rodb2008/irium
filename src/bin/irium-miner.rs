@@ -987,11 +987,11 @@ fn load_persisted_blocks(state: &mut ChainState) {
                 // Recompute merkle to be safe.
                 block.header.merkle_root = block.merkle_root();
 
+                let good_tip = h.saturating_sub(1);
                 if let Err(e) = state.connect_block(block) {
                     eprintln!("[⚠️] Failed to connect persisted block {}: {}", h, e);
-                    let tip = state.tip_height();
-                    prune_blocks_above(tip);
-                    println!("[🧹] Pruned persisted blocks above height {}", tip);
+                    prune_blocks_above(good_tip);
+                    println!("[🧹] Pruned persisted blocks above height {}", good_tip);
                     break;
                 }
             }
@@ -1327,13 +1327,13 @@ fn reconcile_with_template(
                 let local_hex = hex::encode(local_hash);
                 if remote_hash != local_hex {
                     eprintln!(
-                        "[warn] Miner chain mismatch at height {} (local {} != remote {}), resetting to node",
+                        "[warn] Miner chain mismatch at height {} (local {} != remote {}); pruning persisted blocks above {}",
                         local_tip,
                         local_hex,
-                        remote_hash
+                        remote_hash,
+                        local_tip.saturating_sub(1)
                     );
-                    prune_blocks_above(0);
-                    *state = ChainState::new(params.clone());
+                    prune_blocks_above(local_tip.saturating_sub(1));
                     local_tip = state.tip_height();
                 }
             }
@@ -1342,13 +1342,13 @@ fn reconcile_with_template(
 
     if local_tip == remote_tip && local_hash != remote_prev {
         eprintln!(
-            "[warn] Miner chain diverged at height {} (local {} != remote {}), resetting to node",
+            "[warn] Miner chain diverged at height {} (local {} != remote {}); pruning persisted blocks above {}",
             local_tip,
             hex::encode(local_hash),
-            template.prev_hash
+            template.prev_hash,
+            local_tip.saturating_sub(1)
         );
-        prune_blocks_above(0);
-        *state = ChainState::new(params.clone());
+        prune_blocks_above(local_tip.saturating_sub(1));
         local_tip = state.tip_height();
     }
 
@@ -1386,12 +1386,12 @@ fn reconcile_with_template(
                 if let Err(e) = connect_block_from_json(state, &v) {
                     eprintln!("[warn] Miner failed to connect block {}: {}", h, e);
                     if e.contains("does not extend the current tip") {
-                        eprintln!("[warn] Miner chain diverged during sync; resetting to node");
-                        prune_blocks_above(0);
+                        eprintln!("[warn] Miner chain diverged during sync at height {}; pruning above {} and resetting", h, h.saturating_sub(1));
+                        prune_blocks_above(h.saturating_sub(1));
                         *state = ChainState::new(params.clone());
                     } else if e.contains("bits mismatch") {
-                        eprintln!("[warn] Miner difficulty algorithm mismatch at height {} ({}); resetting chain state", h, e);
-                        prune_blocks_above(0);
+                        eprintln!("[warn] Miner difficulty algorithm mismatch at height {} ({}); pruning above {} and resetting", h, e, h.saturating_sub(1));
+                        prune_blocks_above(h.saturating_sub(1));
                         *state = ChainState::new(params.clone());
                     }
                     break;
