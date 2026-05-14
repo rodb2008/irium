@@ -798,12 +798,8 @@ fn trusted_seed_should_dial(local_ip: IpAddr, remote_ip: IpAddr) -> bool {
     }
 }
 
-fn trusted_anchor_peer_id(addr: SocketAddr, trusted_seed: bool) -> String {
-    if trusted_seed {
-        addr.ip().to_string()
-    } else {
-        addr.to_string()
-    }
+fn trusted_anchor_peer_id(addr: SocketAddr, _trusted_seed: bool) -> String {
+    addr.ip().to_string()
 }
 
 async fn sync_request_allowed_for(

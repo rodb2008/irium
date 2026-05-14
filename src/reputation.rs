@@ -18,6 +18,17 @@ fn now_secs() -> f64 {
         .as_secs_f64()
 }
 
+fn normalize_peer_id(peer_id: &str) -> String {
+    // NAT peers connect from a different ephemeral source port each time.
+    // Track reputation by IP only so one host = one entry.
+    if let Some(colon) = peer_id.rfind(':') {
+        if peer_id[colon + 1..].parse::<u16>().is_ok() {
+            return peer_id[..colon].to_string();
+        }
+    }
+    peer_id.to_string()
+}
+
 fn default_reputation_path() -> PathBuf {
     let path = storage::state_dir().join("peer_reputation.json");
     if !path.exists() {
@@ -138,9 +149,14 @@ impl ReputationManager {
         };
         let now = now_secs();
         let mut pruned_any = false;
+        let mut migrated_any = false;
         for (peer_id, value) in map {
             if let Some(obj) = value.as_object() {
-                let mut rep = PeerReputation::new(peer_id.clone());
+                let key = normalize_peer_id(peer_id);
+                if key != *peer_id {
+                    migrated_any = true;
+                }
+                let mut rep = PeerReputation::new(key.clone());
                 rep.score = obj.get("score").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
                 rep.successful_connections = obj
                     .get("successful_connections")
@@ -171,10 +187,23 @@ impl ReputationManager {
                     pruned_any = true;
                     continue;
                 }
-                self.reputations.insert(peer_id.clone(), rep);
+                match self.reputations.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let existing = e.get_mut();
+                        if rep.successful_connections > existing.successful_connections
+                            || (rep.successful_connections == existing.successful_connections
+                                && rep.score > existing.score)
+                        {
+                            *existing = rep;
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(rep);
+                    }
+                }
             }
         }
-        if pruned_any {
+        if pruned_any || migrated_any {
             self.save();
         }
     }
