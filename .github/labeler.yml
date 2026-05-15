@@ -1,0 +1,26 @@
+consensus:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'src/chain.rs'
+      - 'src/pow.rs'
+      - 'src/consensus.rs'
+      - 'src/activation.rs'
+      - 'src/settlement.rs'
+
+wallet:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'src/wallet.rs'
+      - 'src/iriumd.rs'
+
+documentation:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*.md'
+      - 'docs/**'
+
+security:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
