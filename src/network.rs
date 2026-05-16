@@ -8,9 +8,12 @@ use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::storage;
+
+static SEEDLIST_WARN_PRINTED: AtomicBool = AtomicBool::new(false);
 
 #[allow(dead_code)] // baseline path kept for reference; runtime uses seedlist.runtime
 const DEFAULT_SEEDLIST_BASELINE: &str = "bootstrap/seedlist.txt";
@@ -333,14 +336,18 @@ impl SeedlistManager {
         let baseline_entries = if self.verify_seedlist_signature() {
             self.load_seed_entries(&self.baseline)
         } else if Self::allow_unsigned_seedlist() {
-            eprintln!(
-                "[SECURITY WARNING] Seedlist signature invalid or missing. \nBootstrapping from unsigned peer list because IRIUM_SEEDLIST_ALLOW_UNSIGNED=1. \nThis disables seedlist integrity protection. Do not use in production without a valid signature."
-            );
+            if !SEEDLIST_WARN_PRINTED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[SECURITY WARNING] Seedlist signature invalid or missing. \nBootstrapping from unsigned peer list because IRIUM_SEEDLIST_ALLOW_UNSIGNED=1. \nThis disables seedlist integrity protection. Do not use in production without a valid signature."
+                );
+            }
             self.load_seed_entries(&self.baseline)
         } else {
-            eprintln!(
-                "[warn] Seedlist signature invalid or missing; skipping baseline seeds. \nSet IRIUM_SEEDLIST_ALLOW_UNSIGNED=1 to override (not recommended for production)."
-            );
+            if !SEEDLIST_WARN_PRINTED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[warn] Seedlist signature invalid or missing; skipping baseline seeds. \nSet IRIUM_SEEDLIST_ALLOW_UNSIGNED=1 to override (not recommended for production)."
+                );
+            }
             Vec::new()
         };
         for ip in baseline_entries {

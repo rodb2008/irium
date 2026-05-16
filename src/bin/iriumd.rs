@@ -7944,7 +7944,7 @@ async fn main() {
 
                 let dbg = node_clone.sync_debug_snapshot().await;
                 let peer_dbg = node_clone.peer_telemetry_snapshot().await;
-                let seed_count = seed_mgr.merged_seedlist().len();
+                let seed_count = seeds.len();
 
                 // Use validated best-header progress for sync decisions (peer-advertised
                 // heights are untrusted and can cause false stall churn).
