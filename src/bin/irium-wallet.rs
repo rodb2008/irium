@@ -12811,6 +12811,14 @@ fn submit_tx(client: &Client, base: &str, tx: &Transaction) -> Result<(), String
     if !resp.status().is_success() {
         return Err(format!("submit tx failed: {}", resp.status()));
     }
+    let body: serde_json::Value = resp.json()
+        .map_err(|e| format!("submit_tx parse error: {e}"))?;
+    if body.get("accepted").and_then(|v| v.as_bool()) == Some(false) {
+        let reason = body.get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("rejected by node");
+        return Err(format!("transaction rejected: {}", reason));
+    }
     Ok(())
 }
 

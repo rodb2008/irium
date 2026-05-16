@@ -7181,12 +7181,15 @@ async fn submit_tx(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumJson(req): AxumJson<SubmitTxRequest>,
-) -> Result<Json<SubmitTxResponse>, StatusCode> {
-    check_rate_with_auth(&state, &addr, &headers)?;
-    require_rpc_auth(&headers)?;
+) -> Result<Json<SubmitTxResponse>, (StatusCode, Json<SubmitTxResponse>)> {
+    let empty_err = |sc: StatusCode| -> (StatusCode, Json<SubmitTxResponse>) {
+        (sc, Json(SubmitTxResponse { txid: String::new(), accepted: false }))
+    };
+    check_rate_with_auth(&state, &addr, &headers).map_err(|sc| empty_err(sc))?;
+    require_rpc_auth(&headers).map_err(|sc| empty_err(sc))?;
     let bytes = match hex::decode(&req.tx_hex) {
         Ok(b) => b,
-        Err(_) => return Err(StatusCode::BAD_REQUEST),
+        Err(_) => return Err(empty_err(StatusCode::BAD_REQUEST)),
     };
     // A compact wallet tx payload may be ambiguously parseable by the full decoder.
     // Try both decoders and select the candidate that passes fee/signature checks.
@@ -7199,7 +7202,7 @@ async fn submit_tx(
     }
     if candidates.is_empty() {
         eprintln!("submit_tx decode failed: no valid decoder for payload");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(empty_err(StatusCode::BAD_REQUEST));
     }
 
     let (tx, fee) = {
@@ -7230,7 +7233,7 @@ async fn submit_tx(
                     "submit_tx fee validation failed: {}",
                     last_err.unwrap_or_else(|| "no valid decoded transaction".to_string())
                 );
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(empty_err(StatusCode::BAD_REQUEST));
             }
         }
     };
@@ -7249,20 +7252,20 @@ async fn submit_tx(
                 }
             });
         }
-        return Ok(Json(SubmitTxResponse {
+        return Err((StatusCode::CONFLICT, Json(SubmitTxResponse {
             txid: hex_txid,
             accepted: false,
-        }));
+        })));
     }
 
     let raw = bytes;
     let raw_for_broadcast = raw.clone();
     if let Err(e) = mempool.add_transaction(tx, raw, fee) {
         eprintln!("Failed to add tx to mempool: {}", e);
-        return Ok(Json(SubmitTxResponse {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(SubmitTxResponse {
             txid: hex_txid,
             accepted: false,
-        }));
+        })));
     }
     drop(mempool);
 
