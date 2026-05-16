@@ -23,6 +23,53 @@
 //!   --platform <n|name>  select OpenCL platform by index or vendor name substring
 //!   --list-platforms     print all detected OpenCL platforms and devices, then exit
 
+#[cfg(target_os = "linux")]
+fn read_gpu_temp_c() -> Option<f64> {
+    for i in 0..16u32 {
+        let path = format!("/sys/class/hwmon/hwmon{}/temp1_input", i);
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if let Ok(milli) = s.trim().parse::<i64>() {
+                return Some(milli as f64 / 1000.0);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn read_gpu_temp_c() -> Option<f64> {
+    // OpenCL has no standard thermal API on Windows.
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn read_gpu_temp_c() -> Option<f64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_gpu_power_w() -> Option<f64> {
+    for i in 0..16u32 {
+        let path = format!("/sys/class/hwmon/hwmon{}/power1_average", i);
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if let Ok(microwatts) = s.trim().parse::<u64>() {
+                return Some(microwatts as f64 / 1_000_000.0);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn read_gpu_power_w() -> Option<f64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn read_gpu_power_w() -> Option<f64> {
+    None
+}
+
 fn fmt_rate(hs: f64) -> String {
     if hs >= 1_000_000_000.0 {
         format!("{:.2} GH/s", hs / 1_000_000_000.0)
@@ -1309,6 +1356,9 @@ fn mine_stratum_job_gpu(
                             fmt_rate(rate),
                             hashes / 1_000_000
                         );
+                        if let (Some(tc), Some(pw)) = (read_gpu_temp_c(), read_gpu_power_w()) {
+                            println!("[GPU] temp={:.1}C power={:.1}W", tc, pw);
+                        }
                     }
                     *guard = Instant::now();
                 }
@@ -1875,6 +1925,9 @@ fn main() {
                                                 println!("{}", json!({"event":"progress","height":height,"hashes":hashes,"rate_hs":rate,"ts":Utc::now().format("%H:%M:%S").to_string()}));
                                             } else {
                                                 println!("[GPU] Height {height}: {hashes} hashes, {}", fmt_rate(rate));
+                                                if let (Some(tc), Some(pw)) = (read_gpu_temp_c(), read_gpu_power_w()) {
+                                                    println!("[GPU] temp={:.1}C power={:.1}W", tc, pw);
+                                                }
                                             }
                                             *guard = Instant::now();
                                         }
