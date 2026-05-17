@@ -1520,7 +1520,14 @@ fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
     };
 
     let json = serde_json::to_string_pretty(&jb)?;
-    fs::write(path, json)
+    // Atomic write: same pattern storage::write_block_json_string uses on
+    // the node side. A direct fs::write here was the second source of the
+    // "missing header" quarantines — a miner SIGKILL mid-write left a
+    // truncated block_N.json that iriumd later refused to load. The
+    // sibling `.tmp` is reaped on iriumd startup by ensure_runtime_dirs.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, &path)
 }
 
 fn template_changed(client: &Client, height: u64, prev_hash: &str) -> bool {
