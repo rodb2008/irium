@@ -475,6 +475,19 @@ pub fn bootstrap_dir() -> PathBuf {
 pub fn ensure_runtime_dirs() -> std::io::Result<(PathBuf, PathBuf)> {
     let blocks = blocks_dir();
     fs::create_dir_all(&blocks)?;
+    // Atomic-write companion: reap any leftover `block_*.json.tmp` orphans
+    // from a previous run that was killed mid-write. Trying to use them
+    // would only fail validation (or partially write again), so deleting
+    // them up front keeps startup fast and avoids confusing log spam.
+    if let Ok(rd) = fs::read_dir(&blocks) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name.starts_with("block_") && name.ends_with(".json.tmp") {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
     let state = state_dir();
     fs::create_dir_all(&state)?;
     Ok((blocks, state))
@@ -587,7 +600,16 @@ fn read_block_json_string(height: u64) -> std::io::Result<Option<String>> {
 
 fn write_block_json_string(height: u64, json: &str) -> std::io::Result<()> {
     let path = block_json_path_for_height(height)?;
-    fs::write(path, json)
+    // Atomic write: stage the new contents in a `.tmp` sibling, then rename
+    // to the canonical name. fs::rename is atomic on every supported OS, so
+    // readers (including iriumd's startup persisted-block scan) see either
+    // the old file or the fully-written new file — never a half-written
+    // truncated one. Without this, a kill mid-`fs::write` left `block_N.json`
+    // existing but missing fields, triggering the "missing header" quarantine
+    // that returned 404 for that height forever afterwards.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, &path)
 }
 
 fn rename_block_json_to(height: u64, dest: &Path) -> std::io::Result<()> {
