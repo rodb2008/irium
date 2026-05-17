@@ -555,6 +555,15 @@ struct TxLookupResponse {
 struct SubmitTxResponse {
     txid: String,
     accepted: bool,
+    // BUG 1 fix: previously every non-2xx response carried an empty body
+    // ({txid:"", accepted:false}) so the wallet client surfaced an opaque
+    // "submit tx failed: 400 Bad Request" with no detail. The detailed
+    // reason was eprintln!()-ed to iriumd's stderr but never wired into
+    // the HTTP response. Now populated on every error branch; omitted
+    // from the JSON on the success path via skip_serializing_if so
+    // existing clients see no change for a successful submit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -7182,14 +7191,24 @@ async fn submit_tx(
     headers: HeaderMap,
     AxumJson(req): AxumJson<SubmitTxRequest>,
 ) -> Result<Json<SubmitTxResponse>, (StatusCode, Json<SubmitTxResponse>)> {
-    let empty_err = |sc: StatusCode| -> (StatusCode, Json<SubmitTxResponse>) {
-        (sc, Json(SubmitTxResponse { txid: String::new(), accepted: false }))
+    // BUG 1 fix: thread a contextual reason through every error path so the
+    // wallet client surfaces the actual rejection cause instead of a bare
+    // status code. Empty txid on these paths because we either couldn't
+    // decode the tx or didn't accept it.
+    let empty_err = |sc: StatusCode, reason: &str| -> (StatusCode, Json<SubmitTxResponse>) {
+        (sc, Json(SubmitTxResponse {
+            txid: String::new(),
+            accepted: false,
+            reason: Some(reason.to_string()),
+        }))
     };
-    check_rate_with_auth(&state, &addr, &headers).map_err(|sc| empty_err(sc))?;
-    require_rpc_auth(&headers).map_err(|sc| empty_err(sc))?;
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| empty_err(sc, "Rate limit or authentication check failed"))?;
+    require_rpc_auth(&headers)
+        .map_err(|sc| empty_err(sc, "RPC authentication required"))?;
     let bytes = match hex::decode(&req.tx_hex) {
         Ok(b) => b,
-        Err(_) => return Err(empty_err(StatusCode::BAD_REQUEST)),
+        Err(_) => return Err(empty_err(StatusCode::BAD_REQUEST, "Invalid transaction hex")),
     };
     // A compact wallet tx payload may be ambiguously parseable by the full decoder.
     // Try both decoders and select the candidate that passes fee/signature checks.
@@ -7202,7 +7221,7 @@ async fn submit_tx(
     }
     if candidates.is_empty() {
         eprintln!("submit_tx decode failed: no valid decoder for payload");
-        return Err(empty_err(StatusCode::BAD_REQUEST));
+        return Err(empty_err(StatusCode::BAD_REQUEST, "Transaction decode failed"));
     }
 
     let (tx, fee) = {
@@ -7229,11 +7248,12 @@ async fn submit_tx(
         match selected {
             Some(v) => v,
             None => {
-                eprintln!(
-                    "submit_tx fee validation failed: {}",
-                    last_err.unwrap_or_else(|| "no valid decoded transaction".to_string())
-                );
-                return Err(empty_err(StatusCode::BAD_REQUEST));
+                let detail = last_err.unwrap_or_else(|| "no valid decoded transaction".to_string());
+                eprintln!("submit_tx fee validation failed: {}", detail);
+                return Err(empty_err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Fee validation failed: {}", detail),
+                ));
             }
         }
     };
@@ -7255,16 +7275,19 @@ async fn submit_tx(
         return Err((StatusCode::CONFLICT, Json(SubmitTxResponse {
             txid: hex_txid,
             accepted: false,
+            reason: Some("Transaction already in mempool".to_string()),
         })));
     }
 
     let raw = bytes;
     let raw_for_broadcast = raw.clone();
     if let Err(e) = mempool.add_transaction(tx, raw, fee) {
-        eprintln!("Failed to add tx to mempool: {}", e);
+        let mempool_err = format!("Failed to add to mempool: {}", e);
+        eprintln!("{}", mempool_err);
         return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(SubmitTxResponse {
             txid: hex_txid,
             accepted: false,
+            reason: Some(mempool_err),
         })));
     }
     drop(mempool);
@@ -7280,6 +7303,7 @@ async fn submit_tx(
     Ok(Json(SubmitTxResponse {
         txid: hex_txid,
         accepted: true,
+        reason: None,
     }))
 }
 
