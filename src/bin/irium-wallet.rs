@@ -12808,8 +12808,18 @@ fn submit_tx(client: &Client, base: &str, tx: &Transaction) -> Result<(), String
     })
     .map_err(|e| format!("submit tx failed: {e}"))?;
 
-    if !resp.status().is_success() {
-        return Err(format!("submit tx failed: {}", resp.status()));
+    // BUG 1 fix: previously a non-2xx response returned the bare status
+    // line ("submit tx failed: 400 Bad Request") and discarded the body —
+    // iriumd's reason was unreachable. Now read the body on non-2xx and
+    // surface the `reason` field if present so the user sees the actual
+    // rejection cause (e.g. "Fee validation failed: signature invalid").
+    let status = resp.status();
+    if !status.is_success() {
+        let body: serde_json::Value = resp.json().unwrap_or(serde_json::Value::Null);
+        let reason = body.get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("submit tx failed: {} — {}", status, reason));
     }
     let body: serde_json::Value = resp.json()
         .map_err(|e| format!("submit_tx parse error: {e}"))?;
