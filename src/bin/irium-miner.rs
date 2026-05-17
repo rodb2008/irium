@@ -2059,7 +2059,34 @@ fn stratum_reader(
                     job_version.fetch_add(1, Ordering::SeqCst);
                 }
             }
-            _ => {}
+            // C-10 fix: previously a bare `_ => {}` silently dropped every
+            // JSON-RPC response from the pool. mining.subscribe (id=1) and
+            // mining.authorize (id=2) responses are consumed inline before
+            // this thread spawns, so any id-bearing message that lands here
+            // is a mining.submit acknowledgement. Emit a stdout line so the
+            // irium-core shell (and any operator watching the log) can
+            // count accepted vs rejected shares.
+            _ => {
+                if msg.get("id").is_some() && method.is_none() {
+                    let accepted = msg.get("result")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if accepted {
+                        println!("[stratum] share accepted");
+                    } else {
+                        // Stratum error is typically [code, "message", traceback].
+                        let reason = msg.get("error")
+                            .and_then(|e| {
+                                e.get(1)
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| e.as_str())
+                            })
+                            .unwrap_or("unknown reason");
+                        eprintln!("[stratum] share rejected: {}", reason);
+                    }
+                    let _ = std::io::stdout().flush();
+                }
+            }
         }
     }
 }
