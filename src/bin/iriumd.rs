@@ -7975,6 +7975,36 @@ async fn main() {
 
                 // Use validated best-header progress for sync decisions (peer-advertised
                 // heights are untrusted and can cause false stall churn).
+                //
+                // TODO(sync-state-bug-2026-05-17): self-perpetuating-tip stall after restart.
+                // Observed on irium-eu: iriumd restarted after a v1.9.14 deploy, came up at
+                // local_height = 21549 (the last linked tip), and stayed stuck there for 1h+
+                // while the network advanced 21828 -> 21842. Every one of its 14 peers —
+                // including irium-vps with two direct connections — registered `last_height = 21549`
+                // in eu's peer table, so `best_peer_height = 21549`. Because we deliberately
+                // use the validated `sync_target_height` (which only advances when headers
+                // are actually validated) and never the peer-advertised `peer_height`, the
+                // `behind` check below stayed false forever: `sync_target_height == local_height`,
+                // ahead = 0, no sync burst triggered, no getheaders ever issued past 21549.
+                // vps tried to push higher headers to eu unsolicited — log line "[🔁 sync]
+                // P2P 207.244.247.86: unsolicited headers ignored" — confirming the orphan
+                // recovery / unsolicited-headers path also rejected the upgrade.
+                // The only fix that worked was a nuclear resync (delete ~/.irium/blocks/
+                // and ~/.irium/state/, restart). State / banlist / seedlist clearing alone
+                // did NOT unstick it.
+                //
+                // Likely real fix: even with `behind == false`, periodically (every N
+                // heartbeats, e.g. once per minute) issue a getheaders to a randomly-chosen
+                // dialable peer using our current best-header hash as the locator. If that
+                // peer returns headers we don't have, accept them and advance
+                // sync_target_height. Without this, a node that ever finds itself stuck —
+                // for any reason — has no path back to the live tip short of operator
+                // intervention.
+                //
+                // Open question: why did every peer register `last_height = 21549` in eu's
+                // peer table when vps was really at 21833? Either the handshake protocol
+                // is reporting the common-ancestor height, or there is a cap-to-local code
+                // path somewhere that needs auditing too.
                 let behind = sync_target_height >= local_height.saturating_add(3);
                 let header_only_stall = dbg.sync_requests > 0 && dbg.getblocks_inflight == 0;
                 let need_sync_burst = behind && (dbg.getblocks_inflight == 0 || header_only_stall);
