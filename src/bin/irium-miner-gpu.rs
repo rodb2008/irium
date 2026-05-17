@@ -1983,7 +1983,7 @@ fn main() {
                     }
                 }
                 match submit_block(&client, height, &block) {
-                    Ok(_) => println!("[GPU] Block submitted successfully."),
+                    Ok(_) => println!("[GPU] Block accepted by node at height {}!", height),
                     Err(e) => eprintln!("[GPU] Submit error: {e}"),
                 }
                 total_hashes = 0;
