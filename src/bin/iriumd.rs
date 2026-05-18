@@ -7974,43 +7974,42 @@ async fn main() {
                 let seed_count = seeds.len();
 
                 // Use validated best-header progress for sync decisions (peer-advertised
-                // heights are untrusted and can cause false stall churn).
+                // heights are untrusted and can cause false stall churn). When best_header
+                // is genuinely above local we trigger a fast sync burst.
                 //
-                // TODO(sync-state-bug-2026-05-17): self-perpetuating-tip stall after restart.
-                // Observed on irium-eu: iriumd restarted after a v1.9.14 deploy, came up at
-                // local_height = 21549 (the last linked tip), and stayed stuck there for 1h+
-                // while the network advanced 21828 -> 21842. Every one of its 14 peers —
-                // including irium-vps with two direct connections — registered `last_height = 21549`
-                // in eu's peer table, so `best_peer_height = 21549`. Because we deliberately
-                // use the validated `sync_target_height` (which only advances when headers
-                // are actually validated) and never the peer-advertised `peer_height`, the
-                // `behind` check below stayed false forever: `sync_target_height == local_height`,
-                // ahead = 0, no sync burst triggered, no getheaders ever issued past 21549.
-                // vps tried to push higher headers to eu unsolicited — log line "[🔁 sync]
-                // P2P 207.244.247.86: unsolicited headers ignored" — confirming the orphan
-                // recovery / unsolicited-headers path also rejected the upgrade.
-                // The only fix that worked was a nuclear resync (delete ~/.irium/blocks/
-                // and ~/.irium/state/, restart). State / banlist / seedlist clearing alone
-                // did NOT unstick it.
-                //
-                // Likely real fix: even with `behind == false`, periodically (every N
-                // heartbeats, e.g. once per minute) issue a getheaders to a randomly-chosen
-                // dialable peer using our current best-header hash as the locator. If that
-                // peer returns headers we don't have, accept them and advance
-                // sync_target_height. Without this, a node that ever finds itself stuck —
-                // for any reason — has no path back to the live tip short of operator
-                // intervention.
-                //
-                // Open question: why did every peer register `last_height = 21549` in eu's
-                // peer table when vps was really at 21833? Either the handshake protocol
-                // is reporting the common-ancestor height, or there is a cap-to-local code
-                // path somewhere that needs auditing too.
+                // Background: the self-perpetuating-tip stall observed on irium-eu after
+                // the v1.9.14 deploy (local stuck at 21549 while the network was at 21833)
+                // had two root causes:
+                //   1. trusted_remote_height (p2p.rs) capped every peer-advertised height
+                //      to `best_h.max(local_h)`, so on a fresh restart with
+                //      `best_h == local_h` every peer was stored at exactly local_h —
+                //      `best_peer_height` could never exceed local_height. (Fixed in p2p.rs:
+                //      the cap is only applied when best_h is strictly above local_h.)
+                //   2. The `behind` check below uses `sync_target_height`, which is derived
+                //      only from our own validated headers — so if we never get headers
+                //      above local, `behind` is permanently false and no burst fires.
+                // The periodic probe below is the escape hatch for case (2): every ~60s
+                // (12 * 5s heartbeats) it forces a sync burst regardless of `behind`,
+                // using our current tip as the locator. If peers really do have higher
+                // headers, the burst pulls them in and `sync_target_height` advances
+                // normally; if they don't, the burst is a cheap no-op.
                 let behind = sync_target_height >= local_height.saturating_add(3);
                 let header_only_stall = dbg.sync_requests > 0 && dbg.getblocks_inflight == 0;
                 let need_sync_burst = behind && (dbg.getblocks_inflight == 0 || header_only_stall);
-                if need_sync_burst {
+                // Periodic unconditional probe — fires roughly every 60 seconds even when
+                // `behind == false`. Without this, any future regression that pins
+                // `best_peer == local` (cap bug, handshake bug, network partition that
+                // dissolves with the rest of the chain ahead, etc.) would silently strand
+                // the node at its current tip until manual intervention.
+                let periodic_probe = hb_ticks > 0 && hb_ticks % 12 == 0;
+                if need_sync_burst || periodic_probe {
+                    let min_gap = if need_sync_burst {
+                        std::time::Duration::from_secs(10)
+                    } else {
+                        std::time::Duration::from_secs(50)
+                    };
                     let burst_ok = last_sync_burst_at
-                        .map(|t| t.elapsed() >= std::time::Duration::from_secs(10))
+                        .map(|t| t.elapsed() >= min_gap)
                         .unwrap_or(true);
                     if burst_ok {
                         let burst_node = node_clone.clone();

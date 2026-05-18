@@ -1022,9 +1022,28 @@ fn normalize_reason_hint(reason_hint: &str, local_h: u64, best_h: u64) -> Option
 }
 
 fn trusted_remote_height(peer_h: u64, best_h: u64, local_h: u64) -> u64 {
+    // Floor is our own local height — peers behind us are clamped up to local
+    // (we trust our own validated tip more than a stale peer claim).
     let floor = local_h;
-    let cap = best_h.max(local_h);
-    peer_h.max(floor).min(cap)
+    // The cap previously clamped peer-advertised height to `best_h.max(local_h)`
+    // regardless of whether we actually had validated headers above local. On a
+    // fresh restart with `best_h == local_h` this collapses to `cap = local_h`,
+    // which forces *every* peer-reported height back down to our own height —
+    // even when peers are 200 blocks ahead. That made the "we're behind" check
+    // in iriumd.rs's sync loop permanently false (see the periodic escape-hatch
+    // burst added there), produced the irium-eu self-perpetuating-tip stall
+    // observed on 2026-05-17, and could only be cleared with a nuclear resync.
+    //
+    // Fix: only apply the upper cap when we genuinely have validated headers
+    // strictly above local. Otherwise just floor at local and trust whatever
+    // the peer advertised — the sync burst it triggers will validate the
+    // claim (or reject it) for real, instead of silently masking it.
+    if best_h > local_h {
+        let cap = best_h;
+        peer_h.max(floor).min(cap)
+    } else {
+        peer_h.max(floor)
+    }
 }
 
 fn short_hash(hash: [u8; 32]) -> String {
