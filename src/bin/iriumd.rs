@@ -464,6 +464,28 @@ struct UtxosResponse {
     utxos: Vec<UtxoItem>,
 }
 
+// Rich-list response shapes. Surfaced by /rpc/richlist?limit=N. See
+// get_richlist for behaviour notes (single chain-lock pass, non-P2PKH
+// outputs excluded from entries but counted in total_supply_sats,
+// deterministic tie-break by raw PKH).
+#[derive(Serialize)]
+struct RichlistEntry {
+    rank: u32,
+    address: String,
+    balance_sats: u64,
+    balance_irm: f64,
+    utxo_count: u32,
+    percentage: f64,
+}
+
+#[derive(Serialize)]
+struct RichlistResponse {
+    count: usize,
+    total_supply_sats: u64,
+    generated_at_height: u64,
+    entries: Vec<RichlistEntry>,
+}
+
 #[derive(Serialize)]
 struct HistoryItem {
     txid: String,
@@ -502,6 +524,13 @@ struct BalanceQuery {
 #[derive(Deserialize)]
 struct UtxosQuery {
     address: String,
+}
+
+// Rich-list query — limit clamped to [1, 500] inside the handler so a
+// malicious caller can't force base58-encoding of the whole address space.
+#[derive(Deserialize)]
+struct RichlistQuery {
+    limit: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -3594,6 +3623,79 @@ async fn get_utxos(
         pkh: hex::encode(pkh_arr),
         height,
         utxos,
+    }))
+}
+
+// /rpc/richlist?limit=N
+//
+// Top-N IRM holders, ranked by spendable P2PKH balance. Walks the in-memory
+// UTXO set under a single chain-lock so the response is internally
+// consistent: total_supply_sats and the per-entry percentages always refer
+// to the same height. Non-P2PKH outputs (multisig escrows, OP_RETURN,
+// future template scripts) are excluded from the per-address aggregation
+// but still count toward total_supply_sats — clients can sanity-check that
+// the sum of entry balances is <= total_supply.
+//
+// Limit defaults to 100, clamped to [1, 500] so a single request can never
+// trigger base58-encoding of the whole address space.
+async fn get_richlist(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<RichlistQuery>,
+) -> Result<Json<RichlistResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+
+    let limit = q.limit.unwrap_or(100).clamp(1, 500) as usize;
+
+    // Aggregate balances + UTXO counts + total supply in a single pass.
+    let (balances, total_supply, height) = {
+        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut acc: HashMap<[u8; 20], (u64, u32)> = HashMap::new();
+        let mut total: u64 = 0;
+        for utxo in guard.utxos.values() {
+            let value = utxo.output.value;
+            total = total.saturating_add(value);
+            if let Some(pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                let entry = acc.entry(pkh).or_insert((0u64, 0u32));
+                entry.0 = entry.0.saturating_add(value);
+                entry.1 = entry.1.saturating_add(1);
+            }
+        }
+        (acc, total, guard.tip_height())
+    };
+
+    // Sort descending by balance; ties broken by raw PKH so output is
+    // deterministic across calls (frontend caching, test reproducibility).
+    let mut sorted: Vec<([u8; 20], (u64, u32))> = balances.into_iter().collect();
+    sorted.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
+    sorted.truncate(limit);
+
+    let entries: Vec<RichlistEntry> = sorted
+        .into_iter()
+        .enumerate()
+        .map(|(i, (pkh, (bal, utxos)))| {
+            let percentage = if total_supply > 0 {
+                (bal as f64) / (total_supply as f64) * 100.0
+            } else {
+                0.0
+            };
+            RichlistEntry {
+                rank: (i + 1) as u32,
+                address: base58_p2pkh_from_hash(&pkh),
+                balance_sats: bal,
+                balance_irm: (bal as f64) / 100_000_000.0,
+                utxo_count: utxos,
+                percentage,
+            }
+        })
+        .collect();
+
+    Ok(Json(RichlistResponse {
+        count: entries.len(),
+        total_supply_sats: total_supply,
+        generated_at_height: height,
+        entries,
     }))
 }
 
@@ -8936,6 +9038,7 @@ async fn explorer_stats(
         .route("/rpc/mining_metrics", get(mining_metrics))
         .route("/rpc/balance", get(get_balance))
         .route("/rpc/utxos", get(get_utxos))
+        .route("/rpc/richlist", get(get_richlist))
         .route("/rpc/history", get(get_history))
         .route("/rpc/fee_estimate", get(get_fee_estimate))
         .route("/rpc/utxo", get(get_utxo))
@@ -15369,5 +15472,106 @@ mod tests {
         );
         assert_eq!(resp.attestor_count, 2);
         assert_eq!(resp.attestor_count, resp.policy.attestors.len());
+    }
+
+    // ─── Rich-list ──────────────────────────────────────────────────────
+    //
+    // Mocks 5 P2PKH UTXOs across 3 addresses plus 1 non-P2PKH output:
+    //   sender    15 IRM  (10 + 5)         — rank 1, 2 UTXOs
+    //   recipient  5 IRM  (3 + 2)          — rank 2, 2 UTXOs
+    //   refund     1 IRM  (1)              — rank 3, 1 UTXO
+    //   non-P2PKH  4 IRM  (script len=1)   — excluded from entries,
+    //                                        counted in total_supply_sats
+    // Total supply: 25 IRM. Per-entry percentages: 60% / 20% / 4% = 84%.
+    // The remaining 16% is the non-P2PKH bucket and is intentionally not
+    // surfaced as an "entry" (no single owning address for that script).
+    fn insert_utxo(state: &AppState, txid_byte: u8, index: u32, value: u64, script_pubkey: Vec<u8>) {
+        let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip = chain.tip_height();
+        chain.utxos.insert(
+            OutPoint { txid: [txid_byte; 32], index },
+            UtxoEntry {
+                output: TxOutput { value, script_pubkey },
+                height: tip,
+                is_coinbase: false,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_richlist_ranks_and_excludes_non_p2pkh() {
+        let (state, sender, recipient, refund) = create_test_state(None);
+
+        // Genesis state carries premine UTXOs from the locked genesis block;
+        // strip them so this test asserts against only the UTXOs it injects.
+        {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.utxos.clear();
+        }
+
+        // P2PKH helper: build the script bytes from the address's PKH so
+        // the test mirrors what real iriumd-side encoding produces.
+        let p2pkh = |addr: &str| -> Vec<u8> {
+            let pkh = base58_p2pkh_to_hash(addr).expect("addr decode");
+            let mut pkh20 = [0u8; 20];
+            pkh20.copy_from_slice(&pkh);
+            p2pkh_script(&pkh20)
+        };
+
+        // 5 P2PKH UTXOs + 1 non-P2PKH output.
+        insert_utxo(&state, 0x01, 0, 10_00_000_000, p2pkh(&sender));    // 10 IRM
+        insert_utxo(&state, 0x02, 0,  5_00_000_000, p2pkh(&sender));    //  5 IRM
+        insert_utxo(&state, 0x03, 0,  3_00_000_000, p2pkh(&recipient)); //  3 IRM
+        insert_utxo(&state, 0x04, 0,  2_00_000_000, p2pkh(&recipient)); //  2 IRM
+        insert_utxo(&state, 0x05, 0,  1_00_000_000, p2pkh(&refund));    //  1 IRM
+        // Non-P2PKH: 1-byte script will fail p2pkh_hash_from_script's len==25 gate.
+        insert_utxo(&state, 0x06, 0,  4_00_000_000, vec![0x00]);        //  4 IRM
+
+        let resp = get_richlist(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            Query(RichlistQuery { limit: Some(100) }),
+        )
+        .await
+        .expect("richlist call should succeed")
+        .0;
+
+        // total_supply_sats includes ALL outputs (P2PKH + non-P2PKH).
+        assert_eq!(resp.total_supply_sats, 25_00_000_000, "total supply must include non-P2PKH outputs");
+
+        // entries excludes the non-P2PKH output → exactly 3 addresses.
+        assert_eq!(resp.count, 3);
+        assert_eq!(resp.entries.len(), 3);
+
+        // Ranking: highest balance first.
+        assert_eq!(resp.entries[0].rank, 1);
+        assert_eq!(resp.entries[0].address, sender);
+        assert_eq!(resp.entries[0].balance_sats, 15_00_000_000);
+        assert!((resp.entries[0].balance_irm - 15.0).abs() < 1e-9);
+        assert_eq!(resp.entries[0].utxo_count, 2);
+
+        assert_eq!(resp.entries[1].rank, 2);
+        assert_eq!(resp.entries[1].address, recipient);
+        assert_eq!(resp.entries[1].balance_sats, 5_00_000_000);
+        assert_eq!(resp.entries[1].utxo_count, 2);
+
+        assert_eq!(resp.entries[2].rank, 3);
+        assert_eq!(resp.entries[2].address, refund);
+        assert_eq!(resp.entries[2].balance_sats, 1_00_000_000);
+        assert_eq!(resp.entries[2].utxo_count, 1);
+
+        // Percentages match the balance-to-total ratio and never exceed 100.
+        let pct_sum: f64 = resp.entries.iter().map(|e| e.percentage).sum();
+        assert!(pct_sum <= 100.0 + 1e-9, "percentages must sum to ≤ 100, got {}", pct_sum);
+        // The non-P2PKH 4 IRM is the 16% gap — entry percentages should sum to 84%.
+        assert!((pct_sum - 84.0).abs() < 0.01, "expected ≈84% sum, got {}", pct_sum);
+
+        // Sanity-check the rank-1 percentage matches 15/25 = 60%.
+        assert!((resp.entries[0].percentage - 60.0).abs() < 0.01);
+
+        // generated_at_height equals the chain's tip — for the freshly-built
+        // test state with no blocks applied, that's 0.
+        assert_eq!(resp.generated_at_height, 0);
     }
 }
