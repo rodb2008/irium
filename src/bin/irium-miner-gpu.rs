@@ -883,10 +883,36 @@ fn tail_from_header(ser: &[u8]) -> [u32; 3] {
 // Platform and device enumeration
 // =============================================================================
 
+/// Vendor classifiers. The OpenCL platform vendor string is set by the
+/// driver and varies wildly across machines (e.g. "NVIDIA Corporation",
+/// "Advanced Micro Devices, Inc.", "Intel(R) Corporation",
+/// "Intel(R) OpenCL HD Graphics"). We do case-insensitive substring
+/// matching against the substrings that empirically appear in real-world
+/// vendor strings for each silicon family.
+fn vendor_is_nvidia(vendor: &str) -> bool {
+    let v = vendor.to_lowercase();
+    v.contains("nvidia")
+        || v.contains("cuda")
+        || v.contains("geforce")
+        || v.contains("quadro")
+}
+
+fn vendor_is_amd(vendor: &str) -> bool {
+    let v = vendor.to_lowercase();
+    v.contains("amd")
+        || v.contains("advanced micro")
+        || v.contains("radeon")
+        || v.contains("ati")
+}
+
+fn vendor_is_intel(vendor: &str) -> bool {
+    let v = vendor.to_lowercase();
+    v.contains("intel") || v.contains("hd graphics")
+}
+
 /// Returns true if the platform vendor looks like a discrete GPU (NVIDIA or AMD).
 fn vendor_is_discrete(vendor: &str) -> bool {
-    let v = vendor.to_lowercase();
-    v.contains("nvidia") || v.contains("amd") || v.contains("advanced micro")
+    vendor_is_nvidia(vendor) || vendor_is_amd(vendor)
 }
 
 /// Enumerate every OpenCL platform and the display names of its devices.
@@ -905,8 +931,22 @@ fn enumerate_platforms() -> Vec<(Platform, String, Vec<String>)> {
         .into_iter()
         .map(|p| {
             let vendor = p.name().unwrap_or_else(|_| "Unknown".into());
-            let dev_names = Device::list_all(p)
-                .unwrap_or_default()
+            // Surface device-enumeration failures explicitly. Previously this
+            // silently fell back to Vec::new() via .unwrap_or_default(), which
+            // made platforms with broken drivers indistinguishable from
+            // platforms with zero physical devices — auto_select_platform
+            // would then skip them without any user-visible diagnostic.
+            let devs = match Device::list_all(p) {
+                Ok(devs) => devs,
+                Err(e) => {
+                    eprintln!(
+                        "[GPU] Warning: could not list devices for platform {}: {}",
+                        vendor, e
+                    );
+                    Vec::new()
+                }
+            };
+            let dev_names = devs
                 .into_iter()
                 .map(|d| d.name().unwrap_or_else(|_| "Unknown".into()))
                 .collect();
@@ -931,17 +971,69 @@ fn print_platforms(platforms: &[(Platform, String, Vec<String>)]) {
     }
 }
 
-/// Auto-select the best platform: prefer NVIDIA/AMD discrete GPUs over Intel iGPU.
+/// Auto-select the best platform. Priority — discrete GPUs always win, with
+/// Intel iGPUs only chosen as a last resort:
+///   1. NVIDIA with at least one device
+///   2. AMD with at least one device
+///   3. Any non-Intel vendor with at least one device (Apple, Mali, etc.)
+///   4. Intel with at least one device
+///   5. Index 0 (true fallback when no platform has any devices)
+///
+/// When Intel is selected but another platform's vendor string says NVIDIA or
+/// AMD (even if that platform reports zero devices — usually a broken driver),
+/// we emit a stderr warning so the user can correlate the warning with
+/// --list-platforms output and pick the right one manually.
 fn auto_select_platform(platforms: &[(Platform, String, Vec<String>)]) -> usize {
+    let mut nvidia_idx: Option<usize> = None;
+    let mut amd_idx: Option<usize> = None;
+    let mut other_idx: Option<usize> = None; // non-Intel, non-NVIDIA, non-AMD
+    let mut intel_idx: Option<usize> = None;
+
     for (i, (_, vendor, devs)) in platforms.iter().enumerate() {
-        if !devs.is_empty() && vendor_is_discrete(vendor) {
-            return i;
+        if devs.is_empty() {
+            continue;
+        }
+        if vendor_is_nvidia(vendor) {
+            if nvidia_idx.is_none() {
+                nvidia_idx = Some(i);
+            }
+        } else if vendor_is_amd(vendor) {
+            if amd_idx.is_none() {
+                amd_idx = Some(i);
+            }
+        } else if vendor_is_intel(vendor) {
+            if intel_idx.is_none() {
+                intel_idx = Some(i);
+            }
+        } else if other_idx.is_none() {
+            other_idx = Some(i);
         }
     }
-    for (i, (_, _, devs)) in platforms.iter().enumerate() {
-        if !devs.is_empty() {
-            return i;
+
+    if let Some(i) = nvidia_idx {
+        return i;
+    }
+    if let Some(i) = amd_idx {
+        return i;
+    }
+    if let Some(i) = other_idx {
+        return i;
+    }
+    if let Some(i) = intel_idx {
+        // Intel chosen — flag it if any other platform's vendor string suggests
+        // NVIDIA or AMD. That platform may have been discarded only because
+        // device enumeration failed, which is exactly the case the user wants
+        // to know about so they can pursue a driver fix or pass --platform.
+        let has_other_discrete = platforms.iter().enumerate().any(|(j, (_, v, _))| {
+            j != i && vendor_is_discrete(v)
+        });
+        if has_other_discrete {
+            eprintln!(
+                "[GPU] WARNING: Selected Intel GPU but NVIDIA/AMD also available. \
+                 Use --platform to select manually."
+            );
         }
+        return i;
     }
     0
 }
