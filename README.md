@@ -28,7 +28,7 @@ SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.
 | Block reward | 50 IRM during the Early Miner Era; halves every 210,000 blocks |
 | AuxPoW merged mining | Activates at block 26,347 (still pending; current tip ≈ 22k) |
 | Total supply cap | 100,000,000 IRM (96.5M mineable + 3.5M genesis CLTV vest) |
-| Address prefix | `Q` (single-sig P2PKH, version byte 0x39) · `P` (multisig, version byte 0x28) |
+| Address prefix | Single-sig P2PKH uses version byte `0x39`; base58check encoding produces both `Q…` and `P…` leading characters depending on the underlying pubkey-hash — **both prefixes are the same single-sig address format**. A separate multisig version byte `0x28` is used for 2-of-N wallets. |
 | Default P2P port | 38291 |
 | Default RPC / explorer port | 38300 |
 | `/status` lightweight port | 8080 (loopback only by default) |

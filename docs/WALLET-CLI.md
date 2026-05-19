@@ -4,7 +4,7 @@
 
 All chain query and broadcast commands accept `--rpc <url>` to specify a custom node. The default is `http://127.0.0.1:38300`.
 
-> Address prefixes: single-signature P2PKH addresses start with `Q` (base58 version byte `0x39`). Multisig addresses (2-of-2, 2-of-3) start with `P` (version byte `0x28`). Any field documented as `<addr>` accepts either form unless explicitly noted.
+> Address prefixes: every single-signature wallet address uses the same P2PKH version byte `0x39`, but base58check encoding produces leading characters of either `Q…` or `P…` depending on the underlying pubkey-hash. **The leading letter is not a type indicator — both prefixes are the same single-sig address format** and any tool that supports one supports the other. Multisig addresses (used for 2-of-N settlement wallets) use a separate version byte `0x28`; they also visually start with `P…` or `Q…` and can only be distinguished from single-sig by base58-decoding and checking the first byte. Any field documented as `<addr>` accepts any of the three forms unless explicitly noted.
 
 ---
 
@@ -29,7 +29,7 @@ Derives the next address from the wallet seed and stores it.
 irium-wallet new-address
 ```
 
-Output: the new address in Q-prefix format.
+Output: the new address. Note: depending on the underlying public-key-hash, the encoded address may start with `Q…` or `P…`. Both are the same single-sig format (P2PKH version byte `0x39`); the leading letter is purely a property of base58 encoding.
 
 ---
 
