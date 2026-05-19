@@ -8273,12 +8273,12 @@ mod tests {
     #[test]
     fn dialable_multiaddr_from_advertised_accepts_public_ipv4() {
         assert_eq!(
-            dialable_multiaddr_from_advertised("203.0.113.9:38291"),
-            Some("/ip4/203.0.113.9/tcp/38291".to_string())
+            dialable_multiaddr_from_advertised("8.8.8.8:38291"),
+            Some("/ip4/8.8.8.8/tcp/38291".to_string())
         );
         assert_eq!(
-            dialable_multiaddr_from_advertised(" 198.51.100.7:1234 "),
-            Some("/ip4/198.51.100.7/tcp/1234".to_string())
+            dialable_multiaddr_from_advertised(" 1.1.1.1:1234 "),
+            Some("/ip4/1.1.1.1/tcp/1234".to_string())
         );
     }
 
@@ -8301,6 +8301,13 @@ mod tests {
             None
         );
         assert_eq!(dialable_multiaddr_from_advertised("0.0.0.0:38291"), None);
+        // RFC5737 documentation ranges must also be rejected.
+        assert_eq!(dialable_multiaddr_from_advertised("192.0.2.1:38291"), None);
+        assert_eq!(
+            dialable_multiaddr_from_advertised("198.51.100.7:1234"),
+            None
+        );
+        assert_eq!(dialable_multiaddr_from_advertised("203.0.113.9:38291"), None);
     }
 
     #[test]
