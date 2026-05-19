@@ -61,6 +61,10 @@ async fn main() {
     let agent = std::env::var("IRIUM_NODE_AGENT").unwrap_or_else(|_| "Irium-Rust".to_string());
     let relay_address = std::env::var("IRIUM_RELAY_ADDRESS").ok();
     let marketplace_feed_url: Option<String> = std::env::var("IRIUM_MARKETPLACE_FEED_URL").ok();
+    let external_endpoint: Option<String> = std::env::var("IRIUM_EXTERNAL_ENDPOINT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     println!(
         "[{}] 🚀 Starting Irium P2P node on {} (agent {})",
@@ -81,6 +85,7 @@ async fn main() {
         Some(mempool.clone()),
         relay_address,
         marketplace_feed_url,
+        external_endpoint,
     );
     if let Err(e) = node.start().await {
         eprintln!("Failed to start P2P listener: {e}");

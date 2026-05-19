@@ -133,6 +133,14 @@ pub struct HandshakePayload {
     /// Propagated via P2P handshake so peers can discover feeds without manual configuration.
     #[serde(default)]
     pub marketplace_feed: Option<String>,
+    /// Optional self-advertised external endpoint in "host:port" form.
+    /// When present, public and routable, peers should prefer this over the
+    /// TCP source IP when recording us as a dialable peer. Allows nodes
+    /// behind NAT to publish their UPnP-mapped or operator-set public
+    /// address, instead of relying on the receiver's observed TCP IP
+    /// (which is wrong under CGNAT). Older peers silently ignore the field.
+    #[serde(default)]
+    pub external_endpoint: Option<String>,
 }
 
 impl HandshakePayload {
