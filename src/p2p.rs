@@ -2261,6 +2261,41 @@ fn parse_node_id_bytes(payload: &HandshakePayload) -> Option<Vec<u8>> {
         .and_then(|b| if b.len() == 32 { Some(b) } else { None })
 }
 
+// Parse a self-advertised "host:port" endpoint from HandshakePayload.external_endpoint.
+// Accepts only globally routable IPv4 socket addresses. Returns the parsed
+// multiaddr string in `/ip4/.../tcp/...` form on success, otherwise None.
+//
+// Rejected: loopback, RFC1918 private, RFC6598 CGNAT (100.64.0.0/10),
+// link-local, unspecified, broadcast, multicast, documentation, port == 0,
+// and any IPv6 (callers fall back to TCP-source-IP behavior).
+fn dialable_multiaddr_from_advertised(advertised: &str) -> Option<String> {
+    use std::net::Ipv4Addr;
+    let sock: SocketAddr = advertised.trim().parse().ok()?;
+    if sock.port() == 0 {
+        return None;
+    }
+    let v4: Ipv4Addr = match sock.ip() {
+        IpAddr::V4(v) => v,
+        IpAddr::V6(_) => return None,
+    };
+    if v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || v4.is_documentation()
+    {
+        return None;
+    }
+    // RFC6598 CGNAT: 100.64.0.0/10 (octets 100.64 .. 100.127).
+    let oct = v4.octets();
+    if oct[0] == 100 && (64..=127).contains(&oct[1]) {
+        return None;
+    }
+    Some(format!("/ip4/{}/tcp/{}", v4, sock.port()))
+}
+
 fn handshake_fail_window() -> Duration {
     Duration::from_secs(60)
 }
@@ -2435,6 +2470,7 @@ pub struct P2PNode {
     agent: String,
     relay_address: Option<String>,
     marketplace_feed: Option<String>,
+    external_endpoint: Option<String>,
     proof_gossip_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     node_id: Vec<u8>,
     trusted_seed_ips: Arc<HashSet<IpAddr>>,
@@ -2953,6 +2989,7 @@ impl P2PNode {
         mempool: Option<Arc<StdMutex<MempoolManager>>>,
         relay_address: Option<String>,
         marketplace_feed: Option<String>,
+        external_endpoint: Option<String>,
     ) -> Self {
         let proof_gossip_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         P2PNode {
@@ -2980,6 +3017,7 @@ impl P2PNode {
             agent,
             relay_address,
             marketplace_feed,
+            external_endpoint,
             proof_gossip_inbox,
             node_id: Self::load_or_create_node_id(),
             trusted_seed_ips: Self::load_trusted_seed_ips(),
@@ -3005,6 +3043,7 @@ impl P2PNode {
         let agent = self.agent.clone();
         let relay_address = self.relay_address.clone();
         let marketplace_feed = self.marketplace_feed.clone();
+        let external_endpoint = self.external_endpoint.clone();
         let proof_gossip_inbox = self.proof_gossip_inbox.clone();
         let accept_log = self.accept_log.clone();
         let sync_requests = self.sync_requests.clone();
@@ -3124,6 +3163,7 @@ impl P2PNode {
                         let agent_peer = agent.clone();
                         let relay_peer = relay_address.clone();
                         let marketplace_feed_peer = marketplace_feed.clone();
+                        let external_endpoint_peer = external_endpoint.clone();
                         let proof_gossip_inbox_peer = proof_gossip_inbox.clone();
                         let node_id_peer = node_id.clone();
                         let self_ip_peer = self_ips.clone();
@@ -3157,6 +3197,7 @@ impl P2PNode {
                                 agent_peer,
                                 relay_peer,
                                 marketplace_feed_peer,
+                                external_endpoint_peer,
                                 proof_gossip_inbox_peer,
                                 node_id_peer,
                                 trusted,
@@ -3950,6 +3991,7 @@ impl P2PNode {
             tip_hash: Some(hex::encode(&P2PNode::tip_hash(&self.chain))),
             capabilities: local_capabilities(),
             marketplace_feed: self.marketplace_feed.clone(),
+            external_endpoint: self.external_endpoint.clone(),
         };
 
         let msg = payload
@@ -3994,6 +4036,7 @@ impl P2PNode {
         let ping_agent = agent.to_string();
         let ping_relay = self.relay_address.clone();
         let ping_marketplace_feed = self.marketplace_feed.clone();
+        let ping_external_endpoint = self.external_endpoint.clone();
         let ping_port = self.bind_addr.port();
         let ping_node_id = self.node_id.clone();
         let ping_peer_state = peer_state.clone();
@@ -4060,6 +4103,7 @@ impl P2PNode {
                         tip_hash: Some(hex::encode(&P2PNode::tip_hash(&ping_chain))),
                         capabilities: local_capabilities(),
                         marketplace_feed: ping_marketplace_feed.clone(),
+                        external_endpoint: ping_external_endpoint.clone(),
                     };
                     if let Ok(msg) = payload.to_message() {
                         if !send_message_or_disconnect(
@@ -4399,7 +4443,16 @@ impl P2PNode {
                             let supports_uptime = peer_supports_uptime(&payload);
                             {
                                 let mut dir_guard = dir.lock().await;
-                                let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), addr.port());
+                                // Prefer the peer's self-advertised external_endpoint when
+                                // it parses as a globally routable IPv4:port; otherwise
+                                // fall back to TCP source IP + the port we dialed.
+                                let multiaddr = payload
+                                    .external_endpoint
+                                    .as_deref()
+                                    .and_then(dialable_multiaddr_from_advertised)
+                                    .unwrap_or_else(|| {
+                                        format!("/ip4/{}/tcp/{}", addr.ip(), addr.port())
+                                    });
                                 dir_guard.register_connection(
                                     multiaddr.clone(),
                                     Some(agent_str.clone()),
@@ -6073,6 +6126,7 @@ async fn handle_incoming_with_sybil(
     agent: String,
     relay_address: Option<String>,
     marketplace_feed_url: Option<String>,
+    external_endpoint: Option<String>,
     proof_gossip_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     node_id: Vec<u8>,
     trusted_seed: bool,
@@ -6180,6 +6234,7 @@ async fn handle_incoming_with_sybil(
     let ping_agent = agent.clone();
     let ping_relay = relay_address.clone();
     let ping_marketplace_feed = marketplace_feed_url.clone();
+    let ping_external_endpoint = external_endpoint.clone();
     let ping_port = bind_addr.port();
     let ping_node_id = node_id.clone();
     let ping_peer_state = peer_state.clone();
@@ -6242,6 +6297,7 @@ async fn handle_incoming_with_sybil(
                     tip_hash: Some(hex::encode(&P2PNode::tip_hash(&ping_chain))),
                     capabilities: local_capabilities(),
                     marketplace_feed: ping_marketplace_feed.clone(),
+                    external_endpoint: ping_external_endpoint.clone(),
                 };
                 if let Ok(msg) = payload.to_message() {
                     let _ = send_message(&ping_writer, msg, ping_addr).await;
@@ -6334,6 +6390,7 @@ async fn handle_incoming_with_sybil(
         tip_hash: Some(hex::encode(&P2PNode::tip_hash(&chain))),
         capabilities: local_capabilities(),
         marketplace_feed: marketplace_feed_url.clone(),
+        external_endpoint: external_endpoint.clone(),
     };
     if let Ok(msg) = payload.to_message() {
         send_message_detached(&writer, msg, addr);
@@ -6477,7 +6534,19 @@ async fn handle_incoming_with_sybil(
                     } else {
                         bind_addr.port()
                     };
-                    let multiaddr = format!("/ip4/{}/tcp/{}", addr.ip(), advertised_port);
+                    // Prefer the peer's self-advertised external_endpoint when it
+                    // parses as a globally routable IPv4:port. This is the key
+                    // CGNAT escape hatch: TCP source IP equals the carrier-NAT
+                    // address, so without an explicit advertisement we'd gossip
+                    // an unroutable record. Old peers without the field fall
+                    // through to the legacy TCP-source-IP form.
+                    let multiaddr = payload
+                        .external_endpoint
+                        .as_deref()
+                        .and_then(dialable_multiaddr_from_advertised)
+                        .unwrap_or_else(|| {
+                            format!("/ip4/{}/tcp/{}", addr.ip(), advertised_port)
+                        });
                     {
                         let mut dir = directory.lock().await;
                         dir.register_connection(
@@ -6531,6 +6600,7 @@ async fn handle_incoming_with_sybil(
                         tip_hash: Some(hex::encode(&P2PNode::tip_hash(&chain))),
                         capabilities: local_capabilities(),
                         marketplace_feed: marketplace_feed_url.clone(),
+                        external_endpoint: external_endpoint.clone(),
                     };
                     if let Ok(handshake_msg) = response.to_message() {
                         let _ = send_message(&writer, handshake_msg, addr).await;
@@ -7896,8 +7966,9 @@ async fn handle_incoming_with_sybil(
 mod tests {
     use super::{
         attach_orphan_header_chain, block_request_cache_key, classify_outbound_dial_failure,
-        orphan_headers_map, recent_orphan_header_hashes, record_handshake_failure,
-        store_orphan_header, take_orphan_header_children, P2PNode, RecentHashCache,
+        dialable_multiaddr_from_advertised, orphan_headers_map, recent_orphan_header_hashes,
+        record_handshake_failure, store_orphan_header, take_orphan_header_children, P2PNode,
+        RecentHashCache,
     };
     use crate::block::BlockHeader;
     use crate::chain::{block_from_locked, ChainParams, ChainState};
@@ -8165,6 +8236,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
             let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
             {
@@ -8195,6 +8267,72 @@ mod tests {
         assert_eq!(
             classify_outbound_dial_failure("peer 1.2.3.4 is banned"),
             "banned"
+        );
+    }
+
+    #[test]
+    fn dialable_multiaddr_from_advertised_accepts_public_ipv4() {
+        assert_eq!(
+            dialable_multiaddr_from_advertised("8.8.8.8:38291"),
+            Some("/ip4/8.8.8.8/tcp/38291".to_string())
+        );
+        assert_eq!(
+            dialable_multiaddr_from_advertised(" 1.1.1.1:1234 "),
+            Some("/ip4/1.1.1.1/tcp/1234".to_string())
+        );
+    }
+
+    #[test]
+    fn dialable_multiaddr_from_advertised_rejects_unroutable() {
+        // Loopback, private, link-local, broadcast.
+        assert_eq!(dialable_multiaddr_from_advertised("127.0.0.1:38291"), None);
+        assert_eq!(dialable_multiaddr_from_advertised("10.0.0.5:38291"), None);
+        assert_eq!(dialable_multiaddr_from_advertised("172.16.5.1:38291"), None);
+        assert_eq!(
+            dialable_multiaddr_from_advertised("192.168.1.10:38291"),
+            None
+        );
+        assert_eq!(
+            dialable_multiaddr_from_advertised("169.254.10.1:38291"),
+            None
+        );
+        assert_eq!(
+            dialable_multiaddr_from_advertised("255.255.255.255:38291"),
+            None
+        );
+        assert_eq!(dialable_multiaddr_from_advertised("0.0.0.0:38291"), None);
+        // RFC5737 documentation ranges must also be rejected.
+        assert_eq!(dialable_multiaddr_from_advertised("192.0.2.1:38291"), None);
+        assert_eq!(
+            dialable_multiaddr_from_advertised("198.51.100.7:1234"),
+            None
+        );
+        assert_eq!(dialable_multiaddr_from_advertised("203.0.113.9:38291"), None);
+    }
+
+    #[test]
+    fn dialable_multiaddr_from_advertised_rejects_cgnat() {
+        // RFC6598 CGNAT band: 100.64.0.0/10 → first octet 100, second 64..=127.
+        assert_eq!(dialable_multiaddr_from_advertised("100.64.0.1:38291"), None);
+        assert_eq!(
+            dialable_multiaddr_from_advertised("100.127.255.254:38291"),
+            None
+        );
+        // Boundary just outside: 100.63 and 100.128 should be accepted.
+        assert!(dialable_multiaddr_from_advertised("100.63.0.1:38291").is_some());
+        assert!(dialable_multiaddr_from_advertised("100.128.0.1:38291").is_some());
+    }
+
+    #[test]
+    fn dialable_multiaddr_from_advertised_rejects_malformed_and_ipv6() {
+        assert_eq!(dialable_multiaddr_from_advertised(""), None);
+        assert_eq!(dialable_multiaddr_from_advertised("not-an-addr"), None);
+        assert_eq!(dialable_multiaddr_from_advertised("203.0.113.9"), None);
+        assert_eq!(dialable_multiaddr_from_advertised("203.0.113.9:0"), None);
+        // IPv6 currently unsupported by the directory's /ip4/ format.
+        assert_eq!(
+            dialable_multiaddr_from_advertised("[2001:db8::1]:38291"),
+            None
         );
     }
 }

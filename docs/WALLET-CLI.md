@@ -4,6 +4,8 @@
 
 All chain query and broadcast commands accept `--rpc <url>` to specify a custom node. The default is `http://127.0.0.1:38300`.
 
+> Address prefixes: single-signature P2PKH addresses start with `Q` (base58 version byte `0x39`). Multisig addresses (2-of-2, 2-of-3) start with `P` (version byte `0x28`). Any field documented as `<addr>` accepts either form unless explicitly noted.
+
 ---
 
 ## Wallet Initialisation and Key Management
@@ -223,21 +225,47 @@ irium-wallet offer-create \
 
 ### `irium-wallet offer-list [options]`
 
-Lists offers known to the wallet.
+Lists offers known to the wallet (the union of locally created offers, locally
+imported offers, and offers synced from remote feeds — see `feed-list` and
+`offer-feed-sync`). Each row includes the seller's reputation summary so you
+can scan trust signals at a glance.
 
 **Flags:**
 
 | Flag | Description |
 |------|-------------|
-| `--status open\|taken\|settled` | Filter by status |
-| `--source local\|imported\|remote\|all` | Filter by source (default: all) |
-| `--sort score\|newest\|amount\|seller` | Sort order |
-| `--limit <n>` | Maximum number of results |
+| `--status open\|taken\|settled` | Filter by lifecycle status |
+| `--source local\|imported\|remote\|all` | Filter by where the offer originated (default: `all`) |
+| `--seller <pubkey\|addr>` | Show only offers from this seller |
+| `--payment <method>` | Substring match against `payment_method` (e.g. `bank`, `revolut`, `usdt`) |
+| `--min-amount <irm>` | Lower amount bound (decimal IRM) |
+| `--max-amount <irm>` | Upper amount bound (decimal IRM) |
+| `--sort score\|newest\|amount\|seller` | Sort order. `score` ranks by the seller's reputation `ranking_score`; `newest` by `created_at` desc; `amount` by IRM ascending; `seller` alphabetically by seller address |
+| `--limit <n>` | Maximum number of rows to print |
+| `--summary` | Compact one-line-per-offer output (handy when piping into `grep`, `awk`, or the desktop app's offer feed) |
+| `--json` | Emit the full machine-readable feed structure to stdout |
 
 ```
-irium-wallet offer-list --status open --sort newest --limit 20
-irium-wallet offer-list --source local
+# Default ranking by trust score — best counterparties first
+irium-wallet offer-list --sort score --limit 20
+
+# Only bank-transfer offers between 1 and 50 IRM
+irium-wallet offer-list --payment bank --min-amount 1 --max-amount 50
+
+# Everything you imported manually, terse output
+irium-wallet offer-list --source imported --summary
+
+# Just one seller, full JSON
+irium-wallet offer-list --seller Q9KxBRfrnb6v9Vb8vuHjwkZaxj3ZRhJWpg --json
 ```
+
+Each row also prints the seller's reputation summary — see
+[Reputation](#reputation) below for the full field reference. Quick reading:
+
+- `agreements: N` — total completed trades on this seller's address
+- `default_count: N` — count of agreements that ended in `timeout` or `unsatisfied`
+- `risk_signal: low|moderate|high|very_high` — categorical risk derived from the default ratio
+- `ranking_score` (only used internally by `--sort score`) — composite score combining completed-agreement count, recency, and inverse default rate
 
 ---
 
@@ -301,17 +329,56 @@ irium-wallet offer-feed-fetch --url http://node.example.com:38300/offers/feed
 
 ---
 
-### `irium-wallet offer-feed-sync`
+### `irium-wallet offer-feed-sync [--json]`
 
 Syncs offers from all configured feed URLs.
 
 ```
 irium-wallet offer-feed-sync
+irium-wallet offer-feed-sync --json
+```
+
+---
+
+### `irium-wallet offer-feed-export [--out <file>] [--limit <n>]`
+
+Exports the locally cached offer feed as a single JSON document — the same shape served by a node's `/offers/feed` endpoint. Useful for republishing your own offer set on a separate static host, or for taking an offline snapshot before pruning.
+
+| Flag | Description |
+|------|-------------|
+| `--out <file>` | Output path (default: stdout) |
+| `--limit <n>` | Cap the number of offers exported |
+
+```
+irium-wallet offer-feed-export --out my-feed.json
+irium-wallet offer-feed-export --limit 100 --out top100.json
+```
+
+---
+
+### `irium-wallet offer-feed-prune [--older-than-days <n>] [--dry-run] [--json]`
+
+Removes expired or stale offers from the local feed cache. By default prunes anything past its `--timeout` height. Pass `--older-than-days` to also prune offers older than the given calendar age, regardless of timeout.
+
+| Flag | Description |
+|------|-------------|
+| `--older-than-days <n>` | Also prune offers older than `n` days |
+| `--dry-run` | Report what would be pruned without modifying state |
+| `--json` | Emit machine-readable output |
+
+```
+irium-wallet offer-feed-prune --dry-run
+irium-wallet offer-feed-prune --older-than-days 30
 ```
 
 ---
 
 ## Feed Management
+
+The feed registry is stored in plain JSON at `~/.irium/feeds.json` (or
+`%USERPROFILE%\.irium\feeds.json` on Windows). It contains the list of remote
+offer-feed endpoints synced by `offer-feed-sync`. You can edit it by hand, but
+the commands below cover the common cases.
 
 ### `irium-wallet feed-add <url>`
 
@@ -355,14 +422,36 @@ irium-wallet feed-bootstrap
 
 ## Reputation
 
-### `irium-wallet reputation-show <seller_pubkey|address>`
+Reputation is derived locally on every node from observed agreement outcomes —
+there is no central reputation server. Every full node arrives at the same
+numbers because the inputs are deterministic on-chain data.
+
+### `irium-wallet reputation-show <seller_pubkey|address> [--json]`
 
 Shows the reputation record for a seller, including outcome history.
 
 ```
 irium-wallet reputation-show Q9KxBRfrnb6v9Vb8vuHjwkZaxj3ZRhJWpg
 irium-wallet reputation-show 03e918af472e63de044c983df9f09bae57d4c78a70998d5d5fded408672886f868
+irium-wallet reputation-show Q9KxBRfrnb6v9Vb8vuHjwkZaxj3ZRhJWpg --json
 ```
+
+**JSON output (key fields):**
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `total_agreements` | integer | Total completed agreements involving this seller |
+| `satisfied_count` | integer | Agreements that completed with a satisfying release |
+| `default_count` | integer | Agreements that ended in `timeout` or `unsatisfied` outcome |
+| `disputed_count` | integer | Agreements with a recorded dispute |
+| `risk_signal` | string | One of `low`, `moderate`, `high`, `very_high` — derived from the default ratio |
+| `ranking_score` | float | Composite score blending completion count, recency, and inverse defaults — used by `offer-list --sort score` |
+| `recent_default_count` | integer | Defaults within the recent block window (see WHITEPAPER §10 for thresholds) |
+| `last_outcome_height` | integer | Block height at which the last outcome was recorded |
+| `outcomes[]` | array | Per-agreement outcome history (newest first) |
+
+In `offer-list` rows, the same record drives the inline `reputation:` summary —
+which is why the same fields appear without prefix in that listing.
 
 ---
 
@@ -382,6 +471,94 @@ irium-wallet reputation-record-outcome \
   --seller Q9KxBRfrnb6v9Vb8vuHjwkZaxj3ZRhJWpg \
   --outcome satisfied
 ```
+
+---
+
+## Mining (companion binaries)
+
+The wallet binary does not mine; mining is handled by the dedicated
+`irium-miner` (CPU) and `irium-miner-gpu` (GPU + Stratum pool) binaries
+installed alongside `irium-wallet`. All three share the same wallet store, so
+rewards mined to one of your wallet addresses appear directly in
+`irium-wallet balance`.
+
+### Solo CPU mining — `irium-miner`
+
+Mines directly against a local `iriumd` via the `/rpc/getblocktemplate`
+endpoint. Configuration is via environment variables; there are no CLI flags
+beyond `--version` / `--help`.
+
+| Env var | Description |
+|---------|-------------|
+| `IRIUM_MINER_ADDRESS` | Coinbase payout address (base58, `Q…` or `P…`). Required. Alternatively set `IRIUM_MINER_PKH` to a 40-hex public key hash. |
+| `IRIUM_NODE_RPC` | iriumd RPC URL (default `http://127.0.0.1:38300`) |
+| `IRIUM_MINER_THREADS` | Worker thread count (default: all cores) |
+| `IRIUM_ADVERTISE_ADDR` | Optional `ip:port`. When set, the miner embeds the address in every coinbase as a peer-discovery hint. |
+
+```bash
+IRIUM_MINER_ADDRESS=Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa \
+  irium-miner
+```
+
+The miner reads `/etc/irium/miner.env` (if present) on startup so packaged
+deployments can keep secrets out of the shell history.
+
+---
+
+### Solo & pool GPU mining — `irium-miner-gpu`
+
+OpenCL-based SHA-256d miner. Supports both solo (RPC) and pool (Stratum v1)
+modes from the same binary. Auto-detects discrete NVIDIA / AMD GPUs in
+preference to integrated Intel iGPUs.
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--wallet <addr>` | Mining/payout address (same as `IRIUM_MINER_ADDRESS`) |
+| `--pool <url>` | Stratum URL (e.g. `stratum+tcp://pool.iriumlabs.org:3335`). When set, the miner runs in pool mode and ignores `--rpc`. |
+| `--rpc <url>` | Solo-mode node RPC URL (default `http://127.0.0.1:38300`) |
+| `--platform <n\|name>` | OpenCL platform index, or vendor substring (`nvidia`, `amd`, `intel`). Default: auto, prefers NVIDIA / AMD. |
+| `--device <n>` | Device index within the selected platform (default `0`) |
+| `--devices <n,n,…>` | Comma-separated multi-GPU list (overrides `--device`) |
+| `--batch <n>` | Nonces per GPU dispatch (default `4194304` = 2²²) |
+| `--list-platforms` | Print every detected OpenCL platform and device, then exit |
+| `--help` | Show usage and exit |
+
+CLI flags take priority over the equivalent environment variables
+(`IRIUM_STRATUM_URL`, `IRIUM_MINER_ADDRESS`, `IRIUM_GPU_PLATFORM`,
+`IRIUM_GPU_DEVICE`, `IRIUM_GPU_DEVICES`, `IRIUM_GPU_BATCH`, `IRIUM_NODE_RPC`).
+
+**Pool mining against the official pool:**
+
+```bash
+# CPU/GPU profile
+irium-miner-gpu \
+  --pool stratum+tcp://pool.iriumlabs.org:3335 \
+  --wallet Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa
+
+# ASIC profile (use any SHA-256 ASIC's pool-config UI instead — the URL is what matters)
+# stratum+tcp://pool.iriumlabs.org:3333  worker = your Q-address
+```
+
+**Solo GPU mining:**
+
+```bash
+irium-miner-gpu \
+  --wallet Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa \
+  --rpc http://127.0.0.1:38300
+```
+
+**Multi-GPU on a single host:**
+
+```bash
+irium-miner-gpu --wallet Q… --platform nvidia --devices 0,1,2,3
+```
+
+Public pool stats (active miners, blocks found, rolling-window hashrate
+estimate per profile) are served as JSON from
+`http://pool.iriumlabs.org:3337/stats` and surfaced in the `irium-core`
+desktop app under Explorer → Pool Stats.
 
 ---
 
@@ -773,6 +950,37 @@ Adds a signature to a bundle.
 
 ```
 irium-wallet agreement-bundle-sign --bundle bundle-002.json --signer QBuyerAddress...
+```
+
+---
+
+## Agreement Pack / Unpack
+
+`agreement-pack` and `agreement-unpack` are the fastest way to ship a full
+agreement — including its policy, signatures, funding-tx record, and any
+already-submitted proofs — to a counterparty or attestor without exposing
+the wallet that owns it. The pack is a single self-describing JSON blob
+which `agreement-unpack` can fully verify against the chain before any
+write is performed locally.
+
+### `irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]`
+
+Bundles an agreement's on-chain identity, stored policy, signatures, and any submitted proofs into a single JSON document at `<file>`. Pulls live state from the node so the pack is always consistent with the chain at the time of export.
+
+```
+irium-wallet agreement-pack --agreement otc-002 --out otc-002.pack.json
+irium-wallet agreement-pack --agreement abcdef0123456789...32bytehex --out otc-002.pack.json
+```
+
+---
+
+### `irium-wallet agreement-unpack --file <file> [--rpc <url>] [--json]`
+
+Verifies and imports an agreement pack. Validates the document hash, agreement hash, every embedded signature, and confirms the on-chain status before adding anything to the local wallet store. Pass `--rpc` to point verification at a specific node.
+
+```
+irium-wallet agreement-unpack --file otc-002.pack.json
+irium-wallet agreement-unpack --file otc-002.pack.json --rpc http://localhost:38300
 ```
 
 ---

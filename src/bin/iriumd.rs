@@ -1268,6 +1268,10 @@ struct NodeConfig {
     /// Optional relay payout address to advertise to peers.
     #[serde(default)]
     relay_address: Option<String>,
+    /// Optional self-advertised external endpoint in "host:port" form for
+    /// CGNAT/NAT escape — overrides peers' TCP-source-IP inference when set.
+    #[serde(default)]
+    external_endpoint: Option<String>,
     /// Optional runtime root directory for blocks/state (used by mobile/Termux).
     #[serde(default)]
     data_dir: Option<String>,
@@ -7625,6 +7629,17 @@ async fn main() {
         .and_then(|c| c.relay_address.clone())
         .or_else(|| std::env::var("IRIUM_RELAY_ADDRESS").ok());
     let marketplace_feed_url: Option<String> = std::env::var("IRIUM_MARKETPLACE_FEED_URL").ok();
+    // Self-advertised external "host:port" for CGNAT/NAT escape. When set
+    // and globally routable, peers prefer this over TCP-source-IP inference
+    // when recording us as dialable. The GUI populates it via UPnP IGD or
+    // a public IP-echo service before spawning iriumd; manual operators can
+    // set it directly via env or node config.
+    let external_endpoint: Option<String> = node_cfg
+        .as_ref()
+        .and_then(|c| c.external_endpoint.clone())
+        .or_else(|| std::env::var("IRIUM_EXTERNAL_ENDPOINT").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     // Set up P2P node if configured via IRIUM_P2P_BIND env var or node config.
     let p2p_bind_str: Option<String> = std::env::var("IRIUM_P2P_BIND").ok()
@@ -7639,6 +7654,7 @@ async fn main() {
                     Some(mempool.clone()),
                     relay_address.clone(),
                     marketplace_feed_url.clone(),
+                    external_endpoint.clone(),
                 );
                 // Start listener in the background.
                 if let Err(e) = node.start().await {
