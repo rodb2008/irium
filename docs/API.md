@@ -38,6 +38,16 @@ The following endpoints are always public (no token required):
 
 All wallet endpoints (`/wallet/...`) and settlement endpoints (`/rpc/createagreement`, etc.) require authentication if a token is configured.
 
+### Where are the agreement/proof/policy list endpoints?
+
+For programmatic access:
+
+- Agreements list — **`GET /explorer/agreements`** (paginated, no auth). The other agreement-* endpoints (`/rpc/agreementstatus`, `/rpc/agreementtimeline`, etc.) are POST and operate on a single agreement at a time.
+- Proofs list — **`GET /explorer/proofs`** (paginated, no auth, accepts `?agreement_hash=` filter). Alternative: **`POST /rpc/listproofs`** (auth required if token set) which takes an `{"agreement_hash": "…"}` body and returns the same data without pagination.
+- Policies list — **`POST /rpc/listpolicies`** (auth required if token set; no public list endpoint).
+
+There are no `GET /rpc/agreements`, `GET /rpc/proofs`, or `GET /rpc/policies` routes — those would shadow the per-resource POST endpoints. Use the explorer routes above for plain HTTP GET access.
+
 ---
 
 ## Node Status and Health
@@ -443,6 +453,40 @@ Response structure is identical to `GET /rpc/block`.
 
 ---
 
+### `GET /rpc/blocks`
+
+Returns a contiguous range of blocks starting at a given height. Used by
+block explorers and the desktop wallet's Explorer page for batch backfill.
+
+**Query parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `from` | Yes | Start height (integer, inclusive) |
+| `count` | Yes | Number of blocks to return. Capped at 500 per request. |
+
+**Example request:**
+```
+curl "http://localhost:38300/rpc/blocks?from=20000&count=10"
+```
+
+**Example response:**
+```json
+{
+  "from": 20000,
+  "count": 10,
+  "blocks": [ /* same shape as /rpc/block, one entry per height */ ]
+}
+```
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| 404 | `from` is past the current tip |
+
+---
+
 ### `GET /rpc/richlist`
 
 Returns the top N IRM holders ranked by spendable on-chain balance at the
@@ -678,6 +722,110 @@ curl http://localhost:38300/offers/feed
 | `offers[].status` | string | Offer status: `open`, `taken`, or `settled` |
 | `offers[].timeout_height` | integer | Block height after which the offer expires |
 | `offers[].created_at` | integer | Unix timestamp when the offer was created |
+
+---
+
+## Explorer Endpoints
+
+These endpoints power public block explorers and node-status dashboards. All
+are GET, always public (no token required), and CORS-enabled so they can be
+called directly from a browser.
+
+### `GET /explorer/agreements`
+
+Paginated list of agreements known to this node, newest first.
+
+**Query parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `page` | No | 1-based page index (default `1`) |
+| `limit` | No | Page size, clamped to `[1, 100]` (default `25`) |
+
+**Example response:**
+```json
+{
+  "agreements": [
+    {
+      "hash": "96dfc2a96630e6d6…",
+      "agreement_id": "offer-1777888495-1777888517",
+      "template_type": "otc",
+      "total_amount": 50000000,
+      "creation_time": 1777888517,
+      "parties": [
+        {"role": "seller", "display_name": "", "address": "Q…"},
+        {"role": "buyer",  "display_name": "", "address": "Q…"}
+      ]
+    }
+  ],
+  "total": 132,
+  "page": 1,
+  "limit": 25
+}
+```
+
+---
+
+### `GET /explorer/agreement/:hash`
+
+Full detail for a single agreement: the raw agreement JSON, derived lifecycle
+state, and every proof submitted against it.
+
+```
+curl http://localhost:38300/explorer/agreement/96dfc2a96630e6d6…
+```
+
+Response includes `lifecycle` (deterministic state derived from on-chain
+linked transactions) and `proofs[]` with each proof's `status` (`active` /
+`expired`).
+
+---
+
+### `GET /explorer/proofs`
+
+Paginated list of proofs known to this node. Optionally filter to a single
+agreement.
+
+**Query parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `agreement_hash` | No | Only return proofs for this agreement |
+| `page` | No | 1-based page index (default `1`) |
+| `limit` | No | Page size, clamped to `[1, 100]` (default `25`) |
+
+Each entry carries: `proof_id`, `proof_type`, `agreement_hash`, `attested_by`,
+`attestation_time`, and a derived `status` field (`active` while the proof
+has not expired at the current tip; `expired` once `expires_at_height`
+is in the past).
+
+---
+
+### `GET /explorer/reputation/:pubkey`
+
+Reputation summary for an attestor or seller, derived locally on this node
+from agreement and proof storage. Returns:
+
+```json
+{
+  "pubkey": "03e918af472e63de…",
+  "total_agreements_as_seller": 12,
+  "proofs_submitted": 47,
+  "note": "Reputation derived from locally stored agreement and proof data on this node."
+}
+```
+
+The richer reputation fields (`default_count`, `risk_signal`, `ranking_score`)
+are computed wallet-side by `irium-wallet reputation-show`; this RPC returns
+the minimal explorer summary.
+
+---
+
+### `GET /explorer/stats`
+
+Network-wide settlement statistics: total agreements, total proofs, proof
+type counts, current chain height, peer count. Useful for explorer
+dashboards.
 
 ---
 

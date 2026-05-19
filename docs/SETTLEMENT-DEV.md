@@ -271,6 +271,46 @@ irium-wallet agreement-refund otc-trade-001.json \
 
 ---
 
+## Proof Lifecycle
+
+Every submitted proof carries an internal lifecycle state that drives both
+the explorer UI and the policy evaluator. The state is derived deterministically
+from the proof itself, the current chain tip, and (for `satisfied`) the
+stored release policy — so every node reaches the same conclusion.
+
+| Status | When it applies | Meaning |
+|--------|-----------------|---------|
+| `active` | Proof has no expiry set, OR `tip_height < expires_at_height` | Proof is current and counts toward policy evaluation. |
+| `expired` | Proof has `expires_at_height` set AND `tip_height >= expires_at_height` | Proof no longer counts; the attestor must resubmit if the agreement is still active. Returned by `GET /explorer/proofs` and `POST /rpc/listproofs` as a derived field. |
+| `satisfied` | Per-agreement classification used by the outcome engine when the policy's release conditions are met by the current set of active proofs | Agreement can move to release; emitted as `agreement.satisfied` on the WebSocket stream. |
+
+Submitting a proof against an already-`expired` agreement-status row is
+accepted but has no effect — the agreement has already moved past the proof's
+useful window. Use `POST /rpc/listproofs` or `GET /explorer/proofs?agreement_hash=…`
+to inspect the current set.
+
+### Attestor Thresholds
+
+A policy can require **N-of-M attestor signatures** rather than a single
+attestor. Set `attestors[]` to the list of accepted pubkeys/addresses and
+`threshold` to the minimum count required. The evaluator counts only
+**unique** attestor identities across the active proof set, so duplicate
+proofs from the same attestor count as one. See `phase2_proof_automation.md`
+for the full evaluation semantics and edge cases.
+
+### Holdback / Retention
+
+A policy can also declare a top-level **holdback** — a fraction of the
+escrowed amount (in basis points, `holdback_bps`) that stays locked even after
+the base release condition is met. The holdback releases on its own deadline
+or proof requirement. See `phase2_proof_automation.md` for the JSON shape,
+the `holdback_outcome` values (`pending` / `held` / `released`), and the
+`agreementstatus` response fields (`holdback_present`, `holdback_released`,
+`holdback_bps`, `holdback_reason`, etc.). Milestone agreements support
+per-milestone holdbacks under each milestone's evaluation block.
+
+---
+
 ## Using Policies
 
 Policies define conditions that must be met before release is permitted. A policy links an agreement to required proof types and attestors.

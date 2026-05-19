@@ -154,6 +154,32 @@ curl -X POST http://localhost:38300/admin/add-seed \
   -d '{"addr": "<your-public-ip>:38291"}'
 ```
 
+### Environment variables (P2P networking)
+
+| Variable | Purpose |
+|----------|---------|
+| `IRIUM_P2P_BIND` | Listen address/port for incoming P2P (default `0.0.0.0:38291`) |
+| `IRIUM_EXTERNAL_ENDPOINT` | Self-advertised public `ip:port` carried in the handshake. **The CGNAT escape — set this when your TCP source IP is a carrier-NAT address.** Validated server-side: loopback, RFC1918, RFC6598 100.64/10, link-local, broadcast, multicast, documentation, and IPv6 are all rejected. |
+| `IRIUM_NODE_PUBLIC_IP` | Self-IP filter used only by `local_ip_set()` so iriumd doesn't try to dial itself. Not advertised — set this if you operate multiple addresses behind the same node and want to avoid self-dial loops. |
+
+### Behind CGNAT?
+
+If your ISP gives you a 100.64.0.0/10 address rather than a real public IP,
+peers that observe your TCP source IP record an unroutable address and gossip
+it onwards. Symptoms: `0 inbound` peers indefinitely, even with port
+forwarding configured on the local router.
+
+Fixes, in order of impact:
+
+1. Ask your ISP for a public IPv4 (many offer it free on request) — then set `IRIUM_EXTERNAL_ENDPOINT=<that-public-ip>:38291`.
+2. Run a small relay on a VPS and forward port 38291 to your home node.
+3. Accept outbound-only operation: iriumd still syncs and submits transactions, you just don't accept inbound connections.
+
+The desktop wallet (`irium-core`) auto-detects your public IPv4 via an
+external IP-echo service before launching iriumd, and only sets
+`IRIUM_EXTERNAL_ENDPOINT` when the result validates as globally routable.
+Manual CLI users on cloud servers should set the env var explicitly.
+
 ---
 
 ## Settle a Trade

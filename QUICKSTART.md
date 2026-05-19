@@ -2,13 +2,27 @@
 
 This guide takes you from zero to a completed settlement. No blockchain experience needed.
 
-**What you need:** an internet connection and a Linux or macOS computer. Windows users can follow the same steps inside WSL.
+**What you need:** an internet connection and any modern computer (Windows, macOS, or Linux).
 
-**What you will have at the end:** a working Irium wallet, your own IRM address, and a complete understanding of how to trade on the Irium marketplace.
+**What you will have at the end:** a synced node, a working Irium wallet with your own address, a miner producing IRM (optional), and a complete understanding of how to trade on the Irium marketplace.
 
 ---
 
-## Step 1 — Install
+## Two paths
+
+You can use Irium in one of two ways. Pick whichever you prefer — they manage the same wallet and the same chain:
+
+| | **Desktop app (recommended for most people)** | **Command line** |
+|--|--|--|
+| Best for | Day-to-day use, mining, marketplace browsing | Servers, automation, scripting |
+| Where to get it | [Latest release](https://github.com/iriumlabs/irium-core/releases/latest) for Windows / macOS / Linux | `curl` install script below |
+| Includes | Wallet UI · bundled node · bundled CPU + GPU miners · pool client · live explorer / pool stats | `iriumd`, `irium-wallet`, `irium-miner`, `irium-miner-gpu` |
+
+If you choose the desktop app you can skip Step 1 and Step 2 below — the app handles installation and node startup automatically. The remaining steps still apply (the in-app terminal can run any of the CLI commands shown).
+
+---
+
+## Step 1 — Install (CLI path)
 
 Run this command in your terminal:
 
@@ -116,11 +130,64 @@ irium-wallet balance <YOUR_ADDRESS> --rpc http://127.0.0.1:38300
 balance 0 IRM blocks mined 0
 ```
 
-A new address always starts at zero. To receive IRM, share your address with the sender or buy from a marketplace offer.
+A new address always starts at zero. To receive IRM, share your address with the sender, mine some yourself (Step 5), or buy from a marketplace offer (Step 7).
 
 ---
 
-## Step 5 — Browse the marketplace
+## Step 5 — Mine some IRM (optional)
+
+You can earn IRM by contributing computing power. There are three ways to mine — pick whichever fits your hardware:
+
+### Option A — Solo CPU mining
+
+Easiest to start. Uses your CPU and mines directly against your local node.
+
+```bash
+IRIUM_MINER_ADDRESS=<YOUR_ADDRESS> \
+IRIUM_NODE_RPC=http://127.0.0.1:38300 \
+  irium-miner
+```
+
+Replace `<YOUR_ADDRESS>` with one of your addresses from Step 3. Solo mining a block is rare on a busy network — most CPU miners switch to pool mining (Option C) for steadier rewards.
+
+### Option B — Solo GPU mining
+
+If you have a discrete graphics card (NVIDIA, AMD, or recent Intel Arc), the GPU miner is many times faster than the CPU:
+
+```bash
+irium-miner-gpu --wallet <YOUR_ADDRESS> --rpc http://127.0.0.1:38300
+```
+
+Auto-detection picks NVIDIA and AMD over integrated Intel iGPUs. To see all detected OpenCL platforms:
+
+```bash
+irium-miner-gpu --list-platforms
+```
+
+You can force a specific one with `--platform <vendor|index>`, e.g. `--platform nvidia` or `--platform 1`. Run multiple GPUs at once with `--devices 0,1,2`.
+
+### Option C — Pool mining (recommended for steady rewards)
+
+Pool mining splits the reward across many miners so you get small payments regularly instead of waiting for a rare solo block. Connect any Stratum v1 miner — including this repository's `irium-miner-gpu` — to the official public pool:
+
+| Hardware | Pool endpoint |
+|----------|--------------|
+| CPU or GPU | `stratum+tcp://pool.iriumlabs.org:3335` |
+| ASIC | `stratum+tcp://pool.iriumlabs.org:3333` |
+
+For the bundled GPU miner:
+
+```bash
+irium-miner-gpu \
+  --pool stratum+tcp://pool.iriumlabs.org:3335 \
+  --wallet <YOUR_ADDRESS>
+```
+
+Your `<YOUR_ADDRESS>` is also your worker name — the pool credits payouts directly to it. Live pool stats (active miners, blocks found, rolling-window hashrate per profile) are available at `http://pool.iriumlabs.org:3337/stats` and are surfaced in the desktop app's Explorer tab.
+
+---
+
+## Step 6 — Browse the marketplace
 
 Sync the offer feed to discover what is available:
 
@@ -168,7 +235,7 @@ Each offer shows the seller address, amount, payment method, and their reputatio
 
 ---
 
-## Step 6 — Create an offer (seller path)
+## Step 7 — Create an offer (seller path)
 
 If you have IRM to sell, create a sell offer:
 
@@ -212,7 +279,7 @@ irium-wallet offer-import --file offer.json
 
 ---
 
-## Step 7 — Take an offer (buyer path)
+## Step 8 — Take an offer (buyer path)
 
 When you have found an offer to accept, take it with your buyer address:
 
@@ -269,7 +336,7 @@ This locks the IRM on-chain. Neither party can access it until the agreement res
 
 ---
 
-## Step 8 — Submit proof and release
+## Step 9 — Submit proof and release
 
 Once off-chain delivery or payment is complete, the seller submits an attestation:
 
