@@ -1558,6 +1558,13 @@ struct PeerSyncState {
     last_best_header_progress: Option<Instant>,
     headers_recovery_exp: u8,
     last_locator_recovery: Option<Instant>,
+    // Last seen *applied* tip height for this peer's sync state. Used to drive
+    // the "no progress" staleness timer instead of best_header_height: orphan
+    // headers count toward best_header_height but not toward chain progress,
+    // and tying the timer to orphans causes the locator-recovery walk-back
+    // to be reset before its 120s threshold ever fires when a node is stuck
+    // on a stale fork.
+    last_applied_height: u64,
 }
 
 impl Default for PeerSyncState {
@@ -1583,6 +1590,7 @@ impl Default for PeerSyncState {
             last_best_header_progress: None,
             headers_recovery_exp: 0,
             last_locator_recovery: None,
+            last_applied_height: 0,
         }
     }
 }
@@ -1873,14 +1881,24 @@ async fn maybe_request_sync(
     {
         let mut state = peer_state.lock().await;
         let now = Instant::now();
-        if state.last_best_header_height != best_header_height
-            || state.last_best_header_hash != best_header_hash
-        {
-            state.last_best_header_height = best_header_height;
-            state.last_best_header_hash = best_header_hash;
+        // Drive the "no progress" timer off the *applied* tip (local_height),
+        // not off best_header_height. Orphan headers received from a stale
+        // fork (or repeatedly re-pushed by peers we can't connect to via the
+        // current locator) bump best_header_height without ever extending the
+        // applied chain. Tying the timer to best_header_height resets it on
+        // every such orphan, so the 120s staleness threshold below never
+        // fires and locator-recovery never walks back to find common ground.
+        // Tracked separately from last_best_header_* so we still keep those
+        // updated for other consumers but only treat applied-tip advance as
+        // real progress here.
+        if state.last_applied_height != local_height {
+            state.last_applied_height = local_height;
             state.last_best_header_progress = Some(now);
             state.headers_recovery_exp = 0;
-        } else if peer_height > local_height.saturating_add(8)
+        }
+        state.last_best_header_height = best_header_height;
+        state.last_best_header_hash = best_header_hash;
+        if peer_height > local_height.saturating_add(8)
             && best_header_height <= local_height
             && state
                 .last_best_header_progress
