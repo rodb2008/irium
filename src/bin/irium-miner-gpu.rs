@@ -707,7 +707,22 @@ struct GpuMiner {
     target_buf: Buffer<u32>,
     result_buf: Buffer<u32>,
     batch_size: usize,
+    /// Consecutive "suspiciously fast" batches — a real SHA-256d batch on
+    /// any practical GPU takes at least ~10 ms. macOS's GPU watchdog can
+    /// kill a long-running kernel silently, after which the driver returns
+    /// success but the kernel never actually executed; the round-trip
+    /// completes in <5 ms with all-zero results. Layer-A stall detection
+    /// in `mine_batch` counts these and `mine_loop` hard-stops at the
+    /// caller after `SUSPICIOUS_BATCH_LIMIT` consecutive hits. Reset to 0
+    /// on every healthy batch.
+    suspicious_batch_count: u32,
 }
+
+/// Number of consecutive suspiciously-fast batches that triggers a hard
+/// stop. Picked at 10 to absorb a single TDR blip (e.g. GPU briefly
+/// shared with another OpenCL app) but bail before a stalled miner can
+/// spew minutes of fake hashrate.
+const SUSPICIOUS_BATCH_LIMIT: u32 = 10;
 
 // GpuMiner owns its own OpenCL context/queue/kernel — no shared mutable state between
 // instances.  The ocl crate uses raw CL handles which are not auto-Send; we assert Send
@@ -801,6 +816,7 @@ impl GpuMiner {
             target_buf,
             result_buf,
             batch_size,
+            suspicious_batch_count: 0,
         })
     }
 
@@ -843,6 +859,17 @@ impl GpuMiner {
         // Update the nonce_base scalar arg in the already-built kernel
         self.kernel.set_arg(2, nonce_base).map_err(e)?;
 
+        // Time the kernel round-trip. A genuine SHA-256d batch on any
+        // practical GPU takes ≥10 ms; finishing in under 5 ms is the
+        // signature of a kernel that was silently killed by an OS GPU
+        // watchdog (most often macOS, occasionally Windows TDR). The
+        // driver returns success on both calls, but the kernel never ran
+        // and `result_buf` still holds the zero we just wrote — looks
+        // like a clean "no hit". We catch that here so the loop above
+        // doesn't inflate `total_hashes` with imaginary work and (after
+        // SUSPICIOUS_BATCH_LIMIT in a row) the caller can hard-stop.
+        let start = std::time::Instant::now();
+
         // Safety: the kernel was built from verified source, all buffer args are valid
         // and alive for the duration of this call, and queue.finish() below ensures the
         // GPU work completes before we read back results.
@@ -850,6 +877,25 @@ impl GpuMiner {
             self.kernel.enq().map_err(e)?;
         }
         self.queue.finish().map_err(e)?;
+
+        let elapsed = start.elapsed();
+
+        if elapsed.as_millis() < 5 {
+            self.suspicious_batch_count = self.suspicious_batch_count.saturating_add(1);
+            eprintln!(
+                "[GPU] Warning: batch completed suspiciously fast ({} ms) — possible macOS/Windows GPU watchdog kill #{}",
+                elapsed.as_millis(),
+                self.suspicious_batch_count
+            );
+            // Do NOT advance — the caller treats `Ok(None)` as "no hit"
+            // and increments total_hashes by batch_size. We return Err
+            // would crash the miner; the caller's stall-check loop
+            // breaks cleanly on SUSPICIOUS_BATCH_LIMIT.
+            return Ok(None);
+        }
+        // Reset on a healthy batch so a transient TDR blip doesn't
+        // permanently accumulate toward the hard-stop threshold.
+        self.suspicious_batch_count = 0;
 
         let mut result = [0u32; 2];
         self.result_buf.read(&mut result[..]).enq().map_err(e)?;
@@ -1387,41 +1433,66 @@ fn mine_stratum_job_gpu(
             return Ok(true);
         }
 
-        match gpu.mine_batch(nonce_base)? {
-            Some(nonce) => {
-                // Submit share
-                let submit = json!({
-                    "id": submit_id.fetch_add(1, Ordering::SeqCst),
-                    "method": "mining.submit",
-                    "params": [user, job.job_id.as_str(), extranonce2,
-                               job.ntime.as_str(), format!("{:08x}", nonce)]
-                });
-                let _ = stratum_send(writer, &submit);
+        let result = gpu.mine_batch(nonce_base)?;
 
-                // Check if it also meets network target
-                let header_found = BlockHeader {
-                    version,
-                    prev_hash,
-                    merkle_root,
-                    time: current_time,
-                    bits,
-                    nonce,
-                };
-                let hash = header_found.hash();
-                let hash_val = BigUint::from_bytes_be(&hash);
-                if hash_val <= network_target {
-                    println!(
-                        "[GPU {gpu_idx}/Stratum] ✅ Share meets NETWORK target! hash={}",
-                        hex::encode(hash)
-                    );
-                } else {
-                    println!("[GPU {gpu_idx}/Stratum] Share submitted: nonce={nonce:08x}");
-                }
-
-                total_hashes.fetch_add(gpu.batch_size as u64, Ordering::Relaxed);
+        // Stall detection (Layer A). When mine_batch detects a watchdog-killed
+        // kernel it returns Ok(None) AND increments suspicious_batch_count.
+        // We skip the share-submit / hash-counter logic for those batches
+        // (otherwise total_hashes would inflate with imaginary work), and
+        // bail with Err after SUSPICIOUS_BATCH_LIMIT consecutive hits so the
+        // caller's any_error latch stops the whole Stratum run-loop instead
+        // of immediately re-spawning a fresh stalled worker.
+        if gpu.suspicious_batch_count > 0 {
+            if gpu.suspicious_batch_count >= SUSPICIOUS_BATCH_LIMIT {
+                eprintln!(
+                    "[GPU {gpu_idx}/Stratum] STALL DETECTED: {} consecutive suspicious batches.",
+                    gpu.suspicious_batch_count
+                );
+                eprintln!("[GPU] macOS GPU watchdog may be killing kernels.");
+                eprintln!("[GPU] Try reducing intensity. Stopping GPU miner.");
+                return Err(format!(
+                    "GPU stall — {} consecutive watchdog-killed batches (reduce intensity)",
+                    gpu.suspicious_batch_count
+                ));
             }
-            None => {
-                total_hashes.fetch_add(gpu.batch_size as u64, Ordering::Relaxed);
+            // Skip hash-counter update and share-submit for this batch.
+        } else {
+            match result {
+                Some(nonce) => {
+                    // Submit share
+                    let submit = json!({
+                        "id": submit_id.fetch_add(1, Ordering::SeqCst),
+                        "method": "mining.submit",
+                        "params": [user, job.job_id.as_str(), extranonce2,
+                                   job.ntime.as_str(), format!("{:08x}", nonce)]
+                    });
+                    let _ = stratum_send(writer, &submit);
+
+                    // Check if it also meets network target
+                    let header_found = BlockHeader {
+                        version,
+                        prev_hash,
+                        merkle_root,
+                        time: current_time,
+                        bits,
+                        nonce,
+                    };
+                    let hash = header_found.hash();
+                    let hash_val = BigUint::from_bytes_be(&hash);
+                    if hash_val <= network_target {
+                        println!(
+                            "[GPU {gpu_idx}/Stratum] ✅ Share meets NETWORK target! hash={}",
+                            hex::encode(hash)
+                        );
+                    } else {
+                        println!("[GPU {gpu_idx}/Stratum] Share submitted: nonce={nonce:08x}");
+                    }
+
+                    total_hashes.fetch_add(gpu.batch_size as u64, Ordering::Relaxed);
+                }
+                None => {
+                    total_hashes.fetch_add(gpu.batch_size as u64, Ordering::Relaxed);
+                }
             }
         }
 
@@ -1766,10 +1837,30 @@ fn main() {
         std::process::exit(1);
     }
 
-    let batch_size: usize = env::var("IRIUM_GPU_BATCH")
+    let requested_batch_size: usize = env::var("IRIUM_GPU_BATCH")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1 << 22); // 4 194 304 nonces per dispatch
+
+    // OS-aware soft cap. macOS imposes a tight GPU watchdog (~250 ms on
+    // Apple Silicon) that silently kills overruns; 1M nonces keeps a
+    // typical batch well under that ceiling. Linux/Windows are far more
+    // permissive — the 4M default holds. Operators can still raise the
+    // env var manually; the cap is on the EFFECTIVE batch_size passed to
+    // the kernel, not on what the env var says.
+    #[cfg(target_os = "macos")]
+    let max_safe_batch: usize = 1 << 20; // 1 048 576 — ~100 ms on Apple Silicon
+    #[cfg(not(target_os = "macos"))]
+    let max_safe_batch: usize = 1 << 22; // 4 194 304 — default ceiling
+
+    let batch_size = requested_batch_size.min(max_safe_batch);
+
+    if batch_size < requested_batch_size {
+        eprintln!(
+            "[GPU] Note: batch size capped to {} on this OS to avoid GPU watchdog (requested {})",
+            batch_size, requested_batch_size
+        );
+    }
 
     println!(
         "[GPU] Batch size: {} ({:.1}M nonces/dispatch)",
@@ -2004,6 +2095,32 @@ fn main() {
                                 break;
                             }
                             Ok(None) => {
+                                // Stall detection (Layer A). mine_batch returns Ok(None)
+                                // both for "no hit this round" and for a watchdog-killed
+                                // batch; the latter case also increments
+                                // suspicious_batch_count. Skip the hash-counter update
+                                // in the suspicious case (otherwise the displayed rate
+                                // lies) and signal stop after the run-of-N threshold so
+                                // the operator sees a clear error instead of fake
+                                // hashrate scrolling forever.
+                                if gpu.suspicious_batch_count > 0 {
+                                    if gpu.suspicious_batch_count >= SUSPICIOUS_BATCH_LIMIT {
+                                        eprintln!(
+                                            "[GPU {gpu_idx}] STALL DETECTED: {} consecutive suspicious batches.",
+                                            gpu.suspicious_batch_count
+                                        );
+                                        eprintln!("[GPU] macOS GPU watchdog may be killing kernels.");
+                                        eprintln!("[GPU] Try reducing intensity. Stopping GPU miner.");
+                                        stop.store(true, Ordering::SeqCst);
+                                        break;
+                                    }
+                                    // Skip total accounting + nonce advance for the
+                                    // suspicious batch; retry the same nonce_base on
+                                    // the next loop iteration. If the GPU is healthy
+                                    // by then suspicious_batch_count will reset and
+                                    // we resume normally.
+                                    continue;
+                                }
                                 solo_hashes.fetch_add(gpu.batch_size as u64, Ordering::Relaxed);
 
                                 // GPU 0 handles the shared progress log.
