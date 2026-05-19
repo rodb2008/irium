@@ -1,8 +1,10 @@
 # Irium: A Settlement-First Proof-of-Work Blockchain
 
-**Technical Whitepaper — Version 2.0**
+**Technical Whitepaper — Version 2.1**
 
-**Network Status:** Live on Mainnet — Block ~20,500+
+**Network Status:** Live on Mainnet — Block ~22,000+ (May 2026) · node `v1.9.18` released, `v1.9.19` queued on `testing-codes-before-merging`
+
+**Snapshot (block ~22,058):** 12 connected peers · genesis hash `0000000028f25d…` · network era *Early Miner Era* · official-pool live (`pool.iriumlabs.org:3333` ASIC, `:3335` CPU/GPU, `:3337` public stats proxy)
 
 ---
 
@@ -792,15 +794,26 @@ marketplace operations. Key endpoints include:
 
 | Endpoint | Description |
 |---|---|
-| `GET /status` | Node health, block height, peer count |
-| `GET /height` | Current block height |
-| `GET /balance/:address` | Address balance |
-| `POST /submit_proof` | Submit a settlement proof |
-| `GET /agreements/:hash` | Agreement status and lifecycle |
-| `GET /proofs` | List submitted proofs |
-| `GET /offers` | List marketplace offers |
-| `GET /reputation/:pubkey` | Public reputation data |
+| `GET /status` | Node health, block height, peer count, era |
+| `GET /rpc/balance?address=Q…` | Address balance and UTXO count |
+| `GET /rpc/utxos?address=Q…` | Full UTXO list for an address |
+| `GET /rpc/history?address=Q…` | Transaction history for an address |
+| `GET /rpc/block?height=N` | Full block including coinbase miner and serialized txs |
+| `GET /rpc/tx?txid=…` | Single transaction lookup |
+| `GET /rpc/fee_estimate` | Current minimum fee per byte |
+| `GET /rpc/network_hashrate` | Estimated network hashrate + difficulty |
+| `GET /rpc/richlist?limit=N` | Top-N IRM holders by balance (since v1.9.17) |
+| `POST /rpc/submitproof` | Submit a settlement proof |
+| `POST /rpc/agreementstatus` | Agreement status and lifecycle |
+| `POST /rpc/listproofs` | List submitted proofs |
+| `GET /offers/feed` | List marketplace offers |
+| `GET /explorer/reputation/:pubkey` | Public reputation data |
 | `GET /explorer/stats` | Network-wide settlement statistics |
+
+Default RPC port: `38300`. Default P2P port: `38291`. Lightweight `/status`
+server runs on `127.0.0.1:8080` by default (override with
+`IRIUM_STATUS_HOST` / `IRIUM_STATUS_PORT`). Full schema, request shapes and
+authentication requirements are in [docs/API.md](API.md).
 
 ### SDK Availability
 
@@ -1024,6 +1037,53 @@ URL in their local feed registry (`record_discovered_feed()` in `src/p2p.rs`).
 This allows marketplace feeds to propagate organically through the network
 without any central feed directory.
 
+### Self-Advertised External Endpoint (CGNAT Escape)
+
+The handshake payload also carries an optional `external_endpoint` field
+(`"<ip>:<port>"`, IPv4 only) which receivers prefer over the TCP source IP
+when recording a peer as dialable. This is the CGNAT escape hatch: a node
+behind carrier-grade NAT (RFC 6598, `100.64.0.0/10`) sees its peers from
+the carrier's NAT44 address, not its real public IP. Without an explicit
+advertisement, receivers would record that carrier address as the peer's
+dialable endpoint and gossip it to others — poisoning every downstream
+PeerDirectory with unroutable records.
+
+Operators set the field via `IRIUM_EXTERNAL_ENDPOINT=<ip>:<port>` (env)
+or `external_endpoint` in the node config JSON. Routability is validated
+identically on both sender and receiver: loopback, RFC1918 private,
+RFC6598 CGNAT, link-local, broadcast, multicast, RFC5737 documentation,
+unspecified, port 0, and IPv6 are all rejected and fall back to the
+legacy TCP-source-IP behaviour. The field is `#[serde(default)]`, so old
+peers without it are unaffected.
+
+`irium-core` (the desktop wallet) populates `IRIUM_EXTERNAL_ENDPOINT`
+automatically: it asks an external IP-echo service (ipify), validates the
+returned address, and — if UPnP IGD reports a different external IP — it
+trusts ipify (because under CGNAT, UPnP returns the modem's WAN side, not
+the public internet). When neither service produces a routable IPv4, no
+endpoint is advertised; iriumd remains operational in outbound-only mode.
+
+Reference: `src/p2p.rs::dialable_multiaddr_from_advertised` and
+`src/protocol.rs::HandshakePayload::external_endpoint`. Live on
+`testing-codes-before-merging`, scheduled for v1.9.19.
+
+### Public Block-Explorer Endpoints
+
+In addition to the chain-query API surface, `iriumd` exposes a handful of
+read-only endpoints that power public block explorers and node-status
+dashboards without requiring authentication:
+
+- `GET /status` — chain tip + peer summary
+- `GET /peers` — connected peer table
+- `GET /rpc/richlist?limit=N` — top-N IRM holders ranked by spendable
+  balance over the live UTXO set (added in v1.9.17)
+- `GET /rpc/network_hashrate` — estimated network hashrate / difficulty
+- `GET /offers/feed` — marketplace offer feed
+- `GET /explorer/*` — explorer-specific views (stats, agreements, proofs,
+  reputation per pubkey)
+
+Full schema in [docs/API.md](API.md).
+
 ---
 
 ## 14. Key Management and Addresses
@@ -1155,15 +1215,36 @@ prints all detected OpenCL platforms and their devices.
 
 ### Stratum Pool Mining
 
-The GPU miner includes a Stratum protocol client for pool-based mining. When
+The GPU miner includes a Stratum v1 client for pool-based mining. When
 `IRIUM_STRATUM_URL` is set to a `stratum+tcp://` or `stratum://` URL, the miner
 connects to the pool and mines against the pool's work assignment rather than
 a local node.
 
 Stratum configuration:
-- `IRIUM_STRATUM_URL` — pool endpoint (e.g., `stratum+tcp://pool.iriumlabs.org:3333`)
+- `IRIUM_STRATUM_URL` — pool endpoint
 - `IRIUM_STRATUM_USER` — pool username (defaults to mining address)
 - `IRIUM_STRATUM_PASS` — pool password
+
+**Official public pool** (`pool.iriumlabs.org`):
+
+| Profile | Endpoint | Default share difficulty | Worker name |
+|---------|----------|--------------------------|-------------|
+| ASIC / strict | `stratum+tcp://pool.iriumlabs.org:3333` | 16 (vardiff 1–2048) | your `Q…` payout address |
+| CPU / GPU / legacy | `stratum+tcp://pool.iriumlabs.org:3335` | 1 (vardiff 1–1024) | your `Q…` payout address |
+
+The pool runs the `irium-stratum` daemon from this repository
+(`pool/irium-stratum/`) split into two systemd units (`irium-stratum.service`
+ASIC, `irium-stratum-legacy.service` CPU/GPU) so vardiff bounds and default
+difficulty can be tuned independently per hardware class. The pool operator's
+runbook is in `docs/POOL-OPERATOR.md`.
+
+**Public pool stats** are served on `:3337` as JSON
+(`http://pool.iriumlabs.org:3337/stats`) by a small Python proxy on the pool
+host. The proxy scrapes both loopback `/metrics` endpoints, combines them, and
+emits a per-profile rolling-window hashrate estimate
+(`(Δ accepted_shares × default_difficulty × 2³²) / Δ seconds`) along with the
+window length and a confidence level. The proxy is CORS-enabled so any web
+explorer or wallet UI can render the data directly.
 
 Pool operators can use `irium-miner-gpu` as a reference for the client protocol.
 Full pool operator setup instructions are documented in `docs/POOL-OPERATOR.md`
@@ -1271,7 +1352,7 @@ proceeds without a clean test run.
 
 | Feature | Status |
 |---|---|
-| SHA-256d PoW base chain | Live — block ~20,500+ |
+| SHA-256d PoW base chain | Live — block ~22,000+ |
 | LWMA v2 difficulty (N=30) | Live since block 19,740 |
 | HTLCv1 settlement outputs | Live since block 18,677 |
 | Settlement layer (agreements) | Live |
@@ -1282,6 +1363,9 @@ proceeds without a clean test run.
 | P2P offer feed discovery | Live |
 | Reputation system | Live |
 | Merchant tools (invoices, dashboards) | Live |
+| Public block-explorer endpoints (incl. rich list at `/rpc/richlist`) | Live since v1.9.17 |
+| Official public mining pool (CPU/GPU and ASIC profiles) | Live |
+| Public pool stats proxy with rolling-window hashrate | Live |
 | REST API | Live |
 | WebSocket streaming API | Live |
 | Server-Sent Events fallback | Live |
@@ -1291,21 +1375,25 @@ proceeds without a clean test run.
 | ECIES selective disclosure | Live |
 | Proof finality depth and reorg protection | Live |
 | Settlement-aware block explorer | Live |
+| Desktop wallet (`irium-core`) | Shipping (Tauri-based; bundled iriumd, miner, GPU miner) |
 | CPU miner (`irium-miner`) | Live |
-| GPU miner (`irium-miner-gpu`) | Live |
+| GPU miner (`irium-miner-gpu`) | Live (NVIDIA / AMD prioritised over Intel iGPU, since v1.9.18) |
 | Stratum pool mining | Live |
 | Python SDK | Live |
 | JavaScript/TypeScript SDK | Live |
 | Three-layer DNS-free bootstrap (gossip, signed seedlist, blockchain-embedded) | Live |
 | Blockchain-embedded peer discovery (`IRIUM_ADVERTISE_ADDR`) | Live |
+| P2P handshake-level external endpoint advertisement (`IRIUM_EXTERNAL_ENDPOINT`, CGNAT escape) | On `testing-codes-before-merging`, scheduled v1.9.19 |
 | Runtime peer injection (`--add-seed` flag, `POST /admin/add-seed` RPC) | Live |
 | AuxPoW merged mining | Activating at block 26,347 |
 
 ### In Development
 
-- **Desktop wallet** — a native wallet application wrapping the wallet CLI and
-  providing a graphical interface for all settlement and marketplace operations.
-  Being built in a separate repository after this brief is complete.
+- **Desktop wallet (`irium-core`)** — a Tauri-based native wallet wrapping the
+  full settlement + marketplace + miner stack (CPU + GPU + Stratum pool client).
+  Currently shipping on `testing-codes-before-merging`; bundled iriumd binary,
+  rich-list explorer, pool stats tab, and the multi-locale UI (15 languages)
+  are all live.
 - **Web wallet** — a browser-based interface for marketplace browsing, agreement
   creation, and proof submission.
 - **Mobile wallet** — iOS and Android applications with QR code payment flows,

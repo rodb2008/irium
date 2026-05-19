@@ -17,6 +17,27 @@ SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.
 
 ---
 
+## At a Glance
+
+| Parameter | Value |
+|-----------|-------|
+| Current node version | `v1.9.18` (released) · `v1.9.19` queued on `testing-codes-before-merging` |
+| Consensus algorithm | SHA-256d proof of work |
+| Block target interval | 600 s (10 min) |
+| Difficulty adjustment | LWMA (60-block window; LWMA v2 — 30-block window — wired but inactive until rolled forward) |
+| Block reward | 50 IRM during the Early Miner Era; halves every 210,000 blocks |
+| AuxPoW merged mining | Activates at block 26,347 (still pending; current tip ≈ 22k) |
+| Total supply cap | 100,000,000 IRM (96.5M mineable + 3.5M genesis CLTV vest) |
+| Address prefix | `Q` (single-sig P2PKH, version byte 0x39) · `P` (multisig, version byte 0x28) |
+| Default P2P port | 38291 |
+| Default RPC / explorer port | 38300 |
+| `/status` lightweight port | 8080 (loopback only by default) |
+| Official pool — CPU/GPU | `stratum+tcp://pool.iriumlabs.org:3335` |
+| Official pool — ASIC | `stratum+tcp://pool.iriumlabs.org:3333` |
+| Public pool stats proxy | `http://pool.iriumlabs.org:3337/stats` |
+
+---
+
 ## Current State
 
 | Feature | Status |
@@ -27,12 +48,14 @@ SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.
 | Reputation system | Live |
 | Proof ecosystem | Live |
 | Merchant tools | Live |
+| Rich list endpoint (`/rpc/richlist?limit=N`) | Live (since v1.9.17) |
+| Self-advertised P2P external endpoint (CGNAT escape) | Live on `testing-codes-before-merging`, scheduled for v1.9.19 |
 | AuxPoW merged mining | Activating at block 26,347 |
 | WebSocket streaming API | Live |
 | BIP32/BIP39 key derivation | Live |
 | Multisig (2-of-2, 2-of-3) | Live |
 | Confidential agreements | Live |
-| Desktop / web / mobile wallet | In development |
+| Desktop / web / mobile wallet | Desktop wallet (`irium-core`) shipping; web / mobile in development |
 
 ---
 
@@ -80,21 +103,47 @@ irium-wallet balance <YOUR_ADDRESS> # check balance once synced
 
 The node connects to the Irium network automatically. On first run it uses the signed seed list bundled with the software. After the first connection it caches peer addresses locally and never needs the seed nodes again. No configuration needed for a basic setup. Default P2P port: 38291. Default RPC port: 38300.
 
+### Mining options
+
+| Profile | Command / pool |
+|---------|----------------|
+| Solo CPU | `irium-miner --address Q<your-address>` |
+| Solo GPU | `irium-miner-gpu --address Q<your-address>` (build with `--features gpu`) |
+| Pool — CPU/GPU | Point any Stratum v1 miner at `stratum+tcp://pool.iriumlabs.org:3335`, worker `Q<your-address>` |
+| Pool — ASIC | Point any SHA-256 ASIC at `stratum+tcp://pool.iriumlabs.org:3333`, worker `Q<your-address>` |
+
+Public pool stats live at `http://pool.iriumlabs.org:3337/stats` (CORS-enabled JSON with active miners, accepted shares, blocks found, and a rolling-window hashrate estimate per profile).
+
 ---
 
 ## Running a Public Node
 
 If your node has a public IP address, you can help new users bootstrap by
-advertising your address in the blockchain. Set the following environment
-variable before starting the miner:
+advertising your address. Two complementary mechanisms exist:
+
+**Coinbase peer-discovery embed** — your miner stamps the listen address
+into every coinbase transaction so new nodes scanning the chain discover
+you without DNS or a central seed server:
 
 ```bash
 export IRIUM_ADVERTISE_ADDR=<your-public-ip>:38291
 ```
 
-Your miner will embed your listen address in every coinbase transaction.
-New nodes scanning the chain will discover your node automatically without
-needing DNS or a central seed server.
+**P2P handshake external endpoint** — your node tells each peer the IP
+they should record as your dialable address. This is the CGNAT escape
+hatch: without it, peers infer your address from the TCP source IP, which
+under carrier-grade NAT (RFC 6598, `100.64.0.0/10`) is the carrier's NAT
+address rather than your real public IP. Set this when you know your real
+external IPv4:
+
+```bash
+export IRIUM_EXTERNAL_ENDPOINT=<your-public-ip>:38291
+```
+
+iriumd validates the value (rejects RFC1918 private, RFC6598 CGNAT,
+loopback, link-local, multicast, documentation, and IPv6) before
+advertising it. Old peers without the field simply fall back to the
+TCP-source-IP behavior, so this is fully backwards compatible.
 
 To add your node as a seed for a running node without restarting:
 

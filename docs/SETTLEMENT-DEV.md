@@ -292,6 +292,69 @@ irium-wallet agreement-policy-evaluate --agreement a1b2c3d4... --rpc http://loca
 
 ---
 
+## Packing and Distributing Agreements
+
+Once an agreement is funded and a policy is stored, the parties usually need to
+hand the complete state — agreement document, policy, signatures, funding-tx
+record, and any already-submitted proofs — to a counterparty or attestor.
+`agreement-pack` and `agreement-unpack` make this a single round-trip.
+
+### Pack an agreement
+
+```bash
+irium-wallet agreement-pack \
+  --agreement otc-trade-001 \
+  --out otc-trade-001.pack.json \
+  --rpc http://localhost:38300
+```
+
+Output JSON shape (top-level keys):
+
+```json
+{
+  "version": 1,
+  "agreement_hash": "a1b2c3d4...",
+  "agreement": { /* full agreement JSON */ },
+  "policy": { /* stored release policy or null */ },
+  "signatures": [ /* every signature attached so far */ ],
+  "funding": {
+    "txid": "cb7d25dc...",
+    "height": 20300,
+    "confirmations": 4
+  },
+  "proofs": [ /* every submitted proof */ ],
+  "exported_at": 1779100000,
+  "exported_from": "127.0.0.1:38300"
+}
+```
+
+Pulling all four pieces from the node in a single call guarantees the pack is
+consistent with the chain at one specific tip — there's no race window where
+(say) the policy moved on but the proofs reference an older policy.
+
+### Unpack and verify
+
+The receiving party verifies the document hash, agreement hash, all embedded
+signatures, and the on-chain status before importing anything to their local
+wallet:
+
+```bash
+irium-wallet agreement-unpack \
+  --file otc-trade-001.pack.json \
+  --rpc http://localhost:38300
+```
+
+If any signature is invalid, the pack's agreement_hash doesn't match the
+sender's agreement JSON, or the on-chain status contradicts the pack's
+`funding` block, the command fails with a non-zero exit and no local state is
+modified.
+
+This pairs well with the OTC offer flow: seller packs immediately after
+funding → buyer unpacks → buyer verifies the funding tx independently before
+delivering the off-chain side of the trade.
+
+---
+
 ## RPC Endpoints Reference
 
 All settlement endpoints accept JSON bodies and return JSON responses.

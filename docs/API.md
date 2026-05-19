@@ -2,6 +2,15 @@
 
 This document covers every HTTP endpoint exposed by `iriumd`. All amounts are in satoshis. 1 IRM = 100,000,000 satoshis.
 
+Default ports:
+- P2P listener: `38291`
+- RPC / explorer API: `38300`
+- Lightweight `/status` server: `8080` (loopback only by default; override with `IRIUM_STATUS_HOST` / `IRIUM_STATUS_PORT`)
+
+Address prefixes:
+- `Q` — single-sig P2PKH (Base58Check version byte `0x39`)
+- `P` — multisig (Base58Check version byte `0x28`)
+
 ## Authentication
 
 If the environment variable `IRIUM_RPC_TOKEN` is set to a non-empty value on the node, protected endpoints require an `Authorization: Bearer <token>` header.
@@ -17,11 +26,15 @@ The following endpoints are always public (no token required):
 - `GET /rpc/fee_estimate`
 - `GET /rpc/block`
 - `GET /rpc/block_by_hash`
+- `GET /rpc/blocks`
 - `GET /rpc/tx`
 - `GET /rpc/utxo`
+- `GET /rpc/richlist`
 - `GET /rpc/network_hashrate`
 - `GET /rpc/mining_metrics`
 - `GET /offers/feed`
+- `GET /explorer/*`
+- `GET /ws` · `GET /events` (streaming endpoints; see [WEBSOCKET.md](WEBSOCKET.md))
 
 All wallet endpoints (`/wallet/...`) and settlement endpoints (`/rpc/createagreement`, etc.) require authentication if a token is configured.
 
@@ -427,6 +440,60 @@ curl "http://localhost:38300/rpc/block_by_hash?hash=000000000697c1d50667fbde625d
 ```
 
 Response structure is identical to `GET /rpc/block`.
+
+---
+
+### `GET /rpc/richlist`
+
+Returns the top N IRM holders ranked by spendable on-chain balance at the
+current tip. Added in iriumd v1.9.17. Always public — no authentication
+required. Computed in-memory over the live UTXO set so the response is
+authoritative for the tip and reflects every confirmation, not a stale
+index.
+
+**Query parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `limit` | No | Maximum number of entries to return (default: 100; clamped to 1000) |
+
+**Example request:**
+```
+curl "http://localhost:38300/rpc/richlist?limit=10"
+```
+
+**Example response:**
+```json
+{
+  "total_supply_sats": 105450000000000,
+  "generated_at_height": 22058,
+  "entries": [
+    {
+      "rank": 1,
+      "address": "Q9KxBRfrnb6v9Vb8vuHjwkZaxj3ZRhJWpg",
+      "balance_sats": 3175000000000,
+      "utxo_count": 635
+    },
+    {
+      "rank": 2,
+      "address": "Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa",
+      "balance_sats": 1945000000000,
+      "utxo_count": 389
+    }
+  ]
+}
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_supply_sats` | integer | Total minted supply at the snapshot height (includes coinbase rewards + genesis premine) |
+| `generated_at_height` | integer | Chain tip height at which the snapshot was taken |
+| `entries[].rank` | integer | 1-based rank by balance |
+| `entries[].address` | string | Irium address (`Q…` single-sig or `P…` multisig) |
+| `entries[].balance_sats` | integer | Spendable balance in satoshis |
+| `entries[].utxo_count` | integer | Number of unspent outputs at the address |
 
 ---
 
@@ -868,6 +935,60 @@ Wallet endpoints require authentication if `IRIUM_RPC_TOKEN` is set. These endpo
 | `/wallet/export_seed` | POST | Export wallet seed |
 | `/wallet/import_seed` | POST | Import a wallet seed |
 | `/wallet/send` | POST | Build and broadcast a transaction |
+
+---
+
+## P2P Handshake (binary protocol on port 38291)
+
+The HTTP API documented above is for clients. Node-to-node communication
+uses the binary message framing defined in `src/protocol.rs`. The first
+message exchanged by both sides of a TCP connection is a `HandshakePayload`
+(JSON payload, message type `1`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | u32 | Protocol version (currently 1) |
+| `agent` | string | User-agent string |
+| `height` | u64 | Local chain tip height |
+| `timestamp` | i64 | Sender's clock (Unix seconds) |
+| `port` | u16 | Listen port advertised by the sender |
+| `checkpoint_height` | u64? | Optional best checkpoint height the sender knows |
+| `checkpoint_hash` | string? | Optional checkpoint hash (hex) |
+| `relay_address` | string? | Operator's IRM payout address for tx-relay attribution |
+| `node_id` | string? | 32-byte persistent identity hash (hex) |
+| `tip_hash` | string? | 32-byte hash of the sender's tip header (hex) |
+| `capabilities` | string[]? | Capability strings (e.g. `"uptime-v1"`) |
+| `marketplace_feed` | string? | Optional URL of the sender's offer feed |
+| `external_endpoint` | string? | Self-advertised dialable endpoint in `"<ip>:<port>"` form. **New on `testing-codes-before-merging` (v1.9.19 scheduled).** Backwards compatible via `#[serde(default)]`. |
+
+### `external_endpoint` semantics
+
+When set and globally routable, the receiver SHOULD use this string to
+record the sender's dialable address in PeerDirectory (the address later
+gossiped to other peers via `GetPeers` / `Peers` messages). When unset,
+or when the value fails routability validation, the receiver MUST fall
+back to the TCP source IP and the `port` field.
+
+Routability validation is identical on every node and rejects:
+
+- Loopback (127.0.0.0/8, `::1`)
+- RFC1918 private (10/8, 172.16/12, 192.168/16)
+- RFC6598 CGNAT (100.64.0.0/10)
+- Link-local (169.254/16, fe80::/10)
+- Unspecified (0.0.0.0, `::`)
+- Broadcast (255.255.255.255)
+- Multicast
+- RFC5737 documentation (192.0.2/24, 198.51.100/24, 203.0.113/24)
+- IPv6 (the directory currently stores IPv4-only multiaddrs)
+- Port 0
+
+Nodes set their own `external_endpoint` via the
+`IRIUM_EXTERNAL_ENDPOINT=<ip>:<port>` environment variable (or
+`external_endpoint` in the node config JSON). Operators behind CGNAT
+should pair this with port-forwarding at the carrier level (or accept
+outbound-only operation if no inbound is reachable).
+
+Reference implementation in `src/p2p.rs::dialable_multiaddr_from_advertised`.
 
 ---
 

@@ -4,6 +4,8 @@
 
 All chain query and broadcast commands accept `--rpc <url>` to specify a custom node. The default is `http://127.0.0.1:38300`.
 
+> Address prefixes: single-signature P2PKH addresses start with `Q` (base58 version byte `0x39`). Multisig addresses (2-of-2, 2-of-3) start with `P` (version byte `0x28`). Any field documented as `<addr>` accepts either form unless explicitly noted.
+
 ---
 
 ## Wallet Initialisation and Key Management
@@ -301,12 +303,46 @@ irium-wallet offer-feed-fetch --url http://node.example.com:38300/offers/feed
 
 ---
 
-### `irium-wallet offer-feed-sync`
+### `irium-wallet offer-feed-sync [--json]`
 
 Syncs offers from all configured feed URLs.
 
 ```
 irium-wallet offer-feed-sync
+irium-wallet offer-feed-sync --json
+```
+
+---
+
+### `irium-wallet offer-feed-export [--out <file>] [--limit <n>]`
+
+Exports the locally cached offer feed as a single JSON document — the same shape served by a node's `/offers/feed` endpoint. Useful for republishing your own offer set on a separate static host, or for taking an offline snapshot before pruning.
+
+| Flag | Description |
+|------|-------------|
+| `--out <file>` | Output path (default: stdout) |
+| `--limit <n>` | Cap the number of offers exported |
+
+```
+irium-wallet offer-feed-export --out my-feed.json
+irium-wallet offer-feed-export --limit 100 --out top100.json
+```
+
+---
+
+### `irium-wallet offer-feed-prune [--older-than-days <n>] [--dry-run] [--json]`
+
+Removes expired or stale offers from the local feed cache. By default prunes anything past its `--timeout` height. Pass `--older-than-days` to also prune offers older than the given calendar age, regardless of timeout.
+
+| Flag | Description |
+|------|-------------|
+| `--older-than-days <n>` | Also prune offers older than `n` days |
+| `--dry-run` | Report what would be pruned without modifying state |
+| `--json` | Emit machine-readable output |
+
+```
+irium-wallet offer-feed-prune --dry-run
+irium-wallet offer-feed-prune --older-than-days 30
 ```
 
 ---
@@ -773,6 +809,37 @@ Adds a signature to a bundle.
 
 ```
 irium-wallet agreement-bundle-sign --bundle bundle-002.json --signer QBuyerAddress...
+```
+
+---
+
+## Agreement Pack / Unpack
+
+`agreement-pack` and `agreement-unpack` are the fastest way to ship a full
+agreement — including its policy, signatures, funding-tx record, and any
+already-submitted proofs — to a counterparty or attestor without exposing
+the wallet that owns it. The pack is a single self-describing JSON blob
+which `agreement-unpack` can fully verify against the chain before any
+write is performed locally.
+
+### `irium-wallet agreement-pack --agreement <id|hash> --out <file> [--rpc <url>] [--json]`
+
+Bundles an agreement's on-chain identity, stored policy, signatures, and any submitted proofs into a single JSON document at `<file>`. Pulls live state from the node so the pack is always consistent with the chain at the time of export.
+
+```
+irium-wallet agreement-pack --agreement otc-002 --out otc-002.pack.json
+irium-wallet agreement-pack --agreement abcdef0123456789...32bytehex --out otc-002.pack.json
+```
+
+---
+
+### `irium-wallet agreement-unpack --file <file> [--rpc <url>] [--json]`
+
+Verifies and imports an agreement pack. Validates the document hash, agreement hash, every embedded signature, and confirms the on-chain status before adding anything to the local wallet store. Pass `--rpc` to point verification at a specific node.
+
+```
+irium-wallet agreement-unpack --file otc-002.pack.json
+irium-wallet agreement-unpack --file otc-002.pack.json --rpc http://localhost:38300
 ```
 
 ---
