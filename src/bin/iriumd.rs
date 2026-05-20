@@ -59,11 +59,15 @@ use irium_node_rs::settlement::{
     policy_template_to_json, preorder_deposit_template, verify_agreement_bundle,
     AgreementActivityEvent, AgreementAnchor, AgreementAnchorRole, AgreementAuditFundingLegRecord,
     AgreementAuditRecord, AgreementBundle, AgreementFundingLegRef, AgreementLifecycleView,
-    AgreementLinkedTx, AgreementMilestoneStatus, AgreementObject, AgreementSummary,
+    AgreementLinkedTx, AgreementMilestoneStatus, AgreementObject, AgreementSignatureEnvelope,
+    AgreementSummary, AgreementTemplateType, DisputeEvidence, DisputeRaise, DisputeResolution,
     HoldbackEvaluationResult, MilestoneEvaluationResult, MilestoneSpec, PolicyOutcome, PolicyStore,
-    ProofPolicy, ProofStore, RequirementThresholdResult, SettlementProof,
-    TemplateAttestor,
+    ProofPolicy, ProofStore, RequirementThresholdResult, ResolverRegistration, SettlementProof,
+    TemplateAttestor, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+    dispute_evidence_canonical_bytes, dispute_raise_canonical_bytes,
+    dispute_resolution_canonical_bytes, resolver_registration_canonical_bytes,
 };
+use k256::ecdsa::VerifyingKey;
 use irium_node_rs::storage;
 use irium_node_rs::tx::{
     decode_full_tx, encode_htlcv1_claim_witness, encode_htlcv1_refund_witness,
@@ -113,6 +117,47 @@ struct AppState {
     event_tx: EventTx,
     /// Maps proof_id → chain tip height at submission time (Phase 7 finality tracking).
     proof_heights: Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    /// Dispute index keyed by agreement_hash hex (Stage 3.2).
+    disputes_index: Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    /// Resolver registration index keyed by resolver_address (Stage 3.2).
+    resolvers_index: Arc<Mutex<std::collections::HashMap<String, ResolverRegistrationRecord>>>,
+}
+
+const DISPUTE_RESOLVER_RESPONSE_WINDOW: u64 = 288; // blocks
+const MINER_RECENCY_WINDOW: u64 = 2016;            // blocks
+const DISPUTE_ANCHOR_FEE_PER_BYTE: u64 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DisputeState {
+    raise: DisputeRaise,
+    raise_anchor_txid: Option<String>,
+    raise_anchored_at_height: Option<u64>,
+    evidence: Vec<DisputeEvidenceRecord>,
+    resolution: Option<DisputeResolution>,
+    resolution_anchor_txid: Option<String>,
+    resolution_anchored_at_height: Option<u64>,
+    escalated_to_fallback: bool,
+    escalated_at_height: Option<u64>,
+}
+
+impl DisputeState {
+    fn is_open(&self) -> bool {
+        self.resolution.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DisputeEvidenceRecord {
+    evidence: DisputeEvidence,
+    anchor_txid: Option<String>,
+    anchored_at_height: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResolverRegistrationRecord {
+    registration: ResolverRegistration,
+    anchor_txid: Option<String>,
+    anchored_at_height: Option<u64>,
 }
 
 fn proof_finality_depth() -> u64 {
@@ -154,7 +199,19 @@ fn ws_event_matches(event_type: &str, subscribed: &HashSet<String>) -> bool {
 }
 
 fn ws_is_public_event(event_type: &str) -> bool {
-    matches!(event_type, "block.new" | "offer.created" | "agreement.proof_reorged")
+    matches!(
+        event_type,
+        "block.new"
+            | "offer.created"
+            | "agreement.proof_reorged"
+            | "dispute.raised"
+            | "dispute.evidence_submitted"
+            | "dispute.resolved"
+            | "dispute.escalated"
+            | "dispute.raise_anchored"
+            | "dispute.resolve_anchored"
+            | "resolver.registered"
+    )
 }
 
 async fn ws_handle_socket(mut socket: WebSocket, state: AppState, is_public_conn: bool) {
@@ -5737,9 +5794,12 @@ async fn agreement_release_eligibility(
 ) -> Result<Json<AgreementSpendEligibilityResponse>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
-    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-    let resp = evaluate_agreement_spend_eligibility(true, &chain, &req.agreement, &req)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut resp = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        evaluate_agreement_spend_eligibility(true, &chain, &req.agreement, &req)
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+    apply_dispute_status_to_eligibility(&state, &req.agreement, true, &mut resp);
     if resp.eligible {
         if let Ok(ah) = compute_agreement_hash_hex(&req.agreement) {
             emit_event(&state.event_tx, "agreement.satisfied", serde_json::json!({
@@ -5758,9 +5818,12 @@ async fn agreement_refund_eligibility(
 ) -> Result<Json<AgreementSpendEligibilityResponse>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
-    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-    let resp = evaluate_agreement_spend_eligibility(false, &chain, &req.agreement, &req)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut resp = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        evaluate_agreement_spend_eligibility(false, &chain, &req.agreement, &req)
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+    apply_dispute_status_to_eligibility(&state, &req.agreement, false, &mut resp);
     if resp.eligible {
         if let Ok(ah) = compute_agreement_hash_hex(&req.agreement) {
             emit_event(&state.event_tx, "agreement.timeout", serde_json::json!({
@@ -6652,11 +6715,12 @@ async fn build_agreement_spend_internal(
     check_rate_with_auth(&state, &addr, &headers)
         .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
     require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
-    let eligibility = {
+    let mut eligibility = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         evaluate_agreement_spend_eligibility(claim, &chain, &req.agreement, &req)
             .map_err(|e| bad(&e))?
     };
+    apply_dispute_status_to_eligibility(&state, &req.agreement, claim, &mut eligibility);
     if !eligibility.eligible {
         return Err(bad(&format!(
             "ineligible:{}",
@@ -8500,6 +8564,8 @@ async fn main() {
         ))),
         event_tx: event_tx.clone(),
         proof_heights: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        disputes_index: Arc::new(Mutex::new(load_all_disputes_at_startup())),
+        resolvers_index: Arc::new(Mutex::new(load_all_resolvers_at_startup())),
     };
 
     // Background task: emit block.new events when chain height advances.
@@ -8508,6 +8574,8 @@ async fn main() {
         let block_chain = app_state.chain.clone();
         let reorg_proof_heights = app_state.proof_heights.clone();
         let reorg_proof_store = app_state.proof_store.clone();
+        let block_disputes = app_state.disputes_index.clone();
+        let block_resolvers = app_state.resolvers_index.clone();
         tokio::spawn(async move {
             let mut last_known_height: u64 = 0;
             let mut last_known_hash = String::new();
@@ -8551,10 +8619,21 @@ async fn main() {
                             "height": h,
                             "hash": hash,
                         }));
+                        // Stage 3.2: scan newly-confirmed blocks for dispute/resolver anchor OP_RETURNs.
+                        scan_new_blocks_for_dispute_anchors(
+                            &block_chain,
+                            &block_disputes,
+                            &block_resolvers,
+                            &block_event_tx,
+                            last_known_height,
+                            h,
+                        );
                     }
                     last_known_height = h;
                     last_known_hash = hash;
                 }
+                // Stage 3.2: escalation tick — disputes whose primary resolver missed window go to fallback.
+                escalation_tick(&block_disputes, &block_event_tx, h);
             }
         });
     }
@@ -9333,6 +9412,11 @@ async fn explorer_stats(
             post(compute_agreement_hash_rpc),
         )
         .route("/rpc/fundagreement", post(fund_agreement))
+        .route("/rpc/raisedispute", post(raise_dispute))
+        .route("/rpc/disputeevidence", post(submit_dispute_evidence))
+        .route("/rpc/resolvedispute", post(resolve_dispute))
+        .route("/rpc/registerresolver", post(register_resolver))
+        .route("/resolvers/list", get(resolvers_list))
         .route("/rpc/listagreementtxs", post(list_agreement_txs))
         .route("/rpc/agreementfundinglegs", post(agreement_funding_legs))
         .route("/rpc/agreementtimeline", post(agreement_timeline))
@@ -9608,6 +9692,8 @@ mod tests {
             )))),
             event_tx: tokio::sync::broadcast::channel::<std::sync::Arc<String>>(WS_BROADCAST_CAPACITY).0,
             proof_heights: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            disputes_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            resolvers_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
         };
 
         (state, sender, recipient, refund)
@@ -15863,5 +15949,1018 @@ mod tests {
         // generated_at_height equals the chain's tip — for the freshly-built
         // test state with no blocks applied, that's 0.
         assert_eq!(resp.generated_at_height, 0);
+    }
+}
+
+
+// ============================================================================
+// Stage 3.2: Dispute and Resolver System
+// ============================================================================
+
+fn iriumd_disputes_dir() -> std::path::PathBuf {
+    storage::state_dir().join("iriumd_disputes")
+}
+
+fn iriumd_resolvers_dir() -> std::path::PathBuf {
+    storage::state_dir().join("iriumd_resolvers")
+}
+
+fn dispute_state_path(agreement_hash: &str) -> std::path::PathBuf {
+    iriumd_disputes_dir().join(format!("{}.json", agreement_hash))
+}
+
+fn resolver_record_path(addr: &str) -> std::path::PathBuf {
+    iriumd_resolvers_dir().join(format!("{}.json", addr))
+}
+
+fn save_json_atomic<T: Serialize>(path: &std::path::Path, value: &T) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create dir {}: {}", parent.display(), e))?;
+    }
+    let pid = std::process::id();
+    let tmp = path.with_extension(format!("json.tmp.{}", pid));
+    let bytes = serde_json::to_vec_pretty(value).map_err(|e| format!("serialize: {}", e))?;
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write tmp: {}", e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {}", e))?;
+    Ok(())
+}
+
+fn save_dispute_state(state: &DisputeState) -> Result<(), String> {
+    let path = dispute_state_path(&state.raise.agreement_hash);
+    save_json_atomic(&path, state)
+}
+
+fn save_resolver_record(rec: &ResolverRegistrationRecord) -> Result<(), String> {
+    let path = resolver_record_path(&rec.registration.resolver_address);
+    save_json_atomic(&path, rec)
+}
+
+fn load_all_disputes_at_startup() -> std::collections::HashMap<String, DisputeState> {
+    let dir = iriumd_disputes_dir();
+    let mut out = std::collections::HashMap::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[disputes] failed to read {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        match serde_json::from_slice::<DisputeState>(&bytes) {
+            Ok(state) => {
+                out.insert(state.raise.agreement_hash.clone(), state);
+            }
+            Err(e) => {
+                eprintln!("[disputes] failed to parse {}: {}", path.display(), e);
+            }
+        }
+    }
+    out
+}
+
+fn load_all_resolvers_at_startup() -> std::collections::HashMap<String, ResolverRegistrationRecord>
+{
+    let dir = iriumd_resolvers_dir();
+    let mut out = std::collections::HashMap::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if let Ok(rec) = serde_json::from_slice::<ResolverRegistrationRecord>(&bytes) {
+            out.insert(rec.registration.resolver_address.clone(), rec);
+        }
+    }
+    out
+}
+
+fn address_is_recent_miner(chain: &ChainState, address: &str) -> bool {
+    let Some(pkh_vec) = base58_p2pkh_to_hash(address) else {
+        return false;
+    };
+    if pkh_vec.len() != 20 {
+        return false;
+    }
+    let mut target = [0u8; 20];
+    target.copy_from_slice(&pkh_vec);
+    let tip = chain.tip_height();
+    let start = tip.saturating_sub(MINER_RECENCY_WINDOW);
+    for h in start..=tip {
+        let Some(block) = chain.chain.get(h as usize) else {
+            continue;
+        };
+        let Some(coinbase) = block.transactions.first() else {
+            continue;
+        };
+        for out in &coinbase.outputs {
+            if let Some(out_pkh) = p2pkh_hash_from_script(&out.script_pubkey) {
+                if out_pkh == target {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Apply dispute status to an eligibility response. If a dispute is open,
+/// mark not-eligible with reason "dispute_open". If a dispute is resolved,
+/// block the branch that does not match the resolved outcome with reason
+/// "dispute_resolution_blocks_branch".
+fn apply_dispute_status_to_eligibility(
+    state: &AppState,
+    agreement: &AgreementObject,
+    claim: bool,
+    resp: &mut AgreementSpendEligibilityResponse,
+) {
+    let Ok(agreement_hash) = compute_agreement_hash_hex(agreement) else {
+        return;
+    };
+    let dispute = {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&agreement_hash).cloned()
+    };
+    let Some(d) = dispute else {
+        return;
+    };
+    if d.is_open() {
+        resp.eligible = false;
+        if !resp.reasons.iter().any(|r| r == "dispute_open") {
+            resp.reasons.push("dispute_open".to_string());
+        }
+        return;
+    }
+    if let Some(ref resolution) = d.resolution {
+        let want_release = resolution.outcome == "release";
+        let want_refund = resolution.outcome == "refund";
+        let branch_allowed = (claim && want_release) || (!claim && want_refund);
+        if !branch_allowed {
+            resp.eligible = false;
+            if !resp
+                .reasons
+                .iter()
+                .any(|r| r == "dispute_resolution_blocks_branch")
+            {
+                resp.reasons
+                    .push("dispute_resolution_blocks_branch".to_string());
+            }
+        }
+    }
+}
+
+/// Build, sign, and (optionally) broadcast a transaction that anchors the
+/// supplied agreement hash on chain via an OP_RETURN output. Returns the txid
+/// hex on success. Mirrors fund_agreement's wallet+utxo+sign+broadcast path.
+fn build_and_broadcast_anchor_tx(
+    state: &AppState,
+    agreement_hash: &str,
+    role: AgreementAnchorRole,
+) -> Result<String, String> {
+    let anchor_output = build_agreement_anchor_output(&AgreementAnchor {
+        agreement_hash: agreement_hash.to_string(),
+        role,
+        milestone_id: None,
+    })
+    .map_err(|e| format!("anchor_payload: {}", e))?;
+
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet
+            .keys()
+            .map_err(|_| "wallet_keys_unavailable".to_string())?;
+        for key in keys {
+            let bytes = hex::decode(&key.pkh).map_err(|_| "wallet_key_pkh_decode_failed".to_string())?;
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            key_map.insert(arr, key);
+        }
+    }
+    if key_map.is_empty() {
+        return Err("wallet_key_map_empty".to_string());
+    }
+
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if key_map.contains_key(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+    if utxos.is_empty() {
+        return Err("wallet_utxo_set_empty".to_string());
+    }
+    utxos.sort_by(|a, b| a.output.value.cmp(&b.output.value));
+
+    let fee_per_byte = DISPUTE_ANCHOR_FEE_PER_BYTE;
+    // Tx layout: 1 input + 2 outputs (OP_RETURN anchor + change)
+    let estimated_fee = estimate_tx_size(1, 2).saturating_mul(fee_per_byte);
+
+    let mut chosen: Option<WalletUtxo> = None;
+    for utxo in &utxos {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+            continue;
+        }
+        if utxo.output.value > estimated_fee {
+            chosen = Some(utxo.clone());
+            break;
+        }
+    }
+    let utxo = chosen.ok_or_else(|| "insufficient_spendable_funds_or_immature_coinbase".to_string())?;
+
+    let change_value = utxo.output.value.saturating_sub(estimated_fee);
+    let mut outputs = vec![anchor_output];
+    outputs.push(TxOutput {
+        value: change_value,
+        script_pubkey: p2pkh_script(&utxo.pkh),
+    });
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: utxo.outpoint.txid,
+            prev_index: utxo.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        }],
+        outputs,
+        locktime: 0,
+    };
+
+    // Sign the input.
+    let priv_bytes = hex::decode(&utxo.pkh_key_priv(&key_map)?)
+        .map_err(|_| "wallet_priv_decode".to_string())?;
+    if priv_bytes.len() != 32 {
+        return Err("wallet_priv_len".to_string());
+    }
+    let mut sk_arr = [0u8; 32];
+    sk_arr.copy_from_slice(&priv_bytes);
+    let signing_key =
+        SigningKey::from_bytes((&sk_arr).into()).map_err(|_| "signing_key".to_string())?;
+    let pubkey_bytes = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+    let scriptcode = p2pkh_script(&utxo.pkh);
+    let digest = signature_digest(&tx, 0, &scriptcode);
+    let sig: Signature = signing_key
+        .sign_prehash(&digest)
+        .map_err(|_| "sign_prehash".to_string())?;
+    let sig = sig.normalize_s().unwrap_or(sig);
+    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+    sig_bytes.push(0x01);
+    let mut script_sig: Vec<u8> = Vec::with_capacity(2 + sig_bytes.len() + pubkey_bytes.len());
+    script_sig.push(sig_bytes.len() as u8);
+    script_sig.extend_from_slice(&sig_bytes);
+    script_sig.push(pubkey_bytes.len() as u8);
+    script_sig.extend_from_slice(&pubkey_bytes);
+    tx.inputs[0].script_sig = script_sig;
+
+    // Validate fee then submit to mempool.
+    let raw = tx.serialize();
+    let txid = tx.txid();
+    let txid_hex = hex::encode(txid);
+    let fee = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|e| format!("fee_validate: {}", e))?
+    };
+    {
+        let mut mp = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = mp.add_transaction(tx.clone(), raw.clone(), fee);
+    }
+    // Best-effort P2P broadcast.
+    if let Some(ref node) = state.p2p {
+        let node = node.clone();
+        let raw_bytes = raw.clone();
+        tokio::spawn(async move {
+            let _ = node.broadcast_tx(&raw_bytes).await;
+        });
+    }
+    Ok(txid_hex)
+}
+
+trait WalletKeyPrivLookup {
+    fn pkh_key_priv(&self, key_map: &HashMap<[u8; 20], WalletKey>) -> Result<String, String>;
+}
+
+impl WalletKeyPrivLookup for WalletUtxo {
+    fn pkh_key_priv(&self, key_map: &HashMap<[u8; 20], WalletKey>) -> Result<String, String> {
+        key_map
+            .get(&self.pkh)
+            .map(|k| k.privkey.clone())
+            .ok_or_else(|| "wallet_key_for_pkh_missing".to_string())
+    }
+}
+
+/// Compute the payload hash for a DisputeRaise signature. The signature field
+/// is zeroed for the hash so signers can compute the same digest before
+/// embedding their signature.
+fn dispute_raise_payload_hash(d: &DisputeRaise) -> Result<[u8; 32], String> {
+    let mut tmp = d.clone();
+    tmp.signature.signature = String::new();
+    let bytes = dispute_raise_canonical_bytes(&tmp)?;
+    let h = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h);
+    Ok(out)
+}
+
+fn dispute_evidence_payload_hash(d: &DisputeEvidence) -> Result<[u8; 32], String> {
+    let mut tmp = d.clone();
+    tmp.signature.signature = String::new();
+    let bytes = dispute_evidence_canonical_bytes(&tmp)?;
+    let h = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h);
+    Ok(out)
+}
+
+fn dispute_resolution_payload_hash(d: &DisputeResolution) -> Result<[u8; 32], String> {
+    let mut tmp = d.clone();
+    tmp.signature.signature = String::new();
+    let bytes = dispute_resolution_canonical_bytes(&tmp)?;
+    let h = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h);
+    Ok(out)
+}
+
+fn resolver_registration_payload_hash(r: &ResolverRegistration) -> Result<[u8; 32], String> {
+    let mut tmp = r.clone();
+    tmp.signature.signature = String::new();
+    let bytes = resolver_registration_canonical_bytes(&tmp)?;
+    let h = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h);
+    Ok(out)
+}
+
+fn verify_envelope_signature(
+    envelope: &AgreementSignatureEnvelope,
+    digest: &[u8; 32],
+    expected_address: &str,
+) -> Result<(), String> {
+    if envelope.signature_type != AGREEMENT_SIGNATURE_TYPE_SECP256K1 {
+        return Err(format!(
+            "unsupported signature type: {}",
+            envelope.signature_type
+        ));
+    }
+    if envelope
+        .signer_address
+        .as_deref()
+        .map(|s| s != expected_address)
+        .unwrap_or(true)
+    {
+        return Err("signer_address_mismatch".to_string());
+    }
+    let pubkey_bytes = hex::decode(&envelope.signer_public_key)
+        .map_err(|_| "signer_public_key_decode".to_string())?;
+    let verifying_key = VerifyingKey::from_sec1_bytes(&pubkey_bytes)
+        .map_err(|_| "signer_public_key_invalid".to_string())?;
+    // Verify pubkey produces the expected address.
+    let mut sha = Sha256::new();
+    sha.update(&pubkey_bytes);
+    let sha_out = sha.finalize();
+    let rip = ripemd::Ripemd160::digest(&sha_out);
+    let mut pkh = [0u8; 20];
+    pkh.copy_from_slice(&rip);
+    let derived_address = base58_p2pkh_from_hash(&pkh);
+    if derived_address != expected_address {
+        return Err("pubkey_does_not_match_signer_address".to_string());
+    }
+    let sig_bytes =
+        hex::decode(&envelope.signature).map_err(|_| "signature_decode".to_string())?;
+    let parsed = Signature::from_slice(&sig_bytes)
+        .map_err(|_| "signature_format".to_string())?;
+    verifying_key
+        .verify_prehash(digest, &parsed)
+        .map_err(|_| "signature_verify_failed".to_string())?;
+    Ok(())
+}
+
+// ---------- Request/response types ----------
+
+#[derive(Debug, Deserialize)]
+struct RaiseDisputeRequest {
+    dispute: DisputeRaise,
+    agreement: AgreementObject,
+}
+
+#[derive(Debug, Serialize)]
+struct RaiseDisputeResponse {
+    agreement_hash: String,
+    anchor_txid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitDisputeEvidenceRequest {
+    evidence: DisputeEvidence,
+    agreement: AgreementObject,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitDisputeEvidenceResponse {
+    evidence_hash: String,
+    anchor_txid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveDisputeRequest {
+    resolution: DisputeResolution,
+    agreement: AgreementObject,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolveDisputeResponse {
+    anchor_txid: String,
+    outcome: String,
+    resolver_role: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterResolverRequest {
+    registration: ResolverRegistration,
+}
+
+#[derive(Debug, Serialize)]
+struct RegisterResolverResponse {
+    resolver_address: String,
+    anchor_txid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolversListQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolversListEntry {
+    resolver_address: String,
+    registered_at_height: u64,
+    display_name: Option<String>,
+    fee_bps_self_quoted: Option<u32>,
+    anchor_txid: Option<String>,
+    anchored_at_height: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolversListResponse {
+    resolvers: Vec<ResolversListEntry>,
+    next_cursor: Option<String>,
+}
+
+// ---------- Handlers ----------
+
+async fn raise_dispute(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<RaiseDisputeRequest>,
+) -> Result<Json<RaiseDisputeResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    req.dispute.validate().map_err(|e| bad(&e))?;
+    req.agreement.validate().map_err(|e| bad(&e))?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| bad("agreement_hash_failed"))?;
+    if agreement_hash != req.dispute.agreement_hash {
+        return Err(bad("dispute_agreement_hash_mismatch"));
+    }
+    let dispute_eligible = matches!(
+        req.agreement.template_type,
+        AgreementTemplateType::OtcSettlement
+            | AgreementTemplateType::MilestoneSettlement
+            | AgreementTemplateType::ContractorMilestone
+    );
+    if !dispute_eligible {
+        return Err(bad("dispute_template_not_eligible"));
+    }
+    let party = req
+        .agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == req.dispute.raising_party)
+        .ok_or_else(|| bad("raising_party_not_in_agreement"))?;
+    let digest =
+        dispute_raise_payload_hash(&req.dispute).map_err(|e| bad(&format!("payload_hash:{e}")))?;
+    verify_envelope_signature(&req.dispute.signature, &digest, &party.address)
+        .map_err(|e| bad(&format!("signature:{e}")))?;
+    {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = guard.get(&agreement_hash) {
+            if existing.is_open() {
+                return Err(bad("dispute_already_open"));
+            }
+        }
+    }
+    let anchor_txid =
+        build_and_broadcast_anchor_tx(&state, &agreement_hash, AgreementAnchorRole::DisputeRaise)
+            .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
+    let new_state = DisputeState {
+        raise: req.dispute.clone(),
+        raise_anchor_txid: Some(anchor_txid.clone()),
+        raise_anchored_at_height: None,
+        evidence: Vec::new(),
+        resolution: None,
+        resolution_anchor_txid: None,
+        resolution_anchored_at_height: None,
+        escalated_to_fallback: false,
+        escalated_at_height: None,
+    };
+    save_dispute_state(&new_state).map_err(|e| bad(&format!("persist:{e}")))?;
+    {
+        let mut guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(agreement_hash.clone(), new_state);
+    }
+    emit_event(
+        &state.event_tx,
+        "dispute.raised",
+        serde_json::json!({
+            "agreement_hash": agreement_hash,
+            "raising_party": req.dispute.raising_party,
+            "anchor_txid": anchor_txid,
+        }),
+    );
+    Ok(Json(RaiseDisputeResponse {
+        agreement_hash,
+        anchor_txid,
+    }))
+}
+
+async fn submit_dispute_evidence(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<SubmitDisputeEvidenceRequest>,
+) -> Result<Json<SubmitDisputeEvidenceResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    req.evidence.validate().map_err(|e| bad(&e))?;
+    req.agreement.validate().map_err(|e| bad(&e))?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| bad("agreement_hash_failed"))?;
+    if agreement_hash != req.evidence.agreement_hash {
+        return Err(bad("evidence_agreement_hash_mismatch"));
+    }
+    let party = req
+        .agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == req.evidence.submitter_party)
+        .ok_or_else(|| bad("submitter_party_not_in_agreement"))?;
+    let digest = dispute_evidence_payload_hash(&req.evidence)
+        .map_err(|e| bad(&format!("payload_hash:{e}")))?;
+    verify_envelope_signature(&req.evidence.signature, &digest, &party.address)
+        .map_err(|e| bad(&format!("signature:{e}")))?;
+    {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let d = guard.get(&agreement_hash).ok_or_else(|| bad("no_open_dispute"))?;
+        if !d.is_open() {
+            return Err(bad("dispute_already_resolved"));
+        }
+    }
+    let anchor_txid = build_and_broadcast_anchor_tx(
+        &state,
+        &agreement_hash,
+        AgreementAnchorRole::DisputeEvidence,
+    )
+    .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
+    let evidence_hash = req.evidence.evidence_hash.clone();
+    let evidence_record = DisputeEvidenceRecord {
+        evidence: req.evidence,
+        anchor_txid: Some(anchor_txid.clone()),
+        anchored_at_height: None,
+    };
+    let snapshot = {
+        let mut guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let d = guard.get_mut(&agreement_hash).ok_or_else(|| bad("no_open_dispute"))?;
+        d.evidence.push(evidence_record);
+        d.clone()
+    };
+    save_dispute_state(&snapshot).map_err(|e| bad(&format!("persist:{e}")))?;
+    emit_event(
+        &state.event_tx,
+        "dispute.evidence_submitted",
+        serde_json::json!({
+            "agreement_hash": agreement_hash,
+            "evidence_hash": evidence_hash,
+            "anchor_txid": anchor_txid,
+        }),
+    );
+    Ok(Json(SubmitDisputeEvidenceResponse {
+        evidence_hash,
+        anchor_txid,
+    }))
+}
+
+async fn resolve_dispute(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<ResolveDisputeRequest>,
+) -> Result<Json<ResolveDisputeResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    req.resolution.validate().map_err(|e| bad(&e))?;
+    req.agreement.validate().map_err(|e| bad(&e))?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| bad("agreement_hash_failed"))?;
+    if agreement_hash != req.resolution.agreement_hash {
+        return Err(bad("resolution_agreement_hash_mismatch"));
+    }
+    let role = req.resolution.resolver_role.as_str();
+    let expected_address = match role {
+        "primary" => req
+            .agreement
+            .primary_resolver
+            .clone()
+            .ok_or_else(|| bad("agreement_has_no_primary_resolver"))?,
+        "fallback" => req
+            .agreement
+            .fallback_resolver
+            .clone()
+            .ok_or_else(|| bad("agreement_has_no_fallback_resolver"))?,
+        _ => return Err(bad("invalid_resolver_role")),
+    };
+    if expected_address != req.resolution.resolver_address {
+        return Err(bad("resolver_address_mismatch"));
+    }
+    let digest = dispute_resolution_payload_hash(&req.resolution)
+        .map_err(|e| bad(&format!("payload_hash:{e}")))?;
+    verify_envelope_signature(&req.resolution.signature, &digest, &expected_address)
+        .map_err(|e| bad(&format!("signature:{e}")))?;
+    {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let d = guard
+            .get(&agreement_hash)
+            .ok_or_else(|| bad("no_open_dispute"))?;
+        if !d.is_open() {
+            return Err(bad("dispute_already_resolved"));
+        }
+        if role == "fallback" && !d.escalated_to_fallback {
+            return Err(bad("fallback_not_yet_escalated"));
+        }
+    }
+    let anchor_txid = build_and_broadcast_anchor_tx(
+        &state,
+        &agreement_hash,
+        AgreementAnchorRole::DisputeResolve,
+    )
+    .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
+    let outcome = req.resolution.outcome.clone();
+    let resolver_role = req.resolution.resolver_role.clone();
+    let snapshot = {
+        let mut guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let d = guard.get_mut(&agreement_hash).ok_or_else(|| bad("no_open_dispute"))?;
+        d.resolution = Some(req.resolution);
+        d.resolution_anchor_txid = Some(anchor_txid.clone());
+        d.clone()
+    };
+    save_dispute_state(&snapshot).map_err(|e| bad(&format!("persist:{e}")))?;
+    emit_event(
+        &state.event_tx,
+        "dispute.resolved",
+        serde_json::json!({
+            "agreement_hash": agreement_hash,
+            "outcome": outcome,
+            "resolver_role": resolver_role,
+            "anchor_txid": anchor_txid,
+        }),
+    );
+    Ok(Json(ResolveDisputeResponse {
+        anchor_txid,
+        outcome,
+        resolver_role,
+    }))
+}
+
+async fn register_resolver(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<RegisterResolverRequest>,
+) -> Result<Json<RegisterResolverResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    req.registration.validate().map_err(|e| bad(&e))?;
+    let digest = resolver_registration_payload_hash(&req.registration)
+        .map_err(|e| bad(&format!("payload_hash:{e}")))?;
+    verify_envelope_signature(
+        &req.registration.signature,
+        &digest,
+        &req.registration.resolver_address,
+    )
+    .map_err(|e| bad(&format!("signature:{e}")))?;
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        if !address_is_recent_miner(&chain, &req.registration.resolver_address) {
+            return Err(bad("resolver_not_recent_miner"));
+        }
+    }
+    let resolver_address = req.registration.resolver_address.clone();
+    let anchor_txid = build_and_broadcast_anchor_tx(
+        &state,
+        &resolver_address,
+        AgreementAnchorRole::ResolverRegister,
+    )
+    .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
+    let record = ResolverRegistrationRecord {
+        registration: req.registration,
+        anchor_txid: Some(anchor_txid.clone()),
+        anchored_at_height: None,
+    };
+    save_resolver_record(&record).map_err(|e| bad(&format!("persist:{e}")))?;
+    {
+        let mut guard = state.resolvers_index.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(resolver_address.clone(), record);
+    }
+    emit_event(
+        &state.event_tx,
+        "resolver.registered",
+        serde_json::json!({
+            "resolver_address": resolver_address,
+            "anchor_txid": anchor_txid,
+        }),
+    );
+    Ok(Json(RegisterResolverResponse {
+        resolver_address,
+        anchor_txid,
+    }))
+}
+
+async fn resolvers_list(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ResolversListQuery>,
+) -> Result<Json<ResolversListResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    let limit = query.limit.unwrap_or(50).min(500);
+    let resolvers: Vec<ResolverRegistrationRecord> = {
+        let guard = state.resolvers_index.lock().unwrap_or_else(|e| e.into_inner());
+        guard.values().cloned().collect()
+    };
+    let mut sorted = resolvers;
+    sorted.sort_by(|a, b| {
+        b.registration
+            .registered_at_height
+            .cmp(&a.registration.registered_at_height)
+            .then_with(|| {
+                a.registration
+                    .resolver_address
+                    .cmp(&b.registration.resolver_address)
+            })
+    });
+    let start = match query.cursor {
+        Some(cursor) => sorted
+            .iter()
+            .position(|r| r.registration.resolver_address == cursor)
+            .map(|i| i + 1)
+            .unwrap_or(0),
+        None => 0,
+    };
+    let page: Vec<&ResolverRegistrationRecord> = sorted.iter().skip(start).take(limit).collect();
+    let next_cursor = if start + page.len() < sorted.len() {
+        page.last()
+            .map(|r| r.registration.resolver_address.clone())
+    } else {
+        None
+    };
+    let entries: Vec<ResolversListEntry> = page
+        .iter()
+        .map(|r| ResolversListEntry {
+            resolver_address: r.registration.resolver_address.clone(),
+            registered_at_height: r.registration.registered_at_height,
+            display_name: r.registration.display_name.clone(),
+            fee_bps_self_quoted: r.registration.fee_bps_self_quoted,
+            anchor_txid: r.anchor_txid.clone(),
+            anchored_at_height: r.anchored_at_height,
+        })
+        .collect();
+    Ok(Json(ResolversListResponse {
+        resolvers: entries,
+        next_cursor,
+    }))
+}
+
+
+// Stage 3.2: scan newly-confirmed blocks for dispute/resolver anchor OP_RETURNs.
+fn scan_new_blocks_for_dispute_anchors(
+    chain_handle: &Arc<Mutex<ChainState>>,
+    disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    resolvers: &Arc<Mutex<std::collections::HashMap<String, ResolverRegistrationRecord>>>,
+    event_tx: &EventTx,
+    from_height_exclusive: u64,
+    to_height_inclusive: u64,
+) {
+    let snapshot: Vec<(u64, Vec<Transaction>)> = {
+        let g = chain_handle.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        let start = from_height_exclusive.saturating_add(1) as usize;
+        let end = (to_height_inclusive as usize).min(g.chain.len().saturating_sub(1));
+        if start > end {
+            return;
+        }
+        for h in start..=end {
+            if let Some(b) = g.chain.get(h) {
+                out.push((h as u64, b.transactions.clone()));
+            }
+        }
+        out
+    };
+    for (height, txs) in snapshot {
+        for tx in &txs {
+            let txid_hex = hex::encode(tx.txid());
+            for out in &tx.outputs {
+                let Some(anchor) = parse_agreement_anchor(&out.script_pubkey) else {
+                    continue;
+                };
+                match anchor.role {
+                    AgreementAnchorRole::DisputeRaise => {
+                        let mut snapshot_to_persist: Option<DisputeState> = None;
+                        {
+                            let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(d) = guard.get_mut(&anchor.agreement_hash) {
+                                if d.raise_anchored_at_height.is_none() {
+                                    d.raise_anchored_at_height = Some(height);
+                                    d.raise_anchor_txid = Some(txid_hex.clone());
+                                    snapshot_to_persist = Some(d.clone());
+                                }
+                            }
+                        }
+                        if let Some(snap) = snapshot_to_persist {
+                            let _ = save_dispute_state(&snap);
+                            emit_event(
+                                event_tx,
+                                "dispute.raise_anchored",
+                                serde_json::json!({
+                                    "agreement_hash": anchor.agreement_hash,
+                                    "anchor_txid": txid_hex,
+                                    "anchored_at_height": height,
+                                }),
+                            );
+                        }
+                    }
+                    AgreementAnchorRole::DisputeEvidence => {
+                        let mut snapshot_to_persist: Option<DisputeState> = None;
+                        {
+                            let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(d) = guard.get_mut(&anchor.agreement_hash) {
+                                for rec in d.evidence.iter_mut() {
+                                    if rec.anchor_txid.as_deref() == Some(&txid_hex)
+                                        && rec.anchored_at_height.is_none()
+                                    {
+                                        rec.anchored_at_height = Some(height);
+                                        snapshot_to_persist = Some(d.clone());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(snap) = snapshot_to_persist {
+                            let _ = save_dispute_state(&snap);
+                        }
+                    }
+                    AgreementAnchorRole::DisputeResolve => {
+                        let mut snapshot_to_persist: Option<DisputeState> = None;
+                        {
+                            let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(d) = guard.get_mut(&anchor.agreement_hash) {
+                                if d.resolution_anchored_at_height.is_none() {
+                                    d.resolution_anchored_at_height = Some(height);
+                                    d.resolution_anchor_txid = Some(txid_hex.clone());
+                                    snapshot_to_persist = Some(d.clone());
+                                }
+                            }
+                        }
+                        if let Some(snap) = snapshot_to_persist {
+                            let _ = save_dispute_state(&snap);
+                            emit_event(
+                                event_tx,
+                                "dispute.resolve_anchored",
+                                serde_json::json!({
+                                    "agreement_hash": anchor.agreement_hash,
+                                    "anchor_txid": txid_hex,
+                                    "anchored_at_height": height,
+                                }),
+                            );
+                        }
+                    }
+                    AgreementAnchorRole::ResolverRegister => {
+                        let mut snapshot_to_persist: Option<ResolverRegistrationRecord> = None;
+                        {
+                            let mut guard = resolvers.lock().unwrap_or_else(|e| e.into_inner());
+                            for rec in guard.values_mut() {
+                                if rec.anchor_txid.as_deref() == Some(&txid_hex)
+                                    && rec.anchored_at_height.is_none()
+                                {
+                                    rec.anchored_at_height = Some(height);
+                                    snapshot_to_persist = Some(rec.clone());
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(snap) = snapshot_to_persist {
+                            let _ = save_resolver_record(&snap);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+// Stage 3.2: per-tick escalation check.
+fn escalation_tick(
+    disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    event_tx: &EventTx,
+    tip_height: u64,
+) {
+    let mut to_escalate: Vec<String> = Vec::new();
+    {
+        let guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+        for (hash, d) in guard.iter() {
+            if d.is_open()
+                && !d.escalated_to_fallback
+                && d.raise_anchored_at_height
+                    .map(|h| tip_height >= h.saturating_add(DISPUTE_RESOLVER_RESPONSE_WINDOW))
+                    .unwrap_or(false)
+            {
+                to_escalate.push(hash.clone());
+            }
+        }
+    }
+    for hash in to_escalate {
+        let snapshot = {
+            let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(d) = guard.get_mut(&hash) {
+                d.escalated_to_fallback = true;
+                d.escalated_at_height = Some(tip_height);
+                Some(d.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(snap) = snapshot {
+            let _ = save_dispute_state(&snap);
+            emit_event(
+                event_tx,
+                "dispute.escalated",
+                serde_json::json!({
+                    "agreement_hash": hash,
+                    "escalated_at_height": tip_height,
+                }),
+            );
+        }
     }
 }
