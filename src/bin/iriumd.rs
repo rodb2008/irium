@@ -4027,7 +4027,7 @@ fn evaluate_agreement_spend_eligibility(
             Some(secret_hex) => {
                 let preimage = hex::decode(secret_hex.trim())
                     .map_err(|_| "secret_hex_invalid_hex".to_string())?;
-                let digest = sha256d(&preimage)[..32].to_vec();
+                let digest = Sha256::digest(&preimage);
                 if hex::encode(digest) != leg.expected_hash {
                     reasons.push("secret_hash_mismatch".to_string());
                 }
@@ -10138,7 +10138,7 @@ mod tests {
             },
             release_conditions: vec![AgreementReleaseCondition {
                 mode: "secret_preimage".to_string(),
-                secret_hash_hex: Some(hex::encode(sha256d(&s1))),
+                secret_hash_hex: Some(hex::encode(Sha256::digest(&s1))),
                 release_authorizer: Some("payer".to_string()),
                 notes: None,
             }],
@@ -10154,7 +10154,7 @@ mod tests {
                     amount: 300_000_000,
                     recipient_address: payee_address.to_string(),
                     refund_address: payer_address.to_string(),
-                    secret_hash_hex: hex::encode(sha256d(&s1)),
+                    secret_hash_hex: hex::encode(Sha256::digest(&s1)),
                     timeout_height,
                     metadata_hash: None,
                 },
@@ -10164,7 +10164,7 @@ mod tests {
                     amount: 400_000_000,
                     recipient_address: payee_address.to_string(),
                     refund_address: payer_address.to_string(),
-                    secret_hash_hex: hex::encode(sha256d(&s2)),
+                    secret_hash_hex: hex::encode(Sha256::digest(&s2)),
                     timeout_height: timeout_height + 5,
                     metadata_hash: None,
                 },
@@ -10385,7 +10385,7 @@ mod tests {
         };
         confirm_tx_for_agreement_scan(&state, &plain_tx);
         let agreement =
-            sample_agreement_for_test(&sender, &recipient, hex::encode(sha256d(b"x")), 120);
+            sample_agreement_for_test(&sender, &recipient, hex::encode(Sha256::digest(b"x")), 120);
         let res = agreement_release_eligibility(
             ConnectInfo(test_socket()),
             State(state),
