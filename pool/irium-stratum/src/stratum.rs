@@ -1200,6 +1200,21 @@ fn to_job(seq: u64, tpl: &GetBlockTemplate) -> Result<Job> {
     })
 }
 
+struct ActiveSessionGuard;
+
+impl ActiveSessionGuard {
+    fn new() -> Self {
+        ACTIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ActiveSessionGuard {
+    fn drop(&mut self) {
+        ACTIVE_SESSIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 async fn handle_conn(
     id: u64,
     stream: TcpStream,
@@ -1207,7 +1222,7 @@ async fn handle_conn(
     rx: &mut broadcast::Receiver<Job>,
     current: Arc<RwLock<Option<Job>>>,
 ) -> Result<()> {
-    ACTIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
+    let _session_guard = ActiveSessionGuard::new();
 
     let extranonce1 = id.to_be_bytes()[8 - config.extranonce1_size..].to_vec();
     let mut session = SessionState {
@@ -1267,7 +1282,6 @@ async fn handle_conn(
         }
     };
 
-    ACTIVE_SESSIONS.fetch_sub(1, Ordering::SeqCst);
     result
 }
 
