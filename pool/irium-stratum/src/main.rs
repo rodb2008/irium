@@ -120,6 +120,32 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok());
 
+    // v1.9.23 — connection-gate knobs. All optional; passing 0 disables
+    // the corresponding limiter so operators can soft-launch on a per-pool
+    // basis. The /etc/irium-pool/stratum*.env files are expected to set
+    // these for the production deployment (the legacy CPU/GPU pool gets a
+    // tighter cap than the ASIC pool by convention).
+    let max_sessions = env::var("IRIUM_STRATUM_MAX_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1000);
+    let max_conn_per_ip = env::var("IRIUM_STRATUM_MAX_CONN_PER_IP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(10);
+    let conn_window_secs = env::var("IRIUM_STRATUM_CONN_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
+    let ban_threshold = env::var("IRIUM_STRATUM_BAN_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(5);
+    let ban_duration_secs = env::var("IRIUM_STRATUM_BAN_DURATION_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(3600);
+
     if default_diff_raw < 1.0 {
         warn!(
             "[config] STRATUM_DEFAULT_DIFF={} below diff1; clamped to 1",
@@ -165,6 +191,11 @@ async fn main() -> Result<()> {
         found_blocks_file,
         keepalive_notify_secs,
         auxpow_activation_height,
+        max_sessions,
+        max_conn_per_ip,
+        conn_window_secs,
+        ban_threshold,
+        ban_duration_secs,
     };
 
     run(cfg).await
