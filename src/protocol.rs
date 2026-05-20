@@ -15,6 +15,13 @@ pub const MAX_BLOCKS_PER_REQUEST: u32 = 512;
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
+    /// Forward-compat sentinel for message-type bytes the local build does
+    /// not know about. Receivers replace the unknown byte with this variant
+    /// during `Message::deserialize` so the read loop can silently drop the
+    /// message instead of disconnecting the peer. This is what makes adding
+    /// new MessageType variants (e.g., OfferTakeNotification = 20) safe to
+    /// roll out across a mixed-version network.
+    Unknown = 0,
     Handshake = 1,
     Ping = 2,
     Pong = 3,
@@ -43,6 +50,7 @@ impl TryFrom<u8> for MessageType {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         use MessageType::*;
         let mt = match value {
+            0 => Unknown,
             1 => Handshake,
             2 => Ping,
             3 => Pong,
@@ -106,7 +114,15 @@ impl Message {
             return Err("Incomplete message".to_string());
         }
         let payload = data[6..6 + length as usize].to_vec();
-        let msg_type = MessageType::try_from(msg_type_byte)?;
+        // Forward-compat: an unknown msg_type byte is mapped to
+        // MessageType::Unknown rather than propagating an error up to the
+        // read loop (where it would close the peer connection). All
+        // receive-side match blocks have a `_ => {}` catch-all, so an
+        // Unknown message is silently dropped while the peer stays
+        // connected. Lets newer peers introduce additional MessageType
+        // variants without forcing a coordinated upgrade.
+        let msg_type = MessageType::try_from(msg_type_byte)
+            .unwrap_or(MessageType::Unknown);
         Ok(Message { msg_type, payload })
     }
 }
