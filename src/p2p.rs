@@ -2494,6 +2494,10 @@ pub struct P2PNode {
     /// Mirrors proof_gossip_inbox. Drained by an iriumd background task
     /// that mutates the local matching offer file from "open" to "taken".
     offer_take_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_raised_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_evidence_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_resolved_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_escalated_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     node_id: Vec<u8>,
     trusted_seed_ips: Arc<HashSet<IpAddr>>,
 
@@ -3015,6 +3019,10 @@ impl P2PNode {
     ) -> Self {
         let proof_gossip_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let offer_take_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let dispute_raised_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let dispute_evidence_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let dispute_resolved_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let dispute_escalated_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         P2PNode {
             bind_addr,
             peers: Arc::new(Mutex::new(Vec::new())),
@@ -3043,6 +3051,10 @@ impl P2PNode {
             external_endpoint,
             proof_gossip_inbox,
             offer_take_inbox,
+            dispute_raised_inbox,
+            dispute_evidence_inbox,
+            dispute_resolved_inbox,
+            dispute_escalated_inbox,
             node_id: Self::load_or_create_node_id(),
             trusted_seed_ips: Self::load_trusted_seed_ips(),
             banned_ips: Self::load_banned_ips(),
@@ -3070,6 +3082,10 @@ impl P2PNode {
         let external_endpoint = self.external_endpoint.clone();
         let proof_gossip_inbox = self.proof_gossip_inbox.clone();
         let offer_take_inbox = self.offer_take_inbox.clone();
+        let dispute_raised_inbox = self.dispute_raised_inbox.clone();
+        let dispute_evidence_inbox = self.dispute_evidence_inbox.clone();
+        let dispute_resolved_inbox = self.dispute_resolved_inbox.clone();
+        let dispute_escalated_inbox = self.dispute_escalated_inbox.clone();
         let accept_log = self.accept_log.clone();
         let sync_requests = self.sync_requests.clone();
         let block_requests = self.block_requests.clone();
@@ -3191,6 +3207,10 @@ impl P2PNode {
                         let external_endpoint_peer = external_endpoint.clone();
                         let proof_gossip_inbox_peer = proof_gossip_inbox.clone();
                         let offer_take_inbox_peer = offer_take_inbox.clone();
+                        let dispute_raised_inbox_peer = dispute_raised_inbox.clone();
+                        let dispute_evidence_inbox_peer = dispute_evidence_inbox.clone();
+                        let dispute_resolved_inbox_peer = dispute_resolved_inbox.clone();
+                        let dispute_escalated_inbox_peer = dispute_escalated_inbox.clone();
                         let node_id_peer = node_id.clone();
                         let self_ip_peer = self_ips.clone();
                         let sync_peer = sync_requests.clone();
@@ -3226,6 +3246,10 @@ impl P2PNode {
                                 external_endpoint_peer,
                                 proof_gossip_inbox_peer,
                                 offer_take_inbox_peer,
+                                dispute_raised_inbox_peer,
+                                dispute_evidence_inbox_peer,
+                                dispute_resolved_inbox_peer,
+                                dispute_escalated_inbox_peer,
                                 node_id_peer,
                                 trusted,
                             )
@@ -3901,6 +3925,66 @@ impl P2PNode {
         std::mem::take(&mut *inbox)
     }
 
+    /// Broadcast a DisputeRaise (JSON) to every connected peer.
+    pub async fn broadcast_dispute_raised(&self, json: &str) {
+        let payload = crate::protocol::DisputeRaisedNotificationPayload {
+            json: json.as_bytes().to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
+    /// Broadcast a DisputeEvidence (JSON) to every connected peer.
+    pub async fn broadcast_dispute_evidence(&self, json: &str) {
+        let payload = crate::protocol::DisputeEvidenceNotificationPayload {
+            json: json.as_bytes().to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
+    /// Broadcast a DisputeResolution (JSON) to every connected peer.
+    pub async fn broadcast_dispute_resolved(&self, json: &str) {
+        let payload = crate::protocol::DisputeResolvedNotificationPayload {
+            json: json.as_bytes().to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
+    /// Broadcast a dispute escalation announcement (JSON) to every peer.
+    pub async fn broadcast_dispute_escalated(&self, json: &str) {
+        let payload = crate::protocol::DisputeEscalatedNotificationPayload {
+            json: json.as_bytes().to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
+    /// Drain incoming DisputeRaise JSON strings since last call.
+    pub async fn drain_dispute_raised_notifications(&self) -> Vec<String> {
+        let mut inbox = self.dispute_raised_inbox.lock().await;
+        std::mem::take(&mut *inbox)
+    }
+
+    /// Drain incoming DisputeEvidence JSON strings since last call.
+    pub async fn drain_dispute_evidence_notifications(&self) -> Vec<String> {
+        let mut inbox = self.dispute_evidence_inbox.lock().await;
+        std::mem::take(&mut *inbox)
+    }
+
+    /// Drain incoming DisputeResolution JSON strings since last call.
+    pub async fn drain_dispute_resolved_notifications(&self) -> Vec<String> {
+        let mut inbox = self.dispute_resolved_inbox.lock().await;
+        std::mem::take(&mut *inbox)
+    }
+
+    /// Drain incoming dispute-escalated JSON announcements since last call.
+    pub async fn drain_dispute_escalated_notifications(&self) -> Vec<String> {
+        let mut inbox = self.dispute_escalated_inbox.lock().await;
+        std::mem::take(&mut *inbox)
+    }
+
     /// Establish an outbound connection to a peer and send a handshake
     /// message describing this node's view of the chain.
     ///
@@ -4335,6 +4419,10 @@ impl P2PNode {
         let _marketplace_feed_url = self.marketplace_feed.clone();
         let proof_gossip_inbox_outbound = self.proof_gossip_inbox.clone();
         let offer_take_inbox_outbound = self.offer_take_inbox.clone();
+        let dispute_raised_inbox_outbound = self.dispute_raised_inbox.clone();
+        let dispute_evidence_inbox_outbound = self.dispute_evidence_inbox.clone();
+        let dispute_resolved_inbox_outbound = self.dispute_resolved_inbox.clone();
+        let dispute_escalated_inbox_outbound = self.dispute_escalated_inbox.clone();
         let chain_for_sync = self.chain.clone();
         let mempool_for_sync = self.mempool.clone();
         let reputation = self.reputation.clone();
@@ -4405,7 +4493,12 @@ impl P2PNode {
                         | MessageType::Block
                         | MessageType::UptimeChallenge
                         | MessageType::UptimeProof
-                        | MessageType::ProofGossip => {}
+                        | MessageType::ProofGossip
+                        | MessageType::OfferTakeNotification
+                        | MessageType::DisputeRaisedNotification
+                        | MessageType::DisputeEvidenceNotification
+                        | MessageType::DisputeResolvedNotification
+                        | MessageType::DisputeEscalatedNotification => {}
                         _ => {
                             P2PNode::log_event(
                                 "info",
@@ -5985,6 +6078,38 @@ impl P2PNode {
                             }
                         }
                     }
+                    MessageType::DisputeRaisedNotification => {
+                        if let Ok(p) = crate::protocol::DisputeRaisedNotificationPayload::from_message(&msg) {
+                            if let Ok(json) = String::from_utf8(p.json) {
+                                let mut inbox = dispute_raised_inbox_outbound.lock().await;
+                                inbox.push(json);
+                            }
+                        }
+                    }
+                    MessageType::DisputeEvidenceNotification => {
+                        if let Ok(p) = crate::protocol::DisputeEvidenceNotificationPayload::from_message(&msg) {
+                            if let Ok(json) = String::from_utf8(p.json) {
+                                let mut inbox = dispute_evidence_inbox_outbound.lock().await;
+                                inbox.push(json);
+                            }
+                        }
+                    }
+                    MessageType::DisputeResolvedNotification => {
+                        if let Ok(p) = crate::protocol::DisputeResolvedNotificationPayload::from_message(&msg) {
+                            if let Ok(json) = String::from_utf8(p.json) {
+                                let mut inbox = dispute_resolved_inbox_outbound.lock().await;
+                                inbox.push(json);
+                            }
+                        }
+                    }
+                    MessageType::DisputeEscalatedNotification => {
+                        if let Ok(p) = crate::protocol::DisputeEscalatedNotificationPayload::from_message(&msg) {
+                            if let Ok(json) = String::from_utf8(p.json) {
+                                let mut inbox = dispute_escalated_inbox_outbound.lock().await;
+                                inbox.push(json);
+                            }
+                        }
+                    }
                     MessageType::Disconnect => break,
                     _ => {}
                 }
@@ -6192,6 +6317,10 @@ async fn handle_incoming_with_sybil(
     external_endpoint: Option<String>,
     proof_gossip_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     offer_take_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_raised_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_evidence_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_resolved_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_escalated_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     node_id: Vec<u8>,
     trusted_seed: bool,
 ) -> Result<(), String> {
@@ -8006,6 +8135,38 @@ async fn handle_incoming_with_sybil(
                 if let Ok(otn) = crate::protocol::OfferTakeNotificationPayload::from_message(&msg) {
                     if let Ok(json) = String::from_utf8(otn.take_json) {
                         let mut inbox = offer_take_inbox.lock().await;
+                        inbox.push(json);
+                    }
+                }
+            }
+            MessageType::DisputeRaisedNotification => {
+                if let Ok(p) = crate::protocol::DisputeRaisedNotificationPayload::from_message(&msg) {
+                    if let Ok(json) = String::from_utf8(p.json) {
+                        let mut inbox = dispute_raised_inbox.lock().await;
+                        inbox.push(json);
+                    }
+                }
+            }
+            MessageType::DisputeEvidenceNotification => {
+                if let Ok(p) = crate::protocol::DisputeEvidenceNotificationPayload::from_message(&msg) {
+                    if let Ok(json) = String::from_utf8(p.json) {
+                        let mut inbox = dispute_evidence_inbox.lock().await;
+                        inbox.push(json);
+                    }
+                }
+            }
+            MessageType::DisputeResolvedNotification => {
+                if let Ok(p) = crate::protocol::DisputeResolvedNotificationPayload::from_message(&msg) {
+                    if let Ok(json) = String::from_utf8(p.json) {
+                        let mut inbox = dispute_resolved_inbox.lock().await;
+                        inbox.push(json);
+                    }
+                }
+            }
+            MessageType::DisputeEscalatedNotification => {
+                if let Ok(p) = crate::protocol::DisputeEscalatedNotificationPayload::from_message(&msg) {
+                    if let Ok(json) = String::from_utf8(p.json) {
+                        let mut inbox = dispute_escalated_inbox.lock().await;
                         inbox.push(json);
                     }
                 }

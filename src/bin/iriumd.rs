@@ -17411,6 +17411,14 @@ async fn raise_dispute(
             "anchor_txid": anchor_txid,
         }),
     );
+    if let Some(ref node) = state.p2p {
+        if let Ok(json) = serde_json::to_string(&req.dispute) {
+            let node = node.clone();
+            tokio::spawn(async move {
+                node.broadcast_dispute_raised(&json).await;
+            });
+        }
+    }
     Ok(Json(RaiseDisputeResponse {
         agreement_hash,
         anchor_txid,
@@ -17480,6 +17488,22 @@ async fn submit_dispute_evidence(
             "anchor_txid": anchor_txid,
         }),
     );
+    if let Some(ref node) = state.p2p {
+        let evidence_clone = {
+            let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .get(&agreement_hash)
+                .and_then(|d| d.evidence.last().map(|r| r.evidence.clone()))
+        };
+        if let Some(ev) = evidence_clone {
+            if let Ok(json) = serde_json::to_string(&ev) {
+                let node = node.clone();
+                tokio::spawn(async move {
+                    node.broadcast_dispute_evidence(&json).await;
+                });
+            }
+        }
+    }
     Ok(Json(SubmitDisputeEvidenceResponse {
         evidence_hash,
         anchor_txid,
@@ -17563,6 +17587,16 @@ async fn resolve_dispute(
             "anchor_txid": anchor_txid,
         }),
     );
+    if let Some(ref node) = state.p2p {
+        if let Some(resolution_clone) = snapshot.resolution.clone() {
+            if let Ok(json) = serde_json::to_string(&resolution_clone) {
+                let node = node.clone();
+                tokio::spawn(async move {
+                    node.broadcast_dispute_resolved(&json).await;
+                });
+            }
+        }
+    }
     Ok(Json(ResolveDisputeResponse {
         anchor_txid,
         outcome,

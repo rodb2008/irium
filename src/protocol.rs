@@ -56,6 +56,10 @@ pub enum MessageType {
     /// iteration so a third party can't spoof-take an offer to grief
     /// the seller.
     OfferTakeNotification = 20,
+    DisputeRaisedNotification = 21,
+    DisputeEvidenceNotification = 22,
+    DisputeResolvedNotification = 23,
+    DisputeEscalatedNotification = 24,
     Disconnect = 99,
 }
 
@@ -86,6 +90,10 @@ impl TryFrom<u8> for MessageType {
             18 => UptimeProof,
             19 => ProofGossip,
             20 => OfferTakeNotification,
+            21 => DisputeRaisedNotification,
+            22 => DisputeEvidenceNotification,
+            23 => DisputeResolvedNotification,
+            24 => DisputeEscalatedNotification,
             99 => Disconnect,
             other => return Err(format!("Unknown message type: {}", other)),
         };
@@ -659,5 +667,99 @@ impl DisconnectPayload {
         }
         let reason = String::from_utf8(msg.payload.clone()).map_err(|e| e.to_string())?;
         Ok(DisconnectPayload { reason })
+    }
+}
+
+
+/// Gossip payload for a raised dispute. Raw JSON bytes of a DisputeRaise.
+pub struct DisputeRaisedNotificationPayload {
+    pub json: Vec<u8>,
+}
+
+impl DisputeRaisedNotificationPayload {
+    pub fn to_message(&self) -> Message {
+        Message {
+            msg_type: MessageType::DisputeRaisedNotification,
+            payload: self.json.clone(),
+        }
+    }
+
+    pub fn from_message(msg: &Message) -> Result<Self, String> {
+        if msg.msg_type != MessageType::DisputeRaisedNotification {
+            return Err("Not a dispute raised notification".to_string());
+        }
+        Ok(DisputeRaisedNotificationPayload {
+            json: msg.payload.clone(),
+        })
+    }
+}
+
+/// Gossip payload for a submitted dispute evidence. Raw JSON bytes of a DisputeEvidence.
+pub struct DisputeEvidenceNotificationPayload {
+    pub json: Vec<u8>,
+}
+
+impl DisputeEvidenceNotificationPayload {
+    pub fn to_message(&self) -> Message {
+        Message {
+            msg_type: MessageType::DisputeEvidenceNotification,
+            payload: self.json.clone(),
+        }
+    }
+
+    pub fn from_message(msg: &Message) -> Result<Self, String> {
+        if msg.msg_type != MessageType::DisputeEvidenceNotification {
+            return Err("Not a dispute evidence notification".to_string());
+        }
+        Ok(DisputeEvidenceNotificationPayload {
+            json: msg.payload.clone(),
+        })
+    }
+}
+
+/// Gossip payload for a resolved dispute. Raw JSON bytes of a DisputeResolution.
+pub struct DisputeResolvedNotificationPayload {
+    pub json: Vec<u8>,
+}
+
+impl DisputeResolvedNotificationPayload {
+    pub fn to_message(&self) -> Message {
+        Message {
+            msg_type: MessageType::DisputeResolvedNotification,
+            payload: self.json.clone(),
+        }
+    }
+
+    pub fn from_message(msg: &Message) -> Result<Self, String> {
+        if msg.msg_type != MessageType::DisputeResolvedNotification {
+            return Err("Not a dispute resolved notification".to_string());
+        }
+        Ok(DisputeResolvedNotificationPayload {
+            json: msg.payload.clone(),
+        })
+    }
+}
+
+/// Gossip payload announcing an automatic escalation of a dispute to its
+/// fallback resolver. JSON shape: {"agreement_hash": "...", "escalated_at_height": N}
+pub struct DisputeEscalatedNotificationPayload {
+    pub json: Vec<u8>,
+}
+
+impl DisputeEscalatedNotificationPayload {
+    pub fn to_message(&self) -> Message {
+        Message {
+            msg_type: MessageType::DisputeEscalatedNotification,
+            payload: self.json.clone(),
+        }
+    }
+
+    pub fn from_message(msg: &Message) -> Result<Self, String> {
+        if msg.msg_type != MessageType::DisputeEscalatedNotification {
+            return Err("Not a dispute escalated notification".to_string());
+        }
+        Ok(DisputeEscalatedNotificationPayload {
+            json: msg.payload.clone(),
+        })
     }
 }
