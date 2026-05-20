@@ -1842,16 +1842,16 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1 << 22); // 4 194 304 nonces per dispatch
 
-    // OS-aware soft cap. macOS imposes a tight GPU watchdog (~250 ms on
-    // Apple Silicon) that silently kills overruns; 1M nonces keeps a
-    // typical batch well under that ceiling. Linux/Windows are far more
-    // permissive — the 4M default holds. Operators can still raise the
-    // env var manually; the cap is on the EFFECTIVE batch_size passed to
-    // the kernel, not on what the env var says.
-    #[cfg(target_os = "macos")]
-    let max_safe_batch: usize = 1 << 20; // 1 048 576 — ~100 ms on Apple Silicon
-    #[cfg(not(target_os = "macos"))]
-    let max_safe_batch: usize = 1 << 22; // 4 194 304 — default ceiling
+    // Universal soft cap. The earlier macOS-specific 1<<20 cap was removed
+    // (v1.9.24) per advanced-user request — Mac operators were trading too
+    // much hashrate for watchdog safety. The Layer-A stall detection in
+    // mine_batch (SUSPICIOUS_BATCH_LIMIT = 10 consecutive sub-5ms batches)
+    // still catches macOS GPU watchdog kills and surfaces them as a clean
+    // "GPU stall" error, so over-budget Mac kernels fail fast and visibly
+    // rather than silently zero-sharing. Operators on any OS can still
+    // raise IRIUM_GPU_BATCH manually; the cap below is on the EFFECTIVE
+    // batch_size passed to the kernel, not on what the env var says.
+    let max_safe_batch: usize = 1 << 22; // 4 194 304 — universal ceiling
 
     let batch_size = requested_batch_size.min(max_safe_batch);
 
