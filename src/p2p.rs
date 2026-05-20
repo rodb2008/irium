@@ -2490,6 +2490,10 @@ pub struct P2PNode {
     marketplace_feed: Option<String>,
     external_endpoint: Option<String>,
     proof_gossip_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Inbox for incoming MessageType::OfferTakeNotification payloads.
+    /// Mirrors proof_gossip_inbox. Drained by an iriumd background task
+    /// that mutates the local matching offer file from "open" to "taken".
+    offer_take_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     node_id: Vec<u8>,
     trusted_seed_ips: Arc<HashSet<IpAddr>>,
 
@@ -3010,6 +3014,7 @@ impl P2PNode {
         external_endpoint: Option<String>,
     ) -> Self {
         let proof_gossip_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let offer_take_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         P2PNode {
             bind_addr,
             peers: Arc::new(Mutex::new(Vec::new())),
@@ -3037,6 +3042,7 @@ impl P2PNode {
             marketplace_feed,
             external_endpoint,
             proof_gossip_inbox,
+            offer_take_inbox,
             node_id: Self::load_or_create_node_id(),
             trusted_seed_ips: Self::load_trusted_seed_ips(),
             banned_ips: Self::load_banned_ips(),
@@ -3063,6 +3069,7 @@ impl P2PNode {
         let marketplace_feed = self.marketplace_feed.clone();
         let external_endpoint = self.external_endpoint.clone();
         let proof_gossip_inbox = self.proof_gossip_inbox.clone();
+        let offer_take_inbox = self.offer_take_inbox.clone();
         let accept_log = self.accept_log.clone();
         let sync_requests = self.sync_requests.clone();
         let block_requests = self.block_requests.clone();
@@ -3183,6 +3190,7 @@ impl P2PNode {
                         let marketplace_feed_peer = marketplace_feed.clone();
                         let external_endpoint_peer = external_endpoint.clone();
                         let proof_gossip_inbox_peer = proof_gossip_inbox.clone();
+                        let offer_take_inbox_peer = offer_take_inbox.clone();
                         let node_id_peer = node_id.clone();
                         let self_ip_peer = self_ips.clone();
                         let sync_peer = sync_requests.clone();
@@ -3217,6 +3225,7 @@ impl P2PNode {
                                 marketplace_feed_peer,
                                 external_endpoint_peer,
                                 proof_gossip_inbox_peer,
+                                offer_take_inbox_peer,
                                 node_id_peer,
                                 trusted,
                             )
@@ -3859,9 +3868,36 @@ impl P2PNode {
         let _ = broadcast_raw(&self.peers, &serialized).await;
     }
 
+    /// Broadcast an offer-take notification to every connected peer. The
+    /// seller's iriumd (if it's among our peers) parses the JSON, matches
+    /// the offer_id+seller_pubkey against its own ~/.irium/offers/ files,
+    /// and mutates status from "open" to "taken". All other peers ignore
+    /// the message because no offer file matches.
+    ///
+    /// Best-effort: no acknowledgement is expected from the seller. If the
+    /// notification is lost, the seller's relisting watchdog (the 5 s
+    /// offer-watcher background task in iriumd) catches the un-funded
+    /// taken-state after IRIUM_OFFER_RELIST_GRACE_BLOCKS and resets the
+    /// offer to "open" automatically.
+    pub async fn broadcast_offer_take(&self, take_json: &str) {
+        let payload = crate::protocol::OfferTakeNotificationPayload {
+            take_json: take_json.as_bytes().to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
     /// Drain all proof JSON strings received via P2P gossip since last call.
     pub async fn drain_proof_gossip(&self) -> Vec<String> {
         let mut inbox = self.proof_gossip_inbox.lock().await;
+        std::mem::take(&mut *inbox)
+    }
+
+    /// Drain all offer-take notification JSON strings received via P2P
+    /// since the last call. iriumd's offer-take drain task polls this on
+    /// a 2 s cadence and processes each one (see process_received_offer_take).
+    pub async fn drain_offer_take_notifications(&self) -> Vec<String> {
+        let mut inbox = self.offer_take_inbox.lock().await;
         std::mem::take(&mut *inbox)
     }
 
@@ -4298,6 +4334,7 @@ impl P2PNode {
         let relay_addr = self.relay_address.clone();
         let _marketplace_feed_url = self.marketplace_feed.clone();
         let proof_gossip_inbox_outbound = self.proof_gossip_inbox.clone();
+        let offer_take_inbox_outbound = self.offer_take_inbox.clone();
         let chain_for_sync = self.chain.clone();
         let mempool_for_sync = self.mempool.clone();
         let reputation = self.reputation.clone();
@@ -5940,6 +5977,14 @@ impl P2PNode {
                             }
                         }
                     }
+                    MessageType::OfferTakeNotification => {
+                        if let Ok(otn) = crate::protocol::OfferTakeNotificationPayload::from_message(&msg) {
+                            if let Ok(json) = String::from_utf8(otn.take_json) {
+                                let mut inbox = offer_take_inbox_outbound.lock().await;
+                                inbox.push(json);
+                            }
+                        }
+                    }
                     MessageType::Disconnect => break,
                     _ => {}
                 }
@@ -6146,6 +6191,7 @@ async fn handle_incoming_with_sybil(
     marketplace_feed_url: Option<String>,
     external_endpoint: Option<String>,
     proof_gossip_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    offer_take_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     node_id: Vec<u8>,
     trusted_seed: bool,
 ) -> Result<(), String> {
@@ -7952,6 +7998,14 @@ async fn handle_incoming_with_sybil(
                 if let Ok(pg) = crate::protocol::ProofGossipPayload::from_message(&msg) {
                     if let Ok(json) = String::from_utf8(pg.proof_json) {
                         let mut inbox = proof_gossip_inbox.lock().await;
+                        inbox.push(json);
+                    }
+                }
+            }
+            MessageType::OfferTakeNotification => {
+                if let Ok(otn) = crate::protocol::OfferTakeNotificationPayload::from_message(&msg) {
+                    if let Ok(json) = String::from_utf8(otn.take_json) {
+                        let mut inbox = offer_take_inbox.lock().await;
                         inbox.push(json);
                     }
                 }

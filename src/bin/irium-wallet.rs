@@ -7346,6 +7346,13 @@ struct IrmOffer {
     buyer_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     taken_at: Option<u64>,
+    /// Chain tip height observed at offer-take time. Used by the seller's
+    /// iriumd watcher to decide when to relist an un-funded taken offer
+    /// (LAYER 3). Optional + Option because pre-v1.9.24 offers lack the
+    /// field; the watcher skips relist for those rather than relisting
+    /// blindly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    taken_at_height: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7540,6 +7547,7 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
         agreement_hash: None,
         buyer_address: None,
         taken_at: None,
+        taken_at_height: None,
         source: Some("local".to_string()),
         seller_pubkey,
     };
@@ -7919,6 +7927,57 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
         ));
     }
 
+    // LAYER 5: double-take protection for remote offers. Re-fetch the
+    // seller's live /offers/feed and verify the offer is still "open"
+    // there before mutating local state. Prevents two buyers from each
+    // succeeding at offer-take against a stale-cached version of the same
+    // offer. Local offers ("source": None or "source": "local") skip this
+    // check — they're authoritative.
+    if let Some(ref src) = offer.source {
+        if let Some(feed_url) = src.strip_prefix("remote:") {
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+            {
+                Ok(c) => Some(c),
+                Err(_) => None,
+            };
+            if let Some(c) = client {
+                match c.get(feed_url).send() {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(feed_val) = resp.json::<serde_json::Value>() {
+                            let still_open = feed_val
+                                .get("offers")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter().any(|o| {
+                                        o.get("offer_id")
+                                            .and_then(|v| v.as_str())
+                                            == Some(offer_id.as_str())
+                                            && o.get("status")
+                                                .and_then(|v| v.as_str())
+                                                == Some("open")
+                                    })
+                                })
+                                .unwrap_or(false);
+                            if !still_open {
+                                return Err(
+                                    "This offer has already been taken by another buyer."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    // Seller's feed unreachable or returned non-2xx — degrade
+                    // gracefully and proceed. The P2P notification below is
+                    // still best-effort; LAYER 3's relisting watchdog covers
+                    // the corner case where two buyers slip through.
+                    _ => {}
+                }
+            }
+        }
+    }
+
     let now = now_unix();
     let agreement_id = format!("offer-{}-{}", offer_id, now);
     let seller_party = parse_party_spec(&format!("seller|Seller|{}|seller", offer.seller_address))?;
@@ -7949,12 +8008,60 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
     let saved_path = save_agreement_to_store_at(&imported_agreements_dir(), &agreement)?;
 
+    // LAYER 3 input: fetch the current chain tip from iriumd's /status
+    // endpoint so the seller's watcher can later decide whether to relist
+    // this offer if the buyer never anchors the agreement on-chain. Best
+    // effort — falling back to None means the seller's watcher skips the
+    // auto-relist for this offer (operator can still relist manually).
+    let taken_at_height: Option<u64> = {
+        let status_url = format!("{}/status", rpc_url.trim_end_matches('/'));
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()
+            .and_then(|c| c.get(&status_url).send().ok())
+            .and_then(|r| r.json::<serde_json::Value>().ok())
+            .and_then(|v| v.get("height").and_then(|h| h.as_u64()))
+    };
+
     offer.status = "taken".to_string();
     offer.agreement_id = Some(agreement_id.clone());
     offer.agreement_hash = Some(agreement_hash.clone());
     offer.buyer_address = Some(buyer_addr.clone());
     offer.taken_at = Some(now);
+    offer.taken_at_height = taken_at_height;
     save_offer(&offer)?;
+
+    // LAYER 1 send-side: notify the seller's iriumd over P2P that we
+    // took this offer, so the seller's local copy can flip status →
+    // "taken" and stop serving the offer to other peers. Best effort:
+    // if the local iriumd or its peers can't reach the seller, the
+    // seller's relisting watchdog handles the un-funded leftover within
+    // the grace window. Failure here does NOT fail offer-take.
+    if let Some(ref pubkey) = offer.seller_pubkey {
+        let take_payload = serde_json::json!({
+            "offer_id": offer.offer_id,
+            "buyer_address": buyer_addr,
+            "agreement_id": agreement_id,
+            "agreement_hash": agreement_hash,
+            "taken_at": now,
+            "taken_at_height": taken_at_height,
+            "seller_pubkey": pubkey,
+        });
+        if let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            let url = format!("{}/rpc/broadcast_offer_take", rpc_url.trim_end_matches('/'));
+            let mut req = client.post(&url).json(&serde_json::json!({
+                "payload_json": take_payload.to_string(),
+            }));
+            if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+                req = req.bearer_auth(token);
+            }
+            let _ = req.send();
+        }
+    }
 
     // Auto-build and store OTC policy on local node if seller_pubkey is known.
     let mut auto_policy_id: Option<String> = None;
@@ -18733,6 +18840,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: None,
             seller_pubkey: None,
         };
@@ -18774,6 +18882,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: None,
             seller_pubkey: None,
         };
@@ -18812,6 +18921,7 @@ found true"
                 agreement_hash: None,
                 buyer_address: None,
                 taken_at: None,
+                taken_at_height: None,
                 source: None,
                 seller_pubkey: None,
             };
@@ -18848,6 +18958,7 @@ found true"
             agreement_hash: Some("aa".repeat(32)),
             buyer_address: Some("Qbuyer1111111111111111111111111111111".to_string()),
             taken_at: Some(2),
+            taken_at_height: None,
             source: None,
             seller_pubkey: None,
         };
@@ -18915,6 +19026,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: None,
             seller_pubkey: None,
         };
@@ -18945,6 +19057,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: Some("local".to_string()),
             seller_pubkey: None,
         };
@@ -19152,6 +19265,7 @@ found true"
                 agreement_hash: None,
                 buyer_address: None,
                 taken_at: None,
+                taken_at_height: None,
                 source: Some(src_val.to_string()),
                 seller_pubkey: None,
             };
@@ -19184,6 +19298,7 @@ found true"
                 agreement_hash: None,
                 buyer_address: None,
                 taken_at: None,
+                taken_at_height: None,
                 source: Some(src_val.to_string()),
                 seller_pubkey: None,
             };
@@ -19215,6 +19330,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: src.map(|s| s.to_string()),
             seller_pubkey: seller_pk.map(|s| s.to_string()),
         }
@@ -20797,6 +20913,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: Some("local".to_string()),
             seller_pubkey: Some(
                 "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string(),
@@ -20834,6 +20951,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: Some("local".to_string()),
             seller_pubkey: Some(
                 "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string(),

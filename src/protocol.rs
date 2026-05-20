@@ -41,6 +41,21 @@ pub enum MessageType {
     UptimeChallenge = 17,
     UptimeProof = 18,
     ProofGossip = 19,
+    /// Buyer-broadcast notification that a remote offer has been taken.
+    /// Payload: UTF-8 JSON with offer_id, buyer_address, agreement_id,
+    /// agreement_hash, taken_at, seller_pubkey. The seller's iriumd uses
+    /// the payload to flip the matching local offer file from "open" to
+    /// "taken" so /offers/feed stops advertising it to other peers. See
+    /// the `OfferTakeNotificationPayload` struct below for the exact
+    /// wire format and the iriumd handler for receive-side validation.
+    ///
+    /// TODO(security follow-up): no cryptographic signature is required
+    /// today — structural validation (matching seller_pubkey + offer_id
+    /// + status=="open" on receiver) is the only check. Add an ed25519
+    /// signature over the payload by the buyer's wallet key in a later
+    /// iteration so a third party can't spoof-take an offer to grief
+    /// the seller.
+    OfferTakeNotification = 20,
     Disconnect = 99,
 }
 
@@ -70,6 +85,7 @@ impl TryFrom<u8> for MessageType {
             17 => UptimeChallenge,
             18 => UptimeProof,
             19 => ProofGossip,
+            20 => OfferTakeNotification,
             99 => Disconnect,
             other => return Err(format!("Unknown message type: {}", other)),
         };
@@ -200,6 +216,34 @@ impl ProofGossipPayload {
         }
         Ok(ProofGossipPayload {
             proof_json: msg.payload.clone(),
+        })
+    }
+}
+
+/// Wire payload for MessageType::OfferTakeNotification. UTF-8 JSON with the
+/// minimum fields the seller's iriumd needs to mark the offer taken:
+///   { "offer_id", "buyer_address", "agreement_id", "agreement_hash",
+///     "taken_at", "seller_pubkey" }
+/// The seller's iriumd filters by matching its own offer's seller_pubkey
+/// against the payload before mutating anything.
+pub struct OfferTakeNotificationPayload {
+    pub take_json: Vec<u8>,
+}
+
+impl OfferTakeNotificationPayload {
+    pub fn to_message(&self) -> Message {
+        Message {
+            msg_type: MessageType::OfferTakeNotification,
+            payload: self.take_json.clone(),
+        }
+    }
+
+    pub fn from_message(msg: &Message) -> Result<Self, String> {
+        if msg.msg_type != MessageType::OfferTakeNotification {
+            return Err("Not an offer-take notification".to_string());
+        }
+        Ok(OfferTakeNotificationPayload {
+            take_json: msg.payload.clone(),
         })
     }
 }

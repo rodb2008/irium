@@ -3773,6 +3773,27 @@ fn scan_agreement_linked_txs(
     txs
 }
 
+/// LAYER 3: lightweight chain scan answering "has any on-chain tx anchored
+/// this agreement hash yet?". Used by the offer-watcher to decide whether
+/// to relist a taken-but-unfunded offer once the grace window expires. Only
+/// needs the agreement hash (no full AgreementObject), so it's cheap to
+/// call from the watcher without keeping agreement files mirrored on the
+/// seller's machine.
+fn agreement_hash_funded_on_chain(chain: &ChainState, agreement_hash: &str) -> bool {
+    for block in &chain.chain {
+        for tx in &block.transactions {
+            for output in &tx.outputs {
+                if let Some(anchor) = parse_agreement_anchor(&output.script_pubkey) {
+                    if anchor.agreement_hash == agreement_hash {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn find_confirmed_tx_by_id(chain: &ChainState, txid_hex: &str) -> Result<Transaction, String> {
     let target = hex_to_32(txid_hex.trim()).map_err(|e| format!("invalid funding_txid: {e}"))?;
     for block in &chain.chain {
@@ -8538,6 +8559,25 @@ async fn main() {
         });
     }
 
+    // LAYER 1 receive-side: drain P2P OfferTakeNotification inbox and
+    // mutate matching local offer files. Runs on a 2 s cadence — quicker
+    // than the 5 s fs-watcher because the take-broadcast latency directly
+    // determines how long peers can race to take an already-taken offer.
+    if let Some(ref take_p2p) = app_state.p2p {
+        let drain_node = take_p2p.clone();
+        let drain_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                for json in drain_node.drain_offer_take_notifications().await {
+                    if let Err(e) = process_received_offer_take(&json, &drain_event_tx) {
+                        eprintln!("[offer-take] {}", e);
+                    }
+                }
+            }
+        });
+    }
+
     // Background task: drain P2P proof gossip inbox and submit locally.
     if let Some(ref gossip_p2p) = app_state.p2p {
         let drain_node = gossip_p2p.clone();
@@ -8614,8 +8654,19 @@ async fn main() {
     }
 
     // Background task: detect new/taken offers from local offer store.
+    // Also drives LAYER 2 (open→expired when chain tip passes
+    // timeout_height) and LAYER 3 (taken→open auto-relist when the buyer
+    // never anchors the agreement on-chain within the grace window).
     {
         let offer_event_tx = event_tx.clone();
+        let watcher_chain = app_state.chain.clone();
+        // LAYER 3 grace window in blocks. Default 144 (≈ a day at 10-min
+        // blocks; about 2.4 hours at 60 s blocks). Operators can override
+        // via IRIUM_OFFER_RELIST_GRACE_BLOCKS.
+        let relist_grace_blocks: u64 = std::env::var("IRIUM_OFFER_RELIST_GRACE_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(144);
         tokio::spawn(async move {
             let mut seen: HashMap<String, String> = HashMap::new();
             loop {
@@ -8623,30 +8674,103 @@ async fn main() {
                 let dir = offers_feed_dir();
                 if !dir.exists() { continue; }
                 let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+                let tip_height: u64 = watcher_chain
+                    .lock()
+                    .map(|g| g.tip_height())
+                    .unwrap_or(0);
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map(|e| e == "json").unwrap_or(false) {
-                        if let Ok(data) = std::fs::read_to_string(&path) {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
-                                let id = val.get("offer_id")
-                                    .and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                                if id.is_empty() { continue; }
-                                let status = val.get("status")
-                                    .and_then(|s| s.as_str()).unwrap_or("open").to_string();
-                                let prev = seen.get(&id).cloned();
-                                if prev.is_none() && status == "open" {
-                                    emit_event(&offer_event_tx, "offer.created", serde_json::json!({
-                                        "offer_id": id,
-                                    }));
-                                } else if prev.as_deref() == Some("open") && status == "taken" {
-                                    emit_event(&offer_event_tx, "offer.taken", serde_json::json!({
-                                        "offer_id": id,
-                                    }));
+                    if !path.extension().map(|e| e == "json").unwrap_or(false) {
+                        continue;
+                    }
+                    let Ok(data) = std::fs::read_to_string(&path) else { continue };
+                    let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
+                    let id = val.get("offer_id")
+                        .and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    if id.is_empty() { continue; }
+                    let mut status = val.get("status")
+                        .and_then(|s| s.as_str()).unwrap_or("open").to_string();
+                    let timeout_height = val.get("timeout_height").and_then(|v| v.as_u64());
+                    let taken_at_height = val.get("taken_at_height").and_then(|v| v.as_u64());
+                    let agreement_hash = val.get("agreement_hash")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    // LAYER 2: persist open→expired transition to disk so
+                    // the offer never gets re-served in /offers/feed.
+                    if status == "open" {
+                        if let Some(th) = timeout_height {
+                            if tip_height >= th {
+                                if let Some(mut new_val) = serde_json::from_str::<serde_json::Value>(&data).ok() {
+                                    if let Some(obj) = new_val.as_object_mut() {
+                                        obj.insert("status".to_string(), serde_json::json!("expired"));
+                                    }
+                                    if let Ok(serialized) = serde_json::to_string_pretty(&new_val) {
+                                        let _ = std::fs::write(&path, serialized);
+                                    }
                                 }
-                                seen.insert(id, status);
+                                status = "expired".to_string();
                             }
                         }
                     }
+
+                    // LAYER 3: persist taken→open relist if the buyer hasn't
+                    // anchored the agreement on-chain within the grace window.
+                    // Chain-aware check via agreement_hash_funded_on_chain so
+                    // a slow-funding buyer (already on-chain) is not falsely
+                    // relisted. Only fires when taken_at_height is present —
+                    // offers taken before v1.9.24 lack the field and are
+                    // skipped (operator can relist manually).
+                    if status == "taken" {
+                        if let (Some(tah), Some(ref ah)) = (taken_at_height, &agreement_hash) {
+                            if tip_height > tah + relist_grace_blocks {
+                                let funded = watcher_chain
+                                    .lock()
+                                    .map(|g| agreement_hash_funded_on_chain(&g, ah))
+                                    .unwrap_or(false);
+                                if !funded {
+                                    let previous_buyer = val.get("buyer_address")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if let Some(mut new_val) = serde_json::from_str::<serde_json::Value>(&data).ok() {
+                                        if let Some(obj) = new_val.as_object_mut() {
+                                            obj.insert("status".to_string(), serde_json::json!("open"));
+                                            obj.remove("agreement_id");
+                                            obj.remove("agreement_hash");
+                                            obj.remove("buyer_address");
+                                            obj.remove("taken_at");
+                                            obj.remove("taken_at_height");
+                                        }
+                                        if let Ok(serialized) = serde_json::to_string_pretty(&new_val) {
+                                            let _ = std::fs::write(&path, serialized);
+                                        }
+                                    }
+                                    emit_event(&offer_event_tx, "offer.relisted", serde_json::json!({
+                                        "offer_id": id,
+                                        "previous_buyer_address": previous_buyer,
+                                    }));
+                                    status = "open".to_string();
+                                }
+                            }
+                        }
+                    }
+
+                    let prev = seen.get(&id).cloned();
+                    if prev.is_none() && status == "open" {
+                        emit_event(&offer_event_tx, "offer.created", serde_json::json!({
+                            "offer_id": id,
+                        }));
+                    } else if prev.as_deref() == Some("open") && status == "taken" {
+                        emit_event(&offer_event_tx, "offer.taken", serde_json::json!({
+                            "offer_id": id,
+                        }));
+                    } else if prev.as_deref() == Some("open") && status == "expired" {
+                        emit_event(&offer_event_tx, "offer.expired", serde_json::json!({
+                            "offer_id": id,
+                        }));
+                    }
+                    seen.insert(id, status);
                 }
             }
         });
@@ -8687,6 +8811,96 @@ async fn main() {
 
 const OFFERS_FEED_DEFAULT_LIMIT: usize = 500;
 
+/// LAYER 1 receive-side: a peer (the buyer) has broadcast an
+/// OfferTakeNotification. If the local offers/ dir holds a matching offer
+/// whose seller_pubkey matches the payload, mutate it to status="taken"
+/// and emit `offer.taken` so the seller's GUI updates in real time.
+///
+/// Validation is intentionally light for v1 — no cryptographic signature
+/// is required. Structural match (offer_id present locally, seller_pubkey
+/// match, status=="open") prevents accidental collisions; spoofing remains
+/// possible until the security-follow-up adds ed25519 signing (see the
+/// MessageType::OfferTakeNotification comment in protocol.rs).
+fn process_received_offer_take(payload_json: &str, event_tx: &EventTx) -> Result<(), String> {
+    let val: serde_json::Value = serde_json::from_str(payload_json)
+        .map_err(|e| format!("offer-take parse: {e}"))?;
+    let offer_id = val
+        .get("offer_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "offer-take: missing offer_id".to_string())?;
+    let buyer_address = val
+        .get("buyer_address")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "offer-take: missing buyer_address".to_string())?;
+    let agreement_id = val
+        .get("agreement_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "offer-take: missing agreement_id".to_string())?;
+    let agreement_hash = val
+        .get("agreement_hash")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "offer-take: missing agreement_hash".to_string())?;
+    let taken_at = val.get("taken_at").and_then(|v| v.as_i64()).unwrap_or(0);
+    let taken_at_height = val.get("taken_at_height").and_then(|v| v.as_u64());
+    let seller_pubkey_claim = val
+        .get("seller_pubkey")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let dir = offers_feed_dir();
+    let path = dir.join(format!("offer-{}.json", offer_id));
+    if !path.exists() {
+        // Not our offer — silently ignore. Every connected peer receives
+        // the broadcast so most will land here.
+        return Ok(());
+    }
+    let data = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read offer {offer_id}: {e}"))?;
+    let mut offer: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| format!("parse offer {offer_id}: {e}"))?;
+
+    // Verify the seller_pubkey claim matches our local offer's seller_pubkey
+    // (when both are present). Mismatch → silently ignore (someone else's
+    // offer with a colliding id).
+    if !seller_pubkey_claim.is_empty() {
+        let local_pk = offer.get("seller_pubkey").and_then(|v| v.as_str()).unwrap_or("");
+        if !local_pk.is_empty() && local_pk != seller_pubkey_claim {
+            return Ok(());
+        }
+    }
+
+    let cur_status = offer.get("status").and_then(|v| v.as_str()).unwrap_or("open");
+    if cur_status != "open" {
+        return Ok(()); // already taken / expired / etc.
+    }
+
+    if let Some(obj) = offer.as_object_mut() {
+        obj.insert("status".to_string(), serde_json::json!("taken"));
+        obj.insert("buyer_address".to_string(), serde_json::json!(buyer_address));
+        obj.insert("agreement_id".to_string(), serde_json::json!(agreement_id));
+        obj.insert("agreement_hash".to_string(), serde_json::json!(agreement_hash));
+        obj.insert("taken_at".to_string(), serde_json::json!(taken_at));
+        if let Some(h) = taken_at_height {
+            obj.insert("taken_at_height".to_string(), serde_json::json!(h));
+        }
+    }
+    let serialized = serde_json::to_string_pretty(&offer)
+        .map_err(|e| format!("serialise offer: {e}"))?;
+    std::fs::write(&path, serialized)
+        .map_err(|e| format!("write offer {offer_id}: {e}"))?;
+
+    // Emit offer.taken immediately so the seller's GUI updates without
+    // waiting for the 5 s fs-watcher tick. The watcher's own emit will
+    // fire on the next tick too (idempotent on the GUI side — both
+    // events trigger the same silent reload).
+    emit_event(event_tx, "offer.taken", serde_json::json!({
+        "offer_id": offer_id,
+        "buyer_address": buyer_address,
+        "via": "p2p",
+    }));
+    Ok(())
+}
+
 fn offers_feed_dir() -> std::path::PathBuf {
     if let Ok(path) = std::env::var("IRIUM_OFFERS_DIR") {
         return std::path::PathBuf::from(path);
@@ -8714,6 +8928,16 @@ async fn offers_feed(
     check_rate(&state, &addr)?;
     let dir = offers_feed_dir();
     let limit = offers_feed_limit();
+    // LAYER 2: hide offers whose timeout_height has been reached by the
+    // current chain tip. The 5 s offer-watcher background task is the one
+    // that permanently flips status="open" → "expired" on disk; this filter
+    // is a fast-path so we never serve an expired offer to a peer even in
+    // the short window between expiry and the next watcher tick.
+    let current_tip: u64 = state
+        .chain
+        .lock()
+        .map(|guard| guard.tip_height())
+        .unwrap_or(0);
     let mut offers: Vec<serde_json::Value> = Vec::new();
     if dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -8726,6 +8950,12 @@ async fn offers_feed(
                         {
                             if val.get("status").and_then(|s| s.as_str()) != Some("open") {
                                 continue;
+                            }
+                            // LAYER 2 expiry: skip if chain tip past timeout_height.
+                            if let Some(th) = val.get("timeout_height").and_then(|v| v.as_u64()) {
+                                if current_tip >= th {
+                                    continue;
+                                }
                             }
                             if let Some(obj) = val.as_object_mut() {
                                 obj.remove("source");
@@ -8759,6 +8989,37 @@ async fn offers_feed(
         "count": offers.len(),
         "offers": offers,
     })))
+}
+
+/// LAYER 1 send-side RPC. The wallet binary calls this after `offer-take`
+/// has saved its local agreement; iriumd then broadcasts the take to all
+/// peers via MessageType::OfferTakeNotification. Gated behind
+/// require_rpc_auth so only the local wallet (which shares
+/// IRIUM_RPC_TOKEN) can broadcast — prevents a random LAN client from
+/// spoof-taking other people's offers.
+#[derive(Debug, serde::Deserialize)]
+struct BroadcastOfferTakeRequest {
+    /// JSON-encoded payload {offer_id, buyer_address, agreement_id,
+    /// agreement_hash, taken_at, taken_at_height?, seller_pubkey}.
+    payload_json: String,
+}
+
+async fn broadcast_offer_take_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<BroadcastOfferTakeRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    if let Some(ref p2p) = state.p2p {
+        p2p.broadcast_offer_take(&req.payload_json).await;
+        Ok(Json(serde_json::json!({"ok": true})))
+    } else {
+        // No P2P node configured — broadcast is a no-op but we still
+        // return ok so the wallet's best-effort send doesn't error.
+        Ok(Json(serde_json::json!({"ok": false, "reason": "p2p_disabled"})))
+    }
 }
 
 
@@ -9129,6 +9390,7 @@ async fn explorer_stats(
         .route("/explorer/reputation/:pubkey", get(explorer_reputation))
         .route("/explorer/stats", get(explorer_stats))
         .route("/offers/feed", get(offers_feed))
+        .route("/rpc/broadcast_offer_take", post(broadcast_offer_take_rpc))
         .route("/ws", get(ws_handler))
         .route("/events", get(sse_handler))
         .route("/admin/add-seed", post(admin_add_seed))
