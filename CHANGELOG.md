@@ -3,6 +3,17 @@
 All notable changes to Irium are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- OTC agreement direction: `build_otc_agreement` now wires `payer = seller_id` and `payee = buyer_id`, with `refund_address = seller.address` and `release_authorizer = "seller"`. The seller funds the on-chain HTLC escrow; the buyer pays off-chain and receives IRM on release; the seller reclaims via the timeout refund path if no release happens. This corrects a long-standing inversion in the builder where the buyer was placed in the payer slot, which contradicted the actual flow and `docs/SETTLEMENT-DEV.md`.
+- iriumd `/rpc/agreementreleaseeligibility` and `/rpc/agreementrefundeligibility` (via `evaluate_agreement_spend_eligibility`) now hash the supplied secret preimage with single SHA256 to match the consensus HTLC script (`HTLC_V1_HASHALG_SHA256 = 1`) and `chain.rs`. Previously the advisory check used double SHA256 and falsely reported `secret_hash_mismatch` for valid preimages, blocking release.
+
+### Changed
+
+- `agreement-fund` (wallet) refuses OTC agreements whose payer party has role `"buyer"` (legacy direction) with a clear error message directing the user to create a new agreement. No on-chain HTLCs are affected; this is a wallet-side rejection only.
+
 ## [1.1.0] - 2026-05-01
 
 This release documents everything built across Phases A–F of the Irium chain

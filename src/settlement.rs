@@ -1140,8 +1140,8 @@ pub fn build_otc_agreement(
         schema_id: Some(AGREEMENT_SCHEMA_ID_V1.to_string()),
         template_type: AgreementTemplateType::OtcSettlement,
         parties: vec![buyer.clone(), seller.clone()],
-        payer: buyer_id,
-        payee: seller_id,
+        payer: seller_id,
+        payee: buyer_id,
         mediator_reference: None,
         total_amount,
         network_marker: AGREEMENT_NETWORK_MARKER.to_string(),
@@ -1154,17 +1154,17 @@ pub fn build_otc_agreement(
         release_conditions: vec![AgreementReleaseCondition {
             mode: "secret_preimage".to_string(),
             secret_hash_hex: Some(secret_hash_hex),
-            release_authorizer: Some("buyer".to_string()),
+            release_authorizer: Some("seller".to_string()),
             notes: Some(
-                "OTC release path requires the agreed HTLC branch or off-chain coordination"
+                "OTC release path: seller authorizes payout to buyer after receiving off-chain payment"
                     .to_string(),
             ),
         }],
         refund_conditions: vec![AgreementRefundCondition {
-            refund_address: buyer.address.clone(),
+            refund_address: seller.address.clone(),
             timeout_height: refund_timeout_height,
             notes: Some(
-                "Refund remains an HTLC timeout path when the funding leg uses HTLCv1".to_string(),
+                "Refund returns escrowed IRM to seller on HTLC timeout when no release is authorized".to_string(),
             ),
         }],
         milestones: vec![],
@@ -9682,6 +9682,50 @@ mod tests {
             "both milestones satisfied → overall satisfied"
         );
         assert_eq!(result.completed_milestone_count, 2);
+    }
+
+    #[test]
+    fn build_otc_agreement_assigns_seller_as_payer() {
+        let buyer = AgreementParty {
+            party_id: "buyer".to_string(),
+            display_name: "Buyer".to_string(),
+            address: "Qbuyer".to_string(),
+            role: Some("buyer".to_string()),
+        };
+        let seller = AgreementParty {
+            party_id: "seller".to_string(),
+            display_name: "Seller".to_string(),
+            address: "Qseller".to_string(),
+            role: Some("seller".to_string()),
+        };
+        let agreement = build_otc_agreement(
+            "otc-test-direction".to_string(),
+            1_700_000_000,
+            buyer.clone(),
+            seller.clone(),
+            500_000_000,
+            "IRM".to_string(),
+            "off-chain".to_string(),
+            120,
+            "ab".repeat(32),
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .expect("build_otc_agreement");
+        assert_eq!(agreement.payer, "seller", "seller must be the payer (HTLC funder)");
+        assert_eq!(agreement.payee, "buyer", "buyer must be the payee (release recipient)");
+        assert_eq!(agreement.refund_conditions.len(), 1);
+        assert_eq!(
+            agreement.refund_conditions[0].refund_address, "Qseller",
+            "refund returns to seller on timeout"
+        );
+        assert_eq!(agreement.release_conditions.len(), 1);
+        assert_eq!(
+            agreement.release_conditions[0].release_authorizer.as_deref(),
+            Some("seller"),
+            "release authorizer must be seller after fix"
+        );
     }
 }
 

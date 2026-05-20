@@ -23431,6 +23431,20 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            if agreement.template_type
+                == irium_node_rs::settlement::AgreementTemplateType::OtcSettlement
+            {
+                if let Some(payer_party) = agreement
+                    .parties
+                    .iter()
+                    .find(|p| p.party_id == agreement.payer)
+                {
+                    if payer_party.role.as_deref() == Some("buyer") {
+                        eprintln!("This agreement was created with an older version of Irium where the buyer was set as the HTLC funder. This direction is incorrect \u{2014} the seller should fund the escrow. Please create a new agreement.");
+                        std::process::exit(1);
+                    }
+                }
+            }
             let mut rpc_url = default_rpc_url();
             let mut broadcast = false;
             let mut fee_per_byte = None;
