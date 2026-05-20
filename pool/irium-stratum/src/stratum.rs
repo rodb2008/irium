@@ -9,15 +9,18 @@ use num_bigint::BigUint;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 
 #[derive(Clone, Debug)]
 pub enum HashCmpMode {
@@ -120,6 +123,15 @@ pub struct StratumConfig {
     pub found_blocks_file: String,
     pub keepalive_notify_secs: u64,
     pub auxpow_activation_height: Option<u64>,
+    // Connection gating knobs (v1.9.23). A global session cap protects the
+    // pool from runaway TCP accumulation; a per-IP rate limiter throttles
+    // bursts from a single host; repeat offenders are temporarily banned.
+    // Sensible defaults are picked in main.rs from env vars.
+    pub max_sessions: u64,
+    pub max_conn_per_ip: u32,
+    pub conn_window_secs: u64,
+    pub ban_threshold: u32,
+    pub ban_duration_secs: u64,
 }
 
 #[derive(Clone)]
@@ -358,6 +370,136 @@ static COMPAT_NONREWARDABLE_EVENTS: AtomicU64 = AtomicU64::new(0);
 static LAST_SHARE_ACCEPTED_AT: AtomicU64 = AtomicU64::new(0);
 static LAST_SHARE_REJECTED_AT: AtomicU64 = AtomicU64::new(0);
 
+// v1.9.23 — connection-gate counters. Surfaced on /metrics so operators
+// can see how often the cap / rate-limit / ban-list fire and tune the
+// env knobs accordingly.
+static GATE_DROPPED_SESSION_CAP: AtomicU64 = AtomicU64::new(0);
+static GATE_DROPPED_RATE_LIMIT: AtomicU64 = AtomicU64::new(0);
+static GATE_DROPPED_BANNED: AtomicU64 = AtomicU64::new(0);
+static GATE_BANS_ISSUED: AtomicU64 = AtomicU64::new(0);
+
+/// Per-IP connection accounting used by the rate limiter. `count` is the
+/// number of accept()s from this IP inside the current sliding window;
+/// `rate_limit_hits` is how many times this IP has tripped the limit
+/// (rolled into a temporary ban once it reaches `ban_threshold`).
+#[derive(Clone)]
+struct ConnRecord {
+    window_start: Instant,
+    count: u32,
+    rate_limit_hits: u32,
+}
+
+/// Per-IP burst tracking. Keys are unbounded in theory (every random
+/// scanner gets an entry); we GC stale entries inside `gate_connection`
+/// when the window has rolled over, and a periodic janitor task
+/// (`spawn_gate_janitor`) also sweeps after `ban_duration_secs * 2` so
+/// memory can't grow without bound.
+static CONN_RECORDS: Lazy<DashMap<IpAddr, ConnRecord>> = Lazy::new(DashMap::new);
+
+/// Banned IPs and the Instant at which their ban expires.
+static BAN_LIST: Lazy<DashMap<IpAddr, Instant>> = Lazy::new(DashMap::new);
+
+/// Outcome of an accept-time policy check.
+enum GateDecision {
+    /// Allow the connection. Caller must spawn the handler.
+    Allow,
+    /// Drop the connection. The accept loop discards `stream` and continues.
+    Drop(&'static str),
+}
+
+/// Apply the v1.9.23 connection gates in this order:
+///   1. Banned IP → drop
+///   2. Global session cap reached → drop
+///   3. Per-IP rate limit (per `conn_window_secs` window) → drop, and
+///      bump rate_limit_hits; if it crosses `ban_threshold`, ban the IP
+///      for `ban_duration_secs`.
+/// Disabling: passing `max_sessions=0` skips the cap; `max_conn_per_ip=0`
+/// or `conn_window_secs=0` skips the per-IP limiter. Sensible production
+/// defaults are wired in main.rs.
+fn gate_connection(ip: IpAddr, cfg: &StratumConfig) -> GateDecision {
+    // 1. Ban check (and lazy expiry of the entry).
+    if let Some(entry) = BAN_LIST.get(&ip) {
+        let expires_at = *entry.value();
+        drop(entry);
+        if Instant::now() < expires_at {
+            GATE_DROPPED_BANNED.fetch_add(1, Ordering::SeqCst);
+            return GateDecision::Drop("banned");
+        }
+        BAN_LIST.remove(&ip);
+        // Also clear the per-IP record so the post-ban budget starts fresh.
+        CONN_RECORDS.remove(&ip);
+    }
+
+    // 2. Global session cap.
+    if cfg.max_sessions > 0
+        && ACTIVE_SESSIONS.load(Ordering::SeqCst) >= cfg.max_sessions
+    {
+        GATE_DROPPED_SESSION_CAP.fetch_add(1, Ordering::SeqCst);
+        return GateDecision::Drop("session_cap");
+    }
+
+    // 3. Per-IP rate limiter.
+    if cfg.max_conn_per_ip > 0 && cfg.conn_window_secs > 0 {
+        let now = Instant::now();
+        let window = Duration::from_secs(cfg.conn_window_secs);
+        let mut entry = CONN_RECORDS.entry(ip).or_insert(ConnRecord {
+            window_start: now,
+            count: 0,
+            rate_limit_hits: 0,
+        });
+        if now.duration_since(entry.window_start) >= window {
+            entry.window_start = now;
+            entry.count = 0;
+        }
+        entry.count += 1;
+        if entry.count > cfg.max_conn_per_ip {
+            entry.rate_limit_hits += 1;
+            GATE_DROPPED_RATE_LIMIT.fetch_add(1, Ordering::SeqCst);
+            let hits = entry.rate_limit_hits;
+            let threshold = cfg.ban_threshold;
+            // Release the mutable lock before touching BAN_LIST to avoid
+            // a deadlock when the same IP is being checked concurrently.
+            drop(entry);
+            if threshold > 0 && hits >= threshold {
+                let expires_at = Instant::now()
+                    + Duration::from_secs(cfg.ban_duration_secs);
+                BAN_LIST.insert(ip, expires_at);
+                GATE_BANS_ISSUED.fetch_add(1, Ordering::SeqCst);
+                eprintln!("[stratum] Banned IP: {} (hits={})", ip, hits);
+            }
+            return GateDecision::Drop("rate_limit");
+        }
+    }
+
+    GateDecision::Allow
+}
+
+/// Background sweeper that prevents the DashMaps from growing without
+/// bound when a wide fleet of scanners rotates through random IPs. Runs
+/// every `ban_duration_secs` (clamped to >= 60s) and removes:
+///   - CONN_RECORDS entries whose `window_start` is older than 2 windows
+///     (i.e., the host has been quiet for at least 2 * window seconds).
+///   - BAN_LIST entries whose ban has already expired.
+fn spawn_gate_janitor(cfg: StratumConfig) {
+    let mut interval = cfg.ban_duration_secs.max(60);
+    if cfg.conn_window_secs > 0 {
+        interval = interval.min(cfg.conn_window_secs.max(60));
+    }
+    let interval = Duration::from_secs(interval);
+    let window = Duration::from_secs(cfg.conn_window_secs.max(1));
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let now = Instant::now();
+            CONN_RECORDS.retain(|_, rec| {
+                now.duration_since(rec.window_start) < window * 2
+                    || rec.rate_limit_hits > 0
+            });
+            BAN_LIST.retain(|_, expires_at| now < *expires_at);
+        }
+    });
+}
+
 fn mark_accepted_share() {
     ACCEPTED_SHARES.fetch_add(1, Ordering::SeqCst);
     LAST_SHARE_ACCEPTED_AT.store(unix_now_secs(), Ordering::SeqCst);
@@ -457,7 +599,14 @@ async fn metrics_loop(
                         "compat_block_like_shares": COMPAT_BLOCK_LIKE_SHARES.load(Ordering::SeqCst),
                         "compat_nonrewardable_events": COMPAT_NONREWARDABLE_EVENTS.load(Ordering::SeqCst),
                         "last_share_accepted_at": LAST_SHARE_ACCEPTED_AT.load(Ordering::SeqCst),
-                        "last_share_rejected_at": LAST_SHARE_REJECTED_AT.load(Ordering::SeqCst)
+                        "last_share_rejected_at": LAST_SHARE_REJECTED_AT.load(Ordering::SeqCst),
+                        // v1.9.23 connection-gate observability.
+                        "gate_dropped_session_cap": GATE_DROPPED_SESSION_CAP.load(Ordering::SeqCst),
+                        "gate_dropped_rate_limit": GATE_DROPPED_RATE_LIMIT.load(Ordering::SeqCst),
+                        "gate_dropped_banned": GATE_DROPPED_BANNED.load(Ordering::SeqCst),
+                        "gate_bans_issued": GATE_BANS_ISSUED.load(Ordering::SeqCst),
+                        "gate_active_bans": BAN_LIST.len() as u64,
+                        "gate_tracked_ips": CONN_RECORDS.len() as u64
                     })
                     .to_string(),
                 )
@@ -582,9 +731,25 @@ pub async fn run(config: StratumConfig) -> Result<()> {
         }
     });
 
+    // v1.9.23 — start the periodic GC for CONN_RECORDS / BAN_LIST so the
+    // maps don't grow without bound under sustained scanner pressure.
+    spawn_gate_janitor(config.clone());
+
     let conn_id = Arc::new(AtomicU64::new(1));
     loop {
         let (stream, addr) = listener.accept().await?;
+        // Apply v1.9.23 connection gates before spending any further work
+        // on this socket. The stream goes out of scope on Drop here which
+        // closes the connection; we deliberately don't send any goodbye
+        // payload so scanners get nothing to fingerprint on.
+        match gate_connection(addr.ip(), &config) {
+            GateDecision::Allow => {}
+            GateDecision::Drop(reason) => {
+                debug!("[conn] dropped from {} reason={}", addr, reason);
+                drop(stream);
+                continue;
+            }
+        }
         let id = conn_id.fetch_add(1, Ordering::SeqCst);
         info!("[conn] accepted id={} from {}", id, addr);
 
@@ -2470,6 +2635,13 @@ mod tests {
             found_blocks_file: "/tmp/irium-phase1-found-blocks.jsonl".to_string(),
             keepalive_notify_secs: 30,
             auxpow_activation_height: None,
+            // v1.9.23 — disable connection gating in unit tests so the
+            // existing fixtures don't have to think about it.
+            max_sessions: 0,
+            max_conn_per_ip: 0,
+            conn_window_secs: 0,
+            ban_threshold: 0,
+            ban_duration_secs: 0,
         }
     }
 
