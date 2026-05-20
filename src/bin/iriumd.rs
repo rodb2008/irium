@@ -15950,6 +15950,896 @@ mod tests {
         // test state with no blocks applied, that's 0.
         assert_eq!(resp.generated_at_height, 0);
     }
+
+    // ========================================================================
+    // Stage 3.2.1: Dispute & resolver handler tests
+    // ========================================================================
+
+    fn s32_test_sk(seed: u8) -> SigningKey {
+        SigningKey::from_bytes((&[seed; 32]).into()).expect("test sk")
+    }
+
+    fn s32_test_addr(sk: &SigningKey) -> String {
+        let pk = sk
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        let sha = Sha256::digest(&pk);
+        let rip = ripemd::Ripemd160::digest(&sha);
+        let mut pkh = [0u8; 20];
+        pkh.copy_from_slice(&rip);
+        base58_p2pkh_from_hash(&pkh)
+    }
+
+    fn s32_signing_envelope(sk: &SigningKey, agreement_hash: &str) -> AgreementSignatureEnvelope {
+        let pk = sk
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        AgreementSignatureEnvelope {
+            version: 1,
+            target_type: irium_node_rs::settlement::AgreementSignatureTargetType::Agreement,
+            target_hash: agreement_hash.to_string(),
+            signer_public_key: hex::encode(&pk),
+            signer_address: Some(s32_test_addr(sk)),
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            timestamp: Some(1_700_000_000),
+            signer_role: None,
+            signature: String::new(),
+        }
+    }
+
+    fn s32_sign_raise(d: &mut DisputeRaise, sk: &SigningKey) {
+        d.signature = s32_signing_envelope(sk, &d.agreement_hash);
+        let bytes = dispute_raise_canonical_bytes(d).expect("canonical");
+        let digest = Sha256::digest(&bytes);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: Signature = sk.sign_prehash(&arr).expect("sign");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        d.signature.signature = hex::encode(sig.to_bytes());
+    }
+
+    fn s32_sign_evidence(d: &mut DisputeEvidence, sk: &SigningKey) {
+        d.signature = s32_signing_envelope(sk, &d.agreement_hash);
+        let bytes = dispute_evidence_canonical_bytes(d).expect("canonical");
+        let digest = Sha256::digest(&bytes);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: Signature = sk.sign_prehash(&arr).expect("sign");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        d.signature.signature = hex::encode(sig.to_bytes());
+    }
+
+    fn s32_sign_resolution(d: &mut DisputeResolution, sk: &SigningKey) {
+        d.signature = s32_signing_envelope(sk, &d.agreement_hash);
+        let bytes = dispute_resolution_canonical_bytes(d).expect("canonical");
+        let digest = Sha256::digest(&bytes);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: Signature = sk.sign_prehash(&arr).expect("sign");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        d.signature.signature = hex::encode(sig.to_bytes());
+    }
+
+    fn s32_sign_registration(r: &mut ResolverRegistration, sk: &SigningKey) {
+        r.signature = s32_signing_envelope(sk, "");
+        let bytes = resolver_registration_canonical_bytes(r).expect("canonical");
+        let digest = Sha256::digest(&bytes);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: Signature = sk.sign_prehash(&arr).expect("sign");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        r.signature.signature = hex::encode(sig.to_bytes());
+    }
+
+    fn s32_otc_with_resolver(buyer: &str, seller: &str, primary_resolver: Option<&str>) -> AgreementObject {
+        let buyer_party = irium_node_rs::settlement::AgreementParty {
+            party_id: "buyer".to_string(),
+            display_name: "Buyer".to_string(),
+            address: buyer.to_string(),
+            role: Some("buyer".to_string()),
+        };
+        let seller_party = irium_node_rs::settlement::AgreementParty {
+            party_id: "seller".to_string(),
+            display_name: "Seller".to_string(),
+            address: seller.to_string(),
+            role: Some("seller".to_string()),
+        };
+        let mut a = irium_node_rs::settlement::build_otc_agreement(
+            "otc-3-2-1".to_string(),
+            1_700_000_000,
+            buyer_party,
+            seller_party,
+            500_000_000,
+            "IRM".to_string(),
+            "off-chain".to_string(),
+            120,
+            "ab".repeat(32),
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .expect("build_otc");
+        if let Some(addr) = primary_resolver {
+            a.primary_resolver = Some(addr.to_string());
+            a.primary_resolver_fee = Some(1_000_000);
+        }
+        a
+    }
+
+    fn s32_make_raise(agreement: &AgreementObject, raising_party: &str, sk: &SigningKey) -> DisputeRaise {
+        let agreement_hash = compute_agreement_hash_hex(agreement).expect("hash");
+        let mut d = DisputeRaise {
+            version: irium_node_rs::settlement::DISPUTE_RAISE_VERSION,
+            schema_id: Some(irium_node_rs::settlement::DISPUTE_RAISE_SCHEMA_ID.to_string()),
+            agreement_hash,
+            raising_party: raising_party.to_string(),
+            raised_at_height: 100,
+            raised_at_unix: 1_700_000_500,
+            reason: "buyer paid but seller refused release".to_string(),
+            initial_evidence_hash: "bb".repeat(32),
+            signature: s32_signing_envelope(sk, ""),
+        };
+        s32_sign_raise(&mut d, sk);
+        d
+    }
+
+    fn s32_make_evidence(agreement: &AgreementObject, submitter: &str, sk: &SigningKey) -> DisputeEvidence {
+        let agreement_hash = compute_agreement_hash_hex(agreement).expect("hash");
+        let mut d = DisputeEvidence {
+            version: irium_node_rs::settlement::DISPUTE_EVIDENCE_VERSION,
+            schema_id: Some(irium_node_rs::settlement::DISPUTE_EVIDENCE_SCHEMA_ID.to_string()),
+            agreement_hash,
+            submitter_party: submitter.to_string(),
+            submitted_at_height: 110,
+            evidence_type: "payment_proof".to_string(),
+            evidence_payload: "BASE64DATA".to_string(),
+            evidence_hash: "cc".repeat(32),
+            message: None,
+            signature: s32_signing_envelope(sk, ""),
+        };
+        s32_sign_evidence(&mut d, sk);
+        d
+    }
+
+    fn s32_make_resolution(
+        agreement: &AgreementObject,
+        role: &str,
+        sk: &SigningKey,
+        outcome: &str,
+    ) -> DisputeResolution {
+        let agreement_hash = compute_agreement_hash_hex(agreement).expect("hash");
+        let mut d = DisputeResolution {
+            version: irium_node_rs::settlement::DISPUTE_RESOLUTION_VERSION,
+            schema_id: Some(irium_node_rs::settlement::DISPUTE_RESOLUTION_SCHEMA_ID.to_string()),
+            agreement_hash,
+            resolver_address: s32_test_addr(sk),
+            resolver_role: role.to_string(),
+            outcome: outcome.to_string(),
+            resolved_at_height: 200,
+            message: "resolved by primary".to_string(),
+            signature: s32_signing_envelope(sk, ""),
+        };
+        s32_sign_resolution(&mut d, sk);
+        d
+    }
+
+    fn s32_make_registration(sk: &SigningKey, fee_bps: Option<u32>) -> ResolverRegistration {
+        let mut r = ResolverRegistration {
+            version: irium_node_rs::settlement::RESOLVER_REGISTRATION_VERSION,
+            schema_id: Some(irium_node_rs::settlement::RESOLVER_REGISTRATION_SCHEMA_ID.to_string()),
+            resolver_address: s32_test_addr(sk),
+            registered_at_height: 10,
+            display_name: Some("Test Resolver".to_string()),
+            bio: None,
+            fee_bps_self_quoted: fee_bps,
+            signature: s32_signing_envelope(sk, ""),
+        };
+        s32_sign_registration(&mut r, sk);
+        r
+    }
+
+    fn s32_add_wallet_utxos_multi(state: &AppState, address: &str, count: usize, value_each: u64) {
+        let pkh_vec = base58_p2pkh_to_hash(address).expect("addr decode");
+        let mut pkh20 = [0u8; 20];
+        pkh20.copy_from_slice(&pkh_vec);
+        let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip = chain.tip_height();
+        for i in 0..count {
+            let mut txid = [0xAAu8; 32];
+            txid[31] = i as u8;
+            chain.utxos.insert(
+                OutPoint {
+                    txid,
+                    index: 0,
+                },
+                UtxoEntry {
+                    output: TxOutput {
+                        value: value_each,
+                        script_pubkey: p2pkh_script(&pkh20),
+                    },
+                    height: tip,
+                    is_coinbase: false,
+                },
+            );
+        }
+    }
+
+    fn s32_stub_eligibility(
+        agreement_hash: &str,
+        agreement_id: &str,
+        eligible: bool,
+        branch: &str,
+    ) -> AgreementSpendEligibilityResponse {
+        AgreementSpendEligibilityResponse {
+            agreement_hash: agreement_hash.to_string(),
+            agreement_id: agreement_id.to_string(),
+            funding_txid: "ff".repeat(32),
+            htlc_vout: Some(0),
+            anchor_vout: Some(1),
+            role: Some(AgreementAnchorRole::Funding),
+            milestone_id: None,
+            amount: Some(100),
+            branch: branch.to_string(),
+            htlc_backed: true,
+            funded: true,
+            unspent: true,
+            preimage_required: branch == "release",
+            timeout_height: Some(120),
+            timeout_reached: branch == "refund",
+            destination_address: Some("Qdest".to_string()),
+            expected_hash: Some("11".repeat(32)),
+            recipient_address: Some("Qrcpt".to_string()),
+            refund_address: Some("Qrfd".to_string()),
+            eligible,
+            reasons: Vec::new(),
+            trust_model_note: String::new(),
+        }
+    }
+
+    // ---- Direct-helper unit tests (no RPC, no wallet) ----
+
+    #[test]
+    fn s32_eligibility_hook_blocks_release_when_open() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let buyer = s32_test_sk(11);
+        let seller = s32_test_sk(12);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let raise = s32_make_raise(&agreement, "buyer", &buyer);
+        let dstate = DisputeState {
+            raise,
+            raise_anchor_txid: None,
+            raise_anchored_at_height: None,
+            evidence: Vec::new(),
+            resolution: None,
+            resolution_anchor_txid: None,
+            resolution_anchored_at_height: None,
+            escalated_to_fallback: false,
+            escalated_at_height: None,
+        };
+        {
+            let mut guard = state.disputes_index.lock().unwrap();
+            guard.insert(agreement_hash.clone(), dstate);
+        }
+        let mut resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "release");
+        apply_dispute_status_to_eligibility(&state, &agreement, true, &mut resp);
+        assert!(!resp.eligible);
+        assert!(resp.reasons.iter().any(|r| r == "dispute_open"));
+    }
+
+    #[test]
+    fn s32_eligibility_hook_blocks_refund_when_open() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let buyer = s32_test_sk(13);
+        let seller = s32_test_sk(14);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let raise = s32_make_raise(&agreement, "seller", &seller);
+        let dstate = DisputeState {
+            raise,
+            raise_anchor_txid: None,
+            raise_anchored_at_height: None,
+            evidence: Vec::new(),
+            resolution: None,
+            resolution_anchor_txid: None,
+            resolution_anchored_at_height: None,
+            escalated_to_fallback: false,
+            escalated_at_height: None,
+        };
+        {
+            let mut guard = state.disputes_index.lock().unwrap();
+            guard.insert(agreement_hash.clone(), dstate);
+        }
+        let mut resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "refund");
+        apply_dispute_status_to_eligibility(&state, &agreement, false, &mut resp);
+        assert!(!resp.eligible);
+        assert!(resp.reasons.iter().any(|r| r == "dispute_open"));
+    }
+
+    #[test]
+    fn s32_eligibility_hook_resolved_release_blocks_refund_branch() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let buyer = s32_test_sk(15);
+        let seller = s32_test_sk(16);
+        let resolver = s32_test_sk(17);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let resolver_addr = s32_test_addr(&resolver);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, Some(&resolver_addr));
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let raise = s32_make_raise(&agreement, "buyer", &buyer);
+        let resolution = s32_make_resolution(&agreement, "primary", &resolver, "release");
+        let dstate = DisputeState {
+            raise,
+            raise_anchor_txid: Some("aa".repeat(32)),
+            raise_anchored_at_height: Some(10),
+            evidence: Vec::new(),
+            resolution: Some(resolution),
+            resolution_anchor_txid: Some("bb".repeat(32)),
+            resolution_anchored_at_height: Some(20),
+            escalated_to_fallback: false,
+            escalated_at_height: None,
+        };
+        {
+            let mut guard = state.disputes_index.lock().unwrap();
+            guard.insert(agreement_hash.clone(), dstate);
+        }
+        // Release branch should pass (no dispute block).
+        let mut release_resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "release");
+        apply_dispute_status_to_eligibility(&state, &agreement, true, &mut release_resp);
+        assert!(release_resp.eligible);
+        // Refund branch should be blocked.
+        let mut refund_resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "refund");
+        apply_dispute_status_to_eligibility(&state, &agreement, false, &mut refund_resp);
+        assert!(!refund_resp.eligible);
+        assert!(refund_resp.reasons.iter().any(|r| r == "dispute_resolution_blocks_branch"));
+    }
+
+    #[test]
+    fn s32_eligibility_hook_resolved_refund_blocks_release_branch() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let buyer = s32_test_sk(18);
+        let seller = s32_test_sk(19);
+        let resolver = s32_test_sk(20);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let resolver_addr = s32_test_addr(&resolver);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, Some(&resolver_addr));
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let raise = s32_make_raise(&agreement, "seller", &seller);
+        let resolution = s32_make_resolution(&agreement, "primary", &resolver, "refund");
+        let dstate = DisputeState {
+            raise,
+            raise_anchor_txid: Some("aa".repeat(32)),
+            raise_anchored_at_height: Some(10),
+            evidence: Vec::new(),
+            resolution: Some(resolution),
+            resolution_anchor_txid: Some("bb".repeat(32)),
+            resolution_anchored_at_height: Some(20),
+            escalated_to_fallback: false,
+            escalated_at_height: None,
+        };
+        {
+            let mut guard = state.disputes_index.lock().unwrap();
+            guard.insert(agreement_hash.clone(), dstate);
+        }
+        let mut refund_resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "refund");
+        apply_dispute_status_to_eligibility(&state, &agreement, false, &mut refund_resp);
+        assert!(refund_resp.eligible);
+        let mut release_resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "release");
+        apply_dispute_status_to_eligibility(&state, &agreement, true, &mut release_resp);
+        assert!(!release_resp.eligible);
+        assert!(release_resp.reasons.iter().any(|r| r == "dispute_resolution_blocks_branch"));
+    }
+
+    #[test]
+    fn s32_escalation_tick_marks_fallback_after_window() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let buyer = s32_test_sk(21);
+        let seller = s32_test_sk(22);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let raise = s32_make_raise(&agreement, "buyer", &buyer);
+        let dstate = DisputeState {
+            raise,
+            raise_anchor_txid: Some("aa".repeat(32)),
+            raise_anchored_at_height: Some(10),
+            evidence: Vec::new(),
+            resolution: None,
+            resolution_anchor_txid: None,
+            resolution_anchored_at_height: None,
+            escalated_to_fallback: false,
+            escalated_at_height: None,
+        };
+        {
+            let mut guard = state.disputes_index.lock().unwrap();
+            guard.insert(agreement_hash.clone(), dstate);
+        }
+        // Tip exactly 288 blocks past raise → triggers escalation.
+        escalation_tick(&state.disputes_index, &state.event_tx, 10 + 288);
+        let guard = state.disputes_index.lock().unwrap();
+        let d = guard.get(&agreement_hash).expect("present");
+        assert!(d.escalated_to_fallback);
+        assert_eq!(d.escalated_at_height, Some(298));
+    }
+
+    #[test]
+    fn s32_escalation_tick_no_escalation_within_window() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let buyer = s32_test_sk(23);
+        let seller = s32_test_sk(24);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let raise = s32_make_raise(&agreement, "buyer", &buyer);
+        let dstate = DisputeState {
+            raise,
+            raise_anchor_txid: Some("aa".repeat(32)),
+            raise_anchored_at_height: Some(10),
+            evidence: Vec::new(),
+            resolution: None,
+            resolution_anchor_txid: None,
+            resolution_anchored_at_height: None,
+            escalated_to_fallback: false,
+            escalated_at_height: None,
+        };
+        {
+            let mut guard = state.disputes_index.lock().unwrap();
+            guard.insert(agreement_hash.clone(), dstate);
+        }
+        // Tip only 200 blocks past raise — under 288 → no escalation.
+        escalation_tick(&state.disputes_index, &state.event_tx, 210);
+        let guard = state.disputes_index.lock().unwrap();
+        let d = guard.get(&agreement_hash).expect("present");
+        assert!(!d.escalated_to_fallback);
+    }
+
+    #[tokio::test]
+    async fn s32_resolvers_list_paginates() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        for i in 0..3u8 {
+            let sk = s32_test_sk(40 + i);
+            let mut reg = s32_make_registration(&sk, Some(100 * (i as u32 + 1)));
+            reg.registered_at_height = 1000 + i as u64;
+            let rec = ResolverRegistrationRecord {
+                registration: reg,
+                anchor_txid: Some(format!("{:0>64}", i)),
+                anchored_at_height: Some(1000 + i as u64),
+            };
+            let mut guard = state.resolvers_index.lock().unwrap();
+            guard.insert(rec.registration.resolver_address.clone(), rec);
+        }
+        let resp1 = resolvers_list(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(ResolversListQuery {
+                limit: Some(2),
+                cursor: None,
+            }),
+        )
+        .await
+        .expect("list1")
+        .0;
+        assert_eq!(resp1.resolvers.len(), 2);
+        assert!(resp1.next_cursor.is_some());
+        let cursor = resp1.next_cursor.clone().unwrap();
+        let resp2 = resolvers_list(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(ResolversListQuery {
+                limit: Some(2),
+                cursor: Some(cursor),
+            }),
+        )
+        .await
+        .expect("list2")
+        .0;
+        assert_eq!(resp2.resolvers.len(), 1);
+        assert!(resp2.next_cursor.is_none());
+    }
+
+    // ---- Full-handler RPC tests (real wallet + UTXOs) ----
+
+    #[tokio::test]
+    async fn s32_raise_dispute_happy_path() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        let buyer = s32_test_sk(50);
+        let seller = s32_test_sk(51);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let dispute = s32_make_raise(&agreement, "buyer", &buyer);
+        let agreement_hash = dispute.agreement_hash.clone();
+        let resp = raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement: agreement.clone(),
+            }),
+        )
+        .await
+        .expect("raise_dispute")
+        .0;
+        assert_eq!(resp.agreement_hash, agreement_hash);
+        assert!(!resp.anchor_txid.is_empty());
+        let guard = state.disputes_index.lock().unwrap();
+        let d = guard.get(&agreement_hash).expect("present");
+        assert!(d.is_open());
+        assert_eq!(d.raise.raising_party, "buyer");
+    }
+
+    #[tokio::test]
+    async fn s32_raise_dispute_rejects_invalid_signature() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        let buyer = s32_test_sk(52);
+        let wrong = s32_test_sk(53);
+        let seller = s32_test_sk(54);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        // Sign with the WRONG key.
+        let dispute = s32_make_raise(&agreement, "buyer", &wrong);
+        let result = raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("signature"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_raise_dispute_rejects_non_party_raiser() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        let buyer = s32_test_sk(55);
+        let seller = s32_test_sk(56);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        // raising_party set to non-existent id "other".
+        let dispute = s32_make_raise(&agreement, "other", &buyer);
+        let result = raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("raising_party_not_in_agreement"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_raise_dispute_rejects_deposit_template() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        let payer = s32_test_sk(57);
+        let payee = s32_test_sk(58);
+        let payer_addr = s32_test_addr(&payer);
+        let payee_addr = s32_test_addr(&payee);
+        let payer_party = irium_node_rs::settlement::AgreementParty {
+            party_id: "payer".to_string(),
+            display_name: "Payer".to_string(),
+            address: payer_addr.clone(),
+            role: Some("payer".to_string()),
+        };
+        let payee_party = irium_node_rs::settlement::AgreementParty {
+            party_id: "payee".to_string(),
+            display_name: "Payee".to_string(),
+            address: payee_addr.clone(),
+            role: Some("payee".to_string()),
+        };
+        let agreement = irium_node_rs::settlement::build_deposit_agreement(
+            "dep-3-2-1".to_string(),
+            1_700_000_000,
+            payer_party,
+            payee_party,
+            500_000_000,
+            "purpose".to_string(),
+            "refundable".to_string(),
+            120,
+            "ab".repeat(32),
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .expect("build_deposit");
+        let dispute = s32_make_raise(&agreement, "payer", &payer);
+        let result = raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("dispute_template_not_eligible"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_raise_dispute_rejects_duplicate() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        let buyer = s32_test_sk(59);
+        let seller = s32_test_sk(60);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let dispute1 = s32_make_raise(&agreement, "buyer", &buyer);
+        raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute: dispute1,
+                agreement: agreement.clone(),
+            }),
+        )
+        .await
+        .expect("first raise");
+        let dispute2 = s32_make_raise(&agreement, "seller", &seller);
+        let result = raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute: dispute2,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject duplicate");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("dispute_already_open"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_dispute_evidence_appends_to_open_dispute() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 5, 100_000_000);
+        let buyer = s32_test_sk(61);
+        let seller = s32_test_sk(62);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let dispute = s32_make_raise(&agreement, "buyer", &buyer);
+        raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement: agreement.clone(),
+            }),
+        )
+        .await
+        .expect("raise");
+        let evidence = s32_make_evidence(&agreement, "seller", &seller);
+        let agreement_hash = evidence.agreement_hash.clone();
+        let resp = submit_dispute_evidence(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(SubmitDisputeEvidenceRequest {
+                evidence,
+                agreement,
+            }),
+        )
+        .await
+        .expect("evidence")
+        .0;
+        assert!(!resp.anchor_txid.is_empty());
+        let guard = state.disputes_index.lock().unwrap();
+        let d = guard.get(&agreement_hash).expect("present");
+        assert_eq!(d.evidence.len(), 1);
+        assert_eq!(d.evidence[0].evidence.submitter_party, "seller");
+    }
+
+    #[tokio::test]
+    async fn s32_dispute_evidence_rejects_when_no_open_dispute() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        let buyer = s32_test_sk(63);
+        let seller = s32_test_sk(64);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let evidence = s32_make_evidence(&agreement, "buyer", &buyer);
+        let result = submit_dispute_evidence(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(SubmitDisputeEvidenceRequest {
+                evidence,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("no_open_dispute"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_resolve_dispute_primary_release_recorded() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 5, 100_000_000);
+        let buyer = s32_test_sk(65);
+        let seller = s32_test_sk(66);
+        let resolver = s32_test_sk(67);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let resolver_addr = s32_test_addr(&resolver);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, Some(&resolver_addr));
+        let dispute = s32_make_raise(&agreement, "buyer", &buyer);
+        raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement: agreement.clone(),
+            }),
+        )
+        .await
+        .expect("raise");
+        let resolution = s32_make_resolution(&agreement, "primary", &resolver, "release");
+        let agreement_hash = resolution.agreement_hash.clone();
+        let resp = resolve_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(ResolveDisputeRequest {
+                resolution,
+                agreement,
+            }),
+        )
+        .await
+        .expect("resolve")
+        .0;
+        assert_eq!(resp.outcome, "release");
+        assert_eq!(resp.resolver_role, "primary");
+        let guard = state.disputes_index.lock().unwrap();
+        let d = guard.get(&agreement_hash).expect("present");
+        assert!(!d.is_open());
+        assert_eq!(d.resolution.as_ref().unwrap().outcome, "release");
+    }
+
+    #[tokio::test]
+    async fn s32_resolve_dispute_rejects_unknown_resolver() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 5, 100_000_000);
+        let buyer = s32_test_sk(68);
+        let seller = s32_test_sk(69);
+        let resolver = s32_test_sk(70);
+        let attacker = s32_test_sk(71);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let resolver_addr = s32_test_addr(&resolver);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, Some(&resolver_addr));
+        let dispute = s32_make_raise(&agreement, "buyer", &buyer);
+        raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement: agreement.clone(),
+            }),
+        )
+        .await
+        .expect("raise");
+        // Build resolution signed by attacker (not the named resolver).
+        let resolution = s32_make_resolution(&agreement, "primary", &attacker, "release");
+        let result = resolve_dispute(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(ResolveDisputeRequest {
+                resolution,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("resolver_address_mismatch"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_resolve_dispute_rejects_fallback_before_escalation() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 5, 100_000_000);
+        let buyer = s32_test_sk(72);
+        let seller = s32_test_sk(73);
+        let primary = s32_test_sk(74);
+        let fallback = s32_test_sk(75);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let primary_addr = s32_test_addr(&primary);
+        let fallback_addr = s32_test_addr(&fallback);
+        let mut agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, Some(&primary_addr));
+        agreement.fallback_resolver = Some(fallback_addr.clone());
+        agreement.fallback_resolver_fee = Some(500_000);
+        let dispute = s32_make_raise(&agreement, "buyer", &buyer);
+        raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement: agreement.clone(),
+            }),
+        )
+        .await
+        .expect("raise");
+        // Fallback tries to resolve without escalation having occurred.
+        let resolution = s32_make_resolution(&agreement, "fallback", &fallback, "release");
+        let result = resolve_dispute(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(ResolveDisputeRequest {
+                resolution,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("fallback_not_yet_escalated"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_register_resolver_rejects_non_miner() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        // chain.chain is empty in tests → no coinbase → not a recent miner.
+        let resolver = s32_test_sk(80);
+        let registration = s32_make_registration(&resolver, Some(500));
+        let result = register_resolver(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(RegisterResolverRequest { registration }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("resolver_not_recent_miner"), "got: {msg}");
+    }
 }
 
 
