@@ -57,6 +57,10 @@ pub enum AgreementAnchorRole {
     CollateralLock,
     OtcSettlement,
     MerchantSettlement,
+    DisputeRaise,
+    DisputeEvidence,
+    DisputeResolve,
+    ResolverRegister,
 }
 
 impl AgreementAnchorRole {
@@ -70,6 +74,10 @@ impl AgreementAnchorRole {
             Self::CollateralLock => "c",
             Self::OtcSettlement => "o",
             Self::MerchantSettlement => "t",
+            Self::DisputeRaise => "e",
+            Self::DisputeEvidence => "v",
+            Self::DisputeResolve => "x",
+            Self::ResolverRegister => "y",
         }
     }
 
@@ -83,6 +91,10 @@ impl AgreementAnchorRole {
             "c" => Some(Self::CollateralLock),
             "o" => Some(Self::OtcSettlement),
             "t" => Some(Self::MerchantSettlement),
+            "e" => Some(Self::DisputeRaise),
+            "v" => Some(Self::DisputeEvidence),
+            "x" => Some(Self::DisputeResolve),
+            "y" => Some(Self::ResolverRegister),
             _ => None,
         }
     }
@@ -228,6 +240,14 @@ pub struct AgreementObject {
     pub external_reference: Option<String>,
     #[serde(default)]
     pub disputed_metadata_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_resolver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_resolver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_resolver_fee: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_resolver_fee: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1042,6 +1062,10 @@ pub fn build_simple_settlement_agreement(
         invoice_reference: None,
         external_reference: None,
         disputed_metadata_only: false,
+        primary_resolver: None,
+        fallback_resolver: None,
+        primary_resolver_fee: None,
+        fallback_resolver_fee: None,
     };
     agreement.validate()?;
     Ok(agreement)
@@ -1113,6 +1137,10 @@ pub fn build_deposit_agreement(
         invoice_reference: None,
         external_reference: None,
         disputed_metadata_only: false,
+        primary_resolver: None,
+        fallback_resolver: None,
+        primary_resolver_fee: None,
+        fallback_resolver_fee: None,
     };
     agreement.validate()?;
     Ok(agreement)
@@ -1183,6 +1211,10 @@ pub fn build_otc_agreement(
         invoice_reference: None,
         external_reference: None,
         disputed_metadata_only: false,
+        primary_resolver: None,
+        fallback_resolver: None,
+        primary_resolver_fee: None,
+        fallback_resolver_fee: None,
     };
     agreement.validate()?;
     Ok(agreement)
@@ -1246,6 +1278,10 @@ pub fn build_milestone_agreement(
         invoice_reference: None,
         external_reference: None,
         disputed_metadata_only: false,
+        primary_resolver: None,
+        fallback_resolver: None,
+        primary_resolver_fee: None,
+        fallback_resolver_fee: None,
     };
     agreement.validate()?;
     Ok(agreement)
@@ -2100,6 +2136,65 @@ impl AgreementObject {
                 return Err("deposit timeout_height must be > 0".to_string());
             }
         }
+        // Resolver fields are only allowed on dispute-eligible templates.
+        let resolver_eligible = matches!(
+            self.template_type,
+            AgreementTemplateType::OtcSettlement
+                | AgreementTemplateType::MilestoneSettlement
+                | AgreementTemplateType::ContractorMilestone
+        );
+        if !resolver_eligible
+            && (self.primary_resolver.is_some()
+                || self.fallback_resolver.is_some()
+                || self.primary_resolver_fee.is_some()
+                || self.fallback_resolver_fee.is_some())
+        {
+            return Err(
+                "resolver fields are only allowed on OTC, milestone, and contractor templates"
+                    .to_string(),
+            );
+        }
+        if let Some(addr) = &self.primary_resolver {
+            let fee = self.primary_resolver_fee.ok_or_else(|| {
+                "primary_resolver_fee required when primary_resolver is set".to_string()
+            })?;
+            if fee == 0 {
+                return Err("primary_resolver_fee must be > 0".to_string());
+            }
+            if fee >= self.total_amount {
+                return Err("primary_resolver_fee must be < total_amount".to_string());
+            }
+            if addr.trim().is_empty() {
+                return Err("primary_resolver address required".to_string());
+            }
+        } else if self.primary_resolver_fee.is_some() {
+            return Err("primary_resolver_fee set without primary_resolver".to_string());
+        }
+        if let Some(addr) = &self.fallback_resolver {
+            let primary = self.primary_resolver.as_ref().ok_or_else(|| {
+                "fallback_resolver requires primary_resolver".to_string()
+            })?;
+            let fee = self.fallback_resolver_fee.ok_or_else(|| {
+                "fallback_resolver_fee required when fallback_resolver is set".to_string()
+            })?;
+            if fee == 0 {
+                return Err("fallback_resolver_fee must be > 0".to_string());
+            }
+            if addr.trim().is_empty() {
+                return Err("fallback_resolver address required".to_string());
+            }
+            if addr.trim() == primary.trim() {
+                return Err("fallback_resolver must differ from primary_resolver".to_string());
+            }
+            let prim_fee = self.primary_resolver_fee.unwrap_or(0);
+            if prim_fee.saturating_add(fee) >= self.total_amount {
+                return Err(
+                    "primary + fallback resolver fees must be < total_amount".to_string(),
+                );
+            }
+        } else if self.fallback_resolver_fee.is_some() {
+            return Err("fallback_resolver_fee set without fallback_resolver".to_string());
+        }
         Ok(())
     }
 
@@ -2485,6 +2580,10 @@ pub fn build_agreement_activity_timeline(
             }
             AgreementAnchorRole::Refund => "refund_tx_observed",
             AgreementAnchorRole::CollateralLock => "linked_tx_observed",
+            AgreementAnchorRole::DisputeRaise => "dispute_raise_tx_observed",
+            AgreementAnchorRole::DisputeEvidence => "dispute_evidence_tx_observed",
+            AgreementAnchorRole::DisputeResolve => "dispute_resolve_tx_observed",
+            AgreementAnchorRole::ResolverRegister => "resolver_register_tx_observed",
         };
         events.push(AgreementActivityEvent {
             event_type: event_type.to_string(),
@@ -5134,6 +5233,10 @@ mod tests {
             invoice_reference: Some("INV-1".to_string()),
             external_reference: Some("PO-9".to_string()),
             disputed_metadata_only: false,
+            primary_resolver: None,
+            fallback_resolver: None,
+            primary_resolver_fee: None,
+            fallback_resolver_fee: None,
         }
     }
 
@@ -10113,4 +10216,525 @@ pub fn basic_otc_escrow_template(
         milestones: vec![],
         holdback: None,
     })
+}
+
+// ============================================================================
+// Dispute and Resolver Canonical Types (Stage 3.1)
+// ============================================================================
+
+pub const DISPUTE_RAISE_SCHEMA_ID: &str = "irium.phase3.dispute_raise.v1";
+pub const DISPUTE_RAISE_VERSION: u32 = 1;
+pub const DISPUTE_EVIDENCE_SCHEMA_ID: &str = "irium.phase3.dispute_evidence.v1";
+pub const DISPUTE_EVIDENCE_VERSION: u32 = 1;
+pub const DISPUTE_RESOLUTION_SCHEMA_ID: &str = "irium.phase3.dispute_resolution.v1";
+pub const DISPUTE_RESOLUTION_VERSION: u32 = 1;
+pub const RESOLVER_REGISTRATION_SCHEMA_ID: &str = "irium.phase3.resolver_registration.v1";
+pub const RESOLVER_REGISTRATION_VERSION: u32 = 1;
+
+fn validate_hex_hash(field: &str, value: &str) -> Result<(), String> {
+    if value.len() != 64 || hex::decode(value).is_err() {
+        return Err(format!("{} must be 32-byte hex", field));
+    }
+    Ok(())
+}
+
+fn default_dispute_raise_version() -> u32 { DISPUTE_RAISE_VERSION }
+fn default_dispute_evidence_version() -> u32 { DISPUTE_EVIDENCE_VERSION }
+fn default_dispute_resolution_version() -> u32 { DISPUTE_RESOLUTION_VERSION }
+fn default_resolver_registration_version() -> u32 { RESOLVER_REGISTRATION_VERSION }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisputeRaise {
+    #[serde(default = "default_dispute_raise_version")]
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_id: Option<String>,
+    pub agreement_hash: String,
+    pub raising_party: String,
+    pub raised_at_height: u64,
+    pub raised_at_unix: u64,
+    pub reason: String,
+    pub initial_evidence_hash: String,
+    pub signature: AgreementSignatureEnvelope,
+}
+
+impl DisputeRaise {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != DISPUTE_RAISE_VERSION {
+            return Err(format!("unsupported dispute_raise version {}", self.version));
+        }
+        if let Some(sid) = &self.schema_id {
+            if sid != DISPUTE_RAISE_SCHEMA_ID {
+                return Err(format!("unsupported dispute_raise schema_id {}", sid));
+            }
+        }
+        validate_hex_hash("agreement_hash", &self.agreement_hash)?;
+        validate_hex_hash("initial_evidence_hash", &self.initial_evidence_hash)?;
+        if self.raising_party.trim().is_empty() {
+            return Err("raising_party required".to_string());
+        }
+        if self.reason.trim().is_empty() {
+            return Err("reason required".to_string());
+        }
+        if self.reason.len() > 4096 {
+            return Err("reason too long (max 4096 chars)".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisputeEvidence {
+    #[serde(default = "default_dispute_evidence_version")]
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_id: Option<String>,
+    pub agreement_hash: String,
+    pub submitter_party: String,
+    pub submitted_at_height: u64,
+    pub evidence_type: String,
+    pub evidence_payload: String,
+    pub evidence_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub signature: AgreementSignatureEnvelope,
+}
+
+impl DisputeEvidence {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != DISPUTE_EVIDENCE_VERSION {
+            return Err(format!(
+                "unsupported dispute_evidence version {}",
+                self.version
+            ));
+        }
+        if let Some(sid) = &self.schema_id {
+            if sid != DISPUTE_EVIDENCE_SCHEMA_ID {
+                return Err(format!("unsupported dispute_evidence schema_id {}", sid));
+            }
+        }
+        validate_hex_hash("agreement_hash", &self.agreement_hash)?;
+        validate_hex_hash("evidence_hash", &self.evidence_hash)?;
+        if self.submitter_party.trim().is_empty() {
+            return Err("submitter_party required".to_string());
+        }
+        match self.evidence_type.as_str() {
+            "payment_proof" | "delivery_proof" | "communication_proof" => {}
+            other => {
+                return Err(format!(
+                    "evidence_type must be payment_proof|delivery_proof|communication_proof (got {})",
+                    other
+                ))
+            }
+        }
+        if self.evidence_payload.is_empty() {
+            return Err("evidence_payload required".to_string());
+        }
+        if let Some(msg) = &self.message {
+            if msg.len() > 4096 {
+                return Err("message too long (max 4096 chars)".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisputeResolution {
+    #[serde(default = "default_dispute_resolution_version")]
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_id: Option<String>,
+    pub agreement_hash: String,
+    pub resolver_address: String,
+    pub resolver_role: String,
+    pub outcome: String,
+    pub resolved_at_height: u64,
+    pub message: String,
+    pub signature: AgreementSignatureEnvelope,
+}
+
+impl DisputeResolution {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != DISPUTE_RESOLUTION_VERSION {
+            return Err(format!(
+                "unsupported dispute_resolution version {}",
+                self.version
+            ));
+        }
+        if let Some(sid) = &self.schema_id {
+            if sid != DISPUTE_RESOLUTION_SCHEMA_ID {
+                return Err(format!(
+                    "unsupported dispute_resolution schema_id {}",
+                    sid
+                ));
+            }
+        }
+        validate_hex_hash("agreement_hash", &self.agreement_hash)?;
+        if self.resolver_address.trim().is_empty() {
+            return Err("resolver_address required".to_string());
+        }
+        match self.resolver_role.as_str() {
+            "primary" | "fallback" => {}
+            other => return Err(format!("resolver_role must be primary|fallback (got {})", other)),
+        }
+        match self.outcome.as_str() {
+            "release" | "refund" => {}
+            other => return Err(format!("outcome must be release|refund (got {})", other)),
+        }
+        if self.message.len() > 4096 {
+            return Err("message too long (max 4096 chars)".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolverRegistration {
+    #[serde(default = "default_resolver_registration_version")]
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_id: Option<String>,
+    pub resolver_address: String,
+    pub registered_at_height: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_bps_self_quoted: Option<u32>,
+    pub signature: AgreementSignatureEnvelope,
+}
+
+impl ResolverRegistration {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != RESOLVER_REGISTRATION_VERSION {
+            return Err(format!(
+                "unsupported resolver_registration version {}",
+                self.version
+            ));
+        }
+        if let Some(sid) = &self.schema_id {
+            if sid != RESOLVER_REGISTRATION_SCHEMA_ID {
+                return Err(format!(
+                    "unsupported resolver_registration schema_id {}",
+                    sid
+                ));
+            }
+        }
+        if self.resolver_address.trim().is_empty() {
+            return Err("resolver_address required".to_string());
+        }
+        if let Some(bps) = self.fee_bps_self_quoted {
+            if bps > 10_000 {
+                return Err("fee_bps_self_quoted must be <= 10000 (100%)".to_string());
+            }
+        }
+        if let Some(name) = &self.display_name {
+            if name.len() > 128 {
+                return Err("display_name too long (max 128 chars)".to_string());
+            }
+        }
+        if let Some(bio) = &self.bio {
+            if bio.len() > 1024 {
+                return Err("bio too long (max 1024 chars)".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn dispute_raise_canonical_value(d: &DisputeRaise) -> Result<Value, String> {
+    let value = serde_json::to_value(d).map_err(|e| format!("dispute_raise to json: {e}"))?;
+    Ok(sort_json(value))
+}
+pub fn dispute_raise_canonical_bytes(d: &DisputeRaise) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&dispute_raise_canonical_value(d)?)
+        .map_err(|e| format!("dispute_raise serialize: {e}"))
+}
+pub fn dispute_evidence_canonical_value(d: &DisputeEvidence) -> Result<Value, String> {
+    let value = serde_json::to_value(d).map_err(|e| format!("dispute_evidence to json: {e}"))?;
+    Ok(sort_json(value))
+}
+pub fn dispute_evidence_canonical_bytes(d: &DisputeEvidence) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&dispute_evidence_canonical_value(d)?)
+        .map_err(|e| format!("dispute_evidence serialize: {e}"))
+}
+pub fn dispute_resolution_canonical_value(d: &DisputeResolution) -> Result<Value, String> {
+    let value = serde_json::to_value(d).map_err(|e| format!("dispute_resolution to json: {e}"))?;
+    Ok(sort_json(value))
+}
+pub fn dispute_resolution_canonical_bytes(d: &DisputeResolution) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&dispute_resolution_canonical_value(d)?)
+        .map_err(|e| format!("dispute_resolution serialize: {e}"))
+}
+pub fn resolver_registration_canonical_value(r: &ResolverRegistration) -> Result<Value, String> {
+    let value = serde_json::to_value(r).map_err(|e| format!("resolver_registration to json: {e}"))?;
+    Ok(sort_json(value))
+}
+pub fn resolver_registration_canonical_bytes(r: &ResolverRegistration) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&resolver_registration_canonical_value(r)?)
+        .map_err(|e| format!("resolver_registration serialize: {e}"))
+}
+
+#[cfg(test)]
+mod stage_3_1_tests {
+    use super::*;
+
+    fn otc_parties() -> (AgreementParty, AgreementParty) {
+        let buyer = AgreementParty {
+            party_id: "buyer".to_string(),
+            display_name: "Buyer".to_string(),
+            address: "Qbuyer".to_string(),
+            role: Some("buyer".to_string()),
+        };
+        let seller = AgreementParty {
+            party_id: "seller".to_string(),
+            display_name: "Seller".to_string(),
+            address: "Qseller".to_string(),
+            role: Some("seller".to_string()),
+        };
+        (buyer, seller)
+    }
+
+    fn build_test_otc() -> AgreementObject {
+        let (buyer, seller) = otc_parties();
+        build_otc_agreement(
+            "otc-stage31-test".to_string(),
+            1_700_000_000,
+            buyer,
+            seller,
+            500_000_000,
+            "IRM".to_string(),
+            "off-chain".to_string(),
+            120,
+            "ab".repeat(32),
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .expect("build_otc_agreement")
+    }
+
+    #[test]
+    fn agreement_without_resolver_fields_canonical_json_omits_them() {
+        let agreement = build_test_otc();
+        let canonical = agreement_canonical_value(&agreement).expect("canonical_value");
+        let json = serde_json::to_string(&canonical).expect("serialize");
+        assert!(!json.contains("primary_resolver"), "primary_resolver must be omitted when None");
+        assert!(!json.contains("fallback_resolver"), "fallback_resolver must be omitted when None");
+        assert!(!json.contains("primary_resolver_fee"), "primary_resolver_fee must be omitted when None");
+        assert!(!json.contains("fallback_resolver_fee"), "fallback_resolver_fee must be omitted when None");
+    }
+
+    #[test]
+    fn agreement_hash_stable_when_resolver_fields_set_to_none_explicitly() {
+        let mut a = build_test_otc();
+        let h1 = compute_agreement_hash_hex(&a).expect("hash1");
+        a.primary_resolver = None;
+        a.fallback_resolver = None;
+        a.primary_resolver_fee = None;
+        a.fallback_resolver_fee = None;
+        let h2 = compute_agreement_hash_hex(&a).expect("hash2");
+        assert_eq!(h1, h2, "explicit None must hash identically to absent");
+    }
+
+    #[test]
+    fn validate_rejects_resolver_fields_on_deposit_template() {
+        let (buyer, seller) = otc_parties();
+        let mut a = build_deposit_agreement(
+            "dep-stage31".to_string(),
+            1_700_000_000,
+            buyer,
+            seller,
+            500_000_000,
+            "purpose".to_string(),
+            "refundable".to_string(),
+            120,
+            "ab".repeat(32),
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .expect("build_deposit");
+        a.primary_resolver = Some("Qresolver".to_string());
+        a.primary_resolver_fee = Some(1_000_000);
+        let err = a.validate().expect_err("should reject");
+        assert!(err.contains("resolver fields are only allowed"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_otc_with_valid_primary_resolver() {
+        let mut a = build_test_otc();
+        a.primary_resolver = Some("Qresolver1".to_string());
+        a.primary_resolver_fee = Some(1_000_000);
+        a.validate().expect("should accept");
+    }
+
+    #[test]
+    fn validate_rejects_fallback_without_primary() {
+        let mut a = build_test_otc();
+        a.fallback_resolver = Some("Qresolver2".to_string());
+        a.fallback_resolver_fee = Some(500_000);
+        let err = a.validate().expect_err("should reject");
+        assert!(err.contains("fallback_resolver requires primary_resolver"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_fee_zero() {
+        let mut a = build_test_otc();
+        a.primary_resolver = Some("Qresolver".to_string());
+        a.primary_resolver_fee = Some(0);
+        let err = a.validate().expect_err("should reject");
+        assert!(err.contains("primary_resolver_fee must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_fee_geq_total_amount() {
+        let mut a = build_test_otc();
+        a.primary_resolver = Some("Qresolver".to_string());
+        a.primary_resolver_fee = Some(a.total_amount);
+        let err = a.validate().expect_err("should reject");
+        assert!(err.contains("primary_resolver_fee must be < total_amount"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_fallback_equal_primary() {
+        let mut a = build_test_otc();
+        a.primary_resolver = Some("QresolverSame".to_string());
+        a.primary_resolver_fee = Some(1_000_000);
+        a.fallback_resolver = Some("QresolverSame".to_string());
+        a.fallback_resolver_fee = Some(500_000);
+        let err = a.validate().expect_err("should reject");
+        assert!(err.contains("must differ"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_combined_fees_geq_total_amount() {
+        let mut a = build_test_otc();
+        let half = a.total_amount / 2;
+        a.primary_resolver = Some("Qprim".to_string());
+        a.primary_resolver_fee = Some(half);
+        a.fallback_resolver = Some("Qfall".to_string());
+        a.fallback_resolver_fee = Some(half);
+        let err = a.validate().expect_err("should reject");
+        assert!(err.contains("primary + fallback resolver fees must be < total_amount"), "got: {err}");
+    }
+
+    fn sample_signature_envelope() -> AgreementSignatureEnvelope {
+        AgreementSignatureEnvelope {
+            version: AGREEMENT_SIGNATURE_VERSION,
+            target_type: AgreementSignatureTargetType::Agreement,
+            target_hash: "11".repeat(32),
+            signer_public_key: "02".to_string() + &"aa".repeat(32),
+            signer_address: Some("Qsigner".to_string()),
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            timestamp: Some(1_700_000_000),
+            signer_role: Some("party".to_string()),
+            signature: "deadbeef".to_string(),
+        }
+    }
+
+    #[test]
+    fn dispute_raise_round_trip_validate() {
+        let d = DisputeRaise {
+            version: DISPUTE_RAISE_VERSION,
+            schema_id: Some(DISPUTE_RAISE_SCHEMA_ID.to_string()),
+            agreement_hash: "aa".repeat(32),
+            raising_party: "buyer".to_string(),
+            raised_at_height: 100,
+            raised_at_unix: 1_700_000_000,
+            reason: "buyer paid but seller refused release".to_string(),
+            initial_evidence_hash: "bb".repeat(32),
+            signature: sample_signature_envelope(),
+        };
+        d.validate().expect("validate");
+        let bytes = dispute_raise_canonical_bytes(&d).expect("canonical");
+        let parsed: DisputeRaise = serde_json::from_slice(&bytes).expect("parse");
+        assert_eq!(parsed, d);
+    }
+
+    #[test]
+    fn dispute_evidence_validate_rejects_unknown_type() {
+        let mut d = DisputeEvidence {
+            version: DISPUTE_EVIDENCE_VERSION,
+            schema_id: None,
+            agreement_hash: "aa".repeat(32),
+            submitter_party: "seller".to_string(),
+            submitted_at_height: 110,
+            evidence_type: "garbage".to_string(),
+            evidence_payload: "AAAA".to_string(),
+            evidence_hash: "cc".repeat(32),
+            message: None,
+            signature: sample_signature_envelope(),
+        };
+        let err = d.validate().expect_err("should reject");
+        assert!(err.contains("evidence_type"), "got: {err}");
+        d.evidence_type = "payment_proof".to_string();
+        d.validate().expect("now valid");
+    }
+
+    #[test]
+    fn dispute_resolution_validate_rejects_unknown_outcome() {
+        let mut d = DisputeResolution {
+            version: DISPUTE_RESOLUTION_VERSION,
+            schema_id: None,
+            agreement_hash: "aa".repeat(32),
+            resolver_address: "Qresolver".to_string(),
+            resolver_role: "primary".to_string(),
+            outcome: "split".to_string(),
+            resolved_at_height: 200,
+            message: "resolved".to_string(),
+            signature: sample_signature_envelope(),
+        };
+        let err = d.validate().expect_err("should reject");
+        assert!(err.contains("outcome must be"), "got: {err}");
+        d.outcome = "release".to_string();
+        d.validate().expect("now valid");
+    }
+
+    #[test]
+    fn resolver_registration_validate_rejects_bps_over_10000() {
+        let mut r = ResolverRegistration {
+            version: RESOLVER_REGISTRATION_VERSION,
+            schema_id: Some(RESOLVER_REGISTRATION_SCHEMA_ID.to_string()),
+            resolver_address: "Qresolver".to_string(),
+            registered_at_height: 10,
+            display_name: Some("Resolver One".to_string()),
+            bio: None,
+            fee_bps_self_quoted: Some(10_001),
+            signature: sample_signature_envelope(),
+        };
+        let err = r.validate().expect_err("should reject");
+        assert!(err.contains("fee_bps_self_quoted"), "got: {err}");
+        r.fee_bps_self_quoted = Some(500);
+        r.validate().expect("now valid");
+    }
+
+    #[test]
+    fn agreement_anchor_role_short_codes_round_trip() {
+        for role in [
+            AgreementAnchorRole::DisputeRaise,
+            AgreementAnchorRole::DisputeEvidence,
+            AgreementAnchorRole::DisputeResolve,
+            AgreementAnchorRole::ResolverRegister,
+        ] {
+            let code = role.short_code();
+            let parsed = AgreementAnchorRole::from_short_code(code).expect("parse");
+            assert_eq!(parsed, role);
+        }
+    }
+
+    #[test]
+    fn agreement_anchor_payload_dispute_raise_within_op_return_cap() {
+        let anchor = AgreementAnchor {
+            agreement_hash: "aa".repeat(32),
+            role: AgreementAnchorRole::DisputeRaise,
+            milestone_id: None,
+        };
+        let payload = build_agreement_anchor_payload(&anchor).expect("payload");
+        assert!(payload.len() <= 75, "OP_RETURN cap exceeded: {}", payload.len());
+        let txout = build_agreement_anchor_output(&anchor).expect("output");
+        assert_eq!(txout.value, 0);
+    }
 }

@@ -13031,6 +13031,10 @@ mod tests {
             invoice_reference: Some("INV-42".to_string()),
             external_reference: None,
             disputed_metadata_only: false,
+            primary_resolver: None,
+            fallback_resolver: None,
+            primary_resolver_fee: None,
+            fallback_resolver_fee: None,
         }
     }
 
