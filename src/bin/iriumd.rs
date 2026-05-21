@@ -61,9 +61,10 @@ use irium_node_rs::settlement::{
     AgreementAuditRecord, AgreementBundle, AgreementFundingLegRef, AgreementLifecycleView,
     AgreementLinkedTx, AgreementMilestoneStatus, AgreementObject, AgreementSignatureEnvelope,
     AgreementSummary, AgreementTemplateType, DisputeEvidence, DisputeRaise, DisputeResolution,
-    HoldbackEvaluationResult, MilestoneEvaluationResult, MilestoneSpec, PolicyOutcome, PolicyStore,
-    ProofPolicy, ProofStore, RequirementThresholdResult, ResolverRegistration, SettlementProof,
-    TemplateAttestor, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+    EscrowReceiptDisputeRef, EscrowReceiptProofRef, HoldbackEvaluationResult,
+    MilestoneEvaluationResult, MilestoneSpec, PolicyOutcome, PolicyStore, ProofPolicy, ProofStore,
+    RequirementThresholdResult, ResolverRegistration, SettlementProof, TemplateAttestor,
+    TxidWithHeight, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
     DisputeReResolverNomination,
     dispute_evidence_canonical_bytes, dispute_raise_canonical_bytes,
     dispute_reresolve_canonical_bytes, dispute_resolution_canonical_bytes,
@@ -856,6 +857,33 @@ struct AgreementMilestonesResponse {
     agreement_hash: String,
     state: String,
     milestones: Vec<AgreementMilestoneStatus>,
+}
+
+// GROUP F: GET /rpc/agreementreceipt?agreement_hash=<hex>
+// Query params + response shape. iriumd returns only on-chain-derivable
+// fields; the wallet enriches with its local AgreementObject (parties,
+// template_type, total_amount, per-milestone amounts) and signs the
+// final receipt.
+#[derive(Deserialize)]
+struct AgreementReceiptQuery {
+    agreement_hash: String,
+}
+
+#[derive(Serialize)]
+struct AgreementReceiptResponse {
+    agreement_hash: String,
+    tip_height: u64,
+    /// Best-effort state classification using only on-chain anchors.
+    /// Authoritative state (which knows per-milestone target amounts)
+    /// is computed wallet-side by overlaying the local AgreementObject.
+    final_state_hint: String,
+    funding_txids: Vec<TxidWithHeight>,
+    release_txids: Vec<TxidWithHeight>,
+    refund_txids: Vec<TxidWithHeight>,
+    resolved_height: Option<u64>,
+    linked_txs: Vec<AgreementLinkedTx>,
+    proofs: Vec<EscrowReceiptProofRef>,
+    dispute: Option<EscrowReceiptDisputeRef>,
 }
 
 #[derive(Deserialize)]
@@ -3832,6 +3860,46 @@ fn scan_agreement_linked_txs(
     txs
 }
 
+/// GROUP F: hash-only variant of scan_agreement_linked_txs. Used by the
+/// GET /rpc/agreementreceipt endpoint, which knows only the agreement
+/// hash (the wallet has the full AgreementObject locally). Returns all
+/// linked txs anchored to the hash with value=0; the wallet overlays
+/// agreement.milestones[].amount and agreement.total_amount to populate
+/// values in the final receipt. Sort order matches the AgreementObject
+/// variant (height descending, then txid, then milestone_id).
+fn scan_linked_txs_by_hash(
+    chain: &ChainState,
+    agreement_hash: &str,
+) -> Vec<AgreementLinkedTx> {
+    let mut txs = Vec::new();
+    for (height, block) in chain.chain.iter().enumerate() {
+        for tx in &block.transactions {
+            let txid = hex::encode(tx.txid());
+            for output in &tx.outputs {
+                if let Some(anchor) = parse_agreement_anchor(&output.script_pubkey) {
+                    if anchor.agreement_hash == agreement_hash {
+                        txs.push(AgreementLinkedTx {
+                            txid: txid.clone(),
+                            role: anchor.role,
+                            milestone_id: anchor.milestone_id.clone(),
+                            height: Some(height as u64),
+                            confirmed: true,
+                            value: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    txs.sort_by(|a, b| {
+        b.height
+            .cmp(&a.height)
+            .then_with(|| a.txid.cmp(&b.txid))
+            .then_with(|| a.milestone_id.cmp(&b.milestone_id))
+    });
+    txs
+}
+
 /// LAYER 3: lightweight chain scan answering "has any on-chain tx anchored
 /// this agreement hash yet?". Used by the offer-watcher to decide whether
 /// to relist a taken-but-unfunded offer once the grace window expires. Only
@@ -4608,6 +4676,118 @@ async fn agreement_milestones(
         agreement_hash,
         state: format!("{:?}", lifecycle.state).to_lowercase(),
         milestones: lifecycle.milestones,
+    }))
+}
+
+// GROUP F: GET /rpc/agreementreceipt?agreement_hash=<hex>
+// Returns on-chain-derivable receipt data. The wallet enriches with
+// the local AgreementObject (template_type / parties / total_amount /
+// per-milestone amounts) and signs before exporting.
+async fn agreement_receipt(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<AgreementReceiptQuery>,
+) -> Result<Json<AgreementReceiptResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let agreement_hash = q.agreement_hash.trim().to_string();
+    if agreement_hash.len() != 64 || !agreement_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (tip_height, linked_txs) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip = chain.tip_height();
+        let linked = scan_linked_txs_by_hash(&chain, &agreement_hash);
+        (tip, linked)
+    };
+    let to_txid_with_height = |t: &AgreementLinkedTx| TxidWithHeight {
+        txid: t.txid.clone(),
+        height: t.height,
+        milestone_id: t.milestone_id.clone(),
+        value: t.value,
+    };
+    let funding_txids: Vec<TxidWithHeight> = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Funding
+                    | AgreementAnchorRole::DepositLock
+                    | AgreementAnchorRole::OtcSettlement
+                    | AgreementAnchorRole::MerchantSettlement
+            )
+        })
+        .map(to_txid_with_height)
+        .collect();
+    let release_txids: Vec<TxidWithHeight> = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Release | AgreementAnchorRole::MilestoneRelease
+            )
+        })
+        .map(to_txid_with_height)
+        .collect();
+    let refund_txids: Vec<TxidWithHeight> = linked_txs
+        .iter()
+        .filter(|t| matches!(t.role, AgreementAnchorRole::Refund))
+        .map(to_txid_with_height)
+        .collect();
+    let resolved_height = release_txids
+        .iter()
+        .chain(refund_txids.iter())
+        .filter_map(|t| t.height)
+        .max();
+    let final_state_hint = if !refund_txids.is_empty() {
+        "refunded".to_string()
+    } else if !release_txids.is_empty() {
+        "released_or_partial".to_string()
+    } else if !funding_txids.is_empty() {
+        "funded".to_string()
+    } else {
+        "proposed".to_string()
+    };
+    let proofs: Vec<EscrowReceiptProofRef> = {
+        let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+        let heights = state.proof_heights.lock().unwrap_or_else(|e| e.into_inner());
+        store
+            .list_by_agreement(&agreement_hash)
+            .into_iter()
+            .map(|p| EscrowReceiptProofRef {
+                proof_id: p.proof_id.clone(),
+                proof_type: p.proof_type.clone(),
+                attestation_time: p.attestation_time,
+                anchored_at_height: heights.get(&p.proof_id).copied(),
+                anchor_txid: None,
+            })
+            .collect()
+    };
+    let dispute = {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&agreement_hash).and_then(|d| {
+            d.resolution.as_ref().map(|res| EscrowReceiptDisputeRef {
+                resolver_address: res.resolver_address.clone(),
+                resolver_role: res.resolver_role.clone(),
+                outcome: res.outcome.clone(),
+                resolved_at_height: res.resolved_at_height,
+                message_hash: hex::encode(Sha256::digest(res.message.as_bytes())),
+                anchor_txid: d.resolution_anchor_txid.clone(),
+            })
+        })
+    };
+    Ok(Json(AgreementReceiptResponse {
+        agreement_hash,
+        tip_height,
+        final_state_hint,
+        funding_txids,
+        release_txids,
+        refund_txids,
+        resolved_height,
+        linked_txs,
+        proofs,
+        dispute,
     }))
 }
 
@@ -9550,6 +9730,7 @@ async fn explorer_stats(
         .route("/rpc/agreementaudit", post(agreement_audit))
         .route("/rpc/agreementstatus", post(agreement_status))
         .route("/rpc/agreementmilestones", post(agreement_milestones))
+        .route("/rpc/agreementreceipt", get(agreement_receipt))
         .route("/rpc/verifyagreementlink", post(verify_agreement_link))
         .route(
             "/rpc/agreementreleaseeligibility",

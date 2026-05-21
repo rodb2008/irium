@@ -22,6 +22,13 @@ use irium_node_rs::settlement::{
     NoResponseTrigger, PolicyOutcome, ProofPolicy, ProofRequirement, ProofResolution,
     ProofSignatureEnvelope, SettlementProof, TypedProofPayload, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
     AGREEMENT_SIGNATURE_VERSION, PROOF_POLICY_SCHEMA_ID, SETTLEMENT_PROOF_SCHEMA_ID,
+    AgreementAnchorRole, AgreementEscrowReceipt, AgreementLifecycleState,
+    EscrowReceiptDisputeRef, EscrowReceiptProofRef, ExporterSignatureEnvelope,
+    TxidWithHeight, ESCROW_RECEIPT_SCHEMA_ID, ESCROW_RECEIPT_VERSION,
+    escrow_receipt_signing_digest, verify_escrow_receipt_signature,
+    build_escrow_receipt_unsigned,
+    AgreementLinkedTx as SettlementLinkedTx,
+    AgreementMilestoneStatus as SettlementMilestoneStatus,
     DisputeEvidence, DisputeRaise, DisputeReResolverNomination, DisputeResolution,
     ResolverRegistration,
     DISPUTE_EVIDENCE_SCHEMA_ID, DISPUTE_EVIDENCE_VERSION,
@@ -11467,6 +11474,430 @@ fn handle_invoice_import(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// GROUP F: GET /rpc/agreementreceipt response shape mirrors the iriumd
+// type. Fields with value=0 (hash-only scan can't know per-leg amounts)
+// are overlaid against the wallet's local AgreementObject by
+// overlay_linked_tx_values before the receipt is built.
+#[derive(Deserialize)]
+struct AgreementReceiptRpcResponse {
+    #[serde(default)]
+    agreement_hash: String,
+    #[serde(default)]
+    tip_height: u64,
+    #[serde(default)]
+    final_state_hint: String,
+    #[serde(default)]
+    funding_txids: Vec<TxidWithHeight>,
+    #[serde(default)]
+    release_txids: Vec<TxidWithHeight>,
+    #[serde(default)]
+    refund_txids: Vec<TxidWithHeight>,
+    #[serde(default)]
+    resolved_height: Option<u64>,
+    #[serde(default)]
+    linked_txs: Vec<SettlementLinkedTx>,
+    #[serde(default)]
+    proofs: Vec<EscrowReceiptProofRef>,
+    #[serde(default)]
+    dispute: Option<EscrowReceiptDisputeRef>,
+}
+
+// GROUP F (Q3): resolve the signing identity. If --address was supplied,
+// it must be both a party AND a key the wallet holds. Default: pick the
+// first party address that matches any wallet key. Returns the canonical
+// wallet address + compressed pubkey hex.
+fn resolve_exporter_address(
+    wallet: &WalletFile,
+    agreement: &AgreementObject,
+    explicit: Option<&str>,
+) -> Result<(String, String), String> {
+    let party_addrs: HashSet<&str> = agreement.parties.iter().map(|p| p.address.as_str()).collect();
+    if let Some(addr) = explicit {
+        if !party_addrs.contains(addr) {
+            let known: Vec<&String> = agreement.parties.iter().map(|p| &p.address).collect();
+            return Err(format!(
+                "--address {} is not a party to this agreement (parties: {:?})",
+                addr, known
+            ));
+        }
+        let key = find_key(wallet, addr).ok_or_else(|| {
+            format!("--address {} is a party but no matching wallet key found", addr)
+        })?;
+        return Ok((key.address.clone(), key.pubkey.clone()));
+    }
+    for p in agreement.parties.iter() {
+        if let Some(key) = find_key(wallet, &p.address) {
+            return Ok((key.address.clone(), key.pubkey.clone()));
+        }
+    }
+    let known: Vec<&String> = agreement.parties.iter().map(|p| &p.address).collect();
+    Err(format!(
+        "no wallet key matches any party address ({:?}). Specify --address explicitly.",
+        known
+    ))
+}
+
+// GROUP F: the iriumd hash-only scan emits value=0 because it doesn't
+// have the AgreementObject. The wallet does, so we overlay per-leg
+// amounts here. Milestone tx -> agreement.milestones[i].amount for the
+// matching milestone_id; DepositLock/CollateralLock -> deposit_rule
+// amount; everything else -> agreement.total_amount.
+fn overlay_linked_tx_values(
+    rpc: &[SettlementLinkedTx],
+    agreement: &AgreementObject,
+) -> Vec<SettlementLinkedTx> {
+    rpc.iter()
+        .map(|t| {
+            let value = if let Some(mid) = t.milestone_id.as_deref() {
+                agreement
+                    .milestones
+                    .iter()
+                    .find(|m| m.milestone_id == mid)
+                    .map(|m| m.amount)
+                    .unwrap_or(0)
+            } else {
+                match t.role {
+                    AgreementAnchorRole::DepositLock | AgreementAnchorRole::CollateralLock => {
+                        agreement
+                            .deposit_rule
+                            .as_ref()
+                            .map(|r| r.amount)
+                            .unwrap_or(agreement.total_amount)
+                    }
+                    _ => agreement.total_amount,
+                }
+            };
+            SettlementLinkedTx { value, ..t.clone() }
+        })
+        .collect()
+}
+
+// GROUP F: classify the agreement's final state purely from the
+// overlaid amounts plus the optional dispute ref. Mirrors the priority
+// order in settlement::derive_lifecycle so the receipt agrees with
+// /rpc/agreementstatus when both are queried.
+fn compute_final_state(
+    agreement: &AgreementObject,
+    funded: u64,
+    released: u64,
+    refunded: u64,
+    tip_height: u64,
+    dispute: &Option<EscrowReceiptDisputeRef>,
+) -> AgreementLifecycleState {
+    if agreement.disputed_metadata_only {
+        return AgreementLifecycleState::DisputedMetadataOnly;
+    }
+    if let Some(d) = dispute.as_ref() {
+        return match d.outcome.as_str() {
+            "release" => AgreementLifecycleState::Released,
+            "refund" => AgreementLifecycleState::Refunded,
+            _ => AgreementLifecycleState::Funded,
+        };
+    }
+    if refunded > 0 {
+        return AgreementLifecycleState::Refunded;
+    }
+    if released >= agreement.total_amount && released > 0 {
+        return AgreementLifecycleState::Released;
+    }
+    if released > 0 {
+        return AgreementLifecycleState::PartiallyReleased;
+    }
+    if funded > 0 {
+        let refund_timeout = agreement
+            .refund_conditions
+            .iter()
+            .map(|c| c.timeout_height)
+            .min()
+            .unwrap_or(u64::MAX);
+        if tip_height >= refund_timeout {
+            return AgreementLifecycleState::Expired;
+        }
+        return AgreementLifecycleState::Funded;
+    }
+    if agreement
+        .deadlines
+        .settlement_deadline
+        .map(|d| tip_height >= d)
+        .unwrap_or(false)
+    {
+        return AgreementLifecycleState::Expired;
+    }
+    AgreementLifecycleState::Proposed
+}
+
+fn handle_agreement_export_receipt(args: &[String]) -> Result<(), String> {
+    let mut agreement_hash: Option<String> = None;
+    let mut explicit_address: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut pretty = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement-hash" => {
+                agreement_hash =
+                    Some(parse_required_string_flag(args, &mut i, "--agreement-hash")?);
+            }
+            "--address" => {
+                explicit_address = Some(parse_required_string_flag(args, &mut i, "--address")?);
+            }
+            "--out" => {
+                out_path = Some(parse_required_string_flag(args, &mut i, "--out")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--pretty" => {
+                pretty = true;
+                i += 1;
+            }
+            "--json" => {
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let hash = agreement_hash.ok_or_else(|| "--agreement-hash is required".to_string())?;
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "--agreement-hash must be 64 hex chars, got: {}",
+            hash
+        ));
+    }
+
+    // 1. Load local AgreementObject (hard-fail if not present — wallet
+    //    needs template_type/parties/total_amount to enrich the receipt).
+    let stored = load_local_agreement_by_hash(&hash)?;
+    let agreement_value = stored.get("agreement").cloned().unwrap_or(stored);
+    let agreement: AgreementObject = serde_json::from_value(agreement_value)
+        .map_err(|e| format!("parse local agreement object: {e}"))?;
+
+    // 2. Fetch on-chain receipt data via GET /rpc/agreementreceipt.
+    let base = rpc_url.trim_end_matches('/');
+    let url = format!("{}/rpc/agreementreceipt?agreement_hash={}", base, hash);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let mut req = client.get(&url);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
+        .send()
+        .map_err(|e| format!("agreementreceipt request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "agreementreceipt request failed: {}",
+            resp.status()
+        ));
+    }
+    let rpc: AgreementReceiptRpcResponse = resp
+        .json()
+        .map_err(|e| format!("agreementreceipt parse: {e}"))?;
+
+    // 3. Resolve signing identity (Q3 enforced inside).
+    let wallet = ensure_wallet(&wallet_path())?;
+    let (signer_address, signer_pubkey_hex) =
+        resolve_exporter_address(&wallet, &agreement, explicit_address.as_deref())?;
+
+    // 4. Overlay per-leg amounts onto the value=0 linked_txs.
+    let linked_txs = overlay_linked_tx_values(&rpc.linked_txs, &agreement);
+
+    // 5. Sum amounts.
+    let funded_amount: u64 = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Funding
+                    | AgreementAnchorRole::DepositLock
+                    | AgreementAnchorRole::OtcSettlement
+                    | AgreementAnchorRole::MerchantSettlement
+            )
+        })
+        .map(|t| t.value)
+        .sum();
+    let released_amount: u64 = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Release | AgreementAnchorRole::MilestoneRelease
+            )
+        })
+        .map(|t| t.value)
+        .sum();
+    let refunded_amount: u64 = linked_txs
+        .iter()
+        .filter(|t| matches!(t.role, AgreementAnchorRole::Refund))
+        .map(|t| t.value)
+        .sum();
+
+    // 6. Build per-milestone status (Q4: mid-flight is fine; unfunded
+    //    milestones simply have funded=false).
+    let milestones: Vec<SettlementMilestoneStatus> = agreement
+        .milestones
+        .iter()
+        .map(|m| SettlementMilestoneStatus {
+            milestone_id: m.milestone_id.clone(),
+            title: m.title.clone(),
+            amount: m.amount,
+            funded: linked_txs.iter().any(|t| {
+                t.role == AgreementAnchorRole::Funding
+                    && t.milestone_id.as_deref() == Some(m.milestone_id.as_str())
+            }),
+            released: linked_txs.iter().any(|t| {
+                t.role == AgreementAnchorRole::MilestoneRelease
+                    && t.milestone_id.as_deref() == Some(m.milestone_id.as_str())
+            }),
+            refunded: linked_txs.iter().any(|t| {
+                t.role == AgreementAnchorRole::Refund
+                    && t.milestone_id.as_deref() == Some(m.milestone_id.as_str())
+            }),
+        })
+        .collect();
+
+    // 7. Build per-role txid arrays with overlaid values.
+    let funding_txids: Vec<TxidWithHeight> = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Funding
+                    | AgreementAnchorRole::DepositLock
+                    | AgreementAnchorRole::OtcSettlement
+                    | AgreementAnchorRole::MerchantSettlement
+            )
+        })
+        .map(|t| TxidWithHeight {
+            txid: t.txid.clone(),
+            height: t.height,
+            milestone_id: t.milestone_id.clone(),
+            value: t.value,
+        })
+        .collect();
+    let release_txids: Vec<TxidWithHeight> = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Release | AgreementAnchorRole::MilestoneRelease
+            )
+        })
+        .map(|t| TxidWithHeight {
+            txid: t.txid.clone(),
+            height: t.height,
+            milestone_id: t.milestone_id.clone(),
+            value: t.value,
+        })
+        .collect();
+    let refund_txids: Vec<TxidWithHeight> = linked_txs
+        .iter()
+        .filter(|t| matches!(t.role, AgreementAnchorRole::Refund))
+        .map(|t| TxidWithHeight {
+            txid: t.txid.clone(),
+            height: t.height,
+            milestone_id: t.milestone_id.clone(),
+            value: t.value,
+        })
+        .collect();
+    let resolved_height = release_txids
+        .iter()
+        .chain(refund_txids.iter())
+        .filter_map(|t| t.height)
+        .max();
+    let final_state = compute_final_state(
+        &agreement,
+        funded_amount,
+        released_amount,
+        refunded_amount,
+        rpc.tip_height,
+        &rpc.dispute,
+    );
+    let payer_address = agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == agreement.payer)
+        .map(|p| p.address.clone())
+        .unwrap_or_default();
+    let payee_address = agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == agreement.payee)
+        .map(|p| p.address.clone())
+        .unwrap_or_default();
+
+    // 8. Compose unsigned receipt.
+    let mut receipt = AgreementEscrowReceipt {
+        schema_id: ESCROW_RECEIPT_SCHEMA_ID.to_string(),
+        version: ESCROW_RECEIPT_VERSION,
+        agreement_id: agreement.agreement_id.clone(),
+        agreement_hash: hash.clone(),
+        template_type: agreement.template_type,
+        parties: agreement.parties.clone(),
+        payer_address,
+        payee_address,
+        total_amount: agreement.total_amount,
+        final_state,
+        funded_amount,
+        released_amount,
+        refunded_amount,
+        funding_txids,
+        release_txids,
+        refund_txids,
+        resolved_height,
+        milestones,
+        proofs: rpc.proofs,
+        dispute: rpc.dispute,
+        linked_txs,
+        export_timestamp: now_unix(),
+        exporter_address: signer_address.clone(),
+        exporter_pubkey_hex: signer_pubkey_hex.clone(),
+        exporter_signature: ExporterSignatureEnvelope {
+            version: ESCROW_RECEIPT_VERSION,
+            signer_public_key: signer_pubkey_hex.clone(),
+            signer_address: signer_address.clone(),
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            signature: String::new(),
+            payload_hash: String::new(),
+        },
+    };
+
+    // 9. Sign with secp256k1 over the canonical digest.
+    let digest = escrow_receipt_signing_digest(&receipt)?;
+    let (_key, signing_key) = signer_material_from_wallet(&signer_address)?;
+    let sig: Signature = signing_key
+        .sign_prehash(&digest)
+        .map_err(|e| format!("sign receipt: {e}"))?;
+    receipt.exporter_signature.signature = hex::encode(sig.to_bytes());
+    receipt.exporter_signature.payload_hash = hex::encode(digest);
+
+    // 10. Self-verify (catches programmer mistakes before writing).
+    verify_escrow_receipt_signature(&receipt)
+        .map_err(|e| format!("self-verify failed: {e}"))?;
+
+    // 11. Emit.
+    let serialized = if pretty {
+        serde_json::to_string_pretty(&receipt).map_err(|e| format!("serialize: {e}"))?
+    } else {
+        serde_json::to_string(&receipt).map_err(|e| format!("serialize: {e}"))?
+    };
+    if let Some(p) = out_path {
+        std::fs::write(&p, &serialized).map_err(|e| format!("write {}: {e}", p))?;
+        eprintln!(
+            "[ok] receipt written to {} ({} bytes, exporter={})",
+            p,
+            serialized.len(),
+            signer_address
+        );
+    } else {
+        println!("{}", serialized);
+    }
+    Ok(())
+}
+
 fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
     let mut agreement_ref: Option<String> = None;
     let mut out_path: Option<String> = None;
@@ -21581,6 +22012,286 @@ found true"
         assert_eq!(DEFAULT_DISPUTE_WINDOW_BLOCKS, 144);
     }
 
+    // ── GROUP F: escrow receipt export ───────────────────────────────────
+
+    fn group_f_make_agreement_with_parties() -> AgreementObject {
+        let mut agr = group_e_make_agreement(AgreementTemplateType::OtcSettlement, vec![]);
+        agr.parties = vec![
+            AgreementParty {
+                party_id: "buyer".to_string(),
+                display_name: "Buyer".to_string(),
+                address: "Qbuyer123".to_string(),
+                role: Some("buyer".to_string()),
+            },
+            AgreementParty {
+                party_id: "seller".to_string(),
+                display_name: "Seller".to_string(),
+                address: "Qseller456".to_string(),
+                role: Some("seller".to_string()),
+            },
+        ];
+        agr.payer = "seller".to_string();
+        agr.payee = "buyer".to_string();
+        agr
+    }
+
+    fn group_f_make_linked_tx(
+        txid: &str,
+        role: AgreementAnchorRole,
+        height: u64,
+        milestone_id: Option<&str>,
+    ) -> SettlementLinkedTx {
+        SettlementLinkedTx {
+            txid: txid.to_string(),
+            role,
+            milestone_id: milestone_id.map(String::from),
+            height: Some(height),
+            confirmed: true,
+            value: 0,
+        }
+    }
+
+    #[test]
+    fn group_f_overlay_linked_tx_values_uses_total_amount_for_non_milestone() {
+        let agr = group_f_make_agreement_with_parties();
+        let rpc = vec![group_f_make_linked_tx(
+            "aa",
+            AgreementAnchorRole::OtcSettlement,
+            100,
+            None,
+        )];
+        let out = overlay_linked_tx_values(&rpc, &agr);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].value, agr.total_amount);
+    }
+
+    #[test]
+    fn group_f_overlay_linked_tx_values_uses_per_milestone_amount() {
+        let milestones = vec![
+            irium_node_rs::settlement::AgreementMilestone {
+                milestone_id: "m1".to_string(),
+                title: "M1".to_string(),
+                amount: 400,
+                recipient_address: "R".to_string(),
+                refund_address: "B".to_string(),
+                secret_hash_hex: "00".repeat(32),
+                timeout_height: 1000,
+                metadata_hash: None,
+            },
+            irium_node_rs::settlement::AgreementMilestone {
+                milestone_id: "m2".to_string(),
+                title: "M2".to_string(),
+                amount: 600,
+                recipient_address: "R".to_string(),
+                refund_address: "B".to_string(),
+                secret_hash_hex: "11".repeat(32),
+                timeout_height: 2000,
+                metadata_hash: None,
+            },
+        ];
+        let mut agr =
+            group_e_make_agreement(AgreementTemplateType::MilestoneSettlement, milestones);
+        agr.total_amount = 1000;
+        let rpc = vec![
+            group_f_make_linked_tx("aa", AgreementAnchorRole::Funding, 100, Some("m1")),
+            group_f_make_linked_tx("bb", AgreementAnchorRole::Funding, 101, Some("m2")),
+        ];
+        let out = overlay_linked_tx_values(&rpc, &agr);
+        assert_eq!(out[0].value, 400);
+        assert_eq!(out[1].value, 600);
+    }
+
+    #[test]
+    fn group_f_compute_final_state_funded_only() {
+        let agr = group_f_make_agreement_with_parties();
+        let state = compute_final_state(&agr, 1_000_000, 0, 0, 100, &None);
+        assert!(matches!(state, AgreementLifecycleState::Funded));
+    }
+
+    #[test]
+    fn group_f_compute_final_state_released_full() {
+        let agr = group_f_make_agreement_with_parties();
+        let state = compute_final_state(&agr, 1_000_000, 1_000_000, 0, 100, &None);
+        assert!(matches!(state, AgreementLifecycleState::Released));
+    }
+
+    #[test]
+    fn group_f_compute_final_state_dispute_resolution_release() {
+        let agr = group_f_make_agreement_with_parties();
+        let dispute = Some(EscrowReceiptDisputeRef {
+            resolver_address: "Qresolver".to_string(),
+            resolver_role: "primary".to_string(),
+            outcome: "release".to_string(),
+            resolved_at_height: 200,
+            message_hash: "00".repeat(32),
+            anchor_txid: Some("cc".to_string()),
+        });
+        let state = compute_final_state(&agr, 1_000_000, 0, 0, 200, &dispute);
+        assert!(matches!(state, AgreementLifecycleState::Released));
+    }
+
+    #[test]
+    fn group_f_resolve_exporter_address_rejects_non_party() {
+        let wallet = WalletFile {
+            version: 1,
+            seed_hex: None,
+            bip32_seed: None,
+            mnemonic: None,
+            next_index: 0,
+            keys: vec![WalletKey {
+                address: "Qnotaparty".to_string(),
+                pkh: "00".repeat(20),
+                pubkey: "03".to_string() + &"aa".repeat(32),
+                privkey: "11".repeat(32),
+            }],
+        };
+        let agr = group_f_make_agreement_with_parties();
+        let result =
+            resolve_exporter_address(&wallet, &agr, Some("Qnotaparty"));
+        assert!(result.is_err(), "non-party address must be rejected");
+        assert!(
+            result.unwrap_err().contains("not a party"),
+            "error message should mention non-party"
+        );
+    }
+
+    #[test]
+    fn group_f_resolve_exporter_address_party_without_key_rejected() {
+        let wallet = WalletFile {
+            version: 1,
+            seed_hex: None,
+            bip32_seed: None,
+            mnemonic: None,
+            next_index: 0,
+            keys: vec![],
+        };
+        let agr = group_f_make_agreement_with_parties();
+        let result = resolve_exporter_address(&wallet, &agr, None);
+        assert!(result.is_err(), "no matching key must be rejected");
+        assert!(
+            result.unwrap_err().contains("no wallet key matches"),
+            "error message should mention no matching key"
+        );
+    }
+
+    #[test]
+    fn group_f_escrow_receipt_sign_verify_roundtrip() {
+        // Generate a fresh secp256k1 key without touching the wallet
+        // file system, then sign+verify a synthetic receipt end to end.
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        let mut rng_bytes = [0u8; 32];
+        for (i, b) in rng_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(11);
+        }
+        let signing_key = SigningKey::from_slice(&rng_bytes).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let pubkey_hex = hex::encode(verifying_key.to_encoded_point(true).as_bytes());
+
+        let agr = group_f_make_agreement_with_parties();
+        let mut receipt = AgreementEscrowReceipt {
+            schema_id: ESCROW_RECEIPT_SCHEMA_ID.to_string(),
+            version: ESCROW_RECEIPT_VERSION,
+            agreement_id: agr.agreement_id.clone(),
+            agreement_hash: "ab".repeat(32),
+            template_type: agr.template_type,
+            parties: agr.parties.clone(),
+            payer_address: "Qseller456".to_string(),
+            payee_address: "Qbuyer123".to_string(),
+            total_amount: agr.total_amount,
+            final_state: AgreementLifecycleState::Funded,
+            funded_amount: agr.total_amount,
+            released_amount: 0,
+            refunded_amount: 0,
+            funding_txids: vec![TxidWithHeight {
+                txid: "cd".repeat(32),
+                height: Some(100),
+                milestone_id: None,
+                value: agr.total_amount,
+            }],
+            release_txids: vec![],
+            refund_txids: vec![],
+            resolved_height: None,
+            milestones: vec![],
+            proofs: vec![],
+            dispute: None,
+            linked_txs: vec![],
+            export_timestamp: 1_700_000_000,
+            exporter_address: "Qbuyer123".to_string(),
+            exporter_pubkey_hex: pubkey_hex.clone(),
+            exporter_signature: ExporterSignatureEnvelope {
+                version: ESCROW_RECEIPT_VERSION,
+                signer_public_key: pubkey_hex.clone(),
+                signer_address: "Qbuyer123".to_string(),
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                signature: String::new(),
+                payload_hash: String::new(),
+            },
+        };
+        let digest = escrow_receipt_signing_digest(&receipt).unwrap();
+        let sig: Signature = signing_key.sign_prehash(&digest).unwrap();
+        receipt.exporter_signature.signature = hex::encode(sig.to_bytes());
+        receipt.exporter_signature.payload_hash = hex::encode(digest);
+
+        verify_escrow_receipt_signature(&receipt).expect("self-verify must succeed");
+
+        // Tamper with one field and verify must fail.
+        let mut tampered = receipt.clone();
+        tampered.total_amount += 1;
+        assert!(
+            verify_escrow_receipt_signature(&tampered).is_err(),
+            "tampered receipt must fail verification"
+        );
+    }
+
+    #[test]
+    fn group_f_receipt_canonical_bytes_clear_signature_fields() {
+        // The signing input must not include signature/payload_hash, so
+        // changing them post-sign should NOT change the canonical digest.
+        let agr = group_f_make_agreement_with_parties();
+        let make_receipt = |sig: &str, payload: &str| AgreementEscrowReceipt {
+            schema_id: ESCROW_RECEIPT_SCHEMA_ID.to_string(),
+            version: ESCROW_RECEIPT_VERSION,
+            agreement_id: agr.agreement_id.clone(),
+            agreement_hash: "ab".repeat(32),
+            template_type: agr.template_type,
+            parties: agr.parties.clone(),
+            payer_address: "Qseller456".to_string(),
+            payee_address: "Qbuyer123".to_string(),
+            total_amount: agr.total_amount,
+            final_state: AgreementLifecycleState::Funded,
+            funded_amount: 1_000_000,
+            released_amount: 0,
+            refunded_amount: 0,
+            funding_txids: vec![],
+            release_txids: vec![],
+            refund_txids: vec![],
+            resolved_height: None,
+            milestones: vec![],
+            proofs: vec![],
+            dispute: None,
+            linked_txs: vec![],
+            export_timestamp: 1_700_000_000,
+            exporter_address: "Qbuyer123".to_string(),
+            exporter_pubkey_hex: "03".to_string() + &"aa".repeat(32),
+            exporter_signature: ExporterSignatureEnvelope {
+                version: ESCROW_RECEIPT_VERSION,
+                signer_public_key: "03".to_string() + &"aa".repeat(32),
+                signer_address: "Qbuyer123".to_string(),
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                signature: sig.to_string(),
+                payload_hash: payload.to_string(),
+            },
+        };
+        let d1 = escrow_receipt_signing_digest(&make_receipt("", "")).unwrap();
+        let d2 =
+            escrow_receipt_signing_digest(&make_receipt(&"ff".repeat(32), &"ee".repeat(32)))
+                .unwrap();
+        assert_eq!(
+            d1, d2,
+            "signing digest must be independent of signature / payload_hash fields"
+        );
+    }
+
     #[test]
     fn offer_create_sets_seller_pubkey_when_wallet_has_address() {
         // seller_pubkey is populated when resolve_attestor_pubkey_hex succeeds.
@@ -27488,6 +28199,12 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "agreement-pack" => {
             if let Err(e) = handle_agreement_pack(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-export-receipt" => {
+            if let Err(e) = handle_agreement_export_receipt(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }

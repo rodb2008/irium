@@ -304,6 +304,315 @@ pub struct AgreementLifecycleView {
     pub trust_model_note: String,
 }
 
+// ============================================================
+// GROUP F: Escrow Receipt — signed snapshot export
+// ============================================================
+
+pub const ESCROW_RECEIPT_SCHEMA_ID: &str = "irium.escrow_receipt.v1";
+pub const ESCROW_RECEIPT_VERSION: u32 = 1;
+
+/// Per-tx reference inside an escrow receipt. Carries the txid plus
+/// the height at which it was confirmed and (for milestone templates)
+/// the milestone_id, so a single receipt can describe N funding /
+/// release / refund legs without flattening them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxidWithHeight {
+    pub txid: String,
+    #[serde(default)]
+    pub height: Option<u64>,
+    #[serde(default)]
+    pub milestone_id: Option<String>,
+    pub value: u64,
+}
+
+/// Proof reference carried in a receipt. Only the minimal proof
+/// metadata is exported - the full evidence payload remains in the
+/// proof store and is referenced by proof_id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EscrowReceiptProofRef {
+    pub proof_id: String,
+    pub proof_type: String,
+    pub attestation_time: u64,
+    #[serde(default)]
+    pub anchored_at_height: Option<u64>,
+    #[serde(default)]
+    pub anchor_txid: Option<String>,
+}
+
+/// Dispute reference carried in a receipt. The full resolution message
+/// is replaced with its SHA-256 hash so the receipt does not leak the
+/// resolver's private rationale - the message remains in iriumd's
+/// dispute store for the parties to inspect separately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EscrowReceiptDisputeRef {
+    pub resolver_address: String,
+    pub resolver_role: String,
+    pub outcome: String,
+    pub resolved_at_height: u64,
+    pub message_hash: String,
+    #[serde(default)]
+    pub anchor_txid: Option<String>,
+}
+
+/// Signature envelope attached by the exporter (a party to the
+/// agreement) to a finished escrow receipt. Distinct from
+/// AgreementSignatureEnvelope because the receipt has no
+/// target_type/target_hash semantics - it signs the canonical receipt
+/// bytes directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExporterSignatureEnvelope {
+    pub version: u32,
+    pub signer_public_key: String,
+    pub signer_address: String,
+    pub signature_type: String,
+    /// Hex-encoded 64-byte secp256k1 signature. Cleared during canonical
+    /// serialization so signing/verifying are deterministic.
+    pub signature: String,
+    /// Hex-encoded SHA-256 of the canonical receipt bytes used as
+    /// signing input. Cleared during canonical serialization.
+    pub payload_hash: String,
+}
+
+/// Signed, exportable snapshot of an agreement's full on-chain story.
+/// Field set is fixed by the GROUP F spec; deposit-template receipts
+/// simply omit some funding/release fields. Schema bumps go through
+/// ESCROW_RECEIPT_SCHEMA_ID + ESCROW_RECEIPT_VERSION.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementEscrowReceipt {
+    pub schema_id: String,
+    pub version: u32,
+    pub agreement_id: String,
+    pub agreement_hash: String,
+    pub template_type: AgreementTemplateType,
+    pub parties: Vec<AgreementParty>,
+    pub payer_address: String,
+    pub payee_address: String,
+    pub total_amount: u64,
+    pub final_state: AgreementLifecycleState,
+    pub funded_amount: u64,
+    pub released_amount: u64,
+    pub refunded_amount: u64,
+    #[serde(default)]
+    pub funding_txids: Vec<TxidWithHeight>,
+    #[serde(default)]
+    pub release_txids: Vec<TxidWithHeight>,
+    #[serde(default)]
+    pub refund_txids: Vec<TxidWithHeight>,
+    #[serde(default)]
+    pub resolved_height: Option<u64>,
+    #[serde(default)]
+    pub milestones: Vec<AgreementMilestoneStatus>,
+    #[serde(default)]
+    pub proofs: Vec<EscrowReceiptProofRef>,
+    #[serde(default)]
+    pub dispute: Option<EscrowReceiptDisputeRef>,
+    pub linked_txs: Vec<AgreementLinkedTx>,
+    pub export_timestamp: u64,
+    pub exporter_address: String,
+    pub exporter_pubkey_hex: String,
+    pub exporter_signature: ExporterSignatureEnvelope,
+}
+
+/// Build an unsigned escrow receipt by joining the local AgreementObject
+/// with chain-observed lifecycle data, proofs (with optional anchor
+/// info) and an optional dispute resolution (with optional anchor info).
+/// The returned receipt has an empty exporter_signature.signature /
+/// payload_hash; callers fill them via escrow_receipt_signing_digest +
+/// secp256k1 sign before serializing.
+pub fn build_escrow_receipt_unsigned(
+    agreement: &AgreementObject,
+    agreement_hash: &str,
+    lifecycle: &AgreementLifecycleView,
+    proofs: &[(SettlementProof, Option<(u64, Option<String>)>)],
+    dispute: Option<(&DisputeResolution, Option<String>)>,
+    exporter_address: &str,
+    exporter_pubkey_hex: &str,
+    export_timestamp: u64,
+) -> AgreementEscrowReceipt {
+    let funding_txids: Vec<TxidWithHeight> = lifecycle
+        .linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Funding
+                    | AgreementAnchorRole::DepositLock
+                    | AgreementAnchorRole::OtcSettlement
+                    | AgreementAnchorRole::MerchantSettlement
+            )
+        })
+        .map(|t| TxidWithHeight {
+            txid: t.txid.clone(),
+            height: t.height,
+            milestone_id: t.milestone_id.clone(),
+            value: t.value,
+        })
+        .collect();
+    let release_txids: Vec<TxidWithHeight> = lifecycle
+        .linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Release | AgreementAnchorRole::MilestoneRelease
+            )
+        })
+        .map(|t| TxidWithHeight {
+            txid: t.txid.clone(),
+            height: t.height,
+            milestone_id: t.milestone_id.clone(),
+            value: t.value,
+        })
+        .collect();
+    let refund_txids: Vec<TxidWithHeight> = lifecycle
+        .linked_txs
+        .iter()
+        .filter(|t| matches!(t.role, AgreementAnchorRole::Refund))
+        .map(|t| TxidWithHeight {
+            txid: t.txid.clone(),
+            height: t.height,
+            milestone_id: t.milestone_id.clone(),
+            value: t.value,
+        })
+        .collect();
+    let resolved_height = release_txids
+        .iter()
+        .chain(refund_txids.iter())
+        .filter_map(|t| t.height)
+        .max();
+    let payer_address = agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == agreement.payer)
+        .map(|p| p.address.clone())
+        .unwrap_or_default();
+    let payee_address = agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == agreement.payee)
+        .map(|p| p.address.clone())
+        .unwrap_or_default();
+    let proof_refs: Vec<EscrowReceiptProofRef> = proofs
+        .iter()
+        .map(|(p, anchor)| EscrowReceiptProofRef {
+            proof_id: p.proof_id.clone(),
+            proof_type: p.proof_type.clone(),
+            attestation_time: p.attestation_time,
+            anchored_at_height: anchor.as_ref().map(|(h, _)| *h),
+            anchor_txid: anchor.as_ref().and_then(|(_, t)| t.clone()),
+        })
+        .collect();
+    let dispute_ref = dispute.map(|(r, anchor_txid)| {
+        let message_hash = hex::encode(Sha256::digest(r.message.as_bytes()));
+        EscrowReceiptDisputeRef {
+            resolver_address: r.resolver_address.clone(),
+            resolver_role: r.resolver_role.clone(),
+            outcome: r.outcome.clone(),
+            resolved_at_height: r.resolved_at_height,
+            message_hash,
+            anchor_txid,
+        }
+    });
+    AgreementEscrowReceipt {
+        schema_id: ESCROW_RECEIPT_SCHEMA_ID.to_string(),
+        version: ESCROW_RECEIPT_VERSION,
+        agreement_id: agreement.agreement_id.clone(),
+        agreement_hash: agreement_hash.to_string(),
+        template_type: agreement.template_type,
+        parties: agreement.parties.clone(),
+        payer_address,
+        payee_address,
+        total_amount: agreement.total_amount,
+        final_state: lifecycle.state,
+        funded_amount: lifecycle.funded_amount,
+        released_amount: lifecycle.released_amount,
+        refunded_amount: lifecycle.refunded_amount,
+        funding_txids,
+        release_txids,
+        refund_txids,
+        resolved_height,
+        milestones: lifecycle.milestones.clone(),
+        proofs: proof_refs,
+        dispute: dispute_ref,
+        linked_txs: lifecycle.linked_txs.clone(),
+        export_timestamp,
+        exporter_address: exporter_address.to_string(),
+        exporter_pubkey_hex: exporter_pubkey_hex.to_string(),
+        exporter_signature: ExporterSignatureEnvelope {
+            version: ESCROW_RECEIPT_VERSION,
+            signer_public_key: exporter_pubkey_hex.to_string(),
+            signer_address: exporter_address.to_string(),
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            signature: String::new(),
+            payload_hash: String::new(),
+        },
+    }
+}
+
+/// Canonical receipt bytes for signing/verification. Clears the
+/// exporter_signature.signature and .payload_hash fields, serializes
+/// with sorted keys, and returns the deterministic byte vector.
+pub fn escrow_receipt_canonical_bytes(
+    receipt: &AgreementEscrowReceipt,
+) -> Result<Vec<u8>, String> {
+    let mut canon = receipt.clone();
+    canon.exporter_signature.signature.clear();
+    canon.exporter_signature.payload_hash.clear();
+    let value =
+        serde_json::to_value(&canon).map_err(|e| format!("escrow receipt to json: {e}"))?;
+    let sorted = sort_json(value);
+    serde_json::to_vec(&sorted).map_err(|e| format!("escrow receipt canonical serialize: {e}"))
+}
+
+/// SHA-256 of the canonical receipt bytes. The 32-byte digest is the
+/// secp256k1 signing input.
+pub fn escrow_receipt_signing_digest(
+    receipt: &AgreementEscrowReceipt,
+) -> Result<[u8; 32], String> {
+    let bytes = escrow_receipt_canonical_bytes(receipt)?;
+    let digest = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+/// Verify an escrow receipt's exporter_signature against its canonical
+/// digest. Returns Err if the schema_id/version is wrong, the signature
+/// is malformed, or the secp256k1 verification fails. Does NOT
+/// re-validate chain claims - the receipt is a signed snapshot, not a
+/// substitute for chain access.
+pub fn verify_escrow_receipt_signature(
+    receipt: &AgreementEscrowReceipt,
+) -> Result<(), String> {
+    if receipt.schema_id != ESCROW_RECEIPT_SCHEMA_ID {
+        return Err(format!(
+            "unsupported escrow_receipt schema_id {}",
+            receipt.schema_id
+        ));
+    }
+    if receipt.version != ESCROW_RECEIPT_VERSION {
+        return Err(format!(
+            "unsupported escrow_receipt version {}",
+            receipt.version
+        ));
+    }
+    if receipt.exporter_signature.signature.is_empty() {
+        return Err("exporter_signature.signature is empty".to_string());
+    }
+    let digest = escrow_receipt_signing_digest(receipt)?;
+    let pubkey_bytes = hex::decode(&receipt.exporter_signature.signer_public_key)
+        .map_err(|_| "exporter signer_public_key must be hex".to_string())?;
+    let verifying_key = VerifyingKey::from_sec1_bytes(&pubkey_bytes)
+        .map_err(|_| "exporter signer_public_key must be valid secp256k1 SEC1".to_string())?;
+    let sig_bytes = hex::decode(&receipt.exporter_signature.signature)
+        .map_err(|_| "exporter signature must be 64-byte hex".to_string())?;
+    let parsed = Signature::from_slice(&sig_bytes)
+        .map_err(|_| "exporter signature must be 64-byte hex".to_string())?;
+    verifying_key
+        .verify_prehash(&digest, &parsed)
+        .map_err(|_| "exporter signature verification failed".to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettlementFundingLeg {
     pub role: AgreementAnchorRole,
@@ -11104,6 +11413,155 @@ mod stage_3_1_tests {
         assert!(
             err.contains("amount"),
             "null value must count as missing, got: {err}"
+        );
+    }
+
+    // ── GROUP F: escrow receipt ────────────────────────────────────────
+
+    fn group_f_synthetic_lifecycle(agreement_hash: &str) -> AgreementLifecycleView {
+        AgreementLifecycleView {
+            state: AgreementLifecycleState::Funded,
+            agreement_hash: agreement_hash.to_string(),
+            funded_amount: 500_000_000,
+            released_amount: 0,
+            refunded_amount: 0,
+            milestones: vec![],
+            linked_txs: vec![AgreementLinkedTx {
+                txid: "cd".repeat(32),
+                role: AgreementAnchorRole::OtcSettlement,
+                milestone_id: None,
+                height: Some(101),
+                confirmed: true,
+                value: 500_000_000,
+            }],
+            trust_model_note: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn group_f_build_escrow_receipt_unsigned_carries_chain_data() {
+        let agreement = build_test_otc();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = group_f_synthetic_lifecycle(&hash);
+        let receipt = build_escrow_receipt_unsigned(
+            &agreement,
+            &hash,
+            &lifecycle,
+            &[],
+            None,
+            "Qbuyer",
+            "03aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            1_700_000_001,
+        );
+        assert_eq!(receipt.schema_id, ESCROW_RECEIPT_SCHEMA_ID);
+        assert_eq!(receipt.version, ESCROW_RECEIPT_VERSION);
+        assert_eq!(receipt.agreement_hash, hash);
+        assert_eq!(receipt.funding_txids.len(), 1);
+        assert_eq!(receipt.funding_txids[0].txid, "cd".repeat(32));
+        assert_eq!(receipt.funding_txids[0].value, 500_000_000);
+        assert_eq!(receipt.funded_amount, 500_000_000);
+        assert!(receipt.exporter_signature.signature.is_empty());
+        assert!(receipt.exporter_signature.payload_hash.is_empty());
+        assert_eq!(receipt.exporter_address, "Qbuyer");
+    }
+
+    #[test]
+    fn group_f_escrow_receipt_canonical_clears_signature_and_payload_hash() {
+        let agreement = build_test_otc();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = group_f_synthetic_lifecycle(&hash);
+        let mut receipt = build_escrow_receipt_unsigned(
+            &agreement,
+            &hash,
+            &lifecycle,
+            &[],
+            None,
+            "Qbuyer",
+            "03aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            1_700_000_001,
+        );
+        let bytes_empty = escrow_receipt_canonical_bytes(&receipt).unwrap();
+        receipt.exporter_signature.signature = "ff".repeat(32);
+        receipt.exporter_signature.payload_hash = "ee".repeat(32);
+        let bytes_filled = escrow_receipt_canonical_bytes(&receipt).unwrap();
+        assert_eq!(
+            bytes_empty, bytes_filled,
+            "canonical bytes must be independent of signature/payload_hash"
+        );
+    }
+
+    #[test]
+    fn group_f_escrow_receipt_dispute_message_hashed_not_leaked() {
+        let agreement = build_test_otc();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = group_f_synthetic_lifecycle(&hash);
+        let secret_msg =
+            "RESOLVER PRIVATE NOTE — do not leak in exported receipts.";
+        let dispute = DisputeResolution {
+            version: DISPUTE_RESOLUTION_VERSION,
+            schema_id: None,
+            agreement_hash: hash.clone(),
+            resolver_address: "Qresolver".to_string(),
+            resolver_role: "primary".to_string(),
+            outcome: "release".to_string(),
+            resolved_at_height: 250,
+            message: secret_msg.to_string(),
+            signature: AgreementSignatureEnvelope {
+                version: AGREEMENT_SIGNATURE_VERSION,
+                target_type: AgreementSignatureTargetType::Agreement,
+                target_hash: hash.clone(),
+                signer_public_key: "03".to_string() + &"aa".repeat(32),
+                signer_address: Some("Qresolver".to_string()),
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                timestamp: None,
+                signer_role: Some("resolver".to_string()),
+                signature: "00".repeat(64),
+            },
+        };
+        let receipt = build_escrow_receipt_unsigned(
+            &agreement,
+            &hash,
+            &lifecycle,
+            &[],
+            Some((&dispute, Some("aa".repeat(32)))),
+            "Qbuyer",
+            "03aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            1_700_000_001,
+        );
+        let dref = receipt.dispute.as_ref().expect("dispute ref must be present");
+        let expected_hash = hex::encode(Sha256::digest(secret_msg.as_bytes()));
+        assert_eq!(dref.message_hash, expected_hash);
+        let canonical = String::from_utf8(escrow_receipt_canonical_bytes(&receipt).unwrap())
+            .unwrap();
+        assert!(
+            !canonical.contains("PRIVATE NOTE"),
+            "raw dispute message must NOT appear in canonical receipt bytes"
+        );
+        assert_eq!(dref.outcome, "release");
+        assert_eq!(dref.resolver_address, "Qresolver");
+    }
+
+    #[test]
+    fn group_f_verify_escrow_receipt_rejects_wrong_schema_id() {
+        let agreement = build_test_otc();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = group_f_synthetic_lifecycle(&hash);
+        let mut receipt = build_escrow_receipt_unsigned(
+            &agreement,
+            &hash,
+            &lifecycle,
+            &[],
+            None,
+            "Qbuyer",
+            "03aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            1_700_000_001,
+        );
+        receipt.schema_id = "bogus.schema".to_string();
+        receipt.exporter_signature.signature = "ab".repeat(32);
+        let err = verify_escrow_receipt_signature(&receipt).unwrap_err();
+        assert!(
+            err.contains("schema_id"),
+            "wrong schema_id must be rejected, got: {err}"
         );
     }
 }
