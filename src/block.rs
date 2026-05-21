@@ -119,6 +119,23 @@ impl BlockHeader {
         h
     }
 
+    /// Read the prev_hash field from raw 80-byte header bytes WITHOUT knowing
+    /// the block's height. Safe because the prev_hash byte-order convention is
+    /// the SAME pre and post fork (wire = natural order, stored = display order
+    /// which is `reverse(wire)`). Used by P2P sync to look up the parent block
+    /// in the chain and derive the height before doing a full height-aware
+    /// deserialize of the rest of the header.
+    #[allow(dead_code)]
+    pub fn peek_prev_hash(raw: &[u8]) -> Result<[u8; 32], String> {
+        if raw.len() < 36 {
+            return Err("header too short to peek prev_hash".to_string());
+        }
+        let mut prev = [0u8; 32];
+        prev.copy_from_slice(&raw[4..36]);
+        prev.reverse();
+        Ok(prev)
+    }
+
     /// Deserialize a header from the 80-byte compact encoding using the
     /// byte-order convention valid at `height`. Mirror of
     /// `serialize_for_height`: pre-activation reverses both prev_hash and
@@ -237,6 +254,51 @@ impl Block {
     #[allow(dead_code)]
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = self.header.serialize();
+        if let Some(ap) = &self.auxpow {
+            out.extend_from_slice(&crate::auxpow::serialize(ap));
+        }
+        for tx in &self.transactions {
+            out.extend_from_slice(&tx.serialize());
+        }
+        out
+    }
+
+    /// Deserialize a block using the byte-order convention valid at `height`.
+    /// Mirror of `BlockHeader::deserialize_for_height` — only the 80-byte
+    /// header parsing depends on height; the AuxPoW and transaction sections
+    /// are byte-for-byte invariant across the fork.
+    #[allow(dead_code)]
+    pub fn deserialize_for_height(raw: &[u8], height: u64) -> Result<(Self, usize), String> {
+        let (header, mut offset) = BlockHeader::deserialize_for_height(raw, height)?;
+
+        let auxpow = if header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 {
+            Some(crate::auxpow::deserialize(raw, &mut offset)?)
+        } else {
+            None
+        };
+
+        let mut txs = Vec::new();
+        while offset < raw.len() {
+            let tx = crate::tx::decode_full_tx_at(raw, &mut offset)?;
+            txs.push(tx);
+        }
+
+        Ok((
+            Block {
+                header,
+                transactions: txs,
+                auxpow,
+            },
+            offset,
+        ))
+    }
+
+    /// Serialize the block using the byte-order convention valid at `height`.
+    /// Header bytes vary per `serialize_for_height`; tx and AuxPoW sections
+    /// are unchanged across the fork.
+    #[allow(dead_code)]
+    pub fn serialize_for_height(&self, height: u64) -> Vec<u8> {
+        let mut out = self.header.serialize_for_height(height);
         if let Some(ap) = &self.auxpow {
             out.extend_from_slice(&crate::auxpow::serialize(ap));
         }

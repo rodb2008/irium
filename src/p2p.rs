@@ -3808,8 +3808,31 @@ impl P2PNode {
     }
 
     pub async fn broadcast_block(&self, block_bytes: &[u8]) -> Result<(), String> {
-        let (block, _) = Block::deserialize(block_bytes)?;
-        let block_hash = block.header.hash();
+        // Peek prev_hash from the raw bytes (fork-invariant byte order), look
+        // up parent in our chain to derive block_height, then do the full
+        // height-aware deserialize. Required so the merkle_root byte order
+        // decodes correctly at/post the height-30000 hard fork. Pre-fork
+        // heights produce identical bytes to the pre-Fix-2a behavior.
+        let prev_peek = crate::block::BlockHeader::peek_prev_hash(block_bytes)?;
+        let block_height = if let Some(chain_arc) = self.chain.as_ref() {
+            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+            if prev_peek == [0u8; 32] {
+                0
+            } else if let Some(h) = guard
+                .headers
+                .get(&prev_peek)
+                .map(|hw| hw.height)
+                .or_else(|| guard.heights.get(&prev_peek).copied())
+            {
+                h + 1
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let (block, _) = Block::deserialize_for_height(block_bytes, block_height)?;
+        let block_hash = block.header.hash_for_height(block_height);
         let now = Instant::now();
 
         {
@@ -3828,7 +3851,7 @@ impl P2PNode {
         };
         let header_peers = if should_announce_headers {
             let header_msg = HeadersPayload {
-                headers: block.header.serialize(),
+                headers: block.header.serialize_for_height(block_height),
             }
             .to_message();
             broadcast_raw(&self.peers, &header_msg.serialize()).await
@@ -5105,7 +5128,29 @@ impl P2PNode {
 
                                         while offset + 80 <= header_bytes.len() {
                                             let slice = &header_bytes[offset..offset + 80];
-                                            let (header, used) = match crate::block::BlockHeader::deserialize(slice) {
+                                            // Peek prev_hash → look up parent → derive height
+                                            // before height-aware deserialize.
+                                            let prev_peek = match crate::block::BlockHeader::peek_prev_hash(slice) {
+                                                Ok(p) => p,
+                                                Err(_) => {
+                                                    header_error = true;
+                                                    reject_reason = Some("decode_error".to_string());
+                                                    break;
+                                                }
+                                            };
+                                            let header_height = if prev_peek == [0u8; 32] {
+                                                0
+                                            } else if let Some(h) = guard
+                                                .headers
+                                                .get(&prev_peek)
+                                                .map(|hw| hw.height)
+                                                .or_else(|| guard.heights.get(&prev_peek).copied())
+                                            {
+                                                h + 1
+                                            } else {
+                                                0
+                                            };
+                                            let (header, used) = match crate::block::BlockHeader::deserialize_for_height(slice, header_height) {
                                                 Ok(v) => v,
                                                 Err(_) => {
                                                     header_error = true;
@@ -5114,11 +5159,11 @@ impl P2PNode {
                                                 }
                                             };
                                             offset += used;
-                                            last_header_hash = Some(header.hash());
+                                            last_header_hash = Some(header.hash_for_height(header_height));
 
-                                            let header_hash = header.hash();
+                                            let header_hash = header.hash_for_height(header_height);
                                             if header.prev_hash == [0u8; 32] {
-                                                let genesis_hash = guard.params.genesis_block.header.hash();
+                                                let genesis_hash = guard.params.genesis_block.header.hash_for_height(0);
                                                 if header_hash == genesis_hash {
                                                     continue;
                                                 }
@@ -5641,7 +5686,35 @@ impl P2PNode {
                         if let Some(ref chain_arc) = chain_for_sync {
                             if let Ok(payload) = BlockPayload::from_message(&msg) {
                                 let decode_started = Instant::now();
-                                match Block::deserialize(&payload.block_data) {
+                                // Peek prev_hash → look up parent → derive
+                                // block_height before height-aware deserialize.
+                                let prev_peek = match crate::block::BlockHeader::peek_prev_hash(&payload.block_data) {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        P2PNode::log_event(
+                                            "warn",
+                                            "chain",
+                                            format!("P2P {}: block payload too short to peek prev_hash", addr),
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let block_height = {
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                    if prev_peek == [0u8; 32] {
+                                        0
+                                    } else if let Some(h) = guard
+                                        .headers
+                                        .get(&prev_peek)
+                                        .map(|hw| hw.height)
+                                        .or_else(|| guard.heights.get(&prev_peek).copied())
+                                    {
+                                        h + 1
+                                    } else {
+                                        0
+                                    }
+                                };
+                                match Block::deserialize_for_height(&payload.block_data, block_height) {
                                     Ok((block, _)) => {
                                         let decode_ms = decode_started.elapsed().as_millis();
                                         let precheck_started = Instant::now();
@@ -5657,7 +5730,7 @@ impl P2PNode {
                                             continue;
                                         }
                                         let precheck_ms = precheck_started.elapsed().as_millis();
-                                        let bhash = block.header.hash();
+                                        let bhash = block.header.hash_for_height(block_height);
                                         let short = hex::encode(bhash);
                                         let short = short.get(0..12).unwrap_or(&short);
                                         let chain_arc2 = chain_arc.clone();
@@ -7279,22 +7352,47 @@ async fn handle_incoming_with_sybil(
 
                                     while offset + 80 <= header_bytes.len() {
                                         let slice = &header_bytes[offset..offset + 80];
-                                        let (header, used) =
-                                            match crate::block::BlockHeader::deserialize(slice) {
-                                                Ok(v) => v,
+                                        // Peek prev_hash → look up parent → derive height
+                                        // before height-aware deserialize.
+                                        let prev_peek =
+                                            match crate::block::BlockHeader::peek_prev_hash(slice) {
+                                                Ok(p) => p,
                                                 Err(_) => {
                                                     header_error = true;
                                                     reject_reason = Some("decode_error".to_string());
                                                     break;
                                                 }
                                             };
+                                        let header_height = if prev_peek == [0u8; 32] {
+                                            0
+                                        } else if let Some(h) = guard
+                                            .headers
+                                            .get(&prev_peek)
+                                            .map(|hw| hw.height)
+                                            .or_else(|| guard.heights.get(&prev_peek).copied())
+                                        {
+                                            h + 1
+                                        } else {
+                                            0
+                                        };
+                                        let (header, used) = match crate::block::BlockHeader::deserialize_for_height(
+                                            slice,
+                                            header_height,
+                                        ) {
+                                            Ok(v) => v,
+                                            Err(_) => {
+                                                header_error = true;
+                                                reject_reason = Some("decode_error".to_string());
+                                                break;
+                                            }
+                                        };
                                         offset += used;
-                                        last_header_hash = Some(header.hash());
+                                        last_header_hash = Some(header.hash_for_height(header_height));
 
-                                        let header_hash = header.hash();
+                                        let header_hash = header.hash_for_height(header_height);
                                         if header.prev_hash == [0u8; 32] {
                                             let genesis_hash =
-                                                guard.params.genesis_block.header.hash();
+                                                guard.params.genesis_block.header.hash_for_height(0);
                                             if header_hash == genesis_hash {
                                                 continue;
                                             }
@@ -7841,7 +7939,40 @@ async fn handle_incoming_with_sybil(
                         tokio::spawn(async move {
                             let permit_guard = permit;
 
-                            let block = match Block::deserialize(&payload.block_data) {
+                            // Peek prev_hash → look up parent → derive
+                            // block_height before height-aware deserialize.
+                            let prev_peek = match crate::block::BlockHeader::peek_prev_hash(&payload.block_data) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "net",
+                                        format!(
+                                            "P2P {}: block payload too short to peek prev_hash: {}",
+                                            addr2, e
+                                        ),
+                                    );
+                                    let mut rep = reputation2.lock().await;
+                                    rep.record_decode_error(&addr2.to_string());
+                                    return;
+                                }
+                            };
+                            let block_height = {
+                                let guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
+                                if prev_peek == [0u8; 32] {
+                                    0
+                                } else if let Some(h) = guard
+                                    .headers
+                                    .get(&prev_peek)
+                                    .map(|hw| hw.height)
+                                    .or_else(|| guard.heights.get(&prev_peek).copied())
+                                {
+                                    h + 1
+                                } else {
+                                    0
+                                }
+                            };
+                            let block = match Block::deserialize_for_height(&payload.block_data, block_height) {
                                 Ok((b, _)) => b,
                                 Err(e) => {
                                     P2PNode::log_event(
@@ -7870,7 +8001,7 @@ async fn handle_incoming_with_sybil(
                             }
                             let precheck_ms = precheck_started.elapsed().as_millis();
 
-                            let bhash = block.header.hash();
+                            let bhash = block.header.hash_for_height(block_height);
                             let short = hex::encode(bhash);
                             let short = short.get(0..12).unwrap_or(&short).to_string();
 
