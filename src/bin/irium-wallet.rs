@@ -18992,6 +18992,8 @@ found true"
             taken_at_height: None,
             source: None,
             seller_pubkey: None,
+                    template_type: None,
+            milestone_count: None,
         };
         let summary = render_offer_summary(&offer);
         assert!(summary.contains("test-offer-1"), "must contain offer_id");
@@ -19034,6 +19036,8 @@ found true"
             taken_at_height: None,
             source: None,
             seller_pubkey: None,
+                    template_type: None,
+            milestone_count: None,
         };
         let path = save_offer(&offer).unwrap();
         assert!(path.exists(), "offer file must exist after save");
@@ -19073,6 +19077,8 @@ found true"
                 taken_at_height: None,
                 source: None,
                 seller_pubkey: None,
+                            template_type: None,
+                milestone_count: None,
             };
             save_offer(&o).unwrap();
         }
@@ -19110,6 +19116,8 @@ found true"
             taken_at_height: None,
             source: None,
             seller_pubkey: None,
+                    template_type: None,
+            milestone_count: None,
         };
         save_offer(&offer).unwrap();
         let result = handle_offer_take(&[
@@ -19178,6 +19186,8 @@ found true"
             taken_at_height: None,
             source: None,
             seller_pubkey: None,
+                    template_type: None,
+            milestone_count: None,
         };
         let summary = render_offer_summary(&offer);
         assert!(
@@ -19209,6 +19219,8 @@ found true"
             taken_at_height: None,
             source: Some("local".to_string()),
             seller_pubkey: None,
+                    template_type: None,
+            milestone_count: None,
         };
         save_offer(&offer).unwrap();
         let out = dir.join("export-test-out.json");
@@ -19417,6 +19429,8 @@ found true"
                 taken_at_height: None,
                 source: Some(src_val.to_string()),
                 seller_pubkey: None,
+                            template_type: None,
+                milestone_count: None,
             };
             save_offer(&o).unwrap();
         }
@@ -19450,6 +19464,8 @@ found true"
                 taken_at_height: None,
                 source: Some(src_val.to_string()),
                 seller_pubkey: None,
+                            template_type: None,
+                milestone_count: None,
             };
             save_offer(&o).unwrap();
         }
@@ -19482,6 +19498,8 @@ found true"
             taken_at_height: None,
             source: src.map(|s| s.to_string()),
             seller_pubkey: seller_pk.map(|s| s.to_string()),
+            template_type: None,
+            milestone_count: None,
         }
     }
 
@@ -21067,6 +21085,8 @@ found true"
             seller_pubkey: Some(
                 "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string(),
             ),
+                    template_type: None,
+            milestone_count: None,
         };
         let json = serde_json::to_string(&offer).unwrap();
         assert!(
@@ -21105,6 +21125,8 @@ found true"
             seller_pubkey: Some(
                 "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string(),
             ),
+                    template_type: None,
+            milestone_count: None,
         };
         save_offer(&offer).unwrap();
         let out = dir.join("pk-export-out.json");
