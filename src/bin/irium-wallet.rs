@@ -281,6 +281,12 @@ struct FundAgreementRequestBody {
     agreement: AgreementObject,
     fee_per_byte: Option<u64>,
     broadcast: Option<bool>,
+    /// GROUP G: when set, iriumd's /rpc/fundagreement filters the
+    /// built funding legs down to just this milestone, producing a
+    /// single-HTLC tx for partial funding. None preserves the
+    /// existing whole-agreement funding behaviour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    milestone_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -11898,6 +11904,208 @@ fn handle_agreement_export_receipt(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// GROUP G: parse + validate --milestone-id from a wallet subcommand's
+// args. Returns the value or a clear error. Used by both the fund
+// and release aliases.
+fn group_g_parse_required_milestone_id(args: &[String]) -> Result<String, String> {
+    let mut found: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--milestone-id" {
+            if i + 1 >= args.len() {
+                return Err("--milestone-id requires a value".to_string());
+            }
+            found = Some(args[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    let mid = found.ok_or_else(|| {
+        "--milestone-id is required for milestone-scoped commands".to_string()
+    })?;
+    if mid.trim().is_empty() {
+        return Err("--milestone-id must not be empty".to_string());
+    }
+    Ok(mid)
+}
+
+// GROUP G: agreement-milestone-fund <agreement> --milestone-id <id>
+//   [--fee-per-byte <n>] [--broadcast] [--rpc <url>] [--json]
+//
+// Funds ONE milestone leg in its own funding tx. The single-HTLC tx
+// pattern lets a payer trickle-fund a milestone agreement over time
+// (one leg per payday) instead of locking the whole contract upfront.
+// Rejects with a clear message if the milestone is unknown OR already
+// funded on-chain (Q2: no double-anchoring).
+fn handle_agreement_milestone_fund(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err(
+            "usage: agreement-milestone-fund <agreement> --milestone-id <id> \
+[--fee-per-byte <n>] [--broadcast] [--rpc <url>] [--json]"
+                .to_string(),
+        );
+    }
+    let agreement_ref = args[0].clone();
+    let rest = &args[1..];
+    let milestone_id = group_g_parse_required_milestone_id(rest)?;
+    let mut fee_per_byte: Option<u64> = None;
+    let mut broadcast = false;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--milestone-id" => {
+                i += 2;
+            }
+            "--fee-per-byte" => {
+                if i + 1 >= rest.len() {
+                    return Err("--fee-per-byte requires a value".to_string());
+                }
+                fee_per_byte = Some(
+                    rest[i + 1]
+                        .parse::<u64>()
+                        .map_err(|_| "--fee-per-byte must be a non-negative integer".to_string())?,
+                );
+                i += 2;
+            }
+            "--broadcast" => {
+                broadcast = true;
+                i += 1;
+            }
+            "--rpc" => {
+                if i + 1 >= rest.len() {
+                    return Err("--rpc requires a value".to_string());
+                }
+                rpc_url = rest[i + 1].clone();
+                i += 2;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let agreement = load_agreement(&agreement_ref)?;
+    // Validate milestone_id is part of this agreement.
+    if !agreement
+        .milestones
+        .iter()
+        .any(|m| m.milestone_id == milestone_id)
+    {
+        let known: Vec<&String> = agreement.milestones.iter().map(|m| &m.milestone_id).collect();
+        return Err(format!(
+            "--milestone-id {} not found in agreement (milestones: {:?})",
+            milestone_id, known
+        ));
+    }
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    // Best-effort already-funded check via /rpc/agreementmilestones.
+    // iriumd will also reject double-funding (chain-scan inside the
+    // handler) - this client-side check exists to produce a clearer
+    // error before the round-trip.
+    {
+        #[derive(Serialize)]
+        struct MsReq {
+            agreement: AgreementObject,
+        }
+        #[derive(Deserialize)]
+        struct MsResp {
+            milestones: Vec<irium_node_rs::settlement::AgreementMilestoneStatus>,
+        }
+        if let Ok(resp) = rpc_post_json::<MsReq, MsResp>(
+            &client,
+            base,
+            "/rpc/agreementmilestones",
+            &MsReq {
+                agreement: agreement.clone(),
+            },
+        ) {
+            if let Some(ms) = resp
+                .milestones
+                .iter()
+                .find(|m| m.milestone_id == milestone_id)
+            {
+                if ms.funded {
+                    return Err(format!(
+                        "milestone {} is already funded on-chain (refusing to double-anchor)",
+                        milestone_id
+                    ));
+                }
+            }
+        }
+    }
+    let resp: FundAgreementResponse = rpc_post_json(
+        &client,
+        base,
+        "/rpc/fundagreement",
+        &FundAgreementRequestBody {
+            agreement,
+            fee_per_byte,
+            broadcast: Some(broadcast),
+            milestone_id: Some(milestone_id.clone()),
+        },
+    )?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agreement_hash": agreement_hash,
+                "milestone_id":   milestone_id,
+                "funding_txid":   resp.txid,
+                "broadcast":      broadcast,
+            }))
+            .unwrap()
+        );
+        return Ok(());
+    }
+    println!("=== Milestone Funded ===");
+    println!();
+    println!("agreement_hash  {}", agreement_hash);
+    println!("milestone_id    {}", milestone_id);
+    println!("funding_txid    {}", resp.txid);
+    println!(
+        "broadcast       {}",
+        if broadcast { "yes" } else { "no (--broadcast to send)" }
+    );
+    Ok(())
+}
+
+// GROUP G: agreement-milestone-release <agreement> --milestone-id <id> ...
+//
+// Friendly-named alias for `agreement-release ... --milestone-id <id>`.
+// Validates --milestone-id is present (Q3: explicit beats implicit), then
+// re-invokes the wallet binary's existing agreement-release pipeline with
+// the same args. The shell-out keeps the release logic single-sourced.
+fn handle_agreement_milestone_release(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err(
+            "usage: agreement-milestone-release <agreement> --milestone-id <id> \
+[--secret <hex>] [--destination <addr>] [--fee-per-byte <n>] [--broadcast] [--rpc <url>] [--json]"
+                .to_string(),
+        );
+    }
+    // Enforce --milestone-id presence with a clear error.
+    let _ = group_g_parse_required_milestone_id(&args[1..])?;
+    let argv0 = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut cmd = std::process::Command::new(&argv0);
+    cmd.arg("agreement-release");
+    for a in args {
+        cmd.arg(a);
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| format!("spawn agreement-release: {e}"))?;
+    if !status.success() {
+        return Err(format!("agreement-release exited with status {}", status));
+    }
+    Ok(())
+}
+
 fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
     let mut agreement_ref: Option<String> = None;
     let mut out_path: Option<String> = None;
@@ -22243,6 +22451,145 @@ found true"
         );
     }
 
+    // ── GROUP G: partial milestone fund + release aliases ───────────────
+
+    #[test]
+    fn group_g_parse_required_milestone_id_extracts_value() {
+        let args = vec![
+            "--milestone-id".to_string(),
+            "m2".to_string(),
+            "--broadcast".to_string(),
+        ];
+        let mid = group_g_parse_required_milestone_id(&args).unwrap();
+        assert_eq!(mid, "m2");
+    }
+
+    #[test]
+    fn group_g_parse_required_milestone_id_rejects_missing_flag() {
+        let args = vec!["--broadcast".to_string(), "--rpc".to_string(), "x".to_string()];
+        let err = group_g_parse_required_milestone_id(&args).unwrap_err();
+        assert!(
+            err.contains("required"),
+            "expected 'required' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_g_parse_required_milestone_id_rejects_empty_value() {
+        let args = vec!["--milestone-id".to_string(), "  ".to_string()];
+        let err = group_g_parse_required_milestone_id(&args).unwrap_err();
+        assert!(
+            err.contains("must not be empty"),
+            "expected empty-value error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_g_parse_required_milestone_id_rejects_missing_value_after_flag() {
+        let args = vec!["--milestone-id".to_string()];
+        let err = group_g_parse_required_milestone_id(&args).unwrap_err();
+        assert!(
+            err.contains("requires a value"),
+            "expected 'requires a value' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_g_fund_agreement_request_body_serializes_milestone_id() {
+        let payer = AgreementParty {
+            party_id: "payer".to_string(),
+            display_name: "Payer".to_string(),
+            address: "Qpayer".to_string(),
+            role: Some("buyer".to_string()),
+        };
+        let payee = AgreementParty {
+            party_id: "payee".to_string(),
+            display_name: "Payee".to_string(),
+            address: "Qpayee".to_string(),
+            role: Some("seller".to_string()),
+        };
+        let agreement = irium_node_rs::settlement::build_milestone_agreement(
+            "agr-g-ser".to_string(),
+            1_700_000_000,
+            payer,
+            payee,
+            vec![AgreementMilestone {
+                milestone_id: "m1".to_string(),
+                title: "M1".to_string(),
+                amount: 1_000,
+                recipient_address: "Qpayee".to_string(),
+                refund_address: "Qpayer".to_string(),
+                secret_hash_hex: "ab".repeat(32),
+                timeout_height: 500,
+                metadata_hash: None,
+            }],
+            1_000,
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .unwrap();
+        let body = FundAgreementRequestBody {
+            agreement,
+            fee_per_byte: Some(1),
+            broadcast: Some(false),
+            milestone_id: Some("m1".to_string()),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(
+            json.contains("\"milestone_id\":\"m1\""),
+            "json must include milestone_id, got: {json}"
+        );
+    }
+
+    #[test]
+    fn group_g_fund_agreement_request_body_omits_milestone_id_when_none() {
+        let payer = AgreementParty {
+            party_id: "payer".to_string(),
+            display_name: "Payer".to_string(),
+            address: "Qpayer".to_string(),
+            role: Some("buyer".to_string()),
+        };
+        let payee = AgreementParty {
+            party_id: "payee".to_string(),
+            display_name: "Payee".to_string(),
+            address: "Qpayee".to_string(),
+            role: Some("seller".to_string()),
+        };
+        let agreement = irium_node_rs::settlement::build_otc_agreement(
+            "agr-otc-ser".to_string(),
+            1_700_000_000,
+            payer,
+            payee,
+            500_000,
+            "IRM".to_string(),
+            "off".to_string(),
+            500,
+            "ab".repeat(32),
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .unwrap();
+        let body = FundAgreementRequestBody {
+            agreement,
+            fee_per_byte: None,
+            broadcast: Some(true),
+            milestone_id: None,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(
+            !json.contains("milestone_id"),
+            "milestone_id must be omitted when None (back-compat), got: {json}"
+        );
+    }
+
+    #[test]
+    fn group_g_milestone_release_args_must_include_milestone_id_in_validation() {
+        let args = vec!["agreement.json".to_string(), "--broadcast".to_string()];
+        let _err = group_g_parse_required_milestone_id(&args[1..]).unwrap_err();
+    }
+
     #[test]
     fn group_f_receipt_canonical_bytes_clear_signature_fields() {
         // The signing input must not include signature/payload_hash, so
@@ -25292,6 +25639,7 @@ fn main() {
                     agreement,
                     fee_per_byte,
                     broadcast: Some(broadcast),
+                    milestone_id: None,
                 },
             ) {
                 Ok(v) => v,
@@ -28205,6 +28553,18 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "agreement-export-receipt" => {
             if let Err(e) = handle_agreement_export_receipt(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-milestone-fund" => {
+            if let Err(e) = handle_agreement_milestone_fund(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-milestone-release" => {
+            if let Err(e) = handle_agreement_milestone_release(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }

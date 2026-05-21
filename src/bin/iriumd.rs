@@ -820,6 +820,12 @@ struct FundAgreementRequest {
     agreement: AgreementObject,
     fee_per_byte: Option<u64>,
     broadcast: Option<bool>,
+    /// GROUP G: when set, fund only the named milestone leg. Builds a
+    /// single-HTLC funding tx for that milestone instead of the full
+    /// agreement. Rejected if the milestone is not in the agreement OR
+    /// already has a confirmed Funding anchor on-chain.
+    #[serde(default)]
+    milestone_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -4857,10 +4863,45 @@ async fn fund_agreement(
     payer_pkh.copy_from_slice(&payer_vec);
     let mut payee_pkh = [0u8; 20];
     payee_pkh.copy_from_slice(&payee_vec);
-    let legs = build_funding_legs(&req.agreement, payer_pkh, payee_pkh)
+    let mut legs = build_funding_legs(&req.agreement, payer_pkh, payee_pkh)
         .map_err(|_| bad("build_funding_legs_failed"))?;
     if legs.is_empty() {
         return Err(bad("agreement_has_no_funding_legs"));
+    }
+    // GROUP G: per-milestone partial funding. When milestone_id is set,
+    // filter the built legs to that one milestone, reject if unknown,
+    // and reject if a confirmed Funding anchor already exists for that
+    // milestone on-chain (Q2: clear double-funding rejection).
+    if let Some(target_mid) = req.milestone_id.as_deref() {
+        if !req
+            .agreement
+            .milestones
+            .iter()
+            .any(|m| m.milestone_id == target_mid)
+        {
+            return Err(bad("milestone_id_not_found_in_agreement"));
+        }
+        legs.retain(|l| l.milestone_id.as_deref() == Some(target_mid));
+        if legs.is_empty() {
+            return Err(bad("milestone_id_has_no_funding_leg"));
+        }
+        if legs.len() != 1 {
+            return Err(bad("milestone_id_matched_multiple_legs"));
+        }
+        // Already-funded check: walk the chain for a confirmed Funding
+        // anchor that matches both agreement_hash and milestone_id.
+        let already_funded = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            scan_linked_txs_by_hash(&chain, &agreement_hash)
+                .iter()
+                .any(|t| {
+                    t.role == AgreementAnchorRole::Funding
+                        && t.milestone_id.as_deref() == Some(target_mid)
+                })
+        };
+        if already_funded {
+            return Err(bad("milestone_already_funded"));
+        }
     }
 
     let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
@@ -10602,6 +10643,7 @@ mod tests {
                 agreement,
                 fee_per_byte: Some(1),
                 broadcast: Some(false),
+                milestone_id: None,
             }),
         )
         .await

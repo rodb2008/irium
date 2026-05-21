@@ -11541,6 +11541,214 @@ mod stage_3_1_tests {
         assert_eq!(dref.resolver_address, "Qresolver");
     }
 
+    // ── GROUP G: partial milestone release lifecycle ─────────────────────
+
+    fn group_g_three_milestone_agreement() -> AgreementObject {
+        let payer = AgreementParty {
+            party_id: "payer".to_string(),
+            display_name: "Payer".to_string(),
+            address: "Qpayer".to_string(),
+            role: Some("buyer".to_string()),
+        };
+        let payee = AgreementParty {
+            party_id: "payee".to_string(),
+            display_name: "Payee".to_string(),
+            address: "Qpayee".to_string(),
+            role: Some("seller".to_string()),
+        };
+        let milestones = (1..=3u32)
+            .map(|i| AgreementMilestone {
+                milestone_id: format!("m{}", i),
+                title: format!("Milestone {}", i),
+                amount: 100_000,
+                recipient_address: "Qpayee".to_string(),
+                refund_address: "Qpayer".to_string(),
+                secret_hash_hex: format!("{:02x}", i).repeat(32),
+                timeout_height: 1_000 + (i as u64) * 100,
+                metadata_hash: None,
+            })
+            .collect();
+        build_milestone_agreement(
+            "agr-g-test".to_string(),
+            1_700_000_000,
+            payer,
+            payee,
+            milestones,
+            10_000,
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .expect("build milestone agreement")
+    }
+
+    fn group_g_funding_tx(milestone_id: &str, height: u64) -> AgreementLinkedTx {
+        AgreementLinkedTx {
+            txid: format!("aa{}", milestone_id).repeat(2),
+            role: AgreementAnchorRole::Funding,
+            milestone_id: Some(milestone_id.to_string()),
+            height: Some(height),
+            confirmed: true,
+            value: 100_000,
+        }
+    }
+
+    fn group_g_milestone_release_tx(milestone_id: &str, height: u64) -> AgreementLinkedTx {
+        AgreementLinkedTx {
+            txid: format!("bb{}", milestone_id).repeat(2),
+            role: AgreementAnchorRole::MilestoneRelease,
+            milestone_id: Some(milestone_id.to_string()),
+            height: Some(height),
+            confirmed: true,
+            value: 100_000,
+        }
+    }
+
+    #[test]
+    fn group_g_lifecycle_funded_when_zero_milestones_released() {
+        let agreement = group_g_three_milestone_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let linked = vec![
+            group_g_funding_tx("m1", 200),
+            group_g_funding_tx("m2", 201),
+            group_g_funding_tx("m3", 202),
+        ];
+        let lifecycle = derive_lifecycle(&agreement, &hash, linked, 500);
+        assert!(
+            matches!(lifecycle.state, AgreementLifecycleState::Funded),
+            "expected Funded, got {:?}",
+            lifecycle.state
+        );
+        assert_eq!(lifecycle.released_amount, 0);
+        assert_eq!(lifecycle.funded_amount, 300_000);
+    }
+
+    #[test]
+    fn group_g_lifecycle_partially_released_when_one_of_three_released() {
+        let agreement = group_g_three_milestone_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let linked = vec![
+            group_g_funding_tx("m1", 200),
+            group_g_funding_tx("m2", 201),
+            group_g_funding_tx("m3", 202),
+            group_g_milestone_release_tx("m2", 300),
+        ];
+        let lifecycle = derive_lifecycle(&agreement, &hash, linked, 500);
+        assert!(
+            matches!(lifecycle.state, AgreementLifecycleState::PartiallyReleased),
+            "expected PartiallyReleased, got {:?}",
+            lifecycle.state
+        );
+        assert_eq!(lifecycle.released_amount, 100_000);
+        assert_eq!(lifecycle.funded_amount, 300_000);
+        let m2 = lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m2")
+            .expect("m2 in lifecycle");
+        assert!(m2.released, "m2 must be marked released");
+        let m1 = lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m1")
+            .expect("m1 in lifecycle");
+        assert!(!m1.released, "m1 must NOT be marked released");
+    }
+
+    #[test]
+    fn group_g_lifecycle_partially_released_two_of_three() {
+        let agreement = group_g_three_milestone_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let linked = vec![
+            group_g_funding_tx("m1", 200),
+            group_g_funding_tx("m2", 201),
+            group_g_funding_tx("m3", 202),
+            group_g_milestone_release_tx("m1", 300),
+            group_g_milestone_release_tx("m2", 301),
+        ];
+        let lifecycle = derive_lifecycle(&agreement, &hash, linked, 500);
+        assert!(
+            matches!(lifecycle.state, AgreementLifecycleState::PartiallyReleased),
+            "expected PartiallyReleased with 2/3 released, got {:?}",
+            lifecycle.state
+        );
+        assert_eq!(lifecycle.released_amount, 200_000);
+        assert!(lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m1")
+            .unwrap()
+            .released);
+        assert!(lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m2")
+            .unwrap()
+            .released);
+        assert!(!lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m3")
+            .unwrap()
+            .released);
+    }
+
+    #[test]
+    fn group_g_milestone_status_marks_only_funded_milestones() {
+        let agreement = group_g_three_milestone_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        // Only m1 and m3 funded; m2 not funded.
+        let linked = vec![
+            group_g_funding_tx("m1", 200),
+            group_g_funding_tx("m3", 202),
+        ];
+        let lifecycle = derive_lifecycle(&agreement, &hash, linked, 500);
+        let m1 = lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m1")
+            .unwrap();
+        let m2 = lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m2")
+            .unwrap();
+        let m3 = lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m3")
+            .unwrap();
+        assert!(m1.funded, "m1 must be funded");
+        assert!(!m2.funded, "m2 must NOT be funded");
+        assert!(m3.funded, "m3 must be funded");
+        assert_eq!(lifecycle.funded_amount, 200_000);
+    }
+
+    #[test]
+    fn group_g_lifecycle_released_when_all_three_released() {
+        let agreement = group_g_three_milestone_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let linked = vec![
+            group_g_funding_tx("m1", 200),
+            group_g_funding_tx("m2", 201),
+            group_g_funding_tx("m3", 202),
+            group_g_milestone_release_tx("m1", 300),
+            group_g_milestone_release_tx("m2", 301),
+            group_g_milestone_release_tx("m3", 302),
+        ];
+        let lifecycle = derive_lifecycle(&agreement, &hash, linked, 500);
+        assert!(
+            matches!(lifecycle.state, AgreementLifecycleState::Released),
+            "expected Released, got {:?}",
+            lifecycle.state
+        );
+        assert_eq!(lifecycle.released_amount, 300_000);
+        assert!(
+            lifecycle.milestones.iter().all(|m| m.released),
+            "all milestones must be marked released"
+        );
+    }
+
     #[test]
     fn group_f_verify_escrow_receipt_rejects_wrong_schema_id() {
         let agreement = build_test_otc();
