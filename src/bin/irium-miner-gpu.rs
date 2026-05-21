@@ -521,7 +521,7 @@ fn fetch_template(client: &Client) -> Result<BlockTemplate, String> {
 
 fn submit_block(client: &Client, height: u64, block: &Block) -> Result<(), String> {
     let header = &block.header;
-    let hash = header.hash();
+    let hash = header.hash_for_height(height);
     let payload = SubmitBlockRequest {
         height,
         header: JsonHeader {
@@ -1412,7 +1412,12 @@ fn mine_stratum_job_gpu(
         bits,
         nonce: 0,
     };
-    let ser = header.serialize();
+    // GPU stratum miner: StratumJob has no explicit height. Pre-fork-only
+    // path; for post-fork the pool would need to communicate the block
+    // height (via BIP34 coinbase push or a custom extension). For height=0
+    // the bytes match the pre-Fix-2a serialize().
+    // TODO(fix-2a): derive height from coinbase BIP34 for post-fork mining.
+    let ser = header.serialize_for_height(0);
     let midstate = sha256_midstate(ser[..64].try_into().unwrap());
     let mut tail = tail_from_header(&ser);
     let share_words = bigint_to_words(share_target);
@@ -1842,16 +1847,16 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1 << 22); // 4 194 304 nonces per dispatch
 
-    // OS-aware soft cap. macOS imposes a tight GPU watchdog (~250 ms on
-    // Apple Silicon) that silently kills overruns; 1M nonces keeps a
-    // typical batch well under that ceiling. Linux/Windows are far more
-    // permissive — the 4M default holds. Operators can still raise the
-    // env var manually; the cap is on the EFFECTIVE batch_size passed to
-    // the kernel, not on what the env var says.
-    #[cfg(target_os = "macos")]
-    let max_safe_batch: usize = 1 << 20; // 1 048 576 — ~100 ms on Apple Silicon
-    #[cfg(not(target_os = "macos"))]
-    let max_safe_batch: usize = 1 << 22; // 4 194 304 — default ceiling
+    // Universal soft cap. The earlier macOS-specific 1<<20 cap was removed
+    // (v1.9.24) per advanced-user request — Mac operators were trading too
+    // much hashrate for watchdog safety. The Layer-A stall detection in
+    // mine_batch (SUSPICIOUS_BATCH_LIMIT = 10 consecutive sub-5ms batches)
+    // still catches macOS GPU watchdog kills and surfaces them as a clean
+    // "GPU stall" error, so over-budget Mac kernels fail fast and visibly
+    // rather than silently zero-sharing. Operators on any OS can still
+    // raise IRIUM_GPU_BATCH manually; the cap below is on the EFFECTIVE
+    // batch_size passed to the kernel, not on what the env var says.
+    let max_safe_batch: usize = 1 << 22; // 4 194 304 — universal ceiling
 
     let batch_size = requested_batch_size.min(max_safe_batch);
 
@@ -2019,7 +2024,7 @@ fn main() {
         block.header.merkle_root = block.merkle_root();
 
         // ── Pre-compute midstate (constant for the whole template) ────────────
-        let ser = block.header.serialize();
+        let ser = block.header.serialize_for_height(height);
         let midstate = sha256_midstate(ser[..64].try_into().unwrap());
         let ser = Arc::new(ser); // shared across GPU threads
 
@@ -2175,7 +2180,7 @@ fn main() {
         let found = if let Some((nonce, found_time)) = found_result.lock().unwrap().take() {
             block.header.nonce = nonce;
             block.header.time = found_time;
-            let hash = block.header.hash();
+            let hash = block.header.hash_for_height(height);
             if meets_target(&hash, target) {
                 if json_log_enabled() {
                     println!(

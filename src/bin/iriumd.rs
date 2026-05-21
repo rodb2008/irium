@@ -44,7 +44,7 @@ use irium_node_rs::chain::{
 };
 use irium_node_rs::constants::{block_reward, COINBASE_MATURITY};
 use irium_node_rs::genesis::load_locked_genesis;
-use irium_node_rs::mempool::MempoolManager;
+use irium_node_rs::mempool::{evict_invalid_mempool_entries, MempoolManager};
 use irium_node_rs::network::SeedlistManager;
 use irium_node_rs::network_era::network_era;
 use irium_node_rs::p2p::P2PNode;
@@ -59,11 +59,17 @@ use irium_node_rs::settlement::{
     policy_template_to_json, preorder_deposit_template, verify_agreement_bundle,
     AgreementActivityEvent, AgreementAnchor, AgreementAnchorRole, AgreementAuditFundingLegRecord,
     AgreementAuditRecord, AgreementBundle, AgreementFundingLegRef, AgreementLifecycleView,
-    AgreementLinkedTx, AgreementMilestoneStatus, AgreementObject, AgreementSummary,
+    AgreementLinkedTx, AgreementMilestoneStatus, AgreementObject, AgreementSignatureEnvelope,
+    AgreementSummary, AgreementTemplateType, DisputeEvidence, DisputeRaise, DisputeResolution,
     HoldbackEvaluationResult, MilestoneEvaluationResult, MilestoneSpec, PolicyOutcome, PolicyStore,
-    ProofPolicy, ProofStore, RequirementThresholdResult, SettlementProof,
-    TemplateAttestor,
+    ProofPolicy, ProofStore, RequirementThresholdResult, ResolverRegistration, SettlementProof,
+    TemplateAttestor, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+    DisputeReResolverNomination,
+    dispute_evidence_canonical_bytes, dispute_raise_canonical_bytes,
+    dispute_reresolve_canonical_bytes, dispute_resolution_canonical_bytes,
+    resolver_registration_canonical_bytes,
 };
+use k256::ecdsa::VerifyingKey;
 use irium_node_rs::storage;
 use irium_node_rs::tx::{
     decode_full_tx, encode_htlcv1_claim_witness, encode_htlcv1_refund_witness,
@@ -113,6 +119,49 @@ struct AppState {
     event_tx: EventTx,
     /// Maps proof_id → chain tip height at submission time (Phase 7 finality tracking).
     proof_heights: Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    /// Dispute index keyed by agreement_hash hex (Stage 3.2).
+    disputes_index: Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    /// Resolver registration index keyed by resolver_address (Stage 3.2).
+    resolvers_index: Arc<Mutex<std::collections::HashMap<String, ResolverRegistrationRecord>>>,
+}
+
+const DISPUTE_RESOLVER_RESPONSE_WINDOW: u64 = 288; // blocks
+const MINER_RECENCY_WINDOW: u64 = 2016;            // blocks
+const DISPUTE_ANCHOR_FEE_PER_BYTE: u64 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DisputeState {
+    raise: DisputeRaise,
+    raise_anchor_txid: Option<String>,
+    raise_anchored_at_height: Option<u64>,
+    evidence: Vec<DisputeEvidenceRecord>,
+    resolution: Option<DisputeResolution>,
+    resolution_anchor_txid: Option<String>,
+    resolution_anchored_at_height: Option<u64>,
+    escalated_to_fallback: bool,
+    escalated_at_height: Option<u64>,
+    #[serde(default)]
+    reresolve_nomination: Option<DisputeReResolverNomination>,
+}
+
+impl DisputeState {
+    fn is_open(&self) -> bool {
+        self.resolution.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DisputeEvidenceRecord {
+    evidence: DisputeEvidence,
+    anchor_txid: Option<String>,
+    anchored_at_height: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResolverRegistrationRecord {
+    registration: ResolverRegistration,
+    anchor_txid: Option<String>,
+    anchored_at_height: Option<u64>,
 }
 
 fn proof_finality_depth() -> u64 {
@@ -154,7 +203,20 @@ fn ws_event_matches(event_type: &str, subscribed: &HashSet<String>) -> bool {
 }
 
 fn ws_is_public_event(event_type: &str) -> bool {
-    matches!(event_type, "block.new" | "offer.created" | "agreement.proof_reorged")
+    matches!(
+        event_type,
+        "block.new"
+            | "offer.created"
+            | "agreement.proof_reorged"
+            | "dispute.raised"
+            | "dispute.evidence_submitted"
+            | "dispute.resolved"
+            | "dispute.escalated"
+            | "dispute.raise_anchored"
+            | "dispute.resolve_anchored"
+            | "dispute.reresolved"
+            | "resolver.registered"
+    )
 }
 
 async fn ws_handle_socket(mut socket: WebSocket, state: AppState, is_public_conn: bool) {
@@ -2200,7 +2262,7 @@ fn parse_persisted_block_file(
     };
 
     if height == 0 {
-        let h = hex::encode(block.header.hash()).to_lowercase();
+        let h = hex::encode(block.header.hash_for_height(0)).to_lowercase();
         if h != genesis_hash_lc {
             return Err("genesis hash mismatch".to_string());
         }
@@ -2214,7 +2276,7 @@ fn parse_persisted_block_file(
         if block.header.bits == 0 {
             return Err("header bits is zero".to_string());
         }
-        if !meets_target(&block.header.hash(), block.header.target()) {
+        if !meets_target(&block.header.hash_for_height(height), block.header.target()) {
             return Err("header hash does not meet declared target".to_string());
         }
     }
@@ -2256,7 +2318,7 @@ fn discover_persist_mismatch_heights(
     for (height, expected_hash) in expected.iter().copied() {
         let path = blocks_dir.join(format!("block_{}.json", height));
         let valid_and_matching = match parse_persisted_block_file(&path, genesis_hash_lc) {
-            Ok((parsed_h, block)) => parsed_h == height && block.header.hash() == expected_hash,
+            Ok((parsed_h, block)) => parsed_h == height && block.header.hash_for_height(parsed_h) == expected_hash,
             Err(_) => false,
         };
 
@@ -2344,7 +2406,7 @@ fn best_chain_hashes_in_window(
                     continue;
                 }
                 if let Some(block) = state.chain.get(h as usize) {
-                    by_height.entry(h).or_insert(block.header.hash());
+                    by_height.entry(h).or_insert(block.header.hash_for_height(h));
                 }
                 if h == 0 {
                     break;
@@ -2394,7 +2456,7 @@ fn rebuild_startup_header_index(
         let mut next_pending: Vec<(u64, Block)> = Vec::new();
 
         for (h, block) in pending.into_iter() {
-            let hash = block.header.hash();
+            let hash = block.header.hash_for_height(h);
             if state.headers.contains_key(&hash) || state.heights.contains_key(&hash) {
                 continue;
             }
@@ -2454,7 +2516,7 @@ fn rebuild_startup_header_index(
         if *h < window_start || *h > window_tip {
             continue;
         }
-        let hash = block.header.hash();
+        let hash = block.header.hash_for_height(*h);
         let linked = state.headers.contains_key(&hash) || state.heights.contains_key(&hash);
         if !linked {
             unlinked_in_window = unlinked_in_window.saturating_add(1);
@@ -2595,7 +2657,7 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
         observed_hashes_by_height
             .entry(*h)
             .or_default()
-            .push(block.header.hash());
+            .push(block.header.hash_for_height(*h));
     }
 
     let expected_hashes_by_height =
@@ -2994,11 +3056,7 @@ async fn network_status(
     let tip_hash = guard
         .chain
         .last()
-        .map(|b| {
-            let mut h = irium_node_rs::pow::sha256d(&b.header.serialize());
-            h.reverse();
-            hex::encode(h)
-        })
+        .map(|b| hex::encode(b.header.hash_for_height(height)))
         .unwrap_or_else(|| "0".repeat(64));
     let tip_target = guard
         .chain
@@ -3406,10 +3464,11 @@ async fn metrics(
     check_rate(&state, &addr)?;
     let (height, anchor_loaded, tip_hash, anchor_digest) = {
         let g = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip_h = g.tip_height();
         let tip_hash = g
             .chain
             .last()
-            .map(|b| hex::encode(b.header.hash()))
+            .map(|b| hex::encode(b.header.hash_for_height(tip_h)))
             .unwrap_or_else(|| state.genesis_hash.clone());
         let digest = state
             .anchors
@@ -3773,6 +3832,27 @@ fn scan_agreement_linked_txs(
     txs
 }
 
+/// LAYER 3: lightweight chain scan answering "has any on-chain tx anchored
+/// this agreement hash yet?". Used by the offer-watcher to decide whether
+/// to relist a taken-but-unfunded offer once the grace window expires. Only
+/// needs the agreement hash (no full AgreementObject), so it's cheap to
+/// call from the watcher without keeping agreement files mirrored on the
+/// seller's machine.
+fn agreement_hash_funded_on_chain(chain: &ChainState, agreement_hash: &str) -> bool {
+    for block in &chain.chain {
+        for tx in &block.transactions {
+            for output in &tx.outputs {
+                if let Some(anchor) = parse_agreement_anchor(&output.script_pubkey) {
+                    if anchor.agreement_hash == agreement_hash {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn find_confirmed_tx_by_id(chain: &ChainState, txid_hex: &str) -> Result<Transaction, String> {
     let target = hex_to_32(txid_hex.trim()).map_err(|e| format!("invalid funding_txid: {e}"))?;
     for block in &chain.chain {
@@ -4006,7 +4086,7 @@ fn evaluate_agreement_spend_eligibility(
             Some(secret_hex) => {
                 let preimage = hex::decode(secret_hex.trim())
                     .map_err(|_| "secret_hex_invalid_hex".to_string())?;
-                let digest = sha256d(&preimage)[..32].to_vec();
+                let digest = Sha256::digest(&preimage);
                 if hex::encode(digest) != leg.expected_hash {
                     reasons.push("secret_hash_mismatch".to_string());
                 }
@@ -4063,6 +4143,30 @@ fn spend_htlc_from_params(
     fee_per_byte: Option<u64>,
     broadcast: Option<bool>,
     secret_hex: Option<&str>,
+) -> Result<SpendHtlcResponse, StatusCode> {
+    spend_htlc_with_optional_payout(
+        claim,
+        state,
+        funding_txid,
+        vout,
+        destination_address,
+        fee_per_byte,
+        broadcast,
+        secret_hex,
+        None,
+    )
+}
+
+fn spend_htlc_with_optional_payout(
+    claim: bool,
+    state: &AppState,
+    funding_txid: &str,
+    vout: u32,
+    destination_address: &str,
+    fee_per_byte: Option<u64>,
+    broadcast: Option<bool>,
+    secret_hex: Option<&str>,
+    resolver_payout: Option<(String, u64)>,
 ) -> Result<SpendHtlcResponse, StatusCode> {
     {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -4122,9 +4226,39 @@ fn spend_htlc_from_params(
     let mut dest_pkh = [0u8; 20];
     dest_pkh.copy_from_slice(&dest);
     let fee_per_byte = fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let num_outputs = if resolver_payout.is_some() { 2 } else { 1 };
+    let fee = estimate_tx_size(1, num_outputs).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut outputs: Vec<TxOutput> = Vec::with_capacity(num_outputs);
+    if let Some((ref resolver_addr, resolver_fee)) = resolver_payout {
+        if resolver_fee == 0 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if funding_out.output.value <= resolver_fee.saturating_add(fee) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        outputs.push(TxOutput {
+            value: funding_out.output.value - fee - resolver_fee,
+            script_pubkey: p2pkh_script(&dest_pkh),
+        });
+        let resolver_pkh_vec = base58_p2pkh_to_hash(resolver_addr)
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        if resolver_pkh_vec.len() != 20 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let mut resolver_pkh = [0u8; 20];
+        resolver_pkh.copy_from_slice(&resolver_pkh_vec);
+        outputs.push(TxOutput {
+            value: resolver_fee,
+            script_pubkey: p2pkh_script(&resolver_pkh),
+        });
+    } else {
+        outputs.push(TxOutput {
+            value: funding_out.output.value - fee,
+            script_pubkey: p2pkh_script(&dest_pkh),
+        });
     }
     let mut tx = Transaction {
         version: 1,
@@ -4134,10 +4268,7 @@ fn spend_htlc_from_params(
             script_sig: Vec::new(),
             sequence: 0xffff_fffe,
         }],
-        outputs: vec![TxOutput {
-            value: funding_out.output.value - fee,
-            script_pubkey: p2pkh_script(&dest_pkh),
-        }],
+        outputs,
         locktime: 0,
     };
     let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
@@ -5716,9 +5847,12 @@ async fn agreement_release_eligibility(
 ) -> Result<Json<AgreementSpendEligibilityResponse>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
-    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-    let resp = evaluate_agreement_spend_eligibility(true, &chain, &req.agreement, &req)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut resp = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        evaluate_agreement_spend_eligibility(true, &chain, &req.agreement, &req)
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+    apply_dispute_status_to_eligibility(&state, &req.agreement, true, &mut resp);
     if resp.eligible {
         if let Ok(ah) = compute_agreement_hash_hex(&req.agreement) {
             emit_event(&state.event_tx, "agreement.satisfied", serde_json::json!({
@@ -5737,9 +5871,12 @@ async fn agreement_refund_eligibility(
 ) -> Result<Json<AgreementSpendEligibilityResponse>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
-    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-    let resp = evaluate_agreement_spend_eligibility(false, &chain, &req.agreement, &req)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut resp = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        evaluate_agreement_spend_eligibility(false, &chain, &req.agreement, &req)
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+    apply_dispute_status_to_eligibility(&state, &req.agreement, false, &mut resp);
     if resp.eligible {
         if let Ok(ah) = compute_agreement_hash_hex(&req.agreement) {
             emit_event(&state.event_tx, "agreement.timeout", serde_json::json!({
@@ -6631,11 +6768,12 @@ async fn build_agreement_spend_internal(
     check_rate_with_auth(&state, &addr, &headers)
         .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
     require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
-    let eligibility = {
+    let mut eligibility = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         evaluate_agreement_spend_eligibility(claim, &chain, &req.agreement, &req)
             .map_err(|e| bad(&e))?
     };
+    apply_dispute_status_to_eligibility(&state, &req.agreement, claim, &mut eligibility);
     if !eligibility.eligible {
         return Err(bad(&format!(
             "ineligible:{}",
@@ -6646,7 +6784,44 @@ async fn build_agreement_spend_internal(
         .destination_address
         .clone()
         .ok_or_else(|| bad("destination_address_missing"))?;
-    let spend = spend_htlc_from_params(
+    // Stage 3.4.1: if a resolved dispute matches this branch, pay the
+    // resolver out of the spend tx according to the agreement's resolver
+    // fee fields.
+    let resolver_payout: Option<(String, u64)> = {
+        let agreement_hash = compute_agreement_hash_hex(&req.agreement)
+            .map_err(|_| bad("agreement_hash_failed"))?;
+        let dispute_state = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&agreement_hash)
+            .cloned();
+        if let Some(d) = dispute_state {
+            if let Some(ref resolution) = d.resolution {
+                let role = resolution.resolver_role.as_str();
+                let (addr, fee) = match role {
+                    "primary" => (
+                        req.agreement.primary_resolver.clone(),
+                        req.agreement.primary_resolver_fee,
+                    ),
+                    "fallback" => (
+                        req.agreement.fallback_resolver.clone(),
+                        req.agreement.fallback_resolver_fee,
+                    ),
+                    _ => (None, None),
+                };
+                match (addr, fee) {
+                    (Some(a), Some(f)) if f > 0 => Some((a, f)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let spend = spend_htlc_with_optional_payout(
         claim,
         &state,
         &req.funding_txid,
@@ -6657,6 +6832,7 @@ async fn build_agreement_spend_internal(
         req.fee_per_byte,
         req.broadcast,
         req.secret_hex.as_deref(),
+        resolver_payout,
     )
     .map_err(|_| bad("build_htlc_spend_failed"))?;
     Ok(Json(AgreementBuildSpendResponse {
@@ -6789,10 +6965,11 @@ async fn get_block_template(
     if longpoll {
         let last_tip = {
             let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            let tip_h = guard.tip_height();
             guard
                 .chain
                 .last()
-                .map(|b| hex::encode(b.header.hash()))
+                .map(|b| hex::encode(b.header.hash_for_height(tip_h)))
                 .unwrap_or_else(|| state.genesis_hash.clone())
         };
         let last_mempool = state
@@ -6806,10 +6983,11 @@ async fn get_block_template(
             tokio::time::sleep(Duration::from_secs(1)).await;
             let current_tip = {
                 let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+                let tip_h = guard.tip_height();
                 guard
                     .chain
                     .last()
-                    .map(|b| hex::encode(b.header.hash()))
+                    .map(|b| hex::encode(b.header.hash_for_height(tip_h)))
                     .unwrap_or_else(|| state.genesis_hash.clone())
             };
             let current_mempool = state
@@ -6826,8 +7004,9 @@ async fn get_block_template(
     let (height, prev_hash, bits, target, time) = {
         let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let tip = guard.chain.last();
+        let tip_h = guard.tip_height();
         let prev_hash = tip
-            .map(|b| hex::encode(b.header.hash()))
+            .map(|b| hex::encode(b.header.hash_for_height(tip_h)))
             .unwrap_or_else(|| "00".repeat(32));
         let height = guard.height;
         let target = guard.target_for_height(height);
@@ -7012,7 +7191,7 @@ async fn get_tx(
                     txid: hex::encode(target),
                     height: height as u64,
                     index: idx,
-                    block_hash: hex::encode(block.header.hash()),
+                    block_hash: hex::encode(block.header.hash_for_height(height as u64)),
                     inputs: tx.inputs.len(),
                     outputs: tx.outputs.len(),
                     output_value,
@@ -7227,8 +7406,22 @@ async fn submit_block(
             return Err(StatusCode::BAD_REQUEST);
         }
 
-        let tip_hash = block.header.hash();
-        (chain.tip_height(), hex::encode(tip_hash))
+        // Two-pass mempool cleanup while the chain lock is still held so the
+        // post-block UTXO set is what validate_transaction sees:
+        //   1) drop transactions included in this block by txid match
+        //   2) drop transactions that conflict with the new block's UTXOs
+        //      (double-spends), which a plain txid match never catches.
+        {
+            let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+            for tx in block.transactions.iter().skip(1) {
+                mempool.remove(&tx.txid());
+            }
+            evict_invalid_mempool_entries(&chain, &mut mempool);
+        }
+
+        let new_tip_h = chain.tip_height();
+        let tip_hash = block.header.hash_for_height(new_tip_h);
+        (new_tip_h, hex::encode(tip_hash))
     };
 
     // If anchors are loaded, enforce anchor consistency on the new tip.
@@ -7254,15 +7447,6 @@ async fn submit_block(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Remove any included transactions from the HTTP mempool.
-    {
-        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        for tx in block.transactions.iter().skip(1) {
-            let txid = tx.txid();
-            mempool.remove(&txid);
-        }
-    }
-
     // Broadcast the newly accepted block over P2P if enabled.
     if let Some(ref p2p) = state.p2p {
         let mut bytes = Vec::new();
@@ -7270,7 +7454,7 @@ async fn submit_block(
         //
         // For now we reuse Transaction::serialize() and BlockHeader::serialize()
         // and simply concatenate them; remote peers can interpret this as needed.
-        bytes.extend_from_slice(&block.header.serialize());
+        bytes.extend_from_slice(&block.header.serialize_for_height(new_height));
         for tx in &block.transactions {
             bytes.extend_from_slice(&tx.serialize());
         }
@@ -8035,7 +8219,7 @@ async fn main() {
                         Ok(g) => {
                             let local_height = g.tip_height();
                             let tip_bytes =
-                                g.chain.last().map(|b| b.header.hash()).unwrap_or([0u8; 32]);
+                                g.chain.last().map(|b| b.header.hash_for_height(local_height)).unwrap_or([0u8; 32]);
                             let tip = hex::encode(tip_bytes);
                             let best_hash = g.best_header_hash();
                             let best_header_height = g
@@ -8334,7 +8518,7 @@ async fn main() {
                                 Vec::with_capacity((end.saturating_sub(start) + 1) as usize);
                             for h in start..=end {
                                 if let Some(block) = guard.chain.get(h as usize) {
-                                    v.push((h, block.header.hash()));
+                                    v.push((h, block.header.hash_for_height(h)));
                                 }
                             }
                             v
@@ -8392,12 +8576,13 @@ async fn main() {
                     let guard = chain_for_gap_healer
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
+                    let th = guard.tip_height();
                     let tip_bytes = guard
                         .chain
                         .last()
-                        .map(|b| b.header.hash())
+                        .map(|b| b.header.hash_for_height(th))
                         .unwrap_or([0u8; 32]);
-                    (guard.tip_height(), tip_bytes)
+                    (th, tip_bytes)
                 };
 
                 let mut filled: usize = 0;
@@ -8479,6 +8664,8 @@ async fn main() {
         ))),
         event_tx: event_tx.clone(),
         proof_heights: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        disputes_index: Arc::new(Mutex::new(load_all_disputes_at_startup())),
+        resolvers_index: Arc::new(Mutex::new(load_all_resolvers_at_startup())),
     };
 
     // Background task: emit block.new events when chain height advances.
@@ -8487,6 +8674,9 @@ async fn main() {
         let block_chain = app_state.chain.clone();
         let reorg_proof_heights = app_state.proof_heights.clone();
         let reorg_proof_store = app_state.proof_store.clone();
+        let block_disputes = app_state.disputes_index.clone();
+        let block_resolvers = app_state.resolvers_index.clone();
+        let block_p2p = app_state.p2p.clone();
         tokio::spawn(async move {
             let mut last_known_height: u64 = 0;
             let mut last_known_hash = String::new();
@@ -8495,7 +8685,7 @@ async fn main() {
                 let (h, hash) = {
                     let g = block_chain.lock().unwrap_or_else(|e| e.into_inner());
                     let height = g.tip_height();
-                    let hash = g.chain.last().map(|b| hex::encode(b.header.hash())).unwrap_or_default();
+                    let hash = g.chain.last().map(|b| hex::encode(b.header.hash_for_height(height))).unwrap_or_default();
                     (height, hash)
                 };
                 if h < last_known_height && last_known_height > 0 {
@@ -8530,9 +8720,63 @@ async fn main() {
                             "height": h,
                             "hash": hash,
                         }));
+                        // Stage 3.2: scan newly-confirmed blocks for dispute/resolver anchor OP_RETURNs.
+                        scan_new_blocks_for_dispute_anchors(
+                            &block_chain,
+                            &block_disputes,
+                            &block_resolvers,
+                            &block_event_tx,
+                            last_known_height,
+                            h,
+                        );
                     }
                     last_known_height = h;
                     last_known_hash = hash;
+                }
+                // Stage 3.2 + 3.3.1: escalation tick — disputes whose primary resolver missed window go to fallback.
+                escalation_tick(&block_disputes, &block_event_tx, &block_p2p, h).await;
+            }
+        });
+    }
+
+    // LAYER 1 receive-side: drain P2P OfferTakeNotification inbox and
+    // mutate matching local offer files. Runs on a 2 s cadence — quicker
+    // than the 5 s fs-watcher because the take-broadcast latency directly
+    // determines how long peers can race to take an already-taken offer.
+    if let Some(ref take_p2p) = app_state.p2p {
+        let drain_node = take_p2p.clone();
+        let drain_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                for json in drain_node.drain_offer_take_notifications().await {
+                    if let Err(e) = process_received_offer_take(&json, &drain_event_tx) {
+                        eprintln!("[offer-take] {}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    // Stage 3.3.1: drain dispute P2P inboxes and apply to local indexes.
+    if let Some(ref dispute_p2p) = app_state.p2p {
+        let drain_node = dispute_p2p.clone();
+        let drain_disputes = app_state.disputes_index.clone();
+        let drain_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                for json in drain_node.drain_dispute_raised_notifications().await {
+                    process_received_dispute_raise(&json, &drain_disputes, &drain_event_tx);
+                }
+                for json in drain_node.drain_dispute_evidence_notifications().await {
+                    process_received_dispute_evidence(&json, &drain_disputes, &drain_event_tx);
+                }
+                for json in drain_node.drain_dispute_resolved_notifications().await {
+                    process_received_dispute_resolved(&json, &drain_disputes, &drain_event_tx);
+                }
+                for json in drain_node.drain_dispute_escalated_notifications().await {
+                    process_received_dispute_escalated(&json, &drain_disputes, &drain_event_tx);
                 }
             }
         });
@@ -8614,8 +8858,19 @@ async fn main() {
     }
 
     // Background task: detect new/taken offers from local offer store.
+    // Also drives LAYER 2 (open→expired when chain tip passes
+    // timeout_height) and LAYER 3 (taken→open auto-relist when the buyer
+    // never anchors the agreement on-chain within the grace window).
     {
         let offer_event_tx = event_tx.clone();
+        let watcher_chain = app_state.chain.clone();
+        // LAYER 3 grace window in blocks. Default 144 (≈ a day at 10-min
+        // blocks; about 2.4 hours at 60 s blocks). Operators can override
+        // via IRIUM_OFFER_RELIST_GRACE_BLOCKS.
+        let relist_grace_blocks: u64 = std::env::var("IRIUM_OFFER_RELIST_GRACE_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(144);
         tokio::spawn(async move {
             let mut seen: HashMap<String, String> = HashMap::new();
             loop {
@@ -8623,30 +8878,103 @@ async fn main() {
                 let dir = offers_feed_dir();
                 if !dir.exists() { continue; }
                 let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+                let tip_height: u64 = watcher_chain
+                    .lock()
+                    .map(|g| g.tip_height())
+                    .unwrap_or(0);
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map(|e| e == "json").unwrap_or(false) {
-                        if let Ok(data) = std::fs::read_to_string(&path) {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
-                                let id = val.get("offer_id")
-                                    .and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                                if id.is_empty() { continue; }
-                                let status = val.get("status")
-                                    .and_then(|s| s.as_str()).unwrap_or("open").to_string();
-                                let prev = seen.get(&id).cloned();
-                                if prev.is_none() && status == "open" {
-                                    emit_event(&offer_event_tx, "offer.created", serde_json::json!({
-                                        "offer_id": id,
-                                    }));
-                                } else if prev.as_deref() == Some("open") && status == "taken" {
-                                    emit_event(&offer_event_tx, "offer.taken", serde_json::json!({
-                                        "offer_id": id,
-                                    }));
+                    if !path.extension().map(|e| e == "json").unwrap_or(false) {
+                        continue;
+                    }
+                    let Ok(data) = std::fs::read_to_string(&path) else { continue };
+                    let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
+                    let id = val.get("offer_id")
+                        .and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                    if id.is_empty() { continue; }
+                    let mut status = val.get("status")
+                        .and_then(|s| s.as_str()).unwrap_or("open").to_string();
+                    let timeout_height = val.get("timeout_height").and_then(|v| v.as_u64());
+                    let taken_at_height = val.get("taken_at_height").and_then(|v| v.as_u64());
+                    let agreement_hash = val.get("agreement_hash")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    // LAYER 2: persist open→expired transition to disk so
+                    // the offer never gets re-served in /offers/feed.
+                    if status == "open" {
+                        if let Some(th) = timeout_height {
+                            if tip_height >= th {
+                                if let Some(mut new_val) = serde_json::from_str::<serde_json::Value>(&data).ok() {
+                                    if let Some(obj) = new_val.as_object_mut() {
+                                        obj.insert("status".to_string(), serde_json::json!("expired"));
+                                    }
+                                    if let Ok(serialized) = serde_json::to_string_pretty(&new_val) {
+                                        let _ = std::fs::write(&path, serialized);
+                                    }
                                 }
-                                seen.insert(id, status);
+                                status = "expired".to_string();
                             }
                         }
                     }
+
+                    // LAYER 3: persist taken→open relist if the buyer hasn't
+                    // anchored the agreement on-chain within the grace window.
+                    // Chain-aware check via agreement_hash_funded_on_chain so
+                    // a slow-funding buyer (already on-chain) is not falsely
+                    // relisted. Only fires when taken_at_height is present —
+                    // offers taken before v1.9.24 lack the field and are
+                    // skipped (operator can relist manually).
+                    if status == "taken" {
+                        if let (Some(tah), Some(ref ah)) = (taken_at_height, &agreement_hash) {
+                            if tip_height > tah + relist_grace_blocks {
+                                let funded = watcher_chain
+                                    .lock()
+                                    .map(|g| agreement_hash_funded_on_chain(&g, ah))
+                                    .unwrap_or(false);
+                                if !funded {
+                                    let previous_buyer = val.get("buyer_address")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if let Some(mut new_val) = serde_json::from_str::<serde_json::Value>(&data).ok() {
+                                        if let Some(obj) = new_val.as_object_mut() {
+                                            obj.insert("status".to_string(), serde_json::json!("open"));
+                                            obj.remove("agreement_id");
+                                            obj.remove("agreement_hash");
+                                            obj.remove("buyer_address");
+                                            obj.remove("taken_at");
+                                            obj.remove("taken_at_height");
+                                        }
+                                        if let Ok(serialized) = serde_json::to_string_pretty(&new_val) {
+                                            let _ = std::fs::write(&path, serialized);
+                                        }
+                                    }
+                                    emit_event(&offer_event_tx, "offer.relisted", serde_json::json!({
+                                        "offer_id": id,
+                                        "previous_buyer_address": previous_buyer,
+                                    }));
+                                    status = "open".to_string();
+                                }
+                            }
+                        }
+                    }
+
+                    let prev = seen.get(&id).cloned();
+                    if prev.is_none() && status == "open" {
+                        emit_event(&offer_event_tx, "offer.created", serde_json::json!({
+                            "offer_id": id,
+                        }));
+                    } else if prev.as_deref() == Some("open") && status == "taken" {
+                        emit_event(&offer_event_tx, "offer.taken", serde_json::json!({
+                            "offer_id": id,
+                        }));
+                    } else if prev.as_deref() == Some("open") && status == "expired" {
+                        emit_event(&offer_event_tx, "offer.expired", serde_json::json!({
+                            "offer_id": id,
+                        }));
+                    }
+                    seen.insert(id, status);
                 }
             }
         });
@@ -8687,6 +9015,96 @@ async fn main() {
 
 const OFFERS_FEED_DEFAULT_LIMIT: usize = 500;
 
+/// LAYER 1 receive-side: a peer (the buyer) has broadcast an
+/// OfferTakeNotification. If the local offers/ dir holds a matching offer
+/// whose seller_pubkey matches the payload, mutate it to status="taken"
+/// and emit `offer.taken` so the seller's GUI updates in real time.
+///
+/// Validation is intentionally light for v1 — no cryptographic signature
+/// is required. Structural match (offer_id present locally, seller_pubkey
+/// match, status=="open") prevents accidental collisions; spoofing remains
+/// possible until the security-follow-up adds ed25519 signing (see the
+/// MessageType::OfferTakeNotification comment in protocol.rs).
+fn process_received_offer_take(payload_json: &str, event_tx: &EventTx) -> Result<(), String> {
+    let val: serde_json::Value = serde_json::from_str(payload_json)
+        .map_err(|e| format!("offer-take parse: {e}"))?;
+    let offer_id = val
+        .get("offer_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "offer-take: missing offer_id".to_string())?;
+    let buyer_address = val
+        .get("buyer_address")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "offer-take: missing buyer_address".to_string())?;
+    let agreement_id = val
+        .get("agreement_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "offer-take: missing agreement_id".to_string())?;
+    let agreement_hash = val
+        .get("agreement_hash")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "offer-take: missing agreement_hash".to_string())?;
+    let taken_at = val.get("taken_at").and_then(|v| v.as_i64()).unwrap_or(0);
+    let taken_at_height = val.get("taken_at_height").and_then(|v| v.as_u64());
+    let seller_pubkey_claim = val
+        .get("seller_pubkey")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let dir = offers_feed_dir();
+    let path = dir.join(format!("offer-{}.json", offer_id));
+    if !path.exists() {
+        // Not our offer — silently ignore. Every connected peer receives
+        // the broadcast so most will land here.
+        return Ok(());
+    }
+    let data = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read offer {offer_id}: {e}"))?;
+    let mut offer: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| format!("parse offer {offer_id}: {e}"))?;
+
+    // Verify the seller_pubkey claim matches our local offer's seller_pubkey
+    // (when both are present). Mismatch → silently ignore (someone else's
+    // offer with a colliding id).
+    if !seller_pubkey_claim.is_empty() {
+        let local_pk = offer.get("seller_pubkey").and_then(|v| v.as_str()).unwrap_or("");
+        if !local_pk.is_empty() && local_pk != seller_pubkey_claim {
+            return Ok(());
+        }
+    }
+
+    let cur_status = offer.get("status").and_then(|v| v.as_str()).unwrap_or("open");
+    if cur_status != "open" {
+        return Ok(()); // already taken / expired / etc.
+    }
+
+    if let Some(obj) = offer.as_object_mut() {
+        obj.insert("status".to_string(), serde_json::json!("taken"));
+        obj.insert("buyer_address".to_string(), serde_json::json!(buyer_address));
+        obj.insert("agreement_id".to_string(), serde_json::json!(agreement_id));
+        obj.insert("agreement_hash".to_string(), serde_json::json!(agreement_hash));
+        obj.insert("taken_at".to_string(), serde_json::json!(taken_at));
+        if let Some(h) = taken_at_height {
+            obj.insert("taken_at_height".to_string(), serde_json::json!(h));
+        }
+    }
+    let serialized = serde_json::to_string_pretty(&offer)
+        .map_err(|e| format!("serialise offer: {e}"))?;
+    std::fs::write(&path, serialized)
+        .map_err(|e| format!("write offer {offer_id}: {e}"))?;
+
+    // Emit offer.taken immediately so the seller's GUI updates without
+    // waiting for the 5 s fs-watcher tick. The watcher's own emit will
+    // fire on the next tick too (idempotent on the GUI side — both
+    // events trigger the same silent reload).
+    emit_event(event_tx, "offer.taken", serde_json::json!({
+        "offer_id": offer_id,
+        "buyer_address": buyer_address,
+        "via": "p2p",
+    }));
+    Ok(())
+}
+
 fn offers_feed_dir() -> std::path::PathBuf {
     if let Ok(path) = std::env::var("IRIUM_OFFERS_DIR") {
         return std::path::PathBuf::from(path);
@@ -8714,6 +9132,16 @@ async fn offers_feed(
     check_rate(&state, &addr)?;
     let dir = offers_feed_dir();
     let limit = offers_feed_limit();
+    // LAYER 2: hide offers whose timeout_height has been reached by the
+    // current chain tip. The 5 s offer-watcher background task is the one
+    // that permanently flips status="open" → "expired" on disk; this filter
+    // is a fast-path so we never serve an expired offer to a peer even in
+    // the short window between expiry and the next watcher tick.
+    let current_tip: u64 = state
+        .chain
+        .lock()
+        .map(|guard| guard.tip_height())
+        .unwrap_or(0);
     let mut offers: Vec<serde_json::Value> = Vec::new();
     if dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -8726,6 +9154,12 @@ async fn offers_feed(
                         {
                             if val.get("status").and_then(|s| s.as_str()) != Some("open") {
                                 continue;
+                            }
+                            // LAYER 2 expiry: skip if chain tip past timeout_height.
+                            if let Some(th) = val.get("timeout_height").and_then(|v| v.as_u64()) {
+                                if current_tip >= th {
+                                    continue;
+                                }
                             }
                             if let Some(obj) = val.as_object_mut() {
                                 obj.remove("source");
@@ -8759,6 +9193,37 @@ async fn offers_feed(
         "count": offers.len(),
         "offers": offers,
     })))
+}
+
+/// LAYER 1 send-side RPC. The wallet binary calls this after `offer-take`
+/// has saved its local agreement; iriumd then broadcasts the take to all
+/// peers via MessageType::OfferTakeNotification. Gated behind
+/// require_rpc_auth so only the local wallet (which shares
+/// IRIUM_RPC_TOKEN) can broadcast — prevents a random LAN client from
+/// spoof-taking other people's offers.
+#[derive(Debug, serde::Deserialize)]
+struct BroadcastOfferTakeRequest {
+    /// JSON-encoded payload {offer_id, buyer_address, agreement_id,
+    /// agreement_hash, taken_at, taken_at_height?, seller_pubkey}.
+    payload_json: String,
+}
+
+async fn broadcast_offer_take_rpc(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<BroadcastOfferTakeRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    if let Some(ref p2p) = state.p2p {
+        p2p.broadcast_offer_take(&req.payload_json).await;
+        Ok(Json(serde_json::json!({"ok": true})))
+    } else {
+        // No P2P node configured — broadcast is a no-op but we still
+        // return ok so the wallet's best-effort send doesn't error.
+        Ok(Json(serde_json::json!({"ok": false, "reason": "p2p_disabled"})))
+    }
 }
 
 
@@ -9072,6 +9537,13 @@ async fn explorer_stats(
             post(compute_agreement_hash_rpc),
         )
         .route("/rpc/fundagreement", post(fund_agreement))
+        .route("/rpc/raisedispute", post(raise_dispute))
+        .route("/rpc/disputeevidence", post(submit_dispute_evidence))
+        .route("/rpc/resolvedispute", post(resolve_dispute))
+        .route("/rpc/registerresolver", post(register_resolver))
+        .route("/rpc/disputestate", get(get_dispute_state))
+        .route("/rpc/reresolveagreement", post(reresolve_agreement))
+        .route("/resolvers/list", get(resolvers_list))
         .route("/rpc/listagreementtxs", post(list_agreement_txs))
         .route("/rpc/agreementfundinglegs", post(agreement_funding_legs))
         .route("/rpc/agreementtimeline", post(agreement_timeline))
@@ -9129,6 +9601,7 @@ async fn explorer_stats(
         .route("/explorer/reputation/:pubkey", get(explorer_reputation))
         .route("/explorer/stats", get(explorer_stats))
         .route("/offers/feed", get(offers_feed))
+        .route("/rpc/broadcast_offer_take", post(broadcast_offer_take_rpc))
         .route("/ws", get(ws_handler))
         .route("/events", get(sse_handler))
         .route("/admin/add-seed", post(admin_add_seed))
@@ -9346,6 +9819,8 @@ mod tests {
             )))),
             event_tx: tokio::sync::broadcast::channel::<std::sync::Arc<String>>(WS_BROADCAST_CAPACITY).0,
             proof_heights: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            disputes_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            resolvers_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
         };
 
         (state, sender, recipient, refund)
@@ -9826,6 +10301,10 @@ mod tests {
             invoice_reference: None,
             external_reference: None,
             disputed_metadata_only: false,
+            primary_resolver: None,
+            fallback_resolver: None,
+            primary_resolver_fee: None,
+            fallback_resolver_fee: None,
             asset_reference: None,
             payment_reference: None,
             purpose_reference: None,
@@ -9876,7 +10355,7 @@ mod tests {
             },
             release_conditions: vec![AgreementReleaseCondition {
                 mode: "secret_preimage".to_string(),
-                secret_hash_hex: Some(hex::encode(sha256d(&s1))),
+                secret_hash_hex: Some(hex::encode(Sha256::digest(&s1))),
                 release_authorizer: Some("payer".to_string()),
                 notes: None,
             }],
@@ -9892,7 +10371,7 @@ mod tests {
                     amount: 300_000_000,
                     recipient_address: payee_address.to_string(),
                     refund_address: payer_address.to_string(),
-                    secret_hash_hex: hex::encode(sha256d(&s1)),
+                    secret_hash_hex: hex::encode(Sha256::digest(&s1)),
                     timeout_height,
                     metadata_hash: None,
                 },
@@ -9902,7 +10381,7 @@ mod tests {
                     amount: 400_000_000,
                     recipient_address: payee_address.to_string(),
                     refund_address: payer_address.to_string(),
-                    secret_hash_hex: hex::encode(sha256d(&s2)),
+                    secret_hash_hex: hex::encode(Sha256::digest(&s2)),
                     timeout_height: timeout_height + 5,
                     metadata_hash: None,
                 },
@@ -9914,6 +10393,10 @@ mod tests {
             invoice_reference: None,
             external_reference: None,
             disputed_metadata_only: false,
+            primary_resolver: None,
+            fallback_resolver: None,
+            primary_resolver_fee: None,
+            fallback_resolver_fee: None,
             asset_reference: None,
             payment_reference: None,
             purpose_reference: None,
@@ -10123,7 +10606,7 @@ mod tests {
         };
         confirm_tx_for_agreement_scan(&state, &plain_tx);
         let agreement =
-            sample_agreement_for_test(&sender, &recipient, hex::encode(sha256d(b"x")), 120);
+            sample_agreement_for_test(&sender, &recipient, hex::encode(Sha256::digest(b"x")), 120);
         let res = agreement_release_eligibility(
             ConnectInfo(test_socket()),
             State(state),
@@ -10291,6 +10774,10 @@ mod tests {
             invoice_reference: None,
             external_reference: None,
             disputed_metadata_only: false,
+            primary_resolver: None,
+            fallback_resolver: None,
+            primary_resolver_fee: None,
+            fallback_resolver_fee: None,
             asset_reference: None,
             payment_reference: None,
             purpose_reference: None,
@@ -15590,4 +16077,2379 @@ mod tests {
         // test state with no blocks applied, that's 0.
         assert_eq!(resp.generated_at_height, 0);
     }
+
+    // ========================================================================
+    // Stage 3.2.1: Dispute & resolver handler tests
+    // ========================================================================
+
+    fn s32_test_sk(seed: u8) -> SigningKey {
+        SigningKey::from_bytes((&[seed; 32]).into()).expect("test sk")
+    }
+
+    fn s32_test_addr(sk: &SigningKey) -> String {
+        let pk = sk
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        let sha = Sha256::digest(&pk);
+        let rip = ripemd::Ripemd160::digest(&sha);
+        let mut pkh = [0u8; 20];
+        pkh.copy_from_slice(&rip);
+        base58_p2pkh_from_hash(&pkh)
+    }
+
+    fn s32_signing_envelope(sk: &SigningKey, agreement_hash: &str) -> AgreementSignatureEnvelope {
+        let pk = sk
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        AgreementSignatureEnvelope {
+            version: 1,
+            target_type: irium_node_rs::settlement::AgreementSignatureTargetType::Agreement,
+            target_hash: agreement_hash.to_string(),
+            signer_public_key: hex::encode(&pk),
+            signer_address: Some(s32_test_addr(sk)),
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            timestamp: Some(1_700_000_000),
+            signer_role: None,
+            signature: String::new(),
+        }
+    }
+
+    fn s32_sign_raise(d: &mut DisputeRaise, sk: &SigningKey) {
+        d.signature = s32_signing_envelope(sk, &d.agreement_hash);
+        let bytes = dispute_raise_canonical_bytes(d).expect("canonical");
+        let digest = Sha256::digest(&bytes);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: Signature = sk.sign_prehash(&arr).expect("sign");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        d.signature.signature = hex::encode(sig.to_bytes());
+    }
+
+    fn s32_sign_evidence(d: &mut DisputeEvidence, sk: &SigningKey) {
+        d.signature = s32_signing_envelope(sk, &d.agreement_hash);
+        let bytes = dispute_evidence_canonical_bytes(d).expect("canonical");
+        let digest = Sha256::digest(&bytes);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: Signature = sk.sign_prehash(&arr).expect("sign");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        d.signature.signature = hex::encode(sig.to_bytes());
+    }
+
+    fn s32_sign_resolution(d: &mut DisputeResolution, sk: &SigningKey) {
+        d.signature = s32_signing_envelope(sk, &d.agreement_hash);
+        let bytes = dispute_resolution_canonical_bytes(d).expect("canonical");
+        let digest = Sha256::digest(&bytes);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: Signature = sk.sign_prehash(&arr).expect("sign");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        d.signature.signature = hex::encode(sig.to_bytes());
+    }
+
+    fn s32_sign_registration(r: &mut ResolverRegistration, sk: &SigningKey) {
+        r.signature = s32_signing_envelope(sk, "");
+        let bytes = resolver_registration_canonical_bytes(r).expect("canonical");
+        let digest = Sha256::digest(&bytes);
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&digest);
+        let sig: Signature = sk.sign_prehash(&arr).expect("sign");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        r.signature.signature = hex::encode(sig.to_bytes());
+    }
+
+    fn s32_otc_with_resolver(buyer: &str, seller: &str, primary_resolver: Option<&str>) -> AgreementObject {
+        let buyer_party = irium_node_rs::settlement::AgreementParty {
+            party_id: "buyer".to_string(),
+            display_name: "Buyer".to_string(),
+            address: buyer.to_string(),
+            role: Some("buyer".to_string()),
+        };
+        let seller_party = irium_node_rs::settlement::AgreementParty {
+            party_id: "seller".to_string(),
+            display_name: "Seller".to_string(),
+            address: seller.to_string(),
+            role: Some("seller".to_string()),
+        };
+        let mut a = irium_node_rs::settlement::build_otc_agreement(
+            "otc-3-2-1".to_string(),
+            1_700_000_000,
+            buyer_party,
+            seller_party,
+            500_000_000,
+            "IRM".to_string(),
+            "off-chain".to_string(),
+            120,
+            "ab".repeat(32),
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .expect("build_otc");
+        if let Some(addr) = primary_resolver {
+            a.primary_resolver = Some(addr.to_string());
+            a.primary_resolver_fee = Some(1_000_000);
+        }
+        a
+    }
+
+    fn s32_make_raise(agreement: &AgreementObject, raising_party: &str, sk: &SigningKey) -> DisputeRaise {
+        let agreement_hash = compute_agreement_hash_hex(agreement).expect("hash");
+        let mut d = DisputeRaise {
+            version: irium_node_rs::settlement::DISPUTE_RAISE_VERSION,
+            schema_id: Some(irium_node_rs::settlement::DISPUTE_RAISE_SCHEMA_ID.to_string()),
+            agreement_hash,
+            raising_party: raising_party.to_string(),
+            raised_at_height: 100,
+            raised_at_unix: 1_700_000_500,
+            reason: "buyer paid but seller refused release".to_string(),
+            initial_evidence_hash: "bb".repeat(32),
+            signature: s32_signing_envelope(sk, ""),
+        };
+        s32_sign_raise(&mut d, sk);
+        d
+    }
+
+    fn s32_make_evidence(agreement: &AgreementObject, submitter: &str, sk: &SigningKey) -> DisputeEvidence {
+        let agreement_hash = compute_agreement_hash_hex(agreement).expect("hash");
+        let mut d = DisputeEvidence {
+            version: irium_node_rs::settlement::DISPUTE_EVIDENCE_VERSION,
+            schema_id: Some(irium_node_rs::settlement::DISPUTE_EVIDENCE_SCHEMA_ID.to_string()),
+            agreement_hash,
+            submitter_party: submitter.to_string(),
+            submitted_at_height: 110,
+            evidence_type: "payment_proof".to_string(),
+            evidence_payload: "BASE64DATA".to_string(),
+            evidence_hash: "cc".repeat(32),
+            message: None,
+            signature: s32_signing_envelope(sk, ""),
+        };
+        s32_sign_evidence(&mut d, sk);
+        d
+    }
+
+    fn s32_make_resolution(
+        agreement: &AgreementObject,
+        role: &str,
+        sk: &SigningKey,
+        outcome: &str,
+    ) -> DisputeResolution {
+        let agreement_hash = compute_agreement_hash_hex(agreement).expect("hash");
+        let mut d = DisputeResolution {
+            version: irium_node_rs::settlement::DISPUTE_RESOLUTION_VERSION,
+            schema_id: Some(irium_node_rs::settlement::DISPUTE_RESOLUTION_SCHEMA_ID.to_string()),
+            agreement_hash,
+            resolver_address: s32_test_addr(sk),
+            resolver_role: role.to_string(),
+            outcome: outcome.to_string(),
+            resolved_at_height: 200,
+            message: "resolved by primary".to_string(),
+            signature: s32_signing_envelope(sk, ""),
+        };
+        s32_sign_resolution(&mut d, sk);
+        d
+    }
+
+    fn s32_make_registration(sk: &SigningKey, fee_bps: Option<u32>) -> ResolverRegistration {
+        let mut r = ResolverRegistration {
+            version: irium_node_rs::settlement::RESOLVER_REGISTRATION_VERSION,
+            schema_id: Some(irium_node_rs::settlement::RESOLVER_REGISTRATION_SCHEMA_ID.to_string()),
+            resolver_address: s32_test_addr(sk),
+            registered_at_height: 10,
+            display_name: Some("Test Resolver".to_string()),
+            bio: None,
+            fee_bps_self_quoted: fee_bps,
+            signature: s32_signing_envelope(sk, ""),
+        };
+        s32_sign_registration(&mut r, sk);
+        r
+    }
+
+    fn s32_add_wallet_utxos_multi(state: &AppState, address: &str, count: usize, value_each: u64) {
+        let pkh_vec = base58_p2pkh_to_hash(address).expect("addr decode");
+        let mut pkh20 = [0u8; 20];
+        pkh20.copy_from_slice(&pkh_vec);
+        let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip = chain.tip_height();
+        for i in 0..count {
+            let mut txid = [0xAAu8; 32];
+            txid[31] = i as u8;
+            chain.utxos.insert(
+                OutPoint {
+                    txid,
+                    index: 0,
+                },
+                UtxoEntry {
+                    output: TxOutput {
+                        value: value_each,
+                        script_pubkey: p2pkh_script(&pkh20),
+                    },
+                    height: tip,
+                    is_coinbase: false,
+                },
+            );
+        }
+    }
+
+    fn s32_stub_eligibility(
+        agreement_hash: &str,
+        agreement_id: &str,
+        eligible: bool,
+        branch: &str,
+    ) -> AgreementSpendEligibilityResponse {
+        AgreementSpendEligibilityResponse {
+            agreement_hash: agreement_hash.to_string(),
+            agreement_id: agreement_id.to_string(),
+            funding_txid: "ff".repeat(32),
+            htlc_vout: Some(0),
+            anchor_vout: Some(1),
+            role: Some(AgreementAnchorRole::Funding),
+            milestone_id: None,
+            amount: Some(100),
+            branch: branch.to_string(),
+            htlc_backed: true,
+            funded: true,
+            unspent: true,
+            preimage_required: branch == "release",
+            timeout_height: Some(120),
+            timeout_reached: branch == "refund",
+            destination_address: Some("Qdest".to_string()),
+            expected_hash: Some("11".repeat(32)),
+            recipient_address: Some("Qrcpt".to_string()),
+            refund_address: Some("Qrfd".to_string()),
+            eligible,
+            reasons: Vec::new(),
+            trust_model_note: String::new(),
+        }
+    }
+
+    // ---- Direct-helper unit tests (no RPC, no wallet) ----
+
+    #[test]
+    fn s32_eligibility_hook_blocks_release_when_open() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let buyer = s32_test_sk(11);
+        let seller = s32_test_sk(12);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let raise = s32_make_raise(&agreement, "buyer", &buyer);
+        let dstate = DisputeState {
+            raise,
+            raise_anchor_txid: None,
+            raise_anchored_at_height: None,
+            evidence: Vec::new(),
+            resolution: None,
+            resolution_anchor_txid: None,
+            resolution_anchored_at_height: None,
+            escalated_to_fallback: false,
+            escalated_at_height: None,
+        reresolve_nomination: None,
+        };
+        {
+            let mut guard = state.disputes_index.lock().unwrap();
+            guard.insert(agreement_hash.clone(), dstate);
+        }
+        let mut resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "release");
+        apply_dispute_status_to_eligibility(&state, &agreement, true, &mut resp);
+        assert!(!resp.eligible);
+        assert!(resp.reasons.iter().any(|r| r == "dispute_open"));
+    }
+
+    #[test]
+    fn s32_eligibility_hook_blocks_refund_when_open() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let buyer = s32_test_sk(13);
+        let seller = s32_test_sk(14);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let raise = s32_make_raise(&agreement, "seller", &seller);
+        let dstate = DisputeState {
+            raise,
+            raise_anchor_txid: None,
+            raise_anchored_at_height: None,
+            evidence: Vec::new(),
+            resolution: None,
+            resolution_anchor_txid: None,
+            resolution_anchored_at_height: None,
+            escalated_to_fallback: false,
+            escalated_at_height: None,
+        reresolve_nomination: None,
+        };
+        {
+            let mut guard = state.disputes_index.lock().unwrap();
+            guard.insert(agreement_hash.clone(), dstate);
+        }
+        let mut resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "refund");
+        apply_dispute_status_to_eligibility(&state, &agreement, false, &mut resp);
+        assert!(!resp.eligible);
+        assert!(resp.reasons.iter().any(|r| r == "dispute_open"));
+    }
+
+    #[test]
+    fn s32_eligibility_hook_resolved_release_blocks_refund_branch() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let buyer = s32_test_sk(15);
+        let seller = s32_test_sk(16);
+        let resolver = s32_test_sk(17);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let resolver_addr = s32_test_addr(&resolver);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, Some(&resolver_addr));
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let raise = s32_make_raise(&agreement, "buyer", &buyer);
+        let resolution = s32_make_resolution(&agreement, "primary", &resolver, "release");
+        let dstate = DisputeState {
+            raise,
+            raise_anchor_txid: Some("aa".repeat(32)),
+            raise_anchored_at_height: Some(10),
+            evidence: Vec::new(),
+            resolution: Some(resolution),
+            resolution_anchor_txid: Some("bb".repeat(32)),
+            resolution_anchored_at_height: Some(20),
+            escalated_to_fallback: false,
+            escalated_at_height: None,
+        reresolve_nomination: None,
+        };
+        {
+            let mut guard = state.disputes_index.lock().unwrap();
+            guard.insert(agreement_hash.clone(), dstate);
+        }
+        // Release branch should pass (no dispute block).
+        let mut release_resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "release");
+        apply_dispute_status_to_eligibility(&state, &agreement, true, &mut release_resp);
+        assert!(release_resp.eligible);
+        // Refund branch should be blocked.
+        let mut refund_resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "refund");
+        apply_dispute_status_to_eligibility(&state, &agreement, false, &mut refund_resp);
+        assert!(!refund_resp.eligible);
+        assert!(refund_resp.reasons.iter().any(|r| r == "dispute_resolution_blocks_branch"));
+    }
+
+    #[test]
+    fn s32_eligibility_hook_resolved_refund_blocks_release_branch() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let buyer = s32_test_sk(18);
+        let seller = s32_test_sk(19);
+        let resolver = s32_test_sk(20);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let resolver_addr = s32_test_addr(&resolver);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, Some(&resolver_addr));
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let raise = s32_make_raise(&agreement, "seller", &seller);
+        let resolution = s32_make_resolution(&agreement, "primary", &resolver, "refund");
+        let dstate = DisputeState {
+            raise,
+            raise_anchor_txid: Some("aa".repeat(32)),
+            raise_anchored_at_height: Some(10),
+            evidence: Vec::new(),
+            resolution: Some(resolution),
+            resolution_anchor_txid: Some("bb".repeat(32)),
+            resolution_anchored_at_height: Some(20),
+            escalated_to_fallback: false,
+            escalated_at_height: None,
+        reresolve_nomination: None,
+        };
+        {
+            let mut guard = state.disputes_index.lock().unwrap();
+            guard.insert(agreement_hash.clone(), dstate);
+        }
+        let mut refund_resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "refund");
+        apply_dispute_status_to_eligibility(&state, &agreement, false, &mut refund_resp);
+        assert!(refund_resp.eligible);
+        let mut release_resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "release");
+        apply_dispute_status_to_eligibility(&state, &agreement, true, &mut release_resp);
+        assert!(!release_resp.eligible);
+        assert!(release_resp.reasons.iter().any(|r| r == "dispute_resolution_blocks_branch"));
+    }
+
+    #[tokio::test]
+    async fn s32_escalation_tick_marks_fallback_after_window() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let buyer = s32_test_sk(21);
+        let seller = s32_test_sk(22);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let raise = s32_make_raise(&agreement, "buyer", &buyer);
+        let dstate = DisputeState {
+            raise,
+            raise_anchor_txid: Some("aa".repeat(32)),
+            raise_anchored_at_height: Some(10),
+            evidence: Vec::new(),
+            resolution: None,
+            resolution_anchor_txid: None,
+            resolution_anchored_at_height: None,
+            escalated_to_fallback: false,
+            escalated_at_height: None,
+        reresolve_nomination: None,
+        };
+        {
+            let mut guard = state.disputes_index.lock().unwrap();
+            guard.insert(agreement_hash.clone(), dstate);
+        }
+        // Tip exactly 288 blocks past raise → triggers escalation.
+        escalation_tick(&state.disputes_index, &state.event_tx, &None, 10 + 288).await;
+        let guard = state.disputes_index.lock().unwrap();
+        let d = guard.get(&agreement_hash).expect("present");
+        assert!(d.escalated_to_fallback);
+        assert_eq!(d.escalated_at_height, Some(298));
+    }
+
+    #[tokio::test]
+    async fn s32_escalation_tick_no_escalation_within_window() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        let buyer = s32_test_sk(23);
+        let seller = s32_test_sk(24);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let agreement_hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let raise = s32_make_raise(&agreement, "buyer", &buyer);
+        let dstate = DisputeState {
+            raise,
+            raise_anchor_txid: Some("aa".repeat(32)),
+            raise_anchored_at_height: Some(10),
+            evidence: Vec::new(),
+            resolution: None,
+            resolution_anchor_txid: None,
+            resolution_anchored_at_height: None,
+            escalated_to_fallback: false,
+            escalated_at_height: None,
+        reresolve_nomination: None,
+        };
+        {
+            let mut guard = state.disputes_index.lock().unwrap();
+            guard.insert(agreement_hash.clone(), dstate);
+        }
+        // Tip only 200 blocks past raise — under 288 → no escalation.
+        escalation_tick(&state.disputes_index, &state.event_tx, &None, 210).await;
+        let guard = state.disputes_index.lock().unwrap();
+        let d = guard.get(&agreement_hash).expect("present");
+        assert!(!d.escalated_to_fallback);
+    }
+
+    #[tokio::test]
+    async fn s32_resolvers_list_paginates() {
+        let (state, _, _, _) = create_test_state(Some(0));
+        for i in 0..3u8 {
+            let sk = s32_test_sk(40 + i);
+            let mut reg = s32_make_registration(&sk, Some(100 * (i as u32 + 1)));
+            reg.registered_at_height = 1000 + i as u64;
+            let rec = ResolverRegistrationRecord {
+                registration: reg,
+                anchor_txid: Some(format!("{:0>64}", i)),
+                anchored_at_height: Some(1000 + i as u64),
+            };
+            let mut guard = state.resolvers_index.lock().unwrap();
+            guard.insert(rec.registration.resolver_address.clone(), rec);
+        }
+        let resp1 = resolvers_list(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(ResolversListQuery {
+                limit: Some(2),
+                cursor: None,
+            }),
+        )
+        .await
+        .expect("list1")
+        .0;
+        assert_eq!(resp1.resolvers.len(), 2);
+        assert!(resp1.next_cursor.is_some());
+        let cursor = resp1.next_cursor.clone().unwrap();
+        let resp2 = resolvers_list(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(ResolversListQuery {
+                limit: Some(2),
+                cursor: Some(cursor),
+            }),
+        )
+        .await
+        .expect("list2")
+        .0;
+        assert_eq!(resp2.resolvers.len(), 1);
+        assert!(resp2.next_cursor.is_none());
+    }
+
+    // ---- Full-handler RPC tests (real wallet + UTXOs) ----
+
+    #[tokio::test]
+    async fn s32_raise_dispute_happy_path() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        let buyer = s32_test_sk(50);
+        let seller = s32_test_sk(51);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let dispute = s32_make_raise(&agreement, "buyer", &buyer);
+        let agreement_hash = dispute.agreement_hash.clone();
+        let resp = raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement: agreement.clone(),
+            }),
+        )
+        .await
+        .expect("raise_dispute")
+        .0;
+        assert_eq!(resp.agreement_hash, agreement_hash);
+        assert!(!resp.anchor_txid.is_empty());
+        let guard = state.disputes_index.lock().unwrap();
+        let d = guard.get(&agreement_hash).expect("present");
+        assert!(d.is_open());
+        assert_eq!(d.raise.raising_party, "buyer");
+    }
+
+    #[tokio::test]
+    async fn s32_raise_dispute_rejects_invalid_signature() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        let buyer = s32_test_sk(52);
+        let wrong = s32_test_sk(53);
+        let seller = s32_test_sk(54);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        // Sign with the WRONG key.
+        let dispute = s32_make_raise(&agreement, "buyer", &wrong);
+        let result = raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("signature"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_raise_dispute_rejects_non_party_raiser() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        let buyer = s32_test_sk(55);
+        let seller = s32_test_sk(56);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        // raising_party set to non-existent id "other".
+        let dispute = s32_make_raise(&agreement, "other", &buyer);
+        let result = raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("raising_party_not_in_agreement"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_raise_dispute_rejects_deposit_template() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        let payer = s32_test_sk(57);
+        let payee = s32_test_sk(58);
+        let payer_addr = s32_test_addr(&payer);
+        let payee_addr = s32_test_addr(&payee);
+        let payer_party = irium_node_rs::settlement::AgreementParty {
+            party_id: "payer".to_string(),
+            display_name: "Payer".to_string(),
+            address: payer_addr.clone(),
+            role: Some("payer".to_string()),
+        };
+        let payee_party = irium_node_rs::settlement::AgreementParty {
+            party_id: "payee".to_string(),
+            display_name: "Payee".to_string(),
+            address: payee_addr.clone(),
+            role: Some("payee".to_string()),
+        };
+        let agreement = irium_node_rs::settlement::build_deposit_agreement(
+            "dep-3-2-1".to_string(),
+            1_700_000_000,
+            payer_party,
+            payee_party,
+            500_000_000,
+            "purpose".to_string(),
+            "refundable".to_string(),
+            120,
+            "ab".repeat(32),
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .expect("build_deposit");
+        let dispute = s32_make_raise(&agreement, "payer", &payer);
+        let result = raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("dispute_template_not_eligible"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_raise_dispute_rejects_duplicate() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        let buyer = s32_test_sk(59);
+        let seller = s32_test_sk(60);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let dispute1 = s32_make_raise(&agreement, "buyer", &buyer);
+        raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute: dispute1,
+                agreement: agreement.clone(),
+            }),
+        )
+        .await
+        .expect("first raise");
+        let dispute2 = s32_make_raise(&agreement, "seller", &seller);
+        let result = raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute: dispute2,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject duplicate");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("dispute_already_open"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_dispute_evidence_appends_to_open_dispute() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 5, 100_000_000);
+        let buyer = s32_test_sk(61);
+        let seller = s32_test_sk(62);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let dispute = s32_make_raise(&agreement, "buyer", &buyer);
+        raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement: agreement.clone(),
+            }),
+        )
+        .await
+        .expect("raise");
+        let evidence = s32_make_evidence(&agreement, "seller", &seller);
+        let agreement_hash = evidence.agreement_hash.clone();
+        let resp = submit_dispute_evidence(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(SubmitDisputeEvidenceRequest {
+                evidence,
+                agreement,
+            }),
+        )
+        .await
+        .expect("evidence")
+        .0;
+        assert!(!resp.anchor_txid.is_empty());
+        let guard = state.disputes_index.lock().unwrap();
+        let d = guard.get(&agreement_hash).expect("present");
+        assert_eq!(d.evidence.len(), 1);
+        assert_eq!(d.evidence[0].evidence.submitter_party, "seller");
+    }
+
+    #[tokio::test]
+    async fn s32_dispute_evidence_rejects_when_no_open_dispute() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        let buyer = s32_test_sk(63);
+        let seller = s32_test_sk(64);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, None);
+        let evidence = s32_make_evidence(&agreement, "buyer", &buyer);
+        let result = submit_dispute_evidence(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(SubmitDisputeEvidenceRequest {
+                evidence,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("no_open_dispute"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_resolve_dispute_primary_release_recorded() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 5, 100_000_000);
+        let buyer = s32_test_sk(65);
+        let seller = s32_test_sk(66);
+        let resolver = s32_test_sk(67);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let resolver_addr = s32_test_addr(&resolver);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, Some(&resolver_addr));
+        let dispute = s32_make_raise(&agreement, "buyer", &buyer);
+        raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement: agreement.clone(),
+            }),
+        )
+        .await
+        .expect("raise");
+        let resolution = s32_make_resolution(&agreement, "primary", &resolver, "release");
+        let agreement_hash = resolution.agreement_hash.clone();
+        let resp = resolve_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(ResolveDisputeRequest {
+                resolution,
+                agreement,
+            }),
+        )
+        .await
+        .expect("resolve")
+        .0;
+        assert_eq!(resp.outcome, "release");
+        assert_eq!(resp.resolver_role, "primary");
+        let guard = state.disputes_index.lock().unwrap();
+        let d = guard.get(&agreement_hash).expect("present");
+        assert!(!d.is_open());
+        assert_eq!(d.resolution.as_ref().unwrap().outcome, "release");
+    }
+
+    #[tokio::test]
+    async fn s32_resolve_dispute_rejects_unknown_resolver() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 5, 100_000_000);
+        let buyer = s32_test_sk(68);
+        let seller = s32_test_sk(69);
+        let resolver = s32_test_sk(70);
+        let attacker = s32_test_sk(71);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let resolver_addr = s32_test_addr(&resolver);
+        let agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, Some(&resolver_addr));
+        let dispute = s32_make_raise(&agreement, "buyer", &buyer);
+        raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement: agreement.clone(),
+            }),
+        )
+        .await
+        .expect("raise");
+        // Build resolution signed by attacker (not the named resolver).
+        let resolution = s32_make_resolution(&agreement, "primary", &attacker, "release");
+        let result = resolve_dispute(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(ResolveDisputeRequest {
+                resolution,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("resolver_address_mismatch"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_resolve_dispute_rejects_fallback_before_escalation() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 5, 100_000_000);
+        let buyer = s32_test_sk(72);
+        let seller = s32_test_sk(73);
+        let primary = s32_test_sk(74);
+        let fallback = s32_test_sk(75);
+        let buyer_addr = s32_test_addr(&buyer);
+        let seller_addr = s32_test_addr(&seller);
+        let primary_addr = s32_test_addr(&primary);
+        let fallback_addr = s32_test_addr(&fallback);
+        let mut agreement = s32_otc_with_resolver(&buyer_addr, &seller_addr, Some(&primary_addr));
+        agreement.fallback_resolver = Some(fallback_addr.clone());
+        agreement.fallback_resolver_fee = Some(500_000);
+        let dispute = s32_make_raise(&agreement, "buyer", &buyer);
+        raise_dispute(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumJson(RaiseDisputeRequest {
+                dispute,
+                agreement: agreement.clone(),
+            }),
+        )
+        .await
+        .expect("raise");
+        // Fallback tries to resolve without escalation having occurred.
+        let resolution = s32_make_resolution(&agreement, "fallback", &fallback, "release");
+        let result = resolve_dispute(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(ResolveDisputeRequest {
+                resolution,
+                agreement,
+            }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("fallback_not_yet_escalated"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn s32_register_resolver_rejects_non_miner() {
+        let (state, sender, _, _) = create_test_state(Some(0));
+        s32_add_wallet_utxos_multi(&state, &sender, 3, 100_000_000);
+        // chain.chain is empty in tests → no coinbase → not a recent miner.
+        let resolver = s32_test_sk(80);
+        let registration = s32_make_registration(&resolver, Some(500));
+        let result = register_resolver(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(RegisterResolverRequest { registration }),
+        )
+        .await;
+        let (status, msg) = result.expect_err("should reject");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("resolver_not_recent_miner"), "got: {msg}");
+    }
+}
+
+
+// ============================================================================
+// Stage 3.2: Dispute and Resolver System
+// ============================================================================
+
+fn iriumd_disputes_dir() -> std::path::PathBuf {
+    storage::state_dir().join("iriumd_disputes")
+}
+
+fn iriumd_resolvers_dir() -> std::path::PathBuf {
+    storage::state_dir().join("iriumd_resolvers")
+}
+
+fn dispute_state_path(agreement_hash: &str) -> std::path::PathBuf {
+    iriumd_disputes_dir().join(format!("{}.json", agreement_hash))
+}
+
+fn resolver_record_path(addr: &str) -> std::path::PathBuf {
+    iriumd_resolvers_dir().join(format!("{}.json", addr))
+}
+
+fn save_json_atomic<T: Serialize>(path: &std::path::Path, value: &T) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create dir {}: {}", parent.display(), e))?;
+    }
+    let pid = std::process::id();
+    let tmp = path.with_extension(format!("json.tmp.{}", pid));
+    let bytes = serde_json::to_vec_pretty(value).map_err(|e| format!("serialize: {}", e))?;
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write tmp: {}", e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {}", e))?;
+    Ok(())
+}
+
+fn save_dispute_state(state: &DisputeState) -> Result<(), String> {
+    let path = dispute_state_path(&state.raise.agreement_hash);
+    save_json_atomic(&path, state)
+}
+
+fn save_resolver_record(rec: &ResolverRegistrationRecord) -> Result<(), String> {
+    let path = resolver_record_path(&rec.registration.resolver_address);
+    save_json_atomic(&path, rec)
+}
+
+fn load_all_disputes_at_startup() -> std::collections::HashMap<String, DisputeState> {
+    let dir = iriumd_disputes_dir();
+    let mut out = std::collections::HashMap::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[disputes] failed to read {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        match serde_json::from_slice::<DisputeState>(&bytes) {
+            Ok(state) => {
+                out.insert(state.raise.agreement_hash.clone(), state);
+            }
+            Err(e) => {
+                eprintln!("[disputes] failed to parse {}: {}", path.display(), e);
+            }
+        }
+    }
+    out
+}
+
+fn load_all_resolvers_at_startup() -> std::collections::HashMap<String, ResolverRegistrationRecord>
+{
+    let dir = iriumd_resolvers_dir();
+    let mut out = std::collections::HashMap::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if let Ok(rec) = serde_json::from_slice::<ResolverRegistrationRecord>(&bytes) {
+            out.insert(rec.registration.resolver_address.clone(), rec);
+        }
+    }
+    out
+}
+
+fn address_is_recent_miner(chain: &ChainState, address: &str) -> bool {
+    let Some(pkh_vec) = base58_p2pkh_to_hash(address) else {
+        return false;
+    };
+    if pkh_vec.len() != 20 {
+        return false;
+    }
+    let mut target = [0u8; 20];
+    target.copy_from_slice(&pkh_vec);
+    let tip = chain.tip_height();
+    let start = tip.saturating_sub(MINER_RECENCY_WINDOW);
+    for h in start..=tip {
+        let Some(block) = chain.chain.get(h as usize) else {
+            continue;
+        };
+        let Some(coinbase) = block.transactions.first() else {
+            continue;
+        };
+        for out in &coinbase.outputs {
+            if let Some(out_pkh) = p2pkh_hash_from_script(&out.script_pubkey) {
+                if out_pkh == target {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Apply dispute status to an eligibility response. If a dispute is open,
+/// mark not-eligible with reason "dispute_open". If a dispute is resolved,
+/// block the branch that does not match the resolved outcome with reason
+/// "dispute_resolution_blocks_branch".
+fn apply_dispute_status_to_eligibility(
+    state: &AppState,
+    agreement: &AgreementObject,
+    claim: bool,
+    resp: &mut AgreementSpendEligibilityResponse,
+) {
+    let Ok(agreement_hash) = compute_agreement_hash_hex(agreement) else {
+        return;
+    };
+    let dispute = {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&agreement_hash).cloned()
+    };
+    let Some(d) = dispute else {
+        return;
+    };
+    if d.is_open() {
+        resp.eligible = false;
+        if !resp.reasons.iter().any(|r| r == "dispute_open") {
+            resp.reasons.push("dispute_open".to_string());
+        }
+        return;
+    }
+    if let Some(ref resolution) = d.resolution {
+        let want_release = resolution.outcome == "release";
+        let want_refund = resolution.outcome == "refund";
+        let branch_allowed = (claim && want_release) || (!claim && want_refund);
+        if !branch_allowed {
+            resp.eligible = false;
+            if !resp
+                .reasons
+                .iter()
+                .any(|r| r == "dispute_resolution_blocks_branch")
+            {
+                resp.reasons
+                    .push("dispute_resolution_blocks_branch".to_string());
+            }
+        }
+    }
+}
+
+/// Build, sign, and (optionally) broadcast a transaction that anchors the
+/// supplied agreement hash on chain via an OP_RETURN output. Returns the txid
+/// hex on success. Mirrors fund_agreement's wallet+utxo+sign+broadcast path.
+fn build_and_broadcast_anchor_tx(
+    state: &AppState,
+    agreement_hash: &str,
+    role: AgreementAnchorRole,
+) -> Result<String, String> {
+    let anchor_output = build_agreement_anchor_output(&AgreementAnchor {
+        agreement_hash: agreement_hash.to_string(),
+        role,
+        milestone_id: None,
+    })
+    .map_err(|e| format!("anchor_payload: {}", e))?;
+
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet
+            .keys()
+            .map_err(|_| "wallet_keys_unavailable".to_string())?;
+        for key in keys {
+            let bytes = hex::decode(&key.pkh).map_err(|_| "wallet_key_pkh_decode_failed".to_string())?;
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            key_map.insert(arr, key);
+        }
+    }
+    if key_map.is_empty() {
+        return Err("wallet_key_map_empty".to_string());
+    }
+
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if key_map.contains_key(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+    if utxos.is_empty() {
+        return Err("wallet_utxo_set_empty".to_string());
+    }
+    utxos.sort_by(|a, b| a.output.value.cmp(&b.output.value));
+
+    let fee_per_byte = DISPUTE_ANCHOR_FEE_PER_BYTE;
+    // Tx layout: 1 input + 2 outputs (OP_RETURN anchor + change)
+    let estimated_fee = estimate_tx_size(1, 2).saturating_mul(fee_per_byte);
+
+    let mut chosen: Option<WalletUtxo> = None;
+    for utxo in &utxos {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+            continue;
+        }
+        if utxo.output.value > estimated_fee {
+            chosen = Some(utxo.clone());
+            break;
+        }
+    }
+    let utxo = chosen.ok_or_else(|| "insufficient_spendable_funds_or_immature_coinbase".to_string())?;
+
+    let change_value = utxo.output.value.saturating_sub(estimated_fee);
+    let mut outputs = vec![anchor_output];
+    outputs.push(TxOutput {
+        value: change_value,
+        script_pubkey: p2pkh_script(&utxo.pkh),
+    });
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: utxo.outpoint.txid,
+            prev_index: utxo.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        }],
+        outputs,
+        locktime: 0,
+    };
+
+    // Sign the input.
+    let priv_bytes = hex::decode(&utxo.pkh_key_priv(&key_map)?)
+        .map_err(|_| "wallet_priv_decode".to_string())?;
+    if priv_bytes.len() != 32 {
+        return Err("wallet_priv_len".to_string());
+    }
+    let mut sk_arr = [0u8; 32];
+    sk_arr.copy_from_slice(&priv_bytes);
+    let signing_key =
+        SigningKey::from_bytes((&sk_arr).into()).map_err(|_| "signing_key".to_string())?;
+    let pubkey_bytes = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+    let scriptcode = p2pkh_script(&utxo.pkh);
+    let digest = signature_digest(&tx, 0, &scriptcode);
+    let sig: Signature = signing_key
+        .sign_prehash(&digest)
+        .map_err(|_| "sign_prehash".to_string())?;
+    let sig = sig.normalize_s().unwrap_or(sig);
+    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+    sig_bytes.push(0x01);
+    let mut script_sig: Vec<u8> = Vec::with_capacity(2 + sig_bytes.len() + pubkey_bytes.len());
+    script_sig.push(sig_bytes.len() as u8);
+    script_sig.extend_from_slice(&sig_bytes);
+    script_sig.push(pubkey_bytes.len() as u8);
+    script_sig.extend_from_slice(&pubkey_bytes);
+    tx.inputs[0].script_sig = script_sig;
+
+    // Validate fee then submit to mempool.
+    let raw = tx.serialize();
+    let txid = tx.txid();
+    let txid_hex = hex::encode(txid);
+    let fee = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|e| format!("fee_validate: {}", e))?
+    };
+    {
+        let mut mp = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = mp.add_transaction(tx.clone(), raw.clone(), fee);
+    }
+    // Best-effort P2P broadcast.
+    if let Some(ref node) = state.p2p {
+        let node = node.clone();
+        let raw_bytes = raw.clone();
+        tokio::spawn(async move {
+            let _ = node.broadcast_tx(&raw_bytes).await;
+        });
+    }
+    Ok(txid_hex)
+}
+
+trait WalletKeyPrivLookup {
+    fn pkh_key_priv(&self, key_map: &HashMap<[u8; 20], WalletKey>) -> Result<String, String>;
+}
+
+impl WalletKeyPrivLookup for WalletUtxo {
+    fn pkh_key_priv(&self, key_map: &HashMap<[u8; 20], WalletKey>) -> Result<String, String> {
+        key_map
+            .get(&self.pkh)
+            .map(|k| k.privkey.clone())
+            .ok_or_else(|| "wallet_key_for_pkh_missing".to_string())
+    }
+}
+
+/// Compute the payload hash for a DisputeRaise signature. The signature field
+/// is zeroed for the hash so signers can compute the same digest before
+/// embedding their signature.
+fn dispute_raise_payload_hash(d: &DisputeRaise) -> Result<[u8; 32], String> {
+    let mut tmp = d.clone();
+    tmp.signature.signature = String::new();
+    let bytes = dispute_raise_canonical_bytes(&tmp)?;
+    let h = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h);
+    Ok(out)
+}
+
+fn dispute_evidence_payload_hash(d: &DisputeEvidence) -> Result<[u8; 32], String> {
+    let mut tmp = d.clone();
+    tmp.signature.signature = String::new();
+    let bytes = dispute_evidence_canonical_bytes(&tmp)?;
+    let h = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h);
+    Ok(out)
+}
+
+fn dispute_resolution_payload_hash(d: &DisputeResolution) -> Result<[u8; 32], String> {
+    let mut tmp = d.clone();
+    tmp.signature.signature = String::new();
+    let bytes = dispute_resolution_canonical_bytes(&tmp)?;
+    let h = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h);
+    Ok(out)
+}
+
+fn resolver_registration_payload_hash(r: &ResolverRegistration) -> Result<[u8; 32], String> {
+    let mut tmp = r.clone();
+    tmp.signature.signature = String::new();
+    let bytes = resolver_registration_canonical_bytes(&tmp)?;
+    let h = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h);
+    Ok(out)
+}
+
+fn verify_envelope_signature(
+    envelope: &AgreementSignatureEnvelope,
+    digest: &[u8; 32],
+    expected_address: &str,
+) -> Result<(), String> {
+    if envelope.signature_type != AGREEMENT_SIGNATURE_TYPE_SECP256K1 {
+        return Err(format!(
+            "unsupported signature type: {}",
+            envelope.signature_type
+        ));
+    }
+    if envelope
+        .signer_address
+        .as_deref()
+        .map(|s| s != expected_address)
+        .unwrap_or(true)
+    {
+        return Err("signer_address_mismatch".to_string());
+    }
+    let pubkey_bytes = hex::decode(&envelope.signer_public_key)
+        .map_err(|_| "signer_public_key_decode".to_string())?;
+    let verifying_key = VerifyingKey::from_sec1_bytes(&pubkey_bytes)
+        .map_err(|_| "signer_public_key_invalid".to_string())?;
+    // Verify pubkey produces the expected address.
+    let mut sha = Sha256::new();
+    sha.update(&pubkey_bytes);
+    let sha_out = sha.finalize();
+    let rip = ripemd::Ripemd160::digest(&sha_out);
+    let mut pkh = [0u8; 20];
+    pkh.copy_from_slice(&rip);
+    let derived_address = base58_p2pkh_from_hash(&pkh);
+    if derived_address != expected_address {
+        return Err("pubkey_does_not_match_signer_address".to_string());
+    }
+    let sig_bytes =
+        hex::decode(&envelope.signature).map_err(|_| "signature_decode".to_string())?;
+    let parsed = Signature::from_slice(&sig_bytes)
+        .map_err(|_| "signature_format".to_string())?;
+    verifying_key
+        .verify_prehash(digest, &parsed)
+        .map_err(|_| "signature_verify_failed".to_string())?;
+    Ok(())
+}
+
+// ---------- Request/response types ----------
+
+#[derive(Debug, Deserialize)]
+struct RaiseDisputeRequest {
+    dispute: DisputeRaise,
+    agreement: AgreementObject,
+}
+
+#[derive(Debug, Serialize)]
+struct RaiseDisputeResponse {
+    agreement_hash: String,
+    anchor_txid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitDisputeEvidenceRequest {
+    evidence: DisputeEvidence,
+    agreement: AgreementObject,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitDisputeEvidenceResponse {
+    evidence_hash: String,
+    anchor_txid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveDisputeRequest {
+    resolution: DisputeResolution,
+    agreement: AgreementObject,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolveDisputeResponse {
+    anchor_txid: String,
+    outcome: String,
+    resolver_role: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterResolverRequest {
+    registration: ResolverRegistration,
+}
+
+#[derive(Debug, Serialize)]
+struct RegisterResolverResponse {
+    resolver_address: String,
+    anchor_txid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolversListQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolversListEntry {
+    resolver_address: String,
+    registered_at_height: u64,
+    display_name: Option<String>,
+    fee_bps_self_quoted: Option<u32>,
+    anchor_txid: Option<String>,
+    anchored_at_height: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolversListResponse {
+    resolvers: Vec<ResolversListEntry>,
+    next_cursor: Option<String>,
+}
+
+// ---------- Handlers ----------
+
+async fn raise_dispute(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<RaiseDisputeRequest>,
+) -> Result<Json<RaiseDisputeResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    req.dispute.validate().map_err(|e| bad(&e))?;
+    req.agreement.validate().map_err(|e| bad(&e))?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| bad("agreement_hash_failed"))?;
+    if agreement_hash != req.dispute.agreement_hash {
+        return Err(bad("dispute_agreement_hash_mismatch"));
+    }
+    let dispute_eligible = matches!(
+        req.agreement.template_type,
+        AgreementTemplateType::OtcSettlement
+            | AgreementTemplateType::MilestoneSettlement
+            | AgreementTemplateType::ContractorMilestone
+    );
+    if !dispute_eligible {
+        return Err(bad("dispute_template_not_eligible"));
+    }
+    let party = req
+        .agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == req.dispute.raising_party)
+        .ok_or_else(|| bad("raising_party_not_in_agreement"))?;
+    let digest =
+        dispute_raise_payload_hash(&req.dispute).map_err(|e| bad(&format!("payload_hash:{e}")))?;
+    verify_envelope_signature(&req.dispute.signature, &digest, &party.address)
+        .map_err(|e| bad(&format!("signature:{e}")))?;
+    {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = guard.get(&agreement_hash) {
+            if existing.is_open() {
+                return Err(bad("dispute_already_open"));
+            }
+        }
+    }
+    let anchor_txid =
+        build_and_broadcast_anchor_tx(&state, &agreement_hash, AgreementAnchorRole::DisputeRaise)
+            .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
+    let new_state = DisputeState {
+        raise: req.dispute.clone(),
+        raise_anchor_txid: Some(anchor_txid.clone()),
+        raise_anchored_at_height: None,
+        evidence: Vec::new(),
+        resolution: None,
+        resolution_anchor_txid: None,
+        resolution_anchored_at_height: None,
+        escalated_to_fallback: false,
+        escalated_at_height: None,
+    reresolve_nomination: None,
+    };
+    save_dispute_state(&new_state).map_err(|e| bad(&format!("persist:{e}")))?;
+    {
+        let mut guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(agreement_hash.clone(), new_state);
+    }
+    emit_event(
+        &state.event_tx,
+        "dispute.raised",
+        serde_json::json!({
+            "agreement_hash": agreement_hash,
+            "raising_party": req.dispute.raising_party,
+            "anchor_txid": anchor_txid,
+        }),
+    );
+    if let Some(ref node) = state.p2p {
+        if let Ok(json) = serde_json::to_string(&req.dispute) {
+            let node = node.clone();
+            tokio::spawn(async move {
+                node.broadcast_dispute_raised(&json).await;
+            });
+        }
+    }
+    Ok(Json(RaiseDisputeResponse {
+        agreement_hash,
+        anchor_txid,
+    }))
+}
+
+async fn submit_dispute_evidence(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<SubmitDisputeEvidenceRequest>,
+) -> Result<Json<SubmitDisputeEvidenceResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    req.evidence.validate().map_err(|e| bad(&e))?;
+    req.agreement.validate().map_err(|e| bad(&e))?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| bad("agreement_hash_failed"))?;
+    if agreement_hash != req.evidence.agreement_hash {
+        return Err(bad("evidence_agreement_hash_mismatch"));
+    }
+    let party = req
+        .agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == req.evidence.submitter_party)
+        .ok_or_else(|| bad("submitter_party_not_in_agreement"))?;
+    let digest = dispute_evidence_payload_hash(&req.evidence)
+        .map_err(|e| bad(&format!("payload_hash:{e}")))?;
+    verify_envelope_signature(&req.evidence.signature, &digest, &party.address)
+        .map_err(|e| bad(&format!("signature:{e}")))?;
+    {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let d = guard.get(&agreement_hash).ok_or_else(|| bad("no_open_dispute"))?;
+        if !d.is_open() {
+            return Err(bad("dispute_already_resolved"));
+        }
+    }
+    let anchor_txid = build_and_broadcast_anchor_tx(
+        &state,
+        &agreement_hash,
+        AgreementAnchorRole::DisputeEvidence,
+    )
+    .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
+    let evidence_hash = req.evidence.evidence_hash.clone();
+    let evidence_record = DisputeEvidenceRecord {
+        evidence: req.evidence,
+        anchor_txid: Some(anchor_txid.clone()),
+        anchored_at_height: None,
+    };
+    let snapshot = {
+        let mut guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let d = guard.get_mut(&agreement_hash).ok_or_else(|| bad("no_open_dispute"))?;
+        d.evidence.push(evidence_record);
+        d.clone()
+    };
+    save_dispute_state(&snapshot).map_err(|e| bad(&format!("persist:{e}")))?;
+    emit_event(
+        &state.event_tx,
+        "dispute.evidence_submitted",
+        serde_json::json!({
+            "agreement_hash": agreement_hash,
+            "evidence_hash": evidence_hash,
+            "anchor_txid": anchor_txid,
+        }),
+    );
+    if let Some(ref node) = state.p2p {
+        let evidence_clone = {
+            let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .get(&agreement_hash)
+                .and_then(|d| d.evidence.last().map(|r| r.evidence.clone()))
+        };
+        if let Some(ev) = evidence_clone {
+            if let Ok(json) = serde_json::to_string(&ev) {
+                let node = node.clone();
+                tokio::spawn(async move {
+                    node.broadcast_dispute_evidence(&json).await;
+                });
+            }
+        }
+    }
+    Ok(Json(SubmitDisputeEvidenceResponse {
+        evidence_hash,
+        anchor_txid,
+    }))
+}
+
+async fn resolve_dispute(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<ResolveDisputeRequest>,
+) -> Result<Json<ResolveDisputeResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    req.resolution.validate().map_err(|e| bad(&e))?;
+    req.agreement.validate().map_err(|e| bad(&e))?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| bad("agreement_hash_failed"))?;
+    if agreement_hash != req.resolution.agreement_hash {
+        return Err(bad("resolution_agreement_hash_mismatch"));
+    }
+    let role = req.resolution.resolver_role.as_str();
+    let (agreement_primary, agreement_fallback) = (
+        req.agreement.primary_resolver.clone(),
+        req.agreement.fallback_resolver.clone(),
+    );
+    // Stage 3.4.1: a co-signed reresolve nomination overrides the
+    // agreement's named resolvers for this dispute.
+    let agreement_hash_for_role = compute_agreement_hash_hex(&req.agreement)
+        .map_err(|_| bad("agreement_hash_failed"))?;
+    let (effective_primary, effective_fallback) = {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = guard.get(&agreement_hash_for_role) {
+            if let Some(ref nom) = d.reresolve_nomination {
+                (
+                    Some(nom.new_primary_resolver.clone()),
+                    nom.new_fallback_resolver.clone(),
+                )
+            } else {
+                (agreement_primary.clone(), agreement_fallback.clone())
+            }
+        } else {
+            (agreement_primary.clone(), agreement_fallback.clone())
+        }
+    };
+    let expected_address = match role {
+        "primary" => effective_primary
+            .ok_or_else(|| bad("agreement_has_no_primary_resolver"))?,
+        "fallback" => effective_fallback
+            .ok_or_else(|| bad("agreement_has_no_fallback_resolver"))?,
+        _ => return Err(bad("invalid_resolver_role")),
+    };
+    if expected_address != req.resolution.resolver_address {
+        return Err(bad("resolver_address_mismatch"));
+    }
+    let digest = dispute_resolution_payload_hash(&req.resolution)
+        .map_err(|e| bad(&format!("payload_hash:{e}")))?;
+    verify_envelope_signature(&req.resolution.signature, &digest, &expected_address)
+        .map_err(|e| bad(&format!("signature:{e}")))?;
+    {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let d = guard
+            .get(&agreement_hash)
+            .ok_or_else(|| bad("no_open_dispute"))?;
+        if !d.is_open() {
+            return Err(bad("dispute_already_resolved"));
+        }
+        if role == "fallback" && !d.escalated_to_fallback {
+            return Err(bad("fallback_not_yet_escalated"));
+        }
+    }
+    let anchor_txid = build_and_broadcast_anchor_tx(
+        &state,
+        &agreement_hash,
+        AgreementAnchorRole::DisputeResolve,
+    )
+    .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
+    let outcome = req.resolution.outcome.clone();
+    let resolver_role = req.resolution.resolver_role.clone();
+    let snapshot = {
+        let mut guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let d = guard.get_mut(&agreement_hash).ok_or_else(|| bad("no_open_dispute"))?;
+        d.resolution = Some(req.resolution);
+        d.resolution_anchor_txid = Some(anchor_txid.clone());
+        d.clone()
+    };
+    save_dispute_state(&snapshot).map_err(|e| bad(&format!("persist:{e}")))?;
+    emit_event(
+        &state.event_tx,
+        "dispute.resolved",
+        serde_json::json!({
+            "agreement_hash": agreement_hash,
+            "outcome": outcome,
+            "resolver_role": resolver_role,
+            "anchor_txid": anchor_txid,
+        }),
+    );
+    if let Some(ref node) = state.p2p {
+        if let Some(resolution_clone) = snapshot.resolution.clone() {
+            if let Ok(json) = serde_json::to_string(&resolution_clone) {
+                let node = node.clone();
+                tokio::spawn(async move {
+                    node.broadcast_dispute_resolved(&json).await;
+                });
+            }
+        }
+    }
+    Ok(Json(ResolveDisputeResponse {
+        anchor_txid,
+        outcome,
+        resolver_role,
+    }))
+}
+
+async fn register_resolver(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<RegisterResolverRequest>,
+) -> Result<Json<RegisterResolverResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    req.registration.validate().map_err(|e| bad(&e))?;
+    let digest = resolver_registration_payload_hash(&req.registration)
+        .map_err(|e| bad(&format!("payload_hash:{e}")))?;
+    verify_envelope_signature(
+        &req.registration.signature,
+        &digest,
+        &req.registration.resolver_address,
+    )
+    .map_err(|e| bad(&format!("signature:{e}")))?;
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        if !address_is_recent_miner(&chain, &req.registration.resolver_address) {
+            return Err(bad("resolver_not_recent_miner"));
+        }
+    }
+    let resolver_address = req.registration.resolver_address.clone();
+    let anchor_txid = build_and_broadcast_anchor_tx(
+        &state,
+        &resolver_address,
+        AgreementAnchorRole::ResolverRegister,
+    )
+    .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
+    let record = ResolverRegistrationRecord {
+        registration: req.registration,
+        anchor_txid: Some(anchor_txid.clone()),
+        anchored_at_height: None,
+    };
+    save_resolver_record(&record).map_err(|e| bad(&format!("persist:{e}")))?;
+    {
+        let mut guard = state.resolvers_index.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(resolver_address.clone(), record);
+    }
+    emit_event(
+        &state.event_tx,
+        "resolver.registered",
+        serde_json::json!({
+            "resolver_address": resolver_address,
+            "anchor_txid": anchor_txid,
+        }),
+    );
+    Ok(Json(RegisterResolverResponse {
+        resolver_address,
+        anchor_txid,
+    }))
+}
+
+async fn resolvers_list(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ResolversListQuery>,
+) -> Result<Json<ResolversListResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    let limit = query.limit.unwrap_or(50).min(500);
+    let resolvers: Vec<ResolverRegistrationRecord> = {
+        let guard = state.resolvers_index.lock().unwrap_or_else(|e| e.into_inner());
+        guard.values().cloned().collect()
+    };
+    let mut sorted = resolvers;
+    sorted.sort_by(|a, b| {
+        b.registration
+            .registered_at_height
+            .cmp(&a.registration.registered_at_height)
+            .then_with(|| {
+                a.registration
+                    .resolver_address
+                    .cmp(&b.registration.resolver_address)
+            })
+    });
+    let start = match query.cursor {
+        Some(cursor) => sorted
+            .iter()
+            .position(|r| r.registration.resolver_address == cursor)
+            .map(|i| i + 1)
+            .unwrap_or(0),
+        None => 0,
+    };
+    let page: Vec<&ResolverRegistrationRecord> = sorted.iter().skip(start).take(limit).collect();
+    let next_cursor = if start + page.len() < sorted.len() {
+        page.last()
+            .map(|r| r.registration.resolver_address.clone())
+    } else {
+        None
+    };
+    let entries: Vec<ResolversListEntry> = page
+        .iter()
+        .map(|r| ResolversListEntry {
+            resolver_address: r.registration.resolver_address.clone(),
+            registered_at_height: r.registration.registered_at_height,
+            display_name: r.registration.display_name.clone(),
+            fee_bps_self_quoted: r.registration.fee_bps_self_quoted,
+            anchor_txid: r.anchor_txid.clone(),
+            anchored_at_height: r.anchored_at_height,
+        })
+        .collect();
+    Ok(Json(ResolversListResponse {
+        resolvers: entries,
+        next_cursor,
+    }))
+}
+
+
+// Stage 3.2: scan newly-confirmed blocks for dispute/resolver anchor OP_RETURNs.
+fn scan_new_blocks_for_dispute_anchors(
+    chain_handle: &Arc<Mutex<ChainState>>,
+    disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    resolvers: &Arc<Mutex<std::collections::HashMap<String, ResolverRegistrationRecord>>>,
+    event_tx: &EventTx,
+    from_height_exclusive: u64,
+    to_height_inclusive: u64,
+) {
+    let snapshot: Vec<(u64, Vec<Transaction>)> = {
+        let g = chain_handle.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        let start = from_height_exclusive.saturating_add(1) as usize;
+        let end = (to_height_inclusive as usize).min(g.chain.len().saturating_sub(1));
+        if start > end {
+            return;
+        }
+        for h in start..=end {
+            if let Some(b) = g.chain.get(h) {
+                out.push((h as u64, b.transactions.clone()));
+            }
+        }
+        out
+    };
+    for (height, txs) in snapshot {
+        for tx in &txs {
+            let txid_hex = hex::encode(tx.txid());
+            for out in &tx.outputs {
+                let Some(anchor) = parse_agreement_anchor(&out.script_pubkey) else {
+                    continue;
+                };
+                match anchor.role {
+                    AgreementAnchorRole::DisputeRaise => {
+                        let mut snapshot_to_persist: Option<DisputeState> = None;
+                        {
+                            let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(d) = guard.get_mut(&anchor.agreement_hash) {
+                                if d.raise_anchored_at_height.is_none() {
+                                    d.raise_anchored_at_height = Some(height);
+                                    d.raise_anchor_txid = Some(txid_hex.clone());
+                                    snapshot_to_persist = Some(d.clone());
+                                }
+                            }
+                        }
+                        if let Some(snap) = snapshot_to_persist {
+                            let _ = save_dispute_state(&snap);
+                            emit_event(
+                                event_tx,
+                                "dispute.raise_anchored",
+                                serde_json::json!({
+                                    "agreement_hash": anchor.agreement_hash,
+                                    "anchor_txid": txid_hex,
+                                    "anchored_at_height": height,
+                                }),
+                            );
+                        }
+                    }
+                    AgreementAnchorRole::DisputeEvidence => {
+                        let mut snapshot_to_persist: Option<DisputeState> = None;
+                        {
+                            let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(d) = guard.get_mut(&anchor.agreement_hash) {
+                                for rec in d.evidence.iter_mut() {
+                                    if rec.anchor_txid.as_deref() == Some(&txid_hex)
+                                        && rec.anchored_at_height.is_none()
+                                    {
+                                        rec.anchored_at_height = Some(height);
+                                        snapshot_to_persist = Some(d.clone());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(snap) = snapshot_to_persist {
+                            let _ = save_dispute_state(&snap);
+                        }
+                    }
+                    AgreementAnchorRole::DisputeResolve => {
+                        let mut snapshot_to_persist: Option<DisputeState> = None;
+                        {
+                            let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(d) = guard.get_mut(&anchor.agreement_hash) {
+                                if d.resolution_anchored_at_height.is_none() {
+                                    d.resolution_anchored_at_height = Some(height);
+                                    d.resolution_anchor_txid = Some(txid_hex.clone());
+                                    snapshot_to_persist = Some(d.clone());
+                                }
+                            }
+                        }
+                        if let Some(snap) = snapshot_to_persist {
+                            let _ = save_dispute_state(&snap);
+                            emit_event(
+                                event_tx,
+                                "dispute.resolve_anchored",
+                                serde_json::json!({
+                                    "agreement_hash": anchor.agreement_hash,
+                                    "anchor_txid": txid_hex,
+                                    "anchored_at_height": height,
+                                }),
+                            );
+                        }
+                    }
+                    AgreementAnchorRole::ResolverRegister => {
+                        let mut snapshot_to_persist: Option<ResolverRegistrationRecord> = None;
+                        {
+                            let mut guard = resolvers.lock().unwrap_or_else(|e| e.into_inner());
+                            for rec in guard.values_mut() {
+                                if rec.anchor_txid.as_deref() == Some(&txid_hex)
+                                    && rec.anchored_at_height.is_none()
+                                {
+                                    rec.anchored_at_height = Some(height);
+                                    snapshot_to_persist = Some(rec.clone());
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(snap) = snapshot_to_persist {
+                            let _ = save_resolver_record(&snap);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+// Stage 3.2 + 3.3.1: per-tick escalation check, optionally broadcasting via P2P.
+async fn escalation_tick(
+    disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    event_tx: &EventTx,
+    p2p: &Option<P2PNode>,
+    tip_height: u64,
+) {
+    let mut to_escalate: Vec<String> = Vec::new();
+    {
+        let guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+        for (hash, d) in guard.iter() {
+            if d.is_open()
+                && !d.escalated_to_fallback
+                && d.raise_anchored_at_height
+                    .map(|h| tip_height >= h.saturating_add(DISPUTE_RESOLVER_RESPONSE_WINDOW))
+                    .unwrap_or(false)
+            {
+                to_escalate.push(hash.clone());
+            }
+        }
+    }
+    for hash in to_escalate {
+        let snapshot = {
+            let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(d) = guard.get_mut(&hash) {
+                d.escalated_to_fallback = true;
+                d.escalated_at_height = Some(tip_height);
+                Some(d.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(snap) = snapshot {
+            let _ = save_dispute_state(&snap);
+            emit_event(
+                event_tx,
+                "dispute.escalated",
+                serde_json::json!({
+                    "agreement_hash": hash,
+                    "escalated_at_height": tip_height,
+                }),
+            );
+            if let Some(ref node) = p2p {
+                let body = serde_json::json!({
+                    "agreement_hash": hash,
+                    "escalated_at_height": tip_height,
+                });
+                if let Ok(json) = serde_json::to_string(&body) {
+                    node.broadcast_dispute_escalated(&json).await;
+                }
+            }
+        }
+    }
+}
+
+
+// ============================================================================
+// Stage 3.3.1: P2P dispute notification drain — apply incoming peer broadcasts
+// to the local disputes_index. The drain task runs every 5 s and consumes the
+// four dispute inboxes populated by the P2P receive arms in p2p.rs.
+//
+// Signature on the inbound payload is still verified (the signer must own the
+// pubkey that derives to signer_address), but we cannot enforce party-of-
+// agreement membership here because we do not necessarily have the underlying
+// agreement object locally. That check fires when a local user later attempts
+// to act on the dispute via the wallet (which DOES have the agreement).
+// ============================================================================
+
+fn process_received_dispute_raise(
+    json: &str,
+    disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    event_tx: &EventTx,
+) {
+    let d: DisputeRaise = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[dispute-raise drain] parse error: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = d.validate() {
+        eprintln!("[dispute-raise drain] invalid: {}", e);
+        return;
+    }
+    let signer_addr = match d.signature.signer_address.as_deref() {
+        Some(a) => a.to_string(),
+        None => {
+            eprintln!("[dispute-raise drain] missing signer_address");
+            return;
+        }
+    };
+    let digest = match dispute_raise_payload_hash(&d) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[dispute-raise drain] payload hash: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = verify_envelope_signature(&d.signature, &digest, &signer_addr) {
+        eprintln!("[dispute-raise drain] sig verify failed: {}", e);
+        return;
+    }
+    let agreement_hash = d.agreement_hash.clone();
+    let already_have = {
+        let guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+        guard.contains_key(&agreement_hash)
+    };
+    if already_have {
+        return;
+    }
+    let new_state = DisputeState {
+        raise: d,
+        raise_anchor_txid: None,
+        raise_anchored_at_height: None,
+        evidence: Vec::new(),
+        resolution: None,
+        resolution_anchor_txid: None,
+        resolution_anchored_at_height: None,
+        escalated_to_fallback: false,
+        escalated_at_height: None,
+    reresolve_nomination: None,
+    };
+    let _ = save_dispute_state(&new_state);
+    {
+        let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(agreement_hash.clone(), new_state);
+    }
+    emit_event(
+        event_tx,
+        "dispute.raised",
+        serde_json::json!({
+            "agreement_hash": agreement_hash,
+            "source": "p2p",
+        }),
+    );
+}
+
+fn process_received_dispute_evidence(
+    json: &str,
+    disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    event_tx: &EventTx,
+) {
+    let e: DisputeEvidence = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("[dispute-evidence drain] parse: {}", err);
+            return;
+        }
+    };
+    if let Err(err) = e.validate() {
+        eprintln!("[dispute-evidence drain] invalid: {}", err);
+        return;
+    }
+    let signer_addr = match e.signature.signer_address.as_deref() {
+        Some(a) => a.to_string(),
+        None => return,
+    };
+    let digest = match dispute_evidence_payload_hash(&e) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    if verify_envelope_signature(&e.signature, &digest, &signer_addr).is_err() {
+        return;
+    }
+    let agreement_hash = e.agreement_hash.clone();
+    let evidence_hash = e.evidence_hash.clone();
+    let mut snapshot: Option<DisputeState> = None;
+    {
+        let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = guard.get_mut(&agreement_hash) {
+            if d.is_open()
+                && !d.evidence.iter().any(|r| r.evidence.evidence_hash == evidence_hash)
+            {
+                d.evidence.push(DisputeEvidenceRecord {
+                    evidence: e,
+                    anchor_txid: None,
+                    anchored_at_height: None,
+                });
+                snapshot = Some(d.clone());
+            }
+        }
+    }
+    if let Some(snap) = snapshot {
+        let _ = save_dispute_state(&snap);
+        emit_event(
+            event_tx,
+            "dispute.evidence_submitted",
+            serde_json::json!({
+                "agreement_hash": agreement_hash,
+                "evidence_hash": evidence_hash,
+                "source": "p2p",
+            }),
+        );
+    }
+}
+
+fn process_received_dispute_resolved(
+    json: &str,
+    disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    event_tx: &EventTx,
+) {
+    let r: DisputeResolution = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("[dispute-resolved drain] parse: {}", err);
+            return;
+        }
+    };
+    if let Err(err) = r.validate() {
+        eprintln!("[dispute-resolved drain] invalid: {}", err);
+        return;
+    }
+    let signer_addr = match r.signature.signer_address.as_deref() {
+        Some(a) => a.to_string(),
+        None => return,
+    };
+    let digest = match dispute_resolution_payload_hash(&r) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    if verify_envelope_signature(&r.signature, &digest, &signer_addr).is_err() {
+        return;
+    }
+    let agreement_hash = r.agreement_hash.clone();
+    let outcome = r.outcome.clone();
+    let resolver_role = r.resolver_role.clone();
+    let mut snapshot: Option<DisputeState> = None;
+    {
+        let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = guard.get_mut(&agreement_hash) {
+            if d.is_open() {
+                d.resolution = Some(r);
+                snapshot = Some(d.clone());
+            }
+        }
+    }
+    if let Some(snap) = snapshot {
+        let _ = save_dispute_state(&snap);
+        emit_event(
+            event_tx,
+            "dispute.resolved",
+            serde_json::json!({
+                "agreement_hash": agreement_hash,
+                "outcome": outcome,
+                "resolver_role": resolver_role,
+                "source": "p2p",
+            }),
+        );
+    }
+}
+
+fn process_received_dispute_escalated(
+    json: &str,
+    disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    event_tx: &EventTx,
+) {
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let agreement_hash = match v.get("agreement_hash").and_then(|x| x.as_str()) {
+        Some(h) => h.to_string(),
+        None => return,
+    };
+    let escalated_at = v
+        .get("escalated_at_height")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let mut snapshot: Option<DisputeState> = None;
+    {
+        let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = guard.get_mut(&agreement_hash) {
+            if d.is_open() && !d.escalated_to_fallback {
+                d.escalated_to_fallback = true;
+                d.escalated_at_height = Some(escalated_at);
+                snapshot = Some(d.clone());
+            }
+        }
+    }
+    if let Some(snap) = snapshot {
+        let _ = save_dispute_state(&snap);
+        emit_event(
+            event_tx,
+            "dispute.escalated",
+            serde_json::json!({
+                "agreement_hash": agreement_hash,
+                "escalated_at_height": escalated_at,
+                "source": "p2p",
+            }),
+        );
+    }
+}
+
+
+// ============================================================================
+// Stage 3.4.1: dispute-show + dispute-reresolve handlers
+// ============================================================================
+
+#[derive(Deserialize)]
+struct DisputeStateQuery {
+    agreement_hash: String,
+}
+
+#[derive(Serialize)]
+struct DisputeStateRpcResp {
+    found: bool,
+    state: Option<DisputeState>,
+}
+
+async fn get_dispute_state(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<DisputeStateQuery>,
+) -> Result<Json<DisputeStateRpcResp>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let s = {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&q.agreement_hash).cloned()
+    };
+    Ok(Json(DisputeStateRpcResp {
+        found: s.is_some(),
+        state: s,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ReResolveAgreementRequest {
+    nomination: DisputeReResolverNomination,
+    agreement: AgreementObject,
+}
+
+#[derive(Serialize)]
+struct ReResolveAgreementResponse {
+    agreement_hash: String,
+    new_primary_resolver: String,
+    new_fallback_resolver: Option<String>,
+}
+
+fn dispute_reresolve_payload_hash(
+    n: &DisputeReResolverNomination,
+) -> Result<[u8; 32], String> {
+    let mut tmp = n.clone();
+    tmp.party_a_signature.signature = String::new();
+    tmp.party_b_signature.signature = String::new();
+    let bytes = dispute_reresolve_canonical_bytes(&tmp)?;
+    let h = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h);
+    Ok(out)
+}
+
+async fn reresolve_agreement(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<ReResolveAgreementRequest>,
+) -> Result<Json<ReResolveAgreementResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    req.nomination.validate().map_err(|e| bad(&e))?;
+    req.agreement.validate().map_err(|e| bad(&e))?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| bad("agreement_hash_failed"))?;
+    if agreement_hash != req.nomination.agreement_hash {
+        return Err(bad("reresolve_agreement_hash_mismatch"));
+    }
+    if req.agreement.parties.len() < 2 {
+        return Err(bad("agreement_must_have_two_parties"));
+    }
+    let party_a_addr = req.agreement.parties[0].address.clone();
+    let party_b_addr = req.agreement.parties[1].address.clone();
+    let digest = dispute_reresolve_payload_hash(&req.nomination)
+        .map_err(|e| bad(&format!("payload_hash:{e}")))?;
+    // Both signatures must come from the two named parties (in either order).
+    let sa_addr = req
+        .nomination
+        .party_a_signature
+        .signer_address
+        .clone()
+        .ok_or_else(|| bad("party_a_signature_missing_address"))?;
+    let sb_addr = req
+        .nomination
+        .party_b_signature
+        .signer_address
+        .clone()
+        .ok_or_else(|| bad("party_b_signature_missing_address"))?;
+    let pairs = vec![
+        (party_a_addr.clone(), party_b_addr.clone()),
+        (party_b_addr.clone(), party_a_addr.clone()),
+    ];
+    let mut pair_valid = false;
+    for (a, b) in pairs {
+        if sa_addr == a && sb_addr == b {
+            if verify_envelope_signature(&req.nomination.party_a_signature, &digest, &a).is_ok()
+                && verify_envelope_signature(&req.nomination.party_b_signature, &digest, &b)
+                    .is_ok()
+            {
+                pair_valid = true;
+                break;
+            }
+        }
+    }
+    if !pair_valid {
+        return Err(bad("co_signatures_invalid"));
+    }
+    // Miner-recency check on the new resolvers.
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        if !address_is_recent_miner(&chain, &req.nomination.new_primary_resolver) {
+            return Err(bad("new_primary_resolver_not_recent_miner"));
+        }
+        if let Some(ref fb) = req.nomination.new_fallback_resolver {
+            if !address_is_recent_miner(&chain, fb) {
+                return Err(bad("new_fallback_resolver_not_recent_miner"));
+            }
+        }
+    }
+    let new_primary = req.nomination.new_primary_resolver.clone();
+    let new_fallback = req.nomination.new_fallback_resolver.clone();
+    let snapshot: Option<DisputeState> = {
+        let mut guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = guard.get_mut(&agreement_hash) {
+            if !d.is_open() {
+                return Err(bad("dispute_already_resolved"));
+            }
+            d.reresolve_nomination = Some(req.nomination);
+            // Reset escalation: the fallback designation now belongs to a
+            // new resolver who has not had a chance to respond yet.
+            d.escalated_to_fallback = false;
+            d.escalated_at_height = None;
+            Some(d.clone())
+        } else {
+            return Err(bad("no_open_dispute"));
+        }
+    };
+    if let Some(snap) = snapshot {
+        let _ = save_dispute_state(&snap);
+        emit_event(
+            &state.event_tx,
+            "dispute.reresolved",
+            serde_json::json!({
+                "agreement_hash": agreement_hash,
+                "new_primary_resolver": new_primary,
+                "new_fallback_resolver": new_fallback,
+            }),
+        );
+    }
+    Ok(Json(ReResolveAgreementResponse {
+        agreement_hash,
+        new_primary_resolver: new_primary,
+        new_fallback_resolver: new_fallback,
+    }))
 }

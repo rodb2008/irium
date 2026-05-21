@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use crate::block::{Block, BlockHeader};
 use crate::chain::ChainState;
-use crate::mempool::MempoolManager;
+use crate::mempool::{evict_invalid_mempool_entries, MempoolManager};
 use crate::network::{PeerDirectory, PeerRecord};
 use crate::pow::meets_target;
 use crate::protocol::{
@@ -392,8 +392,8 @@ async fn enqueue_persist_block(height: u64, hash: [u8; 32], block: Block) {
         .await;
 }
 
-fn stateless_block_precheck(block: &Block) -> Result<(), String> {
-    let hash = block.header.hash();
+fn stateless_block_precheck(block: &Block, height: u64) -> Result<(), String> {
+    let hash = block.header.hash_for_height(height);
     if !meets_target(&hash, block.header.target()) {
         return Err("pow precheck failed".to_string());
     }
@@ -1164,7 +1164,7 @@ async fn maybe_log_header_sync_state(
             .unwrap_or(local_h);
         let has_best_path = guard
             .best_header_if_better()
-            .and_then(|best| guard.header_path_to_known(best.header.hash()))
+            .and_then(|best| guard.header_path_to_known(best.header.hash_for_height(best.height)))
             .map(|p| !p.is_empty())
             .unwrap_or(false);
         let path_debug = if !has_best_path && best_h > local_h {
@@ -1434,7 +1434,7 @@ fn best_checkpoint(chain: &Option<Arc<StdMutex<ChainState>>>) -> (Option<u64>, O
 
     // Fallback to genesis.
     match guard.chain.get(0) {
-        Some(b) => (Some(0), Some(hex::encode(b.header.hash()))),
+        Some(b) => (Some(0), Some(hex::encode(b.header.hash_for_height(0)))),
         None => (None, None),
     }
 }
@@ -1474,7 +1474,7 @@ fn verify_peer_checkpoint(
     };
 
     let local = match guard.chain.get(height as usize) {
-        Some(b) => b.header.hash(),
+        Some(b) => b.header.hash_for_height(height),
         None => return Ok(()),
     };
 
@@ -1674,7 +1674,14 @@ fn orphan_headers_count() -> usize {
 }
 
 fn store_orphan_header(header: BlockHeader) -> (usize, bool) {
-    let header_hash = header.hash();
+    // Orphan headers have no known parent yet, so we cannot derive their
+    // height. We use hash_for_height(0) which yields pre-fork convention.
+    // For pre-fork blocks this matches the canonical hash exactly. For
+    // post-fork orphans the value differs from the eventually-correct hash;
+    // worst case is the same orphan being stored twice (under two different
+    // keys) when its parent eventually arrives. Acceptable for a transient
+    // cache.
+    let header_hash = header.hash_for_height(0);
     let now = Instant::now();
     {
         let mut recent = recent_orphan_header_hashes()
@@ -1693,7 +1700,7 @@ fn store_orphan_header(header: BlockHeader) -> (usize, bool) {
         .unwrap_or_else(|e| e.into_inner());
     prune_orphan_headers_locked(&mut guard);
     let entries = guard.entry(header.prev_hash).or_default();
-    if entries.iter().any(|e| e.header.hash() == header_hash) {
+    if entries.iter().any(|e| e.header.hash_for_height(0) == header_hash) {
         return (orphan_headers_count_locked(&guard), false);
     }
     entries.push(OrphanHeaderEntry {
@@ -1754,7 +1761,7 @@ fn best_header_linkage_debug(chain: &ChainState) -> String {
     let Some(best) = chain.best_header_if_better() else {
         return "best_header_not_better".to_string();
     };
-    let mut cur = best.header.hash();
+    let mut cur = best.header.hash_for_height(best.height);
     let mut steps: u32 = 0;
     loop {
         if let Some(h) = chain.heights.get(&cur) {
@@ -1791,7 +1798,7 @@ fn locator_hash_at_height(chain: &ChainState, height: u64) -> [u8; 32] {
     chain
         .chain
         .get(height as usize)
-        .map(|b| b.header.hash())
+        .map(|b| b.header.hash_for_height(height))
         .unwrap_or([0u8; 32])
 }
 
@@ -2490,6 +2497,14 @@ pub struct P2PNode {
     marketplace_feed: Option<String>,
     external_endpoint: Option<String>,
     proof_gossip_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Inbox for incoming MessageType::OfferTakeNotification payloads.
+    /// Mirrors proof_gossip_inbox. Drained by an iriumd background task
+    /// that mutates the local matching offer file from "open" to "taken".
+    offer_take_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_raised_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_evidence_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_resolved_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_escalated_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     node_id: Vec<u8>,
     trusted_seed_ips: Arc<HashSet<IpAddr>>,
 
@@ -2896,8 +2911,9 @@ impl P2PNode {
     fn tip_hash(chain: &Option<Arc<StdMutex<ChainState>>>) -> [u8; 32] {
         if let Some(ref c) = chain {
             let guard = c.lock().unwrap_or_else(|e| e.into_inner());
+            let h = guard.tip_height();
             if let Some(last) = guard.chain.last() {
-                return last.header.hash();
+                return last.header.hash_for_height(h);
             }
         }
         [0u8; 32]
@@ -3010,6 +3026,11 @@ impl P2PNode {
         external_endpoint: Option<String>,
     ) -> Self {
         let proof_gossip_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let offer_take_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let dispute_raised_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let dispute_evidence_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let dispute_resolved_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let dispute_escalated_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         P2PNode {
             bind_addr,
             peers: Arc::new(Mutex::new(Vec::new())),
@@ -3037,6 +3058,11 @@ impl P2PNode {
             marketplace_feed,
             external_endpoint,
             proof_gossip_inbox,
+            offer_take_inbox,
+            dispute_raised_inbox,
+            dispute_evidence_inbox,
+            dispute_resolved_inbox,
+            dispute_escalated_inbox,
             node_id: Self::load_or_create_node_id(),
             trusted_seed_ips: Self::load_trusted_seed_ips(),
             banned_ips: Self::load_banned_ips(),
@@ -3063,6 +3089,11 @@ impl P2PNode {
         let marketplace_feed = self.marketplace_feed.clone();
         let external_endpoint = self.external_endpoint.clone();
         let proof_gossip_inbox = self.proof_gossip_inbox.clone();
+        let offer_take_inbox = self.offer_take_inbox.clone();
+        let dispute_raised_inbox = self.dispute_raised_inbox.clone();
+        let dispute_evidence_inbox = self.dispute_evidence_inbox.clone();
+        let dispute_resolved_inbox = self.dispute_resolved_inbox.clone();
+        let dispute_escalated_inbox = self.dispute_escalated_inbox.clone();
         let accept_log = self.accept_log.clone();
         let sync_requests = self.sync_requests.clone();
         let block_requests = self.block_requests.clone();
@@ -3183,6 +3214,11 @@ impl P2PNode {
                         let marketplace_feed_peer = marketplace_feed.clone();
                         let external_endpoint_peer = external_endpoint.clone();
                         let proof_gossip_inbox_peer = proof_gossip_inbox.clone();
+                        let offer_take_inbox_peer = offer_take_inbox.clone();
+                        let dispute_raised_inbox_peer = dispute_raised_inbox.clone();
+                        let dispute_evidence_inbox_peer = dispute_evidence_inbox.clone();
+                        let dispute_resolved_inbox_peer = dispute_resolved_inbox.clone();
+                        let dispute_escalated_inbox_peer = dispute_escalated_inbox.clone();
                         let node_id_peer = node_id.clone();
                         let self_ip_peer = self_ips.clone();
                         let sync_peer = sync_requests.clone();
@@ -3217,6 +3253,11 @@ impl P2PNode {
                                 marketplace_feed_peer,
                                 external_endpoint_peer,
                                 proof_gossip_inbox_peer,
+                                offer_take_inbox_peer,
+                                dispute_raised_inbox_peer,
+                                dispute_evidence_inbox_peer,
+                                dispute_resolved_inbox_peer,
+                                dispute_escalated_inbox_peer,
                                 node_id_peer,
                                 trusted,
                             )
@@ -3775,8 +3816,31 @@ impl P2PNode {
     }
 
     pub async fn broadcast_block(&self, block_bytes: &[u8]) -> Result<(), String> {
-        let (block, _) = Block::deserialize(block_bytes)?;
-        let block_hash = block.header.hash();
+        // Peek prev_hash from the raw bytes (fork-invariant byte order), look
+        // up parent in our chain to derive block_height, then do the full
+        // height-aware deserialize. Required so the merkle_root byte order
+        // decodes correctly at/post the height-30000 hard fork. Pre-fork
+        // heights produce identical bytes to the pre-Fix-2a behavior.
+        let prev_peek = crate::block::BlockHeader::peek_prev_hash(block_bytes)?;
+        let block_height = if let Some(chain_arc) = self.chain.as_ref() {
+            let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+            if prev_peek == [0u8; 32] {
+                0
+            } else if let Some(h) = guard
+                .headers
+                .get(&prev_peek)
+                .map(|hw| hw.height)
+                .or_else(|| guard.heights.get(&prev_peek).copied())
+            {
+                h + 1
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let (block, _) = Block::deserialize_for_height(block_bytes, block_height)?;
+        let block_hash = block.header.hash_for_height(block_height);
         let now = Instant::now();
 
         {
@@ -3795,7 +3859,7 @@ impl P2PNode {
         };
         let header_peers = if should_announce_headers {
             let header_msg = HeadersPayload {
-                headers: block.header.serialize(),
+                headers: block.header.serialize_for_height(block_height),
             }
             .to_message();
             broadcast_raw(&self.peers, &header_msg.serialize()).await
@@ -3859,9 +3923,96 @@ impl P2PNode {
         let _ = broadcast_raw(&self.peers, &serialized).await;
     }
 
+    /// Broadcast an offer-take notification to every connected peer. The
+    /// seller's iriumd (if it's among our peers) parses the JSON, matches
+    /// the offer_id+seller_pubkey against its own ~/.irium/offers/ files,
+    /// and mutates status from "open" to "taken". All other peers ignore
+    /// the message because no offer file matches.
+    ///
+    /// Best-effort: no acknowledgement is expected from the seller. If the
+    /// notification is lost, the seller's relisting watchdog (the 5 s
+    /// offer-watcher background task in iriumd) catches the un-funded
+    /// taken-state after IRIUM_OFFER_RELIST_GRACE_BLOCKS and resets the
+    /// offer to "open" automatically.
+    pub async fn broadcast_offer_take(&self, take_json: &str) {
+        let payload = crate::protocol::OfferTakeNotificationPayload {
+            take_json: take_json.as_bytes().to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
     /// Drain all proof JSON strings received via P2P gossip since last call.
     pub async fn drain_proof_gossip(&self) -> Vec<String> {
         let mut inbox = self.proof_gossip_inbox.lock().await;
+        std::mem::take(&mut *inbox)
+    }
+
+    /// Drain all offer-take notification JSON strings received via P2P
+    /// since the last call. iriumd's offer-take drain task polls this on
+    /// a 2 s cadence and processes each one (see process_received_offer_take).
+    pub async fn drain_offer_take_notifications(&self) -> Vec<String> {
+        let mut inbox = self.offer_take_inbox.lock().await;
+        std::mem::take(&mut *inbox)
+    }
+
+    /// Broadcast a DisputeRaise (JSON) to every connected peer.
+    pub async fn broadcast_dispute_raised(&self, json: &str) {
+        let payload = crate::protocol::DisputeRaisedNotificationPayload {
+            json: json.as_bytes().to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
+    /// Broadcast a DisputeEvidence (JSON) to every connected peer.
+    pub async fn broadcast_dispute_evidence(&self, json: &str) {
+        let payload = crate::protocol::DisputeEvidenceNotificationPayload {
+            json: json.as_bytes().to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
+    /// Broadcast a DisputeResolution (JSON) to every connected peer.
+    pub async fn broadcast_dispute_resolved(&self, json: &str) {
+        let payload = crate::protocol::DisputeResolvedNotificationPayload {
+            json: json.as_bytes().to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
+    /// Broadcast a dispute escalation announcement (JSON) to every peer.
+    pub async fn broadcast_dispute_escalated(&self, json: &str) {
+        let payload = crate::protocol::DisputeEscalatedNotificationPayload {
+            json: json.as_bytes().to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
+    /// Drain incoming DisputeRaise JSON strings since last call.
+    pub async fn drain_dispute_raised_notifications(&self) -> Vec<String> {
+        let mut inbox = self.dispute_raised_inbox.lock().await;
+        std::mem::take(&mut *inbox)
+    }
+
+    /// Drain incoming DisputeEvidence JSON strings since last call.
+    pub async fn drain_dispute_evidence_notifications(&self) -> Vec<String> {
+        let mut inbox = self.dispute_evidence_inbox.lock().await;
+        std::mem::take(&mut *inbox)
+    }
+
+    /// Drain incoming DisputeResolution JSON strings since last call.
+    pub async fn drain_dispute_resolved_notifications(&self) -> Vec<String> {
+        let mut inbox = self.dispute_resolved_inbox.lock().await;
+        std::mem::take(&mut *inbox)
+    }
+
+    /// Drain incoming dispute-escalated JSON announcements since last call.
+    pub async fn drain_dispute_escalated_notifications(&self) -> Vec<String> {
+        let mut inbox = self.dispute_escalated_inbox.lock().await;
         std::mem::take(&mut *inbox)
     }
 
@@ -4298,6 +4449,11 @@ impl P2PNode {
         let relay_addr = self.relay_address.clone();
         let _marketplace_feed_url = self.marketplace_feed.clone();
         let proof_gossip_inbox_outbound = self.proof_gossip_inbox.clone();
+        let offer_take_inbox_outbound = self.offer_take_inbox.clone();
+        let dispute_raised_inbox_outbound = self.dispute_raised_inbox.clone();
+        let dispute_evidence_inbox_outbound = self.dispute_evidence_inbox.clone();
+        let dispute_resolved_inbox_outbound = self.dispute_resolved_inbox.clone();
+        let dispute_escalated_inbox_outbound = self.dispute_escalated_inbox.clone();
         let chain_for_sync = self.chain.clone();
         let mempool_for_sync = self.mempool.clone();
         let reputation = self.reputation.clone();
@@ -4368,7 +4524,12 @@ impl P2PNode {
                         | MessageType::Block
                         | MessageType::UptimeChallenge
                         | MessageType::UptimeProof
-                        | MessageType::ProofGossip => {}
+                        | MessageType::ProofGossip
+                        | MessageType::OfferTakeNotification
+                        | MessageType::DisputeRaisedNotification
+                        | MessageType::DisputeEvidenceNotification
+                        | MessageType::DisputeResolvedNotification
+                        | MessageType::DisputeEscalatedNotification => {}
                         _ => {
                             P2PNode::log_event(
                                 "info",
@@ -4562,7 +4723,7 @@ impl P2PNode {
                                     guard
                                         .chain
                                         .get(*h as usize)
-                                        .map(|b| b.header.hash() == tip)
+                                        .map(|b| b.header.hash_for_height(*h) == tip)
                                         .unwrap_or(false)
                                 } else {
                                     false
@@ -4575,7 +4736,7 @@ impl P2PNode {
                                 guard
                                     .chain
                                     .get(payload.height as usize)
-                                    .map(|b| b.header.hash())
+                                    .map(|b| b.header.hash_for_height(payload.height))
                             } else {
                                 None
                             };
@@ -4683,8 +4844,9 @@ impl P2PNode {
                                             payload.height.saturating_add(1) as usize
                                         };
                                         let mut headers = Vec::new();
-                                        for block in guard.chain.iter().skip(start).take(32) {
-                                            headers.extend_from_slice(&block.header.serialize());
+                                        for (i, block) in guard.chain.iter().skip(start).take(32).enumerate() {
+                                            let h = (start + i) as u64;
+                                            headers.extend_from_slice(&block.header.serialize_for_height(h));
                                         }
                                         headers
                                     };
@@ -4725,13 +4887,15 @@ impl P2PNode {
                                                 (Vec::new(), 0)
                                             } else {
                                                 let mut blocks = Vec::new();
-                                                for b in guard
+                                                for (i, b) in guard
                                                     .chain
                                                     .iter()
                                                     .skip(start_idx)
                                                     .take(fallback_blocks_per_burst())
+                                                    .enumerate()
                                                 {
-                                                    blocks.push(b.serialize());
+                                                    let h = (start_idx + i) as u64;
+                                                    blocks.push(b.serialize_for_height(h));
                                                 }
                                                 (blocks, start_idx as u64)
                                             }
@@ -4883,10 +5047,11 @@ impl P2PNode {
                                         target.copy_from_slice(&payload.start_hash);
                                         start_hash_non_zero = target.iter().any(|b| *b != 0);
                                         if start_hash_non_zero {
-                                            if let Some(pos) = guard
+                                            if let Some((pos, _)) = guard
                                                 .chain
                                                 .iter()
-                                                .position(|b| b.header.hash() == target)
+                                                .enumerate()
+                                                .find(|(idx, b)| b.header.hash_for_height(*idx as u64) == target)
                                             {
                                                 start_idx = pos.saturating_add(1);
                                                 start_found = true;
@@ -4896,9 +5061,10 @@ impl P2PNode {
                                     let count = payload.count.min(MAX_HEADERS_PER_REQUEST) as usize;
                                     let mut bytes = Vec::new();
                                     if !start_hash_non_zero || start_found {
-                                        for block in guard.chain.iter().skip(start_idx).take(count)
+                                        for (i, block) in guard.chain.iter().skip(start_idx).take(count).enumerate()
                                         {
-                                            bytes.extend_from_slice(&block.header.serialize());
+                                            let h = (start_idx + i) as u64;
+                                            bytes.extend_from_slice(&block.header.serialize_for_height(h));
                                         }
                                     }
                                     bytes
@@ -4975,7 +5141,29 @@ impl P2PNode {
 
                                         while offset + 80 <= header_bytes.len() {
                                             let slice = &header_bytes[offset..offset + 80];
-                                            let (header, used) = match crate::block::BlockHeader::deserialize(slice) {
+                                            // Peek prev_hash → look up parent → derive height
+                                            // before height-aware deserialize.
+                                            let prev_peek = match crate::block::BlockHeader::peek_prev_hash(slice) {
+                                                Ok(p) => p,
+                                                Err(_) => {
+                                                    header_error = true;
+                                                    reject_reason = Some("decode_error".to_string());
+                                                    break;
+                                                }
+                                            };
+                                            let header_height = if prev_peek == [0u8; 32] {
+                                                0
+                                            } else if let Some(h) = guard
+                                                .headers
+                                                .get(&prev_peek)
+                                                .map(|hw| hw.height)
+                                                .or_else(|| guard.heights.get(&prev_peek).copied())
+                                            {
+                                                h + 1
+                                            } else {
+                                                0
+                                            };
+                                            let (header, used) = match crate::block::BlockHeader::deserialize_for_height(slice, header_height) {
                                                 Ok(v) => v,
                                                 Err(_) => {
                                                     header_error = true;
@@ -4984,11 +5172,11 @@ impl P2PNode {
                                                 }
                                             };
                                             offset += used;
-                                            last_header_hash = Some(header.hash());
+                                            last_header_hash = Some(header.hash_for_height(header_height));
 
-                                            let header_hash = header.hash();
+                                            let header_hash = header.hash_for_height(header_height);
                                             if header.prev_hash == [0u8; 32] {
-                                                let genesis_hash = guard.params.genesis_block.header.hash();
+                                                let genesis_hash = guard.params.genesis_block.header.hash_for_height(0);
                                                 if header_hash == genesis_hash {
                                                     continue;
                                                 }
@@ -5260,7 +5448,7 @@ impl P2PNode {
                                     let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
                                     if let Some(best) = guard.best_header_if_better() {
                                         if let Some(path) =
-                                            guard.header_path_to_known(best.header.hash())
+                                            guard.header_path_to_known(best.header.hash_for_height(best.height))
                                         {
                                             if let Some(first_hash) = path.first() {
                                                 let mut start_hash = guard
@@ -5271,10 +5459,11 @@ impl P2PNode {
                                                 if start_hash != [0u8; 32]
                                                     && !guard.heights.contains_key(&start_hash)
                                                 {
+                                                    let tip_h = guard.tip_height();
                                                     start_hash = guard
                                                         .chain
                                                         .last()
-                                                        .map(|b| b.header.hash())
+                                                        .map(|b| b.header.hash_for_height(tip_h))
                                                         .unwrap_or([0u8; 32]);
                                                 }
                                                 let count = std::cmp::min(
@@ -5420,10 +5609,11 @@ impl P2PNode {
                                         if start_hash.len() == 32 {
                                             let mut target = [0u8; 32];
                                             target.copy_from_slice(&start_hash);
-                                            if let Some(pos) = guard
+                                            if let Some((pos, _)) = guard
                                                 .chain
                                                 .iter()
-                                                .position(|b| b.header.hash() == target)
+                                                .enumerate()
+                                                .find(|(idx, b)| b.header.hash_for_height(*idx as u64) == target)
                                             {
                                                 start_idx = pos + 1;
                                                 matched_pos = Some(pos);
@@ -5444,7 +5634,7 @@ impl P2PNode {
                                             .skip(start_idx)
                                             .take(count)
                                         {
-                                            blocks.push(b.serialize());
+                                            blocks.push(b.serialize_for_height(idx as u64));
                                             heights.push(idx as u64);
                                         }
                                         let start_h: u64 = heights.first().copied().unwrap_or(0);
@@ -5511,11 +5701,39 @@ impl P2PNode {
                         if let Some(ref chain_arc) = chain_for_sync {
                             if let Ok(payload) = BlockPayload::from_message(&msg) {
                                 let decode_started = Instant::now();
-                                match Block::deserialize(&payload.block_data) {
+                                // Peek prev_hash → look up parent → derive
+                                // block_height before height-aware deserialize.
+                                let prev_peek = match crate::block::BlockHeader::peek_prev_hash(&payload.block_data) {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        P2PNode::log_event(
+                                            "warn",
+                                            "chain",
+                                            format!("P2P {}: block payload too short to peek prev_hash", addr),
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let block_height = {
+                                    let guard = chain_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                    if prev_peek == [0u8; 32] {
+                                        0
+                                    } else if let Some(h) = guard
+                                        .headers
+                                        .get(&prev_peek)
+                                        .map(|hw| hw.height)
+                                        .or_else(|| guard.heights.get(&prev_peek).copied())
+                                    {
+                                        h + 1
+                                    } else {
+                                        0
+                                    }
+                                };
+                                match Block::deserialize_for_height(&payload.block_data, block_height) {
                                     Ok((block, _)) => {
                                         let decode_ms = decode_started.elapsed().as_millis();
                                         let precheck_started = Instant::now();
-                                        if let Err(e) = stateless_block_precheck(&block) {
+                                        if let Err(e) = stateless_block_precheck(&block, block_height) {
                                             P2PNode::log_event(
                                                 "warn",
                                                 "chain",
@@ -5527,7 +5745,7 @@ impl P2PNode {
                                             continue;
                                         }
                                         let precheck_ms = precheck_started.elapsed().as_millis();
-                                        let bhash = block.header.hash();
+                                        let bhash = block.header.hash_for_height(block_height);
                                         let short = hex::encode(bhash);
                                         let short = short.get(0..12).unwrap_or(&short);
                                         let chain_arc2 = chain_arc.clone();
@@ -5590,6 +5808,10 @@ impl P2PNode {
                                                         {
                                                             mem_guard.remove(&tx.txid());
                                                         }
+                                                        evict_invalid_mempool_entries(
+                                                            &guard,
+                                                            &mut mem_guard,
+                                                        );
                                                     }
                                                     new_height_opt = Some(new_height);
                                                     record_verdict = Some(true);
@@ -5650,7 +5872,7 @@ impl P2PNode {
                                         };
                                         let connect_ms = connect_started.elapsed().as_millis();
                                         for (height, b) in persist_blocks {
-                                            let h = b.header.hash();
+                                            let h = b.header.hash_for_height(height);
                                             enqueue_persist_block(height, h, b).await;
                                         }
                                         sync_perf_record(decode_ms, precheck_ms, connect_ms, 0);
@@ -5940,6 +6162,46 @@ impl P2PNode {
                             }
                         }
                     }
+                    MessageType::OfferTakeNotification => {
+                        if let Ok(otn) = crate::protocol::OfferTakeNotificationPayload::from_message(&msg) {
+                            if let Ok(json) = String::from_utf8(otn.take_json) {
+                                let mut inbox = offer_take_inbox_outbound.lock().await;
+                                inbox.push(json);
+                            }
+                        }
+                    }
+                    MessageType::DisputeRaisedNotification => {
+                        if let Ok(p) = crate::protocol::DisputeRaisedNotificationPayload::from_message(&msg) {
+                            if let Ok(json) = String::from_utf8(p.json) {
+                                let mut inbox = dispute_raised_inbox_outbound.lock().await;
+                                inbox.push(json);
+                            }
+                        }
+                    }
+                    MessageType::DisputeEvidenceNotification => {
+                        if let Ok(p) = crate::protocol::DisputeEvidenceNotificationPayload::from_message(&msg) {
+                            if let Ok(json) = String::from_utf8(p.json) {
+                                let mut inbox = dispute_evidence_inbox_outbound.lock().await;
+                                inbox.push(json);
+                            }
+                        }
+                    }
+                    MessageType::DisputeResolvedNotification => {
+                        if let Ok(p) = crate::protocol::DisputeResolvedNotificationPayload::from_message(&msg) {
+                            if let Ok(json) = String::from_utf8(p.json) {
+                                let mut inbox = dispute_resolved_inbox_outbound.lock().await;
+                                inbox.push(json);
+                            }
+                        }
+                    }
+                    MessageType::DisputeEscalatedNotification => {
+                        if let Ok(p) = crate::protocol::DisputeEscalatedNotificationPayload::from_message(&msg) {
+                            if let Ok(json) = String::from_utf8(p.json) {
+                                let mut inbox = dispute_escalated_inbox_outbound.lock().await;
+                                inbox.push(json);
+                            }
+                        }
+                    }
                     MessageType::Disconnect => break,
                     _ => {}
                 }
@@ -6146,6 +6408,11 @@ async fn handle_incoming_with_sybil(
     marketplace_feed_url: Option<String>,
     external_endpoint: Option<String>,
     proof_gossip_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    offer_take_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_raised_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_evidence_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_resolved_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    dispute_escalated_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     node_id: Vec<u8>,
     trusted_seed: bool,
 ) -> Result<(), String> {
@@ -6669,7 +6936,7 @@ async fn handle_incoming_with_sybil(
                                 guard
                                     .chain
                                     .get(*h as usize)
-                                    .map(|b| b.header.hash() == tip)
+                                    .map(|b| b.header.hash_for_height(*h) == tip)
                                     .unwrap_or(false)
                             } else {
                                 false
@@ -6682,7 +6949,7 @@ async fn handle_incoming_with_sybil(
                         guard
                             .chain
                             .get(payload.height as usize)
-                            .map(|b| b.header.hash())
+                            .map(|b| b.header.hash_for_height(payload.height))
                     } else {
                         None
                     };
@@ -6789,8 +7056,9 @@ async fn handle_incoming_with_sybil(
                                     payload.height.saturating_add(1) as usize
                                 };
                                 let mut headers = Vec::new();
-                                for block in guard.chain.iter().skip(start).take(32) {
-                                    headers.extend_from_slice(&block.header.serialize());
+                                for (i, block) in guard.chain.iter().skip(start).take(32).enumerate() {
+                                    let h = (start + i) as u64;
+                                    headers.extend_from_slice(&block.header.serialize_for_height(h));
                                 }
                                 headers
                             };
@@ -6829,13 +7097,15 @@ async fn handle_incoming_with_sybil(
                                         (Vec::new(), 0)
                                     } else {
                                         let mut blocks = Vec::new();
-                                        for b in guard
+                                        for (i, b) in guard
                                             .chain
                                             .iter()
                                             .skip(start_idx)
                                             .take(fallback_blocks_per_burst())
+                                            .enumerate()
                                         {
-                                            blocks.push(b.serialize());
+                                            let h = (start_idx + i) as u64;
+                                            blocks.push(b.serialize_for_height(h));
                                         }
                                         (blocks, start_idx as u64)
                                     }
@@ -6996,10 +7266,11 @@ async fn handle_incoming_with_sybil(
                                     target.copy_from_slice(&start_hash);
                                     start_hash_non_zero = target.iter().any(|b| *b != 0);
                                     if start_hash_non_zero {
-                                        if let Some(pos) = guard
+                                        if let Some((pos, _)) = guard
                                             .chain
                                             .iter()
-                                            .position(|b| b.header.hash() == target)
+                                            .enumerate()
+                                            .find(|(idx, b)| b.header.hash_for_height(*idx as u64) == target)
                                         {
                                             start_idx = pos.saturating_add(1);
                                             start_found = true;
@@ -7009,8 +7280,9 @@ async fn handle_incoming_with_sybil(
                                 let count = count.min(MAX_HEADERS_PER_REQUEST) as usize;
                                 let mut bytes = Vec::new();
                                 if !start_hash_non_zero || start_found {
-                                    for block in guard.chain.iter().skip(start_idx).take(count) {
-                                        bytes.extend_from_slice(&block.header.serialize());
+                                    for (i, block) in guard.chain.iter().skip(start_idx).take(count).enumerate() {
+                                        let h = (start_idx + i) as u64;
+                                        bytes.extend_from_slice(&block.header.serialize_for_height(h));
                                     }
                                 }
                                 bytes
@@ -7104,22 +7376,47 @@ async fn handle_incoming_with_sybil(
 
                                     while offset + 80 <= header_bytes.len() {
                                         let slice = &header_bytes[offset..offset + 80];
-                                        let (header, used) =
-                                            match crate::block::BlockHeader::deserialize(slice) {
-                                                Ok(v) => v,
+                                        // Peek prev_hash → look up parent → derive height
+                                        // before height-aware deserialize.
+                                        let prev_peek =
+                                            match crate::block::BlockHeader::peek_prev_hash(slice) {
+                                                Ok(p) => p,
                                                 Err(_) => {
                                                     header_error = true;
                                                     reject_reason = Some("decode_error".to_string());
                                                     break;
                                                 }
                                             };
+                                        let header_height = if prev_peek == [0u8; 32] {
+                                            0
+                                        } else if let Some(h) = guard
+                                            .headers
+                                            .get(&prev_peek)
+                                            .map(|hw| hw.height)
+                                            .or_else(|| guard.heights.get(&prev_peek).copied())
+                                        {
+                                            h + 1
+                                        } else {
+                                            0
+                                        };
+                                        let (header, used) = match crate::block::BlockHeader::deserialize_for_height(
+                                            slice,
+                                            header_height,
+                                        ) {
+                                            Ok(v) => v,
+                                            Err(_) => {
+                                                header_error = true;
+                                                reject_reason = Some("decode_error".to_string());
+                                                break;
+                                            }
+                                        };
                                         offset += used;
-                                        last_header_hash = Some(header.hash());
+                                        last_header_hash = Some(header.hash_for_height(header_height));
 
-                                        let header_hash = header.hash();
+                                        let header_hash = header.hash_for_height(header_height);
                                         if header.prev_hash == [0u8; 32] {
                                             let genesis_hash =
-                                                guard.params.genesis_block.header.hash();
+                                                guard.params.genesis_block.header.hash_for_height(0);
                                             if header_hash == genesis_hash {
                                                 continue;
                                             }
@@ -7404,7 +7701,7 @@ async fn handle_incoming_with_sybil(
                                     chain_arc_for_tip.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some(best) = guard.best_header_if_better() {
                                     if let Some(path) =
-                                        guard.header_path_to_known(best.header.hash())
+                                        guard.header_path_to_known(best.header.hash_for_height(best.height))
                                     {
                                         if let Some(first_hash) = path.first() {
                                             let mut start_hash = guard
@@ -7415,10 +7712,11 @@ async fn handle_incoming_with_sybil(
                                             if start_hash != [0u8; 32]
                                                 && !guard.heights.contains_key(&start_hash)
                                             {
+                                                let tip_h = guard.tip_height();
                                                 start_hash = guard
                                                     .chain
                                                     .last()
-                                                    .map(|b| b.header.hash())
+                                                    .map(|b| b.header.hash_for_height(tip_h))
                                                     .unwrap_or([0u8; 32]);
                                             }
                                             let count = std::cmp::min(
@@ -7568,8 +7866,8 @@ async fn handle_incoming_with_sybil(
                                 if start_hash.len() == 32 {
                                     let mut target = [0u8; 32];
                                     target.copy_from_slice(&start_hash);
-                                    if let Some(pos) =
-                                        guard.chain.iter().position(|b| b.header.hash() == target)
+                                    if let Some((pos, _)) =
+                                        guard.chain.iter().enumerate().find(|(idx, b)| b.header.hash_for_height(*idx as u64) == target)
                                     {
                                         start_idx = pos + 1;
                                         matched_pos = Some(pos);
@@ -7586,7 +7884,7 @@ async fn handle_incoming_with_sybil(
                                 for (idx, b) in
                                     guard.chain.iter().enumerate().skip(start_idx).take(count)
                                 {
-                                    blocks.push(b.serialize());
+                                    blocks.push(b.serialize_for_height(idx as u64));
                                     heights.push(idx as u64);
                                 }
                                 let start_h: u64 = heights.first().copied().unwrap_or(0);
@@ -7666,7 +7964,40 @@ async fn handle_incoming_with_sybil(
                         tokio::spawn(async move {
                             let permit_guard = permit;
 
-                            let block = match Block::deserialize(&payload.block_data) {
+                            // Peek prev_hash → look up parent → derive
+                            // block_height before height-aware deserialize.
+                            let prev_peek = match crate::block::BlockHeader::peek_prev_hash(&payload.block_data) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    P2PNode::log_event(
+                                        "warn",
+                                        "net",
+                                        format!(
+                                            "P2P {}: block payload too short to peek prev_hash: {}",
+                                            addr2, e
+                                        ),
+                                    );
+                                    let mut rep = reputation2.lock().await;
+                                    rep.record_decode_error(&addr2.to_string());
+                                    return;
+                                }
+                            };
+                            let block_height = {
+                                let guard = chain_arc2.lock().unwrap_or_else(|e| e.into_inner());
+                                if prev_peek == [0u8; 32] {
+                                    0
+                                } else if let Some(h) = guard
+                                    .headers
+                                    .get(&prev_peek)
+                                    .map(|hw| hw.height)
+                                    .or_else(|| guard.heights.get(&prev_peek).copied())
+                                {
+                                    h + 1
+                                } else {
+                                    0
+                                }
+                            };
+                            let block = match Block::deserialize_for_height(&payload.block_data, block_height) {
                                 Ok((b, _)) => b,
                                 Err(e) => {
                                     P2PNode::log_event(
@@ -7685,7 +8016,7 @@ async fn handle_incoming_with_sybil(
 
                             let decode_ms = decode_started.elapsed().as_millis();
                             let precheck_started = Instant::now();
-                            if let Err(e) = stateless_block_precheck(&block) {
+                            if let Err(e) = stateless_block_precheck(&block, block_height) {
                                 P2PNode::log_event(
                                     "warn",
                                     "chain",
@@ -7695,7 +8026,7 @@ async fn handle_incoming_with_sybil(
                             }
                             let precheck_ms = precheck_started.elapsed().as_millis();
 
-                            let bhash = block.header.hash();
+                            let bhash = block.header.hash_for_height(block_height);
                             let short = hex::encode(bhash);
                             let short = short.get(0..12).unwrap_or(&short).to_string();
 
@@ -7712,6 +8043,21 @@ async fn handle_incoming_with_sybil(
                                         Ok((new_height, _)) => {
                                             new_height_opt = Some(new_height);
                                             verdict = Some(true);
+                                            // Mempool cleanup while the chain
+                                            // lock is held: txid match first,
+                                            // then drop double-spend conflicts.
+                                            if let Some(ref mem) = mempool2 {
+                                                let mut mem_guard = mem
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                for tx in block.transactions.iter().skip(1) {
+                                                    mem_guard.remove(&tx.txid());
+                                                }
+                                                evict_invalid_mempool_entries(
+                                                    &guard,
+                                                    &mut mem_guard,
+                                                );
+                                            }
                                             if guard.tip_hash() == bhash {
                                                 let tip = guard.tip_height();
                                                 persist_blocks.push((tip, block.clone()));
@@ -7745,15 +8091,13 @@ async fn handle_incoming_with_sybil(
                             let connect_ms = connect_started.elapsed().as_millis();
 
                             for (height, b) in persist_blocks {
-                                let h = b.header.hash();
+                                let h = b.header.hash_for_height(height);
                                 enqueue_persist_block(height, h, b.clone()).await;
-                                if let Some(ref mem) = mempool2 {
-                                    let mut mem_guard =
-                                        mem.lock().unwrap_or_else(|e| e.into_inner());
-                                    for tx in b.transactions.iter().skip(1) {
-                                        mem_guard.remove(&tx.txid());
-                                    }
-                                }
+                                // Mempool eviction has moved into the
+                                // spawn_blocking_limited closure above so it
+                                // can run with the chain lock held and also
+                                // evict double-spend conflicts (not just txid
+                                // matches).
                             }
                             sync_perf_record(decode_ms, precheck_ms, connect_ms, 0);
 
@@ -7956,6 +8300,46 @@ async fn handle_incoming_with_sybil(
                     }
                 }
             }
+            MessageType::OfferTakeNotification => {
+                if let Ok(otn) = crate::protocol::OfferTakeNotificationPayload::from_message(&msg) {
+                    if let Ok(json) = String::from_utf8(otn.take_json) {
+                        let mut inbox = offer_take_inbox.lock().await;
+                        inbox.push(json);
+                    }
+                }
+            }
+            MessageType::DisputeRaisedNotification => {
+                if let Ok(p) = crate::protocol::DisputeRaisedNotificationPayload::from_message(&msg) {
+                    if let Ok(json) = String::from_utf8(p.json) {
+                        let mut inbox = dispute_raised_inbox.lock().await;
+                        inbox.push(json);
+                    }
+                }
+            }
+            MessageType::DisputeEvidenceNotification => {
+                if let Ok(p) = crate::protocol::DisputeEvidenceNotificationPayload::from_message(&msg) {
+                    if let Ok(json) = String::from_utf8(p.json) {
+                        let mut inbox = dispute_evidence_inbox.lock().await;
+                        inbox.push(json);
+                    }
+                }
+            }
+            MessageType::DisputeResolvedNotification => {
+                if let Ok(p) = crate::protocol::DisputeResolvedNotificationPayload::from_message(&msg) {
+                    if let Ok(json) = String::from_utf8(p.json) {
+                        let mut inbox = dispute_resolved_inbox.lock().await;
+                        inbox.push(json);
+                    }
+                }
+            }
+            MessageType::DisputeEscalatedNotification => {
+                if let Ok(p) = crate::protocol::DisputeEscalatedNotificationPayload::from_message(&msg) {
+                    if let Ok(json) = String::from_utf8(p.json) {
+                        let mut inbox = dispute_escalated_inbox.lock().await;
+                        inbox.push(json);
+                    }
+                }
+            }
             MessageType::Disconnect => break,
             _ => {
                 // Unhandled message types can be ignored for now.
@@ -8008,7 +8392,8 @@ mod tests {
     fn mine_header(mut header: BlockHeader) -> BlockHeader {
         for nonce in 0u32..u32::MAX {
             header.nonce = nonce;
-            let h = header.hash();
+            // Test helper: pre-fork convention (height=0) is fine for synthetic mining.
+            let h = header.hash_for_height(0);
             if meets_target(&h, header.target()) {
                 return header;
             }

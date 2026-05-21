@@ -22,6 +22,16 @@ use irium_node_rs::settlement::{
     NoResponseTrigger, PolicyOutcome, ProofPolicy, ProofRequirement, ProofResolution,
     ProofSignatureEnvelope, SettlementProof, TypedProofPayload, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
     AGREEMENT_SIGNATURE_VERSION, PROOF_POLICY_SCHEMA_ID, SETTLEMENT_PROOF_SCHEMA_ID,
+    DisputeEvidence, DisputeRaise, DisputeReResolverNomination, DisputeResolution,
+    ResolverRegistration,
+    DISPUTE_EVIDENCE_SCHEMA_ID, DISPUTE_EVIDENCE_VERSION,
+    DISPUTE_RAISE_SCHEMA_ID, DISPUTE_RAISE_VERSION,
+    DISPUTE_RERESOLVE_SCHEMA_ID, DISPUTE_RERESOLVE_VERSION,
+    DISPUTE_RESOLUTION_SCHEMA_ID, DISPUTE_RESOLUTION_VERSION,
+    RESOLVER_REGISTRATION_SCHEMA_ID, RESOLVER_REGISTRATION_VERSION,
+    dispute_evidence_canonical_bytes, dispute_raise_canonical_bytes,
+    dispute_reresolve_canonical_bytes,
+    dispute_resolution_canonical_bytes, resolver_registration_canonical_bytes,
 };
 use irium_node_rs::tx::{
     decode_full_tx, encode_mpso_claim_witness, encode_mpso_refund_witness, encode_mpso_script,
@@ -7346,6 +7356,13 @@ struct IrmOffer {
     buyer_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     taken_at: Option<u64>,
+    /// Chain tip height observed at offer-take time. Used by the seller's
+    /// iriumd watcher to decide when to relist an un-funded taken offer
+    /// (LAYER 3). Optional + Option because pre-v1.9.24 offers lack the
+    /// field; the watcher skips relist for those rather than relisting
+    /// blindly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    taken_at_height: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7540,6 +7557,7 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
         agreement_hash: None,
         buyer_address: None,
         taken_at: None,
+        taken_at_height: None,
         source: Some("local".to_string()),
         seller_pubkey,
     };
@@ -7919,6 +7937,57 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
         ));
     }
 
+    // LAYER 5: double-take protection for remote offers. Re-fetch the
+    // seller's live /offers/feed and verify the offer is still "open"
+    // there before mutating local state. Prevents two buyers from each
+    // succeeding at offer-take against a stale-cached version of the same
+    // offer. Local offers ("source": None or "source": "local") skip this
+    // check — they're authoritative.
+    if let Some(ref src) = offer.source {
+        if let Some(feed_url) = src.strip_prefix("remote:") {
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+            {
+                Ok(c) => Some(c),
+                Err(_) => None,
+            };
+            if let Some(c) = client {
+                match c.get(feed_url).send() {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(feed_val) = resp.json::<serde_json::Value>() {
+                            let still_open = feed_val
+                                .get("offers")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter().any(|o| {
+                                        o.get("offer_id")
+                                            .and_then(|v| v.as_str())
+                                            == Some(offer_id.as_str())
+                                            && o.get("status")
+                                                .and_then(|v| v.as_str())
+                                                == Some("open")
+                                    })
+                                })
+                                .unwrap_or(false);
+                            if !still_open {
+                                return Err(
+                                    "This offer has already been taken by another buyer."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    // Seller's feed unreachable or returned non-2xx — degrade
+                    // gracefully and proceed. The P2P notification below is
+                    // still best-effort; LAYER 3's relisting watchdog covers
+                    // the corner case where two buyers slip through.
+                    _ => {}
+                }
+            }
+        }
+    }
+
     let now = now_unix();
     let agreement_id = format!("offer-{}-{}", offer_id, now);
     let seller_party = parse_party_spec(&format!("seller|Seller|{}|seller", offer.seller_address))?;
@@ -7949,12 +8018,60 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
     let saved_path = save_agreement_to_store_at(&imported_agreements_dir(), &agreement)?;
 
+    // LAYER 3 input: fetch the current chain tip from iriumd's /status
+    // endpoint so the seller's watcher can later decide whether to relist
+    // this offer if the buyer never anchors the agreement on-chain. Best
+    // effort — falling back to None means the seller's watcher skips the
+    // auto-relist for this offer (operator can still relist manually).
+    let taken_at_height: Option<u64> = {
+        let status_url = format!("{}/status", rpc_url.trim_end_matches('/'));
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()
+            .and_then(|c| c.get(&status_url).send().ok())
+            .and_then(|r| r.json::<serde_json::Value>().ok())
+            .and_then(|v| v.get("height").and_then(|h| h.as_u64()))
+    };
+
     offer.status = "taken".to_string();
     offer.agreement_id = Some(agreement_id.clone());
     offer.agreement_hash = Some(agreement_hash.clone());
     offer.buyer_address = Some(buyer_addr.clone());
     offer.taken_at = Some(now);
+    offer.taken_at_height = taken_at_height;
     save_offer(&offer)?;
+
+    // LAYER 1 send-side: notify the seller's iriumd over P2P that we
+    // took this offer, so the seller's local copy can flip status →
+    // "taken" and stop serving the offer to other peers. Best effort:
+    // if the local iriumd or its peers can't reach the seller, the
+    // seller's relisting watchdog handles the un-funded leftover within
+    // the grace window. Failure here does NOT fail offer-take.
+    if let Some(ref pubkey) = offer.seller_pubkey {
+        let take_payload = serde_json::json!({
+            "offer_id": offer.offer_id,
+            "buyer_address": buyer_addr,
+            "agreement_id": agreement_id,
+            "agreement_hash": agreement_hash,
+            "taken_at": now,
+            "taken_at_height": taken_at_height,
+            "seller_pubkey": pubkey,
+        });
+        if let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            let url = format!("{}/rpc/broadcast_offer_take", rpc_url.trim_end_matches('/'));
+            let mut req = client.post(&url).json(&serde_json::json!({
+                "payload_json": take_payload.to_string(),
+            }));
+            if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+                req = req.bearer_auth(token);
+            }
+            let _ = req.send();
+        }
+    }
 
     // Auto-build and store OTC policy on local node if seller_pubkey is known.
     let mut auto_policy_id: Option<String> = None;
@@ -12924,6 +13041,10 @@ mod tests {
             invoice_reference: Some("INV-42".to_string()),
             external_reference: None,
             disputed_metadata_only: false,
+            primary_resolver: None,
+            fallback_resolver: None,
+            primary_resolver_fee: None,
+            fallback_resolver_fee: None,
         }
     }
 
@@ -18733,6 +18854,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: None,
             seller_pubkey: None,
         };
@@ -18774,6 +18896,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: None,
             seller_pubkey: None,
         };
@@ -18812,6 +18935,7 @@ found true"
                 agreement_hash: None,
                 buyer_address: None,
                 taken_at: None,
+                taken_at_height: None,
                 source: None,
                 seller_pubkey: None,
             };
@@ -18848,6 +18972,7 @@ found true"
             agreement_hash: Some("aa".repeat(32)),
             buyer_address: Some("Qbuyer1111111111111111111111111111111".to_string()),
             taken_at: Some(2),
+            taken_at_height: None,
             source: None,
             seller_pubkey: None,
         };
@@ -18915,6 +19040,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: None,
             seller_pubkey: None,
         };
@@ -18945,6 +19071,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: Some("local".to_string()),
             seller_pubkey: None,
         };
@@ -19152,6 +19279,7 @@ found true"
                 agreement_hash: None,
                 buyer_address: None,
                 taken_at: None,
+                taken_at_height: None,
                 source: Some(src_val.to_string()),
                 seller_pubkey: None,
             };
@@ -19184,6 +19312,7 @@ found true"
                 agreement_hash: None,
                 buyer_address: None,
                 taken_at: None,
+                taken_at_height: None,
                 source: Some(src_val.to_string()),
                 seller_pubkey: None,
             };
@@ -19215,6 +19344,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: src.map(|s| s.to_string()),
             seller_pubkey: seller_pk.map(|s| s.to_string()),
         }
@@ -20797,6 +20927,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: Some("local".to_string()),
             seller_pubkey: Some(
                 "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string(),
@@ -20834,6 +20965,7 @@ found true"
             agreement_hash: None,
             buyer_address: None,
             taken_at: None,
+            taken_at_height: None,
             source: Some("local".to_string()),
             seller_pubkey: Some(
                 "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string(),
@@ -23313,6 +23445,20 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            if agreement.template_type
+                == irium_node_rs::settlement::AgreementTemplateType::OtcSettlement
+            {
+                if let Some(payer_party) = agreement
+                    .parties
+                    .iter()
+                    .find(|p| p.party_id == agreement.payer)
+                {
+                    if payer_party.role.as_deref() == Some("buyer") {
+                        eprintln!("This agreement was created with an older version of Irium where the buyer was set as the HTLC funder. This direction is incorrect \u{2014} the seller should fund the escrow. Please create a new agreement.");
+                        std::process::exit(1);
+                    }
+                }
+            }
             let mut rpc_url = default_rpc_url();
             let mut broadcast = false;
             let mut fee_per_byte = None;
@@ -26139,6 +26285,48 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
                 std::process::exit(1);
             }
         }
+        "agreement-dispute-raise" => {
+            if let Err(e) = handle_agreement_dispute_raise(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-dispute-respond" => {
+            if let Err(e) = handle_agreement_dispute_respond(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-dispute-resolve" => {
+            if let Err(e) = handle_agreement_dispute_resolve(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "resolver-register" => {
+            if let Err(e) = handle_resolver_register(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "resolver-list" => {
+            if let Err(e) = handle_resolver_list(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-dispute-show" => {
+            if let Err(e) = handle_agreement_dispute_show(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-dispute-reresolve" => {
+            if let Err(e) = handle_agreement_dispute_reresolve(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
         "agreement-dispute" => {
             if let Err(e) = handle_agreement_dispute(&args[1..]) {
                 eprintln!("{}", e);
@@ -26514,4 +26702,750 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
     }
     // ============================================================
+}
+
+
+// ============================================================================
+// Stage 3.4: Dispute and Resolver Wallet CLI Commands
+// ============================================================================
+
+fn s34_build_signed_envelope(
+    pubkey_hex: &str,
+    signer_address: &str,
+    target_hash: &str,
+) -> AgreementSignatureEnvelope {
+    AgreementSignatureEnvelope {
+        version: AGREEMENT_SIGNATURE_VERSION,
+        target_type: AgreementSignatureTargetType::Agreement,
+        target_hash: target_hash.to_string(),
+        signer_public_key: pubkey_hex.to_string(),
+        signer_address: Some(signer_address.to_string()),
+        signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+        timestamp: Some(now_unix()),
+        signer_role: None,
+        signature: String::new(),
+    }
+}
+
+fn s34_ecdsa_sign(signing_key: &SigningKey, bytes: &[u8]) -> Result<String, String> {
+    let digest = Sha256::digest(bytes);
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&digest);
+    let sig: Signature = signing_key
+        .sign_prehash(&arr)
+        .map_err(|e| format!("ecdsa sign: {e}"))?;
+    let sig = sig.normalize_s().unwrap_or(sig);
+    Ok(hex::encode(sig.to_bytes()))
+}
+
+#[derive(Serialize)]
+struct RaiseDisputeRpcReq {
+    dispute: DisputeRaise,
+    agreement: AgreementObject,
+}
+
+#[derive(Deserialize)]
+struct RaiseDisputeRpcResp {
+    agreement_hash: String,
+    anchor_txid: String,
+}
+
+#[derive(Serialize)]
+struct DisputeEvidenceRpcReq {
+    evidence: DisputeEvidence,
+    agreement: AgreementObject,
+}
+
+#[derive(Deserialize)]
+struct DisputeEvidenceRpcResp {
+    evidence_hash: String,
+    anchor_txid: String,
+}
+
+#[derive(Serialize)]
+struct ResolveDisputeRpcReq {
+    resolution: DisputeResolution,
+    agreement: AgreementObject,
+}
+
+#[derive(Deserialize)]
+struct ResolveDisputeRpcResp {
+    anchor_txid: String,
+    outcome: String,
+    resolver_role: String,
+}
+
+#[derive(Serialize)]
+struct RegisterResolverRpcReq {
+    registration: ResolverRegistration,
+}
+
+#[derive(Deserialize)]
+struct RegisterResolverRpcResp {
+    resolver_address: String,
+    anchor_txid: String,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct ResolversListEntryRpc {
+    resolver_address: String,
+    registered_at_height: u64,
+    display_name: Option<String>,
+    fee_bps_self_quoted: Option<u32>,
+    anchor_txid: Option<String>,
+    anchored_at_height: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ResolversListRpcResp {
+    resolvers: Vec<ResolversListEntryRpc>,
+    next_cursor: Option<String>,
+}
+
+fn handle_agreement_dispute_raise(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut raising_party: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut evidence_file: Option<String> = None;
+    let mut key_input: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--raising-party" => {
+                raising_party = Some(parse_required_string_flag(args, &mut i, "--raising-party")?);
+            }
+            "--reason" => {
+                reason = Some(parse_required_string_flag(args, &mut i, "--reason")?);
+            }
+            "--evidence-file" => {
+                evidence_file = Some(parse_required_string_flag(args, &mut i, "--evidence-file")?);
+            }
+            "--key" => {
+                key_input = Some(parse_required_string_flag(args, &mut i, "--key")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let ag_ref = agreement_ref.ok_or_else(|| "--agreement required".to_string())?;
+    let raising = raising_party.ok_or_else(|| "--raising-party required".to_string())?;
+    let reason_text = reason.ok_or_else(|| "--reason required".to_string())?;
+    let evidence_path = evidence_file.ok_or_else(|| "--evidence-file required".to_string())?;
+    let key_str = key_input.ok_or_else(|| "--key required".to_string())?;
+
+    let agreement = load_agreement(&ag_ref)?;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let (signer_address, pubkey_hex, signing_key) = signing_key_from_raw(&key_str)?;
+    let evidence_bytes = std::fs::read(&evidence_path).map_err(|e| format!("read evidence: {e}"))?;
+    let evidence_hash = hex::encode(Sha256::digest(&evidence_bytes));
+
+    let mut dispute = DisputeRaise {
+        version: DISPUTE_RAISE_VERSION,
+        schema_id: Some(DISPUTE_RAISE_SCHEMA_ID.to_string()),
+        agreement_hash: agreement_hash.clone(),
+        raising_party: raising.clone(),
+        raised_at_height: 0,
+        raised_at_unix: now_unix(),
+        reason: reason_text,
+        initial_evidence_hash: evidence_hash,
+        signature: s34_build_signed_envelope(&pubkey_hex, &signer_address, &agreement_hash),
+    };
+    let bytes = dispute_raise_canonical_bytes(&dispute).map_err(|e| format!("canonical: {e}"))?;
+    dispute.signature.signature = s34_ecdsa_sign(&signing_key, &bytes)?;
+
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let req = RaiseDisputeRpcReq { dispute, agreement };
+    let resp: RaiseDisputeRpcResp = rpc_post_json(&client, base, "/rpc/raisedispute", &req)?;
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agreement_hash": resp.agreement_hash,
+                "anchor_txid":    resp.anchor_txid,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("=== Dispute Raised ===");
+        println!();
+        println!("agreement_hash  {}", resp.agreement_hash);
+        println!("anchor_txid     {}", resp.anchor_txid);
+        println!("raising_party   {}", raising);
+    }
+    Ok(())
+}
+
+fn handle_agreement_dispute_respond(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut submitter_party: Option<String> = None;
+    let mut evidence_file: Option<String> = None;
+    let mut evidence_type: Option<String> = None;
+    let mut message: Option<String> = None;
+    let mut key_input: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--submitter-party" => {
+                submitter_party = Some(parse_required_string_flag(args, &mut i, "--submitter-party")?);
+            }
+            "--evidence-file" => {
+                evidence_file = Some(parse_required_string_flag(args, &mut i, "--evidence-file")?);
+            }
+            "--evidence-type" => {
+                evidence_type = Some(parse_required_string_flag(args, &mut i, "--evidence-type")?);
+            }
+            "--message" => {
+                message = Some(parse_required_string_flag(args, &mut i, "--message")?);
+            }
+            "--key" => {
+                key_input = Some(parse_required_string_flag(args, &mut i, "--key")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let ag_ref = agreement_ref.ok_or_else(|| "--agreement required".to_string())?;
+    let submitter = submitter_party.ok_or_else(|| "--submitter-party required".to_string())?;
+    let evidence_path = evidence_file.ok_or_else(|| "--evidence-file required".to_string())?;
+    let etype = evidence_type.ok_or_else(|| "--evidence-type required".to_string())?;
+    let key_str = key_input.ok_or_else(|| "--key required".to_string())?;
+
+    let agreement = load_agreement(&ag_ref)?;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let (signer_address, pubkey_hex, signing_key) = signing_key_from_raw(&key_str)?;
+    let evidence_bytes = std::fs::read(&evidence_path).map_err(|e| format!("read evidence: {e}"))?;
+    let evidence_hash = hex::encode(Sha256::digest(&evidence_bytes));
+    let evidence_payload_b64 = hex::encode(&evidence_bytes);
+
+    let mut evidence = DisputeEvidence {
+        version: DISPUTE_EVIDENCE_VERSION,
+        schema_id: Some(DISPUTE_EVIDENCE_SCHEMA_ID.to_string()),
+        agreement_hash: agreement_hash.clone(),
+        submitter_party: submitter,
+        submitted_at_height: 0,
+        evidence_type: etype,
+        evidence_payload: evidence_payload_b64,
+        evidence_hash: evidence_hash.clone(),
+        message,
+        signature: s34_build_signed_envelope(&pubkey_hex, &signer_address, &agreement_hash),
+    };
+    let bytes = dispute_evidence_canonical_bytes(&evidence).map_err(|e| format!("canonical: {e}"))?;
+    evidence.signature.signature = s34_ecdsa_sign(&signing_key, &bytes)?;
+
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let req = DisputeEvidenceRpcReq { evidence, agreement };
+    let resp: DisputeEvidenceRpcResp = rpc_post_json(&client, base, "/rpc/disputeevidence", &req)?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "evidence_hash": resp.evidence_hash,
+                "anchor_txid":   resp.anchor_txid,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("=== Evidence Submitted ===");
+        println!();
+        println!("evidence_hash  {}", resp.evidence_hash);
+        println!("anchor_txid    {}", resp.anchor_txid);
+    }
+    Ok(())
+}
+
+fn handle_agreement_dispute_resolve(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut outcome: Option<String> = None;
+    let mut resolver_role: Option<String> = None;
+    let mut message: Option<String> = None;
+    let mut key_input: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--outcome" => {
+                outcome = Some(parse_required_string_flag(args, &mut i, "--outcome")?);
+            }
+            "--resolver-role" => {
+                resolver_role = Some(parse_required_string_flag(args, &mut i, "--resolver-role")?);
+            }
+            "--message" => {
+                message = Some(parse_required_string_flag(args, &mut i, "--message")?);
+            }
+            "--key" => {
+                key_input = Some(parse_required_string_flag(args, &mut i, "--key")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let ag_ref = agreement_ref.ok_or_else(|| "--agreement required".to_string())?;
+    let outcome_text = outcome.ok_or_else(|| "--outcome required".to_string())?;
+    let role = resolver_role.unwrap_or_else(|| "primary".to_string());
+    let msg = message.unwrap_or_else(|| "resolved".to_string());
+    let key_str = key_input.ok_or_else(|| "--key required".to_string())?;
+
+    let agreement = load_agreement(&ag_ref)?;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let (resolver_address, pubkey_hex, signing_key) = signing_key_from_raw(&key_str)?;
+
+    let mut resolution = DisputeResolution {
+        version: DISPUTE_RESOLUTION_VERSION,
+        schema_id: Some(DISPUTE_RESOLUTION_SCHEMA_ID.to_string()),
+        agreement_hash: agreement_hash.clone(),
+        resolver_address: resolver_address.clone(),
+        resolver_role: role,
+        outcome: outcome_text,
+        resolved_at_height: 0,
+        message: msg,
+        signature: s34_build_signed_envelope(&pubkey_hex, &resolver_address, &agreement_hash),
+    };
+    let bytes = dispute_resolution_canonical_bytes(&resolution).map_err(|e| format!("canonical: {e}"))?;
+    resolution.signature.signature = s34_ecdsa_sign(&signing_key, &bytes)?;
+
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let req = ResolveDisputeRpcReq { resolution, agreement };
+    let resp: ResolveDisputeRpcResp = rpc_post_json(&client, base, "/rpc/resolvedispute", &req)?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "anchor_txid":    resp.anchor_txid,
+                "outcome":        resp.outcome,
+                "resolver_role":  resp.resolver_role,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("=== Dispute Resolved ===");
+        println!();
+        println!("anchor_txid     {}", resp.anchor_txid);
+        println!("outcome         {}", resp.outcome);
+        println!("resolver_role   {}", resp.resolver_role);
+    }
+    Ok(())
+}
+
+fn handle_resolver_register(args: &[String]) -> Result<(), String> {
+    let mut display_name: Option<String> = None;
+    let mut bio: Option<String> = None;
+    let mut fee_bps: Option<u32> = None;
+    let mut key_input: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--display-name" => {
+                display_name = Some(parse_required_string_flag(args, &mut i, "--display-name")?);
+            }
+            "--bio" => {
+                bio = Some(parse_required_string_flag(args, &mut i, "--bio")?);
+            }
+            "--fee-bps" => {
+                fee_bps = Some(
+                    parse_required_string_flag(args, &mut i, "--fee-bps")?
+                        .parse::<u32>()
+                        .map_err(|_| "invalid --fee-bps".to_string())?,
+                );
+            }
+            "--key" => {
+                key_input = Some(parse_required_string_flag(args, &mut i, "--key")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let key_str = key_input.ok_or_else(|| "--key required".to_string())?;
+    let (resolver_address, pubkey_hex, signing_key) = signing_key_from_raw(&key_str)?;
+
+    let mut reg = ResolverRegistration {
+        version: RESOLVER_REGISTRATION_VERSION,
+        schema_id: Some(RESOLVER_REGISTRATION_SCHEMA_ID.to_string()),
+        resolver_address: resolver_address.clone(),
+        registered_at_height: 0,
+        display_name,
+        bio,
+        fee_bps_self_quoted: fee_bps,
+        signature: s34_build_signed_envelope(&pubkey_hex, &resolver_address, ""),
+    };
+    let bytes = resolver_registration_canonical_bytes(&reg).map_err(|e| format!("canonical: {e}"))?;
+    reg.signature.signature = s34_ecdsa_sign(&signing_key, &bytes)?;
+
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let req = RegisterResolverRpcReq { registration: reg };
+    let resp: RegisterResolverRpcResp = rpc_post_json(&client, base, "/rpc/registerresolver", &req)?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "resolver_address": resp.resolver_address,
+                "anchor_txid":      resp.anchor_txid,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("=== Resolver Registered ===");
+        println!();
+        println!("resolver_address  {}", resp.resolver_address);
+        println!("anchor_txid       {}", resp.anchor_txid);
+    }
+    Ok(())
+}
+
+fn handle_resolver_list(args: &[String]) -> Result<(), String> {
+    let mut rpc_url = default_rpc_url();
+    let mut limit: Option<usize> = None;
+    let mut cursor: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--limit" => {
+                limit = Some(
+                    parse_required_string_flag(args, &mut i, "--limit")?
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --limit".to_string())?,
+                );
+            }
+            "--cursor" => {
+                cursor = Some(parse_required_string_flag(args, &mut i, "--cursor")?);
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let mut url = format!("{}/resolvers/list", base.trim_end_matches('/'));
+    let mut q: Vec<String> = Vec::new();
+    if let Some(l) = limit {
+        q.push(format!("limit={}", l));
+    }
+    if let Some(c) = cursor {
+        q.push(format!("cursor={}", c));
+    }
+    if !q.is_empty() {
+        url.push('?');
+        url.push_str(&q.join("&"));
+    }
+    let resp = client.get(&url).send().map_err(|e| format!("GET /resolvers/list: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        return Err(format!("/resolvers/list: {} {}", status, body));
+    }
+    let parsed: ResolversListRpcResp = resp.json().map_err(|e| format!("parse /resolvers/list: {e}"))?;
+    if json_mode {
+        let v = serde_json::json!({
+            "resolvers": parsed.resolvers.iter().map(|r| serde_json::json!({
+                "resolver_address":     r.resolver_address,
+                "registered_at_height": r.registered_at_height,
+                "display_name":         r.display_name,
+                "fee_bps_self_quoted":  r.fee_bps_self_quoted,
+                "anchor_txid":          r.anchor_txid,
+                "anchored_at_height":   r.anchored_at_height,
+            })).collect::<Vec<_>>(),
+            "next_cursor": parsed.next_cursor,
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    } else if parsed.resolvers.is_empty() {
+        println!("no resolvers registered");
+    } else {
+        println!("registered resolvers ({}):", parsed.resolvers.len());
+        for r in &parsed.resolvers {
+            println!(
+                "  {}  height={}  fee_bps={}  name={}",
+                r.resolver_address,
+                r.registered_at_height,
+                r.fee_bps_self_quoted.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string()),
+                r.display_name.as_deref().unwrap_or("-")
+            );
+        }
+        if let Some(ref c) = parsed.next_cursor {
+            println!();
+            println!("next_cursor  {}", c);
+        }
+    }
+    Ok(())
+}
+
+
+
+// ============================================================================
+// Stage 3.4.1: agreement-dispute-show + agreement-dispute-reresolve
+// ============================================================================
+
+fn handle_agreement_dispute_show(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let ag_ref = agreement_ref.ok_or_else(|| "--agreement required".to_string())?;
+    let agreement = load_agreement(&ag_ref)?;
+    let agreement_hash =
+        irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let url = format!(
+        "{}/rpc/disputestate?agreement_hash={}",
+        base.trim_end_matches('/'),
+        agreement_hash
+    );
+    let mut req = client.get(&url);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
+        .send()
+        .map_err(|e| format!("GET /rpc/disputestate: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        return Err(format!("/rpc/disputestate: {} {}", status, body));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("parse /rpc/disputestate: {e}"))?;
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&body).unwrap());
+        return Ok(());
+    }
+    let found = body
+        .get("found")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !found {
+        println!("no dispute on record for agreement {}", agreement_hash);
+        return Ok(());
+    }
+    let state = body
+        .get("state")
+        .ok_or_else(|| "missing state in response".to_string())?;
+    println!("=== Dispute State ===");
+    println!();
+    println!("agreement_hash      {}", agreement_hash);
+    if let Some(raise) = state.get("raise") {
+        if let Some(rp) = raise.get("raising_party").and_then(|v| v.as_str()) {
+            println!("raising_party       {}", rp);
+        }
+        if let Some(r) = raise.get("reason").and_then(|v| v.as_str()) {
+            println!("reason              {}", r);
+        }
+    }
+    if let Some(t) = state.get("raise_anchor_txid").and_then(|v| v.as_str()) {
+        println!("raise_anchor_txid   {}", t);
+    }
+    if let Some(h) = state.get("raise_anchored_at_height").and_then(|v| v.as_u64()) {
+        println!("raise_anchored_at   block {}", h);
+    }
+    if let Some(ev) = state.get("evidence").and_then(|v| v.as_array()) {
+        println!("evidence_count      {}", ev.len());
+    }
+    if let Some(esc) = state.get("escalated_to_fallback").and_then(|v| v.as_bool()) {
+        println!("escalated           {}", esc);
+    }
+    if let Some(res) = state.get("resolution") {
+        if !res.is_null() {
+            if let Some(o) = res.get("outcome").and_then(|v| v.as_str()) {
+                println!("resolution_outcome  {}", o);
+            }
+            if let Some(r) = res.get("resolver_role").and_then(|v| v.as_str()) {
+                println!("resolver_role       {}", r);
+            }
+            if let Some(a) = res.get("resolver_address").and_then(|v| v.as_str()) {
+                println!("resolver_address    {}", a);
+            }
+        } else {
+            println!("resolution          (still open)");
+        }
+    }
+    if let Some(nom) = state.get("reresolve_nomination") {
+        if !nom.is_null() {
+            if let Some(np) =
+                nom.get("new_primary_resolver").and_then(|v| v.as_str())
+            {
+                println!("reresolve_primary   {}", np);
+            }
+            if let Some(nf) =
+                nom.get("new_fallback_resolver").and_then(|v| v.as_str())
+            {
+                println!("reresolve_fallback  {}", nf);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ReResolveAgreementRpcReq {
+    nomination: DisputeReResolverNomination,
+    agreement: AgreementObject,
+}
+
+#[derive(Deserialize)]
+struct ReResolveAgreementRpcResp {
+    agreement_hash: String,
+    new_primary_resolver: String,
+    new_fallback_resolver: Option<String>,
+}
+
+fn handle_agreement_dispute_reresolve(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut new_primary: Option<String> = None;
+    let mut new_fallback: Option<String> = None;
+    let mut key_a: Option<String> = None;
+    let mut key_b: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--new-resolver" => {
+                new_primary = Some(parse_required_string_flag(args, &mut i, "--new-resolver")?);
+            }
+            "--new-fallback" => {
+                new_fallback = Some(parse_required_string_flag(args, &mut i, "--new-fallback")?);
+            }
+            "--key-a" => {
+                key_a = Some(parse_required_string_flag(args, &mut i, "--key-a")?);
+            }
+            "--key-b" => {
+                key_b = Some(parse_required_string_flag(args, &mut i, "--key-b")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let ag_ref = agreement_ref.ok_or_else(|| "--agreement required".to_string())?;
+    let new_p = new_primary.ok_or_else(|| "--new-resolver required".to_string())?;
+    let key_a_str = key_a.ok_or_else(|| "--key-a required (party A signing key)".to_string())?;
+    let key_b_str = key_b.ok_or_else(|| "--key-b required (party B signing key)".to_string())?;
+    let agreement = load_agreement(&ag_ref)?;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let (addr_a, pub_a, sk_a) = signing_key_from_raw(&key_a_str)?;
+    let (addr_b, pub_b, sk_b) = signing_key_from_raw(&key_b_str)?;
+
+    let mut nomination = DisputeReResolverNomination {
+        version: DISPUTE_RERESOLVE_VERSION,
+        schema_id: Some(DISPUTE_RERESOLVE_SCHEMA_ID.to_string()),
+        agreement_hash: agreement_hash.clone(),
+        new_primary_resolver: new_p,
+        new_fallback_resolver: new_fallback,
+        nominated_at_height: 0,
+        party_a_signature: s34_build_signed_envelope(&pub_a, &addr_a, &agreement_hash),
+        party_b_signature: s34_build_signed_envelope(&pub_b, &addr_b, &agreement_hash),
+    };
+    // Compute payload-hash with both signature fields cleared, sign with each key.
+    let bytes = {
+        let mut tmp = nomination.clone();
+        tmp.party_a_signature.signature = String::new();
+        tmp.party_b_signature.signature = String::new();
+        dispute_reresolve_canonical_bytes(&tmp).map_err(|e| format!("canonical: {e}"))?
+    };
+    nomination.party_a_signature.signature = s34_ecdsa_sign(&sk_a, &bytes)?;
+    nomination.party_b_signature.signature = s34_ecdsa_sign(&sk_b, &bytes)?;
+
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let req = ReResolveAgreementRpcReq {
+        nomination,
+        agreement,
+    };
+    let resp: ReResolveAgreementRpcResp =
+        rpc_post_json(&client, base, "/rpc/reresolveagreement", &req)?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agreement_hash":         resp.agreement_hash,
+                "new_primary_resolver":   resp.new_primary_resolver,
+                "new_fallback_resolver":  resp.new_fallback_resolver,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("=== Resolver Re-nomination Accepted ===");
+        println!();
+        println!("agreement_hash         {}", resp.agreement_hash);
+        println!("new_primary_resolver   {}", resp.new_primary_resolver);
+        if let Some(f) = resp.new_fallback_resolver {
+            println!("new_fallback_resolver  {}", f);
+        }
+    }
+    Ok(())
 }

@@ -4,6 +4,15 @@ use crate::block::{
 };
 use crate::pow::{hash_meets_target, sha256d, target_from_bits, target_from_difficulty_with_limit};
 use crate::template::{GetBlockTemplate, TemplateClient};
+
+/// Mirror of iriumd's STANDARD_HEADER_ACTIVATION_HEIGHT (Fix 2a hard fork).
+/// Must stay in sync with `irium_node_rs::constants::STANDARD_HEADER_ACTIVATION_HEIGHT`.
+/// Below this height the pool emits/consumes iriumd's pre-fork wire convention
+/// (display-order prev on wire, display-order merkle in canonical header). At
+/// and above this height the pool switches to Bitcoin-standard wire format
+/// (swap4(natural) prev, natural merkle in canonical header) so cgminer-family
+/// miners produce iriumd-canonical bytes directly.
+const STANDARD_HEADER_ACTIVATION_HEIGHT: u64 = 30_000;
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use serde_json::{json, Value};
@@ -1089,8 +1098,14 @@ fn reconstruct_canonical_header80(
     prev_wire.reverse();
     header[4..36].copy_from_slice(&prev_wire);
 
+    // Pre-fork (height < STANDARD_HEADER_ACTIVATION_HEIGHT) iriumd serializes
+    // the merkle_root reversed (display-order bytes on wire). At/post-fork
+    // iriumd writes the natural sha256d bytes unchanged (Bitcoin-standard).
+    // Stay byte-for-byte aligned with iriumd's BlockHeader::serialize_for_height.
     let mut merkle_wire = merkle_root_internal;
-    merkle_wire.reverse();
+    if snapshot.height < STANDARD_HEADER_ACTIVATION_HEIGHT {
+        merkle_wire.reverse();
+    }
     header[36..68].copy_from_slice(&merkle_wire);
 
     header[68..72].copy_from_slice(&ntime.to_le_bytes());
@@ -1413,6 +1428,7 @@ async fn handle_message(
 
 fn mode_allows_combo(
     mode: &MinerFamilyMode,
+    height: u64,
     prev_name: &str,
     mr_name: &str,
     v_name: &str,
@@ -1420,17 +1436,56 @@ fn mode_allows_combo(
     b_name: &str,
     n_name: &str,
 ) -> bool {
-    // `v_rolled` / `v_rolled_raw` are the BIP310 version-rolling variants
-    // (LE-encoded and raw-bytes respectively). All non-cpuminer modes treat
-    // them the same way they treat v_be.
+    // Real ASIC firmware (Bitaxe, Antminer, Whatsminer, Avalon, cgminer-family)
+    // produces standard Bitcoin-convention header bytes:
+    //   - version / time / bits / nonce in little-endian (= our t_rev, b_rev,
+    //     n_rev variants, plus v_be/v_le/v_rolled* for version).
+    //   - merkle_root in natural sha256d order placed directly at header[36..68]
+    //     (= our mr_fold_raw_raw variant — no further byte transformation).
+    //   - prev_hash: cgminer applies swap4 to the wire bytes. Pre-fork our wire
+    //     prev_hash is display-order → swap4(display) lands in the header (=
+    //     prev_swap4). At/post-fork our wire becomes swap4(natural) (see
+    //     send_notify) → cgminer's swap4 cancels and natural lands in the
+    //     header (= prev_rev32, since reverse_32(display) = natural).
+    //
+    // Pre-fork the variant scan must allow `prev_swap4`; post-fork `prev_rev32`.
+    // This is the only height-dependent constraint.
+    let post_fork = height >= STANDARD_HEADER_ACTIVATION_HEIGHT;
+
     let v_ok = v_name == "v_be"
+        || v_name == "v_le"
         || v_name == "v_rolled"
         || v_name == "v_rolled_extra"
         || v_name == "v_rolled_raw";
+    let mr_ok = mr_name == "mr_fold_raw_raw";
+    let t_ok = t_name == "t_rev";
+    let b_ok = b_name == "b_rev";
+    let n_ok = n_name == "n_rev";
+
+    let strict_prev_ok = if post_fork {
+        prev_name == "prev_rev32"
+    } else {
+        prev_name == "prev_swap4"
+    };
+
     match mode {
-        MinerFamilyMode::Asic => prev_name == "prev_canon" && mr_name == "mr_canon" && v_ok && t_name == "t_raw" && b_name == "b_raw" && n_name == "n_raw",
-        MinerFamilyMode::Ccminer => (prev_name == "prev_canon" || prev_name == "prev_rev32") && (mr_name == "mr_canon" || mr_name == "mr_rev32") && v_ok && t_name == "t_raw" && b_name == "b_raw" && (n_name == "n_raw" || n_name == "n_rev"),
-        MinerFamilyMode::Auto => (prev_name == "prev_canon" || prev_name == "prev_rev32" || prev_name == "prev_swap4" || prev_name == "prev_rev32_swap4") && (mr_name == "mr_canon" || mr_name == "mr_rev32") && v_ok && t_name == "t_raw" && b_name == "b_raw" && (n_name == "n_raw" || n_name == "n_rev"),
+        MinerFamilyMode::Asic => strict_prev_ok && mr_ok && v_ok && t_ok && b_ok && n_ok,
+        MinerFamilyMode::Ccminer => {
+            // ccminer / older mixed firmware may produce either prev_swap4 or
+            // prev_rev32 (some don't apply the second swap4 step). Allow both
+            // regardless of fork side.
+            (prev_name == "prev_swap4" || prev_name == "prev_rev32")
+                && mr_ok && v_ok && t_ok && b_ok && n_ok
+        }
+        MinerFamilyMode::Auto => {
+            // Liberal mode — accept any of the four prev byte-order variants
+            // plus mr_fold_raw_raw and the standard LE time/bits/nonce.
+            (prev_name == "prev_canon"
+                || prev_name == "prev_rev32"
+                || prev_name == "prev_swap4"
+                || prev_name == "prev_rev32_swap4")
+                && mr_ok && v_ok && t_ok && b_ok && n_ok
+        }
         MinerFamilyMode::Cpuminer => true,
     }
 }
@@ -1531,12 +1586,14 @@ fn decode_cpuminer_compat_submit(
     let canonical_merkle_root = merkle_root_from_coinbase(cb_hash, &snapshot.branches);
     let ntime = parse_u32_hex(&submit.ntime_hex)?;
     let nonce = parse_u32_hex(&submit.nonce_hex)?;
-    let canonical_header80 = header_bytes(
-        snapshot.version,
-        snapshot.prev_hash_internal,
+    // Match iriumd's BlockHeader::serialize() byte order (natural prev,
+    // display merkle) so canonical_hash equals what iriumd would compute
+    // for this submission. Previously used header_bytes() which writes
+    // both fields as-is, producing a hash unrelated to the chain rule.
+    let canonical_header80 = reconstruct_canonical_header80(
+        snapshot,
         canonical_merkle_root,
         ntime,
-        snapshot.bits,
         nonce,
     );
     let canonical_hash = sha256d(&canonical_header80);
@@ -2301,7 +2358,7 @@ async fn handle_submit_legacy_rewardable(
                 for (t_name, t_bytes) in time_opts {
                     for (b_name, b_bytes) in bits_opts {
                         for (n_name, n_bytes) in nonce_opts {
-                            if !mode_allows_combo(&config.miner_family_mode, prev_name, mr_name, v_name, t_name, b_name, n_name) {
+                            if !mode_allows_combo(&config.miner_family_mode, job.height, prev_name, mr_name, v_name, t_name, b_name, n_name) {
                                 continue;
                             }
                             let hdr_v = header_bytes_from_wire(
@@ -2557,9 +2614,25 @@ async fn send_notify(
 ) -> Result<()> {
     let pkh = session.pkh.ok_or_else(|| anyhow!("unauthorized"))?;
 
+    // Compute the wire prev_hash. Pre-fork sends display-order bytes (iriumd's
+    // legacy convention; cgminer-family miners then apply swap4 → swap4(display)
+    // in their header). At/post-fork we send swap4(natural) on the wire so the
+    // miner's swap4 yields natural in the header, matching the Bitcoin-standard
+    // post-fork canonical bytes.
+    let prev_hex_for_height = |job_prev: &[u8; 32], h: u64| -> String {
+        if h < STANDARD_HEADER_ACTIVATION_HEIGHT {
+            hex::encode(job_prev)
+        } else {
+            let mut natural = *job_prev;
+            natural.reverse();
+            hex::encode(swap4_bytes_each_word(natural))
+        }
+    };
+
     let (prev_hex, cb1_hex, cb2_hex, branches) = if let Some(snap) = &session.current_snapshot {
         if snap.auxpow_mode {
-            // AuxPoW: send parent block data (zeros prev, empty branches, parent coinbase)
+            // AuxPoW: parent prev_hash is the zero array — byte order doesn't
+            // matter, leave unchanged.
             (
                 hex::encode(snap.prev_hash_internal),
                 hex::encode(&snap.coinbase_prefix),
@@ -2568,11 +2641,11 @@ async fn send_notify(
             )
         } else {
             let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34);
-            (hex::encode(job.prev_hash), hex::encode(&cb1), hex::encode(&cb2), job.branches.iter().map(hex::encode).collect())
+            (prev_hex_for_height(&job.prev_hash, job.height), hex::encode(&cb1), hex::encode(&cb2), job.branches.iter().map(hex::encode).collect())
         }
     } else {
         let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34);
-        (hex::encode(job.prev_hash), hex::encode(&cb1), hex::encode(&cb2), job.branches.iter().map(hex::encode).collect())
+        (prev_hex_for_height(&job.prev_hash, job.height), hex::encode(&cb1), hex::encode(&cb2), job.branches.iter().map(hex::encode).collect())
     };
 
     info!(
@@ -2639,14 +2712,15 @@ fn cpuminer_miner_header_wire(
     ntime_hex: &str,
     nonce_hex: &str,
 ) -> Result<[u8; 80]> {
+    // Diagnostic log helper. Match iriumd's chain wire format
+    // (height-aware) so the log column shows the same bytes iriumd would
+    // compute, useful for debugging share rejection.
     let ntime = parse_u32_hex(ntime_hex)?;
     let nonce = parse_u32_hex(nonce_hex)?;
-    Ok(header_bytes(
-        snapshot.version,
-        snapshot.prev_hash_internal,
+    Ok(reconstruct_canonical_header80(
+        snapshot,
         coinbase_hash_internal,
         ntime,
-        snapshot.bits,
         nonce,
     ))
 }

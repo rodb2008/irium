@@ -173,7 +173,7 @@ impl ChainState {
         state
             .connect_genesis(genesis.clone())
             .expect("valid genesis block");
-        let genesis_hash = genesis.header.hash();
+        let genesis_hash = genesis.header.hash_for_height(0);
         let work = ChainState::block_work(&genesis);
         state.block_store.insert(genesis_hash, genesis);
         state.heights.insert(genesis_hash, 0);
@@ -282,7 +282,7 @@ impl ChainState {
             if let Some(h) = self.heights.get(hash) {
                 if *h <= min_height {
                     if let Some(block) = self.chain.get(*h as usize) {
-                        if block.header.hash() == *hash {
+                        if block.header.hash_for_height(*h) == *hash {
                             remove.push(*hash);
                         }
                     }
@@ -515,7 +515,7 @@ impl ChainState {
 
         let work = ChainState::block_work(&block);
         self.total_work += work;
-        let hash = block.header.hash();
+        let hash = block.header.hash_for_height(expected_height);
         self.chain.push(block.clone());
         self.height += 1;
         self.issued = new_supply;
@@ -535,7 +535,7 @@ impl ChainState {
         if self
             .chain
             .get(h as usize)
-            .map(|b| b.header.hash() == *hash)
+            .map(|b| b.header.hash_for_height(h) == *hash)
             .unwrap_or(false)
         {
             Some(h)
@@ -553,7 +553,8 @@ impl ChainState {
         if self.chain.len() <= 1 {
             return Err("cannot disconnect genesis".to_string());
         }
-        let tip_hash = tip_block.header.hash();
+        let tip_height = self.height.saturating_sub(1);
+        let tip_hash = tip_block.header.hash_for_height(tip_height);
         let undo = self
             .undo_logs
             .remove(&tip_hash)
@@ -576,10 +577,11 @@ impl ChainState {
 
         self.chain.pop();
         self.height = self.chain.len() as u64;
+        let new_tip_height = self.height.saturating_sub(1);
         self.best_tip = self
             .chain
             .last()
-            .map(|b| b.header.hash())
+            .map(|b| b.header.hash_for_height(new_tip_height))
             .unwrap_or([0u8; 32]);
         Ok(tip_block)
     }
@@ -643,14 +645,9 @@ impl ChainState {
     /// Add a header to the header tree if it extends a known header and compute cumulative work.
 
     pub fn add_header(&mut self, header: BlockHeader) -> Result<u64, String> {
-        let hash = header.hash();
-        if self.headers.contains_key(&hash) || self.heights.contains_key(&hash) {
-            if let Some(h) = self.heights.get(&hash) {
-                return Ok(*h);
-            }
-            return Ok(self.headers.get(&hash).map(|hw| hw.height).unwrap_or(0));
-        }
-
+        // Look up the parent first so we know `height` before computing the
+        // height-aware hash. Pre-Fix-2a the hash was computed before height,
+        // but the post-30000 byte-order convention depends on height.
         let prev_hash = header.prev_hash;
         let (parent_height, parent_work) = if let Some(h) = self.headers.get(&prev_hash) {
             (h.height, h.work.clone())
@@ -667,6 +664,13 @@ impl ChainState {
 
         // Basic PoW check.
         let height = parent_height + 1;
+        let hash = header.hash_for_height(height);
+        if self.headers.contains_key(&hash) || self.heights.contains_key(&hash) {
+            if let Some(h) = self.heights.get(&hash) {
+                return Ok(*h);
+            }
+            return Ok(self.headers.get(&hash).map(|hw| hw.height).unwrap_or(0));
+        }
         let auxpow_active = self.params.auxpow_activation_height
             .map(|ah| height >= ah)
             .unwrap_or(false);
@@ -692,13 +696,14 @@ impl ChainState {
 
     /// Best header hash by total work (main chain tip or best header).
     pub fn best_header_hash(&self) -> [u8; 32] {
+        let tip_height = self.height.saturating_sub(1);
         let mut best = (
             self.total_work.clone(),
-            self.chain.last().map(|b| b.header.hash()),
+            self.chain.last().map(|b| b.header.hash_for_height(tip_height)),
         );
         for hw in self.headers.values() {
             if hw.work > best.0 {
-                best = (hw.work.clone(), Some(hw.header.hash()));
+                best = (hw.work.clone(), Some(hw.header.hash_for_height(hw.height)));
             }
         }
         best.1.unwrap_or([0u8; 32])
@@ -719,9 +724,10 @@ impl ChainState {
 
     /// Check if a header connects to current tip.
     pub fn connects_to_tip(&self, header: &BlockHeader) -> bool {
+        let tip_height = self.height.saturating_sub(1);
         self.chain
             .last()
-            .map(|b| b.header.hash() == header.prev_hash)
+            .map(|b| b.header.hash_for_height(tip_height) == header.prev_hash)
             .unwrap_or(false)
     }
 
@@ -730,17 +736,20 @@ impl ChainState {
     pub fn try_reorg(&mut self, new_blocks: &[Block]) -> Result<bool, String> {
         if let Some(_best_header) = self.best_header_if_better() {
             // Simple sanity: the provided blocks must connect from current tip.
+            let tip_height = self.height.saturating_sub(1);
             let mut current_hash = self
                 .chain
                 .last()
-                .map(|b| b.header.hash())
+                .map(|b| b.header.hash_for_height(tip_height))
                 .unwrap_or([0u8; 32]);
             for block in new_blocks {
                 if block.header.prev_hash != current_hash {
                     return Err("Reorg block does not connect".to_string());
                 }
                 self.connect_block(block.clone())?;
-                current_hash = block.header.hash();
+                // After connect_block self.height has incremented; the block
+                // just connected sits at self.height - 1.
+                current_hash = block.header.hash_for_height(self.height.saturating_sub(1));
             }
             // Clear headers since we have advanced main chain.
             self.headers.clear();
@@ -759,7 +768,7 @@ impl ChainState {
             self.validate_and_apply_transactions(&block, 0, 0, false, Some(MAX_MONEY))?;
 
         self.total_work = ChainState::block_work(&block);
-        let h = block.header.hash();
+        let h = block.header.hash_for_height(0);
         self.chain.push(block);
         self.height = 1;
         self.issued = subsidy_created;
@@ -774,7 +783,7 @@ impl ChainState {
         previous: Option<&Block>,
     ) -> Result<(), String> {
         if let Some(prev) = previous {
-            if block.header.prev_hash != prev.header.hash() {
+            if block.header.prev_hash != prev.header.hash_for_height(height.saturating_sub(1)) {
                 return Err("Block does not extend the current tip".to_string());
             }
         } else if block.header.prev_hash != [0u8; 32] {
@@ -801,7 +810,7 @@ impl ChainState {
         }
 
         // POW / bits
-        let header_hash = block.header.hash();
+        let header_hash = block.header.hash_for_height(height);
         let target = self.target_for_height(height);
         if block.header.target().bits != target.bits {
             return Err("Block bits mismatch".to_string());
@@ -810,7 +819,7 @@ impl ChainState {
             .map(|ah| height >= ah)
             .unwrap_or(false);
         if block.header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 && auxpow_active {
-            let header_bytes = block.header.serialize();
+            let header_bytes = block.header.serialize_for_height(height);
             let ap = block.auxpow.as_ref()
                 .ok_or_else(|| "AuxPoW block is missing AuxPoW data".to_string())?;
             crate::auxpow::validate(ap, &header_bytes, target)?;
@@ -953,9 +962,10 @@ impl ChainState {
 
     /// Hash of the current main chain tip.
     pub fn tip_hash(&self) -> [u8; 32] {
+        let tip_height = self.height.saturating_sub(1);
         self.chain
             .last()
-            .map(|b| b.header.hash())
+            .map(|b| b.header.hash_for_height(tip_height))
             .unwrap_or([0u8; 32])
     }
 
@@ -1021,20 +1031,21 @@ impl ChainState {
         let genesis = &branch[0];
         new_state.connect_genesis(genesis.clone())?;
         let mut cumulative = ChainState::block_work(genesis);
+        let genesis_hash = genesis.header.hash_for_height(0);
         new_state
             .block_store
-            .insert(genesis.header.hash(), genesis.clone());
-        new_state.heights.insert(genesis.header.hash(), 0);
+            .insert(genesis_hash, genesis.clone());
+        new_state.heights.insert(genesis_hash, 0);
         new_state
             .cumulative_work
-            .insert(genesis.header.hash(), cumulative.clone());
+            .insert(genesis_hash, cumulative.clone());
 
         for (idx, block) in branch.iter().enumerate().skip(1) {
             if let Err(e) = new_state.connect_block(block.clone()) {
                 return Err(format!("failed applying block {}: {}", idx, e));
             }
             cumulative += ChainState::block_work(block);
-            let h = block.header.hash();
+            let h = block.header.hash_for_height(idx as u64);
             new_state.block_store.insert(h, block.clone());
             new_state.heights.insert(h, idx as u64);
             new_state.cumulative_work.insert(h, cumulative.clone());
@@ -1045,11 +1056,9 @@ impl ChainState {
 
     /// Store a block and update best chain incrementally.
     pub fn process_block(&mut self, block: Block) -> Result<(u64, [u8; 32]), String> {
-        let hash = block.header.hash();
-        if self.heights.contains_key(&hash) {
-            return Err("duplicate block".to_string());
-        }
-
+        // Resolve parent + height before hashing: the post-30000 hash byte
+        // order depends on the block's height, so we cannot compute the hash
+        // (and use it as a map key) until we know which height to bind to.
         let parent_hash = block.header.prev_hash;
         if parent_hash != [0u8; 32] && !self.heights.contains_key(&parent_hash) {
             self.orphan_pool.entry(parent_hash).or_default().push(block);
@@ -1062,11 +1071,17 @@ impl ChainState {
         } else {
             self.heights.get(&parent_hash).copied().unwrap_or(0) + 1
         };
+
+        let hash = block.header.hash_for_height(block_height);
+        if self.heights.contains_key(&hash) {
+            return Err("duplicate block".to_string());
+        }
+
         let auxpow_active = self.params.auxpow_activation_height
             .map(|ah| block_height >= ah)
             .unwrap_or(false);
         if block.header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 && auxpow_active {
-            let header_bytes = block.header.serialize();
+            let header_bytes = block.header.serialize_for_height(block_height);
             let ap = block.auxpow.as_ref()
                 .ok_or_else(|| "AuxPoW block is missing AuxPoW data".to_string())?;
             crate::auxpow::validate(ap, &header_bytes, block.header.target())?;
@@ -1733,7 +1748,13 @@ mod tests {
     }
 
     fn push_synthetic_block(chain: &mut ChainState, time: u32, bits: u32) {
-        let prev_hash = chain.chain.last().expect("prev block").header.hash();
+        let prev_height = chain.chain.len().saturating_sub(1) as u64;
+        let prev_hash = chain
+            .chain
+            .last()
+            .expect("prev block")
+            .header
+            .hash_for_height(prev_height);
         chain.chain.push(Block {
             header: BlockHeader {
                 version: 1,
@@ -3490,5 +3511,184 @@ mod tests {
             chain.validate_transaction(&tx2).is_ok(),
             "1-of-2 refund (key index 1)"
         );
+    }
+
+    // ----- Mempool eviction on block connect (FIX 2) -----
+
+    fn fresh_mempool_path(label: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "irium_chain_mempool_evict_{}_{}_{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn build_signed_spend(
+        chain: &ChainState,
+        sender: &SigningKey,
+        prev: &OutPoint,
+        value: u64,
+        recipient_pkh: [u8; 20],
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value,
+                script_pubkey: p2pkh_script(&recipient_pkh),
+            }],
+            locktime: 0,
+        };
+        let utxo_script = chain.utxos.get(prev).unwrap().output.script_pubkey.clone();
+        tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, sender);
+        tx
+    }
+
+    #[test]
+    fn evict_invalid_mempool_entries_drops_double_spend() {
+        let mut chain = base_chain(None);
+        let sender = signing_key(11);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 10_000);
+        let tx = build_signed_spend(&chain, &sender, &prev, 5_000, [0xaa; 20]);
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "test setup: signed spend must validate against fresh chain"
+        );
+
+        let path = fresh_mempool_path("double_spend");
+        let mut mempool =
+            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0);
+        let raw = tx.serialize();
+        mempool
+            .add_transaction(tx.clone(), raw, 0)
+            .expect("admit tx to mempool");
+        assert_eq!(mempool.len(), 1);
+
+        // Simulate a block that connected a *different* transaction which
+        // spent the same UTXO: remove the prev outpoint from chain.utxos
+        // (that's what ChainState::connect_block does internally via the
+        // undo log). The mempool entry now references a missing UTXO.
+        chain.utxos.remove(&prev);
+
+        let evicted =
+            crate::mempool::evict_invalid_mempool_entries(&chain, &mut mempool);
+        assert_eq!(evicted, 1, "double-spend conflict must be evicted");
+        assert_eq!(mempool.len(), 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn evict_invalid_mempool_entries_keeps_valid_tx_unchanged() {
+        let mut chain = base_chain(None);
+        let sender = signing_key(12);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 10_000);
+        let tx = build_signed_spend(&chain, &sender, &prev, 5_000, [0xbb; 20]);
+        assert!(chain.validate_transaction(&tx).is_ok());
+
+        let path = fresh_mempool_path("valid_kept");
+        let mut mempool =
+            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0);
+        let raw = tx.serialize();
+        mempool
+            .add_transaction(tx.clone(), raw, 0)
+            .expect("admit tx to mempool");
+        assert_eq!(mempool.len(), 1);
+
+        // No conflict: chain still has the UTXO; tx is still valid.
+        let evicted =
+            crate::mempool::evict_invalid_mempool_entries(&chain, &mut mempool);
+        assert_eq!(evicted, 0, "still-valid tx must not be evicted");
+        assert_eq!(mempool.len(), 1);
+        assert!(mempool.contains(&tx.txid()));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn evict_invalid_mempool_entries_drops_all_conflicts_in_one_pass() {
+        let mut chain = base_chain(None);
+        let sender = signing_key(13);
+        let pkh = key_hash(&sender);
+
+        // Three separate UTXOs spendable by the same key. add_spendable_p2pkh_utxo
+        // uses a fixed prev txid [7u8; 32], so for the other two we insert
+        // directly with distinct keys.
+        let prev0 = add_spendable_p2pkh_utxo(&mut chain, &sender, 10_000);
+        let prev1 = OutPoint {
+            txid: [8u8; 32],
+            index: 0,
+        };
+        chain.utxos.insert(
+            prev1.clone(),
+            UtxoEntry {
+                output: TxOutput {
+                    value: 10_000,
+                    script_pubkey: p2pkh_script(&pkh),
+                },
+                height: chain.tip_height(),
+                is_coinbase: false,
+            },
+        );
+        let prev2 = OutPoint {
+            txid: [9u8; 32],
+            index: 0,
+        };
+        chain.utxos.insert(
+            prev2.clone(),
+            UtxoEntry {
+                output: TxOutput {
+                    value: 10_000,
+                    script_pubkey: p2pkh_script(&pkh),
+                },
+                height: chain.tip_height(),
+                is_coinbase: false,
+            },
+        );
+
+        let path = fresh_mempool_path("multi_conflict");
+        let mut mempool =
+            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0);
+        for (i, prev) in [&prev0, &prev1, &prev2].iter().enumerate() {
+            let tx = build_signed_spend(
+                &chain,
+                &sender,
+                prev,
+                5_000 + i as u64, // distinct value -> distinct txid
+                [0xcc; 20],
+            );
+            let raw = tx.serialize();
+            mempool
+                .add_transaction(tx, raw, 0)
+                .expect("admit tx to mempool");
+        }
+        assert_eq!(mempool.len(), 3);
+
+        // Remove all three UTXOs (a block confirmed conflicting txs for each).
+        chain.utxos.remove(&prev0);
+        chain.utxos.remove(&prev1);
+        chain.utxos.remove(&prev2);
+
+        let evicted =
+            crate::mempool::evict_invalid_mempool_entries(&chain, &mut mempool);
+        assert_eq!(
+            evicted, 3,
+            "all three conflicting entries must be evicted in one pass"
+        );
+        assert_eq!(mempool.len(), 0);
+
+        let _ = std::fs::remove_file(path);
     }
 }

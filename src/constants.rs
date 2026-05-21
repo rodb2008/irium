@@ -50,3 +50,15 @@ pub const LWMA_V2_WINDOW: u64 = 30; // reduced from 60 for faster response
 pub const LWMA_V2_SOLVETIME_CLAMP_FACTOR: u64 = 10; // increased from 6 for stronger slow-block signal
 pub const LWMA_V2_MAX_TARGET_UP_FACTOR: u64 = 2; // unchanged: max 2x ease per block
 pub const LWMA_V2_MAX_TARGET_DOWN_FACTOR: u64 = 2; // unchanged: max 2x harden per block
+
+/// Hard fork: BlockHeader wire serialization switches to Bitcoin-standard
+/// convention at and above this height. Pre-fork (height < this) reverses
+/// BOTH prev_hash and merkle_root before writing the 80-byte header (iriumd
+/// historical convention). At/post-fork only prev_hash is reversed; the
+/// merkle_root is written in natural byte order, matching Bitcoin and
+/// allowing cgminer-family miners (Bitaxe, Antminer, Whatsminer, …) to
+/// produce canonical chain bytes directly.
+///
+/// See src/block.rs::BlockHeader::serialize_for_height for the implementation
+/// and the Fix 2a plan for the migration / activation rationale.
+pub const STANDARD_HEADER_ACTIVATION_HEIGHT: u64 = 30_000;

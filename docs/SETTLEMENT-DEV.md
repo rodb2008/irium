@@ -768,3 +768,235 @@ shared_secret = recipient_secret x ephemeral_pubkey.
 
 The shared secret is identical in both directions (ECDH property), so the same
 AES key is derived and the ciphertext can be decrypted.
+
+
+---
+
+# Dispute and Resolver System (Group B, Stages 3.0–3.4.1)
+
+The dispute system layers on top of the base agreement escrow. Either party can raise a dispute when the off-chain side of an OTC, Milestone, or Contractor agreement breaks down. A nominated resolver — verified as a recent miner — then decides release-or-refund, with a fee paid out of the disputed escrow at spend time.
+
+**Scope:** disputes apply to `otc_settlement`, `milestone_settlement`, and `contractor_milestone` agreements only. `refundable_deposit`, `simple_release_refund`, and `merchant_delayed_settlement` reject resolver fields at validation time.
+
+---
+
+## Resolver fields on the agreement
+
+The agreement creator names up to two resolvers and locks their fees:
+
+```json
+{
+  "primary_resolver":         "Q...",
+  "fallback_resolver":        "Q...",
+  "primary_resolver_fee":     1000000,
+  "fallback_resolver_fee":    500000
+}
+```
+
+- Both addresses must be valid P2PKH (`Q…`).
+- Fees are in satoshis, must be `> 0`, and the combined sum must be `< total_amount`.
+- `fallback_resolver` requires `primary_resolver` to also be set.
+- The address must have appeared in a coinbase output within the last 2 016 blocks at registration time (miner-recency check enforced by `/rpc/registerresolver`).
+- All four fields are optional. An agreement without resolvers can still be raised as a dispute, but no resolver can act on it.
+
+---
+
+## End-to-end flow
+
+```
+   ┌── buyer ──┐                                  ┌── seller ──┐
+   │ off-chain │                                  │ off-chain  │
+   │ payment   │                                  │ delivery   │
+   └─────┬─────┘                                  └─────┬──────┘
+         │                                              │
+         │ (a) raise dispute                            │
+         ▼                                              │
+   ┌─────────────────────────────────────┐              │
+   │   POST /rpc/raisedispute            │              │
+   │   - signs DisputeRaise with party   │              │
+   │     key                             │              │
+   │   - iriumd anchors OP_RETURN tx     │              │
+   │   - HTLC frozen via eligibility hook│              │
+   └─────────────────┬───────────────────┘              │
+                     │ P2P broadcast                    │
+                     ▼                                  │
+   ┌─────────────────────────────────────┐              │
+   │   other party drains inbox, applies │◄─────────────┘
+   │   to local disputes_index           │
+   └─────────────────┬───────────────────┘
+                     │ (b) optional: respond
+                     ▼
+   ┌─────────────────────────────────────┐
+   │   POST /rpc/disputeevidence         │
+   │   - either party submits evidence   │
+   │   - anchored on-chain               │
+   └─────────────────┬───────────────────┘
+                     │ (c) resolve within 288 blocks
+                     ▼
+   ┌─────────────────────────────────────┐
+   │   POST /rpc/resolvedispute          │
+   │   - primary or fallback resolver    │
+   │   - outcome: release | refund       │
+   │   - HTLC unfreezes for the matching │
+   │     branch only                     │
+   └─────────────────┬───────────────────┘
+                     │ (d) winner spends
+                     ▼
+   ┌─────────────────────────────────────┐
+   │   POST /rpc/buildagreementrelease   │
+   │     (or buildagreementrefund)       │
+   │   - tx pays winner (value - fee)    │
+   │   - tx pays resolver (fee)          │
+   └─────────────────────────────────────┘
+```
+
+If the primary resolver does not anchor a resolution within 288 blocks of `raise_anchored_at_height`, the dispute auto-escalates to the fallback resolver. If both resolvers fail, the parties can co-sign a `/rpc/reresolveagreement` nomination of a new pair.
+
+---
+
+## Canonical types
+
+All dispute payloads are signed by their originator with a secp256k1 `AgreementSignatureEnvelope`. The signature is over `Sha256(canonical_bytes_with_signature_field_cleared)`. The signer's pubkey must derive to the same address that appears in `envelope.signer_address`.
+
+| Type | Schema id | Signed by | Required fields |
+|---|---|---|---|
+| `DisputeRaise` | `irium.phase3.dispute_raise.v1` | raising party | `agreement_hash`, `raising_party`, `raised_at_height`, `raised_at_unix`, `reason`, `initial_evidence_hash` |
+| `DisputeEvidence` | `irium.phase3.dispute_evidence.v1` | submitter party | `agreement_hash`, `submitter_party`, `submitted_at_height`, `evidence_type` ∈ {`payment_proof`, `delivery_proof`, `communication_proof`}, `evidence_payload`, `evidence_hash` |
+| `DisputeResolution` | `irium.phase3.dispute_resolution.v1` | resolver | `agreement_hash`, `resolver_address`, `resolver_role` ∈ {`primary`, `fallback`}, `outcome` ∈ {`release`, `refund`}, `resolved_at_height`, `message` |
+| `DisputeReResolverNomination` | `irium.phase3.dispute_reresolve.v1` | BOTH parties | `agreement_hash`, `new_primary_resolver`, `new_fallback_resolver?`, `nominated_at_height`, two signatures |
+| `ResolverRegistration` | `irium.phase3.resolver_registration.v1` | resolver | `resolver_address`, `registered_at_height`, optional `display_name`/`bio`/`fee_bps_self_quoted` |
+
+---
+
+## Anchor roles
+
+Each dispute action emits an OP_RETURN anchor in a small follow-on tx funded by the iriumd wallet. The anchor payload is `agr1:<agreement_hash>:<role_code>`:
+
+| Role | Short code |
+|---|---|
+| `DisputeRaise` | `e` |
+| `DisputeEvidence` | `v` |
+| `DisputeResolve` | `x` |
+| `ResolverRegister` | `y` |
+
+Cap: the OP_RETURN data fits within 75 bytes (5 prefix + 64 hash + 1 colon + 1 code = 71 bytes).
+
+---
+
+## iriumd RPC endpoints
+
+All `POST` endpoints require `IRIUM_RPC_TOKEN` via bearer-auth header. `GET /resolvers/list` is public.
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/rpc/raisedispute` | POST | Validates + verifies sig + anchors + inserts; rejects deposit template or duplicate open dispute |
+| `/rpc/disputeevidence` | POST | Appends evidence record to open dispute; anchors |
+| `/rpc/resolvedispute` | POST | Verifies resolver_address against agreement or reresolve nomination; records resolution; anchors |
+| `/rpc/registerresolver` | POST | Miner-recency check (last 2 016 blocks); inserts/replaces; anchors |
+| `/rpc/reresolveagreement` | POST | Co-signed by both parties; rejects if dispute already resolved; resets escalation |
+| `/rpc/disputestate?agreement_hash=X` | GET | Returns current DisputeState JSON with `found:bool` flag |
+| `/resolvers/list?limit=N&cursor=X` | GET (public) | Paginated list of registered resolvers, sorted by `registered_at_height` desc |
+
+### Eligibility hook
+
+`/rpc/agreementreleaseeligibility` and `/rpc/agreementrefundeligibility` (and their build counterparts) consult `disputes_index` after the chain-side check:
+
+- Open dispute → `eligible: false`, reason `"dispute_open"`.
+- Resolved dispute with outcome `"release"` → release branch passes; refund returns `"dispute_resolution_blocks_branch"`.
+- Resolved dispute with outcome `"refund"` → mirror image.
+
+---
+
+## Wallet CLI
+
+All signing-required commands take `--key <hex|wif>`. The key derives both the signer's address (P2PKH, base58) and the secp256k1 SEC1 public key embedded in the envelope. The wallet also adds the bearer `Authorization` header from `IRIUM_RPC_TOKEN` automatically.
+
+```bash
+# Raise a dispute
+irium-wallet agreement-dispute-raise \
+  --agreement /path/to/agreement.json \
+  --raising-party buyer \
+  --reason "seller refused release after fiat payment" \
+  --evidence-file /path/to/proof.pdf \
+  --key <hex-or-wif>
+
+# Respond with evidence
+irium-wallet agreement-dispute-respond \
+  --agreement /path/to/agreement.json \
+  --submitter-party seller \
+  --evidence-file /path/to/delivery-receipt.pdf \
+  --evidence-type delivery_proof \
+  --message "shipping receipt attached" \
+  --key <hex-or-wif>
+
+# Resolver decides
+irium-wallet agreement-dispute-resolve \
+  --agreement /path/to/agreement.json \
+  --outcome release \
+  --resolver-role primary \
+  --message "buyer-supplied bank wire confirmation matches seller's amount" \
+  --key <resolver-hex-or-wif>
+
+# Inspect current state
+irium-wallet agreement-dispute-show \
+  --agreement /path/to/agreement.json \
+  [--json]
+
+# Co-sign a fresh resolver pair (both parties needed)
+irium-wallet agreement-dispute-reresolve \
+  --agreement /path/to/agreement.json \
+  --new-resolver Q...new-primary... \
+  --new-fallback Q...new-fallback... \
+  --key-a <buyer-hex-or-wif> \
+  --key-b <seller-hex-or-wif>
+
+# Resolver opts in
+irium-wallet resolver-register \
+  --display-name "Pacific Arbitration" \
+  --bio "OTC settlement specialist" \
+  --fee-bps 50 \
+  --key <resolver-hex-or-wif>
+
+# Browse the resolver feed
+irium-wallet resolver-list [--limit N] [--cursor Q...]
+```
+
+---
+
+## P2P propagation
+
+When a dispute action succeeds locally, iriumd best-effort broadcasts the canonical payload to all connected peers:
+
+| Action | MessageType | Payload struct |
+|---|---|---|
+| Raise | `21 DisputeRaisedNotification` | `DisputeRaisedNotificationPayload` |
+| Evidence | `22 DisputeEvidenceNotification` | `DisputeEvidenceNotificationPayload` |
+| Resolve | `23 DisputeResolvedNotification` | `DisputeResolvedNotificationPayload` |
+| Escalate | `24 DisputeEscalatedNotification` | `DisputeEscalatedNotificationPayload` |
+
+Receivers drop the JSON into per-message-type inboxes. A 5 s drain task in iriumd consumes each inbox and applies the change to the local `disputes_index` after re-verifying the signature. The on-chain OP_RETURN anchor remains the durable record; the in-memory + on-disk index is each node's operational cache.
+
+---
+
+## Reputation impact
+
+A resolved dispute affects local reputation tracking (`wallet.rs` outcomes.json):
+
+- Losing party gets `default_count` incremented.
+- Winning party gets `successful_trades_count` incremented.
+
+Currently the wallet records this when the local user observes the resolution; on-chain reputation anchoring is Group H work and not part of Stage 3.
+
+---
+
+## Trust model summary
+
+| Property | Enforcement |
+|---|---|
+| Resolver fee output value | Wallet-side at spend tx build time (chain enforces tx integrity but not split policy) |
+| Resolver identity | secp256k1 signature + agreement's `primary_resolver`/`fallback_resolver` field or co-signed reresolve nomination |
+| Miner-recency for resolvers | iriumd at `/rpc/registerresolver` and `/rpc/reresolveagreement` (last 2 016 blocks of coinbase outputs) |
+| HTLC freeze during open dispute | Wallet-side (eligibility advisory + build refusal). Sophisticated parties can spend the HTLC via raw tools after timeout; the chain does not enforce dispute-aware locking. |
+| Dispute audit trail | OP_RETURN anchor tx for each action with role code `e`/`v`/`x`/`y` |
+
+Future work tagged in commit messages includes on-chain reputation anchoring (Group H), HTLCv2 with a dispute-lock branch, and dispute-evidence storage indexed by chain-anchored evidence-hash.
