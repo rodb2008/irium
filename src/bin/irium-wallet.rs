@@ -2247,6 +2247,10 @@ fn find_key<'a>(wallet: &'a WalletFile, addr: &str) -> Option<&'a WalletKey> {
     wallet.keys.iter().find(|k| k.address == addr)
 }
 
+fn _watch_usage_line() {
+    eprintln!("  irium-wallet watch [--auto-release] [--rpc <url>]   # GROUP C: long-running auto-release daemon; honours IRIUM_AUTO_RELEASE=1");
+}
+
 fn usage() {
     eprintln!("Usage:");
     eprintln!("  irium-wallet init [--seed <64hex>]");
@@ -21247,6 +21251,304 @@ found true"
         assert!(result.unwrap_err().contains("unknown argument"));
     }
 }
+
+// ─── GROUP C: auto-release watcher ─────────────────────────────────────
+// `irium-wallet watch [--auto-release] [--rpc <url>]` — long-running
+// process that subscribes to iriumd's `/ws` event stream and, when
+// IRIUM_AUTO_RELEASE=1 (or --auto-release is passed), reacts to
+// `agreement.satisfied` events by automatically broadcasting the
+// release tx for agreements this wallet funded.
+//
+// Architecture choice (option A in the design plan): the daemon lives
+// in the wallet binary itself rather than wallet-api, because the
+// release path needs key access — wallet-api is intentionally keyless.
+// The Tauri irium-core app will spawn this as a sidecar once the
+// IRIUM_AUTO_RELEASE setting is exposed in the GUI.
+//
+// On every `agreement.satisfied` event:
+//   1. Dedupe via an in-memory HashSet (lost on restart; iriumd will
+//      reject duplicate spends, so worst case is one extra rejected
+//      release attempt per restart).
+//   2. Look up the agreement in the local store. Skip if not found
+//      (peer-created, no local copy).
+//   3. Recover the preimage. Two sources tried in order:
+//        a. `<data_dir>/agreement_secrets/<agreement_id>.hex` — written
+//           by FIX 1 for Hub-created agreements.
+//        b. Deterministic offer-take pattern — preimage is the byte
+//           string `format!("offer-secret-{}-{}", agreement_id,
+//           creation_time)`, hex-encoded; sha256 of those bytes is
+//           what handle_offer_take embedded as `secret_hash`.
+//   4. Pre-check via `/rpc/agreementreleaseeligibility`. If iriumd
+//      reports the agreement is already released or otherwise
+//      ineligible, skip silently (handles both restarts and duplicate
+//      satisfied events).
+//   5. Shell out to `irium-wallet agreement-release <hash> --secret
+//      <hex> --broadcast --rpc <url> --json`. This reuses the existing
+//      release pipeline including its own eligibility re-check and
+//      tx-signing logic without requiring a refactor.
+//   6. On success, scan `<data_dir>/offers/` and set status=settled
+//      for any offer whose agreement_hash matches.
+
+fn handle_watch(args: &[String]) -> Result<(), String> {
+    let mut auto_release = std::env::var("IRIUM_AUTO_RELEASE")
+        .ok()
+        .map(|v| {
+            let t = v.trim().to_ascii_lowercase();
+            t == "1" || t == "true" || t == "yes" || t == "on"
+        })
+        .unwrap_or(false);
+    let mut rpc_url = default_rpc_url();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--auto-release" => {
+                auto_release = true;
+                i += 1;
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            other => return Err(format!("unknown argument to watch: {}", other)),
+        }
+    }
+    let ws_url = rpc_url
+        .trim_end_matches('/')
+        .replacen("https://", "wss://", 1)
+        .replacen("http://", "ws://", 1)
+        + "/ws";
+    eprintln!(
+        "[watch] starting; rpc={} ws={} auto_release={}",
+        rpc_url, ws_url, auto_release
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    rt.block_on(watch_loop(rpc_url, ws_url, auto_release))
+}
+
+async fn watch_loop(
+    rpc_url: String,
+    ws_url: String,
+    auto_release: bool,
+) -> Result<(), String> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let mut released_agreements: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    loop {
+        eprintln!("[watch] connecting to {}", ws_url);
+        let (mut ws, _resp) = match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[watch] ws connect failed: {}; retry in 10s", e);
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+        let subscribe = serde_json::json!({
+            "action": "subscribe",
+            "events": ["agreement.satisfied", "agreement.auto_released"],
+        });
+        if let Err(e) = ws.send(Message::Text(subscribe.to_string())).await {
+            eprintln!("[watch] subscribe send failed: {}; reconnecting", e);
+            continue;
+        }
+        eprintln!("[watch] subscribed; listening for events");
+        while let Some(msg) = ws.next().await {
+            match msg {
+                Ok(Message::Text(t)) => {
+                    let Ok(val) = serde_json::from_str::<serde_json::Value>(&t) else {
+                        continue;
+                    };
+                    let event_type = val
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if event_type == "agreement.satisfied" && auto_release {
+                        let agreement_hash = val
+                            .get("data")
+                            .and_then(|d| d.get("agreement_hash"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if agreement_hash.is_empty() {
+                            continue;
+                        }
+                        if released_agreements.contains(agreement_hash) {
+                            continue;
+                        }
+                        eprintln!(
+                            "[watch] agreement.satisfied {} — attempting auto-release",
+                            agreement_hash
+                        );
+                        match try_auto_release(agreement_hash, &rpc_url).await {
+                            Ok(_) => {
+                                released_agreements.insert(agreement_hash.to_string());
+                                eprintln!("[watch] auto-released {}", agreement_hash);
+                                update_offer_settled_for(agreement_hash);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[watch] auto-release skipped/failed for {}: {}",
+                                    agreement_hash, e
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(Message::Ping(p)) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                Ok(Message::Close(_)) => break,
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("[watch] ws recv error: {}; reconnecting", e);
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+async fn try_auto_release(
+    agreement_hash: &str,
+    rpc_url: &str,
+) -> Result<(), String> {
+    // Look up the agreement locally so we can extract agreement_id and
+    // creation_time for preimage recovery.
+    let agreement = load_local_agreement_by_hash(agreement_hash)?;
+    let inner = agreement.get("agreement").unwrap_or(&agreement);
+    let agreement_id = inner
+        .get("agreement_id")
+        .or_else(|| agreement.get("agreement_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "agreement has no agreement_id".to_string())?
+        .to_string();
+    let creation_time = inner
+        .get("creation_time")
+        .or_else(|| agreement.get("creation_time"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let preimage = recover_preimage(&agreement_id, creation_time)
+        .ok_or_else(|| format!("no preimage recoverable for {}", agreement_id))?;
+    let argv0 = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let rpc_url = rpc_url.to_string();
+    let agreement_hash = agreement_hash.to_string();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&argv0)
+            .arg("agreement-release")
+            .arg(&agreement_hash)
+            .arg("--secret")
+            .arg(&preimage)
+            .arg("--broadcast")
+            .arg("--rpc")
+            .arg(&rpc_url)
+            .arg("--json")
+            .output()
+    })
+    .await
+    .map_err(|e| format!("join: {e}"))?
+    .map_err(|e| format!("spawn agreement-release: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "agreement-release exit {}: {}",
+            out.status,
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Try FIX 1 stored file first; fall back to the deterministic
+/// offer-take preimage pattern. Returns None if neither source has it.
+fn recover_preimage(agreement_id: &str, creation_time: u64) -> Option<String> {
+    let secrets_dir = irium_data_dir().join("agreement_secrets");
+    let path = secrets_dir.join(format!("{}.hex", agreement_id));
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if creation_time > 0 {
+        return Some(hex::encode(
+            format!("offer-secret-{}-{}", agreement_id, creation_time).as_bytes(),
+        ));
+    }
+    None
+}
+
+/// Walks the local agreement store and returns the agreement JSON
+/// whose top-level agreement_hash field matches. Returns Err if the
+/// agreement isn't on this machine — peer-created agreements we have
+/// no local copy of are silently skipped by the caller.
+fn load_local_agreement_by_hash(
+    agreement_hash: &str,
+) -> Result<serde_json::Value, String> {
+    let candidates = [
+        irium_data_dir().join("agreements"),
+        imported_agreements_dir(),
+    ];
+    for d in candidates.iter() {
+        if let Ok(entries) = std::fs::read_dir(d) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
+                    continue;
+                };
+                let top_hash = v
+                    .get("agreement_hash")
+                    .and_then(|h| h.as_str())
+                    .unwrap_or("");
+                if top_hash == agreement_hash {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+    Err(format!(
+        "agreement {} not found in local store",
+        agreement_hash
+    ))
+}
+
+/// Sets status=settled on any local offer whose agreement_hash matches
+/// the freshly-released agreement. Best-effort: read/parse/write
+/// failures are swallowed since the underlying release already
+/// succeeded on-chain and the offer status is purely cosmetic.
+fn update_offer_settled_for(agreement_hash: &str) {
+    let dir = offers_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(mut offer) = serde_json::from_str::<IrmOffer>(&content) else {
+            continue;
+        };
+        if offer.agreement_hash.as_deref() == Some(agreement_hash) {
+            offer.status = "settled".to_string();
+            if let Ok(new_json) = serde_json::to_string_pretty(&offer) {
+                let _ = std::fs::write(&p, new_json);
+            }
+        }
+    }
+}
+
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
@@ -21255,6 +21557,16 @@ fn main() {
     }
 
     match args[0].as_str() {
+        // GROUP C: long-running watcher daemon. Subscribes to iriumd's WS
+        // event stream and auto-releases agreements when their proof
+        // becomes final (or when IRIUM_AUTO_RELEASE=1 is set without the
+        // explicit flag). See handle_watch below for the full design.
+        "watch" => {
+            if let Err(e) = handle_watch(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
         "init" => {
             let path = wallet_path();
             if path.exists() {

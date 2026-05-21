@@ -19,6 +19,11 @@ libc = "0.2"
 k256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 tokio = { version = "1", features = ["full"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# GROUP C: WS client used by `irium-wallet watch` to subscribe to iriumd's
+# /ws event stream for auto-release. rustls flavour matches the rest of
+# the dep tree (reqwest already uses rustls-tls). Pinned to 0.21 to match
+# the tokio 1.x ecosystem of the rest of the workspace.
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 axum = { version = "0.7", features = ["macros", "ws"] }
 
 axum-server = { version = "0.8", features = ["tls-rustls"] }

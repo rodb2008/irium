@@ -17988,6 +17988,26 @@ fn scan_new_blocks_for_dispute_anchors(
                             let _ = save_resolver_record(&snap);
                         }
                     }
+                    // GROUP C: release-role anchors confirming on-chain emit
+                    // `agreement.auto_released` so subscribed clients (the
+                    // Tauri GUI, the wallet watcher) hear that the
+                    // agreement has settled. The same event fires whether
+                    // the release was triggered manually or by `irium-wallet
+                    // watch --auto-release`; the wallet-side dedupe HashSet
+                    // makes repeat events idempotent.
+                    AgreementAnchorRole::OtcSettlement
+                    | AgreementAnchorRole::MerchantSettlement => {
+                        emit_event(
+                            event_tx,
+                            "agreement.auto_released",
+                            serde_json::json!({
+                                "agreement_hash": anchor.agreement_hash,
+                                "anchor_txid": txid_hex,
+                                "anchored_at_height": height,
+                                "role": format!("{:?}", anchor.role),
+                            }),
+                        );
+                    }
                     _ => {}
                 }
             }
