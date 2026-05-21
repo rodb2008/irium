@@ -10465,7 +10465,7 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
         }
     }
 
-    ReputationScore {
+    let mut score = ReputationScore {
         total,
         satisfied,
         failed,
@@ -10480,7 +10480,101 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
         total_proof_response_secs,
         proof_response_count,
         self_trade_count,
+    };
+
+    // GROUP H (Q5): when iriumd is reachable, chain-anchored counts
+    // override the local-file counts. The local file is demoted to an
+    // offline cache only - it remains the fallback path when iriumd is
+    // unreachable, but every reachable lookup ignores it in favour of
+    // chain truth.
+    if let Some(chain) = fetch_chain_reputation(seller_addr) {
+        apply_chain_reputation(&mut score, &chain);
     }
+
+    score
+}
+
+// GROUP H: chain-anchored counts for a single address, mirrored from
+// iriumd's /rpc/reputation/:address response. Lifetime + recent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ChainReputation {
+    pub lifetime_successful_trade: u64,
+    pub lifetime_dispute_win: u64,
+    pub lifetime_dispute_loss: u64,
+    pub lifetime_resolver_non_response: u64,
+    pub recent_successful_trade: u64,
+    pub recent_dispute_win: u64,
+    pub recent_dispute_loss: u64,
+    pub recent_resolver_non_response: u64,
+}
+
+// GROUP H: query iriumd's GET /rpc/reputation/:address. Short timeout
+// (2s) keeps `reputation-show` and listing flows snappy when iriumd is
+// down - we fall back to local file in that case (Q5).
+fn fetch_chain_reputation(address: &str) -> Option<ChainReputation> {
+    if address.trim().is_empty() {
+        return None;
+    }
+    let rpc_url = default_rpc_url();
+    let base = rpc_url.trim_end_matches('/');
+    let url = format!("{}/rpc/reputation/{}", base, address);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(2000))
+        .build()
+        .ok()?;
+    let mut req = client.get(&url);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().ok()?;
+    let lifetime = v.get("lifetime")?;
+    let recent = v.get("recent")?;
+    let g = |obj: &serde_json::Value, key: &str| -> u64 {
+        obj.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+    };
+    Some(ChainReputation {
+        lifetime_successful_trade: g(lifetime, "successful_trade"),
+        lifetime_dispute_win: g(lifetime, "dispute_win"),
+        lifetime_dispute_loss: g(lifetime, "dispute_loss"),
+        lifetime_resolver_non_response: g(lifetime, "resolver_non_response"),
+        recent_successful_trade: g(recent, "successful_trade"),
+        recent_dispute_win: g(recent, "dispute_win"),
+        recent_dispute_loss: g(recent, "dispute_loss"),
+        recent_resolver_non_response: g(recent, "resolver_non_response"),
+    })
+}
+
+// GROUP H: overlay chain counts on top of a locally-computed
+// ReputationScore. Q5 wins: chain replaces local for the fields it
+// covers. Fields the chain has no opinion on (proof_response_secs,
+// self_trade_count) stay as the local value.
+fn apply_chain_reputation(score: &mut ReputationScore, chain: &ChainReputation) {
+    score.satisfied = chain.lifetime_successful_trade as usize;
+    // Defaults are derived from chain's dispute_loss + resolver_non_response
+    // (the latter is a default by the resolver, but tied to the agreement
+    // it failed to resolve - we surface it the same way).
+    score.default_count =
+        (chain.lifetime_dispute_loss + chain.lifetime_resolver_non_response) as usize;
+    score.dispute_count = (chain.lifetime_dispute_win + chain.lifetime_dispute_loss) as usize;
+    let lifetime_total = chain.lifetime_successful_trade
+        + chain.lifetime_dispute_win
+        + chain.lifetime_dispute_loss;
+    if (lifetime_total as usize) > score.total {
+        score.total = lifetime_total as usize;
+    }
+    score.has_outcome_data = lifetime_total > 0;
+    score.recent_satisfied = chain.recent_successful_trade as usize;
+    score.recent_default_count =
+        (chain.recent_dispute_loss + chain.recent_resolver_non_response) as usize;
+    score.recent_total = (chain.recent_successful_trade
+        + chain.recent_dispute_win
+        + chain.recent_dispute_loss) as usize;
+    score.has_recent_data = score.recent_total > 0;
+    // `failed` and `recent_failed` keep the local off-chain count.
 }
 
 fn handle_reputation_show(args: &[String]) -> Result<(), String> {
@@ -22588,6 +22682,122 @@ found true"
     fn group_g_milestone_release_args_must_include_milestone_id_in_validation() {
         let args = vec!["agreement.json".to_string(), "--broadcast".to_string()];
         let _err = group_g_parse_required_milestone_id(&args[1..]).unwrap_err();
+    }
+
+    // ── GROUP H: chain-anchored reputation overlay ───────────────────────
+
+    fn group_h_baseline_score() -> ReputationScore {
+        ReputationScore {
+            total: 0,
+            satisfied: 0,
+            failed: 0,
+            default_count: 0,
+            has_outcome_data: false,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
+        }
+    }
+
+    #[test]
+    fn group_h_apply_chain_reputation_overrides_local_satisfied() {
+        let mut score = group_h_baseline_score();
+        score.satisfied = 99;
+        score.has_outcome_data = true;
+        let chain = ChainReputation {
+            lifetime_successful_trade: 5,
+            ..Default::default()
+        };
+        apply_chain_reputation(&mut score, &chain);
+        assert_eq!(score.satisfied, 5, "chain wins on conflict (Q5)");
+        assert!(score.has_outcome_data);
+    }
+
+    #[test]
+    fn group_h_apply_chain_reputation_dispute_counts_aggregate_loss_plus_non_response() {
+        let mut score = group_h_baseline_score();
+        let chain = ChainReputation {
+            lifetime_dispute_loss: 2,
+            lifetime_resolver_non_response: 3,
+            ..Default::default()
+        };
+        apply_chain_reputation(&mut score, &chain);
+        assert_eq!(
+            score.default_count, 5,
+            "default_count must aggregate dispute_loss + resolver_non_response"
+        );
+    }
+
+    #[test]
+    fn group_h_apply_chain_reputation_dispute_count_is_win_plus_loss() {
+        let mut score = group_h_baseline_score();
+        let chain = ChainReputation {
+            lifetime_dispute_win: 2,
+            lifetime_dispute_loss: 1,
+            ..Default::default()
+        };
+        apply_chain_reputation(&mut score, &chain);
+        assert_eq!(
+            score.dispute_count, 3,
+            "dispute_count must be wins + losses"
+        );
+    }
+
+    #[test]
+    fn group_h_apply_chain_reputation_recent_counts_overlay() {
+        let mut score = group_h_baseline_score();
+        score.recent_satisfied = 10;
+        score.recent_default_count = 4;
+        score.has_recent_data = true;
+        let chain = ChainReputation {
+            recent_successful_trade: 1,
+            recent_dispute_loss: 0,
+            recent_resolver_non_response: 0,
+            ..Default::default()
+        };
+        apply_chain_reputation(&mut score, &chain);
+        assert_eq!(score.recent_satisfied, 1);
+        assert_eq!(score.recent_default_count, 0);
+        assert_eq!(score.recent_total, 1);
+        assert!(score.has_recent_data);
+    }
+
+    #[test]
+    fn group_h_apply_chain_reputation_zero_chain_zeroes_recent_section() {
+        let mut score = group_h_baseline_score();
+        score.recent_satisfied = 99;
+        score.recent_default_count = 99;
+        score.has_recent_data = true;
+        apply_chain_reputation(&mut score, &ChainReputation::default());
+        assert_eq!(
+            score.recent_satisfied, 0,
+            "zero chain count must override nonzero local"
+        );
+        assert_eq!(score.recent_default_count, 0);
+        assert!(!score.has_recent_data);
+    }
+
+    #[test]
+    fn group_h_apply_chain_reputation_grows_total_when_chain_is_larger() {
+        let mut score = group_h_baseline_score();
+        score.total = 2;
+        let chain = ChainReputation {
+            lifetime_successful_trade: 5,
+            lifetime_dispute_win: 1,
+            lifetime_dispute_loss: 1,
+            ..Default::default()
+        };
+        apply_chain_reputation(&mut score, &chain);
+        assert_eq!(
+            score.total, 7,
+            "total must grow to chain lifetime sum when local is smaller"
+        );
     }
 
     #[test]

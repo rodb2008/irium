@@ -2576,6 +2576,173 @@ pub fn parse_agreement_anchor(script_pubkey: &[u8]) -> Option<AgreementAnchor> {
     })
 }
 
+// ============================================================
+// GROUP H: on-chain reputation event anchoring
+// ============================================================
+
+pub const REPUTATION_EVENT_PREFIX: &str = "rep1:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReputationEventKind {
+    /// Recorded in the same tx as an agr1:l or agr1:m release anchor.
+    /// Names a party who completed a trade. Q3: both parties get one
+    /// rep1:s anchor per release tx (two outputs).
+    SuccessfulTrade,
+    /// Recorded in the same tx as an agr1:x dispute-resolve anchor.
+    /// Names the party whose position the resolver upheld.
+    DisputeWin,
+    /// Recorded in the same tx as an agr1:x dispute-resolve anchor.
+    /// Names the party whose position the resolver rejected.
+    DisputeLoss,
+    /// Standalone tx broadcast by any party after the resolver's
+    /// response window has elapsed without a resolution anchor. Names
+    /// the unresponsive resolver. Carries a short 8-byte agreement
+    /// hash prefix so iriumd can locate the dispute being indicted.
+    ResolverNonResponse,
+}
+
+impl ReputationEventKind {
+    pub fn short_code(self) -> &'static str {
+        match self {
+            Self::SuccessfulTrade => "s",
+            Self::DisputeWin => "w",
+            Self::DisputeLoss => "l",
+            Self::ResolverNonResponse => "n",
+        }
+    }
+
+    pub fn from_short_code(v: &str) -> Option<Self> {
+        match v {
+            "s" => Some(Self::SuccessfulTrade),
+            "w" => Some(Self::DisputeWin),
+            "l" => Some(Self::DisputeLoss),
+            "n" => Some(Self::ResolverNonResponse),
+            _ => None,
+        }
+    }
+
+    /// Whether this event kind expects a 16-hex-char agreement short
+    /// hash carried inside the rep1 payload. Only ResolverNonResponse
+    /// does (it has no co-located agr1 anchor in the same tx to
+    /// recover the full hash from).
+    pub fn carries_agreement_short_hash(self) -> bool {
+        matches!(self, Self::ResolverNonResponse)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReputationEvent {
+    pub kind: ReputationEventKind,
+    /// Base58Check address of the party being attested. The on-chain
+    /// payload carries the address as the user-facing base58 string so
+    /// the payload remains human-readable and parseable without
+    /// requiring iriumd to know the version byte.
+    pub address: String,
+    /// First 16 hex chars (8 bytes) of the agreement hash. Set only
+    /// for ResolverNonResponse; None otherwise (recover the full hash
+    /// from the carrying tx's agr1: anchor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agreement_short_hash: Option<String>,
+}
+
+/// Build the bare ASCII payload (no OP_RETURN wrapper). 75-byte cap
+/// matches the agr1 anchor cap so the same downstream OP_RETURN
+/// builders can carry it.
+pub fn build_reputation_event_payload(event: &ReputationEvent) -> Result<Vec<u8>, String> {
+    if event.address.trim().is_empty() {
+        return Err("reputation event address must not be empty".to_string());
+    }
+    if event.address.contains(':') {
+        return Err("reputation event address must not contain ':'".to_string());
+    }
+    let mut payload = format!(
+        "{}{}:{}",
+        REPUTATION_EVENT_PREFIX,
+        event.kind.short_code(),
+        event.address
+    );
+    if event.kind.carries_agreement_short_hash() {
+        let sh = event
+            .agreement_short_hash
+            .as_deref()
+            .ok_or_else(|| "ResolverNonResponse requires agreement_short_hash".to_string())?;
+        if sh.len() != 16 || !sh.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("agreement_short_hash must be 16 hex chars (8 bytes)".to_string());
+        }
+        payload.push(':');
+        payload.push_str(sh);
+    } else if event.agreement_short_hash.is_some() {
+        return Err(
+            "agreement_short_hash is only valid for ResolverNonResponse events".to_string(),
+        );
+    }
+    if payload.len() > 75 {
+        return Err(format!(
+            "reputation event payload too large ({} > 75 bytes)",
+            payload.len()
+        ));
+    }
+    Ok(payload.into_bytes())
+}
+
+pub fn build_reputation_event_output(event: &ReputationEvent) -> Result<TxOutput, String> {
+    let payload = build_reputation_event_payload(event)?;
+    let mut script = Vec::with_capacity(2 + payload.len());
+    script.push(0x6a);
+    script.push(payload.len() as u8);
+    script.extend_from_slice(&payload);
+    Ok(TxOutput {
+        value: 0,
+        script_pubkey: script,
+    })
+}
+
+pub fn parse_reputation_event(script_pubkey: &[u8]) -> Option<ReputationEvent> {
+    if script_pubkey.len() < 2 || script_pubkey[0] != 0x6a {
+        return None;
+    }
+    let len = script_pubkey[1] as usize;
+    if script_pubkey.len() != len + 2 {
+        return None;
+    }
+    let payload = std::str::from_utf8(&script_pubkey[2..]).ok()?;
+    let rest = payload.strip_prefix(REPUTATION_EVENT_PREFIX)?;
+    let mut parts = rest.split(':');
+    let kind = ReputationEventKind::from_short_code(parts.next()?)?;
+    let address = parts.next()?.to_string();
+    if address.is_empty() {
+        return None;
+    }
+    let agreement_short_hash = if kind.carries_agreement_short_hash() {
+        let sh = parts.next()?.to_string();
+        if sh.len() != 16 || !sh.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(sh)
+    } else {
+        None
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(ReputationEvent {
+        kind,
+        address,
+        agreement_short_hash,
+    })
+}
+
+/// Convenience helper: first 16 hex chars of an agreement hash, used as
+/// the on-chain short hash for ResolverNonResponse events. Returns Err
+/// when the input is not a 64-hex-char string.
+pub fn agreement_short_hash_from_full(full_hex: &str) -> Result<String, String> {
+    if full_hex.len() != 64 || !full_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("agreement hash must be 64 hex chars".to_string());
+    }
+    Ok(full_hex[..16].to_string())
+}
+
 pub fn extract_agreement_funding_leg_refs_from_tx(
     tx: &Transaction,
     agreement_hash: &str,
@@ -11771,5 +11938,106 @@ mod stage_3_1_tests {
             err.contains("schema_id"),
             "wrong schema_id must be rejected, got: {err}"
         );
+    }
+
+    // ── GROUP H: on-chain reputation event anchoring ─────────────────────
+
+    #[test]
+    fn group_h_reputation_event_payload_roundtrip_successful_trade() {
+        let event = ReputationEvent {
+            kind: ReputationEventKind::SuccessfulTrade,
+            address: "Qabc123def456".to_string(),
+            agreement_short_hash: None,
+        };
+        let payload = build_reputation_event_payload(&event).unwrap();
+        let s = std::str::from_utf8(&payload).unwrap();
+        assert!(s.starts_with("rep1:s:Q"));
+        let output = build_reputation_event_output(&event).unwrap();
+        let parsed = parse_reputation_event(&output.script_pubkey).expect("parse round-trip");
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn group_h_reputation_event_payload_roundtrip_resolver_non_response_carries_short_hash() {
+        let event = ReputationEvent {
+            kind: ReputationEventKind::ResolverNonResponse,
+            address: "Qresolver1234567".to_string(),
+            agreement_short_hash: Some("ab".repeat(8)),
+        };
+        let output = build_reputation_event_output(&event).unwrap();
+        let parsed = parse_reputation_event(&output.script_pubkey).expect("parse round-trip");
+        assert_eq!(parsed, event);
+        assert_eq!(parsed.agreement_short_hash.as_deref(), Some("abababababababab"));
+    }
+
+    #[test]
+    fn group_h_reputation_event_payload_too_long_rejected() {
+        let event = ReputationEvent {
+            kind: ReputationEventKind::SuccessfulTrade,
+            address: "Q".to_string() + &"x".repeat(80),
+            agreement_short_hash: None,
+        };
+        let err = build_reputation_event_payload(&event).unwrap_err();
+        assert!(
+            err.contains("too large"),
+            "expected too-large error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h_parse_rejects_wrong_prefix() {
+        // OP_RETURN with an agr1 payload must not parse as a reputation event.
+        let agr_payload = b"agr1:l:".to_vec();
+        let mut hash_part = "ab".repeat(32).into_bytes();
+        let mut all = agr_payload;
+        all.append(&mut hash_part);
+        let mut script = vec![0x6a, all.len() as u8];
+        script.extend_from_slice(&all);
+        assert!(parse_reputation_event(&script).is_none());
+    }
+
+    #[test]
+    fn group_h_parse_rejects_unknown_event_short_code() {
+        let payload = b"rep1:z:Qabc".to_vec();
+        let mut script = vec![0x6a, payload.len() as u8];
+        script.extend_from_slice(&payload);
+        assert!(parse_reputation_event(&script).is_none());
+    }
+
+    #[test]
+    fn group_h_resolver_non_response_missing_short_hash_rejected() {
+        let event = ReputationEvent {
+            kind: ReputationEventKind::ResolverNonResponse,
+            address: "Qresolver".to_string(),
+            agreement_short_hash: None,
+        };
+        let err = build_reputation_event_payload(&event).unwrap_err();
+        assert!(
+            err.contains("agreement_short_hash"),
+            "expected required-short-hash error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h_successful_trade_with_short_hash_rejected() {
+        let event = ReputationEvent {
+            kind: ReputationEventKind::SuccessfulTrade,
+            address: "Qabc".to_string(),
+            agreement_short_hash: Some("ab".repeat(8)),
+        };
+        let err = build_reputation_event_payload(&event).unwrap_err();
+        assert!(
+            err.contains("only valid for ResolverNonResponse"),
+            "expected only-valid-for-non-response error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h_agreement_short_hash_from_full_takes_first_16_chars() {
+        let full = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let short = agreement_short_hash_from_full(full).unwrap();
+        assert_eq!(short, "aabbccddeeff0011");
+        assert_eq!(short.len(), 16);
+        assert!(agreement_short_hash_from_full("not-hex").is_err());
     }
 }

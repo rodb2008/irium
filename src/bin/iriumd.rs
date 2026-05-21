@@ -56,15 +56,16 @@ use irium_node_rs::settlement::{
     build_agreement_audit_record, build_funding_legs, compute_agreement_hash_hex,
     contractor_milestone_template, derive_lifecycle, discover_agreement_funding_leg_candidates,
     evaluate_policy, extract_agreement_funding_leg_refs_from_tx, parse_agreement_anchor,
-    policy_template_to_json, preorder_deposit_template, verify_agreement_bundle,
-    AgreementActivityEvent, AgreementAnchor, AgreementAnchorRole, AgreementAuditFundingLegRecord,
-    AgreementAuditRecord, AgreementBundle, AgreementFundingLegRef, AgreementLifecycleView,
-    AgreementLinkedTx, AgreementMilestoneStatus, AgreementObject, AgreementSignatureEnvelope,
-    AgreementSummary, AgreementTemplateType, DisputeEvidence, DisputeRaise, DisputeResolution,
+    parse_reputation_event, policy_template_to_json, preorder_deposit_template,
+    verify_agreement_bundle, AgreementActivityEvent, AgreementAnchor, AgreementAnchorRole,
+    AgreementAuditFundingLegRecord, AgreementAuditRecord, AgreementBundle,
+    AgreementFundingLegRef, AgreementLifecycleView, AgreementLinkedTx,
+    AgreementMilestoneStatus, AgreementObject, AgreementSignatureEnvelope, AgreementSummary,
+    AgreementTemplateType, DisputeEvidence, DisputeRaise, DisputeResolution,
     EscrowReceiptDisputeRef, EscrowReceiptProofRef, HoldbackEvaluationResult,
     MilestoneEvaluationResult, MilestoneSpec, PolicyOutcome, PolicyStore, ProofPolicy, ProofStore,
-    RequirementThresholdResult, ResolverRegistration, SettlementProof, TemplateAttestor,
-    TxidWithHeight, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+    ReputationEvent, ReputationEventKind, RequirementThresholdResult, ResolverRegistration,
+    SettlementProof, TemplateAttestor, TxidWithHeight, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
     DisputeReResolverNomination,
     dispute_evidence_canonical_bytes, dispute_raise_canonical_bytes,
     dispute_reresolve_canonical_bytes, dispute_resolution_canonical_bytes,
@@ -4794,6 +4795,179 @@ async fn agreement_receipt(
         linked_txs,
         proofs,
         dispute,
+    }))
+}
+
+// GROUP H: on-chain reputation event lookup.
+// GET /rpc/reputation/:address returns the chain-anchored reputation
+// events naming this address, with lifetime + recent counts. The chain
+// is authoritative; the wallet's local outcomes file is consulted only
+// when this endpoint is unreachable.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ReputationEventRecord {
+    event_kind: String,
+    txid: String,
+    height: u64,
+    /// Full agreement_hash recovered from the carrying tx's agr1
+    /// anchor (or from the rep1 event's short hash + chain lookup for
+    /// ResolverNonResponse). Empty when unresolvable.
+    agreement_hash: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct ReputationEventCounts {
+    successful_trade: u64,
+    dispute_win: u64,
+    dispute_loss: u64,
+    resolver_non_response: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ReputationLookupResponse {
+    address: String,
+    tip_height: u64,
+    /// Lifetime counts (since block 0).
+    lifetime: ReputationEventCounts,
+    /// Counts restricted to the last `recent_window` blocks.
+    recent: ReputationEventCounts,
+    recent_window: u64,
+    events: Vec<ReputationEventRecord>,
+}
+
+/// Default recent window matches the wallet's existing
+/// ReputationScore "recent" semantics. 4320 blocks ≈ 3 days at the
+/// current ~60-second mean block time.
+const REPUTATION_RECENT_WINDOW_BLOCKS: u64 = 4320;
+
+/// Walks every confirmed tx on the chain looking for OP_RETURN outputs
+/// carrying a rep1: anchor whose address field matches `target`. For
+/// each match, recovers the agreement_hash either from a co-located
+/// agr1: anchor in the same tx (Q2/Q3 path) or from the rep1 payload's
+/// short hash for ResolverNonResponse (Q1 path).
+fn scan_reputation_events_for_address(
+    chain: &ChainState,
+    target: &str,
+) -> Vec<ReputationEventRecord> {
+    let mut out = Vec::new();
+    for (height, block) in chain.chain.iter().enumerate() {
+        for tx in &block.transactions {
+            // Two-pass: find the rep1 outputs that name `target`, then
+            // look for an agr1 output in the same tx for the full
+            // agreement_hash. ResolverNonResponse uses the short hash
+            // in its own payload and scans the chain for the matching
+            // agreement.
+            let mut rep_events: Vec<ReputationEvent> = Vec::new();
+            let mut agr_hash: Option<String> = None;
+            for output in &tx.outputs {
+                if let Some(ev) = parse_reputation_event(&output.script_pubkey) {
+                    if ev.address == target {
+                        rep_events.push(ev);
+                    }
+                } else if let Some(anchor) = parse_agreement_anchor(&output.script_pubkey) {
+                    agr_hash = Some(anchor.agreement_hash.clone());
+                }
+            }
+            if rep_events.is_empty() {
+                continue;
+            }
+            let txid = hex::encode(tx.txid());
+            for ev in rep_events {
+                let resolved_hash = if let Some(ref h) = agr_hash {
+                    h.clone()
+                } else if let Some(short) = ev.agreement_short_hash.as_deref() {
+                    // Match short_hash prefix against agr1 anchors elsewhere on chain.
+                    resolve_agreement_hash_from_short(chain, short).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                out.push(ReputationEventRecord {
+                    event_kind: match ev.kind {
+                        ReputationEventKind::SuccessfulTrade => "successful_trade".to_string(),
+                        ReputationEventKind::DisputeWin => "dispute_win".to_string(),
+                        ReputationEventKind::DisputeLoss => "dispute_loss".to_string(),
+                        ReputationEventKind::ResolverNonResponse => {
+                            "resolver_non_response".to_string()
+                        }
+                    },
+                    txid: txid.clone(),
+                    height: height as u64,
+                    agreement_hash: resolved_hash,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| b.height.cmp(&a.height).then_with(|| a.txid.cmp(&b.txid)));
+    out
+}
+
+/// Match a 16-hex-char agreement_short_hash prefix against any agr1:
+/// anchor on the chain. Returns the first full match. Used only for
+/// ResolverNonResponse events which do not have a co-located agr1
+/// anchor in the same tx.
+fn resolve_agreement_hash_from_short(chain: &ChainState, short: &str) -> Option<String> {
+    for block in &chain.chain {
+        for tx in &block.transactions {
+            for output in &tx.outputs {
+                if let Some(anchor) = parse_agreement_anchor(&output.script_pubkey) {
+                    if anchor.agreement_hash.starts_with(short) {
+                        return Some(anchor.agreement_hash);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn count_reputation_events(
+    events: &[ReputationEventRecord],
+    height_floor: Option<u64>,
+) -> ReputationEventCounts {
+    let mut c = ReputationEventCounts::default();
+    for e in events {
+        if let Some(floor) = height_floor {
+            if e.height < floor {
+                continue;
+            }
+        }
+        match e.event_kind.as_str() {
+            "successful_trade" => c.successful_trade += 1,
+            "dispute_win" => c.dispute_win += 1,
+            "dispute_loss" => c.dispute_loss += 1,
+            "resolver_non_response" => c.resolver_non_response += 1,
+            _ => {}
+        }
+    }
+    c
+}
+
+async fn reputation_lookup(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(address): AxumPath<String>,
+) -> Result<Json<ReputationLookupResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    if address.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (tip_height, events) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip = chain.tip_height();
+        let evs = scan_reputation_events_for_address(&chain, address.trim());
+        (tip, evs)
+    };
+    let lifetime = count_reputation_events(&events, None);
+    let recent_floor = tip_height.saturating_sub(REPUTATION_RECENT_WINDOW_BLOCKS);
+    let recent = count_reputation_events(&events, Some(recent_floor));
+    Ok(Json(ReputationLookupResponse {
+        address,
+        tip_height,
+        lifetime,
+        recent,
+        recent_window: REPUTATION_RECENT_WINDOW_BLOCKS,
+        events,
     }))
 }
 
@@ -9772,6 +9946,7 @@ async fn explorer_stats(
         .route("/rpc/agreementstatus", post(agreement_status))
         .route("/rpc/agreementmilestones", post(agreement_milestones))
         .route("/rpc/agreementreceipt", get(agreement_receipt))
+        .route("/rpc/reputation/:address", get(reputation_lookup))
         .route("/rpc/verifyagreementlink", post(verify_agreement_link))
         .route(
             "/rpc/agreementreleaseeligibility",
