@@ -12200,6 +12200,94 @@ fn handle_agreement_milestone_release(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// GROUP H follow-up: wallet command that triggers iriumd's
+// /rpc/broadcastreputationnonresponse. The wallet just validates args
+// and forwards; iriumd does the dispute lookup, response-window check,
+// and tx broadcast.
+fn handle_agreement_flag_non_response(args: &[String]) -> Result<(), String> {
+    let mut resolver_address: Option<String> = None;
+    let mut agreement_hash: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--resolver" | "--resolver-address" => {
+                resolver_address =
+                    Some(parse_required_string_flag(args, &mut i, "--resolver-address")?);
+            }
+            "--agreement-hash" => {
+                agreement_hash =
+                    Some(parse_required_string_flag(args, &mut i, "--agreement-hash")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let resolver_address = resolver_address.ok_or_else(|| {
+        "--resolver-address is required (the resolver who missed the response window)"
+            .to_string()
+    })?;
+    let agreement_hash = agreement_hash.ok_or_else(|| {
+        "--agreement-hash is required (64 hex chars of the disputed agreement)".to_string()
+    })?;
+    if agreement_hash.len() != 64 || !agreement_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "--agreement-hash must be 64 hex chars, got: {}",
+            agreement_hash
+        ));
+    }
+    if resolver_address.trim().is_empty() {
+        return Err("--resolver-address must not be empty".to_string());
+    }
+    #[derive(Serialize)]
+    struct Req {
+        resolver_address: String,
+        agreement_hash: String,
+    }
+    #[derive(Deserialize)]
+    struct Resp {
+        anchor_txid: String,
+        resolver_address: String,
+        agreement_hash: String,
+    }
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let resp: Resp = rpc_post_json(
+        &client,
+        base,
+        "/rpc/broadcastreputationnonresponse",
+        &Req {
+            resolver_address: resolver_address.clone(),
+            agreement_hash: agreement_hash.clone(),
+        },
+    )?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "anchor_txid":      resp.anchor_txid,
+                "resolver_address": resp.resolver_address,
+                "agreement_hash":   resp.agreement_hash,
+            }))
+            .unwrap()
+        );
+        return Ok(());
+    }
+    println!("=== Resolver Non-Response Flagged ===");
+    println!();
+    println!("anchor_txid       {}", resp.anchor_txid);
+    println!("resolver_address  {}", resp.resolver_address);
+    println!("agreement_hash    {}", resp.agreement_hash);
+    Ok(())
+}
+
 fn handle_agreement_pack(args: &[String]) -> Result<(), String> {
     let mut agreement_ref: Option<String> = None;
     let mut out_path: Option<String> = None;
@@ -22800,6 +22888,92 @@ found true"
         );
     }
 
+    // ── GROUP H follow-up: agreement-flag-non-response ───────────────────
+
+    #[test]
+    fn group_h2_flag_non_response_requires_resolver_address() {
+        let args = vec![
+            "--agreement-hash".to_string(),
+            "ab".repeat(32),
+        ];
+        let err = handle_agreement_flag_non_response(&args).unwrap_err();
+        assert!(
+            err.contains("--resolver-address is required"),
+            "expected missing-resolver error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h2_flag_non_response_requires_agreement_hash() {
+        let args = vec![
+            "--resolver-address".to_string(),
+            "Qresolver".to_string(),
+        ];
+        let err = handle_agreement_flag_non_response(&args).unwrap_err();
+        assert!(
+            err.contains("--agreement-hash is required"),
+            "expected missing-hash error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h2_flag_non_response_rejects_short_agreement_hash() {
+        let args = vec![
+            "--resolver-address".to_string(),
+            "Qresolver".to_string(),
+            "--agreement-hash".to_string(),
+            "abcdef".to_string(),
+        ];
+        let err = handle_agreement_flag_non_response(&args).unwrap_err();
+        assert!(
+            err.contains("64 hex chars"),
+            "expected hash-length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h2_flag_non_response_rejects_non_hex_agreement_hash() {
+        let args = vec![
+            "--resolver-address".to_string(),
+            "Qresolver".to_string(),
+            "--agreement-hash".to_string(),
+            "z".repeat(64),
+        ];
+        let err = handle_agreement_flag_non_response(&args).unwrap_err();
+        assert!(
+            err.contains("64 hex chars"),
+            "expected hex-validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h2_flag_non_response_rejects_empty_resolver_address() {
+        let args = vec![
+            "--resolver-address".to_string(),
+            "   ".to_string(),
+            "--agreement-hash".to_string(),
+            "ab".repeat(32),
+        ];
+        let err = handle_agreement_flag_non_response(&args).unwrap_err();
+        assert!(
+            err.contains("must not be empty"),
+            "expected empty-resolver error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h2_flag_non_response_unknown_flag_rejected() {
+        let args = vec![
+            "--bogus".to_string(),
+            "x".to_string(),
+        ];
+        let err = handle_agreement_flag_non_response(&args).unwrap_err();
+        assert!(
+            err.contains("unknown argument"),
+            "expected unknown-arg error, got: {err}"
+        );
+    }
+
     #[test]
     fn group_f_receipt_canonical_bytes_clear_signature_fields() {
         // The signing input must not include signature/payload_hash, so
@@ -28775,6 +28949,12 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "agreement-milestone-release" => {
             if let Err(e) = handle_agreement_milestone_release(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-flag-non-response" => {
+            if let Err(e) = handle_agreement_flag_non_response(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
