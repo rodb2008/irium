@@ -163,3 +163,134 @@ If the public hostname connects but your miner still reports subscribe/authorize
 | `irium-miner` | Native | Recommended | Use latest `main` build | Baseline for protocol correctness and debugging. |
 
 Use `/metrics` reject reasons (`rejected_stale`, `rejected_low_difficulty`, `rejected_invalid`, `rejected_duplicate`) for triage.
+
+
+---
+
+## Supported miners (v1.9.24+)
+
+As of v1.9.24 the Stratum server handles `mining.configure` (version-rolling negotiation), `mining.suggest_difficulty`, and `mining.multi_version` so the following firmware connects without protocol-error disconnects.
+
+### ASIC miners (port 3333)
+
+| Miner | Chip(s) | Firmware | Status |
+|---|---|---|---|
+| **Bitaxe** | BM1366 / BM1368 | ESP-Miner / AxeOS v1.x and v2.x | Supported. v2+ requires `mining.configure` (shipped). |
+| **Antminer** | S19 series, S21 series | bmminer (with or without version-rolling) | Supported. AsicBoost auto-disabled by pool. |
+| **Whatsminer** | M30 series, M50 series | BTMiner | Supported. `mining.multi_version` is acknowledged so older builds do not disconnect. |
+| **Avalon** | A12 series, A13 series | CanaanMiner / AvalonMiner | Supported. Standard Stratum v1. |
+
+### CPU / GPU miners (port 3335)
+
+| Miner | Class | Notes |
+|---|---|---|
+| **cgminer** (incl. `bmminer`/`bfgminer`) | CPU/ASIC | Reference Stratum v1 implementation. Works on either port. |
+| **cpuminer-opt 26.1** | CPU | Use `-a sha256d`. |
+| **ccminer 2.3.x** | GPU (CUDA) | Use `-a sha256d`. |
+| **lolMiner** | GPU (OpenCL/CUDA) | SHA-256d profile. |
+| **T-Rex** | GPU (CUDA) | SHA-256d profile. |
+| **NBMiner** | GPU | SHA-256d profile. |
+| **irium-miner** | Native | Baseline. |
+
+XMRig is not applicable (RandomX algorithm, not SHA-256d).
+
+---
+
+## Pool connection guide
+
+| | |
+|---|---|
+| **Pool address** | `pool.iriumlabs.org` |
+| **ASIC port** | `3333/tcp` (strict canonical profile, default difficulty 16) |
+| **CPU/GPU port** | `3335/tcp` (legacy compat profile, default difficulty 1) |
+| **Stats endpoint** | `http://pool.iriumlabs.org:3337/` |
+| **Algorithm** | SHA-256d (double SHA-256) |
+| **Protocol** | Stratum v1 only. Stratum v2 not supported; miners fall back to v1 cleanly. |
+| **Version rolling (AsicBoost)** | Not supported. Firmware that calls `mining.configure` is told `"version-rolling": false` and auto-disables AsicBoost. |
+| **Username format** | `your_irium_address.worker_name` (worker suffix optional, for rig identification) |
+| **Password** | Any non-empty string (commonly `x`) |
+| **Vardiff** | Enabled. Starts at difficulty 16 (ASIC) or 1 (CPU/GPU). Retargets every 30 s to a 15 s share interval. Range: 1 to 2048 (ASIC) / 1024 (CPU/GPU). |
+| **TLS** | Disabled. Connect with plain `stratum+tcp://`, not `stratum+ssl://`. |
+
+### Example username (mainnet IRM address)
+
+```
+Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa.rig01
+```
+
+### Note for Chinese-region miners
+
+If port 3333 is blocked by your ISP, try a VPN to reach the pool, or contact the operators for alternative connection options. The Stratum protocol is plain TCP and does not negotiate any encryption above the transport.
+
+---
+
+## Miner-specific quickstart
+
+### Bitaxe (AxeOS / ESP-Miner)
+
+In the AxeOS web UI:
+
+| Field | Value |
+|---|---|
+| Stratum URL | `pool.iriumlabs.org` |
+| Stratum Port | `3333` |
+| Worker (Stratum User) | `Q...your_irium_address.bitaxe01` |
+| Password | `x` |
+
+Save and reboot. AxeOS will negotiate `mining.configure`, receive `version-rolling: false`, disable AsicBoost, and begin submitting shares at diff 16 (vardiff will retune).
+
+### Antminer (bmminer-family)
+
+In the miner web UI Pool 1 settings:
+
+| Field | Value |
+|---|---|
+| URL | `stratum+tcp://pool.iriumlabs.org:3333` |
+| Worker | `Q...your_irium_address.antminer01` |
+| Password | `x` |
+
+If your firmware insists on version-rolling, that's fine — the pool tells it `false` and bmminer disables it.
+
+### Whatsminer (BTMiner)
+
+In the BTMiner web UI:
+
+| Field | Value |
+|---|---|
+| Pool 1 URL | `stratum+tcp://pool.iriumlabs.org:3333` |
+| Pool 1 Worker | `Q...your_irium_address.whatsminer01` |
+| Pool 1 Password | `x` |
+
+`mining.multi_version` is acknowledged with `false`; the miner falls back to single-version templates.
+
+### cpuminer-opt (CPU)
+
+```bash
+cpuminer -a sha256d \
+  -o stratum+tcp://pool.iriumlabs.org:3335 \
+  -u Q...your_irium_address.cpurig \
+  -p x \
+  -t 4
+```
+
+### ccminer / lolMiner / T-Rex / NBMiner (GPU SHA-256d)
+
+```bash
+ccminer -a sha256d \
+  -o stratum+tcp://pool.iriumlabs.org:3335 \
+  -u Q...your_irium_address.gpurig \
+  -p x
+```
+
+Same address + port for the other GPU clients; consult each miner's manual for the `--algorithm` flag and check `-a sha256d` is the SHA-256 double-hash variant (not single).
+
+---
+
+## v1.9.24 release notes (changes from v1.9.23)
+
+- `mining.configure` handler added. Bitaxe ESP-Miner v2+ and any firmware that negotiates version-rolling now receives an explicit `{"version-rolling": false, "version-rolling.mask": "00000000"}` response instead of an `"unsupported method"` error that earlier caused some firmware to drop the connection.
+- `mining.suggest_difficulty` is now acknowledged with `result: true`. cgminer and Antminer firmware that sends this hint no longer logs an unsupported-method error.
+- `mining.multi_version` is now acknowledged with `result: false`. Older Whatsminer BTMiner builds fall back to single-version mode cleanly.
+- `mining.subscribe` response field [2] is now the literal `4` (the correct `extranonce2_size` per Stratum v1) instead of the configurable `extranonce1_size`. Both happened to be 4 by default; tuning `STRATUM_EXTRANONCE1_SIZE` would previously have broken share submission.
+
+No consensus, settlement, P2P, or wallet protocol change.
