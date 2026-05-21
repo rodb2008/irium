@@ -173,7 +173,7 @@ impl ChainState {
         state
             .connect_genesis(genesis.clone())
             .expect("valid genesis block");
-        let genesis_hash = genesis.header.hash();
+        let genesis_hash = genesis.header.hash_for_height(0);
         let work = ChainState::block_work(&genesis);
         state.block_store.insert(genesis_hash, genesis);
         state.heights.insert(genesis_hash, 0);
@@ -282,7 +282,7 @@ impl ChainState {
             if let Some(h) = self.heights.get(hash) {
                 if *h <= min_height {
                     if let Some(block) = self.chain.get(*h as usize) {
-                        if block.header.hash() == *hash {
+                        if block.header.hash_for_height(*h) == *hash {
                             remove.push(*hash);
                         }
                     }
@@ -515,7 +515,7 @@ impl ChainState {
 
         let work = ChainState::block_work(&block);
         self.total_work += work;
-        let hash = block.header.hash();
+        let hash = block.header.hash_for_height(expected_height);
         self.chain.push(block.clone());
         self.height += 1;
         self.issued = new_supply;
@@ -535,7 +535,7 @@ impl ChainState {
         if self
             .chain
             .get(h as usize)
-            .map(|b| b.header.hash() == *hash)
+            .map(|b| b.header.hash_for_height(h) == *hash)
             .unwrap_or(false)
         {
             Some(h)
@@ -553,7 +553,8 @@ impl ChainState {
         if self.chain.len() <= 1 {
             return Err("cannot disconnect genesis".to_string());
         }
-        let tip_hash = tip_block.header.hash();
+        let tip_height = self.height.saturating_sub(1);
+        let tip_hash = tip_block.header.hash_for_height(tip_height);
         let undo = self
             .undo_logs
             .remove(&tip_hash)
@@ -576,10 +577,11 @@ impl ChainState {
 
         self.chain.pop();
         self.height = self.chain.len() as u64;
+        let new_tip_height = self.height.saturating_sub(1);
         self.best_tip = self
             .chain
             .last()
-            .map(|b| b.header.hash())
+            .map(|b| b.header.hash_for_height(new_tip_height))
             .unwrap_or([0u8; 32]);
         Ok(tip_block)
     }
@@ -643,14 +645,9 @@ impl ChainState {
     /// Add a header to the header tree if it extends a known header and compute cumulative work.
 
     pub fn add_header(&mut self, header: BlockHeader) -> Result<u64, String> {
-        let hash = header.hash();
-        if self.headers.contains_key(&hash) || self.heights.contains_key(&hash) {
-            if let Some(h) = self.heights.get(&hash) {
-                return Ok(*h);
-            }
-            return Ok(self.headers.get(&hash).map(|hw| hw.height).unwrap_or(0));
-        }
-
+        // Look up the parent first so we know `height` before computing the
+        // height-aware hash. Pre-Fix-2a the hash was computed before height,
+        // but the post-30000 byte-order convention depends on height.
         let prev_hash = header.prev_hash;
         let (parent_height, parent_work) = if let Some(h) = self.headers.get(&prev_hash) {
             (h.height, h.work.clone())
@@ -667,6 +664,13 @@ impl ChainState {
 
         // Basic PoW check.
         let height = parent_height + 1;
+        let hash = header.hash_for_height(height);
+        if self.headers.contains_key(&hash) || self.heights.contains_key(&hash) {
+            if let Some(h) = self.heights.get(&hash) {
+                return Ok(*h);
+            }
+            return Ok(self.headers.get(&hash).map(|hw| hw.height).unwrap_or(0));
+        }
         let auxpow_active = self.params.auxpow_activation_height
             .map(|ah| height >= ah)
             .unwrap_or(false);
@@ -692,13 +696,14 @@ impl ChainState {
 
     /// Best header hash by total work (main chain tip or best header).
     pub fn best_header_hash(&self) -> [u8; 32] {
+        let tip_height = self.height.saturating_sub(1);
         let mut best = (
             self.total_work.clone(),
-            self.chain.last().map(|b| b.header.hash()),
+            self.chain.last().map(|b| b.header.hash_for_height(tip_height)),
         );
         for hw in self.headers.values() {
             if hw.work > best.0 {
-                best = (hw.work.clone(), Some(hw.header.hash()));
+                best = (hw.work.clone(), Some(hw.header.hash_for_height(hw.height)));
             }
         }
         best.1.unwrap_or([0u8; 32])
@@ -719,9 +724,10 @@ impl ChainState {
 
     /// Check if a header connects to current tip.
     pub fn connects_to_tip(&self, header: &BlockHeader) -> bool {
+        let tip_height = self.height.saturating_sub(1);
         self.chain
             .last()
-            .map(|b| b.header.hash() == header.prev_hash)
+            .map(|b| b.header.hash_for_height(tip_height) == header.prev_hash)
             .unwrap_or(false)
     }
 
@@ -730,17 +736,20 @@ impl ChainState {
     pub fn try_reorg(&mut self, new_blocks: &[Block]) -> Result<bool, String> {
         if let Some(_best_header) = self.best_header_if_better() {
             // Simple sanity: the provided blocks must connect from current tip.
+            let tip_height = self.height.saturating_sub(1);
             let mut current_hash = self
                 .chain
                 .last()
-                .map(|b| b.header.hash())
+                .map(|b| b.header.hash_for_height(tip_height))
                 .unwrap_or([0u8; 32]);
             for block in new_blocks {
                 if block.header.prev_hash != current_hash {
                     return Err("Reorg block does not connect".to_string());
                 }
                 self.connect_block(block.clone())?;
-                current_hash = block.header.hash();
+                // After connect_block self.height has incremented; the block
+                // just connected sits at self.height - 1.
+                current_hash = block.header.hash_for_height(self.height.saturating_sub(1));
             }
             // Clear headers since we have advanced main chain.
             self.headers.clear();
@@ -759,7 +768,7 @@ impl ChainState {
             self.validate_and_apply_transactions(&block, 0, 0, false, Some(MAX_MONEY))?;
 
         self.total_work = ChainState::block_work(&block);
-        let h = block.header.hash();
+        let h = block.header.hash_for_height(0);
         self.chain.push(block);
         self.height = 1;
         self.issued = subsidy_created;
@@ -774,7 +783,7 @@ impl ChainState {
         previous: Option<&Block>,
     ) -> Result<(), String> {
         if let Some(prev) = previous {
-            if block.header.prev_hash != prev.header.hash() {
+            if block.header.prev_hash != prev.header.hash_for_height(height.saturating_sub(1)) {
                 return Err("Block does not extend the current tip".to_string());
             }
         } else if block.header.prev_hash != [0u8; 32] {
@@ -801,7 +810,7 @@ impl ChainState {
         }
 
         // POW / bits
-        let header_hash = block.header.hash();
+        let header_hash = block.header.hash_for_height(height);
         let target = self.target_for_height(height);
         if block.header.target().bits != target.bits {
             return Err("Block bits mismatch".to_string());
@@ -810,7 +819,7 @@ impl ChainState {
             .map(|ah| height >= ah)
             .unwrap_or(false);
         if block.header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 && auxpow_active {
-            let header_bytes = block.header.serialize();
+            let header_bytes = block.header.serialize_for_height(height);
             let ap = block.auxpow.as_ref()
                 .ok_or_else(|| "AuxPoW block is missing AuxPoW data".to_string())?;
             crate::auxpow::validate(ap, &header_bytes, target)?;
@@ -953,9 +962,10 @@ impl ChainState {
 
     /// Hash of the current main chain tip.
     pub fn tip_hash(&self) -> [u8; 32] {
+        let tip_height = self.height.saturating_sub(1);
         self.chain
             .last()
-            .map(|b| b.header.hash())
+            .map(|b| b.header.hash_for_height(tip_height))
             .unwrap_or([0u8; 32])
     }
 
@@ -1021,20 +1031,21 @@ impl ChainState {
         let genesis = &branch[0];
         new_state.connect_genesis(genesis.clone())?;
         let mut cumulative = ChainState::block_work(genesis);
+        let genesis_hash = genesis.header.hash_for_height(0);
         new_state
             .block_store
-            .insert(genesis.header.hash(), genesis.clone());
-        new_state.heights.insert(genesis.header.hash(), 0);
+            .insert(genesis_hash, genesis.clone());
+        new_state.heights.insert(genesis_hash, 0);
         new_state
             .cumulative_work
-            .insert(genesis.header.hash(), cumulative.clone());
+            .insert(genesis_hash, cumulative.clone());
 
         for (idx, block) in branch.iter().enumerate().skip(1) {
             if let Err(e) = new_state.connect_block(block.clone()) {
                 return Err(format!("failed applying block {}: {}", idx, e));
             }
             cumulative += ChainState::block_work(block);
-            let h = block.header.hash();
+            let h = block.header.hash_for_height(idx as u64);
             new_state.block_store.insert(h, block.clone());
             new_state.heights.insert(h, idx as u64);
             new_state.cumulative_work.insert(h, cumulative.clone());
@@ -1045,11 +1056,9 @@ impl ChainState {
 
     /// Store a block and update best chain incrementally.
     pub fn process_block(&mut self, block: Block) -> Result<(u64, [u8; 32]), String> {
-        let hash = block.header.hash();
-        if self.heights.contains_key(&hash) {
-            return Err("duplicate block".to_string());
-        }
-
+        // Resolve parent + height before hashing: the post-30000 hash byte
+        // order depends on the block's height, so we cannot compute the hash
+        // (and use it as a map key) until we know which height to bind to.
         let parent_hash = block.header.prev_hash;
         if parent_hash != [0u8; 32] && !self.heights.contains_key(&parent_hash) {
             self.orphan_pool.entry(parent_hash).or_default().push(block);
@@ -1062,11 +1071,17 @@ impl ChainState {
         } else {
             self.heights.get(&parent_hash).copied().unwrap_or(0) + 1
         };
+
+        let hash = block.header.hash_for_height(block_height);
+        if self.heights.contains_key(&hash) {
+            return Err("duplicate block".to_string());
+        }
+
         let auxpow_active = self.params.auxpow_activation_height
             .map(|ah| block_height >= ah)
             .unwrap_or(false);
         if block.header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 && auxpow_active {
-            let header_bytes = block.header.serialize();
+            let header_bytes = block.header.serialize_for_height(block_height);
             let ap = block.auxpow.as_ref()
                 .ok_or_else(|| "AuxPoW block is missing AuxPoW data".to_string())?;
             crate::auxpow::validate(ap, &header_bytes, block.header.target())?;
@@ -1733,7 +1748,13 @@ mod tests {
     }
 
     fn push_synthetic_block(chain: &mut ChainState, time: u32, bits: u32) {
-        let prev_hash = chain.chain.last().expect("prev block").header.hash();
+        let prev_height = chain.chain.len().saturating_sub(1) as u64;
+        let prev_hash = chain
+            .chain
+            .last()
+            .expect("prev block")
+            .header
+            .hash_for_height(prev_height);
         chain.chain.push(Block {
             header: BlockHeader {
                 version: 1,
