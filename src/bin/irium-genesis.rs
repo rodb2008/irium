@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut nonce: u32 = 0;
     loop {
         block.header.nonce = nonce;
-        let hash = block.header.hash();
+        let hash = block.header.hash_for_height(0);
         if meets_target(&hash, target) {
             let hash_hex = hex::encode(hash);
             let merkle_hex = hex::encode(merkle);

@@ -2262,7 +2262,7 @@ fn parse_persisted_block_file(
     };
 
     if height == 0 {
-        let h = hex::encode(block.header.hash()).to_lowercase();
+        let h = hex::encode(block.header.hash_for_height(0)).to_lowercase();
         if h != genesis_hash_lc {
             return Err("genesis hash mismatch".to_string());
         }
@@ -2276,7 +2276,7 @@ fn parse_persisted_block_file(
         if block.header.bits == 0 {
             return Err("header bits is zero".to_string());
         }
-        if !meets_target(&block.header.hash(), block.header.target()) {
+        if !meets_target(&block.header.hash_for_height(height), block.header.target()) {
             return Err("header hash does not meet declared target".to_string());
         }
     }
@@ -2318,7 +2318,7 @@ fn discover_persist_mismatch_heights(
     for (height, expected_hash) in expected.iter().copied() {
         let path = blocks_dir.join(format!("block_{}.json", height));
         let valid_and_matching = match parse_persisted_block_file(&path, genesis_hash_lc) {
-            Ok((parsed_h, block)) => parsed_h == height && block.header.hash() == expected_hash,
+            Ok((parsed_h, block)) => parsed_h == height && block.header.hash_for_height(parsed_h) == expected_hash,
             Err(_) => false,
         };
 
@@ -2406,7 +2406,7 @@ fn best_chain_hashes_in_window(
                     continue;
                 }
                 if let Some(block) = state.chain.get(h as usize) {
-                    by_height.entry(h).or_insert(block.header.hash());
+                    by_height.entry(h).or_insert(block.header.hash_for_height(h));
                 }
                 if h == 0 {
                     break;
@@ -2456,7 +2456,7 @@ fn rebuild_startup_header_index(
         let mut next_pending: Vec<(u64, Block)> = Vec::new();
 
         for (h, block) in pending.into_iter() {
-            let hash = block.header.hash();
+            let hash = block.header.hash_for_height(h);
             if state.headers.contains_key(&hash) || state.heights.contains_key(&hash) {
                 continue;
             }
@@ -2516,7 +2516,7 @@ fn rebuild_startup_header_index(
         if *h < window_start || *h > window_tip {
             continue;
         }
-        let hash = block.header.hash();
+        let hash = block.header.hash_for_height(*h);
         let linked = state.headers.contains_key(&hash) || state.heights.contains_key(&hash);
         if !linked {
             unlinked_in_window = unlinked_in_window.saturating_add(1);
@@ -2657,7 +2657,7 @@ fn load_persisted_blocks(state: &mut ChainState, genesis_hash_lc: &str) {
         observed_hashes_by_height
             .entry(*h)
             .or_default()
-            .push(block.header.hash());
+            .push(block.header.hash_for_height(*h));
     }
 
     let expected_hashes_by_height =
@@ -3056,11 +3056,7 @@ async fn network_status(
     let tip_hash = guard
         .chain
         .last()
-        .map(|b| {
-            let mut h = irium_node_rs::pow::sha256d(&b.header.serialize());
-            h.reverse();
-            hex::encode(h)
-        })
+        .map(|b| hex::encode(b.header.hash_for_height(height)))
         .unwrap_or_else(|| "0".repeat(64));
     let tip_target = guard
         .chain
@@ -3468,10 +3464,11 @@ async fn metrics(
     check_rate(&state, &addr)?;
     let (height, anchor_loaded, tip_hash, anchor_digest) = {
         let g = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip_h = g.tip_height();
         let tip_hash = g
             .chain
             .last()
-            .map(|b| hex::encode(b.header.hash()))
+            .map(|b| hex::encode(b.header.hash_for_height(tip_h)))
             .unwrap_or_else(|| state.genesis_hash.clone());
         let digest = state
             .anchors
@@ -6968,10 +6965,11 @@ async fn get_block_template(
     if longpoll {
         let last_tip = {
             let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            let tip_h = guard.tip_height();
             guard
                 .chain
                 .last()
-                .map(|b| hex::encode(b.header.hash()))
+                .map(|b| hex::encode(b.header.hash_for_height(tip_h)))
                 .unwrap_or_else(|| state.genesis_hash.clone())
         };
         let last_mempool = state
@@ -6985,10 +6983,11 @@ async fn get_block_template(
             tokio::time::sleep(Duration::from_secs(1)).await;
             let current_tip = {
                 let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+                let tip_h = guard.tip_height();
                 guard
                     .chain
                     .last()
-                    .map(|b| hex::encode(b.header.hash()))
+                    .map(|b| hex::encode(b.header.hash_for_height(tip_h)))
                     .unwrap_or_else(|| state.genesis_hash.clone())
             };
             let current_mempool = state
@@ -7005,8 +7004,9 @@ async fn get_block_template(
     let (height, prev_hash, bits, target, time) = {
         let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let tip = guard.chain.last();
+        let tip_h = guard.tip_height();
         let prev_hash = tip
-            .map(|b| hex::encode(b.header.hash()))
+            .map(|b| hex::encode(b.header.hash_for_height(tip_h)))
             .unwrap_or_else(|| "00".repeat(32));
         let height = guard.height;
         let target = guard.target_for_height(height);
@@ -7191,7 +7191,7 @@ async fn get_tx(
                     txid: hex::encode(target),
                     height: height as u64,
                     index: idx,
-                    block_hash: hex::encode(block.header.hash()),
+                    block_hash: hex::encode(block.header.hash_for_height(height as u64)),
                     inputs: tx.inputs.len(),
                     outputs: tx.outputs.len(),
                     output_value,
@@ -7406,8 +7406,9 @@ async fn submit_block(
             return Err(StatusCode::BAD_REQUEST);
         }
 
-        let tip_hash = block.header.hash();
-        (chain.tip_height(), hex::encode(tip_hash))
+        let new_tip_h = chain.tip_height();
+        let tip_hash = block.header.hash_for_height(new_tip_h);
+        (new_tip_h, hex::encode(tip_hash))
     };
 
     // If anchors are loaded, enforce anchor consistency on the new tip.
@@ -7449,7 +7450,7 @@ async fn submit_block(
         //
         // For now we reuse Transaction::serialize() and BlockHeader::serialize()
         // and simply concatenate them; remote peers can interpret this as needed.
-        bytes.extend_from_slice(&block.header.serialize());
+        bytes.extend_from_slice(&block.header.serialize_for_height(new_height));
         for tx in &block.transactions {
             bytes.extend_from_slice(&tx.serialize());
         }
@@ -8214,7 +8215,7 @@ async fn main() {
                         Ok(g) => {
                             let local_height = g.tip_height();
                             let tip_bytes =
-                                g.chain.last().map(|b| b.header.hash()).unwrap_or([0u8; 32]);
+                                g.chain.last().map(|b| b.header.hash_for_height(local_height)).unwrap_or([0u8; 32]);
                             let tip = hex::encode(tip_bytes);
                             let best_hash = g.best_header_hash();
                             let best_header_height = g
@@ -8513,7 +8514,7 @@ async fn main() {
                                 Vec::with_capacity((end.saturating_sub(start) + 1) as usize);
                             for h in start..=end {
                                 if let Some(block) = guard.chain.get(h as usize) {
-                                    v.push((h, block.header.hash()));
+                                    v.push((h, block.header.hash_for_height(h)));
                                 }
                             }
                             v
@@ -8571,12 +8572,13 @@ async fn main() {
                     let guard = chain_for_gap_healer
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
+                    let th = guard.tip_height();
                     let tip_bytes = guard
                         .chain
                         .last()
-                        .map(|b| b.header.hash())
+                        .map(|b| b.header.hash_for_height(th))
                         .unwrap_or([0u8; 32]);
-                    (guard.tip_height(), tip_bytes)
+                    (th, tip_bytes)
                 };
 
                 let mut filled: usize = 0;
@@ -8679,7 +8681,7 @@ async fn main() {
                 let (h, hash) = {
                     let g = block_chain.lock().unwrap_or_else(|e| e.into_inner());
                     let height = g.tip_height();
-                    let hash = g.chain.last().map(|b| hex::encode(b.header.hash())).unwrap_or_default();
+                    let hash = g.chain.last().map(|b| hex::encode(b.header.hash_for_height(height))).unwrap_or_default();
                     (height, hash)
                 };
                 if h < last_known_height && last_known_height > 0 {
