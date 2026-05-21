@@ -22,6 +22,13 @@ use irium_node_rs::settlement::{
     NoResponseTrigger, PolicyOutcome, ProofPolicy, ProofRequirement, ProofResolution,
     ProofSignatureEnvelope, SettlementProof, TypedProofPayload, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
     AGREEMENT_SIGNATURE_VERSION, PROOF_POLICY_SCHEMA_ID, SETTLEMENT_PROOF_SCHEMA_ID,
+    DisputeEvidence, DisputeRaise, DisputeResolution, ResolverRegistration,
+    DISPUTE_EVIDENCE_SCHEMA_ID, DISPUTE_EVIDENCE_VERSION,
+    DISPUTE_RAISE_SCHEMA_ID, DISPUTE_RAISE_VERSION,
+    DISPUTE_RESOLUTION_SCHEMA_ID, DISPUTE_RESOLUTION_VERSION,
+    RESOLVER_REGISTRATION_SCHEMA_ID, RESOLVER_REGISTRATION_VERSION,
+    dispute_evidence_canonical_bytes, dispute_raise_canonical_bytes,
+    dispute_resolution_canonical_bytes, resolver_registration_canonical_bytes,
 };
 use irium_node_rs::tx::{
     decode_full_tx, encode_mpso_claim_witness, encode_mpso_refund_witness, encode_mpso_script,
@@ -26275,6 +26282,36 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
                 std::process::exit(1);
             }
         }
+        "agreement-dispute-raise" => {
+            if let Err(e) = handle_agreement_dispute_raise(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-dispute-respond" => {
+            if let Err(e) = handle_agreement_dispute_respond(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-dispute-resolve" => {
+            if let Err(e) = handle_agreement_dispute_resolve(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "resolver-register" => {
+            if let Err(e) = handle_resolver_register(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "resolver-list" => {
+            if let Err(e) = handle_resolver_list(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
         "agreement-dispute" => {
             if let Err(e) = handle_agreement_dispute(&args[1..]) {
                 eprintln!("{}", e);
@@ -26651,3 +26688,520 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
     }
     // ============================================================
 }
+
+
+// ============================================================================
+// Stage 3.4: Dispute and Resolver Wallet CLI Commands
+// ============================================================================
+
+fn s34_build_signed_envelope(
+    pubkey_hex: &str,
+    signer_address: &str,
+    target_hash: &str,
+) -> AgreementSignatureEnvelope {
+    AgreementSignatureEnvelope {
+        version: AGREEMENT_SIGNATURE_VERSION,
+        target_type: AgreementSignatureTargetType::Agreement,
+        target_hash: target_hash.to_string(),
+        signer_public_key: pubkey_hex.to_string(),
+        signer_address: Some(signer_address.to_string()),
+        signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+        timestamp: Some(now_unix()),
+        signer_role: None,
+        signature: String::new(),
+    }
+}
+
+fn s34_ecdsa_sign(signing_key: &SigningKey, bytes: &[u8]) -> Result<String, String> {
+    let digest = Sha256::digest(bytes);
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&digest);
+    let sig: Signature = signing_key
+        .sign_prehash(&arr)
+        .map_err(|e| format!("ecdsa sign: {e}"))?;
+    let sig = sig.normalize_s().unwrap_or(sig);
+    Ok(hex::encode(sig.to_bytes()))
+}
+
+#[derive(Serialize)]
+struct RaiseDisputeRpcReq {
+    dispute: DisputeRaise,
+    agreement: AgreementObject,
+}
+
+#[derive(Deserialize)]
+struct RaiseDisputeRpcResp {
+    agreement_hash: String,
+    anchor_txid: String,
+}
+
+#[derive(Serialize)]
+struct DisputeEvidenceRpcReq {
+    evidence: DisputeEvidence,
+    agreement: AgreementObject,
+}
+
+#[derive(Deserialize)]
+struct DisputeEvidenceRpcResp {
+    evidence_hash: String,
+    anchor_txid: String,
+}
+
+#[derive(Serialize)]
+struct ResolveDisputeRpcReq {
+    resolution: DisputeResolution,
+    agreement: AgreementObject,
+}
+
+#[derive(Deserialize)]
+struct ResolveDisputeRpcResp {
+    anchor_txid: String,
+    outcome: String,
+    resolver_role: String,
+}
+
+#[derive(Serialize)]
+struct RegisterResolverRpcReq {
+    registration: ResolverRegistration,
+}
+
+#[derive(Deserialize)]
+struct RegisterResolverRpcResp {
+    resolver_address: String,
+    anchor_txid: String,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct ResolversListEntryRpc {
+    resolver_address: String,
+    registered_at_height: u64,
+    display_name: Option<String>,
+    fee_bps_self_quoted: Option<u32>,
+    anchor_txid: Option<String>,
+    anchored_at_height: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ResolversListRpcResp {
+    resolvers: Vec<ResolversListEntryRpc>,
+    next_cursor: Option<String>,
+}
+
+fn handle_agreement_dispute_raise(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut raising_party: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut evidence_file: Option<String> = None;
+    let mut key_input: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--raising-party" => {
+                raising_party = Some(parse_required_string_flag(args, &mut i, "--raising-party")?);
+            }
+            "--reason" => {
+                reason = Some(parse_required_string_flag(args, &mut i, "--reason")?);
+            }
+            "--evidence-file" => {
+                evidence_file = Some(parse_required_string_flag(args, &mut i, "--evidence-file")?);
+            }
+            "--key" => {
+                key_input = Some(parse_required_string_flag(args, &mut i, "--key")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let ag_ref = agreement_ref.ok_or_else(|| "--agreement required".to_string())?;
+    let raising = raising_party.ok_or_else(|| "--raising-party required".to_string())?;
+    let reason_text = reason.ok_or_else(|| "--reason required".to_string())?;
+    let evidence_path = evidence_file.ok_or_else(|| "--evidence-file required".to_string())?;
+    let key_str = key_input.ok_or_else(|| "--key required".to_string())?;
+
+    let agreement = load_agreement(&ag_ref)?;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let (signer_address, pubkey_hex, signing_key) = signing_key_from_raw(&key_str)?;
+    let evidence_bytes = std::fs::read(&evidence_path).map_err(|e| format!("read evidence: {e}"))?;
+    let evidence_hash = hex::encode(Sha256::digest(&evidence_bytes));
+
+    let mut dispute = DisputeRaise {
+        version: DISPUTE_RAISE_VERSION,
+        schema_id: Some(DISPUTE_RAISE_SCHEMA_ID.to_string()),
+        agreement_hash: agreement_hash.clone(),
+        raising_party: raising.clone(),
+        raised_at_height: 0,
+        raised_at_unix: now_unix(),
+        reason: reason_text,
+        initial_evidence_hash: evidence_hash,
+        signature: s34_build_signed_envelope(&pubkey_hex, &signer_address, &agreement_hash),
+    };
+    let bytes = dispute_raise_canonical_bytes(&dispute).map_err(|e| format!("canonical: {e}"))?;
+    dispute.signature.signature = s34_ecdsa_sign(&signing_key, &bytes)?;
+
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let req = RaiseDisputeRpcReq { dispute, agreement };
+    let resp: RaiseDisputeRpcResp = rpc_post_json(&client, base, "/rpc/raisedispute", &req)?;
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agreement_hash": resp.agreement_hash,
+                "anchor_txid":    resp.anchor_txid,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("=== Dispute Raised ===");
+        println!();
+        println!("agreement_hash  {}", resp.agreement_hash);
+        println!("anchor_txid     {}", resp.anchor_txid);
+        println!("raising_party   {}", raising);
+    }
+    Ok(())
+}
+
+fn handle_agreement_dispute_respond(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut submitter_party: Option<String> = None;
+    let mut evidence_file: Option<String> = None;
+    let mut evidence_type: Option<String> = None;
+    let mut message: Option<String> = None;
+    let mut key_input: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--submitter-party" => {
+                submitter_party = Some(parse_required_string_flag(args, &mut i, "--submitter-party")?);
+            }
+            "--evidence-file" => {
+                evidence_file = Some(parse_required_string_flag(args, &mut i, "--evidence-file")?);
+            }
+            "--evidence-type" => {
+                evidence_type = Some(parse_required_string_flag(args, &mut i, "--evidence-type")?);
+            }
+            "--message" => {
+                message = Some(parse_required_string_flag(args, &mut i, "--message")?);
+            }
+            "--key" => {
+                key_input = Some(parse_required_string_flag(args, &mut i, "--key")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let ag_ref = agreement_ref.ok_or_else(|| "--agreement required".to_string())?;
+    let submitter = submitter_party.ok_or_else(|| "--submitter-party required".to_string())?;
+    let evidence_path = evidence_file.ok_or_else(|| "--evidence-file required".to_string())?;
+    let etype = evidence_type.ok_or_else(|| "--evidence-type required".to_string())?;
+    let key_str = key_input.ok_or_else(|| "--key required".to_string())?;
+
+    let agreement = load_agreement(&ag_ref)?;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let (signer_address, pubkey_hex, signing_key) = signing_key_from_raw(&key_str)?;
+    let evidence_bytes = std::fs::read(&evidence_path).map_err(|e| format!("read evidence: {e}"))?;
+    let evidence_hash = hex::encode(Sha256::digest(&evidence_bytes));
+    let evidence_payload_b64 = hex::encode(&evidence_bytes);
+
+    let mut evidence = DisputeEvidence {
+        version: DISPUTE_EVIDENCE_VERSION,
+        schema_id: Some(DISPUTE_EVIDENCE_SCHEMA_ID.to_string()),
+        agreement_hash: agreement_hash.clone(),
+        submitter_party: submitter,
+        submitted_at_height: 0,
+        evidence_type: etype,
+        evidence_payload: evidence_payload_b64,
+        evidence_hash: evidence_hash.clone(),
+        message,
+        signature: s34_build_signed_envelope(&pubkey_hex, &signer_address, &agreement_hash),
+    };
+    let bytes = dispute_evidence_canonical_bytes(&evidence).map_err(|e| format!("canonical: {e}"))?;
+    evidence.signature.signature = s34_ecdsa_sign(&signing_key, &bytes)?;
+
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let req = DisputeEvidenceRpcReq { evidence, agreement };
+    let resp: DisputeEvidenceRpcResp = rpc_post_json(&client, base, "/rpc/disputeevidence", &req)?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "evidence_hash": resp.evidence_hash,
+                "anchor_txid":   resp.anchor_txid,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("=== Evidence Submitted ===");
+        println!();
+        println!("evidence_hash  {}", resp.evidence_hash);
+        println!("anchor_txid    {}", resp.anchor_txid);
+    }
+    Ok(())
+}
+
+fn handle_agreement_dispute_resolve(args: &[String]) -> Result<(), String> {
+    let mut agreement_ref: Option<String> = None;
+    let mut outcome: Option<String> = None;
+    let mut resolver_role: Option<String> = None;
+    let mut message: Option<String> = None;
+    let mut key_input: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement" => {
+                agreement_ref = Some(parse_required_string_flag(args, &mut i, "--agreement")?);
+            }
+            "--outcome" => {
+                outcome = Some(parse_required_string_flag(args, &mut i, "--outcome")?);
+            }
+            "--resolver-role" => {
+                resolver_role = Some(parse_required_string_flag(args, &mut i, "--resolver-role")?);
+            }
+            "--message" => {
+                message = Some(parse_required_string_flag(args, &mut i, "--message")?);
+            }
+            "--key" => {
+                key_input = Some(parse_required_string_flag(args, &mut i, "--key")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let ag_ref = agreement_ref.ok_or_else(|| "--agreement required".to_string())?;
+    let outcome_text = outcome.ok_or_else(|| "--outcome required".to_string())?;
+    let role = resolver_role.unwrap_or_else(|| "primary".to_string());
+    let msg = message.unwrap_or_else(|| "resolved".to_string());
+    let key_str = key_input.ok_or_else(|| "--key required".to_string())?;
+
+    let agreement = load_agreement(&ag_ref)?;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    let (resolver_address, pubkey_hex, signing_key) = signing_key_from_raw(&key_str)?;
+
+    let mut resolution = DisputeResolution {
+        version: DISPUTE_RESOLUTION_VERSION,
+        schema_id: Some(DISPUTE_RESOLUTION_SCHEMA_ID.to_string()),
+        agreement_hash: agreement_hash.clone(),
+        resolver_address: resolver_address.clone(),
+        resolver_role: role,
+        outcome: outcome_text,
+        resolved_at_height: 0,
+        message: msg,
+        signature: s34_build_signed_envelope(&pubkey_hex, &resolver_address, &agreement_hash),
+    };
+    let bytes = dispute_resolution_canonical_bytes(&resolution).map_err(|e| format!("canonical: {e}"))?;
+    resolution.signature.signature = s34_ecdsa_sign(&signing_key, &bytes)?;
+
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let req = ResolveDisputeRpcReq { resolution, agreement };
+    let resp: ResolveDisputeRpcResp = rpc_post_json(&client, base, "/rpc/resolvedispute", &req)?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "anchor_txid":    resp.anchor_txid,
+                "outcome":        resp.outcome,
+                "resolver_role":  resp.resolver_role,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("=== Dispute Resolved ===");
+        println!();
+        println!("anchor_txid     {}", resp.anchor_txid);
+        println!("outcome         {}", resp.outcome);
+        println!("resolver_role   {}", resp.resolver_role);
+    }
+    Ok(())
+}
+
+fn handle_resolver_register(args: &[String]) -> Result<(), String> {
+    let mut display_name: Option<String> = None;
+    let mut bio: Option<String> = None;
+    let mut fee_bps: Option<u32> = None;
+    let mut key_input: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--display-name" => {
+                display_name = Some(parse_required_string_flag(args, &mut i, "--display-name")?);
+            }
+            "--bio" => {
+                bio = Some(parse_required_string_flag(args, &mut i, "--bio")?);
+            }
+            "--fee-bps" => {
+                fee_bps = Some(
+                    parse_required_string_flag(args, &mut i, "--fee-bps")?
+                        .parse::<u32>()
+                        .map_err(|_| "invalid --fee-bps".to_string())?,
+                );
+            }
+            "--key" => {
+                key_input = Some(parse_required_string_flag(args, &mut i, "--key")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let key_str = key_input.ok_or_else(|| "--key required".to_string())?;
+    let (resolver_address, pubkey_hex, signing_key) = signing_key_from_raw(&key_str)?;
+
+    let mut reg = ResolverRegistration {
+        version: RESOLVER_REGISTRATION_VERSION,
+        schema_id: Some(RESOLVER_REGISTRATION_SCHEMA_ID.to_string()),
+        resolver_address: resolver_address.clone(),
+        registered_at_height: 0,
+        display_name,
+        bio,
+        fee_bps_self_quoted: fee_bps,
+        signature: s34_build_signed_envelope(&pubkey_hex, &resolver_address, ""),
+    };
+    let bytes = resolver_registration_canonical_bytes(&reg).map_err(|e| format!("canonical: {e}"))?;
+    reg.signature.signature = s34_ecdsa_sign(&signing_key, &bytes)?;
+
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let req = RegisterResolverRpcReq { registration: reg };
+    let resp: RegisterResolverRpcResp = rpc_post_json(&client, base, "/rpc/registerresolver", &req)?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "resolver_address": resp.resolver_address,
+                "anchor_txid":      resp.anchor_txid,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("=== Resolver Registered ===");
+        println!();
+        println!("resolver_address  {}", resp.resolver_address);
+        println!("anchor_txid       {}", resp.anchor_txid);
+    }
+    Ok(())
+}
+
+fn handle_resolver_list(args: &[String]) -> Result<(), String> {
+    let mut rpc_url = default_rpc_url();
+    let mut limit: Option<usize> = None;
+    let mut cursor: Option<String> = None;
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--limit" => {
+                limit = Some(
+                    parse_required_string_flag(args, &mut i, "--limit")?
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --limit".to_string())?,
+                );
+            }
+            "--cursor" => {
+                cursor = Some(parse_required_string_flag(args, &mut i, "--cursor")?);
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let mut url = format!("{}/resolvers/list", base.trim_end_matches('/'));
+    let mut q: Vec<String> = Vec::new();
+    if let Some(l) = limit {
+        q.push(format!("limit={}", l));
+    }
+    if let Some(c) = cursor {
+        q.push(format!("cursor={}", c));
+    }
+    if !q.is_empty() {
+        url.push('?');
+        url.push_str(&q.join("&"));
+    }
+    let resp = client.get(&url).send().map_err(|e| format!("GET /resolvers/list: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        return Err(format!("/resolvers/list: {} {}", status, body));
+    }
+    let parsed: ResolversListRpcResp = resp.json().map_err(|e| format!("parse /resolvers/list: {e}"))?;
+    if json_mode {
+        let v = serde_json::json!({
+            "resolvers": parsed.resolvers.iter().map(|r| serde_json::json!({
+                "resolver_address":     r.resolver_address,
+                "registered_at_height": r.registered_at_height,
+                "display_name":         r.display_name,
+                "fee_bps_self_quoted":  r.fee_bps_self_quoted,
+                "anchor_txid":          r.anchor_txid,
+                "anchored_at_height":   r.anchored_at_height,
+            })).collect::<Vec<_>>(),
+            "next_cursor": parsed.next_cursor,
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    } else if parsed.resolvers.is_empty() {
+        println!("no resolvers registered");
+    } else {
+        println!("registered resolvers ({}):", parsed.resolvers.len());
+        for r in &parsed.resolvers {
+            println!(
+                "  {}  height={}  fee_bps={}  name={}",
+                r.resolver_address,
+                r.registered_at_height,
+                r.fee_bps_self_quoted.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string()),
+                r.display_name.as_deref().unwrap_or("-")
+            );
+        }
+        if let Some(ref c) = parsed.next_cursor {
+            println!();
+            println!("next_cursor  {}", c);
+        }
+    }
+    Ok(())
+}
+
