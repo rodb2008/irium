@@ -64,8 +64,10 @@ use irium_node_rs::settlement::{
     HoldbackEvaluationResult, MilestoneEvaluationResult, MilestoneSpec, PolicyOutcome, PolicyStore,
     ProofPolicy, ProofStore, RequirementThresholdResult, ResolverRegistration, SettlementProof,
     TemplateAttestor, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+    DisputeReResolverNomination,
     dispute_evidence_canonical_bytes, dispute_raise_canonical_bytes,
-    dispute_resolution_canonical_bytes, resolver_registration_canonical_bytes,
+    dispute_reresolve_canonical_bytes, dispute_resolution_canonical_bytes,
+    resolver_registration_canonical_bytes,
 };
 use k256::ecdsa::VerifyingKey;
 use irium_node_rs::storage;
@@ -138,6 +140,8 @@ struct DisputeState {
     resolution_anchored_at_height: Option<u64>,
     escalated_to_fallback: bool,
     escalated_at_height: Option<u64>,
+    #[serde(default)]
+    reresolve_nomination: Option<DisputeReResolverNomination>,
 }
 
 impl DisputeState {
@@ -210,6 +214,7 @@ fn ws_is_public_event(event_type: &str) -> bool {
             | "dispute.escalated"
             | "dispute.raise_anchored"
             | "dispute.resolve_anchored"
+            | "dispute.reresolved"
             | "resolver.registered"
     )
 }
@@ -4142,6 +4147,30 @@ fn spend_htlc_from_params(
     broadcast: Option<bool>,
     secret_hex: Option<&str>,
 ) -> Result<SpendHtlcResponse, StatusCode> {
+    spend_htlc_with_optional_payout(
+        claim,
+        state,
+        funding_txid,
+        vout,
+        destination_address,
+        fee_per_byte,
+        broadcast,
+        secret_hex,
+        None,
+    )
+}
+
+fn spend_htlc_with_optional_payout(
+    claim: bool,
+    state: &AppState,
+    funding_txid: &str,
+    vout: u32,
+    destination_address: &str,
+    fee_per_byte: Option<u64>,
+    broadcast: Option<bool>,
+    secret_hex: Option<&str>,
+    resolver_payout: Option<(String, u64)>,
+) -> Result<SpendHtlcResponse, StatusCode> {
     {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let active = chain
@@ -4200,9 +4229,39 @@ fn spend_htlc_from_params(
     let mut dest_pkh = [0u8; 20];
     dest_pkh.copy_from_slice(&dest);
     let fee_per_byte = fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let num_outputs = if resolver_payout.is_some() { 2 } else { 1 };
+    let fee = estimate_tx_size(1, num_outputs).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut outputs: Vec<TxOutput> = Vec::with_capacity(num_outputs);
+    if let Some((ref resolver_addr, resolver_fee)) = resolver_payout {
+        if resolver_fee == 0 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if funding_out.output.value <= resolver_fee.saturating_add(fee) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        outputs.push(TxOutput {
+            value: funding_out.output.value - fee - resolver_fee,
+            script_pubkey: p2pkh_script(&dest_pkh),
+        });
+        let resolver_pkh_vec = base58_p2pkh_to_hash(resolver_addr)
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        if resolver_pkh_vec.len() != 20 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let mut resolver_pkh = [0u8; 20];
+        resolver_pkh.copy_from_slice(&resolver_pkh_vec);
+        outputs.push(TxOutput {
+            value: resolver_fee,
+            script_pubkey: p2pkh_script(&resolver_pkh),
+        });
+    } else {
+        outputs.push(TxOutput {
+            value: funding_out.output.value - fee,
+            script_pubkey: p2pkh_script(&dest_pkh),
+        });
     }
     let mut tx = Transaction {
         version: 1,
@@ -4212,10 +4271,7 @@ fn spend_htlc_from_params(
             script_sig: Vec::new(),
             sequence: 0xffff_fffe,
         }],
-        outputs: vec![TxOutput {
-            value: funding_out.output.value - fee,
-            script_pubkey: p2pkh_script(&dest_pkh),
-        }],
+        outputs,
         locktime: 0,
     };
     let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
@@ -6731,7 +6787,44 @@ async fn build_agreement_spend_internal(
         .destination_address
         .clone()
         .ok_or_else(|| bad("destination_address_missing"))?;
-    let spend = spend_htlc_from_params(
+    // Stage 3.4.1: if a resolved dispute matches this branch, pay the
+    // resolver out of the spend tx according to the agreement's resolver
+    // fee fields.
+    let resolver_payout: Option<(String, u64)> = {
+        let agreement_hash = compute_agreement_hash_hex(&req.agreement)
+            .map_err(|_| bad("agreement_hash_failed"))?;
+        let dispute_state = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&agreement_hash)
+            .cloned();
+        if let Some(d) = dispute_state {
+            if let Some(ref resolution) = d.resolution {
+                let role = resolution.resolver_role.as_str();
+                let (addr, fee) = match role {
+                    "primary" => (
+                        req.agreement.primary_resolver.clone(),
+                        req.agreement.primary_resolver_fee,
+                    ),
+                    "fallback" => (
+                        req.agreement.fallback_resolver.clone(),
+                        req.agreement.fallback_resolver_fee,
+                    ),
+                    _ => (None, None),
+                };
+                match (addr, fee) {
+                    (Some(a), Some(f)) if f > 0 => Some((a, f)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let spend = spend_htlc_with_optional_payout(
         claim,
         &state,
         &req.funding_txid,
@@ -6742,6 +6835,7 @@ async fn build_agreement_spend_internal(
         req.fee_per_byte,
         req.broadcast,
         req.secret_hex.as_deref(),
+        resolver_payout,
     )
     .map_err(|_| bad("build_htlc_spend_failed"))?;
     Ok(Json(AgreementBuildSpendResponse {
@@ -9441,6 +9535,8 @@ async fn explorer_stats(
         .route("/rpc/disputeevidence", post(submit_dispute_evidence))
         .route("/rpc/resolvedispute", post(resolve_dispute))
         .route("/rpc/registerresolver", post(register_resolver))
+        .route("/rpc/disputestate", get(get_dispute_state))
+        .route("/rpc/reresolveagreement", post(reresolve_agreement))
         .route("/resolvers/list", get(resolvers_list))
         .route("/rpc/listagreementtxs", post(list_agreement_txs))
         .route("/rpc/agreementfundinglegs", post(agreement_funding_legs))
@@ -16247,6 +16343,7 @@ mod tests {
             resolution_anchored_at_height: None,
             escalated_to_fallback: false,
             escalated_at_height: None,
+        reresolve_nomination: None,
         };
         {
             let mut guard = state.disputes_index.lock().unwrap();
@@ -16278,6 +16375,7 @@ mod tests {
             resolution_anchored_at_height: None,
             escalated_to_fallback: false,
             escalated_at_height: None,
+        reresolve_nomination: None,
         };
         {
             let mut guard = state.disputes_index.lock().unwrap();
@@ -16312,6 +16410,7 @@ mod tests {
             resolution_anchored_at_height: Some(20),
             escalated_to_fallback: false,
             escalated_at_height: None,
+        reresolve_nomination: None,
         };
         {
             let mut guard = state.disputes_index.lock().unwrap();
@@ -16351,6 +16450,7 @@ mod tests {
             resolution_anchored_at_height: Some(20),
             escalated_to_fallback: false,
             escalated_at_height: None,
+        reresolve_nomination: None,
         };
         {
             let mut guard = state.disputes_index.lock().unwrap();
@@ -16385,6 +16485,7 @@ mod tests {
             resolution_anchored_at_height: None,
             escalated_to_fallback: false,
             escalated_at_height: None,
+        reresolve_nomination: None,
         };
         {
             let mut guard = state.disputes_index.lock().unwrap();
@@ -16418,6 +16519,7 @@ mod tests {
             resolution_anchored_at_height: None,
             escalated_to_fallback: false,
             escalated_at_height: None,
+        reresolve_nomination: None,
         };
         {
             let mut guard = state.disputes_index.lock().unwrap();
@@ -17421,6 +17523,7 @@ async fn raise_dispute(
         resolution_anchored_at_height: None,
         escalated_to_fallback: false,
         escalated_at_height: None,
+    reresolve_nomination: None,
     };
     save_dispute_state(&new_state).map_err(|e| bad(&format!("persist:{e}")))?;
     {
@@ -17554,16 +17657,33 @@ async fn resolve_dispute(
         return Err(bad("resolution_agreement_hash_mismatch"));
     }
     let role = req.resolution.resolver_role.as_str();
+    let (agreement_primary, agreement_fallback) = (
+        req.agreement.primary_resolver.clone(),
+        req.agreement.fallback_resolver.clone(),
+    );
+    // Stage 3.4.1: a co-signed reresolve nomination overrides the
+    // agreement's named resolvers for this dispute.
+    let agreement_hash_for_role = compute_agreement_hash_hex(&req.agreement)
+        .map_err(|_| bad("agreement_hash_failed"))?;
+    let (effective_primary, effective_fallback) = {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = guard.get(&agreement_hash_for_role) {
+            if let Some(ref nom) = d.reresolve_nomination {
+                (
+                    Some(nom.new_primary_resolver.clone()),
+                    nom.new_fallback_resolver.clone(),
+                )
+            } else {
+                (agreement_primary.clone(), agreement_fallback.clone())
+            }
+        } else {
+            (agreement_primary.clone(), agreement_fallback.clone())
+        }
+    };
     let expected_address = match role {
-        "primary" => req
-            .agreement
-            .primary_resolver
-            .clone()
+        "primary" => effective_primary
             .ok_or_else(|| bad("agreement_has_no_primary_resolver"))?,
-        "fallback" => req
-            .agreement
-            .fallback_resolver
-            .clone()
+        "fallback" => effective_fallback
             .ok_or_else(|| bad("agreement_has_no_fallback_resolver"))?,
         _ => return Err(bad("invalid_resolver_role")),
     };
@@ -17989,6 +18109,7 @@ fn process_received_dispute_raise(
         resolution_anchored_at_height: None,
         escalated_to_fallback: false,
         escalated_at_height: None,
+    reresolve_nomination: None,
     };
     let _ = save_dispute_state(&new_state);
     {
@@ -18159,4 +18280,170 @@ fn process_received_dispute_escalated(
             }),
         );
     }
+}
+
+
+// ============================================================================
+// Stage 3.4.1: dispute-show + dispute-reresolve handlers
+// ============================================================================
+
+#[derive(Deserialize)]
+struct DisputeStateQuery {
+    agreement_hash: String,
+}
+
+#[derive(Serialize)]
+struct DisputeStateRpcResp {
+    found: bool,
+    state: Option<DisputeState>,
+}
+
+async fn get_dispute_state(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<DisputeStateQuery>,
+) -> Result<Json<DisputeStateRpcResp>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let s = {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&q.agreement_hash).cloned()
+    };
+    Ok(Json(DisputeStateRpcResp {
+        found: s.is_some(),
+        state: s,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ReResolveAgreementRequest {
+    nomination: DisputeReResolverNomination,
+    agreement: AgreementObject,
+}
+
+#[derive(Serialize)]
+struct ReResolveAgreementResponse {
+    agreement_hash: String,
+    new_primary_resolver: String,
+    new_fallback_resolver: Option<String>,
+}
+
+fn dispute_reresolve_payload_hash(
+    n: &DisputeReResolverNomination,
+) -> Result<[u8; 32], String> {
+    let mut tmp = n.clone();
+    tmp.party_a_signature.signature = String::new();
+    tmp.party_b_signature.signature = String::new();
+    let bytes = dispute_reresolve_canonical_bytes(&tmp)?;
+    let h = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h);
+    Ok(out)
+}
+
+async fn reresolve_agreement(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<ReResolveAgreementRequest>,
+) -> Result<Json<ReResolveAgreementResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    req.nomination.validate().map_err(|e| bad(&e))?;
+    req.agreement.validate().map_err(|e| bad(&e))?;
+    let agreement_hash =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| bad("agreement_hash_failed"))?;
+    if agreement_hash != req.nomination.agreement_hash {
+        return Err(bad("reresolve_agreement_hash_mismatch"));
+    }
+    if req.agreement.parties.len() < 2 {
+        return Err(bad("agreement_must_have_two_parties"));
+    }
+    let party_a_addr = req.agreement.parties[0].address.clone();
+    let party_b_addr = req.agreement.parties[1].address.clone();
+    let digest = dispute_reresolve_payload_hash(&req.nomination)
+        .map_err(|e| bad(&format!("payload_hash:{e}")))?;
+    // Both signatures must come from the two named parties (in either order).
+    let sa_addr = req
+        .nomination
+        .party_a_signature
+        .signer_address
+        .clone()
+        .ok_or_else(|| bad("party_a_signature_missing_address"))?;
+    let sb_addr = req
+        .nomination
+        .party_b_signature
+        .signer_address
+        .clone()
+        .ok_or_else(|| bad("party_b_signature_missing_address"))?;
+    let pairs = vec![
+        (party_a_addr.clone(), party_b_addr.clone()),
+        (party_b_addr.clone(), party_a_addr.clone()),
+    ];
+    let mut pair_valid = false;
+    for (a, b) in pairs {
+        if sa_addr == a && sb_addr == b {
+            if verify_envelope_signature(&req.nomination.party_a_signature, &digest, &a).is_ok()
+                && verify_envelope_signature(&req.nomination.party_b_signature, &digest, &b)
+                    .is_ok()
+            {
+                pair_valid = true;
+                break;
+            }
+        }
+    }
+    if !pair_valid {
+        return Err(bad("co_signatures_invalid"));
+    }
+    // Miner-recency check on the new resolvers.
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        if !address_is_recent_miner(&chain, &req.nomination.new_primary_resolver) {
+            return Err(bad("new_primary_resolver_not_recent_miner"));
+        }
+        if let Some(ref fb) = req.nomination.new_fallback_resolver {
+            if !address_is_recent_miner(&chain, fb) {
+                return Err(bad("new_fallback_resolver_not_recent_miner"));
+            }
+        }
+    }
+    let new_primary = req.nomination.new_primary_resolver.clone();
+    let new_fallback = req.nomination.new_fallback_resolver.clone();
+    let snapshot: Option<DisputeState> = {
+        let mut guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = guard.get_mut(&agreement_hash) {
+            if !d.is_open() {
+                return Err(bad("dispute_already_resolved"));
+            }
+            d.reresolve_nomination = Some(req.nomination);
+            // Reset escalation: the fallback designation now belongs to a
+            // new resolver who has not had a chance to respond yet.
+            d.escalated_to_fallback = false;
+            d.escalated_at_height = None;
+            Some(d.clone())
+        } else {
+            return Err(bad("no_open_dispute"));
+        }
+    };
+    if let Some(snap) = snapshot {
+        let _ = save_dispute_state(&snap);
+        emit_event(
+            &state.event_tx,
+            "dispute.reresolved",
+            serde_json::json!({
+                "agreement_hash": agreement_hash,
+                "new_primary_resolver": new_primary,
+                "new_fallback_resolver": new_fallback,
+            }),
+        );
+    }
+    Ok(Json(ReResolveAgreementResponse {
+        agreement_hash,
+        new_primary_resolver: new_primary,
+        new_fallback_resolver: new_fallback,
+    }))
 }

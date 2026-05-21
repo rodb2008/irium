@@ -10231,6 +10231,9 @@ pub const DISPUTE_RESOLUTION_VERSION: u32 = 1;
 pub const RESOLVER_REGISTRATION_SCHEMA_ID: &str = "irium.phase3.resolver_registration.v1";
 pub const RESOLVER_REGISTRATION_VERSION: u32 = 1;
 
+pub const DISPUTE_RERESOLVE_SCHEMA_ID: &str = "irium.phase3.dispute_reresolve.v1";
+pub const DISPUTE_RERESOLVE_VERSION: u32 = 1;
+
 fn validate_hex_hash(field: &str, value: &str) -> Result<(), String> {
     if value.len() != 64 || hex::decode(value).is_err() {
         return Err(format!("{} must be 32-byte hex", field));
@@ -10475,6 +10478,74 @@ pub fn resolver_registration_canonical_value(r: &ResolverRegistration) -> Result
 pub fn resolver_registration_canonical_bytes(r: &ResolverRegistration) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&resolver_registration_canonical_value(r)?)
         .map_err(|e| format!("resolver_registration serialize: {e}"))
+}
+
+fn default_dispute_reresolve_version() -> u32 { DISPUTE_RERESOLVE_VERSION }
+
+/// Co-signed nomination of new primary and (optional) fallback resolvers
+/// when both originally-named resolvers have failed to respond. Both
+/// parties of the agreement sign the same canonical payload; iriumd
+/// verifies both signatures against the addresses in the agreement's
+/// parties list before swapping the effective resolvers on the dispute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisputeReResolverNomination {
+    #[serde(default = "default_dispute_reresolve_version")]
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_id: Option<String>,
+    pub agreement_hash: String,
+    pub new_primary_resolver: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_fallback_resolver: Option<String>,
+    pub nominated_at_height: u64,
+    pub party_a_signature: AgreementSignatureEnvelope,
+    pub party_b_signature: AgreementSignatureEnvelope,
+}
+
+impl DisputeReResolverNomination {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != DISPUTE_RERESOLVE_VERSION {
+            return Err(format!(
+                "unsupported dispute_reresolve version {}",
+                self.version
+            ));
+        }
+        if let Some(sid) = &self.schema_id {
+            if sid != DISPUTE_RERESOLVE_SCHEMA_ID {
+                return Err(format!(
+                    "unsupported dispute_reresolve schema_id {}",
+                    sid
+                ));
+            }
+        }
+        if self.agreement_hash.len() != 64 || hex::decode(&self.agreement_hash).is_err() {
+            return Err("agreement_hash must be 32-byte hex".to_string());
+        }
+        if self.new_primary_resolver.trim().is_empty() {
+            return Err("new_primary_resolver required".to_string());
+        }
+        if let Some(fb) = &self.new_fallback_resolver {
+            if fb.trim() == self.new_primary_resolver.trim() {
+                return Err(
+                    "new_fallback_resolver must differ from new_primary_resolver".to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn dispute_reresolve_canonical_value(d: &DisputeReResolverNomination) -> Result<Value, String> {
+    let value =
+        serde_json::to_value(d).map_err(|e| format!("dispute_reresolve to json: {e}"))?;
+    Ok(sort_json(value))
+}
+
+pub fn dispute_reresolve_canonical_bytes(
+    d: &DisputeReResolverNomination,
+) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&dispute_reresolve_canonical_value(d)?)
+        .map_err(|e| format!("dispute_reresolve serialize: {e}"))
 }
 
 #[cfg(test)]
