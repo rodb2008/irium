@@ -521,7 +521,7 @@ fn fetch_template(client: &Client) -> Result<BlockTemplate, String> {
 
 fn submit_block(client: &Client, height: u64, block: &Block) -> Result<(), String> {
     let header = &block.header;
-    let hash = header.hash();
+    let hash = header.hash_for_height(height);
     let payload = SubmitBlockRequest {
         height,
         header: JsonHeader {
@@ -1412,7 +1412,12 @@ fn mine_stratum_job_gpu(
         bits,
         nonce: 0,
     };
-    let ser = header.serialize();
+    // GPU stratum miner: StratumJob has no explicit height. Pre-fork-only
+    // path; for post-fork the pool would need to communicate the block
+    // height (via BIP34 coinbase push or a custom extension). For height=0
+    // the bytes match the pre-Fix-2a serialize().
+    // TODO(fix-2a): derive height from coinbase BIP34 for post-fork mining.
+    let ser = header.serialize_for_height(0);
     let midstate = sha256_midstate(ser[..64].try_into().unwrap());
     let mut tail = tail_from_header(&ser);
     let share_words = bigint_to_words(share_target);
@@ -2019,7 +2024,7 @@ fn main() {
         block.header.merkle_root = block.merkle_root();
 
         // ── Pre-compute midstate (constant for the whole template) ────────────
-        let ser = block.header.serialize();
+        let ser = block.header.serialize_for_height(height);
         let midstate = sha256_midstate(ser[..64].try_into().unwrap());
         let ser = Arc::new(ser); // shared across GPU threads
 
@@ -2175,7 +2180,7 @@ fn main() {
         let found = if let Some((nonce, found_time)) = found_result.lock().unwrap().take() {
             block.header.nonce = nonce;
             block.header.time = found_time;
-            let hash = block.header.hash();
+            let hash = block.header.hash_for_height(height);
             if meets_target(&hash, target) {
                 if json_log_enabled() {
                     println!(

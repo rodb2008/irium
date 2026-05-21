@@ -844,7 +844,7 @@ where
 
 fn submit_block_to_node(height: u64, block: &Block) -> Result<(), String> {
     let header = &block.header;
-    let hash = header.hash();
+    let hash = header.hash_for_height(height);
     let payload = SubmitBlockRequest {
         height,
         header: JsonHeader {
@@ -1364,7 +1364,7 @@ fn reconcile_with_template(
     let local_hash = state
         .chain
         .last()
-        .map(|b| b.header.hash())
+        .map(|b| b.header.hash_for_height(local_tip))
         .unwrap_or([0u8; 32]);
 
     if local_tip > 0 {
@@ -1498,7 +1498,7 @@ fn write_block_json(height: u64, block: &Block) -> std::io::Result<()> {
     let path = dir.join(format!("block_{}.json", height));
 
     let header = &block.header;
-    let hash = header.hash();
+    let hash = header.hash_for_height(height);
 
     let jb = JsonBlock {
         height,
@@ -1559,10 +1559,11 @@ fn mine_once(
     let mut prev_hash = [0u8; 32];
     prev_hash.copy_from_slice(&prev_bytes);
 
+    let local_tip_h = chain.tip_height();
     let local_prev = chain
         .chain
         .last()
-        .map(|b| b.header.hash())
+        .map(|b| b.header.hash_for_height(local_tip_h))
         .unwrap_or([0u8; 32]);
     if local_prev != prev_hash {
         return Err("template prev_hash does not match local tip".to_string());
@@ -1738,7 +1739,7 @@ fn mine_once(
                     break;
                 }
                 block.header.nonce = nonce;
-                let h = block.header.hash();
+                let h = block.header.hash_for_height(height);
                 if meets_target(&h, target) {
                     if !found.swap(true, Ordering::SeqCst) {
                         let mut guard = result.lock().unwrap_or_else(|e| e.into_inner());
@@ -2139,7 +2140,13 @@ fn mine_stratum_job(
             bits,
             nonce,
         };
-        let hash = header.hash();
+        // Stratum v1 mining.notify does not carry the chain height. For
+        // pre-fork (height < STANDARD_HEADER_ACTIVATION_HEIGHT=30000) iriumd's
+        // hash_for_height(0) matches the legacy hash() byte-for-byte. Stratum
+        // mining via this reference miner is pre-fork-only until we parse the
+        // height from the coinbase BIP34 prefix or extend the protocol.
+        // TODO(fix-2a): derive height from job.coinbase1 BIP34 push.
+        let hash = header.hash_for_height(0);
         let hash_value = BigUint::from_bytes_be(&hash);
         if &hash_value <= share_target {
             let submit = json!({
@@ -2752,7 +2759,10 @@ fn submit_solo_share(
         bits: job.bits,
         nonce,
     };
-    let hash = header.hash();
+    // SoloStratumJob lacks an explicit height field; pre-fork-only path.
+    // Matches legacy hash() byte-for-byte at any height < 30000.
+    // TODO(fix-2a): thread height through SoloStratumJob for post-fork support.
+    let hash = header.hash_for_height(0);
     let hash_value = BigUint::from_bytes_be(&hash);
     if hash_value > job.share_target {
         return Err("low difficulty share".to_string());
