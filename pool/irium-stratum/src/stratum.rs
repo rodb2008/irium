@@ -1531,12 +1531,14 @@ fn decode_cpuminer_compat_submit(
     let canonical_merkle_root = merkle_root_from_coinbase(cb_hash, &snapshot.branches);
     let ntime = parse_u32_hex(&submit.ntime_hex)?;
     let nonce = parse_u32_hex(&submit.nonce_hex)?;
-    let canonical_header80 = header_bytes(
-        snapshot.version,
-        snapshot.prev_hash_internal,
+    // Match iriumd's BlockHeader::serialize() byte order (natural prev,
+    // display merkle) so canonical_hash equals what iriumd would compute
+    // for this submission. Previously used header_bytes() which writes
+    // both fields as-is, producing a hash unrelated to the chain rule.
+    let canonical_header80 = reconstruct_canonical_header80(
+        snapshot,
         canonical_merkle_root,
         ntime,
-        snapshot.bits,
         nonce,
     );
     let canonical_hash = sha256d(&canonical_header80);
