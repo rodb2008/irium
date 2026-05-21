@@ -26,10 +26,10 @@ pub const MAINNET_LWMA_V2_ACTIVATION_HEIGHT: Option<u64> = Some(19_740);
 /// AuxPoW extension (version bit 1<<8). Standard single-hash PoW blocks
 /// remain valid after activation.
 ///
-/// Height 26347 is approximately 6 weeks after height 20299 (when this
+/// Height 26500 is approximately 6 weeks after height 20299 (when this
 /// constant was set), giving all known node operators time to upgrade
 /// before the first AuxPoW block can appear.
-pub const MAINNET_AUXPOW_ACTIVATION_HEIGHT: Option<u64> = Some(26_347);
+pub const MAINNET_AUXPOW_ACTIVATION_HEIGHT: Option<u64> = Some(26_500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkKind {
@@ -229,15 +229,15 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_auxpow_activation_height_is_26347() {
+    fn mainnet_auxpow_activation_height_is_26500() {
         assert_eq!(
             MAINNET_AUXPOW_ACTIVATION_HEIGHT,
-            Some(26_347),
-            "AuxPoW mainnet activation height must be 26347"
+            Some(26_500),
+            "AuxPoW mainnet activation height must be 26500"
         );
         assert_eq!(
             resolved_auxpow_activation_height(NetworkKind::Mainnet),
-            Some(26_347)
+            Some(26_500)
         );
     }
 
