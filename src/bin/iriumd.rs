@@ -8576,6 +8576,7 @@ async fn main() {
         let reorg_proof_store = app_state.proof_store.clone();
         let block_disputes = app_state.disputes_index.clone();
         let block_resolvers = app_state.resolvers_index.clone();
+        let block_p2p = app_state.p2p.clone();
         tokio::spawn(async move {
             let mut last_known_height: u64 = 0;
             let mut last_known_hash = String::new();
@@ -8632,8 +8633,8 @@ async fn main() {
                     last_known_height = h;
                     last_known_hash = hash;
                 }
-                // Stage 3.2: escalation tick — disputes whose primary resolver missed window go to fallback.
-                escalation_tick(&block_disputes, &block_event_tx, h);
+                // Stage 3.2 + 3.3.1: escalation tick — disputes whose primary resolver missed window go to fallback.
+                escalation_tick(&block_disputes, &block_event_tx, &block_p2p, h).await;
             }
         });
     }
@@ -8652,6 +8653,30 @@ async fn main() {
                     if let Err(e) = process_received_offer_take(&json, &drain_event_tx) {
                         eprintln!("[offer-take] {}", e);
                     }
+                }
+            }
+        });
+    }
+
+    // Stage 3.3.1: drain dispute P2P inboxes and apply to local indexes.
+    if let Some(ref dispute_p2p) = app_state.p2p {
+        let drain_node = dispute_p2p.clone();
+        let drain_disputes = app_state.disputes_index.clone();
+        let drain_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                for json in drain_node.drain_dispute_raised_notifications().await {
+                    process_received_dispute_raise(&json, &drain_disputes, &drain_event_tx);
+                }
+                for json in drain_node.drain_dispute_evidence_notifications().await {
+                    process_received_dispute_evidence(&json, &drain_disputes, &drain_event_tx);
+                }
+                for json in drain_node.drain_dispute_resolved_notifications().await {
+                    process_received_dispute_resolved(&json, &drain_disputes, &drain_event_tx);
+                }
+                for json in drain_node.drain_dispute_escalated_notifications().await {
+                    process_received_dispute_escalated(&json, &drain_disputes, &drain_event_tx);
                 }
             }
         });
@@ -16340,8 +16365,8 @@ mod tests {
         assert!(release_resp.reasons.iter().any(|r| r == "dispute_resolution_blocks_branch"));
     }
 
-    #[test]
-    fn s32_escalation_tick_marks_fallback_after_window() {
+    #[tokio::test]
+    async fn s32_escalation_tick_marks_fallback_after_window() {
         let (state, _, _, _) = create_test_state(Some(0));
         let buyer = s32_test_sk(21);
         let seller = s32_test_sk(22);
@@ -16366,15 +16391,15 @@ mod tests {
             guard.insert(agreement_hash.clone(), dstate);
         }
         // Tip exactly 288 blocks past raise → triggers escalation.
-        escalation_tick(&state.disputes_index, &state.event_tx, 10 + 288);
+        escalation_tick(&state.disputes_index, &state.event_tx, &None, 10 + 288).await;
         let guard = state.disputes_index.lock().unwrap();
         let d = guard.get(&agreement_hash).expect("present");
         assert!(d.escalated_to_fallback);
         assert_eq!(d.escalated_at_height, Some(298));
     }
 
-    #[test]
-    fn s32_escalation_tick_no_escalation_within_window() {
+    #[tokio::test]
+    async fn s32_escalation_tick_no_escalation_within_window() {
         let (state, _, _, _) = create_test_state(Some(0));
         let buyer = s32_test_sk(23);
         let seller = s32_test_sk(24);
@@ -16399,7 +16424,7 @@ mod tests {
             guard.insert(agreement_hash.clone(), dstate);
         }
         // Tip only 200 blocks past raise — under 288 → no escalation.
-        escalation_tick(&state.disputes_index, &state.event_tx, 210);
+        escalation_tick(&state.disputes_index, &state.event_tx, &None, 210).await;
         let guard = state.disputes_index.lock().unwrap();
         let d = guard.get(&agreement_hash).expect("present");
         assert!(!d.escalated_to_fallback);
@@ -17844,10 +17869,11 @@ fn scan_new_blocks_for_dispute_anchors(
     }
 }
 
-// Stage 3.2: per-tick escalation check.
-fn escalation_tick(
+// Stage 3.2 + 3.3.1: per-tick escalation check, optionally broadcasting via P2P.
+async fn escalation_tick(
     disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
     event_tx: &EventTx,
+    p2p: &Option<P2PNode>,
     tip_height: u64,
 ) {
     let mut to_escalate: Vec<String> = Vec::new();
@@ -17885,6 +17911,252 @@ fn escalation_tick(
                     "escalated_at_height": tip_height,
                 }),
             );
+            if let Some(ref node) = p2p {
+                let body = serde_json::json!({
+                    "agreement_hash": hash,
+                    "escalated_at_height": tip_height,
+                });
+                if let Ok(json) = serde_json::to_string(&body) {
+                    node.broadcast_dispute_escalated(&json).await;
+                }
+            }
         }
+    }
+}
+
+
+// ============================================================================
+// Stage 3.3.1: P2P dispute notification drain — apply incoming peer broadcasts
+// to the local disputes_index. The drain task runs every 5 s and consumes the
+// four dispute inboxes populated by the P2P receive arms in p2p.rs.
+//
+// Signature on the inbound payload is still verified (the signer must own the
+// pubkey that derives to signer_address), but we cannot enforce party-of-
+// agreement membership here because we do not necessarily have the underlying
+// agreement object locally. That check fires when a local user later attempts
+// to act on the dispute via the wallet (which DOES have the agreement).
+// ============================================================================
+
+fn process_received_dispute_raise(
+    json: &str,
+    disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    event_tx: &EventTx,
+) {
+    let d: DisputeRaise = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[dispute-raise drain] parse error: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = d.validate() {
+        eprintln!("[dispute-raise drain] invalid: {}", e);
+        return;
+    }
+    let signer_addr = match d.signature.signer_address.as_deref() {
+        Some(a) => a.to_string(),
+        None => {
+            eprintln!("[dispute-raise drain] missing signer_address");
+            return;
+        }
+    };
+    let digest = match dispute_raise_payload_hash(&d) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[dispute-raise drain] payload hash: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = verify_envelope_signature(&d.signature, &digest, &signer_addr) {
+        eprintln!("[dispute-raise drain] sig verify failed: {}", e);
+        return;
+    }
+    let agreement_hash = d.agreement_hash.clone();
+    let already_have = {
+        let guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+        guard.contains_key(&agreement_hash)
+    };
+    if already_have {
+        return;
+    }
+    let new_state = DisputeState {
+        raise: d,
+        raise_anchor_txid: None,
+        raise_anchored_at_height: None,
+        evidence: Vec::new(),
+        resolution: None,
+        resolution_anchor_txid: None,
+        resolution_anchored_at_height: None,
+        escalated_to_fallback: false,
+        escalated_at_height: None,
+    };
+    let _ = save_dispute_state(&new_state);
+    {
+        let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(agreement_hash.clone(), new_state);
+    }
+    emit_event(
+        event_tx,
+        "dispute.raised",
+        serde_json::json!({
+            "agreement_hash": agreement_hash,
+            "source": "p2p",
+        }),
+    );
+}
+
+fn process_received_dispute_evidence(
+    json: &str,
+    disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    event_tx: &EventTx,
+) {
+    let e: DisputeEvidence = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("[dispute-evidence drain] parse: {}", err);
+            return;
+        }
+    };
+    if let Err(err) = e.validate() {
+        eprintln!("[dispute-evidence drain] invalid: {}", err);
+        return;
+    }
+    let signer_addr = match e.signature.signer_address.as_deref() {
+        Some(a) => a.to_string(),
+        None => return,
+    };
+    let digest = match dispute_evidence_payload_hash(&e) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    if verify_envelope_signature(&e.signature, &digest, &signer_addr).is_err() {
+        return;
+    }
+    let agreement_hash = e.agreement_hash.clone();
+    let evidence_hash = e.evidence_hash.clone();
+    let mut snapshot: Option<DisputeState> = None;
+    {
+        let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = guard.get_mut(&agreement_hash) {
+            if d.is_open()
+                && !d.evidence.iter().any(|r| r.evidence.evidence_hash == evidence_hash)
+            {
+                d.evidence.push(DisputeEvidenceRecord {
+                    evidence: e,
+                    anchor_txid: None,
+                    anchored_at_height: None,
+                });
+                snapshot = Some(d.clone());
+            }
+        }
+    }
+    if let Some(snap) = snapshot {
+        let _ = save_dispute_state(&snap);
+        emit_event(
+            event_tx,
+            "dispute.evidence_submitted",
+            serde_json::json!({
+                "agreement_hash": agreement_hash,
+                "evidence_hash": evidence_hash,
+                "source": "p2p",
+            }),
+        );
+    }
+}
+
+fn process_received_dispute_resolved(
+    json: &str,
+    disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    event_tx: &EventTx,
+) {
+    let r: DisputeResolution = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("[dispute-resolved drain] parse: {}", err);
+            return;
+        }
+    };
+    if let Err(err) = r.validate() {
+        eprintln!("[dispute-resolved drain] invalid: {}", err);
+        return;
+    }
+    let signer_addr = match r.signature.signer_address.as_deref() {
+        Some(a) => a.to_string(),
+        None => return,
+    };
+    let digest = match dispute_resolution_payload_hash(&r) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    if verify_envelope_signature(&r.signature, &digest, &signer_addr).is_err() {
+        return;
+    }
+    let agreement_hash = r.agreement_hash.clone();
+    let outcome = r.outcome.clone();
+    let resolver_role = r.resolver_role.clone();
+    let mut snapshot: Option<DisputeState> = None;
+    {
+        let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = guard.get_mut(&agreement_hash) {
+            if d.is_open() {
+                d.resolution = Some(r);
+                snapshot = Some(d.clone());
+            }
+        }
+    }
+    if let Some(snap) = snapshot {
+        let _ = save_dispute_state(&snap);
+        emit_event(
+            event_tx,
+            "dispute.resolved",
+            serde_json::json!({
+                "agreement_hash": agreement_hash,
+                "outcome": outcome,
+                "resolver_role": resolver_role,
+                "source": "p2p",
+            }),
+        );
+    }
+}
+
+fn process_received_dispute_escalated(
+    json: &str,
+    disputes: &Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
+    event_tx: &EventTx,
+) {
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let agreement_hash = match v.get("agreement_hash").and_then(|x| x.as_str()) {
+        Some(h) => h.to_string(),
+        None => return,
+    };
+    let escalated_at = v
+        .get("escalated_at_height")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let mut snapshot: Option<DisputeState> = None;
+    {
+        let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = guard.get_mut(&agreement_hash) {
+            if d.is_open() && !d.escalated_to_fallback {
+                d.escalated_to_fallback = true;
+                d.escalated_at_height = Some(escalated_at);
+                snapshot = Some(d.clone());
+            }
+        }
+    }
+    if let Some(snap) = snapshot {
+        let _ = save_dispute_state(&snap);
+        emit_event(
+            event_tx,
+            "dispute.escalated",
+            serde_json::json!({
+                "agreement_hash": agreement_hash,
+                "escalated_at_height": escalated_at,
+                "source": "p2p",
+            }),
+        );
     }
 }
