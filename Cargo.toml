@@ -23,7 +23,10 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # /ws event stream for auto-release. rustls flavour matches the rest of
 # the dep tree (reqwest already uses rustls-tls). Pinned to 0.21 to match
 # the tokio 1.x ecosystem of the rest of the workspace.
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# GROUP C ws client. TLS feature intentionally disabled — wallet only connects
+# to local iriumd via ws://127.0.0.1; pulling in rustls-tls-webpki-roots drags in
+# rustls-webpki 0.102.8 which has 4 open RustSec advisories and breaks cargo audit.
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }
 axum = { version = "0.7", features = ["macros", "ws"] }
 
 axum-server = { version = "0.8", features = ["tls-rustls"] }
