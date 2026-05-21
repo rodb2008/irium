@@ -83,6 +83,89 @@ impl BlockHeader {
             offset,
         ))
     }
+
+    /// Serialize the 80-byte header using the byte-order convention valid at
+    /// `height`. Pre-`STANDARD_HEADER_ACTIVATION_HEIGHT` reverses BOTH
+    /// prev_hash and merkle_root before writing (iriumd historical). At/post
+    /// activation only prev_hash is reversed; merkle_root is written natural,
+    /// matching Bitcoin standard wire format. See constants.rs for the
+    /// rationale and Fix 2a migration plan.
+    #[allow(dead_code)]
+    pub fn serialize_for_height(&self, height: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(80);
+        out.extend_from_slice(&self.version.to_le_bytes());
+        let mut prev = self.prev_hash;
+        prev.reverse();
+        out.extend_from_slice(&prev);
+        let mut merkle = self.merkle_root;
+        if height < crate::constants::STANDARD_HEADER_ACTIVATION_HEIGHT {
+            merkle.reverse();
+        }
+        out.extend_from_slice(&merkle);
+        out.extend_from_slice(&self.time.to_le_bytes());
+        out.extend_from_slice(&self.bits.to_le_bytes());
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+        out
+    }
+
+    /// Hash the 80-byte header using the byte-order convention valid at
+    /// `height`. Returns display-order bytes (Bitcoin convention for block
+    /// hashes shown to users / used in prev_hash fields of subsequent blocks).
+    #[allow(dead_code)]
+    pub fn hash_for_height(&self, height: u64) -> [u8; 32] {
+        let ser = self.serialize_for_height(height);
+        let mut h = header_hash(&[&ser]);
+        h.reverse();
+        h
+    }
+
+    /// Deserialize a header from the 80-byte compact encoding using the
+    /// byte-order convention valid at `height`. Mirror of
+    /// `serialize_for_height`: pre-activation reverses both prev_hash and
+    /// merkle_root after reading; at/post-activation only prev_hash is reversed.
+    #[allow(dead_code)]
+    pub fn deserialize_for_height(raw: &[u8], height: u64) -> Result<(Self, usize), String> {
+        if raw.len() < 80 {
+            return Err("header too short".to_string());
+        }
+        let mut offset = 0usize;
+        let read_u32 = |buf: &[u8], off: &mut usize| -> Result<u32, String> {
+            if *off + 4 > buf.len() {
+                return Err("unexpected EOF".to_string());
+            }
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&buf[*off..*off + 4]);
+            *off += 4;
+            Ok(u32::from_le_bytes(bytes))
+        };
+
+        let version = read_u32(raw, &mut offset)?;
+        let mut prev_hash = [0u8; 32];
+        prev_hash.copy_from_slice(&raw[offset..offset + 32]);
+        prev_hash.reverse();
+        offset += 32;
+        let mut merkle_root = [0u8; 32];
+        merkle_root.copy_from_slice(&raw[offset..offset + 32]);
+        if height < crate::constants::STANDARD_HEADER_ACTIVATION_HEIGHT {
+            merkle_root.reverse();
+        }
+        offset += 32;
+        let time = read_u32(raw, &mut offset)?;
+        let bits = read_u32(raw, &mut offset)?;
+        let nonce = read_u32(raw, &mut offset)?;
+
+        Ok((
+            BlockHeader {
+                version,
+                prev_hash,
+                merkle_root,
+                time,
+                bits,
+                nonce,
+            },
+            offset,
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
