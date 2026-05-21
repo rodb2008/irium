@@ -1302,13 +1302,53 @@ async fn handle_message(
         .unwrap_or_default();
 
     match method {
+        "mining.configure" => {
+            // Bitaxe / ESP-Miner v2+ sends this before mining.subscribe with the
+            // version-rolling extension. We do not support version-rolling
+            // (the pool builds the header with version=00000001 fixed), so we
+            // return false for the version-rolling result. Returning the JSON
+            // explicitly — instead of falling through to the catch-all
+            // "unsupported method" error — lets recent Bitaxe firmware drop
+            // the AsicBoost flag and continue to mining.subscribe.
+            let resp = json!({
+                "id": id,
+                "result": {
+                    "version-rolling": false,
+                    "version-rolling.mask": "00000000"
+                },
+                "error": null
+            });
+            write_json(wr, &resp).await?;
+        }
+        "mining.suggest_difficulty" => {
+            // Some cgminer-family / Antminer firmware sends a difficulty hint
+            // (mining.suggest_difficulty [diff]) before subscribe. We honour
+            // vardiff regardless; acknowledge with true so the miner does not
+            // log an error or disconnect.
+            let resp = json!({"id": id, "result": true, "error": null});
+            write_json(wr, &resp).await?;
+        }
+        "mining.multi_version" => {
+            // Older Whatsminer BTMiner firmware sends mining.multi_version
+            // to request multi-block-version templates. We do not support it;
+            // return result: false so the miner falls back to single-version
+            // mode rather than treating an error as fatal.
+            let resp = json!({"id": id, "result": false, "error": null});
+            write_json(wr, &resp).await?;
+        }
         "mining.subscribe" => {
+            // Stratum v1: result[2] is extranonce2_size (the number of bytes
+            // the miner must append to extranonce1 in mining.submit). Internally
+            // the snapshot hardcodes 4 (see build_canonical_job_snapshot line ~963);
+            // surface that same 4 here. Previously we incorrectly sent
+            // config.extranonce1_size which happened to be 4 by coincidence —
+            // would have broken any deployment that tuned STRATUM_EXTRANONCE1_SIZE.
             let resp = json!({
                 "id": id,
                 "result": [
                     [["mining.set_difficulty","irium"],["mining.notify","irium"]],
                     hex::encode(&session.extranonce1),
-                    config.extranonce1_size
+                    4u32
                 ],
                 "error": null
             });
