@@ -607,6 +607,14 @@ struct ProofCreateCliOptions {
     expires_at_height: Option<u64>,
     proof_kind: Option<String>,
     reference_id: Option<String>,
+    /// GROUP D: typed_payload.attributes key/value pairs built from
+    /// repeated `--attribute key=value` flags on the CLI. None when no
+    /// --attribute was supplied; Some(_) is a JSON object. Required for
+    /// the 5 standard proof_types (payment_received, delivery_confirmed,
+    /// work_completed, milestone_delivered, deposit_conditions_met) —
+    /// iriumd's submit_proof_rpc rejects proofs that don't carry the
+    /// schema-required keys.
+    attributes: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -3325,12 +3333,21 @@ fn create_settlement_proof_signed(
             payload_hash: String::new(),
         },
         expires_at_height: opts.expires_at_height,
-        typed_payload: opts.proof_kind.as_ref().map(|kind| TypedProofPayload {
-            proof_kind: kind.clone(),
-            content_hash: None,
-            reference_id: opts.reference_id.clone(),
-            attributes: None,
-        }),
+        // GROUP D: build typed_payload when EITHER --proof-kind OR one or
+        // more --attribute key=value flags were supplied. If only
+        // --attribute is set, proof_kind defaults to the proof_type so
+        // the existing validate_typed_proof_payload (which requires a
+        // non-empty proof_kind) is satisfied.
+        typed_payload: if opts.proof_kind.is_some() || opts.attributes.is_some() {
+            Some(TypedProofPayload {
+                proof_kind: opts.proof_kind.clone().unwrap_or_else(|| opts.proof_type.clone()),
+                content_hash: None,
+                reference_id: opts.reference_id.clone(),
+                attributes: opts.attributes.clone(),
+            })
+        } else {
+            None
+        },
     };
 
     let payload_bytes = settlement_proof_payload_bytes(&proof)
@@ -5662,6 +5679,9 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
     let mut expires_at_height: Option<u64> = None;
     let mut proof_kind: Option<String> = None;
     let mut reference_id: Option<String> = None;
+    // GROUP D: collect repeated --attribute key=value into a serde_json::Map.
+    let mut attr_map: serde_json::Map<String, serde_json::Value> =
+        serde_json::Map::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -5775,12 +5795,50 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
                 }
                 rpc_url = Some(args[i].clone());
             }
+            // GROUP D: --attribute key=value. Repeatable. Numeric-looking
+            // values (parseable as i64 / u64 / f64) are stored as JSON
+            // numbers; everything else stays a JSON string. Bare 'true'
+            // and 'false' parse as JSON booleans for ergonomic ease.
+            "--attribute" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--attribute requires key=value".to_string());
+                }
+                let raw = &args[i];
+                let (k, v) = raw.split_once('=').ok_or_else(|| {
+                    format!("--attribute must be key=value, got: {raw}")
+                })?;
+                let key = k.trim().to_string();
+                if key.is_empty() {
+                    return Err("--attribute key must not be empty".to_string());
+                }
+                let val_str = v.trim();
+                let value: serde_json::Value = if let Ok(n) = val_str.parse::<i64>() {
+                    serde_json::Value::from(n)
+                } else if let Ok(n) = val_str.parse::<u64>() {
+                    serde_json::Value::from(n)
+                } else if let Ok(f) = val_str.parse::<f64>() {
+                    serde_json::Value::from(f)
+                } else if val_str == "true" {
+                    serde_json::Value::Bool(true)
+                } else if val_str == "false" {
+                    serde_json::Value::Bool(false)
+                } else {
+                    serde_json::Value::String(val_str.to_string())
+                };
+                attr_map.insert(key, value);
+            }
             other => {
                 return Err(format!("unknown argument: {}", other));
             }
         }
         i += 1;
     }
+    let attributes = if attr_map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(attr_map))
+    };
     Ok(ProofCreateCliOptions {
         agreement_hash: agreement_hash.ok_or_else(|| "--agreement-hash is required".to_string())?,
         proof_type: proof_type.ok_or_else(|| "--proof-type is required".to_string())?,
@@ -5797,6 +5855,7 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
         expires_at_height,
         proof_kind,
         reference_id,
+        attributes,
     })
 }
 
@@ -7160,6 +7219,7 @@ fn handle_otc_attest(args: &[String]) -> Result<(), String> {
         expires_at_height: None,
         proof_kind: None,
         reference_id: None,
+        attributes: None,
     };
     let proof = create_settlement_proof_signed(&opts, attestation_time)?;
 
@@ -15816,6 +15876,7 @@ mod tests {
             expires_at_height: None,
             proof_kind: None,
             reference_id: None,
+            attributes: None,
         };
 
         let proof = create_settlement_proof_signed(&opts, 1700000000).expect("must create proof");
@@ -15927,6 +15988,7 @@ mod tests {
             expires_at_height: None,
             proof_kind: None,
             reference_id: None,
+            attributes: None,
         };
 
         let proof = create_settlement_proof_signed(&opts, 1700001234).expect("must create proof");

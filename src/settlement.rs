@@ -4083,6 +4083,137 @@ pub fn validate_typed_proof_payload(
     Ok(())
 }
 
+// ─── GROUP D: Proof Schema Registry ────────────────────────────────────
+// Each standard proof_type carries a list of required attribute keys that
+// MUST be present in `typed_payload.attributes` (a JSON object). Proofs
+// with an unknown `proof_type` (anything not in STANDARD_PROOF_SCHEMAS)
+// pass through unchallenged so legacy clients and future proof types
+// keep working — that's the forward-compatibility guarantee.
+//
+// v1 enforcement model:
+//   - presence-only: each required field must be a key in attributes and
+//     non-null. Type validation (numeric `amount`, positive `timestamp`,
+//     hex-format `*_hash`, etc) is deliberately NOT enforced in v1.
+//   - strict going forward: a proof with `proof_type = "payment_received"`
+//     and no typed_payload (or typed_payload without the required keys)
+//     is REJECTED at /rpc/submitproof. Pre-FIX-1 clients that haven't
+//     been updated will surface the schema validation error and must
+//     upgrade.
+//
+// Standard schemas registered in this commit (per GROUP D spec):
+//   payment_received        : payment_method, payment_reference, amount, currency, timestamp
+//   delivery_confirmed      : delivery_method, tracking_reference, delivery_address_hash, timestamp
+//   work_completed          : deliverable_hash, completion_notes, timestamp
+//   milestone_delivered     : milestone_id, deliverable_hash, completion_notes, timestamp
+//   deposit_conditions_met  : condition_description, evidence_hash, timestamp
+//
+// Note: legacy proof_type strings (e.g. "delivery_confirmation",
+// "otc_release", "delivery_confirmation") are NOT in this list. They
+// pass through as unknown and continue working as today.
+
+/// A single proof_type schema entry. Required fields must all appear as
+/// keys in the proof's typed_payload.attributes JSON object.
+#[derive(Debug, Clone, Copy)]
+pub struct ProofSchema {
+    pub proof_type: &'static str,
+    pub required_fields: &'static [&'static str],
+}
+
+pub const STANDARD_PROOF_SCHEMAS: &[ProofSchema] = &[
+    ProofSchema {
+        proof_type: "payment_received",
+        required_fields: &[
+            "payment_method",
+            "payment_reference",
+            "amount",
+            "currency",
+            "timestamp",
+        ],
+    },
+    ProofSchema {
+        proof_type: "delivery_confirmed",
+        required_fields: &[
+            "delivery_method",
+            "tracking_reference",
+            "delivery_address_hash",
+            "timestamp",
+        ],
+    },
+    ProofSchema {
+        proof_type: "work_completed",
+        // milestone_id is optional per spec — omit from required_fields.
+        required_fields: &["deliverable_hash", "completion_notes", "timestamp"],
+    },
+    ProofSchema {
+        proof_type: "milestone_delivered",
+        required_fields: &[
+            "milestone_id",
+            "deliverable_hash",
+            "completion_notes",
+            "timestamp",
+        ],
+    },
+    ProofSchema {
+        proof_type: "deposit_conditions_met",
+        required_fields: &["condition_description", "evidence_hash", "timestamp"],
+    },
+];
+
+/// Returns the schema for a known proof_type, or None if the proof_type
+/// is unknown (and therefore not subject to schema validation).
+pub fn lookup_proof_schema(proof_type: &str) -> Option<&'static ProofSchema> {
+    STANDARD_PROOF_SCHEMAS
+        .iter()
+        .find(|s| s.proof_type == proof_type)
+}
+
+/// GROUP D: validate a proof against its registered schema. Returns
+/// Ok(()) for any proof_type not in STANDARD_PROOF_SCHEMAS (forward
+/// compatibility). For registered types, requires typed_payload to
+/// exist, typed_payload.attributes to be a JSON object, and every
+/// required field to be a present non-null key in that object.
+pub fn validate_proof_against_schema(proof: &SettlementProof) -> Result<(), String> {
+    let Some(schema) = lookup_proof_schema(&proof.proof_type) else {
+        return Ok(());
+    };
+    let Some(tp) = proof.typed_payload.as_ref() else {
+        return Err(format!(
+            "proof_type '{}' requires typed_payload with attributes: [{}]",
+            schema.proof_type,
+            schema.required_fields.join(", ")
+        ));
+    };
+    let attrs_val = tp.attributes.as_ref().ok_or_else(|| {
+        format!(
+            "proof_type '{}' requires typed_payload.attributes (got None); required: [{}]",
+            schema.proof_type,
+            schema.required_fields.join(", ")
+        )
+    })?;
+    let obj = attrs_val.as_object().ok_or_else(|| {
+        format!(
+            "proof_type '{}': typed_payload.attributes must be a JSON object",
+            schema.proof_type
+        )
+    })?;
+    let mut missing: Vec<&str> = Vec::new();
+    for field in schema.required_fields {
+        match obj.get(*field) {
+            None => missing.push(*field),
+            Some(v) if v.is_null() => missing.push(*field),
+            _ => {}
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "proof_type '{}' missing required field(s): [{}]",
+            schema.proof_type,
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 pub fn verify_settlement_proof(
     proof: &SettlementProof,
     policy: &ProofPolicy,
@@ -4840,6 +4971,11 @@ impl ProofStore {
             validate_typed_proof_payload(tp, proof.evidence_hash.as_deref())
                 .map_err(|e| format!("typed_payload validation: {e}"))?;
         }
+        // GROUP D: proof schema registry — proof_types with a registered
+        // schema must carry typed_payload.attributes with all required keys.
+        // Unknown proof_types pass through (forward compatibility).
+        validate_proof_against_schema(&proof)
+            .map_err(|e| format!("schema validation: {e}"))?;
         verify_settlement_proof_signature_only(&proof)?;
         let agreement_hash = proof.agreement_hash.clone();
         let proof_id = proof.proof_id.clone();
@@ -10807,5 +10943,167 @@ mod stage_3_1_tests {
         assert!(payload.len() <= 75, "OP_RETURN cap exceeded: {}", payload.len());
         let txout = build_agreement_anchor_output(&anchor).expect("output");
         assert_eq!(txout.value, 0);
+    }
+
+    // ── GROUP D: proof schema registry validation tests ──────────────
+
+    fn group_d_proof(
+        proof_type: &str,
+        typed_payload: Option<TypedProofPayload>,
+    ) -> SettlementProof {
+        SettlementProof {
+            proof_id: "p-d-test".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: proof_type.to_string(),
+            agreement_hash: "a".repeat(64),
+            milestone_id: None,
+            attested_by: "attestor-1".to_string(),
+            attestation_time: 1_700_000_000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: "00".repeat(33),
+                signature_hex: "00".repeat(64),
+                payload_hash: "00".repeat(32),
+            },
+            expires_at_height: None,
+            typed_payload,
+        }
+    }
+
+    fn typed_payload_with_attrs(attrs: serde_json::Value) -> TypedProofPayload {
+        TypedProofPayload {
+            proof_kind: "test".to_string(),
+            content_hash: None,
+            reference_id: None,
+            attributes: Some(attrs),
+        }
+    }
+
+    #[test]
+    fn group_d_schema_unknown_proof_type_passes() {
+        let proof = group_d_proof("legacy_made_up_type", None);
+        validate_proof_against_schema(&proof).expect("unknown type must pass");
+    }
+
+    #[test]
+    fn group_d_schema_legacy_delivery_confirmation_passes() {
+        // The legacy '-ation' string is NOT in the schema registry; the new
+        // '-ed' string IS. Legacy proofs continue working unchanged.
+        let proof = group_d_proof("delivery_confirmation", None);
+        validate_proof_against_schema(&proof).expect("legacy string must pass");
+    }
+
+    #[test]
+    fn group_d_schema_payment_received_full_payload_accepted() {
+        let attrs = serde_json::json!({
+            "payment_method": "bank-transfer",
+            "payment_reference": "REF-12345",
+            "amount": 250.0,
+            "currency": "USD",
+            "timestamp": 1_700_000_000_u64,
+        });
+        let proof = group_d_proof(
+            "payment_received",
+            Some(typed_payload_with_attrs(attrs)),
+        );
+        validate_proof_against_schema(&proof).expect("full payload must pass");
+    }
+
+    #[test]
+    fn group_d_schema_payment_received_missing_amount_rejected() {
+        let attrs = serde_json::json!({
+            "payment_method": "bank-transfer",
+            "payment_reference": "REF-12345",
+            "currency": "USD",
+            "timestamp": 1_700_000_000_u64,
+        });
+        let proof = group_d_proof(
+            "payment_received",
+            Some(typed_payload_with_attrs(attrs)),
+        );
+        let err = validate_proof_against_schema(&proof).unwrap_err();
+        assert!(
+            err.contains("amount"),
+            "error must name missing 'amount' field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_d_schema_payment_received_no_typed_payload_rejected() {
+        let proof = group_d_proof("payment_received", None);
+        let err = validate_proof_against_schema(&proof).unwrap_err();
+        assert!(err.contains("typed_payload"));
+        assert!(err.contains("payment_method"), "error must list required fields, got: {err}");
+    }
+
+    #[test]
+    fn group_d_schema_milestone_delivered_missing_milestone_id_rejected() {
+        let attrs = serde_json::json!({
+            "deliverable_hash": "ab".repeat(32),
+            "completion_notes": "shipped",
+            "timestamp": 1_700_000_000_u64,
+        });
+        let proof = group_d_proof(
+            "milestone_delivered",
+            Some(typed_payload_with_attrs(attrs)),
+        );
+        let err = validate_proof_against_schema(&proof).unwrap_err();
+        assert!(
+            err.contains("milestone_id"),
+            "error must name missing 'milestone_id', got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_d_schema_attributes_not_object_rejected() {
+        let proof = group_d_proof(
+            "payment_received",
+            Some(typed_payload_with_attrs(serde_json::json!("not an object"))),
+        );
+        let err = validate_proof_against_schema(&proof).unwrap_err();
+        assert!(
+            err.contains("attributes must be a JSON object"),
+            "error must reject non-object attributes, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_d_schema_work_completed_milestone_id_optional() {
+        // milestone_id is in the spec as optional for work_completed; the
+        // registry leaves it out of required_fields so a proof without it
+        // is accepted.
+        let attrs = serde_json::json!({
+            "deliverable_hash": "cd".repeat(32),
+            "completion_notes": "draft v2",
+            "timestamp": 1_700_000_000_u64,
+        });
+        let proof = group_d_proof(
+            "work_completed",
+            Some(typed_payload_with_attrs(attrs)),
+        );
+        validate_proof_against_schema(&proof)
+            .expect("work_completed without milestone_id must pass");
+    }
+
+    #[test]
+    fn group_d_schema_null_field_treated_as_missing() {
+        let attrs = serde_json::json!({
+            "payment_method": "bank-transfer",
+            "payment_reference": "REF-12345",
+            "amount": serde_json::Value::Null,
+            "currency": "USD",
+            "timestamp": 1_700_000_000_u64,
+        });
+        let proof = group_d_proof(
+            "payment_received",
+            Some(typed_payload_with_attrs(attrs)),
+        );
+        let err = validate_proof_against_schema(&proof).unwrap_err();
+        assert!(
+            err.contains("amount"),
+            "null value must count as missing, got: {err}"
+        );
     }
 }
