@@ -5,6 +5,12 @@ mod block;
 mod chain;
 mod constants;
 mod genesis;
+// Pulled in so chain.rs's `#[cfg(test)] mod tests` can reference
+// `crate::mempool::evict_invalid_mempool_entries` and `MempoolManager`
+// when `cargo test --all` builds tests for this thin secondary binary.
+// Not used by main() itself.
+#[allow(dead_code)]
+mod mempool;
 mod pow;
 mod tx;
 
