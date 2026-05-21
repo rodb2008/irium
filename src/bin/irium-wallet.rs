@@ -7367,6 +7367,17 @@ struct IrmOffer {
     source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seller_pubkey: Option<String>,
+    /// FIX 3: the trade template the seller is offering. One of
+    /// "otc" (default — current behaviour), "freelance", "milestone",
+    /// "deposit". Pre-FIX-3 offers default to "otc" via the
+    /// Option-is-None branch in handle_offer_take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    template_type: Option<String>,
+    /// FIX 3: number of milestones when template_type=="milestone" or
+    /// "contractor". Seller defines the trade structure at offer-create
+    /// time; the buyer can only accept or decline the whole offer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    milestone_count: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -7479,12 +7490,37 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
     let mut price_note: Option<String> = None;
     let mut payment_instructions: Option<String> = None;
     let mut offer_id: Option<String> = None;
+    // FIX 3: settlement template + milestone count. Both optional;
+    // unset means "otc" (legacy default) and 1 milestone respectively.
+    let mut template_type: Option<String> = None;
+    let mut milestone_count: Option<u32> = None;
     let mut json_mode = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--seller" => {
                 seller = Some(parse_required_string_flag(args, &mut i, "--seller")?);
+            }
+            "--template-type" => {
+                let raw = parse_required_string_flag(args, &mut i, "--template-type")?;
+                let normalized = raw.trim().to_lowercase();
+                if !matches!(normalized.as_str(), "otc" | "freelance" | "milestone" | "deposit") {
+                    return Err(format!(
+                        "--template-type must be otc|freelance|milestone|deposit, got: {}",
+                        raw
+                    ));
+                }
+                template_type = Some(normalized);
+            }
+            "--milestone-count" => {
+                let raw = parse_required_string_flag(args, &mut i, "--milestone-count")?;
+                let n = raw.parse::<u32>().map_err(|_| {
+                    "--milestone-count must be a positive integer".to_string()
+                })?;
+                if n == 0 {
+                    return Err("--milestone-count must be at least 1".to_string());
+                }
+                milestone_count = Some(n);
             }
             "--amount" => {
                 amount = Some(parse_irm(&parse_required_string_flag(
@@ -7558,6 +7594,14 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
         buyer_address: None,
         taken_at: None,
         taken_at_height: None,
+        // FIX 3: persist template + milestone count so handle_offer_take
+        // can dispatch to the right agreement builder.
+        template_type: template_type.clone(),
+        milestone_count: milestone_count.or_else(|| {
+            // Default 1 only when template requires milestones; leave None
+            // for otc/freelance/deposit so the offer JSON stays compact.
+            if matches!(template_type.as_deref(), Some("milestone")) { Some(1) } else { None }
+        }),
         source: Some("local".to_string()),
         seller_pubkey,
     };
@@ -8000,20 +8044,107 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
         format!("offer-doc-{}-{}", agreement_id, now).as_bytes(),
     ));
 
-    let agreement = build_otc_agreement(
-        agreement_id.clone(),
-        now,
-        buyer_party,
-        seller_party,
-        offer.amount_irm,
-        "IRM".to_string(),
-        offer.payment_method.clone(),
-        offer.timeout_height,
-        secret_hash,
-        doc_hash,
-        None,
-        None,
-    )?;
+    // FIX 3: dispatch to the correct agreement builder based on the
+    // seller's chosen template. Pre-FIX-3 offers (no template_type) get
+    // the legacy OTC path for back-compat.
+    let template = offer.template_type.as_deref().unwrap_or("otc");
+    let agreement = match template {
+        "otc" => build_otc_agreement(
+            agreement_id.clone(),
+            now,
+            buyer_party,
+            seller_party,
+            offer.amount_irm,
+            "IRM".to_string(),
+            offer.payment_method.clone(),
+            offer.timeout_height,
+            secret_hash,
+            doc_hash,
+            None,
+            None,
+        )?,
+        "freelance" => build_simple_settlement_agreement(
+            agreement_id.clone(),
+            now,
+            buyer_party,    // party_a / payer  = client (buyer)
+            seller_party,   // party_b / payee  = contractor (seller)
+            offer.amount_irm,
+            None,
+            offer.timeout_height,
+            secret_hash,
+            doc_hash,
+            None,
+            Some("Freelance work — release on contractor proof of completion".to_string()),
+            Some("Refund returns to client if no proof submitted before timeout".to_string()),
+            None,
+        )?,
+        "deposit" => build_deposit_agreement(
+            agreement_id.clone(),
+            now,
+            buyer_party,    // payer  = depositor (buyer)
+            seller_party,   // payee  = recipient (seller)
+            offer.amount_irm,
+            "Refundable deposit".to_string(),
+            "Deposit refund returns to depositor on timeout".to_string(),
+            offer.timeout_height,
+            secret_hash,
+            doc_hash,
+            None,
+            None,
+        )?,
+        "milestone" => {
+            // Split total amount + timeline into N equal slices. The seller
+            // chose milestone_count at offer-create; we default to 1 here
+            // for malformed offers so the builder still has something to
+            // chew on. Per-milestone secret_hash is derived deterministically
+            // from the parent secret_hash so the GUI's secret-recovery flow
+            // (FIX 1) can reproduce it.
+            let n = offer.milestone_count.unwrap_or(1).max(1) as u64;
+            let per_amount = offer.amount_irm / n;
+            let mut milestones: Vec<AgreementMilestone> = Vec::with_capacity(n as usize);
+            // Spread per-milestone timeouts linearly between the next block
+            // (timeout_now + 1) and offer.timeout_height.
+            let span = offer.timeout_height.saturating_sub(now);
+            for j in 0..n {
+                let m_timeout = if span > 0 {
+                    now + ((span * (j + 1)) / n)
+                } else {
+                    offer.timeout_height
+                };
+                let m_secret_hash = hex::encode(Sha256::digest(
+                    format!("offer-secret-{}-{}-m{}", agreement_id, now, j + 1).as_bytes(),
+                ));
+                milestones.push(AgreementMilestone {
+                    milestone_id: format!("m{}", j + 1),
+                    title: format!("Milestone {}", j + 1),
+                    amount: per_amount,
+                    recipient_address: offer.seller_address.clone(),
+                    refund_address: buyer_addr.clone(),
+                    secret_hash_hex: m_secret_hash,
+                    timeout_height: m_timeout,
+                    metadata_hash: None,
+                });
+            }
+            build_milestone_agreement(
+                agreement_id.clone(),
+                now,
+                // payer (buyer) -> payee (seller)
+                parse_party_spec(&format!("buyer|Buyer|{}|buyer", buyer_addr))?,
+                parse_party_spec(&format!("seller|Seller|{}|seller", offer.seller_address))?,
+                milestones,
+                offer.timeout_height,
+                doc_hash,
+                None,
+                None,
+            )?
+        }
+        other => {
+            return Err(format!(
+                "unknown template_type in offer {}: {} (expected otc|freelance|milestone|deposit)",
+                offer.offer_id, other
+            ));
+        }
+    };
 
     let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
     let saved_path = save_agreement_to_store_at(&imported_agreements_dir(), &agreement)?;
