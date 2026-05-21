@@ -308,3 +308,207 @@ impl Block {
         out
     }
 }
+
+#[cfg(test)]
+mod fix2a_boundary_tests {
+    //! Fix 2a hard-fork boundary tests for BlockHeader::*_for_height.
+    //!
+    //! The fork at STANDARD_HEADER_ACTIVATION_HEIGHT (= 30_000) flips the
+    //! merkle byte-order convention in the 80-byte wire header. Below the
+    //! activation height the merkle_root field is reversed before writing
+    //! (legacy iriumd convention); at and above the activation height it is
+    //! written natural-order (Bitcoin standard). The prev_hash convention
+    //! does NOT change at the fork.
+    //!
+    //! These tests pin the boundary behavior at heights 29_999 / 30_000 /
+    //! 30_001 and verify byte equivalence with the legacy serialize() for
+    //! all pre-fork heights.
+    use super::*;
+    use crate::constants::STANDARD_HEADER_ACTIVATION_HEIGHT;
+
+    fn sample_header() -> BlockHeader {
+        // Non-palindromic prev/merkle so byte-reversal differences are visible.
+        let mut prev = [0u8; 32];
+        for (i, b) in prev.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let mut merkle = [0u8; 32];
+        for (i, b) in merkle.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(13).wrapping_add(17);
+        }
+        BlockHeader {
+            version: 1,
+            prev_hash: prev,
+            merkle_root: merkle,
+            time: 0x6a0e_d4c0,
+            bits: 0x1b00_ffff,
+            nonce: 0xdead_beef,
+        }
+    }
+
+    /// Sanity: the activation height constant is the expected value.
+    #[test]
+    fn activation_height_is_30_000() {
+        assert_eq!(STANDARD_HEADER_ACTIVATION_HEIGHT, 30_000);
+    }
+
+    /// For every pre-fork height (0, 1, 100, … 29_999) the new
+    /// serialize_for_height returns the SAME bytes as the legacy serialize().
+    /// This is the central invariant: no existing chain state can become
+    /// invalid because of this commit.
+    #[test]
+    fn serialize_for_height_matches_legacy_for_all_pre_fork_heights() {
+        let h = sample_header();
+        let legacy = h.serialize();
+        for height in [0u64, 1, 99, 1_000, 22_400, 29_998, 29_999] {
+            assert_eq!(
+                h.serialize_for_height(height),
+                legacy,
+                "pre-fork height {height} must produce legacy bytes",
+            );
+        }
+    }
+
+    /// At and above activation, the bytes DIFFER from legacy specifically at
+    /// the merkle_root window [36..68]. Other regions are unchanged.
+    #[test]
+    fn serialize_for_height_diverges_at_activation_in_merkle_only() {
+        let h = sample_header();
+        let legacy = h.serialize();
+        let post = h.serialize_for_height(STANDARD_HEADER_ACTIVATION_HEIGHT);
+
+        // Version + prev_hash + time + bits + nonce regions are identical.
+        assert_eq!(&legacy[0..4], &post[0..4], "version unchanged");
+        assert_eq!(&legacy[4..36], &post[4..36], "prev_hash unchanged");
+        assert_eq!(&legacy[68..72], &post[68..72], "time unchanged");
+        assert_eq!(&legacy[72..76], &post[72..76], "bits unchanged");
+        assert_eq!(&legacy[76..80], &post[76..80], "nonce unchanged");
+
+        // Merkle window IS different.
+        assert_ne!(&legacy[36..68], &post[36..68], "merkle must differ");
+
+        // Specifically: post-fork bytes equal the stored merkle_root as-is;
+        // pre-fork bytes are the reverse.
+        assert_eq!(&post[36..68], &h.merkle_root[..]);
+        let mut expected_legacy_merkle = h.merkle_root;
+        expected_legacy_merkle.reverse();
+        assert_eq!(&legacy[36..68], &expected_legacy_merkle[..]);
+    }
+
+    /// 29_999 stays pre-fork, 30_000 flips post-fork, 30_001 stays post-fork.
+    #[test]
+    fn boundary_29999_30000_30001() {
+        let h = sample_header();
+        let pre = h.serialize_for_height(29_999);
+        let act = h.serialize_for_height(30_000);
+        let post = h.serialize_for_height(30_001);
+
+        assert_eq!(pre, h.serialize(), "29999 = legacy");
+        assert_ne!(act, pre, "30000 differs from 29999");
+        assert_eq!(act, post, "30000 = 30001 (both post-fork)");
+    }
+
+    /// Round-trip: serialize_for_height(h) -> deserialize_for_height(_, h)
+    /// reconstructs the original struct exactly, on both fork sides.
+    #[test]
+    fn serialize_deserialize_roundtrip_both_sides() {
+        let h = sample_header();
+        for height in [0u64, 22_400, 29_999, 30_000, 30_001, 1_000_000] {
+            let bytes = h.serialize_for_height(height);
+            assert_eq!(bytes.len(), 80);
+            let (parsed, consumed) =
+                BlockHeader::deserialize_for_height(&bytes, height).expect("decode");
+            assert_eq!(consumed, 80);
+            assert_eq!(parsed.version, h.version, "@h={height} version");
+            assert_eq!(parsed.prev_hash, h.prev_hash, "@h={height} prev_hash");
+            assert_eq!(parsed.merkle_root, h.merkle_root, "@h={height} merkle_root");
+            assert_eq!(parsed.time, h.time, "@h={height} time");
+            assert_eq!(parsed.bits, h.bits, "@h={height} bits");
+            assert_eq!(parsed.nonce, h.nonce, "@h={height} nonce");
+        }
+    }
+
+    /// hash_for_height pre-fork == legacy hash().
+    /// hash_for_height post-fork differs (different bytes hashed, different sha256d).
+    #[test]
+    fn hash_for_height_pre_matches_legacy_post_differs() {
+        let h = sample_header();
+        let legacy_hash = h.hash();
+        let pre_hash = h.hash_for_height(29_999);
+        let post_hash = h.hash_for_height(30_000);
+
+        assert_eq!(pre_hash, legacy_hash, "pre-fork hash must match legacy hash()");
+        assert_ne!(post_hash, legacy_hash, "post-fork hash must differ from legacy");
+        assert_ne!(post_hash, pre_hash, "post-fork hash must differ from pre-fork hash");
+    }
+
+    /// peek_prev_hash reads bytes [4..36] reversed regardless of fork side.
+    /// This is fork-invariant: the prev_hash byte-order convention is the
+    /// same pre and post fork.
+    #[test]
+    fn peek_prev_hash_is_fork_invariant() {
+        let h = sample_header();
+        let pre = h.serialize_for_height(29_999);
+        let post = h.serialize_for_height(30_000);
+
+        let peeked_pre = BlockHeader::peek_prev_hash(&pre).expect("peek pre");
+        let peeked_post = BlockHeader::peek_prev_hash(&post).expect("peek post");
+
+        assert_eq!(peeked_pre, h.prev_hash, "peek pre returns stored prev_hash");
+        assert_eq!(peeked_post, h.prev_hash, "peek post returns same prev_hash");
+        assert_eq!(peeked_pre, peeked_post, "peek is fork-invariant");
+    }
+
+    /// peek_prev_hash rejects truncated buffers without panicking.
+    #[test]
+    fn peek_prev_hash_rejects_short_input() {
+        assert!(BlockHeader::peek_prev_hash(&[0u8; 0]).is_err());
+        assert!(BlockHeader::peek_prev_hash(&[0u8; 35]).is_err());
+        // exactly 36 bytes is enough to read the prev_hash field
+        assert!(BlockHeader::peek_prev_hash(&[0u8; 36]).is_ok());
+    }
+
+    /// Cross-fork chain link: block at height 30_000 stores its parent's
+    /// hash_for_height(29_999). This must round-trip through the chain so
+    /// the new block can look up its parent using peek_prev_hash on its
+    /// own wire bytes.
+    #[test]
+    fn cross_fork_chain_link_resolves_parent() {
+        let parent = sample_header();
+        let parent_hash_at_29999 = parent.hash_for_height(29_999);
+
+        // The new block at height 30_000 stores parent_hash_at_29999 as its prev_hash.
+        let mut child = sample_header();
+        child.prev_hash = parent_hash_at_29999;
+        child.nonce = child.nonce.wrapping_add(1);
+
+        // Serialize the child with post-fork rules.
+        let child_bytes = child.serialize_for_height(30_000);
+        // A receiver peeks prev_hash from the wire (fork-invariant peek).
+        let recovered_parent_hash = BlockHeader::peek_prev_hash(&child_bytes).expect("peek");
+
+        assert_eq!(
+            recovered_parent_hash, parent_hash_at_29999,
+            "peek must recover the parent's pre-fork hash from the post-fork child bytes",
+        );
+    }
+
+    /// Block::serialize_for_height composes header bytes correctly with no
+    /// AuxPoW and no transactions (degenerate but covers the helper).
+    #[test]
+    fn block_serialize_for_height_header_only_no_txs_no_auxpow() {
+        let header = sample_header();
+        let block = Block {
+            header: header.clone(),
+            transactions: vec![],
+            auxpow: None,
+        };
+        for height in [0u64, 29_999, 30_000] {
+            assert_eq!(
+                block.serialize_for_height(height),
+                header.serialize_for_height(height),
+                "Block::serialize_for_height({height}) prefix must equal header.serialize_for_height({height})",
+            );
+        }
+    }
+}
