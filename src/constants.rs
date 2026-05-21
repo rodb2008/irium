@@ -61,4 +61,4 @@ pub const LWMA_V2_MAX_TARGET_DOWN_FACTOR: u64 = 2; // unchanged: max 2x harden p
 ///
 /// See src/block.rs::BlockHeader::serialize_for_height for the implementation
 /// and the Fix 2a plan for the migration / activation rationale.
-pub const STANDARD_HEADER_ACTIVATION_HEIGHT: u64 = 30_000;
+pub const STANDARD_HEADER_ACTIVATION_HEIGHT: u64 = 23_500;
