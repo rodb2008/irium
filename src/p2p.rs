@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use crate::block::{Block, BlockHeader};
 use crate::chain::ChainState;
-use crate::mempool::MempoolManager;
+use crate::mempool::{evict_invalid_mempool_entries, MempoolManager};
 use crate::network::{PeerDirectory, PeerRecord};
 use crate::pow::meets_target;
 use crate::protocol::{
@@ -5808,6 +5808,10 @@ impl P2PNode {
                                                         {
                                                             mem_guard.remove(&tx.txid());
                                                         }
+                                                        evict_invalid_mempool_entries(
+                                                            &guard,
+                                                            &mut mem_guard,
+                                                        );
                                                     }
                                                     new_height_opt = Some(new_height);
                                                     record_verdict = Some(true);
@@ -8039,6 +8043,21 @@ async fn handle_incoming_with_sybil(
                                         Ok((new_height, _)) => {
                                             new_height_opt = Some(new_height);
                                             verdict = Some(true);
+                                            // Mempool cleanup while the chain
+                                            // lock is held: txid match first,
+                                            // then drop double-spend conflicts.
+                                            if let Some(ref mem) = mempool2 {
+                                                let mut mem_guard = mem
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                for tx in block.transactions.iter().skip(1) {
+                                                    mem_guard.remove(&tx.txid());
+                                                }
+                                                evict_invalid_mempool_entries(
+                                                    &guard,
+                                                    &mut mem_guard,
+                                                );
+                                            }
                                             if guard.tip_hash() == bhash {
                                                 let tip = guard.tip_height();
                                                 persist_blocks.push((tip, block.clone()));
@@ -8074,13 +8093,11 @@ async fn handle_incoming_with_sybil(
                             for (height, b) in persist_blocks {
                                 let h = b.header.hash_for_height(height);
                                 enqueue_persist_block(height, h, b.clone()).await;
-                                if let Some(ref mem) = mempool2 {
-                                    let mut mem_guard =
-                                        mem.lock().unwrap_or_else(|e| e.into_inner());
-                                    for tx in b.transactions.iter().skip(1) {
-                                        mem_guard.remove(&tx.txid());
-                                    }
-                                }
+                                // Mempool eviction has moved into the
+                                // spawn_blocking_limited closure above so it
+                                // can run with the chain lock held and also
+                                // evict double-spend conflicts (not just txid
+                                // matches).
                             }
                             sync_perf_record(decode_ms, precheck_ms, connect_ms, 0);
 

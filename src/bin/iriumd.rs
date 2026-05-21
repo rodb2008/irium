@@ -44,7 +44,7 @@ use irium_node_rs::chain::{
 };
 use irium_node_rs::constants::{block_reward, COINBASE_MATURITY};
 use irium_node_rs::genesis::load_locked_genesis;
-use irium_node_rs::mempool::MempoolManager;
+use irium_node_rs::mempool::{evict_invalid_mempool_entries, MempoolManager};
 use irium_node_rs::network::SeedlistManager;
 use irium_node_rs::network_era::network_era;
 use irium_node_rs::p2p::P2PNode;
@@ -7406,6 +7406,19 @@ async fn submit_block(
             return Err(StatusCode::BAD_REQUEST);
         }
 
+        // Two-pass mempool cleanup while the chain lock is still held so the
+        // post-block UTXO set is what validate_transaction sees:
+        //   1) drop transactions included in this block by txid match
+        //   2) drop transactions that conflict with the new block's UTXOs
+        //      (double-spends), which a plain txid match never catches.
+        {
+            let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+            for tx in block.transactions.iter().skip(1) {
+                mempool.remove(&tx.txid());
+            }
+            evict_invalid_mempool_entries(&chain, &mut mempool);
+        }
+
         let new_tip_h = chain.tip_height();
         let tip_hash = block.header.hash_for_height(new_tip_h);
         (new_tip_h, hex::encode(tip_hash))
@@ -7432,15 +7445,6 @@ async fn submit_block(
         storage::write_block_json_with_source(req.height, &block, req.submit_source.as_deref())
     {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    // Remove any included transactions from the HTTP mempool.
-    {
-        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        for tx in block.transactions.iter().skip(1) {
-            let txid = tx.txid();
-            mempool.remove(&txid);
-        }
     }
 
     // Broadcast the newly accepted block over P2P if enabled.

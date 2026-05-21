@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::chain::ChainState;
 use crate::tx::{decode_full_tx, Transaction};
 
 #[derive(Debug, Clone)]
@@ -273,6 +274,36 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// After a block has been connected, drop any mempool transactions that no
+/// longer validate against the chain (e.g. their inputs were spent by the
+/// new block — a double-spend conflict — or their signatures became invalid
+/// after a reorg). Returns the number of evictions.
+///
+/// The caller must already hold the chain lock so the validation result
+/// reflects the post-block UTXO set. Mempool eviction is recorded to
+/// `pending.json` via `remove`'s persist hook.
+pub fn evict_invalid_mempool_entries(
+    chain: &ChainState,
+    mempool: &mut MempoolManager,
+) -> usize {
+    let candidates = mempool.ordered_transactions();
+    let mut evicted = 0;
+    for tx in &candidates {
+        if let Err(reason) = chain.validate_transaction(tx) {
+            let txid = tx.txid();
+            if mempool.remove(&txid) {
+                evicted += 1;
+                eprintln!(
+                    "[mempool] evicted {} after block connect: {}",
+                    hex::encode(txid),
+                    reason
+                );
+            }
+        }
+    }
+    evicted
 }
 
 #[cfg(test)]

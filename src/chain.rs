@@ -3512,4 +3512,183 @@ mod tests {
             "1-of-2 refund (key index 1)"
         );
     }
+
+    // ----- Mempool eviction on block connect (FIX 2) -----
+
+    fn fresh_mempool_path(label: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "irium_chain_mempool_evict_{}_{}_{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn build_signed_spend(
+        chain: &ChainState,
+        sender: &SigningKey,
+        prev: &OutPoint,
+        value: u64,
+        recipient_pkh: [u8; 20],
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: prev.txid,
+                prev_index: prev.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value,
+                script_pubkey: p2pkh_script(&recipient_pkh),
+            }],
+            locktime: 0,
+        };
+        let utxo_script = chain.utxos.get(prev).unwrap().output.script_pubkey.clone();
+        tx.inputs[0].script_sig = p2pkh_witness(&tx, 0, &utxo_script, sender);
+        tx
+    }
+
+    #[test]
+    fn evict_invalid_mempool_entries_drops_double_spend() {
+        let mut chain = base_chain(None);
+        let sender = signing_key(11);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 10_000);
+        let tx = build_signed_spend(&chain, &sender, &prev, 5_000, [0xaa; 20]);
+        assert!(
+            chain.validate_transaction(&tx).is_ok(),
+            "test setup: signed spend must validate against fresh chain"
+        );
+
+        let path = fresh_mempool_path("double_spend");
+        let mut mempool =
+            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0);
+        let raw = tx.serialize();
+        mempool
+            .add_transaction(tx.clone(), raw, 0)
+            .expect("admit tx to mempool");
+        assert_eq!(mempool.len(), 1);
+
+        // Simulate a block that connected a *different* transaction which
+        // spent the same UTXO: remove the prev outpoint from chain.utxos
+        // (that's what ChainState::connect_block does internally via the
+        // undo log). The mempool entry now references a missing UTXO.
+        chain.utxos.remove(&prev);
+
+        let evicted =
+            crate::mempool::evict_invalid_mempool_entries(&chain, &mut mempool);
+        assert_eq!(evicted, 1, "double-spend conflict must be evicted");
+        assert_eq!(mempool.len(), 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn evict_invalid_mempool_entries_keeps_valid_tx_unchanged() {
+        let mut chain = base_chain(None);
+        let sender = signing_key(12);
+        let prev = add_spendable_p2pkh_utxo(&mut chain, &sender, 10_000);
+        let tx = build_signed_spend(&chain, &sender, &prev, 5_000, [0xbb; 20]);
+        assert!(chain.validate_transaction(&tx).is_ok());
+
+        let path = fresh_mempool_path("valid_kept");
+        let mut mempool =
+            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0);
+        let raw = tx.serialize();
+        mempool
+            .add_transaction(tx.clone(), raw, 0)
+            .expect("admit tx to mempool");
+        assert_eq!(mempool.len(), 1);
+
+        // No conflict: chain still has the UTXO; tx is still valid.
+        let evicted =
+            crate::mempool::evict_invalid_mempool_entries(&chain, &mut mempool);
+        assert_eq!(evicted, 0, "still-valid tx must not be evicted");
+        assert_eq!(mempool.len(), 1);
+        assert!(mempool.contains(&tx.txid()));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn evict_invalid_mempool_entries_drops_all_conflicts_in_one_pass() {
+        let mut chain = base_chain(None);
+        let sender = signing_key(13);
+        let pkh = key_hash(&sender);
+
+        // Three separate UTXOs spendable by the same key. add_spendable_p2pkh_utxo
+        // uses a fixed prev txid [7u8; 32], so for the other two we insert
+        // directly with distinct keys.
+        let prev0 = add_spendable_p2pkh_utxo(&mut chain, &sender, 10_000);
+        let prev1 = OutPoint {
+            txid: [8u8; 32],
+            index: 0,
+        };
+        chain.utxos.insert(
+            prev1.clone(),
+            UtxoEntry {
+                output: TxOutput {
+                    value: 10_000,
+                    script_pubkey: p2pkh_script(&pkh),
+                },
+                height: chain.tip_height(),
+                is_coinbase: false,
+            },
+        );
+        let prev2 = OutPoint {
+            txid: [9u8; 32],
+            index: 0,
+        };
+        chain.utxos.insert(
+            prev2.clone(),
+            UtxoEntry {
+                output: TxOutput {
+                    value: 10_000,
+                    script_pubkey: p2pkh_script(&pkh),
+                },
+                height: chain.tip_height(),
+                is_coinbase: false,
+            },
+        );
+
+        let path = fresh_mempool_path("multi_conflict");
+        let mut mempool =
+            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0);
+        for (i, prev) in [&prev0, &prev1, &prev2].iter().enumerate() {
+            let tx = build_signed_spend(
+                &chain,
+                &sender,
+                prev,
+                5_000 + i as u64, // distinct value -> distinct txid
+                [0xcc; 20],
+            );
+            let raw = tx.serialize();
+            mempool
+                .add_transaction(tx, raw, 0)
+                .expect("admit tx to mempool");
+        }
+        assert_eq!(mempool.len(), 3);
+
+        // Remove all three UTXOs (a block confirmed conflicting txs for each).
+        chain.utxos.remove(&prev0);
+        chain.utxos.remove(&prev1);
+        chain.utxos.remove(&prev2);
+
+        let evicted =
+            crate::mempool::evict_invalid_mempool_entries(&chain, &mut mempool);
+        assert_eq!(
+            evicted, 3,
+            "all three conflicting entries must be evicted in one pass"
+        );
+        assert_eq!(mempool.len(), 0);
+
+        let _ = std::fs::remove_file(path);
+    }
 }
