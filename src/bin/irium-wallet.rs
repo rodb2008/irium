@@ -57,11 +57,19 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
 const IRIUM_MULTISIG_VERSION: u8 = 0x28;
 const DEFAULT_FEE_PER_BYTE: u64 = 1;
+
+/// GROUP E: number of blocks to wait after a satisfying proof is observed
+/// before the auto-release watcher (`irium-wallet watch --auto-release`)
+/// will trigger the release transaction. Gives the counterparty a window
+/// to dispute the proof. Applied to freelance and milestone templates;
+/// OTC and deposit do not use it.
+pub const DEFAULT_DISPUTE_WINDOW_BLOCKS: u64 = 144;
 
 #[derive(Serialize, Deserialize)]
 struct WalletFile {
@@ -7962,6 +7970,11 @@ fn handle_offer_show(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// Manual OTC policy builder retained for the `policy-build-otc` CLI's
+// back-compat path and for build_default_otc_policy_sets_correct_fields
+// (tests). GROUP E's auto-policy path goes through build_otc_template_policy
+// which uses proof_type = "payment_received" instead.
+#[allow(dead_code)]
 fn build_default_otc_policy(
     policy_id: &str,
     agreement_hash: &str,
@@ -7999,6 +8012,207 @@ fn build_default_otc_policy(
         expires_at_height: None,
         milestones: vec![],
         holdback: None,
+    }
+}
+
+// GROUP E: auto-policy builder used by handle_offer_take for the OTC
+// template. Differs from build_default_otc_policy (kept for the manual
+// `policy-build-otc` CLI) in two ways:
+//   - proof_type = "payment_received" instead of "otc_release", so the
+//     proof is matched against GROUP D's payment_received schema (must
+//     carry payment_method / payment_reference / amount / currency /
+//     timestamp attributes).
+//   - requirement_id = "req-payment-received".
+// Attestor, no_response_rule, and refund deadline are unchanged.
+fn build_otc_template_policy(
+    policy_id: &str,
+    agreement_hash: &str,
+    seller_pubkey: &str,
+    timeout_height: u64,
+) -> ProofPolicy {
+    ProofPolicy {
+        policy_id: policy_id.to_string(),
+        schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+        agreement_hash: agreement_hash.to_string(),
+        required_proofs: vec![ProofRequirement {
+            requirement_id: "req-payment-received".to_string(),
+            proof_type: "payment_received".to_string(),
+            required_by: Some(timeout_height),
+            required_attestor_ids: vec!["seller-attestor".to_string()],
+            resolution: ProofResolution::Release,
+            milestone_id: None,
+            threshold: None,
+        }],
+        no_response_rules: vec![NoResponseRule {
+            rule_id: "rule-timeout-refund".to_string(),
+            deadline_height: timeout_height,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: Some(
+                "refund if seller never attests payment_received before timeout".to_string(),
+            ),
+        }],
+        attestors: vec![ApprovedAttestor {
+            attestor_id: "seller-attestor".to_string(),
+            pubkey_hex: seller_pubkey.to_string(),
+            display_name: None,
+            domain: None,
+        }],
+        notes: Some(
+            "OTC template policy: seller attests payment_received; release on proof finality."
+                .to_string(),
+        ),
+        expires_at_height: None,
+        milestones: vec![],
+        holdback: None,
+    }
+}
+
+// GROUP E: auto-policy for the freelance template. The contractor
+// (seller in the offer) attests `work_completed`; release fires after
+// the dispute window expires unless the buyer raises a dispute.
+fn build_default_freelance_policy(
+    policy_id: &str,
+    agreement_hash: &str,
+    contractor_pubkey: &str,
+    timeout_height: u64,
+) -> ProofPolicy {
+    ProofPolicy {
+        policy_id: policy_id.to_string(),
+        schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+        agreement_hash: agreement_hash.to_string(),
+        required_proofs: vec![ProofRequirement {
+            requirement_id: "req-work-completed".to_string(),
+            proof_type: "work_completed".to_string(),
+            required_by: Some(timeout_height),
+            required_attestor_ids: vec!["contractor-attestor".to_string()],
+            resolution: ProofResolution::Release,
+            milestone_id: None,
+            threshold: None,
+        }],
+        no_response_rules: vec![NoResponseRule {
+            rule_id: "rule-timeout-refund".to_string(),
+            deadline_height: timeout_height,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: Some(
+                "refund if contractor never attests work_completed before timeout".to_string(),
+            ),
+        }],
+        attestors: vec![ApprovedAttestor {
+            attestor_id: "contractor-attestor".to_string(),
+            pubkey_hex: contractor_pubkey.to_string(),
+            display_name: None,
+            domain: None,
+        }],
+        notes: Some(
+            "Freelance template policy: contractor attests work_completed; release after dispute window."
+                .to_string(),
+        ),
+        expires_at_height: None,
+        milestones: vec![],
+        holdback: None,
+    }
+}
+
+// GROUP E: auto-policy for a single milestone of a milestone-template
+// agreement. N milestones produce N independent policies (one per
+// milestone_id) so each releases on its own clock without waiting on the
+// others. Resolution is MilestoneRelease.
+fn build_default_milestone_policy(
+    policy_id: &str,
+    agreement_hash: &str,
+    contractor_pubkey: &str,
+    milestone_id: &str,
+    timeout_height: u64,
+) -> ProofPolicy {
+    ProofPolicy {
+        policy_id: policy_id.to_string(),
+        schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+        agreement_hash: agreement_hash.to_string(),
+        required_proofs: vec![ProofRequirement {
+            requirement_id: format!("req-milestone-{}", milestone_id),
+            proof_type: "milestone_delivered".to_string(),
+            required_by: Some(timeout_height),
+            required_attestor_ids: vec!["contractor-attestor".to_string()],
+            resolution: ProofResolution::MilestoneRelease,
+            milestone_id: Some(milestone_id.to_string()),
+            threshold: None,
+        }],
+        no_response_rules: vec![NoResponseRule {
+            rule_id: format!("rule-milestone-{}-timeout", milestone_id),
+            deadline_height: timeout_height,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: Some(milestone_id.to_string()),
+            notes: Some(format!(
+                "refund milestone {} if contractor never attests milestone_delivered before timeout",
+                milestone_id
+            )),
+        }],
+        attestors: vec![ApprovedAttestor {
+            attestor_id: "contractor-attestor".to_string(),
+            pubkey_hex: contractor_pubkey.to_string(),
+            display_name: None,
+            domain: None,
+        }],
+        notes: Some(format!(
+            "Milestone {} policy: contractor attests milestone_delivered; release after dispute window.",
+            milestone_id
+        )),
+        expires_at_height: None,
+        milestones: vec![],
+        holdback: None,
+    }
+}
+
+// GROUP E: dispatch by AgreementTemplateType to the right auto-policy
+// builder. Returns None for templates that intentionally have no policy
+// (RefundableDeposit) or for templates not produced by offer-take
+// (MerchantDelayedSettlement, ContractorMilestone). For milestone
+// settlements, returns N policies — one per milestone in agreement.milestones.
+fn build_template_policy(
+    agreement: &AgreementObject,
+    agreement_hash: &str,
+    attestor_pubkey_hex: &str,
+    fallback_timeout_height: u64,
+) -> Option<Vec<ProofPolicy>> {
+    let policy_id_base = format!("pol-{}", agreement.agreement_id);
+    match agreement.template_type {
+        AgreementTemplateType::OtcSettlement => Some(vec![build_otc_template_policy(
+            &policy_id_base,
+            agreement_hash,
+            attestor_pubkey_hex,
+            fallback_timeout_height,
+        )]),
+        AgreementTemplateType::SimpleReleaseRefund => Some(vec![build_default_freelance_policy(
+            &policy_id_base,
+            agreement_hash,
+            attestor_pubkey_hex,
+            fallback_timeout_height,
+        )]),
+        AgreementTemplateType::MilestoneSettlement => {
+            if agreement.milestones.is_empty() {
+                return None;
+            }
+            let mut policies = Vec::with_capacity(agreement.milestones.len());
+            for m in agreement.milestones.iter() {
+                let pol_id = format!("{}-{}", policy_id_base, m.milestone_id);
+                policies.push(build_default_milestone_policy(
+                    &pol_id,
+                    agreement_hash,
+                    attestor_pubkey_hex,
+                    &m.milestone_id,
+                    m.timeout_height,
+                ));
+            }
+            Some(policies)
+        }
+        AgreementTemplateType::RefundableDeposit
+        | AgreementTemplateType::MerchantDelayedSettlement
+        | AgreementTemplateType::ContractorMilestone => None,
     }
 }
 
@@ -8112,7 +8326,7 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     // seller's chosen template. Pre-FIX-3 offers (no template_type) get
     // the legacy OTC path for back-compat.
     let template = offer.template_type.as_deref().unwrap_or("otc");
-    let agreement = match template {
+    let mut agreement = match template {
         "otc" => build_otc_agreement(
             agreement_id.clone(),
             now,
@@ -8210,6 +8424,18 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
         }
     };
 
+    // GROUP E (Q2): freelance and milestone agreements get a fixed
+    // post-proof dispute window so the auto-release watcher waits
+    // DEFAULT_DISPUTE_WINDOW_BLOCKS past proof observation before
+    // releasing. Mutated BEFORE compute_agreement_hash_hex so the hash
+    // covers it; OTC and deposit are unchanged.
+    if matches!(
+        agreement.template_type,
+        AgreementTemplateType::SimpleReleaseRefund | AgreementTemplateType::MilestoneSettlement
+    ) {
+        agreement.deadlines.dispute_window = Some(DEFAULT_DISPUTE_WINDOW_BLOCKS);
+    }
+
     let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
     let saved_path = save_agreement_to_store_at(&imported_agreements_dir(), &agreement)?;
 
@@ -8268,33 +8494,46 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
         }
     }
 
-    // Auto-build and store OTC policy on local node if seller_pubkey is known.
-    let mut auto_policy_id: Option<String> = None;
+    // GROUP E: dispatch the auto-policy build by template_type. OTC and
+    // freelance produce one policy; milestone produces N (one per
+    // milestone); deposit produces none (HTLC timeout is the only path).
+    let mut auto_policy_ids: Vec<String> = Vec::new();
     if let Some(ref pubkey) = offer.seller_pubkey {
-        let pol_id = format!("pol-{}", offer_id);
-        let policy =
-            build_default_otc_policy(&pol_id, &agreement_hash, pubkey, offer.timeout_height);
-        let base = rpc_url.trim_end_matches('/');
-        match rpc_client(base).and_then(|client| {
-            let req = StorePolicyRpcRequest {
-                policy,
-                replace: false,
-            };
-            rpc_post_json::<StorePolicyRpcRequest, StorePolicyRpcResponse>(
-                &client,
-                base,
-                "/rpc/storepolicy",
-                &req,
-            )
-        }) {
-            Ok(_) => {
-                auto_policy_id = Some(pol_id);
-            }
-            Err(e) => {
-                eprintln!("[warn] auto-policy store failed: {}; set policy manually with policy-build-otc", e);
+        if let Some(policies) =
+            build_template_policy(&agreement, &agreement_hash, pubkey, offer.timeout_height)
+        {
+            let base = rpc_url.trim_end_matches('/');
+            for policy in policies.iter() {
+                let pol_id = policy.policy_id.clone();
+                match rpc_client(base).and_then(|client| {
+                    let req = StorePolicyRpcRequest {
+                        policy: policy.clone(),
+                        replace: false,
+                    };
+                    rpc_post_json::<StorePolicyRpcRequest, StorePolicyRpcResponse>(
+                        &client,
+                        base,
+                        "/rpc/storepolicy",
+                        &req,
+                    )
+                }) {
+                    Ok(_) => {
+                        auto_policy_ids.push(pol_id);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[warn] auto-policy store failed for {}: {}; set policy manually with policy-build-otc/contractor/preorder",
+                            pol_id, e
+                        );
+                    }
+                }
             }
         }
     }
+    // Back-compat: external consumers still read auto_policy_id (singular).
+    // Singular is the first auto-stored policy id, or None when nothing
+    // was stored (e.g. deposit template, no seller_pubkey).
+    let auto_policy_id: Option<String> = auto_policy_ids.first().cloned();
 
     if json_mode {
         println!(
@@ -8305,6 +8544,7 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
                 "agreement_hash":  agreement_hash,
                 "saved_path":      saved_path.display().to_string(),
                 "auto_policy_id":  auto_policy_id,
+                "auto_policy_ids": auto_policy_ids,
             }))
             .unwrap()
         );
@@ -8320,8 +8560,15 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     println!("buyer           {}", buyer_addr);
     println!("amount_irm      {} IRM", format_irm(offer.amount_irm));
     println!("saved_path      {}", saved_path.display());
-    if let Some(ref pol_id) = auto_policy_id {
-        println!("policy_id       {} (auto-created)", pol_id);
+    match auto_policy_ids.len() {
+        0 => {}
+        1 => println!("policy_id       {} (auto-created)", auto_policy_ids[0]),
+        n => {
+            println!("policy_ids      {} policies (auto-created):", n);
+            for id in &auto_policy_ids {
+                println!("                  {}", id);
+            }
+        }
     }
     println!();
     println!("=== Next steps ===");
@@ -21124,6 +21371,216 @@ found true"
         assert_eq!(policy.no_response_rules[0].deadline_height, 5000);
     }
 
+    // ── GROUP E: per-template auto-policy builders ───────────────────────────
+
+    fn group_e_test_pubkey() -> &'static str {
+        "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233"
+    }
+
+    fn group_e_test_agreement_hash() -> String {
+        "aabbccdd".repeat(8)
+    }
+
+    fn group_e_make_agreement(
+        template: AgreementTemplateType,
+        milestones: Vec<AgreementMilestone>,
+    ) -> AgreementObject {
+        AgreementObject {
+            agreement_id: "agr-test-1".to_string(),
+            version: 1,
+            schema_id: None,
+            template_type: template,
+            parties: vec![],
+            payer: "p".to_string(),
+            payee: "q".to_string(),
+            mediator_reference: None,
+            total_amount: 1_000_000,
+            network_marker: "IRIUM".to_string(),
+            creation_time: 0,
+            deadlines: irium_node_rs::settlement::AgreementDeadlines {
+                settlement_deadline: None,
+                refund_deadline: Some(5000),
+                dispute_window: None,
+            },
+            release_conditions: vec![],
+            refund_conditions: vec![],
+            milestones,
+            deposit_rule: None,
+            proof_policy_reference: None,
+            asset_reference: None,
+            payment_reference: None,
+            purpose_reference: None,
+            release_summary: None,
+            refund_summary: None,
+            attestor_reference: None,
+            resolver_reference: None,
+            notes: None,
+            document_hash: "00".repeat(32),
+            metadata_hash: None,
+            invoice_reference: None,
+            external_reference: None,
+            disputed_metadata_only: false,
+            primary_resolver: None,
+            fallback_resolver: None,
+            primary_resolver_fee: None,
+            fallback_resolver_fee: None,
+        }
+    }
+
+    #[test]
+    fn group_e_build_otc_template_policy_uses_payment_received() {
+        let policy = build_otc_template_policy(
+            "pol-otc",
+            &group_e_test_agreement_hash(),
+            group_e_test_pubkey(),
+            5000,
+        );
+        assert_eq!(policy.required_proofs.len(), 1);
+        assert_eq!(policy.required_proofs[0].proof_type, "payment_received");
+        assert_eq!(policy.required_proofs[0].requirement_id, "req-payment-received");
+        assert_eq!(policy.attestors.len(), 1);
+        assert_eq!(policy.attestors[0].attestor_id, "seller-attestor");
+        assert_eq!(policy.no_response_rules.len(), 1);
+        assert_eq!(policy.no_response_rules[0].deadline_height, 5000);
+    }
+
+    #[test]
+    fn group_e_build_default_freelance_policy_sets_correct_fields() {
+        let policy = build_default_freelance_policy(
+            "pol-fl",
+            &group_e_test_agreement_hash(),
+            group_e_test_pubkey(),
+            7000,
+        );
+        assert_eq!(policy.policy_id, "pol-fl");
+        assert_eq!(policy.required_proofs.len(), 1);
+        assert_eq!(policy.required_proofs[0].proof_type, "work_completed");
+        assert_eq!(policy.required_proofs[0].required_by, Some(7000));
+        assert_eq!(policy.attestors[0].attestor_id, "contractor-attestor");
+        assert_eq!(policy.no_response_rules.len(), 1);
+        assert_eq!(policy.no_response_rules[0].deadline_height, 7000);
+        assert!(matches!(
+            policy.required_proofs[0].resolution,
+            ProofResolution::Release
+        ));
+    }
+
+    #[test]
+    fn group_e_build_default_milestone_policy_sets_correct_fields() {
+        let policy = build_default_milestone_policy(
+            "pol-ms-m2",
+            &group_e_test_agreement_hash(),
+            group_e_test_pubkey(),
+            "m2",
+            9000,
+        );
+        assert_eq!(policy.policy_id, "pol-ms-m2");
+        assert_eq!(policy.required_proofs.len(), 1);
+        assert_eq!(policy.required_proofs[0].proof_type, "milestone_delivered");
+        assert_eq!(policy.required_proofs[0].requirement_id, "req-milestone-m2");
+        assert_eq!(policy.required_proofs[0].milestone_id.as_deref(), Some("m2"));
+        assert!(matches!(
+            policy.required_proofs[0].resolution,
+            ProofResolution::MilestoneRelease
+        ));
+        assert_eq!(policy.no_response_rules.len(), 1);
+        assert_eq!(policy.no_response_rules[0].deadline_height, 9000);
+        assert_eq!(
+            policy.no_response_rules[0].milestone_id.as_deref(),
+            Some("m2")
+        );
+    }
+
+    #[test]
+    fn group_e_build_template_policy_otc_returns_one_payment_received_policy() {
+        let agr = group_e_make_agreement(AgreementTemplateType::OtcSettlement, vec![]);
+        let result =
+            build_template_policy(&agr, &group_e_test_agreement_hash(), group_e_test_pubkey(), 5000);
+        let policies = result.expect("OTC must produce a policy");
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].policy_id, "pol-agr-test-1");
+        assert_eq!(policies[0].required_proofs[0].proof_type, "payment_received");
+    }
+
+    #[test]
+    fn group_e_build_template_policy_freelance_returns_one_work_completed_policy() {
+        let agr = group_e_make_agreement(AgreementTemplateType::SimpleReleaseRefund, vec![]);
+        let result =
+            build_template_policy(&agr, &group_e_test_agreement_hash(), group_e_test_pubkey(), 6000);
+        let policies = result.expect("freelance must produce a policy");
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].policy_id, "pol-agr-test-1");
+        assert_eq!(policies[0].required_proofs[0].proof_type, "work_completed");
+        assert_eq!(policies[0].required_proofs[0].required_by, Some(6000));
+    }
+
+    #[test]
+    fn group_e_build_template_policy_milestone_returns_n_unique_policies() {
+        let milestones = vec![
+            AgreementMilestone {
+                milestone_id: "m1".to_string(),
+                title: "M1".to_string(),
+                amount: 100,
+                recipient_address: "R".to_string(),
+                refund_address: "B".to_string(),
+                secret_hash_hex: "00".repeat(32),
+                timeout_height: 1000,
+                metadata_hash: None,
+            },
+            AgreementMilestone {
+                milestone_id: "m2".to_string(),
+                title: "M2".to_string(),
+                amount: 100,
+                recipient_address: "R".to_string(),
+                refund_address: "B".to_string(),
+                secret_hash_hex: "11".repeat(32),
+                timeout_height: 2000,
+                metadata_hash: None,
+            },
+            AgreementMilestone {
+                milestone_id: "m3".to_string(),
+                title: "M3".to_string(),
+                amount: 100,
+                recipient_address: "R".to_string(),
+                refund_address: "B".to_string(),
+                secret_hash_hex: "22".repeat(32),
+                timeout_height: 3000,
+                metadata_hash: None,
+            },
+        ];
+        let agr = group_e_make_agreement(AgreementTemplateType::MilestoneSettlement, milestones);
+        let result =
+            build_template_policy(&agr, &group_e_test_agreement_hash(), group_e_test_pubkey(), 9999);
+        let policies = result.expect("milestone must produce policies");
+        assert_eq!(policies.len(), 3);
+        let ids: std::collections::HashSet<String> =
+            policies.iter().map(|p| p.policy_id.clone()).collect();
+        assert_eq!(ids.len(), 3, "milestone policy_ids must be unique");
+        assert!(ids.contains("pol-agr-test-1-m1"));
+        assert!(ids.contains("pol-agr-test-1-m2"));
+        assert!(ids.contains("pol-agr-test-1-m3"));
+        assert_eq!(
+            policies[0].required_proofs[0].milestone_id.as_deref(),
+            Some("m1")
+        );
+        assert_eq!(policies[0].no_response_rules[0].deadline_height, 1000);
+        assert_eq!(policies[1].no_response_rules[0].deadline_height, 2000);
+        assert_eq!(policies[2].no_response_rules[0].deadline_height, 3000);
+    }
+
+    #[test]
+    fn group_e_build_template_policy_deposit_returns_none() {
+        let agr = group_e_make_agreement(AgreementTemplateType::RefundableDeposit, vec![]);
+        let result =
+            build_template_policy(&agr, &group_e_test_agreement_hash(), group_e_test_pubkey(), 5000);
+        assert!(result.is_none(), "deposit must NOT auto-build a policy");
+    }
+
+    #[test]
+    fn group_e_default_dispute_window_constant_is_144() {
+        assert_eq!(DEFAULT_DISPUTE_WINDOW_BLOCKS, 144);
+    }
+
     #[test]
     fn offer_create_sets_seller_pubkey_when_wallet_has_address() {
         // seller_pubkey is populated when resolve_attestor_pubkey_hex succeeds.
@@ -21418,8 +21875,13 @@ async fn watch_loop(
 ) -> Result<(), String> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
-    let mut released_agreements: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    // GROUP E (Q2): release attempts run in background tasks because
+    // try_auto_release may sleep DEFAULT_DISPUTE_WINDOW_BLOCKS worth of
+    // chain time before releasing. The WS loop must keep accepting
+    // events while that wait is in progress. in_flight dedupes both
+    // pending and completed releases for the lifetime of this process.
+    let in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     loop {
         eprintln!("[watch] connecting to {}", ws_url);
         let (mut ws, _resp) = match tokio_tungstenite::connect_async(&ws_url).await {
@@ -21458,26 +21920,48 @@ async fn watch_loop(
                         if agreement_hash.is_empty() {
                             continue;
                         }
-                        if released_agreements.contains(agreement_hash) {
-                            continue;
+                        // Dedupe / reserve slot under short critical section.
+                        {
+                            let mut guard = in_flight.lock().unwrap();
+                            if guard.contains(agreement_hash) {
+                                continue;
+                            }
+                            guard.insert(agreement_hash.to_string());
                         }
                         eprintln!(
-                            "[watch] agreement.satisfied {} — attempting auto-release",
+                            "[watch] agreement.satisfied {} — scheduling auto-release (dispute window enforced inside try_auto_release)",
                             agreement_hash
                         );
-                        match try_auto_release(agreement_hash, &rpc_url).await {
-                            Ok(_) => {
-                                released_agreements.insert(agreement_hash.to_string());
-                                eprintln!("[watch] auto-released {}", agreement_hash);
-                                update_offer_settled_for(agreement_hash);
+                        let agreement_hash_owned = agreement_hash.to_string();
+                        let rpc_url_clone = rpc_url.clone();
+                        let in_flight_clone = in_flight.clone();
+                        tokio::spawn(async move {
+                            match try_auto_release(
+                                &agreement_hash_owned,
+                                &rpc_url_clone,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    eprintln!(
+                                        "[watch] auto-released {}",
+                                        agreement_hash_owned
+                                    );
+                                    update_offer_settled_for(&agreement_hash_owned);
+                                    // Keep in in_flight forever to dedupe replay events.
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[watch] auto-release skipped/failed for {}: {}",
+                                        agreement_hash_owned, e
+                                    );
+                                    // Failure: clear the slot so a future
+                                    // event for the same hash can retry.
+                                    let mut guard = in_flight_clone.lock().unwrap();
+                                    guard.remove(&agreement_hash_owned);
+                                }
                             }
-                            Err(e) => {
-                                eprintln!(
-                                    "[watch] auto-release skipped/failed for {}: {}",
-                                    agreement_hash, e
-                                );
-                            }
-                        }
+                        });
                     }
                 }
                 Ok(Message::Ping(p)) => {
@@ -21514,6 +21998,52 @@ async fn try_auto_release(
         .or_else(|| agreement.get("creation_time"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+
+    // GROUP E (Q2): if the agreement declares a dispute_window, wait
+    // until at least that many blocks have elapsed past the moment this
+    // call observed the chain tip before triggering release. The window
+    // is set on freelance and milestone templates by handle_offer_take;
+    // OTC and deposit agreements have None and skip the wait.
+    let dispute_window = inner
+        .get("deadlines")
+        .and_then(|d| d.get("dispute_window"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if dispute_window > 0 {
+        let observed_tip = fetch_tip_height_async(rpc_url)
+            .await
+            .map_err(|e| format!("dispute window: tip fetch failed: {}", e))?;
+        let target_tip = observed_tip + dispute_window;
+        eprintln!(
+            "[watch] {} satisfied at tip {} — waiting for tip >= {} ({} block dispute window)",
+            agreement_hash, observed_tip, target_tip, dispute_window
+        );
+        loop {
+            // Poll every minute. 1 block ≈ 1–2 min on Irium today
+            // (BLOCKS_PER_HOUR=60 in irium-core constants); 60-second
+            // poll cadence keeps the watch loop responsive without
+            // hammering iriumd.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let now_tip = match fetch_tip_height_async(rpc_url).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!(
+                        "[watch] {} dispute window: tip poll failed: {} (will retry)",
+                        agreement_hash, e
+                    );
+                    continue;
+                }
+            };
+            if now_tip >= target_tip {
+                eprintln!(
+                    "[watch] {} dispute window elapsed (tip {} >= {})",
+                    agreement_hash, now_tip, target_tip
+                );
+                break;
+            }
+        }
+    }
+
     let preimage = recover_preimage(&agreement_id, creation_time)
         .ok_or_else(|| format!("no preimage recoverable for {}", agreement_id))?;
     let argv0 = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
@@ -21543,6 +22073,24 @@ async fn try_auto_release(
         ));
     }
     Ok(())
+}
+
+/// GROUP E: async wrapper around the existing sync fetch_tip_height
+/// (line 2708) so the auto-release watcher can poll the chain tip from
+/// inside an async task without blocking the executor. Builds a fresh
+/// blocking Client per call (cheap) and reuses the existing sync helper
+/// which already handles HTTPS fallback and IRIUM_RPC_TOKEN bearer auth.
+async fn fetch_tip_height_async(rpc_url: &str) -> Result<u64, String> {
+    let rpc_url = rpc_url.to_string();
+    tokio::task::spawn_blocking(move || -> Result<u64, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+        fetch_tip_height(&client, rpc_url.trim_end_matches('/'))
+    })
+    .await
+    .map_err(|e| format!("join: {e}"))?
 }
 
 /// Try FIX 1 stored file first; fall back to the deterministic
