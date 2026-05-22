@@ -14,34 +14,47 @@ line paths below are for advanced miners and rig operators.
 
 ---
 
-## Windows Quick Start (One-Click Mining)
+## One-Click Mining (Linux / macOS / Windows)
 
-For Windows users who want to start mining immediately without
-technical setup:
+For anyone who wants to start mining immediately without learning
+any CLI flags, every release archive at
+[github.com/iriumlabs/irium/releases/latest](https://github.com/iriumlabs/irium/releases/latest)
+now ships ready-to-run mining scripts alongside the binaries:
 
-1. Download the latest release from
-   [github.com/iriumlabs/irium/releases/latest](https://github.com/iriumlabs/irium/releases/latest).
-2. Extract the .zip file.
-3. Double-click `mine-gpu.bat` to start GPU mining (recommended for
-   any modern AMD / NVIDIA / Intel GPU) _or_ double-click
-   `mine-cpu.bat` to start CPU mining.
-4. Enter your Irium wallet address when prompted (starts with
-   **P** or **Q**).
-5. Mining starts automatically and auto-restarts if it stops.
+| OS      | GPU (pool, recommended) | CPU (solo, local iriumd) |
+|---------|--------------------------|---------------------------|
+| Linux   | `./mine-gpu.sh`         | `./mine-cpu.sh`           |
+| macOS   | `./mine-gpu-mac.sh`     | `./mine-cpu-mac.sh`       |
+| Windows | `mine-gpu.bat`          | `mine-cpu.bat`            |
 
-Your wallet address is saved in `mine-config.txt` next to the .bat
-files, so you only need to enter it once. To use a different address,
-delete `mine-config.txt` and re-run the script.
+How to use:
 
-**`mine-gpu.bat`** connects to the official Irium pool at
+1. Download the archive for your platform and extract it.
+2. Linux/macOS: open Terminal in the extracted folder. Windows:
+   double-click the .bat file.
+3. Linux/macOS users: `./mine-gpu.sh` (or the mac variant).
+4. When prompted, paste your Irium wallet address (starts with **P**
+   or **Q**). It is saved to `mine-config.txt` next to the script so
+   you only enter it once.
+5. Mining starts automatically and auto-restarts if it crashes.
+
+Every archive ships **all six** scripts so a user who downloaded the
+wrong archive or moved a folder between machines still has the right
+launcher handy. The Linux scripts call `chmod +x` on themselves and
+on the bundled miner. The macOS scripts additionally remove the
+`com.apple.quarantine` extended attribute so Gatekeeper does not
+block the unsigned binary on first launch.
+
+**GPU scripts** connect to the official Irium pool at
 `stratum+tcp://pool.iriumlabs.org:3335` in SOLO payout mode  when one
 of your shares meets the network target, the full block reward goes
 directly to your address. No pool fee.
 
-**`mine-cpu.bat`** runs the bundled CPU miner against a local iriumd
-node at `http://127.0.0.1:38300`. Start iriumd first  the Irium Core
+**CPU scripts** run the bundled `irium-miner` against a local iriumd
+at `http://127.0.0.1:38300`. Start iriumd first  the Irium Core
 desktop app exposes that endpoint automatically. For pool-based CPU
-mining install `cpuminer-opt` separately (see the CPU section below).
+mining install `cpuminer-opt` separately (see the CPU section
+below; the bundled `irium-miner` is solo-only).
 
 ---
 
