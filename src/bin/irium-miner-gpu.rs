@@ -808,6 +808,7 @@ impl GpuMiner {
             .map_err(ocl_err)?;
 
         println!("[GPU] Kernel compiled successfully.");
+        let _ = std::io::stdout().flush();
         Ok(Self {
             queue,
             kernel,
@@ -1528,6 +1529,7 @@ fn mine_stratum_job_gpu(
                             println!("[GPU] temp={:.1}C power={:.1}W", tc, pw);
                         }
                     }
+                    let _ = std::io::stdout().flush();
                     *guard = Instant::now();
                 }
             }
@@ -2143,6 +2145,7 @@ fn main() {
                                                     println!("[GPU] temp={:.1}C power={:.1}W", tc, pw);
                                                 }
                                             }
+                                            let _ = std::io::stdout().flush();
                                             *guard = Instant::now();
                                         }
                                     }
@@ -2196,6 +2199,7 @@ fn main() {
                         println!("       rate  = {}", fmt_rate(total_hashes as f64 / elapsed));
                     }
                 }
+                let _ = std::io::stdout().flush();
                 match submit_block(&client, height, &block) {
                     Ok(_) => println!("[GPU] Block accepted by node at height {}!", height),
                     Err(e) => eprintln!("[GPU] Submit error: {e}"),
