@@ -160,38 +160,12 @@ jobs:
               chmod +x "${STAGING}/${helper}" 2>/dev/null || true
             fi
           done
-          cat > "${STAGING}/MINING-QUICKSTART.txt" <<MINIEOF
-Irium Mining Quick Start
-========================
-
-Pick the script that matches your OS and double-click (or run from a shell):
-
-  Linux:    ./mine-gpu.sh        (GPU, recommended)
-            ./mine-cpu.sh        (CPU, requires local iriumd)
-  macOS:    ./mine-gpu-mac.sh    (GPU, recommended)
-            ./mine-cpu-mac.sh    (CPU, requires local iriumd)
-  Windows:  mine-gpu.bat         (GPU, recommended)
-            mine-cpu.bat         (CPU, requires local iriumd)
-
-On first run you will be asked for your Irium wallet address (starts
-with P or Q). It is saved to mine-config.txt next to the script so
-you only enter it once. Mining auto-restarts if it crashes.
-
-GPU scripts connect to the official Irium pool at
-stratum+tcp://pool.iriumlabs.org:3335 in SOLO payout mode -- when one
-of your shares meets the network target, the FULL block reward
-(currently 50 IRM) lands at your wallet address. No pool fee.
-
-CPU scripts run against a local iriumd at http://127.0.0.1:38300 in
-solo mode -- start iriumd first, or run the Irium Core desktop app
-which exposes that endpoint automatically.
-
-Need an Irium wallet address? Download the Irium Core desktop app:
-  https://github.com/iriumlabs/irium-core/releases/latest
-
-Full mining docs:
-  https://github.com/iriumlabs/irium/blob/main/docs/MINING.md
-MINIEOF
+          # MINING-QUICKSTART.txt lives at the repo root so the
+          # template stays out of the YAML scalar (heredocs whose body
+          # touches column 0 break the YAML block scalar parser).
+          if [ -f MINING-QUICKSTART.txt ]; then
+            cp MINING-QUICKSTART.txt "${STAGING}/"
+          fi
           tar -czf "${ARCHIVE}" -C "${STAGING}" .
           echo "ARCHIVE=${ARCHIVE}" >> "${GITHUB_ENV}"
 
@@ -223,39 +197,9 @@ MINIEOF
           foreach ($helper in @("mine-gpu.bat", "mine-cpu.bat", "mine-gpu.sh", "mine-cpu.sh", "mine-gpu-mac.sh", "mine-cpu-mac.sh")) {
             if (Test-Path $helper) { Copy-Item $helper "${staging}/" }
           }
-          $readme = @"
-Irium Mining Quick Start
-========================
-
-Pick the script that matches your OS and double-click (or run from a shell):
-
-  Windows:  mine-gpu.bat         (GPU, recommended)
-            mine-cpu.bat         (CPU, requires local iriumd)
-  Linux:    ./mine-gpu.sh        (GPU, recommended)
-            ./mine-cpu.sh        (CPU, requires local iriumd)
-  macOS:    ./mine-gpu-mac.sh    (GPU, recommended)
-            ./mine-cpu-mac.sh    (CPU, requires local iriumd)
-
-On first run you will be asked for your Irium wallet address (starts
-with P or Q). It is saved to mine-config.txt next to the script so
-you only enter it once. Mining auto-restarts if it crashes.
-
-GPU scripts connect to the official Irium pool at
-stratum+tcp://pool.iriumlabs.org:3335 in SOLO payout mode -- when one
-of your shares meets the network target, the FULL block reward
-(currently 50 IRM) lands at your wallet address. No pool fee.
-
-CPU scripts run against a local iriumd at http://127.0.0.1:38300 in
-solo mode -- start iriumd first, or run the Irium Core desktop app
-which exposes that endpoint automatically.
-
-Need an Irium wallet address? Download the Irium Core desktop app:
-  https://github.com/iriumlabs/irium-core/releases/latest
-
-Full mining docs:
-  https://github.com/iriumlabs/irium/blob/main/docs/MINING.md
-"@
-          $readme | Out-File -FilePath "${staging}/MINING-QUICKSTART.txt" -Encoding utf8
+          if (Test-Path "MINING-QUICKSTART.txt") {
+            Copy-Item "MINING-QUICKSTART.txt" "${staging}/"
+          }
           Compress-Archive -Path "${staging}/*" -DestinationPath $archive -Force
           "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
