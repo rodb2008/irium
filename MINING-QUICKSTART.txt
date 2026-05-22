@@ -1,0 +1,37 @@
+Irium Mining Quick Start
+========================
+
+Pick the script that matches your OS and double-click (or run from a shell):
+
+  Linux:    ./mine-gpu.sh        (GPU, recommended)
+            ./mine-cpu.sh        (CPU, requires local iriumd)
+  macOS:    ./mine-gpu-mac.sh    (GPU, recommended)
+            ./mine-cpu-mac.sh    (CPU, requires local iriumd)
+  Windows:  mine-gpu.bat         (GPU, recommended)
+            mine-cpu.bat         (CPU, requires local iriumd)
+
+On first run you will be asked for your Irium wallet address (starts
+with P or Q). It is saved to mine-config.txt next to the script so
+you only enter it once. Mining auto-restarts if it crashes.
+
+GPU scripts connect to the official Irium pool at
+stratum+tcp://pool.iriumlabs.org:3335 in SOLO payout mode -- when one
+of your shares meets the network target, the FULL block reward
+(currently 50 IRM) lands at your wallet address. No pool fee.
+
+CPU scripts run the bundled irium-miner against a local iriumd at
+http://127.0.0.1:38300 in solo mode -- start iriumd first, or run
+the Irium Core desktop app which exposes that endpoint automatically.
+
+macOS users: the scripts auto-strip the com.apple.quarantine extended
+attribute that Gatekeeper sets on downloaded binaries. If you still
+see "cannot be opened because Apple cannot check it for malicious
+software", run:
+    xattr -d com.apple.quarantine irium-miner-gpu
+or right-click the binary in Finder -> Open -> Open Anyway.
+
+Need an Irium wallet address? Download the Irium Core desktop app:
+  https://github.com/iriumlabs/irium-core/releases/latest
+
+Full mining docs:
+  https://github.com/iriumlabs/irium/blob/main/docs/MINING.md
