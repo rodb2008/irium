@@ -126,6 +126,18 @@ cargo build --release --features gpu --bin irium-miner-gpu
 
 ---
 
+## TypeScript SDK
+
+Web developers can integrate Irium settlement into their apps using the official TypeScript SDK:
+
+```bash
+npm install irium-js
+```
+
+Full documentation and examples at [`sdk/irium-js/`](sdk/irium-js/). Covers agreement lifecycle, proof submission, offer feed, real-time WebSocket events, and chain queries.
+
+---
+
 ## Run a Node
 
 ```bash
