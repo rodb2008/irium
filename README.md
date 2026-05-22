@@ -2,8 +2,7 @@
 
 **Settlement-first SHA-256d proof-of-work blockchain for trustless commerce.**
 
-[![Build](https://github.com/iriumlabs/irium/actions/workflows/release.yml/badge.svg)](https://github.com/iriumlabs/irium/actions/workflows/release.yml)
-[![Latest Release](https://img.shields.io/github/v/release/iriumlabs/irium)](https://github.com/iriumlabs/irium/releases/latest)
+[![Release](https://img.shields.io/github/v/release/iriumlabs/irium?label=release&color=green)](https://github.com/iriumlabs/irium/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
 [![Mainnet](https://img.shields.io/badge/Mainnet-Live-brightgreen)](https://www.iriumlabs.org)
 
