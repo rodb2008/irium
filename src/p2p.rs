@@ -4104,7 +4104,9 @@ impl P2PNode {
                 Err(e) => {
                     self.record_outbound_dial_failure(ip, &e).await;
                     let mut rep = self.reputation.lock().await;
-                    rep.record_failure(&trusted_anchor_peer_id(addr, trusted_seed));
+                    // FIX #128: no bytes received yet -> dial failure,
+                    // not handshake misbehavior. Don't subtract score.
+                    rep.record_dial_failure(&trusted_anchor_peer_id(addr, trusted_seed));
                     return Err(e);
                 }
             };
@@ -4488,7 +4490,9 @@ impl P2PNode {
                     Err(e) => {
                         Self::log_err(format!("P2P outbound {}: closing read loop: {}", addr, e));
                         let mut rep = reputation.lock().await;
-                        rep.record_failure(&trusted_anchor_peer_id(addr, trusted_seed));
+                        // FIX #128: connection dropped mid-session is a
+                        // network event, not malicious behavior.
+                        rep.record_dial_failure(&trusted_anchor_peer_id(addr, trusted_seed));
                         break;
                     }
                 };
@@ -6700,7 +6704,9 @@ async fn handle_incoming_with_sybil(
                     format!("P2P inbound {}: closing read loop: {}", addr, e),
                 );
                 let mut rep = reputation.lock().await;
-                rep.record_failure(&trusted_anchor_peer_id(addr, trusted_seed));
+                // FIX #128: connection dropped mid-session is a
+                // network event, not malicious behavior.
+                rep.record_dial_failure(&trusted_anchor_peer_id(addr, trusted_seed));
                 break;
             }
         };
