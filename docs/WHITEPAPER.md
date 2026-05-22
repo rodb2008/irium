@@ -1,10 +1,77 @@
 # Irium: A Settlement-First Proof-of-Work Blockchain
 
-**Technical Whitepaper — Version 2.1**
+**Technical Whitepaper — Version 2.2 (post-Groups-C-H)**
 
-**Network Status:** Live on Mainnet — Block ~22,000+ (May 2026) · node `v1.9.18` released, `v1.9.19` queued on `testing-codes-before-merging`
+**Network Status:** Live on Mainnet — Block ~22,500 (May 2026) · node `v1.9.28` released (current); desktop app [Irium Core v1.0.42](https://github.com/iriumlabs/irium-core/releases/latest) bundles the v1.9.28 sidecars
 
-**Snapshot (block ~22,058):** 12 connected peers · genesis hash `0000000028f25d…` · network era *Early Miner Era* · official-pool live (`pool.iriumlabs.org:3333` ASIC, `:3335` CPU/GPU, `:3337` public stats proxy)
+**Snapshot (block ~22,500):** ~18 connected peers per VPS node · circulating supply ~1.12M IRM · max supply 100,000,000 IRM (96.5M mineable + 3.5M genesis CLTV vest) · genesis hash `0000000028f25d…` · network era *Early Miner Era* · official-pool live (`pool.iriumlabs.org:3333` ASIC, `:3335` CPU/GPU, `:443` ISP-block fallback, `:3337` public stats proxy, `https://pool.iriumlabs.org/stats` HTML stats page)
+
+**Upcoming hard fork (Fix 2a, activation height 23,500):** the chain
+activates Bitcoin-standard block-header serialization at block 23,500.
+After this height, every standard SHA-256d miner (Bitaxe, S19/S21,
+T-Rex, lolMiner, NBMiner, cpuminer-opt, ccminer) produces valid blocks
+without any firmware patch. All nodes must run iriumd v1.9.28 or newer
+before block 23,500 is mined to avoid forking off the canonical chain.
+
+---
+
+## What's new in v1.9.28 (May 2026)
+
+The release adds a complete second-generation settlement stack (Groups
+C through H, plus a follow-up to auto-emit reputation anchors) and
+hardens the peer-reputation system on small networks. None of these
+require a hard fork — they layer on top of the existing
+[Phase 2 proof automation engine](#7-proof-automation-engine).
+
+- **Group C — Auto-release watcher:** `irium-wallet watch --auto-release`
+  is a long-running daemon that subscribes to iriumd's
+  `agreement.satisfied` WebSocket events and automatically broadcasts
+  the release transaction the moment proof finality is reached. The
+  daemon enforces the agreement's dispute_window (see Group E) before
+  releasing.
+- **Group D — Proof schema registry:** five canonical proof types are
+  now schema-validated by iriumd's `ProofStore::submit` — `payment_received`,
+  `delivery_confirmed`, `work_completed`, `milestone_delivered`,
+  `deposit_conditions_met`. Each requires specific attributes in
+  `typed_payload.attributes`. Unknown proof types pass through
+  unchanged for forward compatibility.
+- **Group E — Auto-policy by template type, plus dispute window:** every
+  offer-take now generates the right `ProofPolicy` for its template
+  (OTC → seller attests `payment_received`; freelance → contractor
+  attests `work_completed`; milestone → N policies, one per milestone;
+  deposit → no policy). Freelance and milestone agreements bake
+  `agreement.deadlines.dispute_window = 144 blocks` (~2.4 h at the
+  current 1–2 min/block cadence). The auto-release watcher waits the
+  window before triggering release.
+- **Group F — Signed escrow receipts:** new `GET /rpc/agreementreceipt`
+  endpoint plus `irium-wallet agreement-export-receipt` produces a
+  party-signed JSON snapshot of the full on-chain story of an
+  agreement (funding txids, release/refund txids, dispute resolution,
+  proofs with anchored heights, lifecycle state). Schema:
+  `irium.escrow_receipt.v1`. Designed as a non-repudiation artifact
+  for accounting and dispute documentation; verifiable offline.
+- **Group G — Per-milestone fund and release:** `/rpc/fundagreement`
+  gains an optional `milestone_id` field; new wallet aliases
+  `agreement-milestone-fund` and `agreement-milestone-release` make
+  the per-milestone path explicit. The `PartiallyReleased` lifecycle
+  state is now exercised end-to-end.
+- **Group H — On-chain reputation event anchoring:** a new `rep1:`
+  OP_RETURN prefix carries four event kinds — `s` SuccessfulTrade,
+  `w` DisputeWin, `l` DisputeLoss, `n` ResolverNonResponse. Release
+  txs auto-embed two `rep1:s` outputs (one for each party).
+  Dispute-resolve txs auto-embed `rep1:w` + `rep1:l`. A new
+  `agreement-flag-non-response` wallet command broadcasts a standalone
+  `rep1:n` tx once a resolver misses their response window. The
+  `GET /rpc/reputation/:address` endpoint returns lifetime + recent
+  (4320-block window) counts; the wallet's `compute_reputation` now
+  overlays chain counts on top of the local outcomes file with the
+  chain winning on conflict.
+- **FIX #128 — Reputation hygiene:** dial failures (peer unreachable,
+  no bytes exchanged) are no longer scored against the peer — only
+  handshake-stage failures (peer reachable, sent bad data) subtract
+  reputation. New env var `IRIUM_REPUTATION_BAN_SCORE_THRESHOLD`
+  (default 20) lets operators on small networks relax or disable
+  the reputation-based ban without rebuilding.
 
 ---
 

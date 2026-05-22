@@ -8,6 +8,32 @@ This guide takes you from zero to a completed settlement. No blockchain experien
 
 ---
 
+## Easiest path — Irium Core desktop app
+
+**For most users, download the Irium Core desktop app from
+[https://github.com/iriumlabs/irium-core/releases/latest](https://github.com/iriumlabs/irium-core/releases/latest).**
+Pick the installer for your operating system (Windows `.exe`, macOS `.dmg`,
+Linux `.AppImage` / `.deb`). The app bundles iriumd v1.9.28 + wallet + CPU/GPU
+miners + pool client + marketplace + settlement Hub. Launch it, follow the
+on-screen prompts to create a wallet, and you are ready to receive IRM,
+mine, and trade — no terminal required.
+
+The desktop app handles Steps 1, 2, and 4 below automatically. Steps 3 and
+5–9 still apply; the in-app **Terminal** tab can run any of the CLI commands
+shown.
+
+---
+
+## Important — block 23,500 hard fork
+
+The chain activates Bitcoin-standard block-header serialization at **block
+23,500** (Fix 2a). **You must be on iriumd v1.9.28 (or the latest Irium Core
+desktop app) before this block is mined.** Older versions will fork off
+from the canonical chain. Mainnet tip is currently ~22,500 — activation
+is days away.
+
+---
+
 ## Two paths
 
 You can use Irium in one of two ways. Pick whichever you prefer — they manage the same wallet and the same chain:
@@ -174,6 +200,7 @@ Pool mining splits the reward across many miners so you get small payments regul
 |----------|--------------|
 | CPU or GPU | `stratum+tcp://pool.iriumlabs.org:3335` |
 | ASIC | `stratum+tcp://pool.iriumlabs.org:3333` |
+| Behind ISP that blocks 3333/3335 (notably China) | `stratum+tcp://pool.iriumlabs.org:443` — same Stratum protocol on the HTTPS port to bypass filtering |
 
 For the bundled GPU miner:
 

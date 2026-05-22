@@ -9,6 +9,24 @@
 
 ---
 
+## The easiest way to run Irium
+
+**Download the Irium Core desktop app:** [https://github.com/iriumlabs/irium-core/releases/latest](https://github.com/iriumlabs/irium-core/releases/latest)
+
+Bundles `iriumd`, `irium-wallet`, and the CPU/GPU miners. Builds for Windows, macOS, and Linux. Handles wallet creation, marketplace, pool mining, settlement, and explorer in one window. No terminal required.
+
+Use the command-line tooling below if you need a server install, automation, or want to build from source.
+
+---
+
+## Important — block 23,500 hard fork (Fix 2a)
+
+The chain activates Bitcoin-standard block-header serialization at **block 23,500**. **Every node must run iriumd v1.9.28 or newer before block 23,500 is mined.** Older nodes will compute the wrong header hash for post-fork blocks and fork off from the canonical chain. Mainnet tip is currently ~22,500; activation is days away at the current cadence.
+
+The desktop app's auto-update prompt will surface the same warning. Server / pool / ASIC operators should `git pull && cargo build --release` (or pull the v1.9.28 release binary) and restart `iriumd` before activation.
+
+---
+
 ## What is Irium
 
 Irium is a proof-of-work blockchain built for trustless escrow and proof-based commerce. Instead of smart contracts, it uses a deterministic settlement layer: buyer and seller lock funds on-chain, an attestor submits a cryptographic proof of delivery, and the chain enforces release or refund automatically. No lawyers, no chargebacks, no intermediaries.
@@ -21,12 +39,14 @@ SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.
 
 | Parameter | Value |
 |-----------|-------|
-| Current node version | `v1.9.18` (released) · `v1.9.19` queued on `testing-codes-before-merging` |
+| Current node version | `v1.9.28` (released; settlement Groups C-H + FIX #128 P2P reputation hygiene + FIX 2a hard-fork code) |
+| Desktop app version | [`v1.0.42`](https://github.com/iriumlabs/irium-core/releases/latest) (bundles the v1.9.28 sidecar binaries) |
 | Consensus algorithm | SHA-256d proof of work |
 | Block target interval | 600 s (10 min) |
 | Difficulty adjustment | LWMA (60-block window; LWMA v2 — 30-block window — wired but inactive until rolled forward) |
 | Block reward | 50 IRM during the Early Miner Era; halves every 210,000 blocks |
-| AuxPoW merged mining | Activates at block 26,347 (still pending; current tip ≈ 22k) |
+| AuxPoW merged mining | Activates at block 26,500 (still pending; current tip ≈ 22,500) |
+| Fix 2a hard fork (Bitcoin-standard header serialization) | Activates at block 23,500 — **all nodes must upgrade to v1.9.28 before this height** |
 | Total supply cap | 100,000,000 IRM (96.5M mineable + 3.5M genesis CLTV vest) |
 | Address prefix | Single-sig P2PKH uses version byte `0x39`; base58check encoding produces both `Q…` and `P…` leading characters depending on the underlying pubkey-hash — **both prefixes are the same single-sig address format**. A separate multisig version byte `0x28` is used for 2-of-N wallets. |
 | Default P2P port | 38291 |
@@ -49,7 +69,14 @@ SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.
 | Proof ecosystem | Live |
 | Merchant tools | Live |
 | Rich list endpoint (`/rpc/richlist?limit=N`) | Live (since v1.9.17) |
-| Self-advertised P2P external endpoint (CGNAT escape) | Live on `testing-codes-before-merging`, scheduled for v1.9.19 |
+| Self-advertised P2P external endpoint (CGNAT escape) | Live (shipped in v1.9.19+) |
+| On-chain reputation event anchoring (`rep1:` prefix) | Live (shipped in v1.9.28 — Group H) |
+| Escrow receipt export (signed) | Live (shipped in v1.9.28 — Group F) |
+| Per-milestone fund + release wallet aliases | Live (shipped in v1.9.28 — Group G) |
+| Per-template auto-policy at offer-take + 144-block dispute window | Live (shipped in v1.9.28 — Group E) |
+| Auto-release watcher (`irium-wallet watch --auto-release`) | Live (shipped in v1.9.28 — Group C) |
+| Proof schema registry (5 standard kinds, GROUP D) | Live (shipped in v1.9.28) |
+| Reputation system — dial-fail vs handshake-fail distinction + env-tunable ban threshold | Live (shipped in v1.9.28 — FIX #128) |
 | AuxPoW merged mining | Activating at block 26,347 |
 | WebSocket streaming API | Live |
 | BIP32/BIP39 key derivation | Live |
@@ -60,6 +87,15 @@ SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.
 ---
 
 ## Quick Install
+
+**Option 0 — Irium Core desktop app (recommended for most users)**
+
+Download the latest installer for Windows, macOS, or Linux from
+[https://github.com/iriumlabs/irium-core/releases/latest](https://github.com/iriumlabs/irium-core/releases/latest).
+The app bundles the v1.9.28 sidecars, runs the node + wallet + miner in one
+window, and ships pool client + marketplace + settlement Hub.
+
+The CLI options below are for power users, server operators, and developers.
 
 **Option 1 — Pre-built binary (Linux/macOS)**
 
@@ -111,8 +147,16 @@ The node connects to the Irium network automatically. On first run it uses the s
 | Solo GPU | `irium-miner-gpu --address Q<your-address>` (build with `--features gpu`) |
 | Pool — CPU/GPU | Point any Stratum v1 miner at `stratum+tcp://pool.iriumlabs.org:3335`, worker `Q<your-address>` |
 | Pool — ASIC | Point any SHA-256 ASIC at `stratum+tcp://pool.iriumlabs.org:3333`, worker `Q<your-address>` |
+| Pool — fallback (port 3333 blocked) | `stratum+tcp://pool.iriumlabs.org:443` — same Stratum protocol on HTTPS port to bypass ISP filtering (notably in China) |
 
-Public pool stats live at `http://pool.iriumlabs.org:3337/stats` (CORS-enabled JSON with active miners, accepted shares, blocks found, and a rolling-window hashrate estimate per profile).
+Public pool stats live at [https://pool.iriumlabs.org/stats](https://pool.iriumlabs.org/stats) and at the raw proxy
+`http://pool.iriumlabs.org:3337/stats` (CORS-enabled JSON with active miners, accepted shares, blocks found, current
+share difficulty, and a rolling-window hashrate estimate per profile).
+
+After block 23,500 activates Fix 2a, every SHA-256d miner (ASIC, GPU, CPU)
+that submits valid work earns real block rewards directly to the IRM
+address used as the Stratum worker name — the pool runs in SOLO payout
+mode (no fee, no aggregation).
 
 ---
 
