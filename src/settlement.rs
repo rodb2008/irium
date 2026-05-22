@@ -304,6 +304,315 @@ pub struct AgreementLifecycleView {
     pub trust_model_note: String,
 }
 
+// ============================================================
+// GROUP F: Escrow Receipt — signed snapshot export
+// ============================================================
+
+pub const ESCROW_RECEIPT_SCHEMA_ID: &str = "irium.escrow_receipt.v1";
+pub const ESCROW_RECEIPT_VERSION: u32 = 1;
+
+/// Per-tx reference inside an escrow receipt. Carries the txid plus
+/// the height at which it was confirmed and (for milestone templates)
+/// the milestone_id, so a single receipt can describe N funding /
+/// release / refund legs without flattening them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxidWithHeight {
+    pub txid: String,
+    #[serde(default)]
+    pub height: Option<u64>,
+    #[serde(default)]
+    pub milestone_id: Option<String>,
+    pub value: u64,
+}
+
+/// Proof reference carried in a receipt. Only the minimal proof
+/// metadata is exported - the full evidence payload remains in the
+/// proof store and is referenced by proof_id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EscrowReceiptProofRef {
+    pub proof_id: String,
+    pub proof_type: String,
+    pub attestation_time: u64,
+    #[serde(default)]
+    pub anchored_at_height: Option<u64>,
+    #[serde(default)]
+    pub anchor_txid: Option<String>,
+}
+
+/// Dispute reference carried in a receipt. The full resolution message
+/// is replaced with its SHA-256 hash so the receipt does not leak the
+/// resolver's private rationale - the message remains in iriumd's
+/// dispute store for the parties to inspect separately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EscrowReceiptDisputeRef {
+    pub resolver_address: String,
+    pub resolver_role: String,
+    pub outcome: String,
+    pub resolved_at_height: u64,
+    pub message_hash: String,
+    #[serde(default)]
+    pub anchor_txid: Option<String>,
+}
+
+/// Signature envelope attached by the exporter (a party to the
+/// agreement) to a finished escrow receipt. Distinct from
+/// AgreementSignatureEnvelope because the receipt has no
+/// target_type/target_hash semantics - it signs the canonical receipt
+/// bytes directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExporterSignatureEnvelope {
+    pub version: u32,
+    pub signer_public_key: String,
+    pub signer_address: String,
+    pub signature_type: String,
+    /// Hex-encoded 64-byte secp256k1 signature. Cleared during canonical
+    /// serialization so signing/verifying are deterministic.
+    pub signature: String,
+    /// Hex-encoded SHA-256 of the canonical receipt bytes used as
+    /// signing input. Cleared during canonical serialization.
+    pub payload_hash: String,
+}
+
+/// Signed, exportable snapshot of an agreement's full on-chain story.
+/// Field set is fixed by the GROUP F spec; deposit-template receipts
+/// simply omit some funding/release fields. Schema bumps go through
+/// ESCROW_RECEIPT_SCHEMA_ID + ESCROW_RECEIPT_VERSION.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementEscrowReceipt {
+    pub schema_id: String,
+    pub version: u32,
+    pub agreement_id: String,
+    pub agreement_hash: String,
+    pub template_type: AgreementTemplateType,
+    pub parties: Vec<AgreementParty>,
+    pub payer_address: String,
+    pub payee_address: String,
+    pub total_amount: u64,
+    pub final_state: AgreementLifecycleState,
+    pub funded_amount: u64,
+    pub released_amount: u64,
+    pub refunded_amount: u64,
+    #[serde(default)]
+    pub funding_txids: Vec<TxidWithHeight>,
+    #[serde(default)]
+    pub release_txids: Vec<TxidWithHeight>,
+    #[serde(default)]
+    pub refund_txids: Vec<TxidWithHeight>,
+    #[serde(default)]
+    pub resolved_height: Option<u64>,
+    #[serde(default)]
+    pub milestones: Vec<AgreementMilestoneStatus>,
+    #[serde(default)]
+    pub proofs: Vec<EscrowReceiptProofRef>,
+    #[serde(default)]
+    pub dispute: Option<EscrowReceiptDisputeRef>,
+    pub linked_txs: Vec<AgreementLinkedTx>,
+    pub export_timestamp: u64,
+    pub exporter_address: String,
+    pub exporter_pubkey_hex: String,
+    pub exporter_signature: ExporterSignatureEnvelope,
+}
+
+/// Build an unsigned escrow receipt by joining the local AgreementObject
+/// with chain-observed lifecycle data, proofs (with optional anchor
+/// info) and an optional dispute resolution (with optional anchor info).
+/// The returned receipt has an empty exporter_signature.signature /
+/// payload_hash; callers fill them via escrow_receipt_signing_digest +
+/// secp256k1 sign before serializing.
+pub fn build_escrow_receipt_unsigned(
+    agreement: &AgreementObject,
+    agreement_hash: &str,
+    lifecycle: &AgreementLifecycleView,
+    proofs: &[(SettlementProof, Option<(u64, Option<String>)>)],
+    dispute: Option<(&DisputeResolution, Option<String>)>,
+    exporter_address: &str,
+    exporter_pubkey_hex: &str,
+    export_timestamp: u64,
+) -> AgreementEscrowReceipt {
+    let funding_txids: Vec<TxidWithHeight> = lifecycle
+        .linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Funding
+                    | AgreementAnchorRole::DepositLock
+                    | AgreementAnchorRole::OtcSettlement
+                    | AgreementAnchorRole::MerchantSettlement
+            )
+        })
+        .map(|t| TxidWithHeight {
+            txid: t.txid.clone(),
+            height: t.height,
+            milestone_id: t.milestone_id.clone(),
+            value: t.value,
+        })
+        .collect();
+    let release_txids: Vec<TxidWithHeight> = lifecycle
+        .linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Release | AgreementAnchorRole::MilestoneRelease
+            )
+        })
+        .map(|t| TxidWithHeight {
+            txid: t.txid.clone(),
+            height: t.height,
+            milestone_id: t.milestone_id.clone(),
+            value: t.value,
+        })
+        .collect();
+    let refund_txids: Vec<TxidWithHeight> = lifecycle
+        .linked_txs
+        .iter()
+        .filter(|t| matches!(t.role, AgreementAnchorRole::Refund))
+        .map(|t| TxidWithHeight {
+            txid: t.txid.clone(),
+            height: t.height,
+            milestone_id: t.milestone_id.clone(),
+            value: t.value,
+        })
+        .collect();
+    let resolved_height = release_txids
+        .iter()
+        .chain(refund_txids.iter())
+        .filter_map(|t| t.height)
+        .max();
+    let payer_address = agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == agreement.payer)
+        .map(|p| p.address.clone())
+        .unwrap_or_default();
+    let payee_address = agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == agreement.payee)
+        .map(|p| p.address.clone())
+        .unwrap_or_default();
+    let proof_refs: Vec<EscrowReceiptProofRef> = proofs
+        .iter()
+        .map(|(p, anchor)| EscrowReceiptProofRef {
+            proof_id: p.proof_id.clone(),
+            proof_type: p.proof_type.clone(),
+            attestation_time: p.attestation_time,
+            anchored_at_height: anchor.as_ref().map(|(h, _)| *h),
+            anchor_txid: anchor.as_ref().and_then(|(_, t)| t.clone()),
+        })
+        .collect();
+    let dispute_ref = dispute.map(|(r, anchor_txid)| {
+        let message_hash = hex::encode(Sha256::digest(r.message.as_bytes()));
+        EscrowReceiptDisputeRef {
+            resolver_address: r.resolver_address.clone(),
+            resolver_role: r.resolver_role.clone(),
+            outcome: r.outcome.clone(),
+            resolved_at_height: r.resolved_at_height,
+            message_hash,
+            anchor_txid,
+        }
+    });
+    AgreementEscrowReceipt {
+        schema_id: ESCROW_RECEIPT_SCHEMA_ID.to_string(),
+        version: ESCROW_RECEIPT_VERSION,
+        agreement_id: agreement.agreement_id.clone(),
+        agreement_hash: agreement_hash.to_string(),
+        template_type: agreement.template_type,
+        parties: agreement.parties.clone(),
+        payer_address,
+        payee_address,
+        total_amount: agreement.total_amount,
+        final_state: lifecycle.state,
+        funded_amount: lifecycle.funded_amount,
+        released_amount: lifecycle.released_amount,
+        refunded_amount: lifecycle.refunded_amount,
+        funding_txids,
+        release_txids,
+        refund_txids,
+        resolved_height,
+        milestones: lifecycle.milestones.clone(),
+        proofs: proof_refs,
+        dispute: dispute_ref,
+        linked_txs: lifecycle.linked_txs.clone(),
+        export_timestamp,
+        exporter_address: exporter_address.to_string(),
+        exporter_pubkey_hex: exporter_pubkey_hex.to_string(),
+        exporter_signature: ExporterSignatureEnvelope {
+            version: ESCROW_RECEIPT_VERSION,
+            signer_public_key: exporter_pubkey_hex.to_string(),
+            signer_address: exporter_address.to_string(),
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            signature: String::new(),
+            payload_hash: String::new(),
+        },
+    }
+}
+
+/// Canonical receipt bytes for signing/verification. Clears the
+/// exporter_signature.signature and .payload_hash fields, serializes
+/// with sorted keys, and returns the deterministic byte vector.
+pub fn escrow_receipt_canonical_bytes(
+    receipt: &AgreementEscrowReceipt,
+) -> Result<Vec<u8>, String> {
+    let mut canon = receipt.clone();
+    canon.exporter_signature.signature.clear();
+    canon.exporter_signature.payload_hash.clear();
+    let value =
+        serde_json::to_value(&canon).map_err(|e| format!("escrow receipt to json: {e}"))?;
+    let sorted = sort_json(value);
+    serde_json::to_vec(&sorted).map_err(|e| format!("escrow receipt canonical serialize: {e}"))
+}
+
+/// SHA-256 of the canonical receipt bytes. The 32-byte digest is the
+/// secp256k1 signing input.
+pub fn escrow_receipt_signing_digest(
+    receipt: &AgreementEscrowReceipt,
+) -> Result<[u8; 32], String> {
+    let bytes = escrow_receipt_canonical_bytes(receipt)?;
+    let digest = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+/// Verify an escrow receipt's exporter_signature against its canonical
+/// digest. Returns Err if the schema_id/version is wrong, the signature
+/// is malformed, or the secp256k1 verification fails. Does NOT
+/// re-validate chain claims - the receipt is a signed snapshot, not a
+/// substitute for chain access.
+pub fn verify_escrow_receipt_signature(
+    receipt: &AgreementEscrowReceipt,
+) -> Result<(), String> {
+    if receipt.schema_id != ESCROW_RECEIPT_SCHEMA_ID {
+        return Err(format!(
+            "unsupported escrow_receipt schema_id {}",
+            receipt.schema_id
+        ));
+    }
+    if receipt.version != ESCROW_RECEIPT_VERSION {
+        return Err(format!(
+            "unsupported escrow_receipt version {}",
+            receipt.version
+        ));
+    }
+    if receipt.exporter_signature.signature.is_empty() {
+        return Err("exporter_signature.signature is empty".to_string());
+    }
+    let digest = escrow_receipt_signing_digest(receipt)?;
+    let pubkey_bytes = hex::decode(&receipt.exporter_signature.signer_public_key)
+        .map_err(|_| "exporter signer_public_key must be hex".to_string())?;
+    let verifying_key = VerifyingKey::from_sec1_bytes(&pubkey_bytes)
+        .map_err(|_| "exporter signer_public_key must be valid secp256k1 SEC1".to_string())?;
+    let sig_bytes = hex::decode(&receipt.exporter_signature.signature)
+        .map_err(|_| "exporter signature must be 64-byte hex".to_string())?;
+    let parsed = Signature::from_slice(&sig_bytes)
+        .map_err(|_| "exporter signature must be 64-byte hex".to_string())?;
+    verifying_key
+        .verify_prehash(&digest, &parsed)
+        .map_err(|_| "exporter signature verification failed".to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettlementFundingLeg {
     pub role: AgreementAnchorRole,
@@ -2267,6 +2576,173 @@ pub fn parse_agreement_anchor(script_pubkey: &[u8]) -> Option<AgreementAnchor> {
     })
 }
 
+// ============================================================
+// GROUP H: on-chain reputation event anchoring
+// ============================================================
+
+pub const REPUTATION_EVENT_PREFIX: &str = "rep1:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReputationEventKind {
+    /// Recorded in the same tx as an agr1:l or agr1:m release anchor.
+    /// Names a party who completed a trade. Q3: both parties get one
+    /// rep1:s anchor per release tx (two outputs).
+    SuccessfulTrade,
+    /// Recorded in the same tx as an agr1:x dispute-resolve anchor.
+    /// Names the party whose position the resolver upheld.
+    DisputeWin,
+    /// Recorded in the same tx as an agr1:x dispute-resolve anchor.
+    /// Names the party whose position the resolver rejected.
+    DisputeLoss,
+    /// Standalone tx broadcast by any party after the resolver's
+    /// response window has elapsed without a resolution anchor. Names
+    /// the unresponsive resolver. Carries a short 8-byte agreement
+    /// hash prefix so iriumd can locate the dispute being indicted.
+    ResolverNonResponse,
+}
+
+impl ReputationEventKind {
+    pub fn short_code(self) -> &'static str {
+        match self {
+            Self::SuccessfulTrade => "s",
+            Self::DisputeWin => "w",
+            Self::DisputeLoss => "l",
+            Self::ResolverNonResponse => "n",
+        }
+    }
+
+    pub fn from_short_code(v: &str) -> Option<Self> {
+        match v {
+            "s" => Some(Self::SuccessfulTrade),
+            "w" => Some(Self::DisputeWin),
+            "l" => Some(Self::DisputeLoss),
+            "n" => Some(Self::ResolverNonResponse),
+            _ => None,
+        }
+    }
+
+    /// Whether this event kind expects a 16-hex-char agreement short
+    /// hash carried inside the rep1 payload. Only ResolverNonResponse
+    /// does (it has no co-located agr1 anchor in the same tx to
+    /// recover the full hash from).
+    pub fn carries_agreement_short_hash(self) -> bool {
+        matches!(self, Self::ResolverNonResponse)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReputationEvent {
+    pub kind: ReputationEventKind,
+    /// Base58Check address of the party being attested. The on-chain
+    /// payload carries the address as the user-facing base58 string so
+    /// the payload remains human-readable and parseable without
+    /// requiring iriumd to know the version byte.
+    pub address: String,
+    /// First 16 hex chars (8 bytes) of the agreement hash. Set only
+    /// for ResolverNonResponse; None otherwise (recover the full hash
+    /// from the carrying tx's agr1: anchor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agreement_short_hash: Option<String>,
+}
+
+/// Build the bare ASCII payload (no OP_RETURN wrapper). 75-byte cap
+/// matches the agr1 anchor cap so the same downstream OP_RETURN
+/// builders can carry it.
+pub fn build_reputation_event_payload(event: &ReputationEvent) -> Result<Vec<u8>, String> {
+    if event.address.trim().is_empty() {
+        return Err("reputation event address must not be empty".to_string());
+    }
+    if event.address.contains(':') {
+        return Err("reputation event address must not contain ':'".to_string());
+    }
+    let mut payload = format!(
+        "{}{}:{}",
+        REPUTATION_EVENT_PREFIX,
+        event.kind.short_code(),
+        event.address
+    );
+    if event.kind.carries_agreement_short_hash() {
+        let sh = event
+            .agreement_short_hash
+            .as_deref()
+            .ok_or_else(|| "ResolverNonResponse requires agreement_short_hash".to_string())?;
+        if sh.len() != 16 || !sh.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("agreement_short_hash must be 16 hex chars (8 bytes)".to_string());
+        }
+        payload.push(':');
+        payload.push_str(sh);
+    } else if event.agreement_short_hash.is_some() {
+        return Err(
+            "agreement_short_hash is only valid for ResolverNonResponse events".to_string(),
+        );
+    }
+    if payload.len() > 75 {
+        return Err(format!(
+            "reputation event payload too large ({} > 75 bytes)",
+            payload.len()
+        ));
+    }
+    Ok(payload.into_bytes())
+}
+
+pub fn build_reputation_event_output(event: &ReputationEvent) -> Result<TxOutput, String> {
+    let payload = build_reputation_event_payload(event)?;
+    let mut script = Vec::with_capacity(2 + payload.len());
+    script.push(0x6a);
+    script.push(payload.len() as u8);
+    script.extend_from_slice(&payload);
+    Ok(TxOutput {
+        value: 0,
+        script_pubkey: script,
+    })
+}
+
+pub fn parse_reputation_event(script_pubkey: &[u8]) -> Option<ReputationEvent> {
+    if script_pubkey.len() < 2 || script_pubkey[0] != 0x6a {
+        return None;
+    }
+    let len = script_pubkey[1] as usize;
+    if script_pubkey.len() != len + 2 {
+        return None;
+    }
+    let payload = std::str::from_utf8(&script_pubkey[2..]).ok()?;
+    let rest = payload.strip_prefix(REPUTATION_EVENT_PREFIX)?;
+    let mut parts = rest.split(':');
+    let kind = ReputationEventKind::from_short_code(parts.next()?)?;
+    let address = parts.next()?.to_string();
+    if address.is_empty() {
+        return None;
+    }
+    let agreement_short_hash = if kind.carries_agreement_short_hash() {
+        let sh = parts.next()?.to_string();
+        if sh.len() != 16 || !sh.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(sh)
+    } else {
+        None
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(ReputationEvent {
+        kind,
+        address,
+        agreement_short_hash,
+    })
+}
+
+/// Convenience helper: first 16 hex chars of an agreement hash, used as
+/// the on-chain short hash for ResolverNonResponse events. Returns Err
+/// when the input is not a 64-hex-char string.
+pub fn agreement_short_hash_from_full(full_hex: &str) -> Result<String, String> {
+    if full_hex.len() != 64 || !full_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("agreement hash must be 64 hex chars".to_string());
+    }
+    Ok(full_hex[..16].to_string())
+}
+
 pub fn extract_agreement_funding_leg_refs_from_tx(
     tx: &Transaction,
     agreement_hash: &str,
@@ -4083,6 +4559,137 @@ pub fn validate_typed_proof_payload(
     Ok(())
 }
 
+// ─── GROUP D: Proof Schema Registry ────────────────────────────────────
+// Each standard proof_type carries a list of required attribute keys that
+// MUST be present in `typed_payload.attributes` (a JSON object). Proofs
+// with an unknown `proof_type` (anything not in STANDARD_PROOF_SCHEMAS)
+// pass through unchallenged so legacy clients and future proof types
+// keep working — that's the forward-compatibility guarantee.
+//
+// v1 enforcement model:
+//   - presence-only: each required field must be a key in attributes and
+//     non-null. Type validation (numeric `amount`, positive `timestamp`,
+//     hex-format `*_hash`, etc) is deliberately NOT enforced in v1.
+//   - strict going forward: a proof with `proof_type = "payment_received"`
+//     and no typed_payload (or typed_payload without the required keys)
+//     is REJECTED at /rpc/submitproof. Pre-FIX-1 clients that haven't
+//     been updated will surface the schema validation error and must
+//     upgrade.
+//
+// Standard schemas registered in this commit (per GROUP D spec):
+//   payment_received        : payment_method, payment_reference, amount, currency, timestamp
+//   delivery_confirmed      : delivery_method, tracking_reference, delivery_address_hash, timestamp
+//   work_completed          : deliverable_hash, completion_notes, timestamp
+//   milestone_delivered     : milestone_id, deliverable_hash, completion_notes, timestamp
+//   deposit_conditions_met  : condition_description, evidence_hash, timestamp
+//
+// Note: legacy proof_type strings (e.g. "delivery_confirmation",
+// "otc_release", "delivery_confirmation") are NOT in this list. They
+// pass through as unknown and continue working as today.
+
+/// A single proof_type schema entry. Required fields must all appear as
+/// keys in the proof's typed_payload.attributes JSON object.
+#[derive(Debug, Clone, Copy)]
+pub struct ProofSchema {
+    pub proof_type: &'static str,
+    pub required_fields: &'static [&'static str],
+}
+
+pub const STANDARD_PROOF_SCHEMAS: &[ProofSchema] = &[
+    ProofSchema {
+        proof_type: "payment_received",
+        required_fields: &[
+            "payment_method",
+            "payment_reference",
+            "amount",
+            "currency",
+            "timestamp",
+        ],
+    },
+    ProofSchema {
+        proof_type: "delivery_confirmed",
+        required_fields: &[
+            "delivery_method",
+            "tracking_reference",
+            "delivery_address_hash",
+            "timestamp",
+        ],
+    },
+    ProofSchema {
+        proof_type: "work_completed",
+        // milestone_id is optional per spec — omit from required_fields.
+        required_fields: &["deliverable_hash", "completion_notes", "timestamp"],
+    },
+    ProofSchema {
+        proof_type: "milestone_delivered",
+        required_fields: &[
+            "milestone_id",
+            "deliverable_hash",
+            "completion_notes",
+            "timestamp",
+        ],
+    },
+    ProofSchema {
+        proof_type: "deposit_conditions_met",
+        required_fields: &["condition_description", "evidence_hash", "timestamp"],
+    },
+];
+
+/// Returns the schema for a known proof_type, or None if the proof_type
+/// is unknown (and therefore not subject to schema validation).
+pub fn lookup_proof_schema(proof_type: &str) -> Option<&'static ProofSchema> {
+    STANDARD_PROOF_SCHEMAS
+        .iter()
+        .find(|s| s.proof_type == proof_type)
+}
+
+/// GROUP D: validate a proof against its registered schema. Returns
+/// Ok(()) for any proof_type not in STANDARD_PROOF_SCHEMAS (forward
+/// compatibility). For registered types, requires typed_payload to
+/// exist, typed_payload.attributes to be a JSON object, and every
+/// required field to be a present non-null key in that object.
+pub fn validate_proof_against_schema(proof: &SettlementProof) -> Result<(), String> {
+    let Some(schema) = lookup_proof_schema(&proof.proof_type) else {
+        return Ok(());
+    };
+    let Some(tp) = proof.typed_payload.as_ref() else {
+        return Err(format!(
+            "proof_type '{}' requires typed_payload with attributes: [{}]",
+            schema.proof_type,
+            schema.required_fields.join(", ")
+        ));
+    };
+    let attrs_val = tp.attributes.as_ref().ok_or_else(|| {
+        format!(
+            "proof_type '{}' requires typed_payload.attributes (got None); required: [{}]",
+            schema.proof_type,
+            schema.required_fields.join(", ")
+        )
+    })?;
+    let obj = attrs_val.as_object().ok_or_else(|| {
+        format!(
+            "proof_type '{}': typed_payload.attributes must be a JSON object",
+            schema.proof_type
+        )
+    })?;
+    let mut missing: Vec<&str> = Vec::new();
+    for field in schema.required_fields {
+        match obj.get(*field) {
+            None => missing.push(*field),
+            Some(v) if v.is_null() => missing.push(*field),
+            _ => {}
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "proof_type '{}' missing required field(s): [{}]",
+            schema.proof_type,
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 pub fn verify_settlement_proof(
     proof: &SettlementProof,
     policy: &ProofPolicy,
@@ -4840,6 +5447,11 @@ impl ProofStore {
             validate_typed_proof_payload(tp, proof.evidence_hash.as_deref())
                 .map_err(|e| format!("typed_payload validation: {e}"))?;
         }
+        // GROUP D: proof schema registry — proof_types with a registered
+        // schema must carry typed_payload.attributes with all required keys.
+        // Unknown proof_types pass through (forward compatibility).
+        validate_proof_against_schema(&proof)
+            .map_err(|e| format!("schema validation: {e}"))?;
         verify_settlement_proof_signature_only(&proof)?;
         let agreement_hash = proof.agreement_hash.clone();
         let proof_id = proof.proof_id.clone();
@@ -10807,5 +11419,625 @@ mod stage_3_1_tests {
         assert!(payload.len() <= 75, "OP_RETURN cap exceeded: {}", payload.len());
         let txout = build_agreement_anchor_output(&anchor).expect("output");
         assert_eq!(txout.value, 0);
+    }
+
+    // ── GROUP D: proof schema registry validation tests ──────────────
+
+    fn group_d_proof(
+        proof_type: &str,
+        typed_payload: Option<TypedProofPayload>,
+    ) -> SettlementProof {
+        SettlementProof {
+            proof_id: "p-d-test".to_string(),
+            schema_id: SETTLEMENT_PROOF_SCHEMA_ID.to_string(),
+            proof_type: proof_type.to_string(),
+            agreement_hash: "a".repeat(64),
+            milestone_id: None,
+            attested_by: "attestor-1".to_string(),
+            attestation_time: 1_700_000_000,
+            evidence_hash: None,
+            evidence_summary: None,
+            signature: ProofSignatureEnvelope {
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                pubkey_hex: "00".repeat(33),
+                signature_hex: "00".repeat(64),
+                payload_hash: "00".repeat(32),
+            },
+            expires_at_height: None,
+            typed_payload,
+        }
+    }
+
+    fn typed_payload_with_attrs(attrs: serde_json::Value) -> TypedProofPayload {
+        TypedProofPayload {
+            proof_kind: "test".to_string(),
+            content_hash: None,
+            reference_id: None,
+            attributes: Some(attrs),
+        }
+    }
+
+    #[test]
+    fn group_d_schema_unknown_proof_type_passes() {
+        let proof = group_d_proof("legacy_made_up_type", None);
+        validate_proof_against_schema(&proof).expect("unknown type must pass");
+    }
+
+    #[test]
+    fn group_d_schema_legacy_delivery_confirmation_passes() {
+        // The legacy '-ation' string is NOT in the schema registry; the new
+        // '-ed' string IS. Legacy proofs continue working unchanged.
+        let proof = group_d_proof("delivery_confirmation", None);
+        validate_proof_against_schema(&proof).expect("legacy string must pass");
+    }
+
+    #[test]
+    fn group_d_schema_payment_received_full_payload_accepted() {
+        let attrs = serde_json::json!({
+            "payment_method": "bank-transfer",
+            "payment_reference": "REF-12345",
+            "amount": 250.0,
+            "currency": "USD",
+            "timestamp": 1_700_000_000_u64,
+        });
+        let proof = group_d_proof(
+            "payment_received",
+            Some(typed_payload_with_attrs(attrs)),
+        );
+        validate_proof_against_schema(&proof).expect("full payload must pass");
+    }
+
+    #[test]
+    fn group_d_schema_payment_received_missing_amount_rejected() {
+        let attrs = serde_json::json!({
+            "payment_method": "bank-transfer",
+            "payment_reference": "REF-12345",
+            "currency": "USD",
+            "timestamp": 1_700_000_000_u64,
+        });
+        let proof = group_d_proof(
+            "payment_received",
+            Some(typed_payload_with_attrs(attrs)),
+        );
+        let err = validate_proof_against_schema(&proof).unwrap_err();
+        assert!(
+            err.contains("amount"),
+            "error must name missing 'amount' field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_d_schema_payment_received_no_typed_payload_rejected() {
+        let proof = group_d_proof("payment_received", None);
+        let err = validate_proof_against_schema(&proof).unwrap_err();
+        assert!(err.contains("typed_payload"));
+        assert!(err.contains("payment_method"), "error must list required fields, got: {err}");
+    }
+
+    #[test]
+    fn group_d_schema_milestone_delivered_missing_milestone_id_rejected() {
+        let attrs = serde_json::json!({
+            "deliverable_hash": "ab".repeat(32),
+            "completion_notes": "shipped",
+            "timestamp": 1_700_000_000_u64,
+        });
+        let proof = group_d_proof(
+            "milestone_delivered",
+            Some(typed_payload_with_attrs(attrs)),
+        );
+        let err = validate_proof_against_schema(&proof).unwrap_err();
+        assert!(
+            err.contains("milestone_id"),
+            "error must name missing 'milestone_id', got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_d_schema_attributes_not_object_rejected() {
+        let proof = group_d_proof(
+            "payment_received",
+            Some(typed_payload_with_attrs(serde_json::json!("not an object"))),
+        );
+        let err = validate_proof_against_schema(&proof).unwrap_err();
+        assert!(
+            err.contains("attributes must be a JSON object"),
+            "error must reject non-object attributes, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_d_schema_work_completed_milestone_id_optional() {
+        // milestone_id is in the spec as optional for work_completed; the
+        // registry leaves it out of required_fields so a proof without it
+        // is accepted.
+        let attrs = serde_json::json!({
+            "deliverable_hash": "cd".repeat(32),
+            "completion_notes": "draft v2",
+            "timestamp": 1_700_000_000_u64,
+        });
+        let proof = group_d_proof(
+            "work_completed",
+            Some(typed_payload_with_attrs(attrs)),
+        );
+        validate_proof_against_schema(&proof)
+            .expect("work_completed without milestone_id must pass");
+    }
+
+    #[test]
+    fn group_d_schema_null_field_treated_as_missing() {
+        let attrs = serde_json::json!({
+            "payment_method": "bank-transfer",
+            "payment_reference": "REF-12345",
+            "amount": serde_json::Value::Null,
+            "currency": "USD",
+            "timestamp": 1_700_000_000_u64,
+        });
+        let proof = group_d_proof(
+            "payment_received",
+            Some(typed_payload_with_attrs(attrs)),
+        );
+        let err = validate_proof_against_schema(&proof).unwrap_err();
+        assert!(
+            err.contains("amount"),
+            "null value must count as missing, got: {err}"
+        );
+    }
+
+    // ── GROUP F: escrow receipt ────────────────────────────────────────
+
+    fn group_f_synthetic_lifecycle(agreement_hash: &str) -> AgreementLifecycleView {
+        AgreementLifecycleView {
+            state: AgreementLifecycleState::Funded,
+            agreement_hash: agreement_hash.to_string(),
+            funded_amount: 500_000_000,
+            released_amount: 0,
+            refunded_amount: 0,
+            milestones: vec![],
+            linked_txs: vec![AgreementLinkedTx {
+                txid: "cd".repeat(32),
+                role: AgreementAnchorRole::OtcSettlement,
+                milestone_id: None,
+                height: Some(101),
+                confirmed: true,
+                value: 500_000_000,
+            }],
+            trust_model_note: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn group_f_build_escrow_receipt_unsigned_carries_chain_data() {
+        let agreement = build_test_otc();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = group_f_synthetic_lifecycle(&hash);
+        let receipt = build_escrow_receipt_unsigned(
+            &agreement,
+            &hash,
+            &lifecycle,
+            &[],
+            None,
+            "Qbuyer",
+            "03aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            1_700_000_001,
+        );
+        assert_eq!(receipt.schema_id, ESCROW_RECEIPT_SCHEMA_ID);
+        assert_eq!(receipt.version, ESCROW_RECEIPT_VERSION);
+        assert_eq!(receipt.agreement_hash, hash);
+        assert_eq!(receipt.funding_txids.len(), 1);
+        assert_eq!(receipt.funding_txids[0].txid, "cd".repeat(32));
+        assert_eq!(receipt.funding_txids[0].value, 500_000_000);
+        assert_eq!(receipt.funded_amount, 500_000_000);
+        assert!(receipt.exporter_signature.signature.is_empty());
+        assert!(receipt.exporter_signature.payload_hash.is_empty());
+        assert_eq!(receipt.exporter_address, "Qbuyer");
+    }
+
+    #[test]
+    fn group_f_escrow_receipt_canonical_clears_signature_and_payload_hash() {
+        let agreement = build_test_otc();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = group_f_synthetic_lifecycle(&hash);
+        let mut receipt = build_escrow_receipt_unsigned(
+            &agreement,
+            &hash,
+            &lifecycle,
+            &[],
+            None,
+            "Qbuyer",
+            "03aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            1_700_000_001,
+        );
+        let bytes_empty = escrow_receipt_canonical_bytes(&receipt).unwrap();
+        receipt.exporter_signature.signature = "ff".repeat(32);
+        receipt.exporter_signature.payload_hash = "ee".repeat(32);
+        let bytes_filled = escrow_receipt_canonical_bytes(&receipt).unwrap();
+        assert_eq!(
+            bytes_empty, bytes_filled,
+            "canonical bytes must be independent of signature/payload_hash"
+        );
+    }
+
+    #[test]
+    fn group_f_escrow_receipt_dispute_message_hashed_not_leaked() {
+        let agreement = build_test_otc();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = group_f_synthetic_lifecycle(&hash);
+        let secret_msg =
+            "RESOLVER PRIVATE NOTE — do not leak in exported receipts.";
+        let dispute = DisputeResolution {
+            version: DISPUTE_RESOLUTION_VERSION,
+            schema_id: None,
+            agreement_hash: hash.clone(),
+            resolver_address: "Qresolver".to_string(),
+            resolver_role: "primary".to_string(),
+            outcome: "release".to_string(),
+            resolved_at_height: 250,
+            message: secret_msg.to_string(),
+            signature: AgreementSignatureEnvelope {
+                version: AGREEMENT_SIGNATURE_VERSION,
+                target_type: AgreementSignatureTargetType::Agreement,
+                target_hash: hash.clone(),
+                signer_public_key: "03".to_string() + &"aa".repeat(32),
+                signer_address: Some("Qresolver".to_string()),
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                timestamp: None,
+                signer_role: Some("resolver".to_string()),
+                signature: "00".repeat(64),
+            },
+        };
+        let receipt = build_escrow_receipt_unsigned(
+            &agreement,
+            &hash,
+            &lifecycle,
+            &[],
+            Some((&dispute, Some("aa".repeat(32)))),
+            "Qbuyer",
+            "03aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            1_700_000_001,
+        );
+        let dref = receipt.dispute.as_ref().expect("dispute ref must be present");
+        let expected_hash = hex::encode(Sha256::digest(secret_msg.as_bytes()));
+        assert_eq!(dref.message_hash, expected_hash);
+        let canonical = String::from_utf8(escrow_receipt_canonical_bytes(&receipt).unwrap())
+            .unwrap();
+        assert!(
+            !canonical.contains("PRIVATE NOTE"),
+            "raw dispute message must NOT appear in canonical receipt bytes"
+        );
+        assert_eq!(dref.outcome, "release");
+        assert_eq!(dref.resolver_address, "Qresolver");
+    }
+
+    // ── GROUP G: partial milestone release lifecycle ─────────────────────
+
+    fn group_g_three_milestone_agreement() -> AgreementObject {
+        let payer = AgreementParty {
+            party_id: "payer".to_string(),
+            display_name: "Payer".to_string(),
+            address: "Qpayer".to_string(),
+            role: Some("buyer".to_string()),
+        };
+        let payee = AgreementParty {
+            party_id: "payee".to_string(),
+            display_name: "Payee".to_string(),
+            address: "Qpayee".to_string(),
+            role: Some("seller".to_string()),
+        };
+        let milestones = (1..=3u32)
+            .map(|i| AgreementMilestone {
+                milestone_id: format!("m{}", i),
+                title: format!("Milestone {}", i),
+                amount: 100_000,
+                recipient_address: "Qpayee".to_string(),
+                refund_address: "Qpayer".to_string(),
+                secret_hash_hex: format!("{:02x}", i).repeat(32),
+                timeout_height: 1_000 + (i as u64) * 100,
+                metadata_hash: None,
+            })
+            .collect();
+        build_milestone_agreement(
+            "agr-g-test".to_string(),
+            1_700_000_000,
+            payer,
+            payee,
+            milestones,
+            10_000,
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .expect("build milestone agreement")
+    }
+
+    fn group_g_funding_tx(milestone_id: &str, height: u64) -> AgreementLinkedTx {
+        AgreementLinkedTx {
+            txid: format!("aa{}", milestone_id).repeat(2),
+            role: AgreementAnchorRole::Funding,
+            milestone_id: Some(milestone_id.to_string()),
+            height: Some(height),
+            confirmed: true,
+            value: 100_000,
+        }
+    }
+
+    fn group_g_milestone_release_tx(milestone_id: &str, height: u64) -> AgreementLinkedTx {
+        AgreementLinkedTx {
+            txid: format!("bb{}", milestone_id).repeat(2),
+            role: AgreementAnchorRole::MilestoneRelease,
+            milestone_id: Some(milestone_id.to_string()),
+            height: Some(height),
+            confirmed: true,
+            value: 100_000,
+        }
+    }
+
+    #[test]
+    fn group_g_lifecycle_funded_when_zero_milestones_released() {
+        let agreement = group_g_three_milestone_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let linked = vec![
+            group_g_funding_tx("m1", 200),
+            group_g_funding_tx("m2", 201),
+            group_g_funding_tx("m3", 202),
+        ];
+        let lifecycle = derive_lifecycle(&agreement, &hash, linked, 500);
+        assert!(
+            matches!(lifecycle.state, AgreementLifecycleState::Funded),
+            "expected Funded, got {:?}",
+            lifecycle.state
+        );
+        assert_eq!(lifecycle.released_amount, 0);
+        assert_eq!(lifecycle.funded_amount, 300_000);
+    }
+
+    #[test]
+    fn group_g_lifecycle_partially_released_when_one_of_three_released() {
+        let agreement = group_g_three_milestone_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let linked = vec![
+            group_g_funding_tx("m1", 200),
+            group_g_funding_tx("m2", 201),
+            group_g_funding_tx("m3", 202),
+            group_g_milestone_release_tx("m2", 300),
+        ];
+        let lifecycle = derive_lifecycle(&agreement, &hash, linked, 500);
+        assert!(
+            matches!(lifecycle.state, AgreementLifecycleState::PartiallyReleased),
+            "expected PartiallyReleased, got {:?}",
+            lifecycle.state
+        );
+        assert_eq!(lifecycle.released_amount, 100_000);
+        assert_eq!(lifecycle.funded_amount, 300_000);
+        let m2 = lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m2")
+            .expect("m2 in lifecycle");
+        assert!(m2.released, "m2 must be marked released");
+        let m1 = lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m1")
+            .expect("m1 in lifecycle");
+        assert!(!m1.released, "m1 must NOT be marked released");
+    }
+
+    #[test]
+    fn group_g_lifecycle_partially_released_two_of_three() {
+        let agreement = group_g_three_milestone_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let linked = vec![
+            group_g_funding_tx("m1", 200),
+            group_g_funding_tx("m2", 201),
+            group_g_funding_tx("m3", 202),
+            group_g_milestone_release_tx("m1", 300),
+            group_g_milestone_release_tx("m2", 301),
+        ];
+        let lifecycle = derive_lifecycle(&agreement, &hash, linked, 500);
+        assert!(
+            matches!(lifecycle.state, AgreementLifecycleState::PartiallyReleased),
+            "expected PartiallyReleased with 2/3 released, got {:?}",
+            lifecycle.state
+        );
+        assert_eq!(lifecycle.released_amount, 200_000);
+        assert!(lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m1")
+            .unwrap()
+            .released);
+        assert!(lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m2")
+            .unwrap()
+            .released);
+        assert!(!lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m3")
+            .unwrap()
+            .released);
+    }
+
+    #[test]
+    fn group_g_milestone_status_marks_only_funded_milestones() {
+        let agreement = group_g_three_milestone_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        // Only m1 and m3 funded; m2 not funded.
+        let linked = vec![
+            group_g_funding_tx("m1", 200),
+            group_g_funding_tx("m3", 202),
+        ];
+        let lifecycle = derive_lifecycle(&agreement, &hash, linked, 500);
+        let m1 = lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m1")
+            .unwrap();
+        let m2 = lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m2")
+            .unwrap();
+        let m3 = lifecycle
+            .milestones
+            .iter()
+            .find(|m| m.milestone_id == "m3")
+            .unwrap();
+        assert!(m1.funded, "m1 must be funded");
+        assert!(!m2.funded, "m2 must NOT be funded");
+        assert!(m3.funded, "m3 must be funded");
+        assert_eq!(lifecycle.funded_amount, 200_000);
+    }
+
+    #[test]
+    fn group_g_lifecycle_released_when_all_three_released() {
+        let agreement = group_g_three_milestone_agreement();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let linked = vec![
+            group_g_funding_tx("m1", 200),
+            group_g_funding_tx("m2", 201),
+            group_g_funding_tx("m3", 202),
+            group_g_milestone_release_tx("m1", 300),
+            group_g_milestone_release_tx("m2", 301),
+            group_g_milestone_release_tx("m3", 302),
+        ];
+        let lifecycle = derive_lifecycle(&agreement, &hash, linked, 500);
+        assert!(
+            matches!(lifecycle.state, AgreementLifecycleState::Released),
+            "expected Released, got {:?}",
+            lifecycle.state
+        );
+        assert_eq!(lifecycle.released_amount, 300_000);
+        assert!(
+            lifecycle.milestones.iter().all(|m| m.released),
+            "all milestones must be marked released"
+        );
+    }
+
+    #[test]
+    fn group_f_verify_escrow_receipt_rejects_wrong_schema_id() {
+        let agreement = build_test_otc();
+        let hash = compute_agreement_hash_hex(&agreement).unwrap();
+        let lifecycle = group_f_synthetic_lifecycle(&hash);
+        let mut receipt = build_escrow_receipt_unsigned(
+            &agreement,
+            &hash,
+            &lifecycle,
+            &[],
+            None,
+            "Qbuyer",
+            "03aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            1_700_000_001,
+        );
+        receipt.schema_id = "bogus.schema".to_string();
+        receipt.exporter_signature.signature = "ab".repeat(32);
+        let err = verify_escrow_receipt_signature(&receipt).unwrap_err();
+        assert!(
+            err.contains("schema_id"),
+            "wrong schema_id must be rejected, got: {err}"
+        );
+    }
+
+    // ── GROUP H: on-chain reputation event anchoring ─────────────────────
+
+    #[test]
+    fn group_h_reputation_event_payload_roundtrip_successful_trade() {
+        let event = ReputationEvent {
+            kind: ReputationEventKind::SuccessfulTrade,
+            address: "Qabc123def456".to_string(),
+            agreement_short_hash: None,
+        };
+        let payload = build_reputation_event_payload(&event).unwrap();
+        let s = std::str::from_utf8(&payload).unwrap();
+        assert!(s.starts_with("rep1:s:Q"));
+        let output = build_reputation_event_output(&event).unwrap();
+        let parsed = parse_reputation_event(&output.script_pubkey).expect("parse round-trip");
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn group_h_reputation_event_payload_roundtrip_resolver_non_response_carries_short_hash() {
+        let event = ReputationEvent {
+            kind: ReputationEventKind::ResolverNonResponse,
+            address: "Qresolver1234567".to_string(),
+            agreement_short_hash: Some("ab".repeat(8)),
+        };
+        let output = build_reputation_event_output(&event).unwrap();
+        let parsed = parse_reputation_event(&output.script_pubkey).expect("parse round-trip");
+        assert_eq!(parsed, event);
+        assert_eq!(parsed.agreement_short_hash.as_deref(), Some("abababababababab"));
+    }
+
+    #[test]
+    fn group_h_reputation_event_payload_too_long_rejected() {
+        let event = ReputationEvent {
+            kind: ReputationEventKind::SuccessfulTrade,
+            address: "Q".to_string() + &"x".repeat(80),
+            agreement_short_hash: None,
+        };
+        let err = build_reputation_event_payload(&event).unwrap_err();
+        assert!(
+            err.contains("too large"),
+            "expected too-large error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h_parse_rejects_wrong_prefix() {
+        // OP_RETURN with an agr1 payload must not parse as a reputation event.
+        let agr_payload = b"agr1:l:".to_vec();
+        let mut hash_part = "ab".repeat(32).into_bytes();
+        let mut all = agr_payload;
+        all.append(&mut hash_part);
+        let mut script = vec![0x6a, all.len() as u8];
+        script.extend_from_slice(&all);
+        assert!(parse_reputation_event(&script).is_none());
+    }
+
+    #[test]
+    fn group_h_parse_rejects_unknown_event_short_code() {
+        let payload = b"rep1:z:Qabc".to_vec();
+        let mut script = vec![0x6a, payload.len() as u8];
+        script.extend_from_slice(&payload);
+        assert!(parse_reputation_event(&script).is_none());
+    }
+
+    #[test]
+    fn group_h_resolver_non_response_missing_short_hash_rejected() {
+        let event = ReputationEvent {
+            kind: ReputationEventKind::ResolverNonResponse,
+            address: "Qresolver".to_string(),
+            agreement_short_hash: None,
+        };
+        let err = build_reputation_event_payload(&event).unwrap_err();
+        assert!(
+            err.contains("agreement_short_hash"),
+            "expected required-short-hash error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h_successful_trade_with_short_hash_rejected() {
+        let event = ReputationEvent {
+            kind: ReputationEventKind::SuccessfulTrade,
+            address: "Qabc".to_string(),
+            agreement_short_hash: Some("ab".repeat(8)),
+        };
+        let err = build_reputation_event_payload(&event).unwrap_err();
+        assert!(
+            err.contains("only valid for ResolverNonResponse"),
+            "expected only-valid-for-non-response error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h_agreement_short_hash_from_full_takes_first_16_chars() {
+        let full = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let short = agreement_short_hash_from_full(full).unwrap();
+        assert_eq!(short, "aabbccddeeff0011");
+        assert_eq!(short.len(), 16);
+        assert!(agreement_short_hash_from_full("not-hex").is_err());
     }
 }

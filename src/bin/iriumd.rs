@@ -52,18 +52,20 @@ use irium_node_rs::pow::{meets_target, sha256d, Target};
 use irium_node_rs::rate_limiter::RateLimiter;
 use irium_node_rs::reputation::ReputationManager;
 use irium_node_rs::settlement::{
-    basic_otc_escrow_template, build_agreement_activity_timeline, build_agreement_anchor_output,
-    build_agreement_audit_record, build_funding_legs, compute_agreement_hash_hex,
-    contractor_milestone_template, derive_lifecycle, discover_agreement_funding_leg_candidates,
-    evaluate_policy, extract_agreement_funding_leg_refs_from_tx, parse_agreement_anchor,
+    agreement_short_hash_from_full, basic_otc_escrow_template, build_agreement_activity_timeline,
+    build_agreement_anchor_output, build_agreement_audit_record, build_funding_legs,
+    build_reputation_event_output, compute_agreement_hash_hex, contractor_milestone_template,
+    derive_lifecycle, discover_agreement_funding_leg_candidates, evaluate_policy,
+    extract_agreement_funding_leg_refs_from_tx, parse_agreement_anchor, parse_reputation_event,
     policy_template_to_json, preorder_deposit_template, verify_agreement_bundle,
     AgreementActivityEvent, AgreementAnchor, AgreementAnchorRole, AgreementAuditFundingLegRecord,
     AgreementAuditRecord, AgreementBundle, AgreementFundingLegRef, AgreementLifecycleView,
     AgreementLinkedTx, AgreementMilestoneStatus, AgreementObject, AgreementSignatureEnvelope,
     AgreementSummary, AgreementTemplateType, DisputeEvidence, DisputeRaise, DisputeResolution,
-    HoldbackEvaluationResult, MilestoneEvaluationResult, MilestoneSpec, PolicyOutcome, PolicyStore,
-    ProofPolicy, ProofStore, RequirementThresholdResult, ResolverRegistration, SettlementProof,
-    TemplateAttestor, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
+    EscrowReceiptDisputeRef, EscrowReceiptProofRef, HoldbackEvaluationResult,
+    MilestoneEvaluationResult, MilestoneSpec, PolicyOutcome, PolicyStore, ProofPolicy, ProofStore,
+    ReputationEvent, ReputationEventKind, RequirementThresholdResult, ResolverRegistration,
+    SettlementProof, TemplateAttestor, TxidWithHeight, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
     DisputeReResolverNomination,
     dispute_evidence_canonical_bytes, dispute_raise_canonical_bytes,
     dispute_reresolve_canonical_bytes, dispute_resolution_canonical_bytes,
@@ -819,6 +821,12 @@ struct FundAgreementRequest {
     agreement: AgreementObject,
     fee_per_byte: Option<u64>,
     broadcast: Option<bool>,
+    /// GROUP G: when set, fund only the named milestone leg. Builds a
+    /// single-HTLC funding tx for that milestone instead of the full
+    /// agreement. Rejected if the milestone is not in the agreement OR
+    /// already has a confirmed Funding anchor on-chain.
+    #[serde(default)]
+    milestone_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -856,6 +864,33 @@ struct AgreementMilestonesResponse {
     agreement_hash: String,
     state: String,
     milestones: Vec<AgreementMilestoneStatus>,
+}
+
+// GROUP F: GET /rpc/agreementreceipt?agreement_hash=<hex>
+// Query params + response shape. iriumd returns only on-chain-derivable
+// fields; the wallet enriches with its local AgreementObject (parties,
+// template_type, total_amount, per-milestone amounts) and signs the
+// final receipt.
+#[derive(Deserialize)]
+struct AgreementReceiptQuery {
+    agreement_hash: String,
+}
+
+#[derive(Serialize)]
+struct AgreementReceiptResponse {
+    agreement_hash: String,
+    tip_height: u64,
+    /// Best-effort state classification using only on-chain anchors.
+    /// Authoritative state (which knows per-milestone target amounts)
+    /// is computed wallet-side by overlaying the local AgreementObject.
+    final_state_hint: String,
+    funding_txids: Vec<TxidWithHeight>,
+    release_txids: Vec<TxidWithHeight>,
+    refund_txids: Vec<TxidWithHeight>,
+    resolved_height: Option<u64>,
+    linked_txs: Vec<AgreementLinkedTx>,
+    proofs: Vec<EscrowReceiptProofRef>,
+    dispute: Option<EscrowReceiptDisputeRef>,
 }
 
 #[derive(Deserialize)]
@@ -3832,6 +3867,46 @@ fn scan_agreement_linked_txs(
     txs
 }
 
+/// GROUP F: hash-only variant of scan_agreement_linked_txs. Used by the
+/// GET /rpc/agreementreceipt endpoint, which knows only the agreement
+/// hash (the wallet has the full AgreementObject locally). Returns all
+/// linked txs anchored to the hash with value=0; the wallet overlays
+/// agreement.milestones[].amount and agreement.total_amount to populate
+/// values in the final receipt. Sort order matches the AgreementObject
+/// variant (height descending, then txid, then milestone_id).
+fn scan_linked_txs_by_hash(
+    chain: &ChainState,
+    agreement_hash: &str,
+) -> Vec<AgreementLinkedTx> {
+    let mut txs = Vec::new();
+    for (height, block) in chain.chain.iter().enumerate() {
+        for tx in &block.transactions {
+            let txid = hex::encode(tx.txid());
+            for output in &tx.outputs {
+                if let Some(anchor) = parse_agreement_anchor(&output.script_pubkey) {
+                    if anchor.agreement_hash == agreement_hash {
+                        txs.push(AgreementLinkedTx {
+                            txid: txid.clone(),
+                            role: anchor.role,
+                            milestone_id: anchor.milestone_id.clone(),
+                            height: Some(height as u64),
+                            confirmed: true,
+                            value: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    txs.sort_by(|a, b| {
+        b.height
+            .cmp(&a.height)
+            .then_with(|| a.txid.cmp(&b.txid))
+            .then_with(|| a.milestone_id.cmp(&b.milestone_id))
+    });
+    txs
+}
+
 /// LAYER 3: lightweight chain scan answering "has any on-chain tx anchored
 /// this agreement hash yet?". Used by the offer-watcher to decide whether
 /// to relist a taken-but-unfunded offer once the grace window expires. Only
@@ -4611,6 +4686,291 @@ async fn agreement_milestones(
     }))
 }
 
+// GROUP F: GET /rpc/agreementreceipt?agreement_hash=<hex>
+// Returns on-chain-derivable receipt data. The wallet enriches with
+// the local AgreementObject (template_type / parties / total_amount /
+// per-milestone amounts) and signs before exporting.
+async fn agreement_receipt(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<AgreementReceiptQuery>,
+) -> Result<Json<AgreementReceiptResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let agreement_hash = q.agreement_hash.trim().to_string();
+    if agreement_hash.len() != 64 || !agreement_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (tip_height, linked_txs) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip = chain.tip_height();
+        let linked = scan_linked_txs_by_hash(&chain, &agreement_hash);
+        (tip, linked)
+    };
+    let to_txid_with_height = |t: &AgreementLinkedTx| TxidWithHeight {
+        txid: t.txid.clone(),
+        height: t.height,
+        milestone_id: t.milestone_id.clone(),
+        value: t.value,
+    };
+    let funding_txids: Vec<TxidWithHeight> = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Funding
+                    | AgreementAnchorRole::DepositLock
+                    | AgreementAnchorRole::OtcSettlement
+                    | AgreementAnchorRole::MerchantSettlement
+            )
+        })
+        .map(to_txid_with_height)
+        .collect();
+    let release_txids: Vec<TxidWithHeight> = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Release | AgreementAnchorRole::MilestoneRelease
+            )
+        })
+        .map(to_txid_with_height)
+        .collect();
+    let refund_txids: Vec<TxidWithHeight> = linked_txs
+        .iter()
+        .filter(|t| matches!(t.role, AgreementAnchorRole::Refund))
+        .map(to_txid_with_height)
+        .collect();
+    let resolved_height = release_txids
+        .iter()
+        .chain(refund_txids.iter())
+        .filter_map(|t| t.height)
+        .max();
+    let final_state_hint = if !refund_txids.is_empty() {
+        "refunded".to_string()
+    } else if !release_txids.is_empty() {
+        "released_or_partial".to_string()
+    } else if !funding_txids.is_empty() {
+        "funded".to_string()
+    } else {
+        "proposed".to_string()
+    };
+    let proofs: Vec<EscrowReceiptProofRef> = {
+        let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+        let heights = state.proof_heights.lock().unwrap_or_else(|e| e.into_inner());
+        store
+            .list_by_agreement(&agreement_hash)
+            .into_iter()
+            .map(|p| EscrowReceiptProofRef {
+                proof_id: p.proof_id.clone(),
+                proof_type: p.proof_type.clone(),
+                attestation_time: p.attestation_time,
+                anchored_at_height: heights.get(&p.proof_id).copied(),
+                anchor_txid: None,
+            })
+            .collect()
+    };
+    let dispute = {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&agreement_hash).and_then(|d| {
+            d.resolution.as_ref().map(|res| EscrowReceiptDisputeRef {
+                resolver_address: res.resolver_address.clone(),
+                resolver_role: res.resolver_role.clone(),
+                outcome: res.outcome.clone(),
+                resolved_at_height: res.resolved_at_height,
+                message_hash: hex::encode(Sha256::digest(res.message.as_bytes())),
+                anchor_txid: d.resolution_anchor_txid.clone(),
+            })
+        })
+    };
+    Ok(Json(AgreementReceiptResponse {
+        agreement_hash,
+        tip_height,
+        final_state_hint,
+        funding_txids,
+        release_txids,
+        refund_txids,
+        resolved_height,
+        linked_txs,
+        proofs,
+        dispute,
+    }))
+}
+
+// GROUP H: on-chain reputation event lookup.
+// GET /rpc/reputation/:address returns the chain-anchored reputation
+// events naming this address, with lifetime + recent counts. The chain
+// is authoritative; the wallet's local outcomes file is consulted only
+// when this endpoint is unreachable.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ReputationEventRecord {
+    event_kind: String,
+    txid: String,
+    height: u64,
+    /// Full agreement_hash recovered from the carrying tx's agr1
+    /// anchor (or from the rep1 event's short hash + chain lookup for
+    /// ResolverNonResponse). Empty when unresolvable.
+    agreement_hash: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct ReputationEventCounts {
+    successful_trade: u64,
+    dispute_win: u64,
+    dispute_loss: u64,
+    resolver_non_response: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ReputationLookupResponse {
+    address: String,
+    tip_height: u64,
+    /// Lifetime counts (since block 0).
+    lifetime: ReputationEventCounts,
+    /// Counts restricted to the last `recent_window` blocks.
+    recent: ReputationEventCounts,
+    recent_window: u64,
+    events: Vec<ReputationEventRecord>,
+}
+
+/// Default recent window matches the wallet's existing
+/// ReputationScore "recent" semantics. 4320 blocks ≈ 3 days at the
+/// current ~60-second mean block time.
+const REPUTATION_RECENT_WINDOW_BLOCKS: u64 = 4320;
+
+/// Walks every confirmed tx on the chain looking for OP_RETURN outputs
+/// carrying a rep1: anchor whose address field matches `target`. For
+/// each match, recovers the agreement_hash either from a co-located
+/// agr1: anchor in the same tx (Q2/Q3 path) or from the rep1 payload's
+/// short hash for ResolverNonResponse (Q1 path).
+fn scan_reputation_events_for_address(
+    chain: &ChainState,
+    target: &str,
+) -> Vec<ReputationEventRecord> {
+    let mut out = Vec::new();
+    for (height, block) in chain.chain.iter().enumerate() {
+        for tx in &block.transactions {
+            // Two-pass: find the rep1 outputs that name `target`, then
+            // look for an agr1 output in the same tx for the full
+            // agreement_hash. ResolverNonResponse uses the short hash
+            // in its own payload and scans the chain for the matching
+            // agreement.
+            let mut rep_events: Vec<ReputationEvent> = Vec::new();
+            let mut agr_hash: Option<String> = None;
+            for output in &tx.outputs {
+                if let Some(ev) = parse_reputation_event(&output.script_pubkey) {
+                    if ev.address == target {
+                        rep_events.push(ev);
+                    }
+                } else if let Some(anchor) = parse_agreement_anchor(&output.script_pubkey) {
+                    agr_hash = Some(anchor.agreement_hash.clone());
+                }
+            }
+            if rep_events.is_empty() {
+                continue;
+            }
+            let txid = hex::encode(tx.txid());
+            for ev in rep_events {
+                let resolved_hash = if let Some(ref h) = agr_hash {
+                    h.clone()
+                } else if let Some(short) = ev.agreement_short_hash.as_deref() {
+                    // Match short_hash prefix against agr1 anchors elsewhere on chain.
+                    resolve_agreement_hash_from_short(chain, short).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                out.push(ReputationEventRecord {
+                    event_kind: match ev.kind {
+                        ReputationEventKind::SuccessfulTrade => "successful_trade".to_string(),
+                        ReputationEventKind::DisputeWin => "dispute_win".to_string(),
+                        ReputationEventKind::DisputeLoss => "dispute_loss".to_string(),
+                        ReputationEventKind::ResolverNonResponse => {
+                            "resolver_non_response".to_string()
+                        }
+                    },
+                    txid: txid.clone(),
+                    height: height as u64,
+                    agreement_hash: resolved_hash,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| b.height.cmp(&a.height).then_with(|| a.txid.cmp(&b.txid)));
+    out
+}
+
+/// Match a 16-hex-char agreement_short_hash prefix against any agr1:
+/// anchor on the chain. Returns the first full match. Used only for
+/// ResolverNonResponse events which do not have a co-located agr1
+/// anchor in the same tx.
+fn resolve_agreement_hash_from_short(chain: &ChainState, short: &str) -> Option<String> {
+    for block in &chain.chain {
+        for tx in &block.transactions {
+            for output in &tx.outputs {
+                if let Some(anchor) = parse_agreement_anchor(&output.script_pubkey) {
+                    if anchor.agreement_hash.starts_with(short) {
+                        return Some(anchor.agreement_hash);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn count_reputation_events(
+    events: &[ReputationEventRecord],
+    height_floor: Option<u64>,
+) -> ReputationEventCounts {
+    let mut c = ReputationEventCounts::default();
+    for e in events {
+        if let Some(floor) = height_floor {
+            if e.height < floor {
+                continue;
+            }
+        }
+        match e.event_kind.as_str() {
+            "successful_trade" => c.successful_trade += 1,
+            "dispute_win" => c.dispute_win += 1,
+            "dispute_loss" => c.dispute_loss += 1,
+            "resolver_non_response" => c.resolver_non_response += 1,
+            _ => {}
+        }
+    }
+    c
+}
+
+async fn reputation_lookup(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(address): AxumPath<String>,
+) -> Result<Json<ReputationLookupResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    if address.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (tip_height, events) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip = chain.tip_height();
+        let evs = scan_reputation_events_for_address(&chain, address.trim());
+        (tip, evs)
+    };
+    let lifetime = count_reputation_events(&events, None);
+    let recent_floor = tip_height.saturating_sub(REPUTATION_RECENT_WINDOW_BLOCKS);
+    let recent = count_reputation_events(&events, Some(recent_floor));
+    Ok(Json(ReputationLookupResponse {
+        address,
+        tip_height,
+        lifetime,
+        recent,
+        recent_window: REPUTATION_RECENT_WINDOW_BLOCKS,
+        events,
+    }))
+}
+
 async fn verify_agreement_link(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -4677,10 +5037,45 @@ async fn fund_agreement(
     payer_pkh.copy_from_slice(&payer_vec);
     let mut payee_pkh = [0u8; 20];
     payee_pkh.copy_from_slice(&payee_vec);
-    let legs = build_funding_legs(&req.agreement, payer_pkh, payee_pkh)
+    let mut legs = build_funding_legs(&req.agreement, payer_pkh, payee_pkh)
         .map_err(|_| bad("build_funding_legs_failed"))?;
     if legs.is_empty() {
         return Err(bad("agreement_has_no_funding_legs"));
+    }
+    // GROUP G: per-milestone partial funding. When milestone_id is set,
+    // filter the built legs to that one milestone, reject if unknown,
+    // and reject if a confirmed Funding anchor already exists for that
+    // milestone on-chain (Q2: clear double-funding rejection).
+    if let Some(target_mid) = req.milestone_id.as_deref() {
+        if !req
+            .agreement
+            .milestones
+            .iter()
+            .any(|m| m.milestone_id == target_mid)
+        {
+            return Err(bad("milestone_id_not_found_in_agreement"));
+        }
+        legs.retain(|l| l.milestone_id.as_deref() == Some(target_mid));
+        if legs.is_empty() {
+            return Err(bad("milestone_id_has_no_funding_leg"));
+        }
+        if legs.len() != 1 {
+            return Err(bad("milestone_id_matched_multiple_legs"));
+        }
+        // Already-funded check: walk the chain for a confirmed Funding
+        // anchor that matches both agreement_hash and milestone_id.
+        let already_funded = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            scan_linked_txs_by_hash(&chain, &agreement_hash)
+                .iter()
+                .any(|t| {
+                    t.role == AgreementAnchorRole::Funding
+                        && t.milestone_id.as_deref() == Some(target_mid)
+                })
+        };
+        if already_funded {
+            return Err(bad("milestone_already_funded"));
+        }
     }
 
     let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
@@ -6835,6 +7230,66 @@ async fn build_agreement_spend_internal(
         resolver_payout,
     )
     .map_err(|_| bad("build_htlc_spend_failed"))?;
+
+    // GROUP H follow-up: on a broadcast release, kick off a separate
+    // best-effort Release anchor tx that carries rep1:s outputs for both
+    // parties. This pins the trade success on-chain without altering the
+    // HTLC spend tx itself. Failures here do NOT undo the release - the
+    // chain truth is the HTLC spend; the rep1 anchor is purely metadata.
+    if claim && spend.accepted {
+        let agreement_hash_for_rep = eligibility.agreement_hash.clone();
+        let payer_address = req
+            .agreement
+            .parties
+            .iter()
+            .find(|p| p.party_id == req.agreement.payer)
+            .map(|p| p.address.clone())
+            .unwrap_or_default();
+        let payee_address = req
+            .agreement
+            .parties
+            .iter()
+            .find(|p| p.party_id == req.agreement.payee)
+            .map(|p| p.address.clone())
+            .unwrap_or_default();
+        let mut rep_outputs: Vec<TxOutput> = Vec::new();
+        if !payer_address.is_empty() {
+            if let Ok(out) = build_reputation_event_output(&ReputationEvent {
+                kind: ReputationEventKind::SuccessfulTrade,
+                address: payer_address,
+                agreement_short_hash: None,
+            }) {
+                rep_outputs.push(out);
+            }
+        }
+        if !payee_address.is_empty() {
+            if let Ok(out) = build_reputation_event_output(&ReputationEvent {
+                kind: ReputationEventKind::SuccessfulTrade,
+                address: payee_address,
+                agreement_short_hash: None,
+            }) {
+                rep_outputs.push(out);
+            }
+        }
+        if !rep_outputs.is_empty() {
+            let release_role = match eligibility.role {
+                Some(AgreementAnchorRole::MilestoneRelease) => AgreementAnchorRole::MilestoneRelease,
+                _ => AgreementAnchorRole::Release,
+            };
+            if let Err(e) = build_and_broadcast_anchor_tx(
+                &state,
+                &agreement_hash_for_rep,
+                release_role,
+                rep_outputs,
+            ) {
+                eprintln!(
+                    "[group_h] best-effort release anchor + rep1:s broadcast failed for {}: {}",
+                    agreement_hash_for_rep, e
+                );
+            }
+        }
+    }
+
     Ok(Json(AgreementBuildSpendResponse {
         agreement_hash: eligibility.agreement_hash,
         agreement_id: req.agreement.agreement_id,
@@ -9550,6 +10005,12 @@ async fn explorer_stats(
         .route("/rpc/agreementaudit", post(agreement_audit))
         .route("/rpc/agreementstatus", post(agreement_status))
         .route("/rpc/agreementmilestones", post(agreement_milestones))
+        .route("/rpc/agreementreceipt", get(agreement_receipt))
+        .route("/rpc/reputation/:address", get(reputation_lookup))
+        .route(
+            "/rpc/broadcastreputationnonresponse",
+            post(broadcast_reputation_non_response),
+        )
         .route("/rpc/verifyagreementlink", post(verify_agreement_link))
         .route(
             "/rpc/agreementreleaseeligibility",
@@ -10421,6 +10882,7 @@ mod tests {
                 agreement,
                 fee_per_byte: Some(1),
                 broadcast: Some(false),
+                milestone_id: None,
             }),
         )
         .await
@@ -17151,10 +17613,17 @@ fn apply_dispute_status_to_eligibility(
 /// Build, sign, and (optionally) broadcast a transaction that anchors the
 /// supplied agreement hash on chain via an OP_RETURN output. Returns the txid
 /// hex on success. Mirrors fund_agreement's wallet+utxo+sign+broadcast path.
+///
+/// GROUP H follow-up: `extra_op_returns` carries additional OP_RETURN outputs
+/// (e.g. rep1:s / rep1:w / rep1:l reputation events) that ride alongside the
+/// primary agr1: anchor in the same tx. Fee estimate, output count, and the
+/// signature digest all include them. Pass `Vec::new()` for the legacy 2-output
+/// behaviour (agr1 + change only).
 fn build_and_broadcast_anchor_tx(
     state: &AppState,
     agreement_hash: &str,
     role: AgreementAnchorRole,
+    extra_op_returns: Vec<TxOutput>,
 ) -> Result<String, String> {
     let anchor_output = build_agreement_anchor_output(&AgreementAnchor {
         agreement_hash: agreement_hash.to_string(),
@@ -17207,8 +17676,9 @@ fn build_and_broadcast_anchor_tx(
     utxos.sort_by(|a, b| a.output.value.cmp(&b.output.value));
 
     let fee_per_byte = DISPUTE_ANCHOR_FEE_PER_BYTE;
-    // Tx layout: 1 input + 2 outputs (OP_RETURN anchor + change)
-    let estimated_fee = estimate_tx_size(1, 2).saturating_mul(fee_per_byte);
+    // Tx layout: 1 input + (1 agr1 anchor + N rep1 extras + 1 change) outputs.
+    let num_outputs = 2 + extra_op_returns.len();
+    let estimated_fee = estimate_tx_size(1, num_outputs).saturating_mul(fee_per_byte);
 
     let mut chosen: Option<WalletUtxo> = None;
     for utxo in &utxos {
@@ -17225,6 +17695,9 @@ fn build_and_broadcast_anchor_tx(
 
     let change_value = utxo.output.value.saturating_sub(estimated_fee);
     let mut outputs = vec![anchor_output];
+    for extra in extra_op_returns {
+        outputs.push(extra);
+    }
     outputs.push(TxOutput {
         value: change_value,
         script_pubkey: p2pkh_script(&utxo.pkh),
@@ -17287,6 +17760,144 @@ fn build_and_broadcast_anchor_tx(
         let _ = mp.add_transaction(tx.clone(), raw.clone(), fee);
     }
     // Best-effort P2P broadcast.
+    if let Some(ref node) = state.p2p {
+        let node = node.clone();
+        let raw_bytes = raw.clone();
+        tokio::spawn(async move {
+            let _ = node.broadcast_tx(&raw_bytes).await;
+        });
+    }
+    Ok(txid_hex)
+}
+
+/// GROUP H follow-up: build, sign, and broadcast a standalone reputation-
+/// event tx. No agr1 anchor; the rep1 outputs (typically just one rep1:n)
+/// are the only OP_RETURN outputs. Used by the resolver_non_response flow
+/// where the carrying tx is a pure reputation event, not part of a
+/// release / refund / disputeresolve flow.
+fn build_and_broadcast_rep_event_tx(
+    state: &AppState,
+    rep_outputs: Vec<TxOutput>,
+) -> Result<String, String> {
+    if rep_outputs.is_empty() {
+        return Err("rep_outputs_empty".to_string());
+    }
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet
+            .keys()
+            .map_err(|_| "wallet_keys_unavailable".to_string())?;
+        for key in keys {
+            let bytes = hex::decode(&key.pkh)
+                .map_err(|_| "wallet_key_pkh_decode_failed".to_string())?;
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            key_map.insert(arr, key);
+        }
+    }
+    if key_map.is_empty() {
+        return Err("wallet_key_map_empty".to_string());
+    }
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if key_map.contains_key(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+    if utxos.is_empty() {
+        return Err("wallet_utxo_set_empty".to_string());
+    }
+    utxos.sort_by(|a, b| a.output.value.cmp(&b.output.value));
+    let fee_per_byte = DISPUTE_ANCHOR_FEE_PER_BYTE;
+    let num_outputs = rep_outputs.len() + 1; // rep + change
+    let estimated_fee = estimate_tx_size(1, num_outputs).saturating_mul(fee_per_byte);
+    let mut chosen: Option<WalletUtxo> = None;
+    for utxo in &utxos {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+            continue;
+        }
+        if utxo.output.value > estimated_fee {
+            chosen = Some(utxo.clone());
+            break;
+        }
+    }
+    let utxo = chosen
+        .ok_or_else(|| "insufficient_spendable_funds_or_immature_coinbase".to_string())?;
+    let change_value = utxo.output.value.saturating_sub(estimated_fee);
+    let mut outputs = rep_outputs;
+    outputs.push(TxOutput {
+        value: change_value,
+        script_pubkey: p2pkh_script(&utxo.pkh),
+    });
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: utxo.outpoint.txid,
+            prev_index: utxo.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        }],
+        outputs,
+        locktime: 0,
+    };
+    let priv_bytes = hex::decode(&utxo.pkh_key_priv(&key_map)?)
+        .map_err(|_| "wallet_priv_decode".to_string())?;
+    if priv_bytes.len() != 32 {
+        return Err("wallet_priv_len".to_string());
+    }
+    let mut sk_arr = [0u8; 32];
+    sk_arr.copy_from_slice(&priv_bytes);
+    let signing_key =
+        SigningKey::from_bytes((&sk_arr).into()).map_err(|_| "signing_key".to_string())?;
+    let pubkey_bytes = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+    let scriptcode = p2pkh_script(&utxo.pkh);
+    let digest = signature_digest(&tx, 0, &scriptcode);
+    let sig: Signature = signing_key
+        .sign_prehash(&digest)
+        .map_err(|_| "sign_prehash".to_string())?;
+    let sig = sig.normalize_s().unwrap_or(sig);
+    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+    sig_bytes.push(0x01);
+    let mut script_sig: Vec<u8> = Vec::with_capacity(2 + sig_bytes.len() + pubkey_bytes.len());
+    script_sig.push(sig_bytes.len() as u8);
+    script_sig.extend_from_slice(&sig_bytes);
+    script_sig.push(pubkey_bytes.len() as u8);
+    script_sig.extend_from_slice(&pubkey_bytes);
+    tx.inputs[0].script_sig = script_sig;
+    let raw = tx.serialize();
+    let txid = tx.txid();
+    let txid_hex = hex::encode(txid);
+    let fee = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|e| format!("fee_validate: {}", e))?
+    };
+    {
+        let mut mp = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = mp.add_transaction(tx.clone(), raw.clone(), fee);
+    }
     if let Some(ref node) = state.p2p {
         let node = node.clone();
         let raw_bytes = raw.clone();
@@ -17436,6 +18047,24 @@ struct ResolveDisputeResponse {
     resolver_role: String,
 }
 
+// GROUP H follow-up: payload for the resolver-non-response indictment.
+// Any party can submit. iriumd verifies the dispute exists, is still
+// open (no resolution anchored), and the resolver's response window
+// (DISPUTE_RESOLVER_RESPONSE_WINDOW blocks past the raise anchor)
+// has elapsed.
+#[derive(Debug, Deserialize)]
+struct BroadcastReputationNonResponseRequest {
+    resolver_address: String,
+    agreement_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BroadcastReputationNonResponseResponse {
+    anchor_txid: String,
+    resolver_address: String,
+    agreement_hash: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct RegisterResolverRequest {
     registration: ResolverRegistration,
@@ -17517,8 +18146,13 @@ async fn raise_dispute(
         }
     }
     let anchor_txid =
-        build_and_broadcast_anchor_tx(&state, &agreement_hash, AgreementAnchorRole::DisputeRaise)
-            .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
+        build_and_broadcast_anchor_tx(
+            &state,
+            &agreement_hash,
+            AgreementAnchorRole::DisputeRaise,
+            Vec::new(),
+        )
+        .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
     let new_state = DisputeState {
         raise: req.dispute.clone(),
         raise_anchor_txid: Some(anchor_txid.clone()),
@@ -17598,6 +18232,7 @@ async fn submit_dispute_evidence(
         &state,
         &agreement_hash,
         AgreementAnchorRole::DisputeEvidence,
+        Vec::new(),
     )
     .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
     let evidence_hash = req.evidence.evidence_hash.clone();
@@ -17712,10 +18347,54 @@ async fn resolve_dispute(
             return Err(bad("fallback_not_yet_escalated"));
         }
     }
+    // GROUP H follow-up: embed rep1:w + rep1:l reputation events alongside
+    // the agr1:x DisputeResolve anchor in the same tx. The resolver knows
+    // both parties' addresses from the agreement; the winner is the party
+    // who receives funds per outcome ("release" -> payee wins;
+    // "refund" -> payer wins).
+    let payer_address = req
+        .agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == req.agreement.payer)
+        .map(|p| p.address.clone())
+        .unwrap_or_default();
+    let payee_address = req
+        .agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == req.agreement.payee)
+        .map(|p| p.address.clone())
+        .unwrap_or_default();
+    let (winner_addr, loser_addr) = match req.resolution.outcome.as_str() {
+        "release" => (payee_address.clone(), payer_address.clone()),
+        "refund" => (payer_address.clone(), payee_address.clone()),
+        _ => (String::new(), String::new()),
+    };
+    let mut rep_outputs: Vec<TxOutput> = Vec::new();
+    if !winner_addr.is_empty() {
+        if let Ok(out) = build_reputation_event_output(&ReputationEvent {
+            kind: ReputationEventKind::DisputeWin,
+            address: winner_addr,
+            agreement_short_hash: None,
+        }) {
+            rep_outputs.push(out);
+        }
+    }
+    if !loser_addr.is_empty() {
+        if let Ok(out) = build_reputation_event_output(&ReputationEvent {
+            kind: ReputationEventKind::DisputeLoss,
+            address: loser_addr,
+            agreement_short_hash: None,
+        }) {
+            rep_outputs.push(out);
+        }
+    }
     let anchor_txid = build_and_broadcast_anchor_tx(
         &state,
         &agreement_hash,
         AgreementAnchorRole::DisputeResolve,
+        rep_outputs,
     )
     .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
     let outcome = req.resolution.outcome.clone();
@@ -17786,6 +18465,7 @@ async fn register_resolver(
         &state,
         &resolver_address,
         AgreementAnchorRole::ResolverRegister,
+        Vec::new(),
     )
     .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
     let record = ResolverRegistrationRecord {
@@ -17809,6 +18489,73 @@ async fn register_resolver(
     Ok(Json(RegisterResolverResponse {
         resolver_address,
         anchor_txid,
+    }))
+}
+
+// GROUP H follow-up: broadcast a standalone rep1:n indictment of a
+// resolver who missed the response window for an open dispute. Any
+// caller can submit; iriumd validates the dispute exists, has not been
+// resolved, and the resolver's response window has elapsed (raise
+// height + DISPUTE_RESOLVER_RESPONSE_WINDOW blocks). The named
+// resolver must match the dispute's currently effective resolver
+// (primary, or fallback if escalated, or the reresolve nominee).
+async fn broadcast_reputation_non_response(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<BroadcastReputationNonResponseRequest>,
+) -> Result<Json<BroadcastReputationNonResponseResponse>, (StatusCode, String)> {
+    let bad =
+        |reason: &str| -> (StatusCode, String) { (StatusCode::BAD_REQUEST, reason.to_string()) };
+    check_rate_with_auth(&state, &addr, &headers)
+        .map_err(|sc| (sc, format!("rate_limit_or_auth_failed:{sc}")))?;
+    require_rpc_auth(&headers).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    if req.resolver_address.trim().is_empty() {
+        return Err(bad("resolver_address_empty"));
+    }
+    if req.agreement_hash.len() != 64
+        || !req.agreement_hash.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(bad("agreement_hash_invalid"));
+    }
+    // Look up the dispute and validate state.
+    let (raise_height, is_open) = {
+        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let d = guard
+            .get(&req.agreement_hash)
+            .ok_or_else(|| bad("dispute_not_found"))?;
+        let raise_h = d
+            .raise_anchored_at_height
+            .ok_or_else(|| bad("dispute_raise_not_anchored"))?;
+        (raise_h, d.is_open())
+    };
+    if !is_open {
+        return Err(bad("dispute_already_resolved"));
+    }
+    // Window check.
+    let tip_height = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.tip_height()
+    };
+    let deadline = raise_height.saturating_add(DISPUTE_RESOLVER_RESPONSE_WINDOW);
+    if tip_height < deadline {
+        return Err(bad("response_window_not_elapsed"));
+    }
+    // Build rep1:n event.
+    let short = agreement_short_hash_from_full(&req.agreement_hash)
+        .map_err(|_| bad("agreement_short_hash_failed"))?;
+    let rep_output = build_reputation_event_output(&ReputationEvent {
+        kind: ReputationEventKind::ResolverNonResponse,
+        address: req.resolver_address.clone(),
+        agreement_short_hash: Some(short),
+    })
+    .map_err(|e| bad(&format!("rep1_payload:{e}")))?;
+    let anchor_txid = build_and_broadcast_rep_event_tx(&state, vec![rep_output])
+        .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
+    Ok(Json(BroadcastReputationNonResponseResponse {
+        anchor_txid,
+        resolver_address: req.resolver_address,
+        agreement_hash: req.agreement_hash,
     }))
 }
 
@@ -17987,6 +18734,26 @@ fn scan_new_blocks_for_dispute_anchors(
                         if let Some(snap) = snapshot_to_persist {
                             let _ = save_resolver_record(&snap);
                         }
+                    }
+                    // GROUP C: release-role anchors confirming on-chain emit
+                    // `agreement.auto_released` so subscribed clients (the
+                    // Tauri GUI, the wallet watcher) hear that the
+                    // agreement has settled. The same event fires whether
+                    // the release was triggered manually or by `irium-wallet
+                    // watch --auto-release`; the wallet-side dedupe HashSet
+                    // makes repeat events idempotent.
+                    AgreementAnchorRole::OtcSettlement
+                    | AgreementAnchorRole::MerchantSettlement => {
+                        emit_event(
+                            event_tx,
+                            "agreement.auto_released",
+                            serde_json::json!({
+                                "agreement_hash": anchor.agreement_hash,
+                                "anchor_txid": txid_hex,
+                                "anchored_at_height": height,
+                                "role": format!("{:?}", anchor.role),
+                            }),
+                        );
                     }
                     _ => {}
                 }

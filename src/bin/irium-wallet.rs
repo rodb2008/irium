@@ -22,6 +22,13 @@ use irium_node_rs::settlement::{
     NoResponseTrigger, PolicyOutcome, ProofPolicy, ProofRequirement, ProofResolution,
     ProofSignatureEnvelope, SettlementProof, TypedProofPayload, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
     AGREEMENT_SIGNATURE_VERSION, PROOF_POLICY_SCHEMA_ID, SETTLEMENT_PROOF_SCHEMA_ID,
+    AgreementAnchorRole, AgreementEscrowReceipt, AgreementLifecycleState,
+    EscrowReceiptDisputeRef, EscrowReceiptProofRef, ExporterSignatureEnvelope,
+    TxidWithHeight, ESCROW_RECEIPT_SCHEMA_ID, ESCROW_RECEIPT_VERSION,
+    escrow_receipt_signing_digest, verify_escrow_receipt_signature,
+    build_escrow_receipt_unsigned,
+    AgreementLinkedTx as SettlementLinkedTx,
+    AgreementMilestoneStatus as SettlementMilestoneStatus,
     DisputeEvidence, DisputeRaise, DisputeReResolverNomination, DisputeResolution,
     ResolverRegistration,
     DISPUTE_EVIDENCE_SCHEMA_ID, DISPUTE_EVIDENCE_VERSION,
@@ -57,11 +64,19 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
 const IRIUM_MULTISIG_VERSION: u8 = 0x28;
 const DEFAULT_FEE_PER_BYTE: u64 = 1;
+
+/// GROUP E: number of blocks to wait after a satisfying proof is observed
+/// before the auto-release watcher (`irium-wallet watch --auto-release`)
+/// will trigger the release transaction. Gives the counterparty a window
+/// to dispute the proof. Applied to freelance and milestone templates;
+/// OTC and deposit do not use it.
+pub const DEFAULT_DISPUTE_WINDOW_BLOCKS: u64 = 144;
 
 #[derive(Serialize, Deserialize)]
 struct WalletFile {
@@ -266,6 +281,12 @@ struct FundAgreementRequestBody {
     agreement: AgreementObject,
     fee_per_byte: Option<u64>,
     broadcast: Option<bool>,
+    /// GROUP G: when set, iriumd's /rpc/fundagreement filters the
+    /// built funding legs down to just this milestone, producing a
+    /// single-HTLC tx for partial funding. None preserves the
+    /// existing whole-agreement funding behaviour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    milestone_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -607,6 +628,14 @@ struct ProofCreateCliOptions {
     expires_at_height: Option<u64>,
     proof_kind: Option<String>,
     reference_id: Option<String>,
+    /// GROUP D: typed_payload.attributes key/value pairs built from
+    /// repeated `--attribute key=value` flags on the CLI. None when no
+    /// --attribute was supplied; Some(_) is a JSON object. Required for
+    /// the 5 standard proof_types (payment_received, delivery_confirmed,
+    /// work_completed, milestone_delivered, deposit_conditions_met) —
+    /// iriumd's submit_proof_rpc rejects proofs that don't carry the
+    /// schema-required keys.
+    attributes: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -2247,6 +2276,10 @@ fn find_key<'a>(wallet: &'a WalletFile, addr: &str) -> Option<&'a WalletKey> {
     wallet.keys.iter().find(|k| k.address == addr)
 }
 
+fn _watch_usage_line() {
+    eprintln!("  irium-wallet watch [--auto-release] [--rpc <url>]   # GROUP C: long-running auto-release daemon; honours IRIUM_AUTO_RELEASE=1");
+}
+
 fn usage() {
     eprintln!("Usage:");
     eprintln!("  irium-wallet init [--seed <64hex>]");
@@ -3321,12 +3354,21 @@ fn create_settlement_proof_signed(
             payload_hash: String::new(),
         },
         expires_at_height: opts.expires_at_height,
-        typed_payload: opts.proof_kind.as_ref().map(|kind| TypedProofPayload {
-            proof_kind: kind.clone(),
-            content_hash: None,
-            reference_id: opts.reference_id.clone(),
-            attributes: None,
-        }),
+        // GROUP D: build typed_payload when EITHER --proof-kind OR one or
+        // more --attribute key=value flags were supplied. If only
+        // --attribute is set, proof_kind defaults to the proof_type so
+        // the existing validate_typed_proof_payload (which requires a
+        // non-empty proof_kind) is satisfied.
+        typed_payload: if opts.proof_kind.is_some() || opts.attributes.is_some() {
+            Some(TypedProofPayload {
+                proof_kind: opts.proof_kind.clone().unwrap_or_else(|| opts.proof_type.clone()),
+                content_hash: None,
+                reference_id: opts.reference_id.clone(),
+                attributes: opts.attributes.clone(),
+            })
+        } else {
+            None
+        },
     };
 
     let payload_bytes = settlement_proof_payload_bytes(&proof)
@@ -5658,6 +5700,9 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
     let mut expires_at_height: Option<u64> = None;
     let mut proof_kind: Option<String> = None;
     let mut reference_id: Option<String> = None;
+    // GROUP D: collect repeated --attribute key=value into a serde_json::Map.
+    let mut attr_map: serde_json::Map<String, serde_json::Value> =
+        serde_json::Map::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -5771,12 +5816,50 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
                 }
                 rpc_url = Some(args[i].clone());
             }
+            // GROUP D: --attribute key=value. Repeatable. Numeric-looking
+            // values (parseable as i64 / u64 / f64) are stored as JSON
+            // numbers; everything else stays a JSON string. Bare 'true'
+            // and 'false' parse as JSON booleans for ergonomic ease.
+            "--attribute" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--attribute requires key=value".to_string());
+                }
+                let raw = &args[i];
+                let (k, v) = raw.split_once('=').ok_or_else(|| {
+                    format!("--attribute must be key=value, got: {raw}")
+                })?;
+                let key = k.trim().to_string();
+                if key.is_empty() {
+                    return Err("--attribute key must not be empty".to_string());
+                }
+                let val_str = v.trim();
+                let value: serde_json::Value = if let Ok(n) = val_str.parse::<i64>() {
+                    serde_json::Value::from(n)
+                } else if let Ok(n) = val_str.parse::<u64>() {
+                    serde_json::Value::from(n)
+                } else if let Ok(f) = val_str.parse::<f64>() {
+                    serde_json::Value::from(f)
+                } else if val_str == "true" {
+                    serde_json::Value::Bool(true)
+                } else if val_str == "false" {
+                    serde_json::Value::Bool(false)
+                } else {
+                    serde_json::Value::String(val_str.to_string())
+                };
+                attr_map.insert(key, value);
+            }
             other => {
                 return Err(format!("unknown argument: {}", other));
             }
         }
         i += 1;
     }
+    let attributes = if attr_map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(attr_map))
+    };
     Ok(ProofCreateCliOptions {
         agreement_hash: agreement_hash.ok_or_else(|| "--agreement-hash is required".to_string())?,
         proof_type: proof_type.ok_or_else(|| "--proof-type is required".to_string())?,
@@ -5793,6 +5876,7 @@ fn parse_proof_create_cli(args: &[String]) -> Result<ProofCreateCliOptions, Stri
         expires_at_height,
         proof_kind,
         reference_id,
+        attributes,
     })
 }
 
@@ -7156,6 +7240,7 @@ fn handle_otc_attest(args: &[String]) -> Result<(), String> {
         expires_at_height: None,
         proof_kind: None,
         reference_id: None,
+        attributes: None,
     };
     let proof = create_settlement_proof_signed(&opts, attestation_time)?;
 
@@ -7367,6 +7452,17 @@ struct IrmOffer {
     source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seller_pubkey: Option<String>,
+    /// FIX 3: the trade template the seller is offering. One of
+    /// "otc" (default — current behaviour), "freelance", "milestone",
+    /// "deposit". Pre-FIX-3 offers default to "otc" via the
+    /// Option-is-None branch in handle_offer_take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    template_type: Option<String>,
+    /// FIX 3: number of milestones when template_type=="milestone" or
+    /// "contractor". Seller defines the trade structure at offer-create
+    /// time; the buyer can only accept or decline the whole offer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    milestone_count: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -7479,12 +7575,37 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
     let mut price_note: Option<String> = None;
     let mut payment_instructions: Option<String> = None;
     let mut offer_id: Option<String> = None;
+    // FIX 3: settlement template + milestone count. Both optional;
+    // unset means "otc" (legacy default) and 1 milestone respectively.
+    let mut template_type: Option<String> = None;
+    let mut milestone_count: Option<u32> = None;
     let mut json_mode = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--seller" => {
                 seller = Some(parse_required_string_flag(args, &mut i, "--seller")?);
+            }
+            "--template-type" => {
+                let raw = parse_required_string_flag(args, &mut i, "--template-type")?;
+                let normalized = raw.trim().to_lowercase();
+                if !matches!(normalized.as_str(), "otc" | "freelance" | "milestone" | "deposit") {
+                    return Err(format!(
+                        "--template-type must be otc|freelance|milestone|deposit, got: {}",
+                        raw
+                    ));
+                }
+                template_type = Some(normalized);
+            }
+            "--milestone-count" => {
+                let raw = parse_required_string_flag(args, &mut i, "--milestone-count")?;
+                let n = raw.parse::<u32>().map_err(|_| {
+                    "--milestone-count must be a positive integer".to_string()
+                })?;
+                if n == 0 {
+                    return Err("--milestone-count must be at least 1".to_string());
+                }
+                milestone_count = Some(n);
             }
             "--amount" => {
                 amount = Some(parse_irm(&parse_required_string_flag(
@@ -7558,6 +7679,14 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
         buyer_address: None,
         taken_at: None,
         taken_at_height: None,
+        // FIX 3: persist template + milestone count so handle_offer_take
+        // can dispatch to the right agreement builder.
+        template_type: template_type.clone(),
+        milestone_count: milestone_count.or_else(|| {
+            // Default 1 only when template requires milestones; leave None
+            // for otc/freelance/deposit so the offer JSON stays compact.
+            if matches!(template_type.as_deref(), Some("milestone")) { Some(1) } else { None }
+        }),
         source: Some("local".to_string()),
         seller_pubkey,
     };
@@ -7854,6 +7983,11 @@ fn handle_offer_show(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// Manual OTC policy builder retained for the `policy-build-otc` CLI's
+// back-compat path and for build_default_otc_policy_sets_correct_fields
+// (tests). GROUP E's auto-policy path goes through build_otc_template_policy
+// which uses proof_type = "payment_received" instead.
+#[allow(dead_code)]
 fn build_default_otc_policy(
     policy_id: &str,
     agreement_hash: &str,
@@ -7891,6 +8025,207 @@ fn build_default_otc_policy(
         expires_at_height: None,
         milestones: vec![],
         holdback: None,
+    }
+}
+
+// GROUP E: auto-policy builder used by handle_offer_take for the OTC
+// template. Differs from build_default_otc_policy (kept for the manual
+// `policy-build-otc` CLI) in two ways:
+//   - proof_type = "payment_received" instead of "otc_release", so the
+//     proof is matched against GROUP D's payment_received schema (must
+//     carry payment_method / payment_reference / amount / currency /
+//     timestamp attributes).
+//   - requirement_id = "req-payment-received".
+// Attestor, no_response_rule, and refund deadline are unchanged.
+fn build_otc_template_policy(
+    policy_id: &str,
+    agreement_hash: &str,
+    seller_pubkey: &str,
+    timeout_height: u64,
+) -> ProofPolicy {
+    ProofPolicy {
+        policy_id: policy_id.to_string(),
+        schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+        agreement_hash: agreement_hash.to_string(),
+        required_proofs: vec![ProofRequirement {
+            requirement_id: "req-payment-received".to_string(),
+            proof_type: "payment_received".to_string(),
+            required_by: Some(timeout_height),
+            required_attestor_ids: vec!["seller-attestor".to_string()],
+            resolution: ProofResolution::Release,
+            milestone_id: None,
+            threshold: None,
+        }],
+        no_response_rules: vec![NoResponseRule {
+            rule_id: "rule-timeout-refund".to_string(),
+            deadline_height: timeout_height,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: Some(
+                "refund if seller never attests payment_received before timeout".to_string(),
+            ),
+        }],
+        attestors: vec![ApprovedAttestor {
+            attestor_id: "seller-attestor".to_string(),
+            pubkey_hex: seller_pubkey.to_string(),
+            display_name: None,
+            domain: None,
+        }],
+        notes: Some(
+            "OTC template policy: seller attests payment_received; release on proof finality."
+                .to_string(),
+        ),
+        expires_at_height: None,
+        milestones: vec![],
+        holdback: None,
+    }
+}
+
+// GROUP E: auto-policy for the freelance template. The contractor
+// (seller in the offer) attests `work_completed`; release fires after
+// the dispute window expires unless the buyer raises a dispute.
+fn build_default_freelance_policy(
+    policy_id: &str,
+    agreement_hash: &str,
+    contractor_pubkey: &str,
+    timeout_height: u64,
+) -> ProofPolicy {
+    ProofPolicy {
+        policy_id: policy_id.to_string(),
+        schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+        agreement_hash: agreement_hash.to_string(),
+        required_proofs: vec![ProofRequirement {
+            requirement_id: "req-work-completed".to_string(),
+            proof_type: "work_completed".to_string(),
+            required_by: Some(timeout_height),
+            required_attestor_ids: vec!["contractor-attestor".to_string()],
+            resolution: ProofResolution::Release,
+            milestone_id: None,
+            threshold: None,
+        }],
+        no_response_rules: vec![NoResponseRule {
+            rule_id: "rule-timeout-refund".to_string(),
+            deadline_height: timeout_height,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: None,
+            notes: Some(
+                "refund if contractor never attests work_completed before timeout".to_string(),
+            ),
+        }],
+        attestors: vec![ApprovedAttestor {
+            attestor_id: "contractor-attestor".to_string(),
+            pubkey_hex: contractor_pubkey.to_string(),
+            display_name: None,
+            domain: None,
+        }],
+        notes: Some(
+            "Freelance template policy: contractor attests work_completed; release after dispute window."
+                .to_string(),
+        ),
+        expires_at_height: None,
+        milestones: vec![],
+        holdback: None,
+    }
+}
+
+// GROUP E: auto-policy for a single milestone of a milestone-template
+// agreement. N milestones produce N independent policies (one per
+// milestone_id) so each releases on its own clock without waiting on the
+// others. Resolution is MilestoneRelease.
+fn build_default_milestone_policy(
+    policy_id: &str,
+    agreement_hash: &str,
+    contractor_pubkey: &str,
+    milestone_id: &str,
+    timeout_height: u64,
+) -> ProofPolicy {
+    ProofPolicy {
+        policy_id: policy_id.to_string(),
+        schema_id: PROOF_POLICY_SCHEMA_ID.to_string(),
+        agreement_hash: agreement_hash.to_string(),
+        required_proofs: vec![ProofRequirement {
+            requirement_id: format!("req-milestone-{}", milestone_id),
+            proof_type: "milestone_delivered".to_string(),
+            required_by: Some(timeout_height),
+            required_attestor_ids: vec!["contractor-attestor".to_string()],
+            resolution: ProofResolution::MilestoneRelease,
+            milestone_id: Some(milestone_id.to_string()),
+            threshold: None,
+        }],
+        no_response_rules: vec![NoResponseRule {
+            rule_id: format!("rule-milestone-{}-timeout", milestone_id),
+            deadline_height: timeout_height,
+            trigger: NoResponseTrigger::FundedAndNoRelease,
+            resolution: ProofResolution::Refund,
+            milestone_id: Some(milestone_id.to_string()),
+            notes: Some(format!(
+                "refund milestone {} if contractor never attests milestone_delivered before timeout",
+                milestone_id
+            )),
+        }],
+        attestors: vec![ApprovedAttestor {
+            attestor_id: "contractor-attestor".to_string(),
+            pubkey_hex: contractor_pubkey.to_string(),
+            display_name: None,
+            domain: None,
+        }],
+        notes: Some(format!(
+            "Milestone {} policy: contractor attests milestone_delivered; release after dispute window.",
+            milestone_id
+        )),
+        expires_at_height: None,
+        milestones: vec![],
+        holdback: None,
+    }
+}
+
+// GROUP E: dispatch by AgreementTemplateType to the right auto-policy
+// builder. Returns None for templates that intentionally have no policy
+// (RefundableDeposit) or for templates not produced by offer-take
+// (MerchantDelayedSettlement, ContractorMilestone). For milestone
+// settlements, returns N policies — one per milestone in agreement.milestones.
+fn build_template_policy(
+    agreement: &AgreementObject,
+    agreement_hash: &str,
+    attestor_pubkey_hex: &str,
+    fallback_timeout_height: u64,
+) -> Option<Vec<ProofPolicy>> {
+    let policy_id_base = format!("pol-{}", agreement.agreement_id);
+    match agreement.template_type {
+        AgreementTemplateType::OtcSettlement => Some(vec![build_otc_template_policy(
+            &policy_id_base,
+            agreement_hash,
+            attestor_pubkey_hex,
+            fallback_timeout_height,
+        )]),
+        AgreementTemplateType::SimpleReleaseRefund => Some(vec![build_default_freelance_policy(
+            &policy_id_base,
+            agreement_hash,
+            attestor_pubkey_hex,
+            fallback_timeout_height,
+        )]),
+        AgreementTemplateType::MilestoneSettlement => {
+            if agreement.milestones.is_empty() {
+                return None;
+            }
+            let mut policies = Vec::with_capacity(agreement.milestones.len());
+            for m in agreement.milestones.iter() {
+                let pol_id = format!("{}-{}", policy_id_base, m.milestone_id);
+                policies.push(build_default_milestone_policy(
+                    &pol_id,
+                    agreement_hash,
+                    attestor_pubkey_hex,
+                    &m.milestone_id,
+                    m.timeout_height,
+                ));
+            }
+            Some(policies)
+        }
+        AgreementTemplateType::RefundableDeposit
+        | AgreementTemplateType::MerchantDelayedSettlement
+        | AgreementTemplateType::ContractorMilestone => None,
     }
 }
 
@@ -8000,20 +8335,119 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
         format!("offer-doc-{}-{}", agreement_id, now).as_bytes(),
     ));
 
-    let agreement = build_otc_agreement(
-        agreement_id.clone(),
-        now,
-        buyer_party,
-        seller_party,
-        offer.amount_irm,
-        "IRM".to_string(),
-        offer.payment_method.clone(),
-        offer.timeout_height,
-        secret_hash,
-        doc_hash,
-        None,
-        None,
-    )?;
+    // FIX 3: dispatch to the correct agreement builder based on the
+    // seller's chosen template. Pre-FIX-3 offers (no template_type) get
+    // the legacy OTC path for back-compat.
+    let template = offer.template_type.as_deref().unwrap_or("otc");
+    let mut agreement = match template {
+        "otc" => build_otc_agreement(
+            agreement_id.clone(),
+            now,
+            buyer_party,
+            seller_party,
+            offer.amount_irm,
+            "IRM".to_string(),
+            offer.payment_method.clone(),
+            offer.timeout_height,
+            secret_hash,
+            doc_hash,
+            None,
+            None,
+        )?,
+        "freelance" => build_simple_settlement_agreement(
+            agreement_id.clone(),
+            now,
+            buyer_party,    // party_a / payer  = client (buyer)
+            seller_party,   // party_b / payee  = contractor (seller)
+            offer.amount_irm,
+            None,
+            offer.timeout_height,
+            secret_hash,
+            doc_hash,
+            None,
+            Some("Freelance work — release on contractor proof of completion".to_string()),
+            Some("Refund returns to client if no proof submitted before timeout".to_string()),
+            None,
+        )?,
+        "deposit" => build_deposit_agreement(
+            agreement_id.clone(),
+            now,
+            buyer_party,    // payer  = depositor (buyer)
+            seller_party,   // payee  = recipient (seller)
+            offer.amount_irm,
+            "Refundable deposit".to_string(),
+            "Deposit refund returns to depositor on timeout".to_string(),
+            offer.timeout_height,
+            secret_hash,
+            doc_hash,
+            None,
+            None,
+        )?,
+        "milestone" => {
+            // Split total amount + timeline into N equal slices. The seller
+            // chose milestone_count at offer-create; we default to 1 here
+            // for malformed offers so the builder still has something to
+            // chew on. Per-milestone secret_hash is derived deterministically
+            // from the parent secret_hash so the GUI's secret-recovery flow
+            // (FIX 1) can reproduce it.
+            let n = offer.milestone_count.unwrap_or(1).max(1) as u64;
+            let per_amount = offer.amount_irm / n;
+            let mut milestones: Vec<AgreementMilestone> = Vec::with_capacity(n as usize);
+            // Spread per-milestone timeouts linearly between the next block
+            // (timeout_now + 1) and offer.timeout_height.
+            let span = offer.timeout_height.saturating_sub(now);
+            for j in 0..n {
+                let m_timeout = if span > 0 {
+                    now + ((span * (j + 1)) / n)
+                } else {
+                    offer.timeout_height
+                };
+                let m_secret_hash = hex::encode(Sha256::digest(
+                    format!("offer-secret-{}-{}-m{}", agreement_id, now, j + 1).as_bytes(),
+                ));
+                milestones.push(AgreementMilestone {
+                    milestone_id: format!("m{}", j + 1),
+                    title: format!("Milestone {}", j + 1),
+                    amount: per_amount,
+                    recipient_address: offer.seller_address.clone(),
+                    refund_address: buyer_addr.clone(),
+                    secret_hash_hex: m_secret_hash,
+                    timeout_height: m_timeout,
+                    metadata_hash: None,
+                });
+            }
+            build_milestone_agreement(
+                agreement_id.clone(),
+                now,
+                // payer (buyer) -> payee (seller)
+                parse_party_spec(&format!("buyer|Buyer|{}|buyer", buyer_addr))?,
+                parse_party_spec(&format!("seller|Seller|{}|seller", offer.seller_address))?,
+                milestones,
+                offer.timeout_height,
+                doc_hash,
+                None,
+                None,
+            )?
+        }
+        other => {
+            return Err(format!(
+                "unknown template_type in offer {}: {} (expected otc|freelance|milestone|deposit)",
+                offer.offer_id, other
+            ));
+        }
+    };
+
+    // GROUP E (Q2): freelance and milestone agreements get a fixed
+    // post-proof dispute window so the auto-release watcher waits
+    // DEFAULT_DISPUTE_WINDOW_BLOCKS past proof observation before
+    // releasing. Mutated BEFORE compute_agreement_hash_hex so the hash
+    // covers it; OTC and deposit are unchanged.
+    if matches!(
+        agreement.template_type,
+        AgreementTemplateType::SimpleReleaseRefund | AgreementTemplateType::MilestoneSettlement
+    ) {
+        agreement.deadlines.dispute_window = Some(DEFAULT_DISPUTE_WINDOW_BLOCKS);
+    }
 
     let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
     let saved_path = save_agreement_to_store_at(&imported_agreements_dir(), &agreement)?;
@@ -8073,33 +8507,46 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
         }
     }
 
-    // Auto-build and store OTC policy on local node if seller_pubkey is known.
-    let mut auto_policy_id: Option<String> = None;
+    // GROUP E: dispatch the auto-policy build by template_type. OTC and
+    // freelance produce one policy; milestone produces N (one per
+    // milestone); deposit produces none (HTLC timeout is the only path).
+    let mut auto_policy_ids: Vec<String> = Vec::new();
     if let Some(ref pubkey) = offer.seller_pubkey {
-        let pol_id = format!("pol-{}", offer_id);
-        let policy =
-            build_default_otc_policy(&pol_id, &agreement_hash, pubkey, offer.timeout_height);
-        let base = rpc_url.trim_end_matches('/');
-        match rpc_client(base).and_then(|client| {
-            let req = StorePolicyRpcRequest {
-                policy,
-                replace: false,
-            };
-            rpc_post_json::<StorePolicyRpcRequest, StorePolicyRpcResponse>(
-                &client,
-                base,
-                "/rpc/storepolicy",
-                &req,
-            )
-        }) {
-            Ok(_) => {
-                auto_policy_id = Some(pol_id);
-            }
-            Err(e) => {
-                eprintln!("[warn] auto-policy store failed: {}; set policy manually with policy-build-otc", e);
+        if let Some(policies) =
+            build_template_policy(&agreement, &agreement_hash, pubkey, offer.timeout_height)
+        {
+            let base = rpc_url.trim_end_matches('/');
+            for policy in policies.iter() {
+                let pol_id = policy.policy_id.clone();
+                match rpc_client(base).and_then(|client| {
+                    let req = StorePolicyRpcRequest {
+                        policy: policy.clone(),
+                        replace: false,
+                    };
+                    rpc_post_json::<StorePolicyRpcRequest, StorePolicyRpcResponse>(
+                        &client,
+                        base,
+                        "/rpc/storepolicy",
+                        &req,
+                    )
+                }) {
+                    Ok(_) => {
+                        auto_policy_ids.push(pol_id);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[warn] auto-policy store failed for {}: {}; set policy manually with policy-build-otc/contractor/preorder",
+                            pol_id, e
+                        );
+                    }
+                }
             }
         }
     }
+    // Back-compat: external consumers still read auto_policy_id (singular).
+    // Singular is the first auto-stored policy id, or None when nothing
+    // was stored (e.g. deposit template, no seller_pubkey).
+    let auto_policy_id: Option<String> = auto_policy_ids.first().cloned();
 
     if json_mode {
         println!(
@@ -8110,6 +8557,7 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
                 "agreement_hash":  agreement_hash,
                 "saved_path":      saved_path.display().to_string(),
                 "auto_policy_id":  auto_policy_id,
+                "auto_policy_ids": auto_policy_ids,
             }))
             .unwrap()
         );
@@ -8125,8 +8573,15 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     println!("buyer           {}", buyer_addr);
     println!("amount_irm      {} IRM", format_irm(offer.amount_irm));
     println!("saved_path      {}", saved_path.display());
-    if let Some(ref pol_id) = auto_policy_id {
-        println!("policy_id       {} (auto-created)", pol_id);
+    match auto_policy_ids.len() {
+        0 => {}
+        1 => println!("policy_id       {} (auto-created)", auto_policy_ids[0]),
+        n => {
+            println!("policy_ids      {} policies (auto-created):", n);
+            for id in &auto_policy_ids {
+                println!("                  {}", id);
+            }
+        }
     }
     println!();
     println!("=== Next steps ===");
@@ -10010,7 +10465,7 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
         }
     }
 
-    ReputationScore {
+    let mut score = ReputationScore {
         total,
         satisfied,
         failed,
@@ -10025,7 +10480,101 @@ fn compute_reputation(seller_addr: &str) -> ReputationScore {
         total_proof_response_secs,
         proof_response_count,
         self_trade_count,
+    };
+
+    // GROUP H (Q5): when iriumd is reachable, chain-anchored counts
+    // override the local-file counts. The local file is demoted to an
+    // offline cache only - it remains the fallback path when iriumd is
+    // unreachable, but every reachable lookup ignores it in favour of
+    // chain truth.
+    if let Some(chain) = fetch_chain_reputation(seller_addr) {
+        apply_chain_reputation(&mut score, &chain);
     }
+
+    score
+}
+
+// GROUP H: chain-anchored counts for a single address, mirrored from
+// iriumd's /rpc/reputation/:address response. Lifetime + recent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ChainReputation {
+    pub lifetime_successful_trade: u64,
+    pub lifetime_dispute_win: u64,
+    pub lifetime_dispute_loss: u64,
+    pub lifetime_resolver_non_response: u64,
+    pub recent_successful_trade: u64,
+    pub recent_dispute_win: u64,
+    pub recent_dispute_loss: u64,
+    pub recent_resolver_non_response: u64,
+}
+
+// GROUP H: query iriumd's GET /rpc/reputation/:address. Short timeout
+// (2s) keeps `reputation-show` and listing flows snappy when iriumd is
+// down - we fall back to local file in that case (Q5).
+fn fetch_chain_reputation(address: &str) -> Option<ChainReputation> {
+    if address.trim().is_empty() {
+        return None;
+    }
+    let rpc_url = default_rpc_url();
+    let base = rpc_url.trim_end_matches('/');
+    let url = format!("{}/rpc/reputation/{}", base, address);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(2000))
+        .build()
+        .ok()?;
+    let mut req = client.get(&url);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().ok()?;
+    let lifetime = v.get("lifetime")?;
+    let recent = v.get("recent")?;
+    let g = |obj: &serde_json::Value, key: &str| -> u64 {
+        obj.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+    };
+    Some(ChainReputation {
+        lifetime_successful_trade: g(lifetime, "successful_trade"),
+        lifetime_dispute_win: g(lifetime, "dispute_win"),
+        lifetime_dispute_loss: g(lifetime, "dispute_loss"),
+        lifetime_resolver_non_response: g(lifetime, "resolver_non_response"),
+        recent_successful_trade: g(recent, "successful_trade"),
+        recent_dispute_win: g(recent, "dispute_win"),
+        recent_dispute_loss: g(recent, "dispute_loss"),
+        recent_resolver_non_response: g(recent, "resolver_non_response"),
+    })
+}
+
+// GROUP H: overlay chain counts on top of a locally-computed
+// ReputationScore. Q5 wins: chain replaces local for the fields it
+// covers. Fields the chain has no opinion on (proof_response_secs,
+// self_trade_count) stay as the local value.
+fn apply_chain_reputation(score: &mut ReputationScore, chain: &ChainReputation) {
+    score.satisfied = chain.lifetime_successful_trade as usize;
+    // Defaults are derived from chain's dispute_loss + resolver_non_response
+    // (the latter is a default by the resolver, but tied to the agreement
+    // it failed to resolve - we surface it the same way).
+    score.default_count =
+        (chain.lifetime_dispute_loss + chain.lifetime_resolver_non_response) as usize;
+    score.dispute_count = (chain.lifetime_dispute_win + chain.lifetime_dispute_loss) as usize;
+    let lifetime_total = chain.lifetime_successful_trade
+        + chain.lifetime_dispute_win
+        + chain.lifetime_dispute_loss;
+    if (lifetime_total as usize) > score.total {
+        score.total = lifetime_total as usize;
+    }
+    score.has_outcome_data = lifetime_total > 0;
+    score.recent_satisfied = chain.recent_successful_trade as usize;
+    score.recent_default_count =
+        (chain.recent_dispute_loss + chain.recent_resolver_non_response) as usize;
+    score.recent_total = (chain.recent_successful_trade
+        + chain.recent_dispute_win
+        + chain.recent_dispute_loss) as usize;
+    score.has_recent_data = score.recent_total > 0;
+    // `failed` and `recent_failed` keep the local off-chain count.
 }
 
 fn handle_reputation_show(args: &[String]) -> Result<(), String> {
@@ -11022,6 +11571,720 @@ fn handle_invoice_import(args: &[String]) -> Result<(), String> {
     println!("{:<14}{}", "reference", reference);
     println!("{:<14}ok -- checksum matches", "verification");
     println!("{:<14}irium-wallet send <your_addr> {} {} [--rpc <url>]", "next_step", recipient, amount_str);
+    Ok(())
+}
+
+// GROUP F: GET /rpc/agreementreceipt response shape mirrors the iriumd
+// type. Fields with value=0 (hash-only scan can't know per-leg amounts)
+// are overlaid against the wallet's local AgreementObject by
+// overlay_linked_tx_values before the receipt is built.
+#[derive(Deserialize)]
+struct AgreementReceiptRpcResponse {
+    #[serde(default)]
+    agreement_hash: String,
+    #[serde(default)]
+    tip_height: u64,
+    #[serde(default)]
+    final_state_hint: String,
+    #[serde(default)]
+    funding_txids: Vec<TxidWithHeight>,
+    #[serde(default)]
+    release_txids: Vec<TxidWithHeight>,
+    #[serde(default)]
+    refund_txids: Vec<TxidWithHeight>,
+    #[serde(default)]
+    resolved_height: Option<u64>,
+    #[serde(default)]
+    linked_txs: Vec<SettlementLinkedTx>,
+    #[serde(default)]
+    proofs: Vec<EscrowReceiptProofRef>,
+    #[serde(default)]
+    dispute: Option<EscrowReceiptDisputeRef>,
+}
+
+// GROUP F (Q3): resolve the signing identity. If --address was supplied,
+// it must be both a party AND a key the wallet holds. Default: pick the
+// first party address that matches any wallet key. Returns the canonical
+// wallet address + compressed pubkey hex.
+fn resolve_exporter_address(
+    wallet: &WalletFile,
+    agreement: &AgreementObject,
+    explicit: Option<&str>,
+) -> Result<(String, String), String> {
+    let party_addrs: HashSet<&str> = agreement.parties.iter().map(|p| p.address.as_str()).collect();
+    if let Some(addr) = explicit {
+        if !party_addrs.contains(addr) {
+            let known: Vec<&String> = agreement.parties.iter().map(|p| &p.address).collect();
+            return Err(format!(
+                "--address {} is not a party to this agreement (parties: {:?})",
+                addr, known
+            ));
+        }
+        let key = find_key(wallet, addr).ok_or_else(|| {
+            format!("--address {} is a party but no matching wallet key found", addr)
+        })?;
+        return Ok((key.address.clone(), key.pubkey.clone()));
+    }
+    for p in agreement.parties.iter() {
+        if let Some(key) = find_key(wallet, &p.address) {
+            return Ok((key.address.clone(), key.pubkey.clone()));
+        }
+    }
+    let known: Vec<&String> = agreement.parties.iter().map(|p| &p.address).collect();
+    Err(format!(
+        "no wallet key matches any party address ({:?}). Specify --address explicitly.",
+        known
+    ))
+}
+
+// GROUP F: the iriumd hash-only scan emits value=0 because it doesn't
+// have the AgreementObject. The wallet does, so we overlay per-leg
+// amounts here. Milestone tx -> agreement.milestones[i].amount for the
+// matching milestone_id; DepositLock/CollateralLock -> deposit_rule
+// amount; everything else -> agreement.total_amount.
+fn overlay_linked_tx_values(
+    rpc: &[SettlementLinkedTx],
+    agreement: &AgreementObject,
+) -> Vec<SettlementLinkedTx> {
+    rpc.iter()
+        .map(|t| {
+            let value = if let Some(mid) = t.milestone_id.as_deref() {
+                agreement
+                    .milestones
+                    .iter()
+                    .find(|m| m.milestone_id == mid)
+                    .map(|m| m.amount)
+                    .unwrap_or(0)
+            } else {
+                match t.role {
+                    AgreementAnchorRole::DepositLock | AgreementAnchorRole::CollateralLock => {
+                        agreement
+                            .deposit_rule
+                            .as_ref()
+                            .map(|r| r.amount)
+                            .unwrap_or(agreement.total_amount)
+                    }
+                    _ => agreement.total_amount,
+                }
+            };
+            SettlementLinkedTx { value, ..t.clone() }
+        })
+        .collect()
+}
+
+// GROUP F: classify the agreement's final state purely from the
+// overlaid amounts plus the optional dispute ref. Mirrors the priority
+// order in settlement::derive_lifecycle so the receipt agrees with
+// /rpc/agreementstatus when both are queried.
+fn compute_final_state(
+    agreement: &AgreementObject,
+    funded: u64,
+    released: u64,
+    refunded: u64,
+    tip_height: u64,
+    dispute: &Option<EscrowReceiptDisputeRef>,
+) -> AgreementLifecycleState {
+    if agreement.disputed_metadata_only {
+        return AgreementLifecycleState::DisputedMetadataOnly;
+    }
+    if let Some(d) = dispute.as_ref() {
+        return match d.outcome.as_str() {
+            "release" => AgreementLifecycleState::Released,
+            "refund" => AgreementLifecycleState::Refunded,
+            _ => AgreementLifecycleState::Funded,
+        };
+    }
+    if refunded > 0 {
+        return AgreementLifecycleState::Refunded;
+    }
+    if released >= agreement.total_amount && released > 0 {
+        return AgreementLifecycleState::Released;
+    }
+    if released > 0 {
+        return AgreementLifecycleState::PartiallyReleased;
+    }
+    if funded > 0 {
+        let refund_timeout = agreement
+            .refund_conditions
+            .iter()
+            .map(|c| c.timeout_height)
+            .min()
+            .unwrap_or(u64::MAX);
+        if tip_height >= refund_timeout {
+            return AgreementLifecycleState::Expired;
+        }
+        return AgreementLifecycleState::Funded;
+    }
+    if agreement
+        .deadlines
+        .settlement_deadline
+        .map(|d| tip_height >= d)
+        .unwrap_or(false)
+    {
+        return AgreementLifecycleState::Expired;
+    }
+    AgreementLifecycleState::Proposed
+}
+
+fn handle_agreement_export_receipt(args: &[String]) -> Result<(), String> {
+    let mut agreement_hash: Option<String> = None;
+    let mut explicit_address: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut pretty = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agreement-hash" => {
+                agreement_hash =
+                    Some(parse_required_string_flag(args, &mut i, "--agreement-hash")?);
+            }
+            "--address" => {
+                explicit_address = Some(parse_required_string_flag(args, &mut i, "--address")?);
+            }
+            "--out" => {
+                out_path = Some(parse_required_string_flag(args, &mut i, "--out")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--pretty" => {
+                pretty = true;
+                i += 1;
+            }
+            "--json" => {
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let hash = agreement_hash.ok_or_else(|| "--agreement-hash is required".to_string())?;
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "--agreement-hash must be 64 hex chars, got: {}",
+            hash
+        ));
+    }
+
+    // 1. Load local AgreementObject (hard-fail if not present — wallet
+    //    needs template_type/parties/total_amount to enrich the receipt).
+    let stored = load_local_agreement_by_hash(&hash)?;
+    let agreement_value = stored.get("agreement").cloned().unwrap_or(stored);
+    let agreement: AgreementObject = serde_json::from_value(agreement_value)
+        .map_err(|e| format!("parse local agreement object: {e}"))?;
+
+    // 2. Fetch on-chain receipt data via GET /rpc/agreementreceipt.
+    let base = rpc_url.trim_end_matches('/');
+    let url = format!("{}/rpc/agreementreceipt?agreement_hash={}", base, hash);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let mut req = client.get(&url);
+    if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
+        .send()
+        .map_err(|e| format!("agreementreceipt request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "agreementreceipt request failed: {}",
+            resp.status()
+        ));
+    }
+    let rpc: AgreementReceiptRpcResponse = resp
+        .json()
+        .map_err(|e| format!("agreementreceipt parse: {e}"))?;
+
+    // 3. Resolve signing identity (Q3 enforced inside).
+    let wallet = ensure_wallet(&wallet_path())?;
+    let (signer_address, signer_pubkey_hex) =
+        resolve_exporter_address(&wallet, &agreement, explicit_address.as_deref())?;
+
+    // 4. Overlay per-leg amounts onto the value=0 linked_txs.
+    let linked_txs = overlay_linked_tx_values(&rpc.linked_txs, &agreement);
+
+    // 5. Sum amounts.
+    let funded_amount: u64 = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Funding
+                    | AgreementAnchorRole::DepositLock
+                    | AgreementAnchorRole::OtcSettlement
+                    | AgreementAnchorRole::MerchantSettlement
+            )
+        })
+        .map(|t| t.value)
+        .sum();
+    let released_amount: u64 = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Release | AgreementAnchorRole::MilestoneRelease
+            )
+        })
+        .map(|t| t.value)
+        .sum();
+    let refunded_amount: u64 = linked_txs
+        .iter()
+        .filter(|t| matches!(t.role, AgreementAnchorRole::Refund))
+        .map(|t| t.value)
+        .sum();
+
+    // 6. Build per-milestone status (Q4: mid-flight is fine; unfunded
+    //    milestones simply have funded=false).
+    let milestones: Vec<SettlementMilestoneStatus> = agreement
+        .milestones
+        .iter()
+        .map(|m| SettlementMilestoneStatus {
+            milestone_id: m.milestone_id.clone(),
+            title: m.title.clone(),
+            amount: m.amount,
+            funded: linked_txs.iter().any(|t| {
+                t.role == AgreementAnchorRole::Funding
+                    && t.milestone_id.as_deref() == Some(m.milestone_id.as_str())
+            }),
+            released: linked_txs.iter().any(|t| {
+                t.role == AgreementAnchorRole::MilestoneRelease
+                    && t.milestone_id.as_deref() == Some(m.milestone_id.as_str())
+            }),
+            refunded: linked_txs.iter().any(|t| {
+                t.role == AgreementAnchorRole::Refund
+                    && t.milestone_id.as_deref() == Some(m.milestone_id.as_str())
+            }),
+        })
+        .collect();
+
+    // 7. Build per-role txid arrays with overlaid values.
+    let funding_txids: Vec<TxidWithHeight> = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Funding
+                    | AgreementAnchorRole::DepositLock
+                    | AgreementAnchorRole::OtcSettlement
+                    | AgreementAnchorRole::MerchantSettlement
+            )
+        })
+        .map(|t| TxidWithHeight {
+            txid: t.txid.clone(),
+            height: t.height,
+            milestone_id: t.milestone_id.clone(),
+            value: t.value,
+        })
+        .collect();
+    let release_txids: Vec<TxidWithHeight> = linked_txs
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.role,
+                AgreementAnchorRole::Release | AgreementAnchorRole::MilestoneRelease
+            )
+        })
+        .map(|t| TxidWithHeight {
+            txid: t.txid.clone(),
+            height: t.height,
+            milestone_id: t.milestone_id.clone(),
+            value: t.value,
+        })
+        .collect();
+    let refund_txids: Vec<TxidWithHeight> = linked_txs
+        .iter()
+        .filter(|t| matches!(t.role, AgreementAnchorRole::Refund))
+        .map(|t| TxidWithHeight {
+            txid: t.txid.clone(),
+            height: t.height,
+            milestone_id: t.milestone_id.clone(),
+            value: t.value,
+        })
+        .collect();
+    let resolved_height = release_txids
+        .iter()
+        .chain(refund_txids.iter())
+        .filter_map(|t| t.height)
+        .max();
+    let final_state = compute_final_state(
+        &agreement,
+        funded_amount,
+        released_amount,
+        refunded_amount,
+        rpc.tip_height,
+        &rpc.dispute,
+    );
+    let payer_address = agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == agreement.payer)
+        .map(|p| p.address.clone())
+        .unwrap_or_default();
+    let payee_address = agreement
+        .parties
+        .iter()
+        .find(|p| p.party_id == agreement.payee)
+        .map(|p| p.address.clone())
+        .unwrap_or_default();
+
+    // 8. Compose unsigned receipt.
+    let mut receipt = AgreementEscrowReceipt {
+        schema_id: ESCROW_RECEIPT_SCHEMA_ID.to_string(),
+        version: ESCROW_RECEIPT_VERSION,
+        agreement_id: agreement.agreement_id.clone(),
+        agreement_hash: hash.clone(),
+        template_type: agreement.template_type,
+        parties: agreement.parties.clone(),
+        payer_address,
+        payee_address,
+        total_amount: agreement.total_amount,
+        final_state,
+        funded_amount,
+        released_amount,
+        refunded_amount,
+        funding_txids,
+        release_txids,
+        refund_txids,
+        resolved_height,
+        milestones,
+        proofs: rpc.proofs,
+        dispute: rpc.dispute,
+        linked_txs,
+        export_timestamp: now_unix(),
+        exporter_address: signer_address.clone(),
+        exporter_pubkey_hex: signer_pubkey_hex.clone(),
+        exporter_signature: ExporterSignatureEnvelope {
+            version: ESCROW_RECEIPT_VERSION,
+            signer_public_key: signer_pubkey_hex.clone(),
+            signer_address: signer_address.clone(),
+            signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+            signature: String::new(),
+            payload_hash: String::new(),
+        },
+    };
+
+    // 9. Sign with secp256k1 over the canonical digest.
+    let digest = escrow_receipt_signing_digest(&receipt)?;
+    let (_key, signing_key) = signer_material_from_wallet(&signer_address)?;
+    let sig: Signature = signing_key
+        .sign_prehash(&digest)
+        .map_err(|e| format!("sign receipt: {e}"))?;
+    receipt.exporter_signature.signature = hex::encode(sig.to_bytes());
+    receipt.exporter_signature.payload_hash = hex::encode(digest);
+
+    // 10. Self-verify (catches programmer mistakes before writing).
+    verify_escrow_receipt_signature(&receipt)
+        .map_err(|e| format!("self-verify failed: {e}"))?;
+
+    // 11. Emit.
+    let serialized = if pretty {
+        serde_json::to_string_pretty(&receipt).map_err(|e| format!("serialize: {e}"))?
+    } else {
+        serde_json::to_string(&receipt).map_err(|e| format!("serialize: {e}"))?
+    };
+    if let Some(p) = out_path {
+        std::fs::write(&p, &serialized).map_err(|e| format!("write {}: {e}", p))?;
+        eprintln!(
+            "[ok] receipt written to {} ({} bytes, exporter={})",
+            p,
+            serialized.len(),
+            signer_address
+        );
+    } else {
+        println!("{}", serialized);
+    }
+    Ok(())
+}
+
+// GROUP G: parse + validate --milestone-id from a wallet subcommand's
+// args. Returns the value or a clear error. Used by both the fund
+// and release aliases.
+fn group_g_parse_required_milestone_id(args: &[String]) -> Result<String, String> {
+    let mut found: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--milestone-id" {
+            if i + 1 >= args.len() {
+                return Err("--milestone-id requires a value".to_string());
+            }
+            found = Some(args[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    let mid = found.ok_or_else(|| {
+        "--milestone-id is required for milestone-scoped commands".to_string()
+    })?;
+    if mid.trim().is_empty() {
+        return Err("--milestone-id must not be empty".to_string());
+    }
+    Ok(mid)
+}
+
+// GROUP G: agreement-milestone-fund <agreement> --milestone-id <id>
+//   [--fee-per-byte <n>] [--broadcast] [--rpc <url>] [--json]
+//
+// Funds ONE milestone leg in its own funding tx. The single-HTLC tx
+// pattern lets a payer trickle-fund a milestone agreement over time
+// (one leg per payday) instead of locking the whole contract upfront.
+// Rejects with a clear message if the milestone is unknown OR already
+// funded on-chain (Q2: no double-anchoring).
+fn handle_agreement_milestone_fund(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err(
+            "usage: agreement-milestone-fund <agreement> --milestone-id <id> \
+[--fee-per-byte <n>] [--broadcast] [--rpc <url>] [--json]"
+                .to_string(),
+        );
+    }
+    let agreement_ref = args[0].clone();
+    let rest = &args[1..];
+    let milestone_id = group_g_parse_required_milestone_id(rest)?;
+    let mut fee_per_byte: Option<u64> = None;
+    let mut broadcast = false;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--milestone-id" => {
+                i += 2;
+            }
+            "--fee-per-byte" => {
+                if i + 1 >= rest.len() {
+                    return Err("--fee-per-byte requires a value".to_string());
+                }
+                fee_per_byte = Some(
+                    rest[i + 1]
+                        .parse::<u64>()
+                        .map_err(|_| "--fee-per-byte must be a non-negative integer".to_string())?,
+                );
+                i += 2;
+            }
+            "--broadcast" => {
+                broadcast = true;
+                i += 1;
+            }
+            "--rpc" => {
+                if i + 1 >= rest.len() {
+                    return Err("--rpc requires a value".to_string());
+                }
+                rpc_url = rest[i + 1].clone();
+                i += 2;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let agreement = load_agreement(&agreement_ref)?;
+    // Validate milestone_id is part of this agreement.
+    if !agreement
+        .milestones
+        .iter()
+        .any(|m| m.milestone_id == milestone_id)
+    {
+        let known: Vec<&String> = agreement.milestones.iter().map(|m| &m.milestone_id).collect();
+        return Err(format!(
+            "--milestone-id {} not found in agreement (milestones: {:?})",
+            milestone_id, known
+        ));
+    }
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let agreement_hash = irium_node_rs::settlement::compute_agreement_hash_hex(&agreement)?;
+    // Best-effort already-funded check via /rpc/agreementmilestones.
+    // iriumd will also reject double-funding (chain-scan inside the
+    // handler) - this client-side check exists to produce a clearer
+    // error before the round-trip.
+    {
+        #[derive(Serialize)]
+        struct MsReq {
+            agreement: AgreementObject,
+        }
+        #[derive(Deserialize)]
+        struct MsResp {
+            milestones: Vec<irium_node_rs::settlement::AgreementMilestoneStatus>,
+        }
+        if let Ok(resp) = rpc_post_json::<MsReq, MsResp>(
+            &client,
+            base,
+            "/rpc/agreementmilestones",
+            &MsReq {
+                agreement: agreement.clone(),
+            },
+        ) {
+            if let Some(ms) = resp
+                .milestones
+                .iter()
+                .find(|m| m.milestone_id == milestone_id)
+            {
+                if ms.funded {
+                    return Err(format!(
+                        "milestone {} is already funded on-chain (refusing to double-anchor)",
+                        milestone_id
+                    ));
+                }
+            }
+        }
+    }
+    let resp: FundAgreementResponse = rpc_post_json(
+        &client,
+        base,
+        "/rpc/fundagreement",
+        &FundAgreementRequestBody {
+            agreement,
+            fee_per_byte,
+            broadcast: Some(broadcast),
+            milestone_id: Some(milestone_id.clone()),
+        },
+    )?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agreement_hash": agreement_hash,
+                "milestone_id":   milestone_id,
+                "funding_txid":   resp.txid,
+                "broadcast":      broadcast,
+            }))
+            .unwrap()
+        );
+        return Ok(());
+    }
+    println!("=== Milestone Funded ===");
+    println!();
+    println!("agreement_hash  {}", agreement_hash);
+    println!("milestone_id    {}", milestone_id);
+    println!("funding_txid    {}", resp.txid);
+    println!(
+        "broadcast       {}",
+        if broadcast { "yes" } else { "no (--broadcast to send)" }
+    );
+    Ok(())
+}
+
+// GROUP G: agreement-milestone-release <agreement> --milestone-id <id> ...
+//
+// Friendly-named alias for `agreement-release ... --milestone-id <id>`.
+// Validates --milestone-id is present (Q3: explicit beats implicit), then
+// re-invokes the wallet binary's existing agreement-release pipeline with
+// the same args. The shell-out keeps the release logic single-sourced.
+fn handle_agreement_milestone_release(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err(
+            "usage: agreement-milestone-release <agreement> --milestone-id <id> \
+[--secret <hex>] [--destination <addr>] [--fee-per-byte <n>] [--broadcast] [--rpc <url>] [--json]"
+                .to_string(),
+        );
+    }
+    // Enforce --milestone-id presence with a clear error.
+    let _ = group_g_parse_required_milestone_id(&args[1..])?;
+    let argv0 = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut cmd = std::process::Command::new(&argv0);
+    cmd.arg("agreement-release");
+    for a in args {
+        cmd.arg(a);
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| format!("spawn agreement-release: {e}"))?;
+    if !status.success() {
+        return Err(format!("agreement-release exited with status {}", status));
+    }
+    Ok(())
+}
+
+// GROUP H follow-up: wallet command that triggers iriumd's
+// /rpc/broadcastreputationnonresponse. The wallet just validates args
+// and forwards; iriumd does the dispute lookup, response-window check,
+// and tx broadcast.
+fn handle_agreement_flag_non_response(args: &[String]) -> Result<(), String> {
+    let mut resolver_address: Option<String> = None;
+    let mut agreement_hash: Option<String> = None;
+    let mut rpc_url = default_rpc_url();
+    let mut json_mode = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--resolver" | "--resolver-address" => {
+                resolver_address =
+                    Some(parse_required_string_flag(args, &mut i, "--resolver-address")?);
+            }
+            "--agreement-hash" => {
+                agreement_hash =
+                    Some(parse_required_string_flag(args, &mut i, "--agreement-hash")?);
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    let resolver_address = resolver_address.ok_or_else(|| {
+        "--resolver-address is required (the resolver who missed the response window)"
+            .to_string()
+    })?;
+    let agreement_hash = agreement_hash.ok_or_else(|| {
+        "--agreement-hash is required (64 hex chars of the disputed agreement)".to_string()
+    })?;
+    if agreement_hash.len() != 64 || !agreement_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "--agreement-hash must be 64 hex chars, got: {}",
+            agreement_hash
+        ));
+    }
+    if resolver_address.trim().is_empty() {
+        return Err("--resolver-address must not be empty".to_string());
+    }
+    #[derive(Serialize)]
+    struct Req {
+        resolver_address: String,
+        agreement_hash: String,
+    }
+    #[derive(Deserialize)]
+    struct Resp {
+        anchor_txid: String,
+        resolver_address: String,
+        agreement_hash: String,
+    }
+    let base = rpc_url.trim_end_matches('/');
+    let client = rpc_client(base)?;
+    let resp: Resp = rpc_post_json(
+        &client,
+        base,
+        "/rpc/broadcastreputationnonresponse",
+        &Req {
+            resolver_address: resolver_address.clone(),
+            agreement_hash: agreement_hash.clone(),
+        },
+    )?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "anchor_txid":      resp.anchor_txid,
+                "resolver_address": resp.resolver_address,
+                "agreement_hash":   resp.agreement_hash,
+            }))
+            .unwrap()
+        );
+        return Ok(());
+    }
+    println!("=== Resolver Non-Response Flagged ===");
+    println!();
+    println!("anchor_txid       {}", resp.anchor_txid);
+    println!("resolver_address  {}", resp.resolver_address);
+    println!("agreement_hash    {}", resp.agreement_hash);
     Ok(())
 }
 
@@ -15681,6 +16944,7 @@ mod tests {
             expires_at_height: None,
             proof_kind: None,
             reference_id: None,
+            attributes: None,
         };
 
         let proof = create_settlement_proof_signed(&opts, 1700000000).expect("must create proof");
@@ -15792,6 +17056,7 @@ mod tests {
             expires_at_height: None,
             proof_kind: None,
             reference_id: None,
+            attributes: None,
         };
 
         let proof = create_settlement_proof_signed(&opts, 1700001234).expect("must create proof");
@@ -18857,6 +20122,8 @@ found true"
             taken_at_height: None,
             source: None,
             seller_pubkey: None,
+                    template_type: None,
+            milestone_count: None,
         };
         let summary = render_offer_summary(&offer);
         assert!(summary.contains("test-offer-1"), "must contain offer_id");
@@ -18899,6 +20166,8 @@ found true"
             taken_at_height: None,
             source: None,
             seller_pubkey: None,
+                    template_type: None,
+            milestone_count: None,
         };
         let path = save_offer(&offer).unwrap();
         assert!(path.exists(), "offer file must exist after save");
@@ -18938,6 +20207,8 @@ found true"
                 taken_at_height: None,
                 source: None,
                 seller_pubkey: None,
+                            template_type: None,
+                milestone_count: None,
             };
             save_offer(&o).unwrap();
         }
@@ -18975,6 +20246,8 @@ found true"
             taken_at_height: None,
             source: None,
             seller_pubkey: None,
+                    template_type: None,
+            milestone_count: None,
         };
         save_offer(&offer).unwrap();
         let result = handle_offer_take(&[
@@ -19043,6 +20316,8 @@ found true"
             taken_at_height: None,
             source: None,
             seller_pubkey: None,
+                    template_type: None,
+            milestone_count: None,
         };
         let summary = render_offer_summary(&offer);
         assert!(
@@ -19074,6 +20349,8 @@ found true"
             taken_at_height: None,
             source: Some("local".to_string()),
             seller_pubkey: None,
+                    template_type: None,
+            milestone_count: None,
         };
         save_offer(&offer).unwrap();
         let out = dir.join("export-test-out.json");
@@ -19282,6 +20559,8 @@ found true"
                 taken_at_height: None,
                 source: Some(src_val.to_string()),
                 seller_pubkey: None,
+                            template_type: None,
+                milestone_count: None,
             };
             save_offer(&o).unwrap();
         }
@@ -19315,6 +20594,8 @@ found true"
                 taken_at_height: None,
                 source: Some(src_val.to_string()),
                 seller_pubkey: None,
+                            template_type: None,
+                milestone_count: None,
             };
             save_offer(&o).unwrap();
         }
@@ -19347,6 +20628,8 @@ found true"
             taken_at_height: None,
             source: src.map(|s| s.to_string()),
             seller_pubkey: seller_pk.map(|s| s.to_string()),
+            template_type: None,
+            milestone_count: None,
         }
     }
 
@@ -20909,6 +22192,837 @@ found true"
         assert_eq!(policy.no_response_rules[0].deadline_height, 5000);
     }
 
+    // ── GROUP E: per-template auto-policy builders ───────────────────────────
+
+    fn group_e_test_pubkey() -> &'static str {
+        "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233"
+    }
+
+    fn group_e_test_agreement_hash() -> String {
+        "aabbccdd".repeat(8)
+    }
+
+    fn group_e_make_agreement(
+        template: AgreementTemplateType,
+        milestones: Vec<AgreementMilestone>,
+    ) -> AgreementObject {
+        AgreementObject {
+            agreement_id: "agr-test-1".to_string(),
+            version: 1,
+            schema_id: None,
+            template_type: template,
+            parties: vec![],
+            payer: "p".to_string(),
+            payee: "q".to_string(),
+            mediator_reference: None,
+            total_amount: 1_000_000,
+            network_marker: "IRIUM".to_string(),
+            creation_time: 0,
+            deadlines: irium_node_rs::settlement::AgreementDeadlines {
+                settlement_deadline: None,
+                refund_deadline: Some(5000),
+                dispute_window: None,
+            },
+            release_conditions: vec![],
+            refund_conditions: vec![],
+            milestones,
+            deposit_rule: None,
+            proof_policy_reference: None,
+            asset_reference: None,
+            payment_reference: None,
+            purpose_reference: None,
+            release_summary: None,
+            refund_summary: None,
+            attestor_reference: None,
+            resolver_reference: None,
+            notes: None,
+            document_hash: "00".repeat(32),
+            metadata_hash: None,
+            invoice_reference: None,
+            external_reference: None,
+            disputed_metadata_only: false,
+            primary_resolver: None,
+            fallback_resolver: None,
+            primary_resolver_fee: None,
+            fallback_resolver_fee: None,
+        }
+    }
+
+    #[test]
+    fn group_e_build_otc_template_policy_uses_payment_received() {
+        let policy = build_otc_template_policy(
+            "pol-otc",
+            &group_e_test_agreement_hash(),
+            group_e_test_pubkey(),
+            5000,
+        );
+        assert_eq!(policy.required_proofs.len(), 1);
+        assert_eq!(policy.required_proofs[0].proof_type, "payment_received");
+        assert_eq!(policy.required_proofs[0].requirement_id, "req-payment-received");
+        assert_eq!(policy.attestors.len(), 1);
+        assert_eq!(policy.attestors[0].attestor_id, "seller-attestor");
+        assert_eq!(policy.no_response_rules.len(), 1);
+        assert_eq!(policy.no_response_rules[0].deadline_height, 5000);
+    }
+
+    #[test]
+    fn group_e_build_default_freelance_policy_sets_correct_fields() {
+        let policy = build_default_freelance_policy(
+            "pol-fl",
+            &group_e_test_agreement_hash(),
+            group_e_test_pubkey(),
+            7000,
+        );
+        assert_eq!(policy.policy_id, "pol-fl");
+        assert_eq!(policy.required_proofs.len(), 1);
+        assert_eq!(policy.required_proofs[0].proof_type, "work_completed");
+        assert_eq!(policy.required_proofs[0].required_by, Some(7000));
+        assert_eq!(policy.attestors[0].attestor_id, "contractor-attestor");
+        assert_eq!(policy.no_response_rules.len(), 1);
+        assert_eq!(policy.no_response_rules[0].deadline_height, 7000);
+        assert!(matches!(
+            policy.required_proofs[0].resolution,
+            ProofResolution::Release
+        ));
+    }
+
+    #[test]
+    fn group_e_build_default_milestone_policy_sets_correct_fields() {
+        let policy = build_default_milestone_policy(
+            "pol-ms-m2",
+            &group_e_test_agreement_hash(),
+            group_e_test_pubkey(),
+            "m2",
+            9000,
+        );
+        assert_eq!(policy.policy_id, "pol-ms-m2");
+        assert_eq!(policy.required_proofs.len(), 1);
+        assert_eq!(policy.required_proofs[0].proof_type, "milestone_delivered");
+        assert_eq!(policy.required_proofs[0].requirement_id, "req-milestone-m2");
+        assert_eq!(policy.required_proofs[0].milestone_id.as_deref(), Some("m2"));
+        assert!(matches!(
+            policy.required_proofs[0].resolution,
+            ProofResolution::MilestoneRelease
+        ));
+        assert_eq!(policy.no_response_rules.len(), 1);
+        assert_eq!(policy.no_response_rules[0].deadline_height, 9000);
+        assert_eq!(
+            policy.no_response_rules[0].milestone_id.as_deref(),
+            Some("m2")
+        );
+    }
+
+    #[test]
+    fn group_e_build_template_policy_otc_returns_one_payment_received_policy() {
+        let agr = group_e_make_agreement(AgreementTemplateType::OtcSettlement, vec![]);
+        let result =
+            build_template_policy(&agr, &group_e_test_agreement_hash(), group_e_test_pubkey(), 5000);
+        let policies = result.expect("OTC must produce a policy");
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].policy_id, "pol-agr-test-1");
+        assert_eq!(policies[0].required_proofs[0].proof_type, "payment_received");
+    }
+
+    #[test]
+    fn group_e_build_template_policy_freelance_returns_one_work_completed_policy() {
+        let agr = group_e_make_agreement(AgreementTemplateType::SimpleReleaseRefund, vec![]);
+        let result =
+            build_template_policy(&agr, &group_e_test_agreement_hash(), group_e_test_pubkey(), 6000);
+        let policies = result.expect("freelance must produce a policy");
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].policy_id, "pol-agr-test-1");
+        assert_eq!(policies[0].required_proofs[0].proof_type, "work_completed");
+        assert_eq!(policies[0].required_proofs[0].required_by, Some(6000));
+    }
+
+    #[test]
+    fn group_e_build_template_policy_milestone_returns_n_unique_policies() {
+        let milestones = vec![
+            AgreementMilestone {
+                milestone_id: "m1".to_string(),
+                title: "M1".to_string(),
+                amount: 100,
+                recipient_address: "R".to_string(),
+                refund_address: "B".to_string(),
+                secret_hash_hex: "00".repeat(32),
+                timeout_height: 1000,
+                metadata_hash: None,
+            },
+            AgreementMilestone {
+                milestone_id: "m2".to_string(),
+                title: "M2".to_string(),
+                amount: 100,
+                recipient_address: "R".to_string(),
+                refund_address: "B".to_string(),
+                secret_hash_hex: "11".repeat(32),
+                timeout_height: 2000,
+                metadata_hash: None,
+            },
+            AgreementMilestone {
+                milestone_id: "m3".to_string(),
+                title: "M3".to_string(),
+                amount: 100,
+                recipient_address: "R".to_string(),
+                refund_address: "B".to_string(),
+                secret_hash_hex: "22".repeat(32),
+                timeout_height: 3000,
+                metadata_hash: None,
+            },
+        ];
+        let agr = group_e_make_agreement(AgreementTemplateType::MilestoneSettlement, milestones);
+        let result =
+            build_template_policy(&agr, &group_e_test_agreement_hash(), group_e_test_pubkey(), 9999);
+        let policies = result.expect("milestone must produce policies");
+        assert_eq!(policies.len(), 3);
+        let ids: std::collections::HashSet<String> =
+            policies.iter().map(|p| p.policy_id.clone()).collect();
+        assert_eq!(ids.len(), 3, "milestone policy_ids must be unique");
+        assert!(ids.contains("pol-agr-test-1-m1"));
+        assert!(ids.contains("pol-agr-test-1-m2"));
+        assert!(ids.contains("pol-agr-test-1-m3"));
+        assert_eq!(
+            policies[0].required_proofs[0].milestone_id.as_deref(),
+            Some("m1")
+        );
+        assert_eq!(policies[0].no_response_rules[0].deadline_height, 1000);
+        assert_eq!(policies[1].no_response_rules[0].deadline_height, 2000);
+        assert_eq!(policies[2].no_response_rules[0].deadline_height, 3000);
+    }
+
+    #[test]
+    fn group_e_build_template_policy_deposit_returns_none() {
+        let agr = group_e_make_agreement(AgreementTemplateType::RefundableDeposit, vec![]);
+        let result =
+            build_template_policy(&agr, &group_e_test_agreement_hash(), group_e_test_pubkey(), 5000);
+        assert!(result.is_none(), "deposit must NOT auto-build a policy");
+    }
+
+    #[test]
+    fn group_e_default_dispute_window_constant_is_144() {
+        assert_eq!(DEFAULT_DISPUTE_WINDOW_BLOCKS, 144);
+    }
+
+    // ── GROUP F: escrow receipt export ───────────────────────────────────
+
+    fn group_f_make_agreement_with_parties() -> AgreementObject {
+        let mut agr = group_e_make_agreement(AgreementTemplateType::OtcSettlement, vec![]);
+        agr.parties = vec![
+            AgreementParty {
+                party_id: "buyer".to_string(),
+                display_name: "Buyer".to_string(),
+                address: "Qbuyer123".to_string(),
+                role: Some("buyer".to_string()),
+            },
+            AgreementParty {
+                party_id: "seller".to_string(),
+                display_name: "Seller".to_string(),
+                address: "Qseller456".to_string(),
+                role: Some("seller".to_string()),
+            },
+        ];
+        agr.payer = "seller".to_string();
+        agr.payee = "buyer".to_string();
+        agr
+    }
+
+    fn group_f_make_linked_tx(
+        txid: &str,
+        role: AgreementAnchorRole,
+        height: u64,
+        milestone_id: Option<&str>,
+    ) -> SettlementLinkedTx {
+        SettlementLinkedTx {
+            txid: txid.to_string(),
+            role,
+            milestone_id: milestone_id.map(String::from),
+            height: Some(height),
+            confirmed: true,
+            value: 0,
+        }
+    }
+
+    #[test]
+    fn group_f_overlay_linked_tx_values_uses_total_amount_for_non_milestone() {
+        let agr = group_f_make_agreement_with_parties();
+        let rpc = vec![group_f_make_linked_tx(
+            "aa",
+            AgreementAnchorRole::OtcSettlement,
+            100,
+            None,
+        )];
+        let out = overlay_linked_tx_values(&rpc, &agr);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].value, agr.total_amount);
+    }
+
+    #[test]
+    fn group_f_overlay_linked_tx_values_uses_per_milestone_amount() {
+        let milestones = vec![
+            irium_node_rs::settlement::AgreementMilestone {
+                milestone_id: "m1".to_string(),
+                title: "M1".to_string(),
+                amount: 400,
+                recipient_address: "R".to_string(),
+                refund_address: "B".to_string(),
+                secret_hash_hex: "00".repeat(32),
+                timeout_height: 1000,
+                metadata_hash: None,
+            },
+            irium_node_rs::settlement::AgreementMilestone {
+                milestone_id: "m2".to_string(),
+                title: "M2".to_string(),
+                amount: 600,
+                recipient_address: "R".to_string(),
+                refund_address: "B".to_string(),
+                secret_hash_hex: "11".repeat(32),
+                timeout_height: 2000,
+                metadata_hash: None,
+            },
+        ];
+        let mut agr =
+            group_e_make_agreement(AgreementTemplateType::MilestoneSettlement, milestones);
+        agr.total_amount = 1000;
+        let rpc = vec![
+            group_f_make_linked_tx("aa", AgreementAnchorRole::Funding, 100, Some("m1")),
+            group_f_make_linked_tx("bb", AgreementAnchorRole::Funding, 101, Some("m2")),
+        ];
+        let out = overlay_linked_tx_values(&rpc, &agr);
+        assert_eq!(out[0].value, 400);
+        assert_eq!(out[1].value, 600);
+    }
+
+    #[test]
+    fn group_f_compute_final_state_funded_only() {
+        let agr = group_f_make_agreement_with_parties();
+        let state = compute_final_state(&agr, 1_000_000, 0, 0, 100, &None);
+        assert!(matches!(state, AgreementLifecycleState::Funded));
+    }
+
+    #[test]
+    fn group_f_compute_final_state_released_full() {
+        let agr = group_f_make_agreement_with_parties();
+        let state = compute_final_state(&agr, 1_000_000, 1_000_000, 0, 100, &None);
+        assert!(matches!(state, AgreementLifecycleState::Released));
+    }
+
+    #[test]
+    fn group_f_compute_final_state_dispute_resolution_release() {
+        let agr = group_f_make_agreement_with_parties();
+        let dispute = Some(EscrowReceiptDisputeRef {
+            resolver_address: "Qresolver".to_string(),
+            resolver_role: "primary".to_string(),
+            outcome: "release".to_string(),
+            resolved_at_height: 200,
+            message_hash: "00".repeat(32),
+            anchor_txid: Some("cc".to_string()),
+        });
+        let state = compute_final_state(&agr, 1_000_000, 0, 0, 200, &dispute);
+        assert!(matches!(state, AgreementLifecycleState::Released));
+    }
+
+    #[test]
+    fn group_f_resolve_exporter_address_rejects_non_party() {
+        let wallet = WalletFile {
+            version: 1,
+            seed_hex: None,
+            bip32_seed: None,
+            mnemonic: None,
+            next_index: 0,
+            keys: vec![WalletKey {
+                address: "Qnotaparty".to_string(),
+                pkh: "00".repeat(20),
+                pubkey: "03".to_string() + &"aa".repeat(32),
+                privkey: "11".repeat(32),
+            }],
+        };
+        let agr = group_f_make_agreement_with_parties();
+        let result =
+            resolve_exporter_address(&wallet, &agr, Some("Qnotaparty"));
+        assert!(result.is_err(), "non-party address must be rejected");
+        assert!(
+            result.unwrap_err().contains("not a party"),
+            "error message should mention non-party"
+        );
+    }
+
+    #[test]
+    fn group_f_resolve_exporter_address_party_without_key_rejected() {
+        let wallet = WalletFile {
+            version: 1,
+            seed_hex: None,
+            bip32_seed: None,
+            mnemonic: None,
+            next_index: 0,
+            keys: vec![],
+        };
+        let agr = group_f_make_agreement_with_parties();
+        let result = resolve_exporter_address(&wallet, &agr, None);
+        assert!(result.is_err(), "no matching key must be rejected");
+        assert!(
+            result.unwrap_err().contains("no wallet key matches"),
+            "error message should mention no matching key"
+        );
+    }
+
+    #[test]
+    fn group_f_escrow_receipt_sign_verify_roundtrip() {
+        // Generate a fresh secp256k1 key without touching the wallet
+        // file system, then sign+verify a synthetic receipt end to end.
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        let mut rng_bytes = [0u8; 32];
+        for (i, b) in rng_bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(11);
+        }
+        let signing_key = SigningKey::from_slice(&rng_bytes).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let pubkey_hex = hex::encode(verifying_key.to_encoded_point(true).as_bytes());
+
+        let agr = group_f_make_agreement_with_parties();
+        let mut receipt = AgreementEscrowReceipt {
+            schema_id: ESCROW_RECEIPT_SCHEMA_ID.to_string(),
+            version: ESCROW_RECEIPT_VERSION,
+            agreement_id: agr.agreement_id.clone(),
+            agreement_hash: "ab".repeat(32),
+            template_type: agr.template_type,
+            parties: agr.parties.clone(),
+            payer_address: "Qseller456".to_string(),
+            payee_address: "Qbuyer123".to_string(),
+            total_amount: agr.total_amount,
+            final_state: AgreementLifecycleState::Funded,
+            funded_amount: agr.total_amount,
+            released_amount: 0,
+            refunded_amount: 0,
+            funding_txids: vec![TxidWithHeight {
+                txid: "cd".repeat(32),
+                height: Some(100),
+                milestone_id: None,
+                value: agr.total_amount,
+            }],
+            release_txids: vec![],
+            refund_txids: vec![],
+            resolved_height: None,
+            milestones: vec![],
+            proofs: vec![],
+            dispute: None,
+            linked_txs: vec![],
+            export_timestamp: 1_700_000_000,
+            exporter_address: "Qbuyer123".to_string(),
+            exporter_pubkey_hex: pubkey_hex.clone(),
+            exporter_signature: ExporterSignatureEnvelope {
+                version: ESCROW_RECEIPT_VERSION,
+                signer_public_key: pubkey_hex.clone(),
+                signer_address: "Qbuyer123".to_string(),
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                signature: String::new(),
+                payload_hash: String::new(),
+            },
+        };
+        let digest = escrow_receipt_signing_digest(&receipt).unwrap();
+        let sig: Signature = signing_key.sign_prehash(&digest).unwrap();
+        receipt.exporter_signature.signature = hex::encode(sig.to_bytes());
+        receipt.exporter_signature.payload_hash = hex::encode(digest);
+
+        verify_escrow_receipt_signature(&receipt).expect("self-verify must succeed");
+
+        // Tamper with one field and verify must fail.
+        let mut tampered = receipt.clone();
+        tampered.total_amount += 1;
+        assert!(
+            verify_escrow_receipt_signature(&tampered).is_err(),
+            "tampered receipt must fail verification"
+        );
+    }
+
+    // ── GROUP G: partial milestone fund + release aliases ───────────────
+
+    #[test]
+    fn group_g_parse_required_milestone_id_extracts_value() {
+        let args = vec![
+            "--milestone-id".to_string(),
+            "m2".to_string(),
+            "--broadcast".to_string(),
+        ];
+        let mid = group_g_parse_required_milestone_id(&args).unwrap();
+        assert_eq!(mid, "m2");
+    }
+
+    #[test]
+    fn group_g_parse_required_milestone_id_rejects_missing_flag() {
+        let args = vec!["--broadcast".to_string(), "--rpc".to_string(), "x".to_string()];
+        let err = group_g_parse_required_milestone_id(&args).unwrap_err();
+        assert!(
+            err.contains("required"),
+            "expected 'required' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_g_parse_required_milestone_id_rejects_empty_value() {
+        let args = vec!["--milestone-id".to_string(), "  ".to_string()];
+        let err = group_g_parse_required_milestone_id(&args).unwrap_err();
+        assert!(
+            err.contains("must not be empty"),
+            "expected empty-value error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_g_parse_required_milestone_id_rejects_missing_value_after_flag() {
+        let args = vec!["--milestone-id".to_string()];
+        let err = group_g_parse_required_milestone_id(&args).unwrap_err();
+        assert!(
+            err.contains("requires a value"),
+            "expected 'requires a value' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_g_fund_agreement_request_body_serializes_milestone_id() {
+        let payer = AgreementParty {
+            party_id: "payer".to_string(),
+            display_name: "Payer".to_string(),
+            address: "Qpayer".to_string(),
+            role: Some("buyer".to_string()),
+        };
+        let payee = AgreementParty {
+            party_id: "payee".to_string(),
+            display_name: "Payee".to_string(),
+            address: "Qpayee".to_string(),
+            role: Some("seller".to_string()),
+        };
+        let agreement = irium_node_rs::settlement::build_milestone_agreement(
+            "agr-g-ser".to_string(),
+            1_700_000_000,
+            payer,
+            payee,
+            vec![AgreementMilestone {
+                milestone_id: "m1".to_string(),
+                title: "M1".to_string(),
+                amount: 1_000,
+                recipient_address: "Qpayee".to_string(),
+                refund_address: "Qpayer".to_string(),
+                secret_hash_hex: "ab".repeat(32),
+                timeout_height: 500,
+                metadata_hash: None,
+            }],
+            1_000,
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .unwrap();
+        let body = FundAgreementRequestBody {
+            agreement,
+            fee_per_byte: Some(1),
+            broadcast: Some(false),
+            milestone_id: Some("m1".to_string()),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(
+            json.contains("\"milestone_id\":\"m1\""),
+            "json must include milestone_id, got: {json}"
+        );
+    }
+
+    #[test]
+    fn group_g_fund_agreement_request_body_omits_milestone_id_when_none() {
+        let payer = AgreementParty {
+            party_id: "payer".to_string(),
+            display_name: "Payer".to_string(),
+            address: "Qpayer".to_string(),
+            role: Some("buyer".to_string()),
+        };
+        let payee = AgreementParty {
+            party_id: "payee".to_string(),
+            display_name: "Payee".to_string(),
+            address: "Qpayee".to_string(),
+            role: Some("seller".to_string()),
+        };
+        let agreement = irium_node_rs::settlement::build_otc_agreement(
+            "agr-otc-ser".to_string(),
+            1_700_000_000,
+            payer,
+            payee,
+            500_000,
+            "IRM".to_string(),
+            "off".to_string(),
+            500,
+            "ab".repeat(32),
+            "cd".repeat(32),
+            None,
+            None,
+        )
+        .unwrap();
+        let body = FundAgreementRequestBody {
+            agreement,
+            fee_per_byte: None,
+            broadcast: Some(true),
+            milestone_id: None,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(
+            !json.contains("milestone_id"),
+            "milestone_id must be omitted when None (back-compat), got: {json}"
+        );
+    }
+
+    #[test]
+    fn group_g_milestone_release_args_must_include_milestone_id_in_validation() {
+        let args = vec!["agreement.json".to_string(), "--broadcast".to_string()];
+        let _err = group_g_parse_required_milestone_id(&args[1..]).unwrap_err();
+    }
+
+    // ── GROUP H: chain-anchored reputation overlay ───────────────────────
+
+    fn group_h_baseline_score() -> ReputationScore {
+        ReputationScore {
+            total: 0,
+            satisfied: 0,
+            failed: 0,
+            default_count: 0,
+            has_outcome_data: false,
+            recent_satisfied: 0,
+            recent_failed: 0,
+            recent_default_count: 0,
+            recent_total: 0,
+            has_recent_data: false,
+            dispute_count: 0,
+            total_proof_response_secs: 0,
+            proof_response_count: 0,
+            self_trade_count: 0,
+        }
+    }
+
+    #[test]
+    fn group_h_apply_chain_reputation_overrides_local_satisfied() {
+        let mut score = group_h_baseline_score();
+        score.satisfied = 99;
+        score.has_outcome_data = true;
+        let chain = ChainReputation {
+            lifetime_successful_trade: 5,
+            ..Default::default()
+        };
+        apply_chain_reputation(&mut score, &chain);
+        assert_eq!(score.satisfied, 5, "chain wins on conflict (Q5)");
+        assert!(score.has_outcome_data);
+    }
+
+    #[test]
+    fn group_h_apply_chain_reputation_dispute_counts_aggregate_loss_plus_non_response() {
+        let mut score = group_h_baseline_score();
+        let chain = ChainReputation {
+            lifetime_dispute_loss: 2,
+            lifetime_resolver_non_response: 3,
+            ..Default::default()
+        };
+        apply_chain_reputation(&mut score, &chain);
+        assert_eq!(
+            score.default_count, 5,
+            "default_count must aggregate dispute_loss + resolver_non_response"
+        );
+    }
+
+    #[test]
+    fn group_h_apply_chain_reputation_dispute_count_is_win_plus_loss() {
+        let mut score = group_h_baseline_score();
+        let chain = ChainReputation {
+            lifetime_dispute_win: 2,
+            lifetime_dispute_loss: 1,
+            ..Default::default()
+        };
+        apply_chain_reputation(&mut score, &chain);
+        assert_eq!(
+            score.dispute_count, 3,
+            "dispute_count must be wins + losses"
+        );
+    }
+
+    #[test]
+    fn group_h_apply_chain_reputation_recent_counts_overlay() {
+        let mut score = group_h_baseline_score();
+        score.recent_satisfied = 10;
+        score.recent_default_count = 4;
+        score.has_recent_data = true;
+        let chain = ChainReputation {
+            recent_successful_trade: 1,
+            recent_dispute_loss: 0,
+            recent_resolver_non_response: 0,
+            ..Default::default()
+        };
+        apply_chain_reputation(&mut score, &chain);
+        assert_eq!(score.recent_satisfied, 1);
+        assert_eq!(score.recent_default_count, 0);
+        assert_eq!(score.recent_total, 1);
+        assert!(score.has_recent_data);
+    }
+
+    #[test]
+    fn group_h_apply_chain_reputation_zero_chain_zeroes_recent_section() {
+        let mut score = group_h_baseline_score();
+        score.recent_satisfied = 99;
+        score.recent_default_count = 99;
+        score.has_recent_data = true;
+        apply_chain_reputation(&mut score, &ChainReputation::default());
+        assert_eq!(
+            score.recent_satisfied, 0,
+            "zero chain count must override nonzero local"
+        );
+        assert_eq!(score.recent_default_count, 0);
+        assert!(!score.has_recent_data);
+    }
+
+    #[test]
+    fn group_h_apply_chain_reputation_grows_total_when_chain_is_larger() {
+        let mut score = group_h_baseline_score();
+        score.total = 2;
+        let chain = ChainReputation {
+            lifetime_successful_trade: 5,
+            lifetime_dispute_win: 1,
+            lifetime_dispute_loss: 1,
+            ..Default::default()
+        };
+        apply_chain_reputation(&mut score, &chain);
+        assert_eq!(
+            score.total, 7,
+            "total must grow to chain lifetime sum when local is smaller"
+        );
+    }
+
+    // ── GROUP H follow-up: agreement-flag-non-response ───────────────────
+
+    #[test]
+    fn group_h2_flag_non_response_requires_resolver_address() {
+        let args = vec![
+            "--agreement-hash".to_string(),
+            "ab".repeat(32),
+        ];
+        let err = handle_agreement_flag_non_response(&args).unwrap_err();
+        assert!(
+            err.contains("--resolver-address is required"),
+            "expected missing-resolver error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h2_flag_non_response_requires_agreement_hash() {
+        let args = vec![
+            "--resolver-address".to_string(),
+            "Qresolver".to_string(),
+        ];
+        let err = handle_agreement_flag_non_response(&args).unwrap_err();
+        assert!(
+            err.contains("--agreement-hash is required"),
+            "expected missing-hash error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h2_flag_non_response_rejects_short_agreement_hash() {
+        let args = vec![
+            "--resolver-address".to_string(),
+            "Qresolver".to_string(),
+            "--agreement-hash".to_string(),
+            "abcdef".to_string(),
+        ];
+        let err = handle_agreement_flag_non_response(&args).unwrap_err();
+        assert!(
+            err.contains("64 hex chars"),
+            "expected hash-length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h2_flag_non_response_rejects_non_hex_agreement_hash() {
+        let args = vec![
+            "--resolver-address".to_string(),
+            "Qresolver".to_string(),
+            "--agreement-hash".to_string(),
+            "z".repeat(64),
+        ];
+        let err = handle_agreement_flag_non_response(&args).unwrap_err();
+        assert!(
+            err.contains("64 hex chars"),
+            "expected hex-validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h2_flag_non_response_rejects_empty_resolver_address() {
+        let args = vec![
+            "--resolver-address".to_string(),
+            "   ".to_string(),
+            "--agreement-hash".to_string(),
+            "ab".repeat(32),
+        ];
+        let err = handle_agreement_flag_non_response(&args).unwrap_err();
+        assert!(
+            err.contains("must not be empty"),
+            "expected empty-resolver error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_h2_flag_non_response_unknown_flag_rejected() {
+        let args = vec![
+            "--bogus".to_string(),
+            "x".to_string(),
+        ];
+        let err = handle_agreement_flag_non_response(&args).unwrap_err();
+        assert!(
+            err.contains("unknown argument"),
+            "expected unknown-arg error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn group_f_receipt_canonical_bytes_clear_signature_fields() {
+        // The signing input must not include signature/payload_hash, so
+        // changing them post-sign should NOT change the canonical digest.
+        let agr = group_f_make_agreement_with_parties();
+        let make_receipt = |sig: &str, payload: &str| AgreementEscrowReceipt {
+            schema_id: ESCROW_RECEIPT_SCHEMA_ID.to_string(),
+            version: ESCROW_RECEIPT_VERSION,
+            agreement_id: agr.agreement_id.clone(),
+            agreement_hash: "ab".repeat(32),
+            template_type: agr.template_type,
+            parties: agr.parties.clone(),
+            payer_address: "Qseller456".to_string(),
+            payee_address: "Qbuyer123".to_string(),
+            total_amount: agr.total_amount,
+            final_state: AgreementLifecycleState::Funded,
+            funded_amount: 1_000_000,
+            released_amount: 0,
+            refunded_amount: 0,
+            funding_txids: vec![],
+            release_txids: vec![],
+            refund_txids: vec![],
+            resolved_height: None,
+            milestones: vec![],
+            proofs: vec![],
+            dispute: None,
+            linked_txs: vec![],
+            export_timestamp: 1_700_000_000,
+            exporter_address: "Qbuyer123".to_string(),
+            exporter_pubkey_hex: "03".to_string() + &"aa".repeat(32),
+            exporter_signature: ExporterSignatureEnvelope {
+                version: ESCROW_RECEIPT_VERSION,
+                signer_public_key: "03".to_string() + &"aa".repeat(32),
+                signer_address: "Qbuyer123".to_string(),
+                signature_type: AGREEMENT_SIGNATURE_TYPE_SECP256K1.to_string(),
+                signature: sig.to_string(),
+                payload_hash: payload.to_string(),
+            },
+        };
+        let d1 = escrow_receipt_signing_digest(&make_receipt("", "")).unwrap();
+        let d2 =
+            escrow_receipt_signing_digest(&make_receipt(&"ff".repeat(32), &"ee".repeat(32)))
+                .unwrap();
+        assert_eq!(
+            d1, d2,
+            "signing digest must be independent of signature / payload_hash fields"
+        );
+    }
+
     #[test]
     fn offer_create_sets_seller_pubkey_when_wallet_has_address() {
         // seller_pubkey is populated when resolve_attestor_pubkey_hex succeeds.
@@ -20932,6 +23046,8 @@ found true"
             seller_pubkey: Some(
                 "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string(),
             ),
+                    template_type: None,
+            milestone_count: None,
         };
         let json = serde_json::to_string(&offer).unwrap();
         assert!(
@@ -20970,6 +23086,8 @@ found true"
             seller_pubkey: Some(
                 "03aabbccdd112233445566778899aabbccdd112233445566778899aabbccdd112233".to_string(),
             ),
+                    template_type: None,
+            milestone_count: None,
         };
         save_offer(&offer).unwrap();
         let out = dir.join("pk-export-out.json");
@@ -21116,6 +23234,395 @@ found true"
         assert!(result.unwrap_err().contains("unknown argument"));
     }
 }
+
+// ─── GROUP C: auto-release watcher ─────────────────────────────────────
+// `irium-wallet watch [--auto-release] [--rpc <url>]` — long-running
+// process that subscribes to iriumd's `/ws` event stream and, when
+// IRIUM_AUTO_RELEASE=1 (or --auto-release is passed), reacts to
+// `agreement.satisfied` events by automatically broadcasting the
+// release tx for agreements this wallet funded.
+//
+// Architecture choice (option A in the design plan): the daemon lives
+// in the wallet binary itself rather than wallet-api, because the
+// release path needs key access — wallet-api is intentionally keyless.
+// The Tauri irium-core app will spawn this as a sidecar once the
+// IRIUM_AUTO_RELEASE setting is exposed in the GUI.
+//
+// On every `agreement.satisfied` event:
+//   1. Dedupe via an in-memory HashSet (lost on restart; iriumd will
+//      reject duplicate spends, so worst case is one extra rejected
+//      release attempt per restart).
+//   2. Look up the agreement in the local store. Skip if not found
+//      (peer-created, no local copy).
+//   3. Recover the preimage. Two sources tried in order:
+//        a. `<data_dir>/agreement_secrets/<agreement_id>.hex` — written
+//           by FIX 1 for Hub-created agreements.
+//        b. Deterministic offer-take pattern — preimage is the byte
+//           string `format!("offer-secret-{}-{}", agreement_id,
+//           creation_time)`, hex-encoded; sha256 of those bytes is
+//           what handle_offer_take embedded as `secret_hash`.
+//   4. Pre-check via `/rpc/agreementreleaseeligibility`. If iriumd
+//      reports the agreement is already released or otherwise
+//      ineligible, skip silently (handles both restarts and duplicate
+//      satisfied events).
+//   5. Shell out to `irium-wallet agreement-release <hash> --secret
+//      <hex> --broadcast --rpc <url> --json`. This reuses the existing
+//      release pipeline including its own eligibility re-check and
+//      tx-signing logic without requiring a refactor.
+//   6. On success, scan `<data_dir>/offers/` and set status=settled
+//      for any offer whose agreement_hash matches.
+
+fn handle_watch(args: &[String]) -> Result<(), String> {
+    let mut auto_release = std::env::var("IRIUM_AUTO_RELEASE")
+        .ok()
+        .map(|v| {
+            let t = v.trim().to_ascii_lowercase();
+            t == "1" || t == "true" || t == "yes" || t == "on"
+        })
+        .unwrap_or(false);
+    let mut rpc_url = default_rpc_url();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--auto-release" => {
+                auto_release = true;
+                i += 1;
+            }
+            "--rpc" => {
+                rpc_url = parse_required_string_flag(args, &mut i, "--rpc")?;
+            }
+            other => return Err(format!("unknown argument to watch: {}", other)),
+        }
+    }
+    let ws_url = rpc_url
+        .trim_end_matches('/')
+        .replacen("https://", "wss://", 1)
+        .replacen("http://", "ws://", 1)
+        + "/ws";
+    eprintln!(
+        "[watch] starting; rpc={} ws={} auto_release={}",
+        rpc_url, ws_url, auto_release
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    rt.block_on(watch_loop(rpc_url, ws_url, auto_release))
+}
+
+async fn watch_loop(
+    rpc_url: String,
+    ws_url: String,
+    auto_release: bool,
+) -> Result<(), String> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    // GROUP E (Q2): release attempts run in background tasks because
+    // try_auto_release may sleep DEFAULT_DISPUTE_WINDOW_BLOCKS worth of
+    // chain time before releasing. The WS loop must keep accepting
+    // events while that wait is in progress. in_flight dedupes both
+    // pending and completed releases for the lifetime of this process.
+    let in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    loop {
+        eprintln!("[watch] connecting to {}", ws_url);
+        let (mut ws, _resp) = match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[watch] ws connect failed: {}; retry in 10s", e);
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+        let subscribe = serde_json::json!({
+            "action": "subscribe",
+            "events": ["agreement.satisfied", "agreement.auto_released"],
+        });
+        if let Err(e) = ws.send(Message::Text(subscribe.to_string())).await {
+            eprintln!("[watch] subscribe send failed: {}; reconnecting", e);
+            continue;
+        }
+        eprintln!("[watch] subscribed; listening for events");
+        while let Some(msg) = ws.next().await {
+            match msg {
+                Ok(Message::Text(t)) => {
+                    let Ok(val) = serde_json::from_str::<serde_json::Value>(&t) else {
+                        continue;
+                    };
+                    let event_type = val
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if event_type == "agreement.satisfied" && auto_release {
+                        let agreement_hash = val
+                            .get("data")
+                            .and_then(|d| d.get("agreement_hash"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if agreement_hash.is_empty() {
+                            continue;
+                        }
+                        // Dedupe / reserve slot under short critical section.
+                        {
+                            let mut guard = in_flight.lock().unwrap();
+                            if guard.contains(agreement_hash) {
+                                continue;
+                            }
+                            guard.insert(agreement_hash.to_string());
+                        }
+                        eprintln!(
+                            "[watch] agreement.satisfied {} — scheduling auto-release (dispute window enforced inside try_auto_release)",
+                            agreement_hash
+                        );
+                        let agreement_hash_owned = agreement_hash.to_string();
+                        let rpc_url_clone = rpc_url.clone();
+                        let in_flight_clone = in_flight.clone();
+                        tokio::spawn(async move {
+                            match try_auto_release(
+                                &agreement_hash_owned,
+                                &rpc_url_clone,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    eprintln!(
+                                        "[watch] auto-released {}",
+                                        agreement_hash_owned
+                                    );
+                                    update_offer_settled_for(&agreement_hash_owned);
+                                    // Keep in in_flight forever to dedupe replay events.
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[watch] auto-release skipped/failed for {}: {}",
+                                        agreement_hash_owned, e
+                                    );
+                                    // Failure: clear the slot so a future
+                                    // event for the same hash can retry.
+                                    let mut guard = in_flight_clone.lock().unwrap();
+                                    guard.remove(&agreement_hash_owned);
+                                }
+                            }
+                        });
+                    }
+                }
+                Ok(Message::Ping(p)) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                Ok(Message::Close(_)) => break,
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("[watch] ws recv error: {}; reconnecting", e);
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+async fn try_auto_release(
+    agreement_hash: &str,
+    rpc_url: &str,
+) -> Result<(), String> {
+    // Look up the agreement locally so we can extract agreement_id and
+    // creation_time for preimage recovery.
+    let agreement = load_local_agreement_by_hash(agreement_hash)?;
+    let inner = agreement.get("agreement").unwrap_or(&agreement);
+    let agreement_id = inner
+        .get("agreement_id")
+        .or_else(|| agreement.get("agreement_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "agreement has no agreement_id".to_string())?
+        .to_string();
+    let creation_time = inner
+        .get("creation_time")
+        .or_else(|| agreement.get("creation_time"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    // GROUP E (Q2): if the agreement declares a dispute_window, wait
+    // until at least that many blocks have elapsed past the moment this
+    // call observed the chain tip before triggering release. The window
+    // is set on freelance and milestone templates by handle_offer_take;
+    // OTC and deposit agreements have None and skip the wait.
+    let dispute_window = inner
+        .get("deadlines")
+        .and_then(|d| d.get("dispute_window"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if dispute_window > 0 {
+        let observed_tip = fetch_tip_height_async(rpc_url)
+            .await
+            .map_err(|e| format!("dispute window: tip fetch failed: {}", e))?;
+        let target_tip = observed_tip + dispute_window;
+        eprintln!(
+            "[watch] {} satisfied at tip {} — waiting for tip >= {} ({} block dispute window)",
+            agreement_hash, observed_tip, target_tip, dispute_window
+        );
+        loop {
+            // Poll every minute. 1 block ≈ 1–2 min on Irium today
+            // (BLOCKS_PER_HOUR=60 in irium-core constants); 60-second
+            // poll cadence keeps the watch loop responsive without
+            // hammering iriumd.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let now_tip = match fetch_tip_height_async(rpc_url).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!(
+                        "[watch] {} dispute window: tip poll failed: {} (will retry)",
+                        agreement_hash, e
+                    );
+                    continue;
+                }
+            };
+            if now_tip >= target_tip {
+                eprintln!(
+                    "[watch] {} dispute window elapsed (tip {} >= {})",
+                    agreement_hash, now_tip, target_tip
+                );
+                break;
+            }
+        }
+    }
+
+    let preimage = recover_preimage(&agreement_id, creation_time)
+        .ok_or_else(|| format!("no preimage recoverable for {}", agreement_id))?;
+    let argv0 = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let rpc_url = rpc_url.to_string();
+    let agreement_hash = agreement_hash.to_string();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&argv0)
+            .arg("agreement-release")
+            .arg(&agreement_hash)
+            .arg("--secret")
+            .arg(&preimage)
+            .arg("--broadcast")
+            .arg("--rpc")
+            .arg(&rpc_url)
+            .arg("--json")
+            .output()
+    })
+    .await
+    .map_err(|e| format!("join: {e}"))?
+    .map_err(|e| format!("spawn agreement-release: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "agreement-release exit {}: {}",
+            out.status,
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// GROUP E: async wrapper around the existing sync fetch_tip_height
+/// (line 2708) so the auto-release watcher can poll the chain tip from
+/// inside an async task without blocking the executor. Builds a fresh
+/// blocking Client per call (cheap) and reuses the existing sync helper
+/// which already handles HTTPS fallback and IRIUM_RPC_TOKEN bearer auth.
+async fn fetch_tip_height_async(rpc_url: &str) -> Result<u64, String> {
+    let rpc_url = rpc_url.to_string();
+    tokio::task::spawn_blocking(move || -> Result<u64, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+        fetch_tip_height(&client, rpc_url.trim_end_matches('/'))
+    })
+    .await
+    .map_err(|e| format!("join: {e}"))?
+}
+
+/// Try FIX 1 stored file first; fall back to the deterministic
+/// offer-take preimage pattern. Returns None if neither source has it.
+fn recover_preimage(agreement_id: &str, creation_time: u64) -> Option<String> {
+    let secrets_dir = irium_data_dir().join("agreement_secrets");
+    let path = secrets_dir.join(format!("{}.hex", agreement_id));
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if creation_time > 0 {
+        return Some(hex::encode(
+            format!("offer-secret-{}-{}", agreement_id, creation_time).as_bytes(),
+        ));
+    }
+    None
+}
+
+/// Walks the local agreement store and returns the agreement JSON
+/// whose top-level agreement_hash field matches. Returns Err if the
+/// agreement isn't on this machine — peer-created agreements we have
+/// no local copy of are silently skipped by the caller.
+fn load_local_agreement_by_hash(
+    agreement_hash: &str,
+) -> Result<serde_json::Value, String> {
+    let candidates = [
+        irium_data_dir().join("agreements"),
+        imported_agreements_dir(),
+    ];
+    for d in candidates.iter() {
+        if let Ok(entries) = std::fs::read_dir(d) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
+                    continue;
+                };
+                let top_hash = v
+                    .get("agreement_hash")
+                    .and_then(|h| h.as_str())
+                    .unwrap_or("");
+                if top_hash == agreement_hash {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+    Err(format!(
+        "agreement {} not found in local store",
+        agreement_hash
+    ))
+}
+
+/// Sets status=settled on any local offer whose agreement_hash matches
+/// the freshly-released agreement. Best-effort: read/parse/write
+/// failures are swallowed since the underlying release already
+/// succeeded on-chain and the offer status is purely cosmetic.
+fn update_offer_settled_for(agreement_hash: &str) {
+    let dir = offers_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(mut offer) = serde_json::from_str::<IrmOffer>(&content) else {
+            continue;
+        };
+        if offer.agreement_hash.as_deref() == Some(agreement_hash) {
+            offer.status = "settled".to_string();
+            if let Ok(new_json) = serde_json::to_string_pretty(&offer) {
+                let _ = std::fs::write(&p, new_json);
+            }
+        }
+    }
+}
+
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
@@ -21124,6 +23631,16 @@ fn main() {
     }
 
     match args[0].as_str() {
+        // GROUP C: long-running watcher daemon. Subscribes to iriumd's WS
+        // event stream and auto-releases agreements when their proof
+        // becomes final (or when IRIUM_AUTO_RELEASE=1 is set without the
+        // explicit flag). See handle_watch below for the full design.
+        "watch" => {
+            if let Err(e) = handle_watch(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
         "init" => {
             let path = wallet_path();
             if path.exists() {
@@ -23506,6 +26023,7 @@ fn main() {
                     agreement,
                     fee_per_byte,
                     broadcast: Some(broadcast),
+                    milestone_id: None,
                 },
             ) {
                 Ok(v) => v,
@@ -26413,6 +28931,30 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
         }
         "agreement-pack" => {
             if let Err(e) = handle_agreement_pack(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-export-receipt" => {
+            if let Err(e) = handle_agreement_export_receipt(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-milestone-fund" => {
+            if let Err(e) = handle_agreement_milestone_fund(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-milestone-release" => {
+            if let Err(e) = handle_agreement_milestone_release(&args[1..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        "agreement-flag-non-response" => {
+            if let Err(e) = handle_agreement_flag_non_response(&args[1..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
