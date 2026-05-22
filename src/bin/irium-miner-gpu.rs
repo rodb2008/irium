@@ -724,6 +724,13 @@ struct GpuMiner {
 /// spew minutes of fake hashrate.
 const SUSPICIOUS_BATCH_LIMIT: u32 = 10;
 
+/// Minimum batch size we are willing to shrink to before declaring the
+/// GPU unusable for mining. 65 536 nonces takes well under 100 ms even
+/// on an integrated Vega 8 iGPU, so any hardware that still triggers
+/// the sub-5ms watchdog detector at this size is either driverless,
+/// software-emulated, or genuinely broken. F1 (auto-halve) target.
+const MIN_BATCH_SIZE: usize = 1 << 16;
+
 // GpuMiner owns its own OpenCL context/queue/kernel — no shared mutable state between
 // instances.  The ocl crate uses raw CL handles which are not auto-Send; we assert Send
 // because each GpuMiner is moved into exactly one thread and never accessed concurrently.
@@ -838,6 +845,24 @@ impl GpuMiner {
         Ok(())
     }
 
+    /// F1 auto-halve: shrink the per-dispatch batch by 2x and reset the
+    /// suspicious-batch counter so the next mine_batch call uses a smaller
+    /// global work size. Returns Err once batch_size hits MIN_BATCH_SIZE.
+    /// No kernel rebuild needed because mine_batch issues each enqueue via
+    /// `self.kernel.cmd().gws(self.batch_size)` — the override path picks
+    /// up the shrunk size on the very next dispatch.
+    fn shrink_batch(&mut self) -> Result<(), String> {
+        if self.batch_size <= MIN_BATCH_SIZE {
+            return Err(format!(
+                "GPU watchdog still firing at minimum batch size {} — hardware unusable for mining (try a different OpenCL platform/device)",
+                MIN_BATCH_SIZE
+            ));
+        }
+        self.batch_size /= 2;
+        self.suspicious_batch_count = 0;
+        Ok(())
+    }
+
     /// Upload an updated tail only (call when timestamp changes).
     fn update_tail(&mut self, tail: &[u32; 3]) -> Result<(), String> {
         self.tail_buf
@@ -874,8 +899,11 @@ impl GpuMiner {
         // Safety: the kernel was built from verified source, all buffer args are valid
         // and alive for the duration of this call, and queue.finish() below ensures the
         // GPU work completes before we read back results.
+        // F1: enqueue via cmd().gws(self.batch_size) instead of the plain
+        // .enq() so a shrink_batch() between batches takes effect on the
+        // very next dispatch without rebuilding the kernel.
         unsafe {
-            self.kernel.enq().map_err(e)?;
+            self.kernel.cmd().gws(self.batch_size).enq().map_err(e)?;
         }
         self.queue.finish().map_err(e)?;
 
@@ -1454,12 +1482,34 @@ fn mine_stratum_job_gpu(
                     "[GPU {gpu_idx}/Stratum] STALL DETECTED: {} consecutive suspicious batches.",
                     gpu.suspicious_batch_count
                 );
-                eprintln!("[GPU] macOS GPU watchdog may be killing kernels.");
-                eprintln!("[GPU] Try reducing intensity. Stopping GPU miner.");
+                eprintln!("[GPU] Watchdog kept firing even at minimum batch size.");
+                eprintln!("[GPU] Stopping GPU miner.");
                 return Err(format!(
-                    "GPU stall — {} consecutive watchdog-killed batches (reduce intensity)",
-                    gpu.suspicious_batch_count
+                    "GPU stall — {} consecutive watchdog-killed batches at batch_size {}",
+                    gpu.suspicious_batch_count, gpu.batch_size
                 ));
+            }
+            // F1 auto-halve: after 3 suspicious batches in a row, halve
+            // the batch size and keep mining instead of just dying after
+            // 10. The next mine_batch call uses the shrunk gws via
+            // self.kernel.cmd().gws(self.batch_size).enq(). Repeats until
+            // we either find a stable size or hit MIN_BATCH_SIZE (then
+            // the >=SUSPICIOUS_BATCH_LIMIT branch above hard-fails).
+            if gpu.suspicious_batch_count >= 3 {
+                let old = gpu.batch_size;
+                match gpu.shrink_batch() {
+                    Ok(()) => {
+                        eprintln!(
+                            "[GPU {gpu_idx}/Stratum] watchdog stalls detected — halving batch {} -> {} (intensity ~{}%)",
+                            old, gpu.batch_size,
+                            (gpu.batch_size as f64 / (1usize << 22) as f64 * 100.0).round() as u32
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[GPU {gpu_idx}/Stratum] {}", e);
+                        return Err(e);
+                    }
+                }
             }
             // Skip hash-counter update and share-submit for this batch.
         } else {
@@ -1734,6 +1784,7 @@ Options:
   --devices         <n,n,...> Comma-separated device indices (multi-GPU)
 
   --batch           <n>       Nonces per GPU dispatch (default: 4194304)
+  --intensity       <10..100> Percentage of default batch (alternative to --batch)
 
   --rpc             <url>     Node RPC URL for solo mining (env: IRIUM_NODE_RPC)
 
@@ -1810,6 +1861,24 @@ fn main() {
                     std::process::exit(1);
                 });
                 env::set_var("IRIUM_GPU_BATCH", val);
+            }
+            // F2: --intensity N (10..100) maps to N% of the default 4M
+            // batch — same mapping the desktop GUIs intensity slider uses
+            // so the CLI and GUI speak the same vocabulary. Conservative
+            // default for one-click .bat/.sh launchers is 50 (~2M batch)
+            // which clears Windows TDR on every iGPU we have tested.
+            "--intensity" => {
+                let val = args.next().unwrap_or_else(|| {
+                    eprintln!("--intensity requires a value 10..100");
+                    std::process::exit(1);
+                });
+                let n: usize = val.parse().unwrap_or_else(|_| {
+                    eprintln!("--intensity requires a numeric value 10..100, got {val}");
+                    std::process::exit(1);
+                });
+                let clamped = n.clamp(10, 100);
+                let batch = ((clamped as f64 / 100.0) * (1usize << 22) as f64).round() as usize;
+                env::set_var("IRIUM_GPU_BATCH", batch.to_string());
             }
             "--rpc" => {
                 let val = args.next().unwrap_or_else(|| {
@@ -2113,13 +2182,31 @@ fn main() {
                                 if gpu.suspicious_batch_count > 0 {
                                     if gpu.suspicious_batch_count >= SUSPICIOUS_BATCH_LIMIT {
                                         eprintln!(
-                                            "[GPU {gpu_idx}] STALL DETECTED: {} consecutive suspicious batches.",
-                                            gpu.suspicious_batch_count
+                                            "[GPU {gpu_idx}] STALL DETECTED: {} consecutive suspicious batches at batch_size {}.",
+                                            gpu.suspicious_batch_count, gpu.batch_size
                                         );
-                                        eprintln!("[GPU] macOS GPU watchdog may be killing kernels.");
-                                        eprintln!("[GPU] Try reducing intensity. Stopping GPU miner.");
+                                        eprintln!("[GPU] Watchdog kept firing even at minimum batch size.");
+                                        eprintln!("[GPU] Stopping GPU miner.");
                                         stop.store(true, Ordering::SeqCst);
                                         break;
+                                    }
+                                    // F1 auto-halve: same shape as the stratum path.
+                                    if gpu.suspicious_batch_count >= 3 {
+                                        let old = gpu.batch_size;
+                                        match gpu.shrink_batch() {
+                                            Ok(()) => {
+                                                eprintln!(
+                                                    "[GPU {gpu_idx}] watchdog stalls detected — halving batch {} -> {} (intensity ~{}%)",
+                                                    old, gpu.batch_size,
+                                                    (gpu.batch_size as f64 / (1usize << 22) as f64 * 100.0).round() as u32
+                                                );
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[GPU {gpu_idx}] {}", e);
+                                                stop.store(true, Ordering::SeqCst);
+                                                break;
+                                            }
+                                        }
                                     }
                                     // Skip total accounting + nonce advance for the
                                     // suspicious batch; retry the same nonce_base on
