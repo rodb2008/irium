@@ -7796,7 +7796,15 @@ async fn submit_block(
     };
 
     // Sanity-check header hash matches payload.
-    let derived_hash = block_header.hash();
+    // Fix 2a Step B completion: use height-aware hash. Pre-fork
+    // (h < STANDARD_HEADER_ACTIVATION_HEIGHT) this is byte-identical
+    // to legacy hash() per the pinning test
+    // serialize_for_height_matches_legacy_for_all_pre_fork_heights.
+    // Post-fork the merkle byte order matches the rest of the chain
+    // validation path (Block::merkle_root native order + ASIC wire),
+    // closing the inconsistency that caused submit_block to reject
+    // valid pool blocks with "merkle root mismatch" in connect_block.
+    let derived_hash = block_header.hash_for_height(req.height);
     if derived_hash[..] != hash_bytes[..] {
         eprintln!(
             "[submit_block] reject branch=hash_mismatch derived={} provided={}",
