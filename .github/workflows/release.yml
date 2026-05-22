@@ -35,7 +35,7 @@ jobs:
             os: windows-latest
             archive_ext: zip
             use_cross: "false"
-            build_gpu: "false"
+            build_gpu: "true"
 
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -90,6 +90,37 @@ jobs:
               --bin iriumd --bin irium-wallet --bin irium-miner --bin irium-spv
           fi
 
+      - name: Generate OpenCL.lib (Windows)
+        if: matrix.os == 'windows-latest' && matrix.build_gpu == 'true'
+        shell: pwsh
+        run: |
+          $vsRoot = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $msvcDir = Get-ChildItem "$vsRoot\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $msvcDir) { throw "No MSVC toolchain under $vsRoot" }
+          $msvcBin = "$($msvcDir.FullName)\bin\HostX64\x64"
+          $stubRoot = Join-Path $env:RUNNER_TEMP 'opencl-stub'
+          $libDir = Join-Path $stubRoot 'lib\x64'
+          New-Item -ItemType Directory -Path $libDir -Force | Out-Null
+          Push-Location $env:RUNNER_TEMP
+          & "$msvcBin\dumpbin.exe" /exports C:\Windows\System32\OpenCL.dll | Out-File -Encoding ASCII opencl-exports.txt
+          $def = New-Object System.Collections.Generic.List[string]
+          $def.Add('LIBRARY OpenCL')
+          $def.Add('EXPORTS')
+          $inSec = $false
+          foreach ($l in Get-Content opencl-exports.txt) {
+            if ($l -match '^\s+ordinal\s+hint') { $inSec = $true; continue }
+            if ($inSec) {
+              if ($l -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)') { $def.Add('    ' + $matches[1]) }
+              elseif ($l -match '^\s+Summary') { break }
+            }
+          }
+          $def | Out-File -Encoding ASCII OpenCL.def
+          & "$msvcBin\lib.exe" /def:OpenCL.def /out:"$libDir\OpenCL.lib" /machine:x64
+          Pop-Location
+          if (-not (Test-Path "$libDir\OpenCL.lib")) { throw 'OpenCL.lib generation failed' }
+          Write-Host "Generated OpenCL.lib ($((Get-Item "$libDir\OpenCL.lib").Length) bytes)"
+          "INTELOCLSDKROOT=$stubRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Build GPU miner
         if: matrix.build_gpu == 'true'
         run: |
@@ -101,13 +132,12 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           TARGET="${{ matrix.target }}"
-          # Map Rust target triples to user-friendly platform names
           case "${TARGET}" in
             x86_64-unknown-linux-gnu)   PLATFORM="linux-x86_64"   ;;
-            aarch64-unknown-linux-gnu)  PLATFORM="linux-arm64"     ;;
-            x86_64-apple-darwin)        PLATFORM="macos-x86_64"    ;;
-            aarch64-apple-darwin)       PLATFORM="macos-arm64"      ;;
-            *)                          PLATFORM="${TARGET}"         ;;
+            aarch64-unknown-linux-gnu)  PLATFORM="linux-arm64"    ;;
+            x86_64-apple-darwin)        PLATFORM="macos-x86_64"   ;;
+            aarch64-apple-darwin)       PLATFORM="macos-arm64"    ;;
+            *)                          PLATFORM="${TARGET}"       ;;
           esac
           ARCHIVE="irium-${VERSION}-${PLATFORM}.tar.gz"
           STAGING="dist-${TARGET}"
@@ -115,9 +145,53 @@ jobs:
           for bin in iriumd irium-wallet irium-miner irium-spv; do
             cp "target/${TARGET}/release/${bin}" "${STAGING}/"
           done
-          if [ "${{ matrix.build_gpu }}" = "true" ] && [ -f "target/${TARGET}/release/irium-miner-gpu" ]; then
-            cp "target/${TARGET}/release/irium-miner-gpu" "${STAGING}/"
+          if [ "${{ matrix.build_gpu }}" = "true" ]; then
+            if [ -f "target/${TARGET}/release/irium-miner-gpu" ]; then
+              cp "target/${TARGET}/release/irium-miner-gpu" "${STAGING}/"
+              echo "Included irium-miner-gpu in archive"
+            else
+              echo "ERROR: build_gpu=true but irium-miner-gpu missing"
+              exit 1
+            fi
           fi
+          for helper in mine-gpu.sh mine-cpu.sh mine-gpu-mac.sh mine-cpu-mac.sh mine-gpu.bat mine-cpu.bat; do
+            if [ -f "${helper}" ]; then
+              cp "${helper}" "${STAGING}/"
+              chmod +x "${STAGING}/${helper}" 2>/dev/null || true
+            fi
+          done
+          cat > "${STAGING}/MINING-QUICKSTART.txt" <<MINIEOF
+Irium Mining Quick Start
+========================
+
+Pick the script that matches your OS and double-click (or run from a shell):
+
+  Linux:    ./mine-gpu.sh        (GPU, recommended)
+            ./mine-cpu.sh        (CPU, requires local iriumd)
+  macOS:    ./mine-gpu-mac.sh    (GPU, recommended)
+            ./mine-cpu-mac.sh    (CPU, requires local iriumd)
+  Windows:  mine-gpu.bat         (GPU, recommended)
+            mine-cpu.bat         (CPU, requires local iriumd)
+
+On first run you will be asked for your Irium wallet address (starts
+with P or Q). It is saved to mine-config.txt next to the script so
+you only enter it once. Mining auto-restarts if it crashes.
+
+GPU scripts connect to the official Irium pool at
+stratum+tcp://pool.iriumlabs.org:3335 in SOLO payout mode -- when one
+of your shares meets the network target, the FULL block reward
+(currently 50 IRM) lands at your wallet address. No pool fee.
+
+CPU scripts run against a local iriumd at http://127.0.0.1:38300 in
+solo mode -- start iriumd first, or run the Irium Core desktop app
+which exposes that endpoint automatically.
+
+Need an Irium wallet address? Download the Irium Core desktop app:
+  https://github.com/iriumlabs/irium-core/releases/latest
+
+Full mining docs:
+  https://github.com/iriumlabs/irium/blob/main/docs/MINING.md
+MINIEOF
           tar -czf "${ARCHIVE}" -C "${STAGING}" .
           echo "ARCHIVE=${ARCHIVE}" >> "${GITHUB_ENV}"
 
@@ -127,7 +201,6 @@ jobs:
         run: |
           $version = $env:GITHUB_REF_NAME
           $target = "${{ matrix.target }}"
-          # Map Rust target triple to user-friendly platform name
           $platform = switch ($target) {
             "x86_64-pc-windows-msvc" { "windows-x86_64" }
             default { $target }
@@ -138,6 +211,51 @@ jobs:
           foreach ($bin in @("iriumd", "irium-wallet", "irium-miner", "irium-spv")) {
             Copy-Item "target/${target}/release/${bin}.exe" "${staging}/"
           }
+          if ("${{ matrix.build_gpu }}" -eq "true") {
+            $gpu = "target/${target}/release/irium-miner-gpu.exe"
+            if (Test-Path $gpu) {
+              Copy-Item $gpu "${staging}/"
+              Write-Host "Included irium-miner-gpu.exe in archive"
+            } else {
+              throw "build_gpu=true but irium-miner-gpu.exe missing at $gpu"
+            }
+          }
+          foreach ($helper in @("mine-gpu.bat", "mine-cpu.bat", "mine-gpu.sh", "mine-cpu.sh", "mine-gpu-mac.sh", "mine-cpu-mac.sh")) {
+            if (Test-Path $helper) { Copy-Item $helper "${staging}/" }
+          }
+          $readme = @"
+Irium Mining Quick Start
+========================
+
+Pick the script that matches your OS and double-click (or run from a shell):
+
+  Windows:  mine-gpu.bat         (GPU, recommended)
+            mine-cpu.bat         (CPU, requires local iriumd)
+  Linux:    ./mine-gpu.sh        (GPU, recommended)
+            ./mine-cpu.sh        (CPU, requires local iriumd)
+  macOS:    ./mine-gpu-mac.sh    (GPU, recommended)
+            ./mine-cpu-mac.sh    (CPU, requires local iriumd)
+
+On first run you will be asked for your Irium wallet address (starts
+with P or Q). It is saved to mine-config.txt next to the script so
+you only enter it once. Mining auto-restarts if it crashes.
+
+GPU scripts connect to the official Irium pool at
+stratum+tcp://pool.iriumlabs.org:3335 in SOLO payout mode -- when one
+of your shares meets the network target, the FULL block reward
+(currently 50 IRM) lands at your wallet address. No pool fee.
+
+CPU scripts run against a local iriumd at http://127.0.0.1:38300 in
+solo mode -- start iriumd first, or run the Irium Core desktop app
+which exposes that endpoint automatically.
+
+Need an Irium wallet address? Download the Irium Core desktop app:
+  https://github.com/iriumlabs/irium-core/releases/latest
+
+Full mining docs:
+  https://github.com/iriumlabs/irium/blob/main/docs/MINING.md
+"@
+          $readme | Out-File -FilePath "${staging}/MINING-QUICKSTART.txt" -Encoding utf8
           Compress-Archive -Path "${staging}/*" -DestinationPath $archive -Force
           "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
