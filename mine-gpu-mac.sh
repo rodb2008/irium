@@ -91,7 +91,7 @@ echo
 
 while true; do
     echo "[$(date +%T)] launching irium-miner-gpu..."
-    "${MINER_BIN}" --wallet "${WALLET}" --pool "${POOL_URL}" || true
+    "${MINER_BIN}" --wallet "${WALLET}" --pool "${POOL_URL}" --intensity 50 || true
     echo "[$(date +%T)] miner exited. restarting in 5s (Ctrl+C to stop)..."
     sleep 5
 done

@@ -85,7 +85,7 @@ echo.
 
 :loop
 echo  [%TIME%] Launching irium-miner-gpu...
-"%MINER_EXE%" --wallet "%WALLET%" --pool "%POOL_URL%"
+"%MINER_EXE%" --wallet "%WALLET%" --pool "%POOL_URL%" --intensity 50
 set "RC=!ERRORLEVEL!"
 echo.
 echo  [%TIME%] Miner exited with code !RC!. Restarting in 5 seconds...
