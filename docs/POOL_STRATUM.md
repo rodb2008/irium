@@ -22,14 +22,30 @@ The binaries will be at `target/release/irium-stratum` and
 Port profiles:
 
 - `3333` (strict canonical): `stratum+tcp://pool.iriumlabs.org:3333`
-  - Use for: ASIC/modern firmware
+  - Use for: ASIC/modern firmware (Bitaxe, S19, S21, Whatsminer, Avalon)
 - `3335` (legacy compatibility): `stratum+tcp://pool.iriumlabs.org:3335`
-  - Use for: CPU/GPU and older Stratum clients (cpuminer/ccminer/legacy cgminer family)
+  - Use for: CPU/GPU and older Stratum clients (cpuminer-opt, ccminer, T-Rex, lolMiner, NBMiner, legacy cgminer family)
+- `443` (ISP-block fallback): `stratum+tcp://pool.iriumlabs.org:443`
+  - Use when: outbound TCP/3333 or TCP/3335 is filtered by your ISP (notably common in mainland China). Same Stratum protocol served on the HTTPS port to bypass DPI filtering.
+- `80` (second fallback): `stratum+tcp://pool.iriumlabs.org:80`
+  - Use when: both 3333/3335 and 443 are filtered. Same protocol, HTTP port.
 - Username: `IRM_ADDRESS.worker1`
 - Password: `x`
 
 Example username:
 - `Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa.worker1`
+
+Live stats: [https://pool.iriumlabs.org/stats](https://pool.iriumlabs.org/stats)
+(active miners, accepted/rejected shares, current share difficulty per
+profile, blocks found, rolling-window hashrate estimate).
+
+**Block 23,500 hard fork (Fix 2a):** the chain activates Bitcoin-
+standard block-header serialization at block 23,500. After activation
+every SHA-256d miner — Bitaxe, ASIC, T-Rex, lolMiner, NBMiner,
+cpuminer-opt — that submits a winning share earns the full block
+reward (currently 50 IRM) directly to the IRM address used as the
+Stratum worker name. This pool runs in SOLO payout mode; there is no
+pool fee.
 
 ## Recommended endpoint selection
 
@@ -159,7 +175,12 @@ If the public hostname connects but your miner still reports subscribe/authorize
 |---|---|---|---|---|
 | `cpuminer-opt 26.1` | CPU | Stable on legacy port | `-a sha256d -o stratum+tcp://pool.iriumlabs.org:3335 -u WALLET.worker -p x -t N` | Use legacy profile port `3335`. |
 | `ccminer 2.3.1/2.3.2` | GPU | Stable on legacy port | `-a sha256d -o stratum+tcp://pool.iriumlabs.org:3335 -u WALLET.worker -p x` | Use legacy profile port `3335`. |
-| `cgminer/bmminer 4.10.0` | ASIC/legacy | Stable on strict port | Pool0 DNS hostname | Use strict port `3333`; fallback `3335` only if firmware requires it. |
-| `irium-miner` | Native | Recommended | Use latest `main` build | Baseline for protocol correctness and debugging. |
+| `T-Rex` | GPU | Validated | `t-rex -a sha256d -o stratum+tcp://pool.iriumlabs.org:3335 -u WALLET.gpu1 -p x` | Use legacy profile port `3335`. NVIDIA-only. |
+| `lolMiner` | GPU | Validated | `lolMiner --algo SHA256D --pool stratum+tcp://pool.iriumlabs.org:3335 --user WALLET.gpu1 --pass x` | Use legacy profile port `3335`. AMD + NVIDIA. |
+| `NBMiner` | GPU | Validated | `nbminer -a sha256d -o stratum+tcp://pool.iriumlabs.org:3335 -u WALLET.gpu1 -p x` | Use legacy profile port `3335`. |
+| `Bitaxe` (S19-compatible firmware) | ASIC | Validated | Stratum URL `pool.iriumlabs.org`, Port `3333`, User `WALLET.bitaxe1`, Password `x`, TLS OFF | Use strict port `3333`. Switch to `443` if your ISP blocks `3333`. |
+| `cgminer / bmminer 4.10.0` | ASIC/legacy | Stable on strict port | Pool0 DNS hostname | Use strict port `3333`; fallback `3335` only if firmware requires it. |
+| `S19 / S21 / Whatsminer / Avalon` (stock firmware) | ASIC | Validated | Pool URL `stratum+tcp://pool.iriumlabs.org:3333`, Worker `WALLET.rig1`, Password `x` | Same as Bitaxe; switch to port `443` if 3333 is blocked. |
+| `irium-miner` / `irium-miner-gpu` | Native | Recommended | Use latest `main` build | Baseline for protocol correctness and debugging. |
 
 Use `/metrics` reject reasons (`rejected_stale`, `rejected_low_difficulty`, `rejected_invalid`, `rejected_duplicate`) for triage.
