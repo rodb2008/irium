@@ -75,8 +75,8 @@ jobs:
         with:
           tool: cross
 
-      - name: Install OpenCL headers
-        if: matrix.build_gpu == 'true'
+      - name: Install OpenCL headers (Linux)
+        if: matrix.build_gpu == 'true' && runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
 
       - name: Build core binaries
