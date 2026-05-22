@@ -14,6 +14,37 @@ line paths below are for advanced miners and rig operators.
 
 ---
 
+## Windows Quick Start (One-Click Mining)
+
+For Windows users who want to start mining immediately without
+technical setup:
+
+1. Download the latest release from
+   [github.com/iriumlabs/irium/releases/latest](https://github.com/iriumlabs/irium/releases/latest).
+2. Extract the .zip file.
+3. Double-click `mine-gpu.bat` to start GPU mining (recommended for
+   any modern AMD / NVIDIA / Intel GPU) _or_ double-click
+   `mine-cpu.bat` to start CPU mining.
+4. Enter your Irium wallet address when prompted (starts with
+   **P** or **Q**).
+5. Mining starts automatically and auto-restarts if it stops.
+
+Your wallet address is saved in `mine-config.txt` next to the .bat
+files, so you only need to enter it once. To use a different address,
+delete `mine-config.txt` and re-run the script.
+
+**`mine-gpu.bat`** connects to the official Irium pool at
+`stratum+tcp://pool.iriumlabs.org:3335` in SOLO payout mode  when one
+of your shares meets the network target, the full block reward goes
+directly to your address. No pool fee.
+
+**`mine-cpu.bat`** runs the bundled CPU miner against a local iriumd
+node at `http://127.0.0.1:38300`. Start iriumd first  the Irium Core
+desktop app exposes that endpoint automatically. For pool-based CPU
+mining install `cpuminer-opt` separately (see the CPU section below).
+
+---
+
 ## Important — block 23,500 hard fork
 
 The chain activates Bitcoin-standard block-header serialization at

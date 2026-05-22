@@ -8,6 +8,32 @@ This guide takes you from zero to a completed settlement. No blockchain experien
 
 ---
 
+## Step 0  Windows users: try the one-click .bat files first
+
+If you are on Windows and just want to start mining without learning
+any commands, the irium release archive contains two ready-to-run
+shortcuts:
+
+1. Download `irium-v<latest>-windows-x86_64.zip` from
+   [github.com/iriumlabs/irium/releases/latest](https://github.com/iriumlabs/irium/releases/latest).
+2. Extract the .zip.
+3. Double-click **`mine-gpu.bat`** (recommended for any GPU) or
+   **`mine-cpu.bat`** (requires a local iriumd; see below).
+4. Paste your Irium wallet address when prompted. It is saved in
+   `mine-config.txt` for next time.
+5. Mining starts and auto-restarts if it crashes.
+
+That is the entire setup for a casual GPU miner. Steps 1-9 below are
+for operators who want a synced node, a wallet they control,
+marketplace listings, and so on. The .bat files use the official
+Irium pool in SOLO payout mode: when one of your shares meets the
+network target the full block reward (currently 50 IRM) lands at
+your wallet address with no pool fee. The Irium Core desktop app
+described next does the same thing with a friendlier GUI and bundles
+a wallet, sync indicator, and marketplace.
+
+---
+
 ## Easiest path — Irium Core desktop app
 
 **For most users, download the Irium Core desktop app from
