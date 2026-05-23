@@ -307,11 +307,11 @@ Same address + port for the other GPU clients; consult each miner's manual for t
 
 ---
 
-## v1.9.24 release notes (changes from v1.9.23)
+## Changelog
 
-- `mining.configure` handler added. Bitaxe ESP-Miner v2+ and any firmware that negotiates version-rolling now receives an explicit `{"version-rolling": false, "version-rolling.mask": "00000000"}` response instead of an `"unsupported method"` error that earlier caused some firmware to drop the connection.
-- `mining.suggest_difficulty` is now acknowledged with `result: true`. cgminer and Antminer firmware that sends this hint no longer logs an unsupported-method error.
-- `mining.multi_version` is now acknowledged with `result: false`. Older Whatsminer BTMiner builds fall back to single-version mode cleanly.
-- `mining.subscribe` response field [2] is now the literal `4` (the correct `extranonce2_size` per Stratum v1) instead of the configurable `extranonce1_size`. Both happened to be 4 by default; tuning `STRATUM_EXTRANONCE1_SIZE` would previously have broken share submission.
+For the full per-release pool-Stratum changelog (including the v1.9.24
+firmware-compatibility additions — `mining.configure`,
+`mining.suggest_difficulty`, `mining.multi_version`, and the
+`mining.subscribe` `extranonce2_size` fix), see the GitHub releases page:
 
-No consensus, settlement, P2P, or wallet protocol change.
+[github.com/iriumlabs/irium/releases](https://github.com/iriumlabs/irium/releases)
