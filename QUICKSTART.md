@@ -39,8 +39,9 @@ a wallet, sync indicator, and marketplace.
 **For most users, download the Irium Core desktop app from
 [https://github.com/iriumlabs/irium-core/releases/latest](https://github.com/iriumlabs/irium-core/releases/latest).**
 Pick the installer for your operating system (Windows `.exe`, macOS `.dmg`,
-Linux `.AppImage` / `.deb`). The app bundles iriumd v1.9.28 + wallet + CPU/GPU
-miners + pool client + marketplace + settlement Hub. Launch it, follow the
+Linux `.AppImage` / `.deb`). The app bundles the latest v1.9.x iriumd
+sidecar + wallet + CPU/GPU miners + pool client + marketplace +
+settlement Hub. Launch it, follow the
 on-screen prompts to create a wallet, and you are ready to receive IRM,
 mine, and trade — no terminal required.
 
@@ -53,10 +54,13 @@ shown.
 ## Important — block 23,500 hard fork
 
 The chain activates Bitcoin-standard block-header serialization at **block
-23,500** (Fix 2a). **You must be on iriumd v1.9.28 (or the latest Irium Core
-desktop app) before this block is mined.** Older versions will fork off
-from the canonical chain. Mainnet tip is currently ~22,500 — activation
-is days away.
+23,500** (Fix 2a). **You must be on iriumd v1.9.28 or newer (latest tag is
+v1.9.32; the latest Irium Core desktop app bundles it) before this block
+is mined.** Older versions will fork off from the canonical chain. Check
+the current tip against the activation height with
+`curl http://127.0.0.1:38300/status | jq '.height'`; if your `height` is
+already past 23,500 your node has already crossed the fork and is on the
+correct chain.
 
 ---
 
