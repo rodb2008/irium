@@ -23,8 +23,10 @@ The on-the-wire `template_type` field uses the snake_case enum values defined in
 | `otc_settlement` | Buyer/seller trade. Includes asset reference and payment reference. |
 | `refundable_deposit` | Payer/payee deposit. Includes purpose reference and refund summary. |
 | `milestone_settlement` | Multiple milestones, each with its own amount, timeout height, and per-milestone secret hash. |
-| `merchant_delayed_settlement` | Merchant-side settlement with a delayed payout deadline. |
-| `contractor_milestone` | Contractor-style milestone agreement with per-leg release authorization. |
+| `merchant_delayed_settlement` *(no builder)* | Merchant-side settlement with a delayed payout deadline. |
+| `contractor_milestone` *(no builder)* | Contractor-style milestone agreement with per-leg release authorization. |
+
+> **Note on `merchant_delayed_settlement` and `contractor_milestone`:** these template types are recognized by the `AgreementTemplateType` enum deserializer (so `iriumd` will accept agreement JSON carrying them), but `src/settlement.rs` does not yet define canonical builders for either, and `irium-wallet` has no `agreement-create-*` CLI command that produces them. Creating one today requires hand-constructing the `AgreementObject` JSON and POSTing it to `/rpc/createagreement`. Tracking issues for canonical builders: [iriumlabs/irium#54](https://github.com/iriumlabs/irium/issues/54) (merchant) and [iriumlabs/irium#55](https://github.com/iriumlabs/irium/issues/55) (contractor).
 
 ---
 
@@ -273,6 +275,65 @@ This is the canonical `AgreementObject` shape from `src/settlement.rs`. The `tem
 ```
 
 Note on OTC roles: the canonical `build_otc_agreement` function maps `payer = seller` (the party that locks IRM in the HTLC) and `payee = buyer` (the party that receives IRM after delivering off-chain payment). This is the opposite of a fiat-side mental model where the buyer "pays first" — on-chain, the seller's IRM is what gets escrowed.
+
+### `release_authorizer` per template
+
+The `release_conditions[].release_authorizer` field is a semantic tag identifying which party is responsible for authorizing release (typically because they hold the preimage and decide when to share it). The canonical builders in `src/settlement.rs` use these values:
+
+| Template | `release_authorizer` | Why |
+|---|---|---|
+| `simple_release_refund` | `"payer"` | The payer locks funds in the HTLC and authorizes release by revealing the preimage. (`build_simple_settlement_agreement`, `settlement.rs:1350`) |
+| `refundable_deposit` | `"payer"` | Depositor controls release. (`build_deposit_agreement`, `settlement.rs:1419`) |
+| `milestone_settlement` | `"payer"` | Per-milestone HTLC branches are independently authorized by the payer. (`build_milestone_agreement`, `settlement.rs:1566`) |
+| `otc_settlement` | `"seller"` | In OTC, the seller IS the canonical payer (`payer = seller_id` in `parties[]`), because the seller locks IRM in escrow. (`build_otc_agreement`, `settlement.rs:1494`) |
+
+Wallets MUST set this field consistently with the canonical builders. Setting it incorrectly does not break the on-chain HTLC (which only cares about the preimage and timeout), but the agreement's audit / receipt views display the named authorizer and will mislead counterparties.
+
+### Variant: `refundable_deposit`
+
+A `refundable_deposit` agreement carries the same envelope as `simple_release_refund` plus a top-level `purpose_reference` and a `deposit_rule` object describing the release/refund destinations from the chain's point of view. Per `build_deposit_agreement` in `src/settlement.rs`:
+
+```json
+{
+  "agreement_id": "deposit-rental-001",
+  "version": 1,
+  "schema_id": "irium.phase1.canonical.v1",
+  "template_type": "refundable_deposit",
+  "parties": [
+    {"party_id": "payer", "display_name": "Tenant", "address": "QTenantAddress...", "role": "payer"},
+    {"party_id": "payee", "display_name": "Landlord", "address": "QLandlordAddress...", "role": "payee"}
+  ],
+  "payer": "payer",
+  "payee": "payee",
+  "total_amount": 100000000,
+  "network_marker": "IRIUM",
+  "creation_time": 1777624133,
+  "deadlines": {
+    "settlement_deadline": null,
+    "refund_deadline": 25000,
+    "dispute_window": null
+  },
+  "release_conditions": [
+    { "mode": "secret_preimage", "secret_hash_hex": "a3f1...", "release_authorizer": "payer" }
+  ],
+  "refund_conditions": [
+    { "refund_address": "QTenantAddress...", "timeout_height": 25000 }
+  ],
+  "milestones": [],
+  "deposit_rule": {
+    "amount": 100000000,
+    "beneficiary_address": "QLandlordAddress...",
+    "refund_address": "QTenantAddress...",
+    "timeout_height": 25000,
+    "notes": "Returned in full at end of tenancy if no damages"
+  },
+  "purpose_reference": "Rental security deposit",
+  "document_hash": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+  "disputed_metadata_only": false
+}
+```
+
+`deposit_rule` is the wire field iriumd's audit / inspect / receipt code reads when rendering deposit context — agreements without it still validate (HTLC works from `refund_conditions[].timeout_height` and `release_conditions[].secret_hash_hex` alone) but lose this context downstream. The `inspectagreement` response surfaces `has_deposit_rule: true` only when the field is present.
 
 ### Agreement hash response
 
@@ -559,6 +620,24 @@ Check milestone status:
 irium-wallet agreement-milestones milestone-001.json --rpc http://localhost:38300
 ```
 
+### Per-milestone shape inside `milestones[]`
+
+A `milestone_settlement` agreement replaces the single-HTLC envelope with an array of milestone objects under `milestones[]`. Each entry is one HTLC leg with its own preimage, timeout, and destination:
+
+```json
+{
+  "milestone_id": "m1",
+  "title": "Design phase",
+  "amount": 50000000,
+  "recipient_address": "QContractorAddress...",
+  "refund_address": "QClientAddress...",
+  "secret_hash_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "timeout_height": 20800,
+  "metadata_hash": null
+}
+```
+
+Each milestone is funded independently via `POST /rpc/fundagreement` with `milestone_id` in the request body; per-milestone release/refund work the same way using `POST /rpc/agreementreleaseeligibility` / `/rpc/buildagreementrelease` / `/rpc/agreementrefundeligibility` / `/rpc/buildagreementrefund` with `milestone_id` set to the leg being spent. `total_amount` at the agreement level is the sum of `milestones[].amount`. The HTLC mechanics (preimage, timeout, recipient, refund address) live inside each milestone entry, so `milestone_id` is required on every per-milestone RPC call.
 
 ---
 
