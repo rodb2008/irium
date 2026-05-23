@@ -12,7 +12,7 @@ use crate::template::{GetBlockTemplate, TemplateClient};
 /// and above this height the pool switches to Bitcoin-standard wire format
 /// (swap4(natural) prev, natural merkle in canonical header) so cgminer-family
 /// miners produce iriumd-canonical bytes directly.
-const STANDARD_HEADER_ACTIVATION_HEIGHT: u64 = 30_000;
+const STANDARD_HEADER_ACTIVATION_HEIGHT: u64 = 23_500;
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use serde_json::{json, Value};

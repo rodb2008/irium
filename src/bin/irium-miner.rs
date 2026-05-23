@@ -245,7 +245,7 @@ fn advertise_peer_output() -> Option<TxOutput> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_coinbase, build_coinbase_with_pkh, script_from_relay_address};
+    use super::{build_coinbase, build_coinbase_with_pkh, extract_height_from_coinbase1_hex, script_from_relay_address};
     use irium_node_rs::activation::{resolved_htlcv1_activation_height, NetworkKind};
     use irium_node_rs::activation::{
         resolved_lwma_v2_activation_height, MAINNET_LWMA_V2_ACTIVATION_HEIGHT,
@@ -412,6 +412,67 @@ mod tests {
         if let Some(v) = saved_pkh   { std::env::set_var("IRIUM_MINER_PKH", v); }
         assert!(result.is_err(), "invalid address must be rejected");
     }
+
+    #[test]
+    fn extract_height_from_coinbase1_bip34() {
+        // BIP34 mode: height 22656 = 0x5880 -> 2 LE bytes [0x80, 0x58]
+        let mut tx: Vec<u8> = Vec::new();
+        tx.extend_from_slice(&1u32.to_le_bytes());            // version
+        tx.push(0x01);                                        // tx_in count varint
+        tx.extend_from_slice(&[0u8; 32]);                     // prev_txid
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());  // prev_index
+        let script_sig: Vec<u8> = {
+            let mut s = vec![0x02u8, 0x80, 0x58]; // BIP34 push: len=2, height LE
+            s.extend_from_slice(b"Irium");
+            s
+        };
+        tx.push(script_sig.len() as u8);                      // script_sig length varint
+        tx.extend_from_slice(&script_sig);
+        let hex_str = hex::encode(&tx);
+        assert_eq!(extract_height_from_coinbase1_hex(&hex_str), Some(22_656));
+    }
+
+    #[test]
+    fn extract_height_from_coinbase1_bip34_high_bit_padding() {
+        // BIP34 mode: height 128 = 0x80, requires extra 0x00 byte for sign neutrality.
+        // Push = [0x02, 0x80, 0x00]. Parser must read full push_n=2 bytes as LE -> 128.
+        let mut tx: Vec<u8> = Vec::new();
+        tx.extend_from_slice(&1u32.to_le_bytes());
+        tx.push(0x01);
+        tx.extend_from_slice(&[0u8; 32]);
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let script_sig: Vec<u8> = {
+            let mut s = vec![0x02u8, 0x80, 0x00];
+            s.extend_from_slice(b"Irium");
+            s
+        };
+        tx.push(script_sig.len() as u8);
+        tx.extend_from_slice(&script_sig);
+        let hex_str = hex::encode(&tx);
+        assert_eq!(extract_height_from_coinbase1_hex(&hex_str), Some(128));
+    }
+
+    #[test]
+    fn extract_height_from_coinbase1_text_mode() {
+        // Text mode: "Irium 22656"
+        let mut tx: Vec<u8> = Vec::new();
+        tx.extend_from_slice(&1u32.to_le_bytes());
+        tx.push(0x01);
+        tx.extend_from_slice(&[0u8; 32]);
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let script_sig = b"Irium 22656";
+        tx.push(script_sig.len() as u8);
+        tx.extend_from_slice(script_sig);
+        let hex_str = hex::encode(&tx);
+        assert_eq!(extract_height_from_coinbase1_hex(&hex_str), Some(22_656));
+    }
+
+    #[test]
+    fn extract_height_from_coinbase1_returns_none_on_garbage() {
+        assert_eq!(extract_height_from_coinbase1_hex(""), None);
+        assert_eq!(extract_height_from_coinbase1_hex("not-hex"), None);
+        assert_eq!(extract_height_from_coinbase1_hex("00"), None); // too short
+    }
 }
 
 fn miner_address_info() -> Option<(String, Vec<u8>)> {
@@ -473,6 +534,61 @@ fn build_coinbase_with_pkh(
         inputs: vec![coinbase_input],
         outputs: vec![coinbase_output],
         locktime: 0,
+    }
+}
+
+/// Extract block height from a pool-emitted coinbase1 hex string.
+///
+/// The pool (irium-stratum) encodes height in script_sig in one of two formats
+/// (selected by IRIUM_STRATUM_COINBASE_BIP34):
+///   * BIP34 mode (default): length-prefixed little-endian height push, then b"Irium".
+///   * Text mode: ASCII "Irium {height}".
+///
+/// Coinbase tx prefix layout: 4 (version) + 1 (tx_in count varint) + 32 (prev_txid)
+/// + 4 (prev_index) = 41 bytes, followed by a varint for script_sig length.
+fn extract_height_from_coinbase1_hex(coinbase1_hex: &str) -> Option<u64> {
+    let bytes = hex::decode(coinbase1_hex).ok()?;
+    const PREFIX_LEN: usize = 41;
+    if bytes.len() < PREFIX_LEN + 1 {
+        return None;
+    }
+    let mut o = PREFIX_LEN;
+    let first = bytes[o];
+    o += 1;
+    match first {
+        0..=0xfc => {}
+        0xfd => o += 2,
+        0xfe => o += 4,
+        0xff => o += 8,
+    }
+    if bytes.len() <= o {
+        return None;
+    }
+    if bytes[o] == b'I' {
+        const TEXT_PREFIX: &[u8] = b"Irium ";
+        if bytes.len() < o + TEXT_PREFIX.len() || &bytes[o..o + TEXT_PREFIX.len()] != TEXT_PREFIX {
+            return None;
+        }
+        o += TEXT_PREFIX.len();
+        let mut h: u64 = 0;
+        let mut saw_digit = false;
+        while o < bytes.len() && bytes[o].is_ascii_digit() {
+            h = h.checked_mul(10)?.checked_add((bytes[o] - b'0') as u64)?;
+            o += 1;
+            saw_digit = true;
+        }
+        if saw_digit { Some(h) } else { None }
+    } else {
+        let push_n = bytes[o] as usize;
+        o += 1;
+        if push_n == 0 || push_n > 8 || bytes.len() < o + push_n {
+            return None;
+        }
+        let mut h: u64 = 0;
+        for (i, &b) in bytes[o..o + push_n].iter().enumerate() {
+            h |= (b as u64) << (i * 8);
+        }
+        Some(h)
     }
 }
 
@@ -1902,6 +2018,7 @@ struct StratumJob {
     nbits: String,
     ntime: String,
     _clean_jobs: bool,
+    height: Option<u64>,
 }
 
 struct StratumState {
@@ -2044,10 +2161,12 @@ fn stratum_reader(
             }
             (Some("mining.notify"), Some(p)) => {
                 if p.len() >= 9 {
+                    let coinbase1 = p[2].as_str().unwrap_or("").to_string();
+                    let height = extract_height_from_coinbase1_hex(&coinbase1);
                     let job = StratumJob {
                         job_id: p[0].as_str().unwrap_or("").to_string(),
                         prev_hash: p[1].as_str().unwrap_or("").to_string(),
-                        coinbase1: p[2].as_str().unwrap_or("").to_string(),
+                        coinbase1,
                         coinbase2: p[3].as_str().unwrap_or("").to_string(),
                         merkle_branch: p[4]
                             .as_array()
@@ -2061,6 +2180,7 @@ fn stratum_reader(
                         nbits: p[6].as_str().unwrap_or("").to_string(),
                         ntime: p[7].as_str().unwrap_or("").to_string(),
                         _clean_jobs: p[8].as_bool().unwrap_or(false),
+                        height,
                     };
                     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
                     guard.job = Some(job);
@@ -2140,13 +2260,9 @@ fn mine_stratum_job(
             bits,
             nonce,
         };
-        // Stratum v1 mining.notify does not carry the chain height. For
-        // pre-fork (height < STANDARD_HEADER_ACTIVATION_HEIGHT=30000) iriumd's
-        // hash_for_height(0) matches the legacy hash() byte-for-byte. Stratum
-        // mining via this reference miner is pre-fork-only until we parse the
-        // height from the coinbase BIP34 prefix or extend the protocol.
-        // TODO(fix-2a): derive height from job.coinbase1 BIP34 push.
-        let hash = header.hash_for_height(0);
+        // Height comes from extract_height_from_coinbase1_hex (BIP34 push or text
+        // "Irium {height}"); falls back to 0 (pre-fork) if extraction fails.
+        let hash = header.hash_for_height(job.height.unwrap_or(0));
         let hash_value = BigUint::from_bytes_be(&hash);
         if &hash_value <= share_target {
             let submit = json!({
@@ -2759,10 +2875,7 @@ fn submit_solo_share(
         bits: job.bits,
         nonce,
     };
-    // SoloStratumJob lacks an explicit height field; pre-fork-only path.
-    // Matches legacy hash() byte-for-byte at any height < 30000.
-    // TODO(fix-2a): thread height through SoloStratumJob for post-fork support.
-    let hash = header.hash_for_height(0);
+    let hash = header.hash_for_height(job.height);
     let hash_value = BigUint::from_bytes_be(&hash);
     if hash_value > job.share_target {
         return Err("low difficulty share".to_string());
