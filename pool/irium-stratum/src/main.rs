@@ -1,4 +1,5 @@
 mod block;
+mod events;
 mod pow;
 mod stratum;
 mod template;

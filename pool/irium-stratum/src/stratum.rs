@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Notify, RwLock};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 use dashmap::DashMap;
@@ -735,12 +735,32 @@ pub async fn run(config: StratumConfig) -> Result<()> {
         });
     }
 
+    // Wake signal: SSE subscriber sets this on each iriumd block.new event,
+    // template_loop wakes up and immediately fetches a fresh template.
+    let refresh_notify = Arc::new(Notify::new());
+
+    let sse_rpc_base = config.rpc_base.clone();
+    let sse_rpc_token = config.rpc_token.clone();
+    let sse_notify = Arc::clone(&refresh_notify);
+    tokio::spawn(async move {
+        crate::events::subscribe_block_new(sse_rpc_base, sse_rpc_token, sse_notify).await;
+    });
+
     let cfg_clone = config.clone();
     let tx_clone = tx.clone();
     let current_clone = Arc::clone(&current);
     let template_state_clone = Arc::clone(&template_state);
+    let notify_clone = Arc::clone(&refresh_notify);
     tokio::spawn(async move {
-        if let Err(e) = template_loop(cfg_clone, tx_clone, current_clone, template_state_clone).await {
+        if let Err(e) = template_loop(
+            cfg_clone,
+            tx_clone,
+            current_clone,
+            template_state_clone,
+            notify_clone,
+        )
+        .await
+        {
             error!("[tmpl] loop stopped: {e}");
         }
     });
@@ -1148,6 +1168,7 @@ async fn template_loop(
     tx: broadcast::Sender<Job>,
     current: Arc<RwLock<Option<Job>>>,
     template_state: Arc<RwLock<TemplateState>>,
+    refresh_notify: Arc<Notify>,
 ) -> Result<()> {
     let client = TemplateClient::new(config.rpc_base.clone(), config.rpc_token.clone())?;
     let mut last_key = String::new();
@@ -1195,7 +1216,14 @@ async fn template_loop(
             }
             Err(e) => warn!("[tmpl] fetch failed: {e}"),
         }
-        sleep(Duration::from_millis(config.refresh_ms)).await;
+        // Wait for whichever fires first: the periodic poll interval (fallback)
+        // or an SSE-pushed `block.new` event (immediate refresh on new tip).
+        tokio::select! {
+            _ = sleep(Duration::from_millis(config.refresh_ms)) => {}
+            _ = refresh_notify.notified() => {
+                info!("[tmpl] block.new event received → refreshing immediately");
+            }
+        }
     }
 }
 
