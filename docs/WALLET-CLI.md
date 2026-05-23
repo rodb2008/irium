@@ -485,8 +485,15 @@ rewards mined to one of your wallet addresses appear directly in
 ### Solo CPU mining — `irium-miner`
 
 Mines directly against a local `iriumd` via the `/rpc/getblocktemplate`
-endpoint. Configuration is via environment variables; there are no CLI flags
-beyond `--version` / `--help`.
+endpoint. Mostly configured via environment variables; a small set of CLI
+flags also exists:
+
+| Flag | Description |
+|------|-------------|
+| `--threads <n>` / `-t <n>` | Worker thread count (overrides `IRIUM_MINER_THREADS`) |
+| `--solo-stratum` | Enable the bundled solo Stratum bridge so external ASIC/GPU miners can submit work to this `irium-miner`'s local node (see [`docs/SOLO_STRATUM.md`](SOLO_STRATUM.md)) |
+| `--solo-stratum-listen <ip:port>` (alias `--listen <ip:port>`) | Listen address for the solo Stratum bridge; required when `--solo-stratum` is set |
+| `--version`, `--help` | Standard |
 
 | Env var | Description |
 |---------|-------------|
@@ -522,6 +529,7 @@ preference to integrated Intel iGPUs.
 | `--device <n>` | Device index within the selected platform (default `0`) |
 | `--devices <n,n,…>` | Comma-separated multi-GPU list (overrides `--device`) |
 | `--batch <n>` | Nonces per GPU dispatch (default `4194304` = 2²²) |
+| `--intensity <n>` | Tuning hint for batch sizing on smaller GPUs (lower = smaller batch, lower latency) |
 | `--list-platforms` | Print every detected OpenCL platform and device, then exit |
 | `--help` | Show usage and exit |
 
@@ -1080,3 +1088,141 @@ Returns active agreements for a buyer.
 ```
 irium-wallet buyer-status --address QBuyerAddress...
 ```
+
+---
+
+## Additional Commands (terse reference)
+
+The wallet binary exposes more subcommands than the deep-dive sections above
+document. The list below is a one-line index of every additional dispatch
+case present in `src/bin/irium-wallet.rs` — pass `--help` to each one for the
+authoritative flag set and examples.
+
+### Wallet setup
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet create-wallet [--bip32]` | Create a new wallet; `--bip32` generates a 24-word BIP39 mnemonic with derivation path `m/44'/1'/0'/0/0`. |
+| `irium-wallet import-mnemonic <words...>` | Import a wallet from a BIP39 mnemonic phrase. |
+| `irium-wallet export-mnemonic [--force]` | Print the current wallet's mnemonic. Destructive disclosure — requires `--force`. |
+| `irium-wallet qr <addr>` | Render an Irium address as an ASCII / SVG QR code. |
+| `irium-wallet watch [--auto-release] [--rpc <url>]` | Long-running watcher that monitors agreements and (with `--auto-release`) builds + broadcasts release tx when proofs reach finality. |
+
+### Agreement templates and creation
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet template-list` | List the built-in agreement templates (`otc-basic`, `deposit-protection`, `milestone-payment`, `irm-sell-offer`, etc.). |
+| `irium-wallet template-show <id>` | Print the canonical JSON for a single template. |
+| `irium-wallet agreement-create-from-template --template <id> [...]` | Build an agreement from a template with overrides. |
+| `irium-wallet agreement-template <subcommand>` | Manage user-saved agreement templates. |
+| `irium-wallet flow-otc-demo` | Run the scripted end-to-end OTC demo flow (offer → take → fund → proof → release) against a local node. Used for smoke-testing. |
+
+### Agreement local store and exports
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet agreement-load <ref>` | Load an agreement from the local store by id or hash. |
+| `irium-wallet agreement-export <ref> [--out <file>]` | Export an agreement JSON to a file or stdout. |
+| `irium-wallet agreement-store-private <agreement.json>` | Store an agreement only in the local private-agreements directory (no broadcast). |
+| `irium-wallet agreement-local-store-list` | List every agreement currently in the local agreement store. |
+| `irium-wallet agreement-funding-legs <ref> [--rpc <url>]` | Show the candidate funding-leg UTXOs the node would consider when spending this agreement. |
+| `irium-wallet agreement-audit-export <ref> [--out <file>] [--rpc <url>]` | Export the full audit record as a signed JSON file. |
+| `irium-wallet agreement-statement <ref> [--rpc <url>]` | Print a human-readable settlement statement for an agreement. |
+| `irium-wallet agreement-statement-export <ref> [--format text\|html\|json] [--out <file>]` | Export the statement in the chosen format. |
+| `irium-wallet agreement-receipt <ref> [--format html\|json] [--out <file>]` | Export a signed escrow receipt artifact. |
+| `irium-wallet agreement-verify-artifacts <ref>` | Verify document hash, agreement hash, signatures, and on-chain status of a stored agreement. |
+| `irium-wallet agreement-export-receipt <ref> [--out <file>] [--rpc <url>]` | Export the legacy single-file receipt format (Group F). |
+| `irium-wallet agreement-flag-non-response <ref>` | Locally record a counterparty non-response without anchoring on-chain; surfaces in reputation. |
+
+### Private agreement exchange
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet agreement-share <agreement_hash> <recipient_pubkey> [--out <file>]` | Encrypt and export an agreement for a specific recipient (ECIES + AES-256-GCM). |
+| `irium-wallet agreement-decrypt <file> [--wallet <path>] [--store-private] [--json]` | Decrypt a received share blob with the local wallet keys. |
+| `irium-wallet agreement-import <file>` | Import a plaintext agreement JSON into the local store. |
+
+### Share packages
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet agreement-share-package-inspect <file>` | Print the manifest and verification status of a received package. |
+| `irium-wallet agreement-share-package-verify <file> [--rpc <url>]` | Full verification against the chain. |
+| `irium-wallet agreement-share-package-import <file> [--rpc <url>]` | Import after successful verify. |
+| `irium-wallet agreement-share-package-list` | List packages in the local inbox. |
+| `irium-wallet agreement-share-package-show <ref>` | Show one package by id or filename. |
+| `irium-wallet agreement-share-package-archive <ref>` | Move a package out of the active inbox into the archive directory. |
+| `irium-wallet agreement-share-package-prune [--older-than-days <n>] [--dry-run]` | Remove old packages from the inbox / archive. |
+| `irium-wallet agreement-share-package-remove <ref>` | Hard-delete a package by id. |
+
+### Bundles and signatures
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet agreement-bundle-pack <ref> [--out <file>]` | Build a bundle without registering it on a node. |
+| `irium-wallet agreement-bundle-unpack <file> [--rpc <url>] [--json]` | Verify and import a bundle from disk. |
+| `irium-wallet agreement-bundle-verify-signatures <file>` | Verify only the embedded signatures (no chain check). |
+| `irium-wallet agreement-signature-inspect <file>` | Print the signed envelope fields for a single signature file. |
+| `irium-wallet agreement-verify-signature --agreement <ref> --signature <file>` | Verify a detached signature against an agreement. |
+
+### Per-milestone operations (milestone / contractor agreements)
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet agreement-milestone-fund <ref> --milestone <id> [--rpc <url>]` | Fund a single milestone HTLC leg of a milestone agreement. |
+| `irium-wallet agreement-milestone-release <ref> --milestone <id> --secret <hex> [--rpc <url>]` | Release a single milestone leg with its preimage. |
+
+### Proof creation and submission helpers
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet proof-sign --proof <file> --key <hex\|wif>` | Sign a proof JSON with a secp256k1 key. |
+| `irium-wallet proof-submit-json --proof <file> [--rpc <url>]` | Submit a pre-built proof JSON to a node. |
+| `irium-wallet proof-template-list` | List the built-in proof-schema templates. |
+| `irium-wallet proof-template-create --template <id> --out <file>` | Render a starter proof JSON from a template. |
+
+### Attestor commands
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet attestor-list [--json]` | List attestors known to the local node, including bond status. |
+| `irium-wallet attestor-register --bond <irm> --from <addr>` | Anchor a bond commitment for an attestor address. |
+| `irium-wallet attestor-bond-status [--address <addr>] [--json]` | Inspect bond state for one or all attestors. |
+| `irium-wallet attestor-slash --attestor <addr> --proof1 <id> --proof2 <id> --agreement <hash>` | Record an on-chain slash for two contradicting proofs from the same attestor. |
+| `irium-wallet attestor-withdraw-bond --from <addr>` | Anchor a bond withdrawal after the cooldown elapses. |
+
+### Dispute and resolver commands (Phase 3)
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet agreement-dispute-raise --agreement <file> --raising-party <role> --reason <text> --evidence-file <path> --key <hex\|wif>` | Raise a dispute, anchor on-chain. |
+| `irium-wallet agreement-dispute-respond --agreement <file> --submitter-party <role> --evidence-file <path> --evidence-type <type> --message <text> --key <hex\|wif>` | Submit evidence on an open dispute. |
+| `irium-wallet agreement-dispute-resolve --agreement <file> --outcome <release\|refund> --resolver-role <primary\|fallback> --message <text> --key <hex\|wif>` | Resolver records the resolution. |
+| `irium-wallet agreement-dispute-reresolve --agreement <file> --new-resolver <addr> --new-fallback <addr> --key-a <hex\|wif> --key-b <hex\|wif>` | Co-signed nomination of a new resolver pair. |
+| `irium-wallet agreement-dispute-show --agreement <file> [--json]` | Inspect the current dispute state. |
+| `irium-wallet agreement-dispute-list` | List all open disputes the local node knows about. |
+| `irium-wallet resolver-register --display-name <text> [--bio <text>] [--fee-bps <n>] --key <hex\|wif>` | Register as a resolver (miner-recency check enforced server-side). |
+| `irium-wallet resolver-list [--limit <n>] [--cursor <q>]` | Browse the public resolver feed. |
+
+### Reputation extras
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet reputation-export [--out <file>]` | Export the local outcomes store. |
+| `irium-wallet reputation-import <file>` | Merge an exported outcomes file into the local store. |
+| `irium-wallet reputation-self-trade-check --seller <addr>` | Detect self-trade patterns that would inflate a seller's reputation. |
+
+### Marketplace extras
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet offer-feed-discover` | Walk the seed-list and connected peers to discover new offer feed URLs. |
+| `irium-wallet marketplace-sync [--rpc <url>]` | One-shot sync of feeds + offers + reputation outcomes. |
+
+### Invoices
+
+| Command | Purpose |
+|---|---|
+| `irium-wallet invoice-generate --agreement <ref> [--out <file>]` | Generate an invoice artifact for an agreement. |
+| `irium-wallet invoice-import <file>` | Import an invoice into the local store. |
