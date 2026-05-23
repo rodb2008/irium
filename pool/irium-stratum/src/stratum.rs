@@ -12,7 +12,32 @@ use crate::template::{GetBlockTemplate, TemplateClient};
 /// and above this height the pool switches to Bitcoin-standard wire format
 /// (swap4(natural) prev, natural merkle in canonical header) so cgminer-family
 /// miners produce iriumd-canonical bytes directly.
-const STANDARD_HEADER_ACTIVATION_HEIGHT: u64 = 23_500;
+const STANDARD_HEADER_ACTIVATION_HEIGHT: u64 = 22_888;
+
+/// LWMA-style vardiff parameters. Window holds the last N share intervals
+/// per session; recent intervals are weighted higher so the algorithm
+/// reacts quickly when miner hashrate changes (e.g. ASIC warm-up,
+/// re-overclock) without over-correcting on a single outlier.
+const LWMA_WINDOW: usize = 8;
+/// Minimum number of share intervals before the first retarget. Prevents
+/// post-connect noise from spiking diff on the very first share.
+const LWMA_MIN_SAMPLES: usize = 4;
+/// Damping factor applied between current and computed target difficulty:
+/// `new = old * (1 - α) + target * α`. Smaller α = smoother but slower
+/// convergence; 0.3 reaches steady state in ~4 retargets.
+const LWMA_DAMPING: f64 = 0.3;
+/// Minimum seconds between two retargets, regardless of share rate.
+/// Smoother than the old binary scheme so 10s is safe; protects against
+/// chatty `mining.set_difficulty` floods.
+const LWMA_MIN_RETARGET_SECS: u64 = 10;
+/// Suppress no-op `mining.set_difficulty` when the relative diff change
+/// is below this threshold. Reduces stale-share blowback from
+/// micro-adjustments the miner can't usefully react to.
+const LWMA_CHANGE_THRESHOLD: f64 = 0.05;
+/// Per-interval clamp fed into LWMA: any single observed interval longer
+/// than (clamp_multiplier * target_secs) is treated as a connection gap
+/// rather than a true slowdown, preventing one pause from collapsing diff.
+const LWMA_INTERVAL_CLAMP_MULTIPLIER: u64 = 4;
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use serde_json::{json, Value};
@@ -20,6 +45,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::Path;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -347,7 +373,9 @@ struct SessionState {
     difficulty: f64,
     current_job: Option<Job>,
     current_snapshot: Option<CanonicalJobSnapshot>,
-    last_share_ts: Option<u64>,
+    /// Ring buffer of the most recent accepted-share timestamps. Capped at
+    /// LWMA_WINDOW + 1 entries so we can derive LWMA_WINDOW intervals.
+    recent_share_ts: VecDeque<u64>,
     last_retarget_ts: u64,
     coinbase_bip34: bool,
     adapter_kind: AdapterKind,
@@ -1280,7 +1308,7 @@ async fn handle_conn(
         difficulty: config.default_diff,
         current_job: None,
         current_snapshot: None,
-        last_share_ts: None,
+        recent_share_ts: VecDeque::with_capacity(LWMA_WINDOW + 1),
         last_retarget_ts: unix_now_secs(),
         coinbase_bip34: config.coinbase_bip34,
         adapter_kind: select_adapter_kind(&config),
@@ -2623,38 +2651,83 @@ async fn maybe_update_vardiff_after_accepted_share(
     config: &StratumConfig,
     worker: &str,
 ) -> Result<()> {
-    if config.vardiff_enabled {
-        let now = unix_now_secs();
-        if let Some(last_share) = session.last_share_ts {
-            let observed = now.saturating_sub(last_share);
-            let since_retarget = now.saturating_sub(session.last_retarget_ts);
-            if since_retarget >= config.vardiff_retarget_secs {
-                let mut new_diff = session.difficulty;
-                let fast_threshold = (config.vardiff_target_share_secs / 2).max(1);
-                let slow_threshold = config.vardiff_target_share_secs.saturating_mul(2);
-                if observed < fast_threshold {
-                    new_diff = (session.difficulty * 2.0).min(config.vardiff_max_diff);
-                } else if observed > slow_threshold {
-                    new_diff = (session.difficulty / 2.0).max(config.vardiff_min_diff);
-                }
-                if (new_diff - session.difficulty).abs() > f64::EPSILON {
-                    let old = session.difficulty;
-                    session.difficulty = new_diff;
-                    session.last_retarget_ts = now;
-                    info!(
-                        "[vardiff] worker={} old_diff={} new_diff={} observed_share_s={} target_s={}",
-                        worker,
-                        old,
-                        new_diff,
-                        observed,
-                        config.vardiff_target_share_secs
-                    );
-                    send_set_difficulty(wr, conn_id, session.worker.as_deref(), session.difficulty).await?;
-                }
-            }
-        }
-        session.last_share_ts = Some(now);
+    if !config.vardiff_enabled {
+        return Ok(());
     }
+    let now = unix_now_secs();
+
+    // Record this share's timestamp in the rolling window.
+    session.recent_share_ts.push_back(now);
+    while session.recent_share_ts.len() > LWMA_WINDOW + 1 {
+        session.recent_share_ts.pop_front();
+    }
+
+    // Need at least LWMA_MIN_SAMPLES intervals, which means LWMA_MIN_SAMPLES + 1 timestamps.
+    if session.recent_share_ts.len() < LWMA_MIN_SAMPLES + 1 {
+        return Ok(());
+    }
+
+    // Throttle retargets — a hard floor under the LWMA reactivity so we
+    // never flood the miner with `mining.set_difficulty` messages.
+    if now.saturating_sub(session.last_retarget_ts) < LWMA_MIN_RETARGET_SECS {
+        return Ok(());
+    }
+
+    let target_secs = config.vardiff_target_share_secs.max(1) as f64;
+    let cap_secs = config
+        .vardiff_target_share_secs
+        .saturating_mul(LWMA_INTERVAL_CLAMP_MULTIPLIER)
+        .max(1);
+
+    // Compute weighted average of recent share intervals. Most recent
+    // interval gets weight n, oldest gets weight 1, so a sudden change in
+    // miner hashrate is reflected within a handful of shares.
+    let ts: Vec<u64> = session.recent_share_ts.iter().copied().collect();
+    let intervals: Vec<u64> = ts
+        .windows(2)
+        .map(|w| {
+            let raw = w[1].saturating_sub(w[0]).max(1);
+            raw.min(cap_secs)
+        })
+        .collect();
+    let n = intervals.len();
+    let mut sum_weighted: f64 = 0.0;
+    let mut sum_weights: f64 = 0.0;
+    for (i, interval) in intervals.iter().enumerate() {
+        let w = (i + 1) as f64;
+        sum_weighted += w * (*interval as f64);
+        sum_weights += w;
+    }
+    let lwma_secs = (sum_weighted / sum_weights).max(1.0);
+
+    // Proportional target: diff scales linearly with the ratio of observed
+    // share interval to desired share interval. Then damp toward it.
+    let computed_target = session.difficulty * (target_secs / lwma_secs);
+    let raw_new = session.difficulty * (1.0 - LWMA_DAMPING) + computed_target * LWMA_DAMPING;
+    let new_diff = raw_new
+        .max(config.vardiff_min_diff)
+        .min(config.vardiff_max_diff);
+
+    // Suppress no-op micro-adjustments — those just cost the miner
+    // stale shares for no benefit.
+    let rel_change = ((new_diff - session.difficulty) / session.difficulty).abs();
+    if rel_change >= LWMA_CHANGE_THRESHOLD {
+        let old = session.difficulty;
+        session.difficulty = new_diff;
+        session.last_retarget_ts = now;
+        info!(
+            "[vardiff] worker={} old_diff={:.2} new_diff={:.2} lwma_secs={:.1} target_s={} samples={} n={}",
+            worker,
+            old,
+            new_diff,
+            lwma_secs,
+            config.vardiff_target_share_secs,
+            n,
+            session.recent_share_ts.len()
+        );
+        send_set_difficulty(wr, conn_id, session.worker.as_deref(), session.difficulty).await?;
+    }
+
     Ok(())
 }
 
@@ -2891,7 +2964,7 @@ mod tests {
             difficulty: 0.0001,
             current_job: None,
             current_snapshot: None,
-            last_share_ts: None,
+            recent_share_ts: std::collections::VecDeque::new(),
             last_retarget_ts: 0,
             coinbase_bip34: true,
             adapter_kind: mode,
