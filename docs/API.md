@@ -69,9 +69,12 @@ curl http://localhost:38300/status
   "height": 20296,
   "genesis_hash": "0000000028f25d65557e9d8d9e991f516c00d68f5aeae10b750645b398bd10a3",
   "network_era": "Early Miner Era",
+  "network_era_description": "Irium is still in its early miner phase. Early participants are helping secure and shape the network.",
+  "network_era_tagline": "Early participants are helping secure the network.",
+  "early_participation_signal": true,
+  "anchors_digest": "0475f8e5b5daad5bfbdcfe323b743b9b3388d1774862a3addd81493dca800a23",
   "peer_count": 4,
   "anchor_loaded": true,
-  "anchors_digest": "0475f8e5b5daad5bfbdcfe323b743b9b3388d1774862a3addd81493dca800a23",
   "node_id": "675de6172873fd4ecd552f795ef7571fd400375fd19e89ae8ebc0bc8bc9fdaf7",
   "sybil_difficulty": 10,
   "best_header_tip": {
@@ -79,7 +82,19 @@ curl http://localhost:38300/status
     "hash": "000000000697c1d50667fbde625d93dbc172f915021c63d42bd79abbde0f5fed"
   },
   "persisted_height": 20296,
-  "persist_queue_len": 0
+  "persist_queue_len": 0,
+  "persisted_contiguous_height": 20296,
+  "persisted_max_height_on_disk": 20296,
+  "quarantine_count": 0,
+  "persisted_window_tip": 20240,
+  "missing_persisted_in_window": 0,
+  "missing_or_mismatch_in_window": 0,
+  "expected_hash_coverage_in_window": 2000,
+  "expected_hash_window_span": 2000,
+  "gap_healer_active": false,
+  "gap_healer_last_progress_ts": 0,
+  "gap_healer_last_filled_height": null,
+  "gap_healer_pending_count": 0
 }
 ```
 
@@ -90,15 +105,30 @@ curl http://localhost:38300/status
 | `height` | integer | Current chain height (best known block) |
 | `genesis_hash` | string | SHA256d hash of block 0 |
 | `network_era` | string | Human-readable name for the current emission era |
+| `network_era_description` | string | Long-form description of the current era |
+| `network_era_tagline` | string or null | Short tagline for the current era |
+| `early_participation_signal` | boolean | True while the node is in an early-participation era |
+| `anchors_digest` | string or null | SHA256 digest of the loaded anchor set (null if no anchors loaded) |
 | `peer_count` | integer | Number of currently connected peers |
 | `anchor_loaded` | boolean | Whether the trust anchor file is loaded |
-| `anchors_digest` | string | SHA256 digest of the loaded anchor set |
-| `node_id` | string | This node's public identity hash |
-| `sybil_difficulty` | integer | Current sybil-resistance proof-of-work difficulty |
+| `node_id` | string or null | This node's public identity hash (null until identity initialised) |
+| `sybil_difficulty` | integer or null | Current sybil-resistance proof-of-work difficulty (null when not configured) |
 | `best_header_tip.height` | integer | Height of the best known block header |
 | `best_header_tip.hash` | string | Hash of the best known block header |
 | `persisted_height` | integer | Height of the last block fully written to disk |
 | `persist_queue_len` | integer | Number of blocks queued for disk write |
+| `persisted_contiguous_height` | integer | Highest height for which every preceding block is on disk |
+| `persisted_max_height_on_disk` | integer | Highest individual height present on disk (may exceed `persisted_contiguous_height` during reorg recovery) |
+| `quarantine_count` | integer | Number of blocks currently quarantined pending validation |
+| `persisted_window_tip` | integer | Tip of the persistence window scan |
+| `missing_persisted_in_window` | integer | Blocks missing from disk within the scan window |
+| `missing_or_mismatch_in_window` | integer | Blocks missing or with hash mismatches within the scan window |
+| `expected_hash_coverage_in_window` | integer | Blocks within the scan window for which an expected hash is known |
+| `expected_hash_window_span` | integer | Configured size of the scan window |
+| `gap_healer_active` | boolean | True while the gap healer task is actively backfilling |
+| `gap_healer_last_progress_ts` | integer | Unix timestamp of the gap healer's last progress; `0` if it has never run |
+| `gap_healer_last_filled_height` | integer or null | Height of the most recent block the gap healer wrote |
+| `gap_healer_pending_count` | integer | Number of gap-healer fills currently queued |
 
 ---
 
@@ -141,6 +171,17 @@ curl http://localhost:38300/peers
 | `last_seen` | float | Unix timestamp when this peer was last active |
 | `dialable` | boolean | Whether the node believes this peer is reachable outbound |
 | `last_successful_handshake` | float | Unix timestamp of last completed handshake |
+
+---
+
+### `GET /network-status`
+
+Returns a richer network-status payload used by node dashboards. Includes the same fields as `/status` plus aggregated peer activity, era/hashrate snapshots, and recent block-time samples. Always public (no auth).
+
+**Example request:**
+```
+curl http://localhost:38300/network-status
+```
 
 ---
 
@@ -725,6 +766,16 @@ curl http://localhost:38300/offers/feed
 
 ---
 
+### `POST /rpc/broadcast_offer_take`
+
+Broadcasts an `offer.taken` notification across the P2P marketplace gossip layer. Called by the wallet after `offer-take` succeeds locally so that other nodes update their offer-status caches without waiting for the next gossip round.
+
+Requires `IRIUM_RPC_TOKEN` authentication if a token is configured.
+
+**Request body:** `{"offer_id": "...", "taker_address": "...", "agreement_hash": "..."}` (taker context plus the agreement hash produced by `offer-take`).
+
+---
+
 ## Explorer Endpoints
 
 These endpoints power public block explorers and node-status dashboards. All
@@ -936,7 +987,20 @@ Builds (and optionally broadcasts) the funding transaction for an agreement.
 
 Returns the current on-chain status of an agreement.
 
-**Request body:** `{"agreement_hash": "<hex>"}` or an agreement JSON object.
+**Request body:** `AgreementRequest` — `{"agreement": <agreement JSON>}`. The full `AgreementObject` is required so the node can deterministically compute the hash and scan its linked transactions; just an `agreement_hash` is not accepted.
+
+**Response:** `AgreementStatusResponse`
+```json
+{
+  "agreement_hash": "<hex>",
+  "lifecycle": { "state": "funded", "funding": { /* ... */ }, "milestones": [ /* ... */ ] },
+  "proof_depth": null,
+  "proof_final": false,
+  "release_eligible": false
+}
+```
+
+`lifecycle.state` is one of: `draft`, `proposed`, `funded`, `partially_released`, `released`, `refunded`, `expired`, `cancelled`, `disputed_metadata_only`.
 
 ---
 
@@ -960,9 +1024,9 @@ Returns a full audit record for an agreement including all on-chain events, proo
 
 Checks whether the conditions for releasing funds from an agreement are currently met.
 
-**Request body:** Agreement reference.
+**Request body:** `AgreementSpendRequest` — `{"agreement": <agreement JSON>, "funding_txid": "<hex>", "htlc_vout": <u32?>, "milestone_id": "<id?>", "destination_address": "<addr?>", "fee_per_byte": <u64?>, "broadcast": <bool?>, "secret_hex": "<hex?>"}`. The `funding_txid` is required so the node can locate the specific HTLC output being evaluated.
 
-**Response:** `{"eligible": true|false, "reason": "..."}`
+**Response:** `AgreementSpendEligibilityResponse` — `{"agreement_hash": "...", "agreement_id": "...", "funding_txid": "...", "htlc_vout": 0, "anchor_vout": 1, "role": "OtcSettlement", "milestone_id": null, "amount": <sats>, "branch": "release", "htlc_backed": true, "funded": true, "unspent": true, "preimage_required": true, "timeout_height": <h>, "timeout_reached": false, "destination_address": "...", "expected_hash": "...", "recipient_address": "...", "refund_address": "...", "eligible": <bool>, "reasons": ["<code>", "..."], "trust_model_note": "..."}`. The `reasons` field is a plural array of machine-readable codes (e.g. `policy_satisfied:delivery_confirmed`, `policy_not_satisfied`), not a singular `reason` string.
 
 ---
 
@@ -970,9 +1034,9 @@ Checks whether the conditions for releasing funds from an agreement are currentl
 
 Checks whether the timeout conditions for a refund are met.
 
-**Request body:** Agreement reference.
+**Request body:** Same `AgreementSpendRequest` shape as `/rpc/agreementreleaseeligibility`.
 
-**Response:** `{"eligible": true|false, "reason": "..."}`
+**Response:** Same `AgreementSpendEligibilityResponse` shape; `branch` is `"refund"` and reasons such as `timeout_not_reached:current=N,target=M` populate `reasons[]` when ineligible.
 
 ---
 
@@ -980,7 +1044,9 @@ Checks whether the timeout conditions for a refund are met.
 
 Builds the release transaction (unlocks funds to the recipient using the secret).
 
-**Request body:** Agreement reference and secret preimage.
+**Request body:** `AgreementSpendRequest` with `secret_hex` populated (the preimage of the agreement's release-condition `secret_hash_hex`).
+
+**Response:** `AgreementBuildSpendResponse` — `{"agreement_hash", "agreement_id", "funding_txid", "htlc_vout", "role", "milestone_id", "branch": "release", "destination_address", "txid", "accepted", "raw_tx_hex", "fee", "trust_model_note"}`. When `broadcast: true` and the node accepted the tx, `accepted` is `true` and the tx is in the mempool; otherwise the caller can submit `raw_tx_hex` themselves via `POST /rpc/submit_tx`.
 
 ---
 
@@ -988,7 +1054,75 @@ Builds the release transaction (unlocks funds to the recipient using the secret)
 
 Builds the refund transaction (returns funds to the funder after timeout).
 
-**Request body:** Agreement reference.
+**Request body:** `AgreementSpendRequest` (no `secret_hex` needed for refund).
+
+**Response:** Same `AgreementBuildSpendResponse` shape as `/rpc/buildagreementrelease`; `branch` is `"refund"`.
+
+---
+
+### `POST /rpc/buildsettlementtx`
+
+Builds a settlement transaction for an agreement leg using a higher-level builder (alternative to the explicit `buildagreementrelease` / `buildagreementrefund` pair). Used internally by `irium-wallet otc-settle` and the desktop app's one-click settlement flow.
+
+**Request body:** Agreement reference plus settlement parameters.
+
+---
+
+### `POST /rpc/buildotctemplate`
+
+Returns the canonical OTC `AgreementObject` template for a given set of inputs (buyer, seller, amount, refund timeout, etc.) plus an associated default release policy. The wallet uses this to render previews before the user signs.
+
+**Request body:** OTC template parameters (buyer / seller / amount / asset reference / payment reference / refund timeout / secret hash / optional attestors and threshold).
+
+**Response:** `{"agreement": <AgreementObject>, "policy": <release policy>}`.
+
+---
+
+### `POST /rpc/checkpolicy`
+
+Evaluates a release policy against a hypothetical set of proofs, without requiring the agreement to be on-chain yet. Used by wallets to preview "would this satisfy the policy?" before submitting proofs.
+
+**Request body:** Policy and candidate proof set.
+
+**Response:** `{"satisfied": true|false, "details": [...]}`.
+
+---
+
+### `POST /rpc/agreementfundinglegs`
+
+Returns the candidate funding-leg UTXOs for an agreement, scanned from the chain. Returns one or more `AgreementFundingLegCandidate` entries describing each HTLC output, plus a `selection_required` flag set to `true` when more than one candidate matches (so the caller must pick before building a spend).
+
+**Request body:** `AgreementContextRequest` — `{"agreement": <agreement JSON>, "bundle": <optional bundle>}`.
+
+**Response:** `{"agreement_hash": "...", "selection_required": <bool>, "candidates": [{"funding_txid", "htlc_vout", "anchor_vout", "role", "milestone_id", "amount", ...}], "trust_model_note": "..."}`.
+
+---
+
+### `GET /rpc/agreementreceipt`
+
+Returns on-chain-derivable receipt data for an agreement. The wallet typically enriches the response with the local `AgreementObject` (template_type, parties, total_amount, per-milestone amounts) before signing and exporting the final receipt.
+
+**Query parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `agreement_hash` | Yes | Agreement hash (hex) |
+
+**Response:** `AgreementReceiptResponse` — `{"agreement_hash", "tip_height", "final_state_hint", "funding_txids": [...], "release_txids": [...], "refund_txids": [...], "resolved_height", "linked_txs": [...], "proofs": [...], "dispute": <optional>}`.
+
+---
+
+### `GET /rpc/reputation/:address`
+
+Returns the local reputation summary for a single address (the same record produced by `irium-wallet reputation-show <addr> --json`).
+
+**Path parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `address` | Yes | Irium address (base58, `Q…` or `P…`) |
+
+**Response:** Reputation record including `total_agreements`, `satisfied_count`, `default_count`, `disputed_count`, `risk_signal`, `ranking_score`, `recent_default_count`, `last_outcome_height`, and `outcomes[]`.
 
 ---
 
@@ -1078,9 +1212,9 @@ Wallet endpoints require authentication if `IRIUM_RPC_TOKEN` is set. These endpo
 | `/wallet/addresses` | GET | List wallet addresses |
 | `/wallet/receive` | GET | Get current receive address |
 | `/wallet/new_address` | POST | Generate a new address |
-| `/wallet/export_wif` | POST | Export private key in WIF format |
+| `/wallet/export_wif` | GET | Export private key in WIF format |
 | `/wallet/import_wif` | POST | Import a WIF private key |
-| `/wallet/export_seed` | POST | Export wallet seed |
+| `/wallet/export_seed` | GET | Export wallet seed |
 | `/wallet/import_seed` | POST | Import a wallet seed |
 | `/wallet/send` | POST | Build and broadcast a transaction |
 
