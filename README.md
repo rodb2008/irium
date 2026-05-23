@@ -38,8 +38,8 @@ SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.
 
 | Parameter | Value |
 |-----------|-------|
-| Current node version | `v1.9.28` (released; settlement Groups C-H + FIX #128 P2P reputation hygiene + FIX 2a hard-fork code) |
-| Desktop app version | [`v1.0.42`](https://github.com/iriumlabs/irium-core/releases/latest) (bundles the v1.9.28 sidecar binaries) |
+| Current node version | `v1.9.32` (latest tag; v1.9.28 introduced settlement Groups C-H, FIX #128 P2P reputation hygiene, and FIX 2a hard-fork code; v1.9.29-v1.9.32 added GPU-miner and pool-Stratum fixes) |
+| Desktop app version | [`v1.0.42`](https://github.com/iriumlabs/irium-core/releases/latest) (bundles the latest v1.9.x sidecar binaries) |
 | Consensus algorithm | SHA-256d proof of work |
 | Block target interval | 600 s (10 min) |
 | Difficulty adjustment | LWMA (60-block window; LWMA v2 — 30-block window — wired but inactive until rolled forward) |
@@ -76,7 +76,7 @@ SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.
 | Auto-release watcher (`irium-wallet watch --auto-release`) | Live (shipped in v1.9.28 — Group C) |
 | Proof schema registry (5 standard kinds, GROUP D) | Live (shipped in v1.9.28) |
 | Reputation system — dial-fail vs handshake-fail distinction + env-tunable ban threshold | Live (shipped in v1.9.28 — FIX #128) |
-| AuxPoW merged mining | Activating at block 26,347 |
+| AuxPoW merged mining | Activating at block 26,500 (matches `MAINNET_AUXPOW_ACTIVATION_HEIGHT` in `src/activation.rs`) |
 | WebSocket streaming API | Live |
 | BIP32/BIP39 key derivation | Live |
 | Multisig (2-of-2, 2-of-3) | Live |

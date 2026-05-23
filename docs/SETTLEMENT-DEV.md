@@ -14,12 +14,17 @@ On top of the base HTLC, Irium adds a structured agreement layer with proof subm
 
 ## Agreement Types
 
-| Type | Use case |
+The on-the-wire `template_type` field uses the snake_case enum values defined in
+`src/settlement.rs::AgreementTemplateType`:
+
+| `template_type` value | Use case |
 |------|----------|
-| `simple-settlement` | Two parties, one amount, one secret hash. General purpose. |
-| `otc` | Buyer/seller trade. Includes asset reference and payment reference. |
-| `deposit` | Payer/payee. Includes purpose reference and refund summary. |
-| `milestone` | Multiple milestones, each with a separate amount and timeout height. |
+| `simple_release_refund` | Two parties, one amount, one secret hash. General purpose. |
+| `otc_settlement` | Buyer/seller trade. Includes asset reference and payment reference. |
+| `refundable_deposit` | Payer/payee deposit. Includes purpose reference and refund summary. |
+| `milestone_settlement` | Multiple milestones, each with its own amount, timeout height, and per-milestone secret hash. |
+| `merchant_delayed_settlement` | Merchant-side settlement with a delayed payout deadline. |
+| `contractor_milestone` | Contractor-style milestone agreement with per-leg release authorization. |
 
 ---
 
@@ -53,16 +58,18 @@ On top of the base HTLC, Irium adds a structured agreement layer with proof subm
 irium-wallet agreement-create-otc \
   --agreement-id otc-trade-001 \
   --creation-time $(date +%s) \
-  --buyer addr=QBuyerAddress... \
-  --seller addr=QSellerAddress... \
+  --buyer  "buyer|Buyer|QBuyerAddress...|buyer" \
+  --seller "seller|Seller|QSellerAddress...|seller" \
   --amount 1.0 \
   --asset-reference "50 USDT" \
   --payment-reference "SEPA transfer ref #12345" \
-  --secret-hash a3f1b2c3d4e5f6071234567890abcdef1234567890abcdef1234567890abcdef12 \
+  --secret-hash a3f1b2c3d4e5f6071234567890abcdef1234567890abcdef1234567890abcdef \
   --refund-timeout 20500 \
-  --document-hash fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fe \
+  --document-hash fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 \
   --out otc-trade-001.json
 ```
+
+The `--buyer` and `--seller` flags expect a pipe-delimited `party_id|display_name|address|role(optional)` spec (parsed by `parse_party_spec` in `src/bin/irium-wallet.rs`). The `--secret-hash` and `--document-hash` values must each be exactly 64 hex characters (32 bytes); the parser rejects anything else.
 
 The `--secret-hash` is the SHA256 of the secret preimage. The secret itself is kept private by the party who will trigger release.
 
@@ -80,18 +87,21 @@ irium-wallet agreement-hash otc-trade-001.json
 
 Output: a 32-byte hex hash. This hash uniquely identifies the agreement and is used in all subsequent API calls.
 
-You can also compute it via the RPC API:
+You can also compute it via the RPC API. The endpoint expects an `AgreementRequest` body — the agreement JSON wrapped in `{"agreement": ...}`:
 
 ```bash
 curl -X POST http://localhost:38300/rpc/computeagreementhash \
   -H "Content-Type: application/json" \
-  -d @otc-trade-001.json
+  -H "Authorization: Bearer $IRIUM_RPC_TOKEN" \
+  -d "$(jq -n --argfile agr otc-trade-001.json '{agreement: $agr}')"
 ```
 
 Response:
 ```json
 {"agreement_hash": "a1b2c3d4...32bytehex..."}
 ```
+
+The `Authorization` header is required whenever `IRIUM_RPC_TOKEN` is set on the node — `/rpc/computeagreementhash` and all settlement endpoints are protected.
 
 ---
 
@@ -122,14 +132,31 @@ irium-wallet agreement-fund otc-trade-001.json --rpc http://localhost:38300
 irium-wallet agreement-status otc-trade-001.json --rpc http://localhost:38300
 ```
 
-Via RPC:
+Via RPC (note: takes the full agreement, not a hash, per `AgreementRequest`):
 ```bash
 curl -X POST http://localhost:38300/rpc/agreementstatus \
   -H "Content-Type: application/json" \
-  -d '{"agreement_hash": "a1b2c3d4...32bytehex..."}'
+  -H "Authorization: Bearer $IRIUM_RPC_TOKEN" \
+  -d "$(jq -n --argfile agr otc-trade-001.json '{agreement: $agr}')"
 ```
 
-Status values include: `pending`, `funded`, `released`, `refunded`.
+The response includes the current lifecycle state plus proof-finality fields:
+
+```json
+{
+  "agreement_hash": "...",
+  "lifecycle": {
+    "state": "funded",
+    "funding": { /* derived from chain */ },
+    "milestones": [ /* per-milestone status, if any */ ]
+  },
+  "proof_depth": null,
+  "proof_final": false,
+  "release_eligible": false
+}
+```
+
+`lifecycle.state` is one of the `AgreementLifecycleState` snake_case values: `draft`, `proposed`, `funded`, `partially_released`, `released`, `refunded`, `expired`, `cancelled`, `disputed_metadata_only`.
 
 ---
 
@@ -149,11 +176,12 @@ irium-wallet agreement-proof-create \
 irium-wallet agreement-proof-submit --proof proof.json --rpc http://localhost:38300
 ```
 
-Via RPC directly:
+Via RPC directly. The endpoint expects a `SubmitProofRequest` body, so wrap the proof JSON in `{"proof": ...}`:
 ```bash
 curl -X POST http://localhost:38300/rpc/submitproof \
   -H "Content-Type: application/json" \
-  -d @proof.json
+  -H "Authorization: Bearer $IRIUM_RPC_TOKEN" \
+  -d "$(jq -n --argfile p proof.json '{proof: $p}')"
 ```
 
 ---
@@ -197,41 +225,78 @@ irium-wallet agreement-refund otc-trade-001.json \
 
 ### Agreement JSON structure (output of `agreement-create-otc`)
 
+This is the canonical `AgreementObject` shape from `src/settlement.rs`. The `template_type` enum is serialized as snake_case; `parties` is an array (not a map); `payer` and `payee` are `party_id` references into the `parties` array (not addresses); there is **no** top-level `secret_hash` or `refund_timeout` field — those live inside `release_conditions[].secret_hash_hex` and `refund_conditions[].timeout_height` / `deadlines.refund_deadline` respectively. Signatures are tracked separately via `AgreementSignatureEnvelope` and are not part of the `AgreementObject`.
+
 ```json
 {
   "agreement_id": "otc-trade-001",
-  "agreement_type": "otc",
+  "version": 1,
+  "schema_id": "irium.phase1.canonical.v1",
+  "template_type": "otc_settlement",
+  "parties": [
+    {"party_id": "buyer",  "display_name": "Buyer",  "address": "QBuyerAddress...",  "role": "buyer"},
+    {"party_id": "seller", "display_name": "Seller", "address": "QSellerAddress...", "role": "seller"}
+  ],
+  "payer": "seller",
+  "payee": "buyer",
+  "total_amount": 100000000,
+  "network_marker": "IRIUM",
   "creation_time": 1777624133,
-  "parties": {
-    "buyer": {"addr": "QBuyerAddress..."},
-    "seller": {"addr": "QSellerAddress..."}
+  "deadlines": {
+    "settlement_deadline": null,
+    "refund_deadline": 20500,
+    "dispute_window": null
   },
-  "amount_satoshis": 100000000,
+  "release_conditions": [
+    {
+      "mode": "secret_preimage",
+      "secret_hash_hex": "a3f1b2c3d4e5f6071234567890abcdef1234567890abcdef1234567890abcdef",
+      "release_authorizer": "seller",
+      "notes": "OTC release path: seller authorizes payout to buyer after receiving off-chain payment"
+    }
+  ],
+  "refund_conditions": [
+    {
+      "refund_address": "QSellerAddress...",
+      "timeout_height": 20500,
+      "notes": "Refund returns escrowed IRM to seller on HTLC timeout when no release is authorized"
+    }
+  ],
+  "milestones": [],
   "asset_reference": "50 USDT",
   "payment_reference": "SEPA transfer ref #12345",
-  "secret_hash": "a3f1b2c3d4e5f6071234567890abcdef1234567890abcdef1234567890abcdef12",
-  "refund_timeout": 20500,
-  "document_hash": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fe",
-  "signatures": {}
+  "release_summary": "HTLC-backed OTC release path",
+  "refund_summary": "Timeout refund path for the OTC funding leg",
+  "document_hash": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+  "disputed_metadata_only": false
 }
 ```
+
+Note on OTC roles: the canonical `build_otc_agreement` function maps `payer = seller` (the party that locks IRM in the HTLC) and `payee = buyer` (the party that receives IRM after delivering off-chain payment). This is the opposite of a fiat-side mental model where the buyer "pays first" — on-chain, the seller's IRM is what gets escrowed.
 
 ### Agreement hash response
 
 ```json
-{"agreement_hash": "a1b2c3d4e5f6078901234567890abcdef1234567890abcdef1234567890abcdef1"}
+{"agreement_hash": "a1b2c3d4e5f6078901234567890abcdef1234567890abcdef1234567890abcd"}
 ```
 
+The `agreement_hash` value is exactly 64 hex characters (32 bytes).
+
 ### Agreement status response
+
+The `AgreementStatusResponse` struct in `src/bin/iriumd.rs` defines the exact shape. Lifecycle information (including funding-tx visibility, milestone status, and the derived state) lives nested under `lifecycle`; proof-finality fields are top-level so callers can gate release on `release_eligible` without parsing `lifecycle`.
 
 ```json
 {
   "agreement_hash": "a1b2c3d4...",
-  "status": "funded",
-  "funding_txid": "cb7d25dc615df7e64726c171b18f401c916133f9335ed5153e3e14312b001b12",
-  "funding_height": 20300,
-  "refund_timeout": 20500,
-  "amount_satoshis": 100000000
+  "lifecycle": {
+    "state": "funded",
+    "funding": { /* funding-tx record derived from chain */ },
+    "milestones": [ /* per-milestone status, milestone agreements only */ ]
+  },
+  "proof_depth": null,
+  "proof_final": false,
+  "release_eligible": false
 }
 ```
 
@@ -253,10 +318,32 @@ irium-wallet agreement-refund otc-trade-001.json \
 
 ### Release eligibility response
 
+The `AgreementSpendEligibilityResponse` struct returns rich context including the expected secret hash for verification, the funding leg details, and a `reasons[]` array (plural) of machine-readable codes — not a single `reason` string. Both eligibility endpoints (`/rpc/agreementreleaseeligibility` and `/rpc/agreementrefundeligibility`) take an `AgreementSpendRequest` body that includes the agreement object **and** a `funding_txid` so the node can locate the specific HTLC output being spent.
+
 ```json
 {
+  "agreement_hash": "a1b2c3d4...",
+  "agreement_id": "otc-trade-001",
+  "funding_txid": "cb7d25dc...",
+  "htlc_vout": 0,
+  "anchor_vout": 1,
+  "role": "OtcSettlement",
+  "milestone_id": null,
+  "amount": 100000000,
+  "branch": "release",
+  "htlc_backed": true,
+  "funded": true,
+  "unspent": true,
+  "preimage_required": true,
+  "timeout_height": 20500,
+  "timeout_reached": false,
+  "destination_address": "QBuyerAddress...",
+  "expected_hash": "a3f1b2c3d4e5f6071234567890abcdef1234567890abcdef1234567890abcdef",
+  "recipient_address": "QBuyerAddress...",
+  "refund_address": "QSellerAddress...",
   "eligible": true,
-  "reason": "Policy satisfied: delivery_confirmed proof submitted by required attestor."
+  "reasons": ["policy_satisfied:delivery_confirmed"],
+  "trust_model_note": "..."
 }
 ```
 
@@ -264,8 +351,16 @@ irium-wallet agreement-refund otc-trade-001.json \
 
 ```json
 {
+  "agreement_hash": "a1b2c3d4...",
+  "branch": "refund",
+  "funded": true,
+  "unspent": true,
+  "timeout_height": 20500,
+  "timeout_reached": false,
+  "destination_address": "QSellerAddress...",
+  "refund_address": "QSellerAddress...",
   "eligible": false,
-  "reason": "Refund timeout not reached. Current height: 20400, timeout: 20500."
+  "reasons": ["timeout_not_reached:current=20400,target=20500"]
 }
 ```
 
@@ -428,9 +523,9 @@ All settlement endpoints accept JSON bodies and return JSON responses.
 
 | Scenario | Expected behaviour |
 |----------|--------------------|
-| Funding tx not yet confirmed | `agreementstatus` returns `pending` |
-| Release attempted before policy satisfied | `agreementreleaseeligibility` returns `eligible: false` with reason |
-| Refund attempted before timeout | `agreementrefundeligibility` returns `eligible: false` with reason |
+| Funding tx not yet confirmed | `agreementstatus` returns `lifecycle.state: "draft"` or `"proposed"` and `release_eligible: false` |
+| Release attempted before policy satisfied | `agreementreleaseeligibility` returns `eligible: false` with codes in `reasons[]` (e.g. `["policy_not_satisfied"]`) |
+| Refund attempted before timeout | `agreementrefundeligibility` returns `eligible: false` with codes in `reasons[]` (e.g. `["timeout_not_reached:current=N,target=M"]`) |
 | Proof submitted after release | Proof accepted but has no effect on eligibility |
 | Wrong secret provided | Release transaction will fail validation at the node |
 | Agreement hash mismatch | Node rejects the request with a 400 error |
@@ -444,16 +539,18 @@ Milestone agreements release funds in stages. Each milestone has:
 - A proof type requirement
 - A timeout height
 
-Creating a milestone agreement:
+Creating a milestone agreement. Real CLI uses `--payer` / `--payee` (pipe-delimited party specs, same as OTC `--buyer` / `--seller`), one `--milestone` flag per milestone (pipe-delimited `id|title|amount_irm|timeout_height|secret_hash_hex|deliverable_hash(optional)`), and `--refund-deadline` (not `--refund-timeout`). There is no top-level `--secret-hash` for milestone agreements — each milestone carries its own:
+
 ```bash
 irium-wallet agreement-create-milestone \
   --agreement-id milestone-001 \
   --creation-time $(date +%s) \
-  --party-a addr=QClientAddress... \
-  --party-b addr=QContractorAddress... \
-  --secret-hash a3f1...32bytehex... \
-  --refund-timeout 21000 \
-  --document-hash fedcba...32bytehex... \
+  --payer "payer|Client|QClientAddress...|client" \
+  --payee "payee|Contractor|QContractorAddress...|contractor" \
+  --milestone "m1|Design phase|0.5|20800|1111111111111111111111111111111111111111111111111111111111111111" \
+  --milestone "m2|Implementation|1.0|20900|2222222222222222222222222222222222222222222222222222222222222222" \
+  --refund-deadline 21000 \
+  --document-hash fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 \
   --out milestone-001.json
 ```
 

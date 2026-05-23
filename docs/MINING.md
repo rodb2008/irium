@@ -71,8 +71,9 @@ now hashes headers exactly like Bitcoin.
 **This means external ASIC and GPU miners earn real block rewards
 starting at block 23,500**, with no special firmware patches.
 
-Make sure your iriumd is on v1.9.28 (or the latest Irium Core desktop
-app) before block 23,500 is mined — older nodes will fork off.
+Make sure your iriumd is on v1.9.28 or newer (latest tag is v1.9.32 —
+see [github.com/iriumlabs/irium/releases/latest](https://github.com/iriumlabs/irium/releases/latest))
+before block 23,500 is mined; older nodes will fork off.
 
 ---
 
@@ -212,9 +213,18 @@ mining gives steadier results.
 
 ### Solo CPU (bundled)
 
+`irium-miner` reads its payout address and node URL from environment
+variables — there is no `--address` or `--rpc` flag on the CPU miner:
+
 ```
-irium-miner --address <YOUR_IRM_ADDRESS> --rpc http://127.0.0.1:38300
+IRIUM_MINER_ADDRESS=<YOUR_IRM_ADDRESS> \
+IRIUM_NODE_RPC=http://127.0.0.1:38300 \
+  irium-miner
 ```
+
+Optional: `--threads N` (or `IRIUM_MINER_THREADS=N`) to limit worker
+threads. See [`docs/WALLET-CLI.md`](WALLET-CLI.md#solo-cpu-mining--irium-miner)
+for the full env-var reference.
 
 ### Solo GPU (bundled, requires OpenCL)
 

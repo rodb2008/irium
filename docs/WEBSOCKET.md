@@ -12,8 +12,10 @@ WebSocket:  ws://<host>:<port>/ws
 SSE:        http://<host>:<port>/events
 ```
 
-The port is controlled by the `IRIUM_WS_PORT` environment variable (default: same as
-`IRIUM_HTTP_PORT`, typically 38300).
+The WebSocket and SSE handlers share the main HTTP server's port — there is no
+separate WebSocket port. The HTTP listener binds to `IRIUM_NODE_HOST` /
+`IRIUM_NODE_PORT` (default `127.0.0.1:38300`); use the same host and port for
+`/ws` and `/events`.
 
 Example with default port:
 
@@ -65,9 +67,9 @@ The server does not stream any events until a subscription is sent.
 }
 ```
 
-`agreement.*` matches all agreement event types:
+`agreement.*` matches all agreement event types emitted by iriumd:
 `agreement.funded`, `agreement.proof_submitted`, `agreement.satisfied`,
-`agreement.timeout`, `agreement.disputed`.
+`agreement.timeout`, `agreement.auto_released`.
 
 **Subscribe with an agreement filter:**
 
@@ -241,16 +243,56 @@ path eligible.
 
 ---
 
-### `agreement.disputed`
+### `agreement.auto_released`
 
-Fired when a dispute is raised against an agreement.
+Fired when the auto-release watcher (`irium-wallet watch --auto-release`) or
+the node's internal release path completes a release transaction for an
+agreement. Delivered alongside `agreement.satisfied` so clients that follow
+the auto-release flow can react without polling status.
 
 ```json
 {
-  "type": "agreement.disputed",
+  "type": "agreement.auto_released",
   "ts": 1746144700,
   "data": {
     "agreement_hash": "a1b2c3d4e5f6..."
+  }
+}
+```
+
+---
+
+### `offer.relisted`
+
+Fired when a previously-taken or expired offer is relisted back to `open`
+(see `IRIUM_OFFER_RELIST_GRACE_BLOCKS`). Delivered to authenticated
+connections only.
+
+```json
+{
+  "type": "offer.relisted",
+  "ts": 1746144750,
+  "data": {
+    "offer_id": "off_abc123",
+    "status": "open"
+  }
+}
+```
+
+---
+
+### `offer.expired`
+
+Fired when an offer crosses its `timeout_height` and the node marks it
+expired.
+
+```json
+{
+  "type": "offer.expired",
+  "ts": 1746144800,
+  "data": {
+    "offer_id": "off_abc123",
+    "status": "expired"
   }
 }
 ```
@@ -501,6 +543,7 @@ ws.on("message", (data) => {
 
 | Variable | Default | Description |
 |---|---|---|
-| `IRIUM_RPC_TOKEN` | (unset) | Bearer token required for WS/SSE auth |
-| `IRIUM_WS_PUBLIC` | `false` | Allow unauthenticated access to public events |
-| `IRIUM_WS_PORT` | same as HTTP | Override WS port (normally shares HTTP port) |
+| `IRIUM_RPC_TOKEN` | (unset) | Bearer token required for WS/SSE auth (shared with the rest of the RPC API) |
+| `IRIUM_WS_PUBLIC` | `false` | When `true`, allows unauthenticated WS/SSE connections to receive the public-event subset (`block.new`, `offer.created`); all other events still require auth |
+| `IRIUM_NODE_HOST` | `127.0.0.1` | HTTP/WS/SSE listener host (shared) |
+| `IRIUM_NODE_PORT` | `38300` | HTTP/WS/SSE listener port (shared — no separate WS port) |
