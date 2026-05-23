@@ -67,6 +67,10 @@ pub fn build_coinbase_tx(height: u64, reward: u64, pkh: &[u8; 20], extranonce: &
     let mut tx = Vec::with_capacity(200);
     tx.extend_from_slice(&1u32.to_le_bytes());
     put_varint(1, &mut tx);
+    // Fix F: iriumd's tx format prefixes prev_txid with a 1-byte length (=32),
+    // unlike Bitcoin. Missing this byte caused submit_block to silent-400
+    // (decode_full_tx_at: "invalid prev_txid length") for every pool block.
+    tx.push(32u8);
     tx.extend_from_slice(&[0u8; 32]);
     tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
 

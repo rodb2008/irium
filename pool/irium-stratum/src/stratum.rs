@@ -1462,11 +1462,18 @@ fn mode_allows_combo(
     let b_ok = b_name == "b_rev";
     let n_ok = n_name == "n_rev";
 
-    let strict_prev_ok = if post_fork {
-        prev_name == "prev_rev32"
-    } else {
-        prev_name == "prev_swap4"
-    };
+    // Fix D (evidence-based): with Fix A unifying mining.notify prev to
+    // swap4(natural) at all heights, the cgminer-family ASIC's internal
+    // swap4 cancels and the wire prev = natural = `prev_rev32` orientation
+    // regardless of fork side. Allow both prev_swap4 (legacy/fallback for
+    // miners that don't do the second swap4) and prev_rev32 (the canonical
+    // case after Fix A) so variant detection finds whichever the ASIC
+    // actually produced. The narrower height-conditional gate was based on
+    // an incorrect mental model of pre-fork iriumd canonical wire format
+    // (it's reverse(stored), NOT swap4(stored)) and is the root cause of
+    // 24h+ pre-fork submit_block hash_mismatch rejections.
+    let _ = post_fork;
+    let strict_prev_ok = prev_name == "prev_rev32" || prev_name == "prev_swap4";
 
     match mode {
         MinerFamilyMode::Asic => strict_prev_ok && mr_ok && v_ok && t_ok && b_ok && n_ok,
@@ -2500,16 +2507,43 @@ async fn handle_submit_legacy_rewardable(
         tx_hex.push(hex::encode(&cb));
         tx_hex.extend(job.tx_hex.clone());
 
+        // Send the natural sha256d folded merkle (mr_raw_raw). iriumd's
+        // block.merkle_root() also produces this natural value after decoding
+        // and reversing leaves, so connect_block validates correctly. Pre-fork
+        // the hash check will still fail (iriumd's wire merkle is reverse of
+        // stored = display, ASIC's wire merkle is natural) — pre-fork ASIC
+        // mining is fundamentally not supported. Post-fork iriumd doesn't
+        // reverse merkle for wire, so both hash check and merkle validation
+        // align and blocks land.
+        let merkle_root_for_json = mr;
+        // Fix C: iriumd's submit_block compares JSON `hash` against
+        // reverse(sha256d(canonical_wire)) — display order. With Fix A
+        // canonicalizing the ASIC wire bytes and Fix B aligning the JSON
+        // merkle field, `chosen.hash` (= sha256d of the chosen variant
+        // header, natural order) now IS the natural canonical hash.
+        // Reversing yields the display-order hash iriumd expects.
+        let mut hash_display = hash;
+        hash_display.reverse();
+
+        // Fix E: the ASIC may have applied BIP310 version rolling. The chosen
+        // variant's header[0..4] holds the LE bytes the ASIC actually hashed.
+        // iriumd will canonicalize with `version.to_le_bytes()`, so we must
+        // send the numeric u32 that matches the chosen variant's header bytes.
+        let canonical_version = accepted_idx
+            .and_then(|idx| checks.get(idx))
+            .map(|c| u32::from_le_bytes(c.header[0..4].try_into().unwrap()))
+            .unwrap_or(1u32);
+
         let req = SubmitRequest {
             height: job.height,
             header: SubmitHeader {
-                version: 1,
+                version: canonical_version,
                 prev_hash: hex::encode(job.prev_hash),
-                merkle_root: hex::encode(mr),
+                merkle_root: hex::encode(merkle_root_for_json),
                 time: ntime,
                 bits: format!("{:08x}", job.bits),
                 nonce,
-                hash: hex::encode(hash),
+                hash: hex::encode(hash_display),
             },
             tx_hex,
             submit_source: "pool_stratum".to_string(),
@@ -2528,10 +2562,15 @@ async fn handle_submit_legacy_rewardable(
             .await?;
         if resp.status().is_success() {
             mark_submit_accepted();
-            info!("[block] submitted worker={} height={}", worker, job.height);
+            info!(
+                "[block] submitted worker={} height={} hash={}",
+                worker,
+                job.height,
+                hex::encode(hash_display)
+            );
             let row = FoundBlockRecord {
                 height: job.height,
-                hash: hex::encode(hash),
+                hash: hex::encode(hash_display),
                 time: unix_now_secs(),
                 worker: worker.to_string(),
                 address: worker_address(&worker),
@@ -2614,19 +2653,21 @@ async fn send_notify(
 ) -> Result<()> {
     let pkh = session.pkh.ok_or_else(|| anyhow!("unauthorized"))?;
 
-    // Compute the wire prev_hash. Pre-fork sends display-order bytes (iriumd's
-    // legacy convention; cgminer-family miners then apply swap4 → swap4(display)
-    // in their header). At/post-fork we send swap4(natural) on the wire so the
-    // miner's swap4 yields natural in the header, matching the Bitcoin-standard
-    // post-fork canonical bytes.
-    let prev_hex_for_height = |job_prev: &[u8; 32], h: u64| -> String {
-        if h < STANDARD_HEADER_ACTIVATION_HEIGHT {
-            hex::encode(job_prev)
-        } else {
-            let mut natural = *job_prev;
-            natural.reverse();
-            hex::encode(swap4_bytes_each_word(natural))
-        }
+    // Evidence-based Fix A (after empirical debugging):
+    // iriumd's serialize_for_height does `prev.reverse()` for wire bytes
+    // unconditionally (both pre- and post-fork) — wire prev = reverse(stored
+    // display) = natural sha256d order. cgminer-family ASICs apply swap4 to
+    // the prev bytes in mining.notify before writing them to the wire header.
+    // To make wire_prev == iriumd canonical (= natural) regardless of fork
+    // side, send swap4(natural) here so the miner's swap4 cancels.
+    // The original pre-fork branch (sending display) caused wire_prev =
+    // swap4(display), which never matches natural for non-palindromic
+    // hashes — the root cause of historical pre-fork submit_block
+    // hash_mismatch rejections (0 blocks found in 24h+).
+    let prev_hex_for_height = |job_prev: &[u8; 32], _h: u64| -> String {
+        let mut natural = *job_prev;
+        natural.reverse();
+        hex::encode(swap4_bytes_each_word(natural))
     };
 
     let (prev_hex, cb1_hex, cb2_hex, branches) = if let Some(snap) = &session.current_snapshot {
@@ -2957,7 +2998,7 @@ mod tests {
         let _guard = test_guard();
         let config = test_config(MinerFamilyMode::Cpuminer);
         let session = test_session(AdapterKind::CpuminerCompatibility);
-        let snapshot = build_canonical_job_snapshot(&test_job(), &session).unwrap();
+        let snapshot = build_canonical_job_snapshot(&test_job(), &session, &config).unwrap();
         let submit = SubmitTuple {
             job_id: snapshot.job_id.clone(),
             extranonce2_hex: "00000000".to_string(),
@@ -3021,6 +3062,10 @@ mod tests {
             branches: vec![],
             tip_hash_at_job_create: [0u8; 32],
             created_at_unix: 0,
+        
+            auxpow_mode: false,
+            irium_header80: None,
+            irium_coinbase_hex: None,
         };
         let solve = CanonicalSolve {
             adapter_id: "cpuminer_compat",
@@ -3253,7 +3298,7 @@ mod tests {
         let _guard = test_guard();
         let config = test_config(MinerFamilyMode::Cpuminer);
         let session = test_session(AdapterKind::CpuminerCompatibility);
-        let snapshot = build_canonical_job_snapshot(&test_job(), &session).unwrap();
+        let snapshot = build_canonical_job_snapshot(&test_job(), &session, &config).unwrap();
         let submit = SubmitTuple {
             job_id: snapshot.job_id.clone(),
             extranonce2_hex: "00000000".to_string(),
@@ -3266,4 +3311,9 @@ mod tests {
         assert!(!allow_rewardable_promotion(&solve));
         assert_eq!(solve.adapter_id, "cpuminer_compat");
     }
+
+
+
+
+
 }
