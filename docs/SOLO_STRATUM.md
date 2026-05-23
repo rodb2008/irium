@@ -34,8 +34,12 @@ export IRIUM_RPC_TOKEN=<same-token-as-iriumd>
 
 ## Start solo Stratum
 
+The local `iriumd` exposes HTTP RPC by default. Use `http://` for a plain
+local connection; switch to `https://` only if you have configured
+`IRIUM_TLS_CERT` / `IRIUM_TLS_KEY` on the node.
+
 ```bash
-export IRIUM_NODE_RPC=https://127.0.0.1:38300
+export IRIUM_NODE_RPC=http://127.0.0.1:38300
 ./target/release/irium-miner --solo-stratum --listen 0.0.0.0:3333
 ```
 
@@ -47,6 +51,13 @@ export IRIUM_SOLO_STRATUM_LISTEN=0.0.0.0:3333
 export IRIUM_SOLO_STRATUM_DIFFICULTY=1
 ./target/release/irium-miner
 ```
+
+Two further env vars tune the bridge's Stratum behaviour:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `IRIUM_SOLO_STRATUM_EXTRANONCE2_SIZE` | 4 | Bytes of `extranonce2` advertised in `mining.subscribe`. Increase only when an ASIC requires a wider rolling field. |
+| `IRIUM_SOLO_STRATUM_REFRESH_SECS` | (built-in) | How often the bridge polls `/rpc/getblocktemplate` for a fresh job (and pushes `mining.notify` with `clean_jobs=true` when the tip changes). Lower = more responsive on tip change; higher = lighter on the local node. |
 
 ## CPU multicore mining
 
