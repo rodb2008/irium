@@ -1138,9 +1138,10 @@ fn reconstruct_canonical_header80(
     merkle_root_internal: [u8; 32],
     ntime: u32,
     nonce: u32,
+    effective_version: u32,
 ) -> [u8; 80] {
     let mut header = [0u8; 80];
-    header[0..4].copy_from_slice(&snapshot.version.to_le_bytes());
+    header[0..4].copy_from_slice(&effective_version.to_le_bytes());
 
     let mut prev_wire = snapshot.prev_hash_internal;
     prev_wire.reverse();
@@ -1609,7 +1610,7 @@ fn decode_native_rewardable_submit(
     let ntime = parse_u32_hex(&submit.ntime_hex)?;
     let nonce = parse_u32_hex(&submit.nonce_hex)?;
     let canonical_header80 =
-        reconstruct_canonical_header80(snapshot, canonical_merkle_root, ntime, nonce);
+        reconstruct_canonical_header80(snapshot, canonical_merkle_root, ntime, nonce, snapshot.version);
     let mut canonical_hash = sha256d(&canonical_header80);
     canonical_hash.reverse();
     let share_target = snapshot.block_target.clone();
@@ -1649,17 +1650,6 @@ fn decode_cpuminer_compat_submit(
     let canonical_merkle_root = merkle_root_from_coinbase(cb_hash, &snapshot.branches);
     let ntime = parse_u32_hex(&submit.ntime_hex)?;
     let nonce = parse_u32_hex(&submit.nonce_hex)?;
-    // Match iriumd's BlockHeader::serialize() byte order (natural prev,
-    // display merkle) so canonical_hash equals what iriumd would compute
-    // for this submission. Previously used header_bytes() which writes
-    // both fields as-is, producing a hash unrelated to the chain rule.
-    let canonical_header80 = reconstruct_canonical_header80(
-        snapshot,
-        canonical_merkle_root,
-        ntime,
-        nonce,
-    );
-    let canonical_hash = sha256d(&canonical_header80);
 
     fn fold_merkle(root0: [u8; 32], branches: &[[u8; 32]], rev_branch: bool, rev_each_round: bool) -> [u8; 32] {
         let mut root = root0;
@@ -1717,6 +1707,7 @@ fn decode_cpuminer_compat_submit(
     #[derive(Clone)]
     struct CheckResult {
         name: &'static str,
+        header: [u8; 80],
         hash: [u8; 32],
         ok_share_be: bool,
         ok_share_le: bool,
@@ -1780,6 +1771,7 @@ fn decode_cpuminer_compat_submit(
                             let ok_share = if use_le { ok_share_le } else { ok_share_be };
                             checks.push(CheckResult {
                                 name: Box::leak(format!("{}+{}:{}", prev_name, mr_name, mode).into_boxed_str()),
+                                header: hdr_v,
                                 hash: hash_v,
                                 ok_share_be,
                                 ok_share_le,
@@ -1805,8 +1797,30 @@ fn decode_cpuminer_compat_submit(
             if use_le { chosen.ok_block_le } else { chosen.ok_block_be },
         )
     } else {
-        ("none", canonical_hash, false, false)
+        ("none", [0u8; 32], false, false)
     };
+
+    // Patch 5: honor BIP310 version rolling. The chosen variant's
+    // header[0..4] holds the LE bytes the ASIC actually hashed for the
+    // version field. iriumd canonicalizes by writing
+    // SubmitHeader.version.to_le_bytes(), so we must compute canonical_hash
+    // with the same effective version the chip used, otherwise canonical_hash
+    // and chip_hash diverge by 16+ bits of entropy and block_ok essentially
+    // never fires for ASICs that use version rolling (NerdQAxe+, AntMiner S19,
+    // etc.). Mirrors Fix E in handle_submit_native_rewardable.
+    let effective_version = accepted_idx
+        .and_then(|idx| checks.get(idx))
+        .map(|c| u32::from_le_bytes(c.header[0..4].try_into().unwrap()))
+        .unwrap_or(snapshot.version);
+    let canonical_header80 = reconstruct_canonical_header80(
+        snapshot,
+        canonical_merkle_root,
+        ntime,
+        nonce,
+        effective_version,
+    );
+    let canonical_hash = sha256d(&canonical_header80);
+    let share_hash = if accepted_idx.is_some() { share_hash } else { canonical_hash };
 
     Ok(CanonicalSolve {
         adapter_id: "cpuminer_compat",
@@ -2043,10 +2057,17 @@ async fn submit_canonical_block(
     snapshot: &CanonicalJobSnapshot,
     solve: &CanonicalSolve,
 ) -> Result<NodeSubmitResult> {
+    // Patch 5: derive version from the canonical header bytes (which include
+    // the chip's BIP310-rolled version, when applicable). iriumd serializes
+    // via to_le_bytes() and recomputes the hash; this guarantees byte-identity
+    // with what the chip hashed.
+    let effective_version = u32::from_le_bytes(
+        solve.canonical_header80[0..4].try_into().expect("80-byte header"),
+    );
     let req = SubmitRequest {
         height: snapshot.height,
         header: SubmitHeader {
-            version: snapshot.version,
+            version: effective_version,
             prev_hash: hex::encode(snapshot.prev_hash_internal),
             merkle_root: hex::encode(solve.canonical_merkle_root),
             time: parse_u32_hex(&solve.ntime_hex)?,
@@ -2907,6 +2928,7 @@ fn cpuminer_miner_header_wire(
         coinbase_hash_internal,
         ntime,
         nonce,
+        snapshot.version,
     ))
 }
 
@@ -3155,6 +3177,38 @@ mod tests {
         assert!(solve.share_ok);
         assert!(solve.rewardable);
         assert_eq!(solve.adapter_id, "cpuminer_compat");
+    }
+
+    #[test]
+    fn cpuminer_compat_canonical_hash_honors_rolled_version() {
+        // Patch 5: when SubmitTuple.rolled_version_hex is Some(extra), the
+        // compat decoder must scan v_rolled = snapshot.version | extra and
+        // bind canonical_header80[0..4] to that effective version. iriumd
+        // recomputes the same hash via SubmitHeader.version.to_le_bytes(),
+        // so canonical_hash must equal sha256d(canonical_header80) bit-for-bit.
+        let _guard = test_guard();
+        let config = test_config(MinerFamilyMode::Cpuminer);
+        let session = test_session(AdapterKind::CpuminerCompatibility);
+        let snapshot = build_canonical_job_snapshot(&test_job(), &session, &config).unwrap();
+        let rolled_extra: u32 = 0x00000007;
+        let submit = SubmitTuple {
+            job_id: snapshot.job_id.clone(),
+            extranonce2_hex: "00000000".to_string(),
+            ntime_hex: format!("{:08x}", snapshot.base_ntime),
+            nonce_hex: "00000001".to_string(),
+            rolled_version_hex: Some(format!("{:08x}", rolled_extra)),
+        };
+        let solve = CpuminerCompatibilityAdapter
+            .decode_submit(&snapshot, &session, &config, &submit)
+            .unwrap();
+        let expected_version = snapshot.version | rolled_extra;
+        let actual_version =
+            u32::from_le_bytes(solve.canonical_header80[0..4].try_into().unwrap());
+        assert_eq!(
+            actual_version, expected_version,
+            "canonical header must encode the BIP310-rolled version, not the base version"
+        );
+        assert_eq!(solve.canonical_hash, sha256d(&solve.canonical_header80));
     }
 
     #[test]
