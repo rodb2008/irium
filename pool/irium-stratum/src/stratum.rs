@@ -1884,7 +1884,13 @@ fn process_cpuminer_compat_solve(
         events.push(CompatEvent::CompatSolvedShare);
     }
 
-    if solve.share_block_like || solve.block_ok {
+    // Patch 7: only fire COMPAT_CANDIDATE_BLOCKED when promotion is ACTUALLY
+    // blocked. Pre-fix this fired whenever share_block_like || block_ok, which
+    // includes the case where allow_rewardable_promotion(solve) returns true
+    // — i.e., the warn fired even when the block WAS being submitted, producing
+    // a misleading "action=no_candidate_promotion" log line right next to the
+    // [block] submitted INFO line. Now the warn fires iff the gate denies.
+    if (solve.share_block_like || solve.block_ok) && !allow_rewardable_promotion(solve) {
         mark_compat_nonrewardable_event();
         warn!(
             "[COMPAT_CANDIDATE_BLOCKED] worker={} adapter_id={} rewardable={} job={} share_block_like={} canonical_block_ok={} share_hash={} canonical_hash={} block_target={} template_fingerprint={} action=no_candidate_promotion",
