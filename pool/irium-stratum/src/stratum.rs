@@ -623,6 +623,34 @@ async fn metrics_loop(
             let first = req.lines().next().unwrap_or("");
 
             let (status, body) = if first.starts_with("GET /metrics") {
+                // pool_integrity: single-word self-attested health signal,
+                // surfaced by stats-proxy.py at pool.iriumlabs.org:3337/stats.
+                // Replaces the dead "unknown" placeholder the proxy used to
+                // return whenever this key was missing from /metrics. Derived
+                // from existing atomics, no new state. Decision order:
+                //   active_sessions == 0                       → "no_miners"
+                //   sessions > 0 && no share within 300 s      → "degraded"
+                //   sessions > 0 && recent share && blocks > 0 → "ok"
+                //   sessions > 0 && recent share && blocks = 0 → "unknown"
+                // The last case is a legitimate pre-first-block warmup; we
+                // keep it as "unknown" rather than "ok" because end-to-end
+                // pipeline validity isn't proven until iriumd accepts at
+                // least one submission.
+                let active_sessions = ACTIVE_SESSIONS.load(Ordering::SeqCst);
+                let submit_accepted_now = SUBMIT_ACCEPTED.load(Ordering::SeqCst);
+                let last_share_acc_at = LAST_SHARE_ACCEPTED_AT.load(Ordering::SeqCst);
+                let now = unix_now_secs();
+                let pool_integrity = if active_sessions == 0 {
+                    "no_miners"
+                } else if last_share_acc_at == 0
+                    || now.saturating_sub(last_share_acc_at) >= 300
+                {
+                    "degraded"
+                } else if submit_accepted_now > 0 {
+                    "ok"
+                } else {
+                    "unknown"
+                };
                 (
                     "200 OK",
                     json!({
@@ -648,7 +676,8 @@ async fn metrics_loop(
                         "gate_dropped_banned": GATE_DROPPED_BANNED.load(Ordering::SeqCst),
                         "gate_bans_issued": GATE_BANS_ISSUED.load(Ordering::SeqCst),
                         "gate_active_bans": BAN_LIST.len() as u64,
-                        "gate_tracked_ips": CONN_RECORDS.len() as u64
+                        "gate_tracked_ips": CONN_RECORDS.len() as u64,
+                        "pool_integrity": pool_integrity
                     })
                     .to_string(),
                 )
