@@ -1810,7 +1810,7 @@ fn decode_cpuminer_compat_submit(
 
     Ok(CanonicalSolve {
         adapter_id: "cpuminer_compat",
-        rewardable: false,
+        rewardable: true,
         share_variant,
         extranonce2_hex: submit.extranonce2_hex.clone(),
         ntime_hex: submit.ntime_hex.clone(),
@@ -1960,6 +1960,49 @@ async fn handle_submit_cpuminer_compat(
     }
 
     let _events = process_cpuminer_compat_solve(&worker, &snapshot, &solve);
+
+    // POST-PHASE-2A: cpuminer-compat path now submits valid blocks. This is
+    // required for miners on port 443 fallback (sslh-mux for ISPs that block
+    // 3333/3335, notably China) who use non-standard byte arrangements that
+    // only the 1,536-variant compat scan can identify. See issue #57.
+    //
+    // solve.canonical_hash is computed from solve.canonical_header80 via
+    // reconstruct_canonical_header80 — byte-identical to what iriumd derives
+    // in submit_block, so the submission validates the same way the working
+    // legacy_rewardable path on port 3333 does.
+    if allow_rewardable_promotion(&solve) {
+        mark_candidate_detected();
+        info!(
+            "[block] candidate worker={} height={} hash={}",
+            worker,
+            snapshot.height,
+            hex::encode(solve.canonical_hash)
+        );
+        mark_candidate_submitted();
+        mark_block_submit_attempt();
+        let client = reqwest::Client::builder().build()?;
+        match submit_canonical_block(&client, config, &snapshot, &solve).await? {
+            NodeSubmitResult::Accepted { .. } => {
+                mark_submit_accepted();
+                info!("[block] submitted worker={} height={}", worker, snapshot.height);
+                let row = FoundBlockRecord {
+                    height: snapshot.height,
+                    hash: hex::encode(solve.canonical_hash),
+                    time: unix_now_secs(),
+                    worker: worker.to_string(),
+                    address: worker_address(&worker),
+                };
+                if let Err(e) = append_found_block(&config.found_blocks_file, &row) {
+                    warn!("[block] record append failed worker={} height={} err={}", worker, snapshot.height, e);
+                }
+            }
+            NodeSubmitResult::Rejected { reason } => {
+                mark_submit_rejected();
+                warn!("[block] submit failed reason={} worker={}", reason, worker);
+            }
+        }
+    }
+
     maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
     Ok(true)
 }
@@ -3110,7 +3153,7 @@ mod tests {
         let adapter = CpuminerCompatibilityAdapter;
         let solve = adapter.decode_submit(&snapshot, &session, &config, &submit).unwrap();
         assert!(solve.share_ok);
-        assert!(!solve.rewardable);
+        assert!(solve.rewardable);
         assert_eq!(solve.adapter_id, "cpuminer_compat");
     }
 
@@ -3395,7 +3438,11 @@ mod tests {
     }
 
     #[test]
-    fn cpuminer_compat_path_still_nonrewardable_under_phase2a() {
+    fn cpuminer_compat_path_is_rewardable_post_fix() {
+        // POST-PHASE-2A: the cpuminer-compat adapter is now rewardable. See
+        // issue #57 for the rationale (port 443 sslh-mux fallback miners
+        // with non-standard byte arrangements need block submission via the
+        // 1,536-variant compat decoder).
         let _guard = test_guard();
         let config = test_config(MinerFamilyMode::Cpuminer);
         let session = test_session(AdapterKind::CpuminerCompatibility);
@@ -3408,8 +3455,12 @@ mod tests {
             rolled_version_hex: None,
         };
         let solve = CpuminerCompatibilityAdapter.decode_submit(&snapshot, &session, &config, &submit).unwrap();
-        assert!(!solve.rewardable);
-        assert!(!allow_rewardable_promotion(&solve));
+        assert!(solve.rewardable);
+        // allow_rewardable_promotion gates on (rewardable && block_ok).
+        // rewardable is now true; block_ok depends on the synthetic share's
+        // canonical_hash vs block_target. We assert the gate now mirrors block_ok
+        // (instead of being unconditionally false as in the pre-fix design).
+        assert_eq!(allow_rewardable_promotion(&solve), solve.block_ok);
         assert_eq!(solve.adapter_id, "cpuminer_compat");
     }
 
