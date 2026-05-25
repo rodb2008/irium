@@ -1819,7 +1819,12 @@ fn decode_cpuminer_compat_submit(
         nonce,
         effective_version,
     );
-    let canonical_hash = sha256d(&canonical_header80);
+    // Patch 6: reverse to match native_rewardable's canonical_hash byte order
+    // (line ~1613). Without this, hash_meets_target() compares raw sha256d bytes
+    // as BE — wrong order — and block_ok evaluates false for hashes that actually
+    // meet block_target. Mirror is required for block_ok to fire correctly.
+    let mut canonical_hash = sha256d(&canonical_header80);
+    canonical_hash.reverse();
     let share_hash = if accepted_idx.is_some() { share_hash } else { canonical_hash };
 
     Ok(CanonicalSolve {
@@ -3208,7 +3213,9 @@ mod tests {
             actual_version, expected_version,
             "canonical header must encode the BIP310-rolled version, not the base version"
         );
-        assert_eq!(solve.canonical_hash, sha256d(&solve.canonical_header80));
+        let mut expected_hash = sha256d(&solve.canonical_header80);
+        expected_hash.reverse();
+        assert_eq!(solve.canonical_hash, expected_hash);
     }
 
     #[test]
