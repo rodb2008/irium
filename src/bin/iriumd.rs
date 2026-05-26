@@ -9221,6 +9221,61 @@ async fn main() {
         });
     }
 
+    // Phase 1A+1B: drain incoming OfferBroadcast payloads and write each
+    // to ~/.irium/offers/offer-<offer_id>.json so /offers/feed serves it
+    // locally. The p2p layer has already done dedup + rate limit + size
+    // check + parse validation (offer_id, status==open) and re-broadcast
+    // to its other peers, so this drainer's only job is durable persistence.
+    // We do NOT overwrite an existing offer file - if the local node is
+    // the offer's seller, the locally-created file is authoritative; if a
+    // duplicate ID arrives from a different seller it's dropped here to
+    // avoid the gossip layer rewriting our own offers. 2 s cadence mirrors
+    // the offer-take drainer above.
+    if let Some(ref broadcast_p2p) = app_state.p2p {
+        let drain_node = broadcast_p2p.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let offers_dir = offers_feed_dir();
+                if !offers_dir.exists() {
+                    if let Err(e) = std::fs::create_dir_all(&offers_dir) {
+                        eprintln!("[offer-broadcast] create_dir_all {}: {}", offers_dir.display(), e);
+                        continue;
+                    }
+                }
+                for json in drain_node.drain_offer_broadcasts().await {
+                    let val: serde_json::Value = match serde_json::from_str(&json) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("[offer-broadcast] drop unparseable: {}", e);
+                            continue;
+                        }
+                    };
+                    let id = match val.get("offer_id").and_then(|v| v.as_str()) {
+                        Some(s) if !s.is_empty() => s.to_string(),
+                        _ => {
+                            eprintln!("[offer-broadcast] drop missing offer_id");
+                            continue;
+                        }
+                    };
+                    if id.len() > 128 || id.is_empty()
+                        || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    {
+                        eprintln!("[offer-broadcast] drop unsafe offer_id: {}", id);
+                        continue;
+                    }
+                    let path = offers_dir.join(format!("offer-{}.json", id));
+                    if path.exists() {
+                        continue;
+                    }
+                    if let Err(e) = std::fs::write(&path, &json) {
+                        eprintln!("[offer-broadcast] write {}: {}", path.display(), e);
+                    }
+                }
+            }
+        });
+    }
+
     // Stage 3.3.1: drain dispute P2P inboxes and apply to local indexes.
     if let Some(ref dispute_p2p) = app_state.p2p {
         let drain_node = dispute_p2p.clone();
@@ -9327,6 +9382,9 @@ async fn main() {
     {
         let offer_event_tx = event_tx.clone();
         let watcher_chain = app_state.chain.clone();
+        // Phase 1A+1B: clone the P2P handle so the watcher can announce
+        // newly-created local offers to peers. None when P2P is disabled.
+        let watcher_p2p = app_state.p2p.clone();
         // LAYER 3 grace window in blocks. Default 144 (≈ a day at 10-min
         // blocks; about 2.4 hours at 60 s blocks). Operators can override
         // via IRIUM_OFFER_RELIST_GRACE_BLOCKS.
@@ -9336,6 +9394,13 @@ async fn main() {
             .unwrap_or(144);
         tokio::spawn(async move {
             let mut seen: HashMap<String, String> = HashMap::new();
+            // Phase 1A+1B: tracks which local offer IDs we have already
+            // announced via P2P gossip during THIS iriumd session. On
+            // restart it's empty, so all open offers re-broadcast — the
+            // gossip LRU on every peer absorbs the duplicates (one tick
+            // of network noise, then quiet again).
+            let mut broadcast_announced: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let dir = offers_feed_dir();
@@ -9345,6 +9410,10 @@ async fn main() {
                     .lock()
                     .map(|g| g.tip_height())
                     .unwrap_or(0);
+                // Phase 1A+1B: collect open offers we have not yet announced.
+                // We queue here and broadcast outside the per-file loop so
+                // no async I/O happens while iterating fs entries.
+                let mut to_broadcast: Vec<(String, String)> = Vec::new();
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if !path.extension().map(|e| e == "json").unwrap_or(false) {
@@ -9437,7 +9506,25 @@ async fn main() {
                             "offer_id": id,
                         }));
                     }
+                    // Phase 1A+1B: queue OPEN offers we have not yet
+                    // announced this session. Status was potentially
+                    // mutated by LAYER 2 (open→expired) or LAYER 3
+                    // (taken→open relist) above, so this check after the
+                    // transitions catches relists too.
+                    if status == "open" && !broadcast_announced.contains(&id) {
+                        to_broadcast.push((id.clone(), data.clone()));
+                    }
                     seen.insert(id, status);
+                }
+                // Phase 1A+1B: emit broadcasts outside the fs-iteration
+                // loop. Mark each as announced only after broadcast_offer
+                // returns so a panic/early-return doesn't leave us in a
+                // half-announced state that would skip retry next tick.
+                if let Some(ref p2p) = watcher_p2p {
+                    for (id, json) in to_broadcast {
+                        p2p.broadcast_offer(&json).await;
+                        broadcast_announced.insert(id);
+                    }
                 }
             }
         });

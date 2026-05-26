@@ -60,6 +60,27 @@ pub enum MessageType {
     DisputeEvidenceNotification = 22,
     DisputeResolvedNotification = 23,
     DisputeEscalatedNotification = 24,
+    /// Seller-broadcast announcement of a new (or republished) offer.
+    /// Payload: UTF-8 JSON of the full offer object (same shape that
+    /// `/offers/feed` exposes — id, seller_address, amount_sats,
+    /// description, payment_method, payment_instructions, status="open",
+    /// created_at, timeout_height, seller_pubkey, …). Receivers write
+    /// the JSON to ~/.irium/offers/<id>.json so `/offers/feed` serves it
+    /// locally, then re-broadcast to every peer EXCEPT the source so
+    /// the offer propagates via gossip flood. Dedup is per-receiver via
+    /// a bounded LRU of recently-seen offer IDs (see p2p.rs).
+    ///
+    /// Replaces the legacy `IRIUM_MARKETPLACE_FEED_URL` env-var-based
+    /// discovery for new installs. Old peers without this variant ignore
+    /// the message via the `Unknown = 0` sentinel; mixed-version networks
+    /// degrade gracefully (offers only propagate among upgraded peers).
+    ///
+    /// TODO(security follow-up): no cryptographic signature is required
+    /// today — same gap as OfferTakeNotification. Add an ed25519
+    /// signature over the payload by the seller's wallet key so a third
+    /// party can't flood the network with fake offers attributed to
+    /// other sellers.
+    OfferBroadcast = 25,
     Disconnect = 99,
 }
 
@@ -94,6 +115,7 @@ impl TryFrom<u8> for MessageType {
             22 => DisputeEvidenceNotification,
             23 => DisputeResolvedNotification,
             24 => DisputeEscalatedNotification,
+            25 => OfferBroadcast,
             99 => Disconnect,
             other => return Err(format!("Unknown message type: {}", other)),
         };
@@ -761,5 +783,84 @@ impl DisputeEscalatedNotificationPayload {
         Ok(DisputeEscalatedNotificationPayload {
             json: msg.payload.clone(),
         })
+    }
+}
+
+/// Wire payload for MessageType::OfferBroadcast. UTF-8 JSON of the full
+/// offer object (same shape `/offers/feed` exposes). The seller's iriumd
+/// emits one of these per newly-created local offer; every receiving peer
+/// writes the JSON to ~/.irium/offers/<id>.json and re-broadcasts to its
+/// other peers (the gossip flood). Anti-spam (per-peer rate limit + max
+/// payload size + LRU dedup) lives in p2p.rs to keep this struct minimal.
+pub struct OfferBroadcastPayload {
+    pub offer_json: Vec<u8>,
+}
+
+impl OfferBroadcastPayload {
+    pub fn to_message(&self) -> Message {
+        Message {
+            msg_type: MessageType::OfferBroadcast,
+            payload: self.offer_json.clone(),
+        }
+    }
+
+    pub fn from_message(msg: &Message) -> Result<Self, String> {
+        if msg.msg_type != MessageType::OfferBroadcast {
+            return Err("Not an offer broadcast".to_string());
+        }
+        Ok(OfferBroadcastPayload {
+            offer_json: msg.payload.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_type_try_from_offer_broadcast_25() {
+        // Forward-compat: byte 25 maps to OfferBroadcast.
+        assert_eq!(MessageType::try_from(25u8).unwrap(), MessageType::OfferBroadcast);
+    }
+
+    #[test]
+    fn message_type_try_from_unknown_byte_errors() {
+        // Sanity: a byte we don't know about returns an error (the read-loop
+        // wraps this with .unwrap_or(Unknown) for graceful degradation).
+        assert!(MessageType::try_from(200u8).is_err());
+    }
+
+    #[test]
+    fn offer_broadcast_payload_roundtrip() {
+        let json = br#"{"id":"abc","status":"open","amount_sats":1000}"#.to_vec();
+        let payload = OfferBroadcastPayload { offer_json: json.clone() };
+        let msg = payload.to_message();
+        assert_eq!(msg.msg_type, MessageType::OfferBroadcast);
+        assert_eq!(msg.payload, json);
+
+        let parsed = OfferBroadcastPayload::from_message(&msg).expect("parse ok");
+        assert_eq!(parsed.offer_json, json);
+    }
+
+    #[test]
+    fn offer_broadcast_payload_rejects_wrong_message_type() {
+        // from_message must refuse a message tagged with a different variant —
+        // protects callers that match on msg_type before dispatching.
+        let msg = Message { msg_type: MessageType::Tx, payload: vec![1, 2, 3] };
+        assert!(OfferBroadcastPayload::from_message(&msg).is_err());
+    }
+
+    #[test]
+    fn offer_broadcast_wire_serialization_roundtrip() {
+        // End-to-end: payload → Message → serialized bytes → deserialized
+        // Message → parsed payload. Catches breakage in the framing layer.
+        let json = br#"{"id":"x","status":"open"}"#.to_vec();
+        let msg = OfferBroadcastPayload { offer_json: json.clone() }.to_message();
+        let bytes = msg.serialize();
+        let parsed_msg = Message::deserialize(&bytes).expect("deserialize ok");
+        assert_eq!(parsed_msg.msg_type, MessageType::OfferBroadcast);
+        let parsed_payload = OfferBroadcastPayload::from_message(&parsed_msg).expect("parse ok");
+        assert_eq!(parsed_payload.offer_json, json);
     }
 }
