@@ -1542,7 +1542,16 @@ async fn handle_message(
                     write_json(wr, &resp).await?;
                 }
                 Err(e) => {
-                    let resp = json!({"id": id, "result": false, "error": [23, e.to_string(), null]});
+                    // Detect the stale-share marker from handle_submit_legacy_rewardable
+                    // and surface Stratum error code 21 ("Stale share"). Other
+                    // errors stay on the existing code 23 ("Other / unknown").
+                    let msg = e.to_string();
+                    let (code, reason): (i32, String) = if msg.starts_with("__STALE_SHARE__") {
+                        (21, "Stale share".to_string())
+                    } else {
+                        (23, msg)
+                    };
+                    let resp = json!({"id": id, "result": false, "error": [code, reason, null]});
                     write_json(wr, &resp).await?;
                 }
             }
@@ -2471,6 +2480,35 @@ async fn handle_submit_legacy_rewardable(
     let worker = session.worker.clone().unwrap_or_else(|| format!("conn-{conn_id}"));
     let pkh = session.pkh.ok_or_else(|| anyhow!("unauthorized"))?;
     let job = session.current_job.clone().ok_or_else(|| anyhow!("no active job"))?;
+
+    // Stale-share rejection by job_id mismatch.
+    //
+    // The pool emits new templates roughly once per second. A submission
+    // referencing a job_id other than the one currently active for this
+    // session was hashed against a stale prev_hash / merkle_root context -
+    // no byte-order transformation can produce a valid hash for it. Cheap
+    // reject saves ~1024-1536 SHA256d invocations per stale submission and
+    // surfaces the standard Stratum error code 21 ("Stale share") instead
+    // of the misleading "low_difficulty" that the variant scanner would
+    // otherwise emit.
+    //
+    // The "__STALE_SHARE__" marker prefix in the error message is detected
+    // by the mining.submit dispatch arm in handle_request and converted to
+    // Stratum error code 21 on the wire. Upstream proxies (MRR's stratum-
+    // proxy, NiceHash, etc.) can then diagnose buffering / clean_jobs
+    // forwarding problems on their side rather than blaming the pool.
+    if submit.job_id != job.job_id {
+        warn!(
+            "[share] stale worker={} submit_job={} current_job={} reason=stale_share",
+            worker, submit.job_id, job.job_id
+        );
+        mark_rejected_share();
+        return Err(anyhow!(
+            "__STALE_SHARE__: submitted job {} != current job {}",
+            submit.job_id,
+            job.job_id
+        ));
+    }
 
     let extra2 = hex::decode(&submit.extranonce2_hex).map_err(|e| anyhow!("extranonce2 decode: {e}"))?;
     let mut en = session.extranonce1.clone();
