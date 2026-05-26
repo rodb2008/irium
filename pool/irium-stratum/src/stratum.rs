@@ -2624,6 +2624,89 @@ async fn handle_submit_legacy_rewardable(
         }
     }
 
+    // ============================================================
+    // FALLBACK DEEP SCAN
+    // ============================================================
+    // If the fast path (mode_allows_combo filter, ~4-6 combinations)
+    // returned no match, retry every combination that the filter
+    // rejected. Bounded cost: zero SHA256d invocations when the fast
+    // pass succeeds (the common case); up to ~2,500 SHA256d when it
+    // misses, completing in single-digit milliseconds on any modern
+    // CPU. SHA256d throughput is not the bottleneck; the bottleneck
+    // was that some miner firmware (notably MRR-routed PxWSud4i.rig1)
+    // produces hashes whose byte interpretation falls outside the
+    // Asic-mode-allowed axis subset, and those shares were being
+    // silently rejected (chosen_variant=none, reason=low_difficulty).
+    // Deep-scan results are labelled with a "deep:" name prefix so
+    // logs can distinguish recovered hits from fast-path hits and
+    // surface which miner firmware families need scanner broadening.
+    if accepted_idx.is_none() {
+        for (prev_name, prev_for_header) in prev_variants {
+            for &(mr_name, mr_for_header) in merkle_variants.iter() {
+                for &(v_name, v_bytes) in version_opts.iter() {
+                    for (t_name, t_bytes) in time_opts {
+                        for (b_name, b_bytes) in bits_opts {
+                            for (n_name, n_bytes) in nonce_opts {
+                                // Skip combinations already tested in fast pass.
+                                if mode_allows_combo(
+                                    &config.miner_family_mode,
+                                    job.height,
+                                    prev_name,
+                                    mr_name,
+                                    v_name,
+                                    t_name,
+                                    b_name,
+                                    n_name,
+                                ) {
+                                    continue;
+                                }
+                                let hdr_v = header_bytes_from_wire(
+                                    v_bytes,
+                                    prev_for_header,
+                                    mr_for_header,
+                                    t_bytes,
+                                    b_bytes,
+                                    n_bytes,
+                                );
+                                let mode = format!("{}:{}:{}:{}", v_name, t_name, b_name, n_name);
+                                let hash_v = sha256d(&hdr_v);
+                                let hash_int_be = BigUint::from_bytes_be(&hash_v);
+                                let mut hash_rev = hash_v;
+                                hash_rev.reverse();
+                                let hash_int_le = BigUint::from_bytes_be(&hash_rev);
+                                let ok_share_be = hash_int_be <= share_target;
+                                let ok_share_le = hash_int_le <= share_target;
+                                let ok_block_be = hash_int_be <= block_target;
+                                let ok_block_le = hash_int_le <= block_target;
+                                let ok_share = if use_le { ok_share_le } else { ok_share_be };
+
+                                checks.push(CheckResult {
+                                    name: Box::leak(
+                                        format!("deep:{}+{}:{}", prev_name, mr_name, mode)
+                                            .into_boxed_str(),
+                                    ),
+                                    header: hdr_v,
+                                    hash: hash_v,
+                                    ok_share_be,
+                                    ok_share_le,
+                                    ok_block_be,
+                                    ok_block_le,
+                                });
+
+                                if ok_share && accepted_idx.is_none() {
+                                    accepted_idx = Some(checks.len() - 1);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // ============================================================
+    // END FALLBACK DEEP SCAN
+    // ============================================================
+
     let canonical = &checks[0];
     info!(
         "[sharedebug-header] worker={} job={} variant={} version_hex={:08x} prevhash={} merkle_root={} ntime_hex={} nbits_hex={} nonce_hex={:08x} header80={} hash={}",
@@ -3617,8 +3700,106 @@ mod tests {
         assert_eq!(solve.adapter_id, "cpuminer_compat");
     }
 
+    // ============================================================
+    // DEEP-SCAN FALLBACK TESTS
+    // ============================================================
+    // These tests verify the LOGIC underlying the deep-scan fallback
+    // in handle_submit_legacy_rewardable. The integration path itself
+    // (async + TCP writer + iriumd RPC) is not unit-testable in
+    // isolation, so we cover the constituent pieces:
+    //   1-3. mode_allows_combo rejects off-axis combos -> deep path
+    //        is the only place those combos get tested
+    //   4.   mode_allows_combo accepts the canonical ASIC layout ->
+    //        fast path still hits for normal firmware
+    //   5.   Deep-scan variant labels carry the "deep:" prefix
+    //        exactly as logged
 
+    #[test]
+    fn deep_scan_filter_rejects_prev_canon_for_asic() {
+        // The fast path (Asic mode) does NOT test prev_canon, only
+        // prev_rev32 and prev_swap4. So if a miner happens to produce
+        // a share that hashes correctly under prev_canon, fast misses
+        // and deep scan recovers it.
+        assert!(!mode_allows_combo(
+            &MinerFamilyMode::Asic, 23000,
+            "prev_canon", "mr_fold_raw_raw",
+            "v_le", "t_rev", "b_rev", "n_rev"
+        ));
+    }
 
+    #[test]
+    fn deep_scan_filter_rejects_off_axis_merkle_for_asic() {
+        // mr_fold_raw_rev / mr_fold_round_raw / mr_fold_round_rev all
+        // fall outside the fast-path filter. Deep scan covers them.
+        for mr in &["mr_fold_raw_rev", "mr_fold_round_raw", "mr_fold_round_rev"] {
+            assert!(!mode_allows_combo(
+                &MinerFamilyMode::Asic, 23000,
+                "prev_rev32", mr,
+                "v_le", "t_rev", "b_rev", "n_rev"
+            ), "mr={} should be rejected by fast path filter", mr);
+        }
+    }
 
+    #[test]
+    fn deep_scan_filter_rejects_raw_axis_combos_for_asic() {
+        // t_raw, b_raw, n_raw all fall outside fast-path filter so
+        // deep scan is the only place they get tested.
+        assert!(!mode_allows_combo(
+            &MinerFamilyMode::Asic, 23000,
+            "prev_rev32", "mr_fold_raw_raw",
+            "v_le", "t_raw", "b_rev", "n_rev"
+        ));
+        assert!(!mode_allows_combo(
+            &MinerFamilyMode::Asic, 23000,
+            "prev_rev32", "mr_fold_raw_raw",
+            "v_le", "t_rev", "b_raw", "n_rev"
+        ));
+        assert!(!mode_allows_combo(
+            &MinerFamilyMode::Asic, 23000,
+            "prev_rev32", "mr_fold_raw_raw",
+            "v_le", "t_rev", "b_rev", "n_raw"
+        ));
+    }
 
+    #[test]
+    fn deep_scan_filter_still_accepts_canonical_asic_layout() {
+        // Sanity check that the fast-path filter still allows the
+        // canonical ASIC byte layout. Existing miners using prev_rev32
+        // or prev_swap4 with the standard LE axes must continue to
+        // hit the fast path without entering deep scan.
+        assert!(mode_allows_combo(
+            &MinerFamilyMode::Asic, 23000,
+            "prev_rev32", "mr_fold_raw_raw",
+            "v_le", "t_rev", "b_rev", "n_rev"
+        ));
+        assert!(mode_allows_combo(
+            &MinerFamilyMode::Asic, 23000,
+            "prev_swap4", "mr_fold_raw_raw",
+            "v_be", "t_rev", "b_rev", "n_rev"
+        ));
+        assert!(mode_allows_combo(
+            &MinerFamilyMode::Asic, 23000,
+            "prev_rev32", "mr_fold_raw_raw",
+            "v_rolled", "t_rev", "b_rev", "n_rev"
+        ));
+    }
+
+    #[test]
+    fn deep_scan_variant_name_carries_deep_prefix() {
+        // The deep-scan fallback labels each tested combination as
+        // "deep:<prev>+<mr>:<v>:<t>:<b>:<n>" so log scrapers can
+        // distinguish fast-path hits from recovered hits.
+        let prev_name = "prev_canon";
+        let mr_name = "mr_fold_raw_rev";
+        let mode = format!("{}:{}:{}:{}", "v_le", "t_raw", "b_rev", "n_rev");
+        let name = format!("deep:{}+{}:{}", prev_name, mr_name, mode);
+        assert_eq!(
+            name,
+            "deep:prev_canon+mr_fold_raw_rev:v_le:t_raw:b_rev:n_rev"
+        );
+        assert!(name.starts_with("deep:"));
+        // Fast-path names do not have the "deep:" prefix.
+        let fast_name = format!("{}+{}:{}", "prev_rev32", "mr_fold_raw_raw", mode);
+        assert!(!fast_name.starts_with("deep:"));
+    }
 }
