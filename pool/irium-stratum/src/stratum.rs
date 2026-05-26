@@ -379,6 +379,12 @@ struct SessionState {
     last_retarget_ts: u64,
     coinbase_bip34: bool,
     adapter_kind: AdapterKind,
+    /// FIX 1: opt-in flag set by mining.extranonce.subscribe. Reserved for
+    /// future extranonce-rotation pushes (mining.set_extranonce). We
+    /// acknowledge the subscription with result:true even though we do
+    /// not currently rotate extranonce1 mid-session - that ack alone is
+    /// what unblocks the J19+ AsicBoost xnonce idle-wait state.
+    wants_extranonce_updates: bool,
 }
 
 #[derive(Clone, Default)]
@@ -1373,6 +1379,7 @@ async fn handle_conn(
         last_retarget_ts: unix_now_secs(),
         coinbase_bip34: config.coinbase_bip34,
         adapter_kind: select_adapter_kind(&config),
+        wants_extranonce_updates: false,
     };
 
     let (rd, mut wr) = stream.into_split();
@@ -1440,18 +1447,23 @@ async fn handle_message(
 
     match method {
         "mining.configure" => {
-            // Bitaxe / ESP-Miner v2+ sends this before mining.subscribe with the
-            // version-rolling extension. We do not support version-rolling
-            // (the pool builds the header with version=00000001 fixed), so we
-            // return false for the version-rolling result. Returning the JSON
-            // explicitly — instead of falling through to the catch-all
-            // "unsupported method" error — lets recent Bitaxe firmware drop
-            // the AsicBoost flag and continue to mining.subscribe.
+            // FIX 2: enable BIP310 version-rolling negotiation. Bitaxe / ESP-Miner
+            // v2+ sends this before mining.subscribe to negotiate the AsicBoost
+            // version-rolling extension. We DO support version-rolling on the
+            // submit side - the pool extracts params[5] (rolled_version_hex)
+            // and the variant scanner tries v_rolled/v_rolled_extra/v_rolled_raw
+            // permutations (see SubmitTuple.rolled_version_hex at line ~299).
+            // Previously we returned false here, which left Bitaxe firmware in
+            // a state where it parsed mining.notify but rejected it with
+            // "Failed to process mining notification" because it expected
+            // version-rolling to be available after the configure step.
+            // 1fffe000 is the BIP310 standard mask (bits 13-28 of nVersion =
+            // the canonical AsicBoost rolling window).
             let resp = json!({
                 "id": id,
                 "result": {
-                    "version-rolling": false,
-                    "version-rolling.mask": "00000000"
+                    "version-rolling": true,
+                    "version-rolling.mask": "1fffe000"
                 },
                 "error": null
             });
@@ -1534,6 +1546,19 @@ async fn handle_message(
                     write_json(wr, &resp).await?;
                 }
             }
+        }
+        "mining.extranonce.subscribe" => {
+            // FIX 1: J19+ AsicBoost xnonce (MRR rentals) and Bitaxe v2+ firmware
+            // opt into server-rotated extranonce via this extension. When the pool
+            // does NOT recognize the method, those rigs enter an idle wait state:
+            // they complete subscribe + authorize, then never submit shares
+            // because they're waiting on the extranonce-rotation ack that never
+            // comes. Acknowledging with result:true unblocks them even though we
+            // do not currently rotate extranonce1 mid-session. The session flag
+            // is reserved for when we wire up actual mining.set_extranonce pushes.
+            session.wants_extranonce_updates = true;
+            let resp = json!({"id": id, "result": true, "error": null});
+            write_json(wr, &resp).await?;
         }
         _ => {
             let resp = json!({"id": id, "result": null, "error": [20, "unsupported method", null]});
@@ -3104,6 +3129,7 @@ mod tests {
             last_retarget_ts: 0,
             coinbase_bip34: true,
             adapter_kind: mode,
+            wants_extranonce_updates: false,
         }
     }
 
