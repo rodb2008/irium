@@ -170,15 +170,41 @@ def background_sampler():
     # Periodically self-scrape so the rolling window stays populated even
     # when no client is requesting /stats. Without this, the first GUI
     # fetch always returns null until two requests are far enough apart.
+    #
+    # Wrapped in try/except so a transient exception in record_and_estimate
+    # (e.g., malformed upstream metrics, deque race) does not silently kill
+    # this daemon thread. Without the wrapper, a single bad iteration
+    # leaves the process alive but sampling frozen — hashrate estimates
+    # would never advance again until process restart.
     while True:
-        for name, cfg in DEFAULTS.items():
-            metrics = fetch(cfg["metrics"])
-            record_and_estimate(name, metrics)
+        try:
+            for name, cfg in DEFAULTS.items():
+                metrics = fetch(cfg["metrics"])
+                record_and_estimate(name, metrics)
+        except Exception as e:
+            print(f"[stats-proxy] background sampler error: {e}", flush=True)
         time.sleep(30)
 
 
 if __name__ == "__main__":
     threading.Thread(target=background_sampler, daemon=True).start()
-    server = HTTPServer(("0.0.0.0", PUBLIC_PORT), Handler)
-    print(f"Pool stats proxy running on :{PUBLIC_PORT}")
-    server.serve_forever()
+    # Outer retry loop: if HTTPServer construction or serve_forever raises
+    # (port temporarily unavailable, transient OS error, OOM recovery,
+    # internal Python exception), sleep briefly and try again. systemd
+    # will also restart the process if we exit, but the in-process retry
+    # keeps the rolling sampling window populated across transient errors
+    # instead of resetting it on every process restart.
+    while True:
+        try:
+            server = HTTPServer(("0.0.0.0", PUBLIC_PORT), Handler)
+            print(f"Pool stats proxy running on :{PUBLIC_PORT}", flush=True)
+            server.serve_forever()
+        except OSError as e:
+            # Most likely: port already in use (zombie process from a
+            # previous run, or unit-file collision). Sleep longer for
+            # bind contention so the holder has time to exit.
+            print(f"[stats-proxy] HTTPServer bind/serve OSError: {e}", flush=True)
+            time.sleep(5)
+        except Exception as e:
+            print(f"[stats-proxy] unexpected error in main loop: {e}", flush=True)
+            time.sleep(3)
