@@ -2469,6 +2469,16 @@ fn record_discovered_feed(url: &str) {
     }
 }
 
+/// Phase 1A+1B (P2P offer gossip): caps for the OfferBroadcast handling
+/// path. Defaults chosen to keep one busy seller well below the per-peer
+/// cap while rejecting flood attempts. A normal offer JSON is < 2 KB; the
+/// 64 KB MAX_BYTES is a comfortable safety margin. 20 offers/min is roughly
+/// 1 every 3 seconds. 1000-entry LRU = ~40 KB memory.
+const OFFER_BROADCAST_MAX_BYTES: usize = 65_536;
+const OFFER_BROADCAST_PEER_RATE_PER_MIN: u32 = 20;
+const OFFER_BROADCAST_RATE_WINDOW_SECS: u64 = 60;
+const OFFER_BROADCAST_SEEN_CAP: usize = 1000;
+
 #[derive(Clone)]
 pub struct P2PNode {
     bind_addr: SocketAddr,
@@ -2501,6 +2511,20 @@ pub struct P2PNode {
     /// Mirrors proof_gossip_inbox. Drained by an iriumd background task
     /// that mutates the local matching offer file from "open" to "taken".
     offer_take_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Phase 1A+1B: inbox for incoming MessageType::OfferBroadcast payloads.
+    /// Drained by an iriumd background task that writes the JSON to
+    /// ~/.irium/offers/<id>.json so /offers/feed serves it locally.
+    /// Push happens only AFTER LRU dedup + rate limit + size check pass.
+    offer_broadcast_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Phase 1A+1B: bounded LRU of recently-seen offer IDs. FIFO eviction
+    /// when len reaches OFFER_BROADCAST_SEEN_CAP. Used by both inbound and
+    /// outbound receive arms to drop duplicate broadcasts (prevents
+    /// amplification storms). VecDeque keeps insertion order for eviction;
+    /// HashSet keeps O(1) membership.
+    seen_offer_ids: Arc<tokio::sync::Mutex<(VecDeque<String>, HashSet<String>)>>,
+    /// Phase 1A+1B: per-peer sliding-window rate limiter for offer broadcasts.
+    /// Key: peer SocketAddr. Value: (window_start, count_in_window).
+    offer_rate_limit: Arc<tokio::sync::Mutex<HashMap<SocketAddr, (Instant, u32)>>>,
     dispute_raised_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     dispute_evidence_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     dispute_resolved_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -3027,6 +3051,12 @@ impl P2PNode {
     ) -> Self {
         let proof_gossip_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let offer_take_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let offer_broadcast_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let seen_offer_ids = Arc::new(tokio::sync::Mutex::new((
+            VecDeque::with_capacity(OFFER_BROADCAST_SEEN_CAP),
+            HashSet::with_capacity(OFFER_BROADCAST_SEEN_CAP),
+        )));
+        let offer_rate_limit = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let dispute_raised_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let dispute_evidence_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let dispute_resolved_inbox = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -3059,6 +3089,9 @@ impl P2PNode {
             external_endpoint,
             proof_gossip_inbox,
             offer_take_inbox,
+            offer_broadcast_inbox,
+            seen_offer_ids,
+            offer_rate_limit,
             dispute_raised_inbox,
             dispute_evidence_inbox,
             dispute_resolved_inbox,
@@ -3090,6 +3123,9 @@ impl P2PNode {
         let external_endpoint = self.external_endpoint.clone();
         let proof_gossip_inbox = self.proof_gossip_inbox.clone();
         let offer_take_inbox = self.offer_take_inbox.clone();
+        let offer_broadcast_inbox = self.offer_broadcast_inbox.clone();
+        let seen_offer_ids = self.seen_offer_ids.clone();
+        let offer_rate_limit = self.offer_rate_limit.clone();
         let dispute_raised_inbox = self.dispute_raised_inbox.clone();
         let dispute_evidence_inbox = self.dispute_evidence_inbox.clone();
         let dispute_resolved_inbox = self.dispute_resolved_inbox.clone();
@@ -3215,6 +3251,9 @@ impl P2PNode {
                         let external_endpoint_peer = external_endpoint.clone();
                         let proof_gossip_inbox_peer = proof_gossip_inbox.clone();
                         let offer_take_inbox_peer = offer_take_inbox.clone();
+                        let offer_broadcast_inbox_peer = offer_broadcast_inbox.clone();
+                        let seen_offer_ids_peer = seen_offer_ids.clone();
+                        let offer_rate_limit_peer = offer_rate_limit.clone();
                         let dispute_raised_inbox_peer = dispute_raised_inbox.clone();
                         let dispute_evidence_inbox_peer = dispute_evidence_inbox.clone();
                         let dispute_resolved_inbox_peer = dispute_resolved_inbox.clone();
@@ -3254,6 +3293,9 @@ impl P2PNode {
                                 external_endpoint_peer,
                                 proof_gossip_inbox_peer,
                                 offer_take_inbox_peer,
+                                offer_broadcast_inbox_peer,
+                                seen_offer_ids_peer,
+                                offer_rate_limit_peer,
                                 dispute_raised_inbox_peer,
                                 dispute_evidence_inbox_peer,
                                 dispute_resolved_inbox_peer,
@@ -3942,6 +3984,26 @@ impl P2PNode {
         let _ = broadcast_raw(&self.peers, &serialized).await;
     }
 
+    /// Phase 1A+1B: broadcast a newly-created (or republished) local offer
+    /// to all connected peers. Mirrors broadcast_offer_take — best-effort
+    /// flood, no ack. Receiving peers run try_accept_offer_broadcast for
+    /// size/rate/dedup checks before storing + re-broadcasting.
+    pub async fn broadcast_offer(&self, offer_json: &str) {
+        let payload = crate::protocol::OfferBroadcastPayload {
+            offer_json: offer_json.as_bytes().to_vec(),
+        };
+        let serialized = payload.to_message().serialize();
+        let _ = broadcast_raw(&self.peers, &serialized).await;
+    }
+
+    /// Phase 1A+1B: drain accumulated incoming offer JSON strings. Called
+    /// by iriumd offer-watcher, which writes each JSON to
+    /// ~/.irium/offers/<id>.json so /offers/feed serves it locally.
+    pub async fn drain_offer_broadcasts(&self) -> Vec<String> {
+        let mut inbox = self.offer_broadcast_inbox.lock().await;
+        std::mem::take(&mut *inbox)
+    }
+
     /// Drain all proof JSON strings received via P2P gossip since last call.
     pub async fn drain_proof_gossip(&self) -> Vec<String> {
         let mut inbox = self.proof_gossip_inbox.lock().await;
@@ -4452,6 +4514,9 @@ impl P2PNode {
         let _marketplace_feed_url = self.marketplace_feed.clone();
         let proof_gossip_inbox_outbound = self.proof_gossip_inbox.clone();
         let offer_take_inbox_outbound = self.offer_take_inbox.clone();
+        let offer_broadcast_inbox_outbound = self.offer_broadcast_inbox.clone();
+        let seen_offer_ids_outbound = self.seen_offer_ids.clone();
+        let offer_rate_limit_outbound = self.offer_rate_limit.clone();
         let dispute_raised_inbox_outbound = self.dispute_raised_inbox.clone();
         let dispute_evidence_inbox_outbound = self.dispute_evidence_inbox.clone();
         let dispute_resolved_inbox_outbound = self.dispute_resolved_inbox.clone();
@@ -4530,6 +4595,7 @@ impl P2PNode {
                         | MessageType::UptimeProof
                         | MessageType::ProofGossip
                         | MessageType::OfferTakeNotification
+                        | MessageType::OfferBroadcast
                         | MessageType::DisputeRaisedNotification
                         | MessageType::DisputeEvidenceNotification
                         | MessageType::DisputeResolvedNotification
@@ -6174,6 +6240,26 @@ impl P2PNode {
                             }
                         }
                     }
+                    MessageType::OfferBroadcast => {
+                        if let Ok(ob) = crate::protocol::OfferBroadcastPayload::from_message(&msg) {
+                            if let Some(json) = try_accept_offer_broadcast(
+                                &ob.offer_json,
+                                addr,
+                                &seen_offer_ids_outbound,
+                                &offer_rate_limit_outbound,
+                            ).await {
+                                {
+                                    let mut inbox = offer_broadcast_inbox_outbound.lock().await;
+                                    inbox.push(json.clone());
+                                }
+                                let payload = crate::protocol::OfferBroadcastPayload {
+                                    offer_json: json.into_bytes(),
+                                };
+                                let bytes = payload.to_message().serialize();
+                                let _ = broadcast_raw(&peers_vec, &bytes).await;
+                            }
+                        }
+                    }
                     MessageType::DisputeRaisedNotification => {
                         if let Ok(p) = crate::protocol::DisputeRaisedNotificationPayload::from_message(&msg) {
                             if let Ok(json) = String::from_utf8(p.json) {
@@ -6349,6 +6435,67 @@ async fn send_message_or_disconnect(
     }
 }
 
+/// Phase 1A+1B: shared validation pipeline for incoming OfferBroadcast
+/// messages. Returns Some(json) if the offer should be ingested (pushed
+/// to inbox + re-broadcast); None if dropped (size, rate, dedup, or
+/// parse failure). Drop reasons are silent to avoid log spam from
+/// misbehaving peers.
+async fn try_accept_offer_broadcast(
+    raw: &[u8],
+    addr: SocketAddr,
+    seen: &Arc<tokio::sync::Mutex<(VecDeque<String>, HashSet<String>)>>,
+    rate: &Arc<tokio::sync::Mutex<HashMap<SocketAddr, (Instant, u32)>>>,
+) -> Option<String> {
+    if raw.len() > OFFER_BROADCAST_MAX_BYTES {
+        return None;
+    }
+    let json = match String::from_utf8(raw.to_vec()) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&json) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    // Offer JSON uses the field name "offer_id" (set by irium-wallet's
+    // save_offer at src/bin/irium-wallet.rs:7488 — file name is also
+    // "offer-<offer_id>.json"). Reject broadcasts missing this field.
+    let id = match parsed.get("offer_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return None,
+    };
+    if parsed.get("status").and_then(|v| v.as_str()) != Some("open") {
+        return None;
+    }
+    {
+        let mut g = rate.lock().await;
+        let now = Instant::now();
+        let entry = g.entry(addr).or_insert((now, 0));
+        if now.duration_since(entry.0).as_secs() >= OFFER_BROADCAST_RATE_WINDOW_SECS {
+            *entry = (now, 0);
+        }
+        if entry.1 >= OFFER_BROADCAST_PEER_RATE_PER_MIN {
+            return None;
+        }
+        entry.1 = entry.1.saturating_add(1);
+    }
+    {
+        let mut g = seen.lock().await;
+        let (order, set) = &mut *g;
+        if set.contains(&id) {
+            return None;
+        }
+        if order.len() >= OFFER_BROADCAST_SEEN_CAP {
+            if let Some(oldest) = order.pop_front() {
+                set.remove(&oldest);
+            }
+        }
+        order.push_back(id.clone());
+        set.insert(id);
+    }
+    Some(json)
+}
+
 async fn broadcast_raw(peers: &Arc<Mutex<Vec<Arc<Mutex<OwnedWriteHalf>>>>>, bytes: &[u8]) -> usize {
     // Never hold the peers lock while awaiting I/O.
     let peers_snapshot = {
@@ -6413,6 +6560,9 @@ async fn handle_incoming_with_sybil(
     external_endpoint: Option<String>,
     proof_gossip_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     offer_take_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    offer_broadcast_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
+    seen_offer_ids: Arc<tokio::sync::Mutex<(VecDeque<String>, HashSet<String>)>>,
+    offer_rate_limit: Arc<tokio::sync::Mutex<HashMap<SocketAddr, (Instant, u32)>>>,
     dispute_raised_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     dispute_evidence_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
     dispute_resolved_inbox: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -8311,6 +8461,26 @@ async fn handle_incoming_with_sybil(
                     if let Ok(json) = String::from_utf8(otn.take_json) {
                         let mut inbox = offer_take_inbox.lock().await;
                         inbox.push(json);
+                    }
+                }
+            }
+            MessageType::OfferBroadcast => {
+                if let Ok(ob) = crate::protocol::OfferBroadcastPayload::from_message(&msg) {
+                    if let Some(json) = try_accept_offer_broadcast(
+                        &ob.offer_json,
+                        addr,
+                        &seen_offer_ids,
+                        &offer_rate_limit,
+                    ).await {
+                        {
+                            let mut inbox = offer_broadcast_inbox.lock().await;
+                            inbox.push(json.clone());
+                        }
+                        let payload = crate::protocol::OfferBroadcastPayload {
+                            offer_json: json.into_bytes(),
+                        };
+                        let bytes = payload.to_message().serialize();
+                        let _ = broadcast_raw(&peers, &bytes).await;
                     }
                 }
             }
