@@ -1231,45 +1231,76 @@ async fn template_loop(
     let client = TemplateClient::new(config.rpc_base.clone(), config.rpc_token.clone())?;
     let mut last_key = String::new();
     let mut seq: u64 = 1;
+    // Sync-gap guardrail: track the highest template height we've ever
+    // accepted in this pool session. If iriumd later returns a template
+    // whose height is below STANDARD_HEADER_ACTIVATION_HEIGHT WHILE we
+    // know the network has previously been observed at or above that
+    // threshold, the template is stale - likely from an iriumd that just
+    // restarted and is re-syncing. Accepting it would cause
+    // reconstruct_canonical_header80 to take the pre-fork merkle-reverse
+    // branch, producing canonical_hash bytes that don't match what the
+    // chip hashed (the chip operates on post-fork rules). That's the
+    // exact failure mode that produced 17 COMPAT_CANDIDATE_BLOCKED events
+    // during 2026-05-26 13:39-13:43 IST while iriumd was re-syncing
+    // after the P2P-offer-gossip deploy. One-way ratchet - once we've
+    // seen post-fork data, we never accept pre-fork templates again.
+    let mut max_seen_height: u64 = 0;
 
     loop {
         match client.fetch_template().await {
             Ok(tpl) => {
                 let job = to_job(seq, &tpl)?;
-                let prevhash = hex::encode(job.prev_hash);
-                let now_ts = unix_now_secs();
+                // Guardrail: refuse stale pre-fork templates once we've
+                // seen the network at/above the activation height.
+                if job.height < STANDARD_HEADER_ACTIVATION_HEIGHT
+                    && max_seen_height >= STANDARD_HEADER_ACTIVATION_HEIGHT
                 {
-                    let mut st = template_state.write().await;
-                    st.last_height = job.height;
-                    st.last_prevhash = prevhash.clone();
-                    st.last_update_unix = now_ts;
-                }
-                info!("[tmpl] height={} prev={} ts={}", job.height, prevhash, now_ts);
-
-                let key = format!("{}:{}", job.height, prevhash);
-                if key != last_key {
-                    last_key = key;
-                    seq = seq.wrapping_add(1);
-                    {
-                        let mut w = current.write().await;
-                        *w = Some(job.clone());
+                    warn!(
+                        "[tmpl] refusing stale pre-fork template: height={} max_seen={} threshold={}; iriumd is likely re-syncing - will retry on next poll",
+                        job.height, max_seen_height, STANDARD_HEADER_ACTIVATION_HEIGHT
+                    );
+                    // Fall through to the wait-and-retry block at the
+                    // bottom of the loop body. Do NOT update last_key,
+                    // template_state, or broadcast the job to peers.
+                } else {
+                    if job.height > max_seen_height {
+                        max_seen_height = job.height;
                     }
-                    let _ = tx.send(job.clone());
-                    info!(
-                        "[job] id={} height={} block_target={} bits={} prev={}",
-                        job.job_id,
-                        job.height,
-                        biguint_to_32hex(&target_from_bits(job.bits)),
-                        job.nbits_hex,
-                        hex::encode(job.prev_hash)
-                    );
-                    info!(
-                        "[tmpl] new job id={} height={} txs={} target={}",
-                        job.job_id,
-                        job.height,
-                        job.tx_hex.len(),
-                        job.template_target_hex
-                    );
+                    let prevhash = hex::encode(job.prev_hash);
+                    let now_ts = unix_now_secs();
+                    {
+                        let mut st = template_state.write().await;
+                        st.last_height = job.height;
+                        st.last_prevhash = prevhash.clone();
+                        st.last_update_unix = now_ts;
+                    }
+                    info!("[tmpl] height={} prev={} ts={}", job.height, prevhash, now_ts);
+
+                    let key = format!("{}:{}", job.height, prevhash);
+                    if key != last_key {
+                        last_key = key;
+                        seq = seq.wrapping_add(1);
+                        {
+                            let mut w = current.write().await;
+                            *w = Some(job.clone());
+                        }
+                        let _ = tx.send(job.clone());
+                        info!(
+                            "[job] id={} height={} block_target={} bits={} prev={}",
+                            job.job_id,
+                            job.height,
+                            biguint_to_32hex(&target_from_bits(job.bits)),
+                            job.nbits_hex,
+                            hex::encode(job.prev_hash)
+                        );
+                        info!(
+                            "[tmpl] new job id={} height={} txs={} target={}",
+                            job.job_id,
+                            job.height,
+                            job.tx_hex.len(),
+                            job.template_target_hex
+                        );
+                    }
                 }
             }
             Err(e) => warn!("[tmpl] fetch failed: {e}"),
