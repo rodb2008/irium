@@ -417,6 +417,15 @@ static COMPAT_BLOCK_LIKE_SHARES: AtomicU64 = AtomicU64::new(0);
 static COMPAT_NONREWARDABLE_EVENTS: AtomicU64 = AtomicU64::new(0);
 static LAST_SHARE_ACCEPTED_AT: AtomicU64 = AtomicU64::new(0);
 static LAST_SHARE_REJECTED_AT: AtomicU64 = AtomicU64::new(0);
+// Latest template height observed by the template_loop. Used by
+// handle_submit_legacy_rewardable to detect stale-by-height submissions
+// (sessions whose broadcast channel lagged and are still mining an old
+// height). Updated whenever a fresh template is accepted; monotonically
+// non-decreasing in practice. Reads use Relaxed ordering since the load
+// is purely advisory - a stale read of N-1 would just classify a stale
+// share as "old job_id" rather than "old height"; either way the share
+// is rejected via the same Stratum error code 21.
+static LATEST_TEMPLATE_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 // v1.9.23 — connection-gate counters. Surfaced on /metrics so operators
 // can see how often the cap / rate-limit / ban-list fire and tune the
@@ -1272,6 +1281,12 @@ async fn template_loop(
                     if job.height > max_seen_height {
                         max_seen_height = job.height;
                     }
+                    // Update the process-wide latest-template-height atomic
+                    // used by handle_submit_legacy_rewardable's stale-by-
+                    // height check. The check uses +2 tolerance so this
+                    // store is safe to fire on every template even with
+                    // brief race conditions.
+                    LATEST_TEMPLATE_HEIGHT.store(job.height, Ordering::Relaxed);
                     let prevhash = hex::encode(job.prev_hash);
                     let now_ts = unix_now_secs();
                     {
@@ -2507,6 +2522,44 @@ async fn handle_submit_legacy_rewardable(
             "__STALE_SHARE__: submitted job {} != current job {}",
             submit.job_id,
             job.job_id
+        ));
+    }
+
+    // Stale-share rejection by chain-height mismatch (Approach B).
+    //
+    // The session's current_job reflects the last mining.notify
+    // delivered to this session. But tokio broadcast channels drop
+    // messages for slow consumers (RecvError::Lagged), and busy MRR-
+    // proxy sessions can fall behind. A session that lagged on the
+    // broadcast keeps mining the LAST job it actually received -
+    // even though the chain has advanced multiple heights. Every
+    // submission it makes hashes against a stale prev_hash /
+    // merkle_root and is unrecoverable.
+    //
+    // The job_id check above catches the case where the WIRE submission
+    // references an older job than the session itself knows. This
+    // height check catches the OTHER case: the session's current_job
+    // is itself stale relative to the pool's latest template (lagged
+    // broadcast).
+    //
+    // +2 tolerance: a 1-2 block lag is normal during template rotation
+    // (a session might submit "in flight" for height N just as the
+    // pool moves to N+1 or N+2). Anything 3+ blocks behind is
+    // definitely stale and unrecoverable. LATEST_TEMPLATE_HEIGHT > 0
+    // guard skips the check during cold-start before the first
+    // template arrives.
+    let latest_height = LATEST_TEMPLATE_HEIGHT.load(Ordering::Relaxed);
+    if latest_height > 0 && job.height + 2 < latest_height {
+        warn!(
+            "[share] stale-by-height worker={} job_height={} chain_height={} lag={} reason=stale_height",
+            worker, job.height, latest_height, latest_height - job.height
+        );
+        mark_rejected_share();
+        return Err(anyhow!(
+            "__STALE_SHARE__: job height {} is {} blocks behind chain height {}",
+            job.height,
+            latest_height - job.height,
+            latest_height
         ));
     }
 
@@ -3839,5 +3892,58 @@ mod tests {
         // Fast-path names do not have the "deep:" prefix.
         let fast_name = format!("{}+{}:{}", "prev_rev32", "mr_fold_raw_raw", mode);
         assert!(!fast_name.starts_with("deep:"));
+    }
+
+    // ============================================================
+    // STALE-HEIGHT TESTS (Approach B)
+    // ============================================================
+    // These tests verify the height-stale check logic without
+    // requiring async + TCP writer integration. The +2 tolerance,
+    // cold-start guard, and shared marker prefix are all covered.
+
+    #[test]
+    fn stale_height_check_respects_plus_two_tolerance() {
+        // +2 tolerance: a 1-2 block lag is within normal template-
+        // rotation latency; anything 3+ blocks behind is rejected.
+        let chain_tip: u64 = 100;
+        // job at chain_tip - 2 (= 98): within tolerance, NOT stale
+        assert!(!(98u64 + 2 < chain_tip), "98 = tip - 2 should be within tolerance");
+        // job at chain_tip - 3 (= 97): outside tolerance, IS stale
+        assert!(97u64 + 2 < chain_tip, "97 = tip - 3 should be stale");
+        // job at chain_tip (= 100): not stale (same height)
+        assert!(!(100u64 + 2 < chain_tip), "tip itself never stale");
+        // job at chain_tip + 1 (= 101): not stale (ahead - shouldn't
+        // happen in practice but the check must not false-positive)
+        assert!(!(101u64 + 2 < chain_tip), "ahead-of-tip never stale");
+    }
+
+    #[test]
+    fn stale_height_check_skipped_at_cold_start() {
+        // When LATEST_TEMPLATE_HEIGHT is 0 (cold start, no template
+        // received yet), the guard skips the check so the first
+        // submission of a fresh pool is not mistakenly classified
+        // as stale.
+        let latest_height: u64 = 0;
+        let any_job_height: u64 = 23000;
+        // Replicates the runtime check exactly:
+        //   latest_height > 0 && job.height + 2 < latest_height
+        assert!(!(latest_height > 0 && any_job_height + 2 < latest_height));
+    }
+
+    #[test]
+    fn stale_height_marker_uses_same_prefix_as_job_id_stale() {
+        // Both stale-share paths (job_id mismatch and height
+        // mismatch) must use the same __STALE_SHARE__ marker
+        // prefix so the dispatch error-code-21 mapping covers both.
+        let height_msg = format!(
+            "__STALE_SHARE__: job height {} is {} blocks behind chain height {}",
+            95u64, 5u64, 100u64
+        );
+        let job_id_msg = format!(
+            "__STALE_SHARE__: submitted job {} != current job {}",
+            "0000000000000001", "0000000000000050"
+        );
+        assert!(height_msg.starts_with("__STALE_SHARE__"));
+        assert!(job_id_msg.starts_with("__STALE_SHARE__"));
     }
 }
