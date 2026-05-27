@@ -1,5 +1,6 @@
 mod block;
 mod events;
+mod payout;
 mod pow;
 mod stratum;
 mod template;
@@ -198,6 +199,15 @@ async fn main() -> Result<()> {
         ban_threshold,
         ban_duration_secs,
     };
+
+    // Spawn PPLNS payout maturity-poller in the background. It polls
+    // iriumd /status every 30s and processes any pending blocks that have
+    // reached coinbase maturity (block_height + 100). See payout.rs for
+    // the full two-stage design. Both args are cloned because run() takes
+    // cfg by value and consumes it.
+    let payout_rpc_base = cfg.rpc_base.clone();
+    let payout_rpc_token = cfg.rpc_token.clone();
+    tokio::spawn(payout::maturity_poller(payout_rpc_base, payout_rpc_token));
 
     run(cfg).await
 }

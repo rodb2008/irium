@@ -675,7 +675,8 @@ fn mark_rejected_share() {
 // the aggregate counter, only augments it with per-worker breakdown.
 // Silently skips on poisoned mutex (should never happen but mining
 // must not stall on observability bookkeeping).
-fn record_miner_share_accepted(worker: &str) {
+fn record_miner_share_accepted(worker: &str, diff: f64) {
+    crate::payout::record_share(worker, diff);
     let now = unix_now_secs();
     if let Ok(mut map) = MINER_STATS.lock() {
         let entry = map.entry(worker.to_string()).or_default();
@@ -902,6 +903,20 @@ async fn metrics_loop(
                     })
                     .to_string(),
                 )
+            } else if first.starts_with("GET /payouts") {
+                // PPLNS payout log — last 50 sent/failed payouts, with
+                // block height, miner, amount, share count, pct, tx_id.
+                // Consumed by stats-proxy and the Block Explorer's pool
+                // stats page. See payout.rs for the data shape.
+                let payload = crate::payout::payouts_view_json().to_string();
+                ("200 OK", payload)
+            } else if first.starts_with("GET /miners_payout") {
+                // Per-address PPLNS standing snapshot from the CURRENT
+                // 10k-share window. Adds pending_shares,
+                // estimated_payout_irm, and pct_of_window for each
+                // address. Consumed by stats-proxy's /miners enrichment.
+                let payload = crate::payout::miners_payout_view_json().to_string();
+                ("200 OK", payload)
             } else {
                 ("404 Not Found", "{\"error\":\"not_found\"}".to_string())
             };
@@ -1177,7 +1192,7 @@ fn build_auxpow_parent_coinbase_prefix_suffix(
     script_sig.extend_from_slice(&1u32.to_le_bytes());
     script_sig.extend_from_slice(&0u32.to_le_bytes());
 
-    let spk = payout_script_from_pkh(pkh);
+    let spk = payout_script_from_pkh(&*crate::payout::POOL_PAYOUT_PKH_BYTES);
     let mut tx = Vec::with_capacity(256);
     tx.extend_from_slice(&1u32.to_le_bytes()); // version
     tx.push(1u8); // input count
@@ -1246,17 +1261,17 @@ fn build_canonical_job_snapshot(job: &Job, session: &SessionState, config: &Stra
     let (coinbase_prefix, coinbase_suffix, prev_hash_internal, branches, auxpow_mode, irium_header80, irium_coinbase_hex) =
         if auxpow_active {
             // AuxPoW: build fixed Irium coinbase, compute Irium block hash, build parent coinbase
-            let irium_coinbase = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &[], session.coinbase_bip34);
+            let irium_coinbase = build_coinbase_tx(job.height, job.coinbase_value, &*crate::payout::POOL_PAYOUT_PKH_BYTES, &[], session.coinbase_bip34);
             let irium_coinbase_hash = sha256d(&irium_coinbase);
             let irium_merkle_root = merkle_root_from_coinbase(irium_coinbase_hash, &job.branches);
             let irium_h80 = build_irium_auxpow_header(job.prev_hash, irium_merkle_root, ntime, job.bits);
             let aux_hash = sha256d(&irium_h80);
             let (pp, ps) = build_auxpow_parent_coinbase_prefix_suffix(
-                job.height, job.coinbase_value, &pkh, &aux_hash, session.coinbase_bip34,
+                job.height, job.coinbase_value, &*crate::payout::POOL_PAYOUT_PKH_BYTES, &aux_hash, session.coinbase_bip34,
             );
             (pp, ps, [0u8; 32], vec![], true, Some(irium_h80), Some(hex::encode(&irium_coinbase)))
         } else {
-            let (cp, cs) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34);
+            let (cp, cs) = coinbase_prefix_suffix(job.height, job.coinbase_value, &*crate::payout::POOL_PAYOUT_PKH_BYTES, session.coinbase_bip34);
             (cp, cs, job.prev_hash, job.branches.clone(), false, None, None)
         };
 
@@ -1280,7 +1295,7 @@ fn build_canonical_job_snapshot(job: &Job, session: &SessionState, config: &Stra
         extranonce2_size: 4,
         coinbase_prefix,
         coinbase_suffix,
-        payout_script: payout_script_from_pkh(&pkh),
+        payout_script: payout_script_from_pkh(&*crate::payout::POOL_PAYOUT_PKH_BYTES),
         tx_hex: job.tx_hex.clone(),
         tx_hashes_internal,
         branches,
@@ -2211,11 +2226,12 @@ fn process_cpuminer_compat_solve(
     worker: &str,
     snapshot: &CanonicalJobSnapshot,
     solve: &CanonicalSolve,
+    diff: f64,
 ) -> Vec<CompatEvent> {
     let mut events = Vec::new();
 
     mark_accepted_share();
-    record_miner_share_accepted(worker);
+    record_miner_share_accepted(worker, diff);
     info!(
         "[SHARE_ACCEPTED] worker={} adapter_id={} rewardable={} variant={} hash={} canonical_hash={}",
         worker,
@@ -2346,7 +2362,7 @@ async fn handle_submit_cpuminer_compat(
         return Err(anyhow!("low_difficulty"));
     }
 
-    let _events = process_cpuminer_compat_solve(&worker, &snapshot, &solve);
+    let _events = process_cpuminer_compat_solve(&worker, &snapshot, &solve, session.difficulty);
 
     // POST-PHASE-2A: cpuminer-compat path now submits valid blocks. This is
     // required for miners on port 443 fallback (sslh-mux for ISPs that block
@@ -2371,6 +2387,10 @@ async fn handle_submit_cpuminer_compat(
         match submit_canonical_block(&client, config, &snapshot, &solve).await? {
             NodeSubmitResult::Accepted { .. } => {
                 mark_submit_accepted();
+                crate::payout::queue_block_for_payout(
+                    snapshot.height,
+                    hex::encode(solve.canonical_hash),
+                );
                 info!("[block] submitted worker={} height={}", worker, snapshot.height);
                 let row = FoundBlockRecord {
                     height: snapshot.height,
@@ -2524,7 +2544,7 @@ async fn handle_submit_native_rewardable(
     }
 
     mark_accepted_share();
-    record_miner_share_accepted(&worker);
+    record_miner_share_accepted(&worker, session.difficulty);
     mark_rewardable_share_accepted();
     info!(
         "[REWARDABLE_SHARE_ACCEPTED] worker={} adapter_id={} rewardable={} job={} canonical_hash={} share_target={}",
@@ -2570,6 +2590,10 @@ async fn handle_submit_native_rewardable(
             } => {
                 mark_submit_accepted();
                 mark_chain_height_advanced_by_pool();
+                crate::payout::queue_block_for_payout(
+                    accepted_height,
+                    hex::encode(solve.canonical_hash),
+                );
                 info!(
                     "[BLOCK_ACCEPTED] worker={} job={} canonical_hash={} accepted_height={} template_fingerprint={}",
                     worker,
@@ -2645,7 +2669,7 @@ async fn handle_submit_auxpow(
     if !ok_share {
         if config.soft_accept_invalid_shares {
             mark_accepted_share();
-            record_miner_share_accepted(&worker);
+            record_miner_share_accepted(&worker, session.difficulty);
             warn!("[AUXPOW_SHARE_SOFT_ACCEPTED] worker={}", worker);
             maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, true).await;
             maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
@@ -2659,7 +2683,7 @@ async fn handle_submit_auxpow(
     }
 
     mark_accepted_share();
-    record_miner_share_accepted(&worker);
+    record_miner_share_accepted(&worker, session.difficulty);
     mark_rewardable_share_accepted();
     info!(
         "[AUXPOW_SHARE_ACCEPTED] worker={} hash={} block_target={}",
@@ -2718,6 +2742,10 @@ async fn handle_submit_auxpow(
             Ok(resp) if resp.status().is_success() => {
                 mark_submit_accepted();
                 mark_chain_height_advanced_by_pool();
+                crate::payout::queue_block_for_payout(
+                    snapshot.height,
+                    hex::encode(irium_hash),
+                );
                 info!(
                     "[AUXPOW_BLOCK_ACCEPTED] worker={} height={} irium_hash={}",
                     worker, snapshot.height, hex::encode(irium_hash)
@@ -2835,7 +2863,7 @@ async fn handle_submit_legacy_rewardable(
     let mut en = session.extranonce1.clone();
     en.extend_from_slice(&extra2);
 
-    let cb = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &en, config.coinbase_bip34);
+    let cb = build_coinbase_tx(job.height, job.coinbase_value, &*crate::payout::POOL_PAYOUT_PKH_BYTES, &en, config.coinbase_bip34);
     let cb_hash = sha256d(&cb);
 
     fn fold_merkle(root0: [u8; 32], branches: &[[u8; 32]], rev_branch: bool, rev_each_round: bool) -> [u8; 32] {
@@ -3139,13 +3167,13 @@ async fn handle_submit_legacy_rewardable(
 
     if ok_share {
         mark_accepted_share();
-        record_miner_share_accepted(&worker);
+        record_miner_share_accepted(&worker, session.difficulty);
         session.consecutive_variant_none = 0;
         info!("{}", check_line);
         info!("[share] accepted worker={} hash={}", worker, hex::encode(hash));
     } else if config.soft_accept_invalid_shares {
         mark_accepted_share();
-        record_miner_share_accepted(&worker);
+        record_miner_share_accepted(&worker, session.difficulty);
         warn!("{}", check_line);
         warn!("[share] soft-accepted worker={} reason=compat_soft_accept", worker);
         return Ok(true);
@@ -3237,6 +3265,10 @@ async fn handle_submit_legacy_rewardable(
             .await?;
         if resp.status().is_success() {
             mark_submit_accepted();
+            crate::payout::queue_block_for_payout(
+                job.height,
+                hex::encode(hash_display),
+            );
             info!(
                 "[block] submitted worker={} height={} hash={}",
                 worker,
@@ -3529,11 +3561,11 @@ async fn send_notify(
                 snap.branches.iter().map(hex::encode).collect::<Vec<_>>(),
             )
         } else {
-            let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34);
+            let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &*crate::payout::POOL_PAYOUT_PKH_BYTES, session.coinbase_bip34);
             (prev_hex_for_height(&job.prev_hash, job.height), hex::encode(&cb1), hex::encode(&cb2), job.branches.iter().map(hex::encode).collect())
         }
     } else {
-        let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34);
+        let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &*crate::payout::POOL_PAYOUT_PKH_BYTES, session.coinbase_bip34);
         (prev_hex_for_height(&job.prev_hash, job.height), hex::encode(&cb1), hex::encode(&cb2), job.branches.iter().map(hex::encode).collect())
     };
 
@@ -3801,6 +3833,10 @@ mod tests {
             } => {
                 mark_submit_accepted();
                 mark_chain_height_advanced_by_pool();
+                crate::payout::queue_block_for_payout(
+                    accepted_height,
+                    hex::encode(solve.canonical_hash),
+                );
                 let record = RoundEligibleRecord {
                     height: accepted_height,
                     job_id: snapshot.job_id.clone(),
@@ -3982,7 +4018,7 @@ mod tests {
             block_ok: false,
         };
 
-        let events = process_cpuminer_compat_solve("worker1", &snapshot, &solve);
+        let events = process_cpuminer_compat_solve("worker1", &snapshot, &solve, 1.0);
 
         assert_eq!(
             events,
