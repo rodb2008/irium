@@ -48,7 +48,7 @@ const LWMA_INTERVAL_CLAMP_MULTIPLIER: u64 = 4;
 // to give the miner a chance to recover from stale-share blowback that
 // LWMA alone cannot diagnose (because LWMA only sees ACCEPTED share
 // intervals, not the rejection rate).
-const RESCUE_TRIGGER_PCT: f64 = 60.0;
+const RESCUE_TRIGGER_PCT: f64 = 99.9;
 const RESCUE_RECOVER_PCT: f64 = 30.0;
 const RESCUE_REDUCTION_FACTOR: f64 = 0.5;
 const RESCUE_DIFF_FLOOR: f64 = 524288.0;
