@@ -28,6 +28,13 @@ MIN_SECONDS = 120
 _lock = threading.Lock()
 _samples = {name: deque() for name in DEFAULTS}
 
+# Per-miner rolling samples for the /miners endpoint. Keyed by worker
+# username, each value is a deque of (timestamp, accepted_count) tuples
+# pruned to WINDOW_SECS. Same shape and semantics as _samples above but
+# per-worker rather than per-profile. Populated by background_sampler
+# from the "miners" subobject in stratum's /metrics JSON.
+_miner_samples = {}
+
 
 def fetch(url):
     try:
@@ -116,8 +123,55 @@ def record_and_estimate(profile, metrics):
     }
 
 
+def record_miner_sample(worker, accepted):
+    """Append (now, accepted) to the per-worker deque and prune old entries.
+
+    Same rolling-window semantics as record_and_estimate but keyed by
+    worker. Caller holds no lock - this acquires _lock briefly. Safe to
+    call concurrently from background_sampler and the /miners request
+    handler.
+    """
+    now = time.time()
+    with _lock:
+        buf = _miner_samples.setdefault(worker, deque())
+        buf.append((now, accepted))
+        cutoff = now - WINDOW_SECS
+        while buf and buf[0][0] < cutoff:
+            buf.popleft()
+
+
+def estimate_miner_hashrate(worker, accepted_now, diff):
+    """Compute the per-worker rolling hashrate over the last WINDOW_SECS.
+
+    Returns a tuple (hashrate_hps, window_seconds). Returns (None, 0) if
+    no samples are available, (None, ws) during warmup (window too short),
+    and (0, ws) if the window is mature but no new shares arrived.
+
+    Uses the same formula as record_and_estimate (delta * diff * 2^32 /
+    seconds) so the per-miner number is directly comparable to the
+    aggregate hashrate_estimate_hps in /stats.
+    """
+    with _lock:
+        buf = _miner_samples.get(worker)
+        if not buf:
+            return (None, 0)
+        oldest_ts, oldest_accepted = buf[0]
+    now = time.time()
+    delta_shares = accepted_now - oldest_accepted
+    delta_seconds = now - oldest_ts
+    if delta_seconds < MIN_SECONDS:
+        return (None, int(delta_seconds))
+    if delta_shares < MIN_SHARES:
+        return (0, int(delta_seconds))
+    hashrate_hps = (delta_shares * diff * (1 << 32)) / delta_seconds
+    return (hashrate_hps, int(delta_seconds))
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/miners":
+            self._handle_miners()
+            return
         if self.path not in ("/", "/stats", "/api/stats"):
             self.send_response(404)
             self.end_headers()
@@ -162,6 +216,69 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_miners(self):
+        """GET /miners: per-worker accepted/rejected counts, reject reasons,
+        rolling 15-min hashrate, and seconds since the worker's last share.
+
+        Reads the "miners" subobject from stratum's /metrics JSON (no new
+        IPC) and merges per-worker rolling samples maintained by
+        background_sampler. Workers appearing on both ASIC and CPU
+        endpoints (rare in practice - the same worker name would have to
+        be authorized on both ports) are emitted twice in the output,
+        once per profile, with the profile baseline diff used for
+        hashrate. This is the cleanest mapping that mirrors how the
+        aggregate /stats endpoint already segregates asic vs cpu_gpu.
+        """
+        asic = fetch(ASIC_METRICS)
+        cpu = fetch(CPU_METRICS)
+        now = time.time()
+        miners_list = []
+        for profile, source_metrics in (("asic", asic), ("cpu_gpu", cpu)):
+            miners_data = source_metrics.get("miners", {}) or {}
+            diff = DEFAULTS[profile]["diff"]
+            for worker, mstats in miners_data.items():
+                accepted = int(mstats.get("accepted", 0) or 0)
+                rejected = int(mstats.get("rejected", 0) or 0)
+                total = accepted + rejected
+                reject_rate = (
+                    round((rejected / total) * 100, 1)
+                    if total >= MIN_SHARES else None
+                )
+                last_share_at = int(mstats.get("last_share_at", 0) or 0)
+                last_share_ago = (
+                    int(now - last_share_at) if last_share_at > 0 else None
+                )
+                # Per-miner hashrate over the rolling 15-min window. Uses
+                # the same formula as the aggregate hashrate so numbers
+                # are directly comparable.
+                hashrate_15m, _hr_ws = estimate_miner_hashrate(worker, accepted, diff)
+                miners_list.append({
+                    "worker": worker,
+                    "profile": profile,
+                    "accepted": accepted,
+                    "rejected": rejected,
+                    "reject_rate_pct": reject_rate,
+                    "reject_reasons": mstats.get("reject_reasons", {}) or {},
+                    "hashrate_15m": hashrate_15m,
+                    "last_share_ago_seconds": last_share_ago,
+                })
+        # Sort newest-active first so the most informative rows appear at
+        # the top of any consumer that doesn't sort itself.
+        miners_list.sort(
+            key=lambda m: (m["last_share_ago_seconds"] if m["last_share_ago_seconds"] is not None else 10**9)
+        )
+        response = {
+            "total_miners": len(miners_list),
+            "miners": miners_list,
+        }
+        body = json.dumps(response, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, *args):
         pass
 
@@ -181,6 +298,21 @@ def background_sampler():
             for name, cfg in DEFAULTS.items():
                 metrics = fetch(cfg["metrics"])
                 record_and_estimate(name, metrics)
+                # Also feed per-miner samples so the /miners endpoint has
+                # rolling hashrate data even when no client has hit it
+                # yet. Inner try/except so one malformed miner entry
+                # doesn't poison the whole sampling tick.
+                miners_data = metrics.get("miners", {}) or {}
+                for worker, mstats in miners_data.items():
+                    try:
+                        accepted = int(mstats.get("accepted", 0) or 0)
+                        record_miner_sample(worker, accepted)
+                    except Exception as inner_e:
+                        print(
+                            f"[stats-proxy] miner-sample error for "
+                            f"{worker}: {inner_e}",
+                            flush=True,
+                        )
         except Exception as e:
             print(f"[stats-proxy] background sampler error: {e}", flush=True)
         time.sleep(30)

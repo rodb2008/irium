@@ -38,6 +38,26 @@ const LWMA_CHANGE_THRESHOLD: f64 = 0.05;
 /// than (clamp_multiplier * target_secs) is treated as a connection gap
 /// rather than a true slowdown, preventing one pause from collapsing diff.
 const LWMA_INTERVAL_CLAMP_MULTIPLIER: u64 = 4;
+
+// ============================================================
+// Vardiff RESCUE constants
+// ============================================================
+// Defensive supplement to LWMA vardiff: when a miner's rolling reject
+// rate climbs above RESCUE_TRIGGER_PCT and their assigned difficulty is
+// above RESCUE_DIFF_FLOOR, drop their diff by (1 - RESCUE_REDUCTION_FACTOR)
+// to give the miner a chance to recover from stale-share blowback that
+// LWMA alone cannot diagnose (because LWMA only sees ACCEPTED share
+// intervals, not the rejection rate).
+const RESCUE_TRIGGER_PCT: f64 = 60.0;
+const RESCUE_RECOVER_PCT: f64 = 30.0;
+const RESCUE_REDUCTION_FACTOR: f64 = 0.6;
+const RESCUE_DIFF_FLOOR: f64 = 32768.0;
+const RESCUE_COOLDOWN_SECS: u64 = 60;
+const RESCUE_MIN_SAMPLES: usize = 20;
+const RESCUE_MIN_WINDOW_SECS: u64 = 120;
+const RESCUE_SAMPLE_CAP: usize = 200;
+const RESCUE_MAX_AGE_SECS: u64 = 300;
+
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use serde_json::{json, Value};
@@ -385,6 +405,18 @@ struct SessionState {
     /// not currently rotate extranonce1 mid-session - that ack alone is
     /// what unblocks the J19+ AsicBoost xnonce idle-wait state.
     wants_extranonce_updates: bool,
+    /// Rolling per-session share outcome history for the vardiff rescue
+    /// path. Each entry: (timestamp_unix_secs, accepted). Bounded by
+    /// RESCUE_SAMPLE_CAP and RESCUE_MAX_AGE_SECS.
+    recent_share_outcomes: VecDeque<(u64, bool)>,
+    /// Unix seconds of the most recent vardiff-rescue reduction.
+    /// Enforces RESCUE_COOLDOWN_SECS between reductions.
+    last_rescue_at: u64,
+    /// True while the session is in the rescued state. Cleared once
+    /// rolling reject rate drops below RESCUE_RECOVER_PCT. Used by
+    /// maybe_update_vardiff_after_accepted_share to suppress LWMA
+    /// RAISES during the rescue window (lowers still permitted).
+    rescue_active: bool,
 }
 
 #[derive(Clone, Default)]
@@ -426,6 +458,55 @@ static LAST_SHARE_REJECTED_AT: AtomicU64 = AtomicU64::new(0);
 // share as "old job_id" rather than "old height"; either way the share
 // is rejected via the same Stratum error code 21.
 static LATEST_TEMPLATE_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+// ============================================================
+// Per-miner share + rejection tracking
+// ============================================================
+// Adds per-miner observability ON TOP of existing aggregate counters
+// (ACCEPTED_SHARES / REJECTED_SHARES). The aggregate counters are NOT
+// modified - this is purely additive tracking. Surfaced in /metrics
+// JSON for stats-proxy.py to consume via its existing HTTP scrape
+// (no new IPC mechanism).
+//
+// Reject reasons are categorised so operators can distinguish stale
+// submissions (proxy lag) from genuine POW failures (firmware bug) at
+// a glance. All 6 categories are defined here; only 3 are currently
+// populated (stale_job, stale_height, low_pow) because those are the
+// only sites that already call mark_rejected_share(). The other three
+// (bad_extranonce, coinbase_mismatch, unknown) are reserved for future
+// site-specific tagging without requiring structural changes.
+
+const REJECT_REASON_STALE_JOB: &str = "stale_job";
+const REJECT_REASON_STALE_HEIGHT: &str = "stale_height";
+const REJECT_REASON_LOW_POW: &str = "low_pow";
+#[allow(dead_code)]
+const REJECT_REASON_BAD_EXTRANONCE: &str = "bad_extranonce";
+#[allow(dead_code)]
+const REJECT_REASON_COINBASE_MISMATCH: &str = "coinbase_mismatch";
+#[allow(dead_code)]
+const REJECT_REASON_UNKNOWN: &str = "unknown";
+
+#[derive(Default, Clone)]
+struct MinerStats {
+    accepted: u64,
+    rejected: u64,
+    reject_reasons: std::collections::HashMap<&'static str, u64>,
+    last_share_at: u64,
+}
+
+// Per-miner stats keyed by the worker username (typically
+// <address>.<subworker> from mining.authorize). Mutex-protected; locks
+// are held only for the brief moment of updating one entry on
+// accept/reject. Sized in the low hundreds of bytes per worker - 100
+// active workers ~= 65 KB, negligible.
+static MINER_STATS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, MinerStats>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+// Pool-wide rejection-reason histogram. Mirrors the per-miner
+// reject_reasons but aggregated across all workers for quick health
+// diagnostics. Keys are the REJECT_REASON_* &'static str constants.
+static GLOBAL_REJECT_REASONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<&'static str, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 // v1.9.23 — connection-gate counters. Surfaced on /metrics so operators
 // can see how often the cap / rate-limit / ban-list fire and tune the
@@ -567,6 +648,39 @@ fn mark_rejected_share() {
     LAST_SHARE_REJECTED_AT.store(unix_now_secs(), Ordering::SeqCst);
 }
 
+// Record an accepted share for the given worker. Called immediately
+// after mark_accepted_share() at every accept site - never replaces
+// the aggregate counter, only augments it with per-worker breakdown.
+// Silently skips on poisoned mutex (should never happen but mining
+// must not stall on observability bookkeeping).
+fn record_miner_share_accepted(worker: &str) {
+    let now = unix_now_secs();
+    if let Ok(mut map) = MINER_STATS.lock() {
+        let entry = map.entry(worker.to_string()).or_default();
+        entry.accepted = entry.accepted.saturating_add(1);
+        entry.last_share_at = now;
+    }
+}
+
+// Record a rejected share for the given worker with a reason category.
+// `reason` must be one of the REJECT_REASON_* &'static str constants
+// above so the map key is a stable string slice. Updates BOTH the
+// per-miner map and the pool-wide GLOBAL_REJECT_REASONS histogram.
+// Last_share_at is updated to "last activity" (not just last accept)
+// so an idle / disconnected miner is detectable from /metrics.
+fn record_miner_share_rejected(worker: &str, reason: &'static str) {
+    let now = unix_now_secs();
+    if let Ok(mut map) = MINER_STATS.lock() {
+        let entry = map.entry(worker.to_string()).or_default();
+        entry.rejected = entry.rejected.saturating_add(1);
+        *entry.reject_reasons.entry(reason).or_insert(0) += 1;
+        entry.last_share_at = now;
+    }
+    if let Ok(mut g) = GLOBAL_REJECT_REASONS.lock() {
+        *g.entry(reason).or_insert(0) += 1;
+    }
+}
+
 fn mark_candidate_detected() {
     CANDIDATES_DETECTED.fetch_add(1, Ordering::SeqCst);
 }
@@ -666,6 +780,44 @@ async fn metrics_loop(
                 } else {
                     "unknown"
                 };
+                // Build the per-miner JSON object outside the json! macro
+                // because the macro grammar doesn't accept block-expression
+                // values. Lock is held briefly while we clone the small
+                // HashMap snapshot, then released before the build loop.
+                let miners_json: serde_json::Value = {
+                    let snapshot = MINER_STATS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let mut obj = serde_json::Map::new();
+                    for (worker, stats) in snapshot.iter() {
+                        let mut reasons = serde_json::Map::new();
+                        for (k, v) in stats.reject_reasons.iter() {
+                            reasons.insert((*k).to_string(), serde_json::json!(*v));
+                        }
+                        obj.insert(
+                            worker.clone(),
+                            serde_json::json!({
+                                "accepted": stats.accepted,
+                                "rejected": stats.rejected,
+                                "reject_reasons": reasons,
+                                "last_share_at": stats.last_share_at,
+                            }),
+                        );
+                    }
+                    serde_json::Value::Object(obj)
+                };
+                let global_reasons_json: serde_json::Value = {
+                    let snapshot = GLOBAL_REJECT_REASONS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let mut obj = serde_json::Map::new();
+                    for (k, v) in snapshot.iter() {
+                        obj.insert((*k).to_string(), serde_json::json!(*v));
+                    }
+                    serde_json::Value::Object(obj)
+                };
                 (
                     "200 OK",
                     json!({
@@ -692,7 +844,18 @@ async fn metrics_loop(
                         "gate_bans_issued": GATE_BANS_ISSUED.load(Ordering::SeqCst),
                         "gate_active_bans": BAN_LIST.len() as u64,
                         "gate_tracked_ips": CONN_RECORDS.len() as u64,
-                        "pool_integrity": pool_integrity
+                        "pool_integrity": pool_integrity,
+                        // Per-miner observability. Keys are worker usernames
+                        // (typically <address>.<subworker> from mining.authorize).
+                        // Snapshot of MINER_STATS taken just above; lock is
+                        // held briefly inside the lock-clone-build pattern.
+                        // Consumed by stats-proxy.py to populate the public
+                        // /miners endpoint without inventing a new IPC.
+                        "miners": miners_json,
+                        // Pool-wide rejection-reason histogram. Same key set
+                        // as miners[*].reject_reasons but summed across all
+                        // workers. Useful for at-a-glance health diagnostics.
+                        "global_reject_reasons": global_reasons_json
                     })
                     .to_string(),
                 )
@@ -1395,6 +1558,9 @@ async fn handle_conn(
         coinbase_bip34: config.coinbase_bip34,
         adapter_kind: select_adapter_kind(&config),
         wants_extranonce_updates: false,
+        recent_share_outcomes: VecDeque::with_capacity(RESCUE_SAMPLE_CAP),
+        last_rescue_at: 0,
+        rescue_active: false,
     };
 
     let (rd, mut wr) = stream.into_split();
@@ -1965,6 +2131,7 @@ fn process_cpuminer_compat_solve(
     let mut events = Vec::new();
 
     mark_accepted_share();
+    record_miner_share_accepted(worker);
     info!(
         "[SHARE_ACCEPTED] worker={} adapter_id={} rewardable={} variant={} hash={} canonical_hash={}",
         worker,
@@ -2075,6 +2242,8 @@ async fn handle_submit_cpuminer_compat(
             return Ok(true);
         }
         mark_rejected_share();
+        record_miner_share_rejected(&worker, REJECT_REASON_LOW_POW);
+        maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         warn!(
             "[SHARE_REJECTED] worker={} adapter_id={} rewardable={} reason=low_difficulty job={} extranonce2={} ntime={} nonce={} raw_submitted_hash={} canonical_hash={} share_target={} block_target={} template_fingerprint={}",
             worker,
@@ -2137,6 +2306,7 @@ async fn handle_submit_cpuminer_compat(
         }
     }
 
+    maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, true).await;
     maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
     Ok(true)
 }
@@ -2259,6 +2429,8 @@ async fn handle_submit_native_rewardable(
 
     if !solve.share_ok {
         mark_rejected_share();
+        record_miner_share_rejected(&worker, REJECT_REASON_LOW_POW);
+        maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         warn!(
             "[share] reject worker={} adapter_id={} reason=low_difficulty",
             worker,
@@ -2268,6 +2440,7 @@ async fn handle_submit_native_rewardable(
     }
 
     mark_accepted_share();
+    record_miner_share_accepted(&worker);
     mark_rewardable_share_accepted();
     info!(
         "[REWARDABLE_SHARE_ACCEPTED] worker={} adapter_id={} rewardable={} job={} canonical_hash={} share_target={}",
@@ -2351,6 +2524,7 @@ async fn handle_submit_native_rewardable(
         }
     }
 
+    maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, true).await;
     maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
     Ok(true)
 }
@@ -2387,16 +2561,21 @@ async fn handle_submit_auxpow(
     if !ok_share {
         if config.soft_accept_invalid_shares {
             mark_accepted_share();
+            record_miner_share_accepted(&worker);
             warn!("[AUXPOW_SHARE_SOFT_ACCEPTED] worker={}", worker);
+            maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, true).await;
             maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
             return Ok(true);
         }
         mark_rejected_share();
+        record_miner_share_rejected(&worker, REJECT_REASON_LOW_POW);
+        maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         warn!("[AUXPOW_SHARE_REJECTED] worker={} reason=low_difficulty hash={}", worker, hex::encode(parent_hash_display));
         return Err(anyhow!("low_difficulty"));
     }
 
     mark_accepted_share();
+    record_miner_share_accepted(&worker);
     mark_rewardable_share_accepted();
     info!(
         "[AUXPOW_SHARE_ACCEPTED] worker={} hash={} block_target={}",
@@ -2481,6 +2660,7 @@ async fn handle_submit_auxpow(
         }
     }
 
+    maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, true).await;
     maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
     Ok(true)
 }
@@ -2518,6 +2698,8 @@ async fn handle_submit_legacy_rewardable(
             worker, submit.job_id, job.job_id
         );
         mark_rejected_share();
+        record_miner_share_rejected(&worker, REJECT_REASON_STALE_JOB);
+        maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         return Err(anyhow!(
             "__STALE_SHARE__: submitted job {} != current job {}",
             submit.job_id,
@@ -2555,6 +2737,8 @@ async fn handle_submit_legacy_rewardable(
             worker, job.height, latest_height, latest_height - job.height
         );
         mark_rejected_share();
+        record_miner_share_rejected(&worker, REJECT_REASON_STALE_HEIGHT);
+        maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         return Err(anyhow!(
             "__STALE_SHARE__: job height {} is {} blocks behind chain height {}",
             job.height,
@@ -2871,15 +3055,19 @@ async fn handle_submit_legacy_rewardable(
 
     if ok_share {
         mark_accepted_share();
+        record_miner_share_accepted(&worker);
         info!("{}", check_line);
         info!("[share] accepted worker={} hash={}", worker, hex::encode(hash));
     } else if config.soft_accept_invalid_shares {
         mark_accepted_share();
+        record_miner_share_accepted(&worker);
         warn!("{}", check_line);
         warn!("[share] soft-accepted worker={} reason=compat_soft_accept", worker);
         return Ok(true);
     } else {
         mark_rejected_share();
+        record_miner_share_rejected(&worker, REJECT_REASON_LOW_POW);
+        maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         warn!("{}", check_line);
         warn!("[share] reject worker={} reason=low_difficulty", worker);
         return Err(anyhow!("low_difficulty"));
@@ -2974,6 +3162,7 @@ async fn handle_submit_legacy_rewardable(
         }
     }
 
+    maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, true).await;
     maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
     Ok(true)
 }
@@ -3042,6 +3231,15 @@ async fn maybe_update_vardiff_after_accepted_share(
         .max(config.vardiff_min_diff)
         .min(config.vardiff_max_diff);
 
+    // Rescue-aware suppression: while a session is in the rescued
+    // state, LWMA must NOT raise diff (the whole point of the rescue
+    // is to give the miner a lower diff to recover at). Lowers are
+    // still allowed - if the miner is legitimately slowing down, an
+    // additional drop is helpful, not harmful.
+    if session.rescue_active && new_diff > session.difficulty {
+        return Ok(());
+    }
+
     // Suppress no-op micro-adjustments — those just cost the miner
     // stale shares for no benefit.
     let rel_change = ((new_diff - session.difficulty) / session.difficulty).abs();
@@ -3078,6 +3276,114 @@ async fn send_set_difficulty(
     );
     let msg = json!({"id": Value::Null, "method": "mining.set_difficulty", "params": [diff]});
     write_json(wr, &msg).await
+}
+
+// Vardiff RESCUE - called after every share submission (accepted OR
+// rejected), runs alongside the LWMA path which fires only on accepts.
+//
+// Errors from send_set_difficulty are logged via warn! and swallowed -
+// this function MUST NOT propagate errors because callers at reject
+// sites depend on the caller's existing Err(anyhow!) value (containing
+// e.g. the "__STALE_SHARE__" marker that the dispatch layer maps to
+// Stratum error code 21). The rate-tracking side effect always runs
+// regardless of write failures.
+async fn maybe_apply_vardiff_rescue(
+    conn_id: u64,
+    wr: &mut tokio::net::tcp::OwnedWriteHalf,
+    session: &mut SessionState,
+    worker: &str,
+    accepted: bool,
+) {
+    let now = unix_now_secs();
+    session.recent_share_outcomes.push_back((now, accepted));
+    // Prune by capacity (oldest first).
+    while session.recent_share_outcomes.len() > RESCUE_SAMPLE_CAP {
+        session.recent_share_outcomes.pop_front();
+    }
+    // Prune by max age.
+    while let Some(&(ts, _)) = session.recent_share_outcomes.front() {
+        if now.saturating_sub(ts) > RESCUE_MAX_AGE_SECS {
+            session.recent_share_outcomes.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    // Sessions at or below the safe floor are exempt.
+    if session.difficulty <= RESCUE_DIFF_FLOOR {
+        return;
+    }
+
+    // Window N = max(RESCUE_MIN_SAMPLES, count_in_last_2_min). The window
+    // grows to satisfy the LARGER of "at least 20 shares" OR "last 2 min".
+    let two_min_ago = now.saturating_sub(RESCUE_MIN_WINDOW_SECS);
+    let count_in_2min = session
+        .recent_share_outcomes
+        .iter()
+        .filter(|(ts, _)| *ts >= two_min_ago)
+        .count();
+    let target_n = std::cmp::max(RESCUE_MIN_SAMPLES, count_in_2min);
+    if session.recent_share_outcomes.len() < target_n {
+        return;
+    }
+
+    // Walk last target_n outcomes newest-first.
+    let mut accepted_count: u64 = 0;
+    let mut rejected_count: u64 = 0;
+    for &(_, ok) in session
+        .recent_share_outcomes
+        .iter()
+        .rev()
+        .take(target_n)
+    {
+        if ok {
+            accepted_count += 1;
+        } else {
+            rejected_count += 1;
+        }
+    }
+    let total = accepted_count + rejected_count;
+    if total == 0 {
+        return;
+    }
+    let reject_rate_pct = (rejected_count as f64) / (total as f64) * 100.0;
+
+    // Recovery first - so a recovered session doesn't immediately re-arm
+    // rescue on a single bad share.
+    if session.rescue_active && reject_rate_pct < RESCUE_RECOVER_PCT {
+        session.rescue_active = false;
+    }
+
+    // Trigger: rate above threshold AND not within cooldown.
+    if reject_rate_pct > RESCUE_TRIGGER_PCT {
+        if now.saturating_sub(session.last_rescue_at) < RESCUE_COOLDOWN_SECS {
+            return;
+        }
+        let old_diff = session.difficulty;
+        let new_diff = (old_diff * RESCUE_REDUCTION_FACTOR).max(RESCUE_DIFF_FLOOR);
+        if new_diff < old_diff {
+            session.difficulty = new_diff;
+            session.last_rescue_at = now;
+            session.rescue_active = true;
+            warn!(
+                "[vardiff-rescue] worker={} old_diff={} new_diff={} reject_rate_pct={} reason=rescue",
+                worker, old_diff, new_diff, reject_rate_pct
+            );
+            if let Err(e) = send_set_difficulty(
+                wr,
+                conn_id,
+                session.worker.as_deref(),
+                session.difficulty,
+            )
+            .await
+            {
+                warn!(
+                    "[vardiff-rescue] worker={} send_set_difficulty failed: {}",
+                    worker, e
+                );
+            }
+        }
+    }
 }
 
 async fn send_notify(
@@ -3304,6 +3610,9 @@ mod tests {
             coinbase_bip34: true,
             adapter_kind: mode,
             wants_extranonce_updates: false,
+            recent_share_outcomes: std::collections::VecDeque::new(),
+            last_rescue_at: 0,
+            rescue_active: false,
         }
     }
 
@@ -3420,6 +3729,12 @@ mod tests {
         COMPAT_SOLVED_SHARES.store(0, Ordering::SeqCst);
         COMPAT_BLOCK_LIKE_SHARES.store(0, Ordering::SeqCst);
         COMPAT_NONREWARDABLE_EVENTS.store(0, Ordering::SeqCst);
+        // Clear per-miner observability state so tests don't leak counts
+        // into each other. Both maps use Mutex; unwrap_or_else handles
+        // theoretical poisoning (cannot happen via the tests but the
+        // type signature demands handling).
+        MINER_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        GLOBAL_REJECT_REASONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     #[test]
