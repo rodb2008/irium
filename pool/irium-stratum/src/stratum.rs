@@ -58,6 +58,16 @@ const RESCUE_MIN_WINDOW_SECS: u64 = 120;
 const RESCUE_SAMPLE_CAP: usize = 200;
 const RESCUE_MAX_AGE_SECS: u64 = 300;
 
+// ============================================================
+// Variant-scanner disconnect threshold
+// ============================================================
+// When a session accumulates this many CONSECUTIVE share rejections
+// with chosen_variant=none (i.e., the variant scanner + deep-scan
+// fallback both found no matching byte-order combination), the
+// session is closed gracefully. The miner can immediately reconnect;
+// this is NOT a ban. Counter resets to 0 on any accepted share.
+const VARIANT_NONE_DISCONNECT_THRESHOLD: u64 = 50;
+
 use anyhow::{anyhow, Result};
 use num_bigint::BigUint;
 use serde_json::{json, Value};
@@ -417,6 +427,13 @@ struct SessionState {
     /// maybe_update_vardiff_after_accepted_share to suppress LWMA
     /// RAISES during the rescue window (lowers still permitted).
     rescue_active: bool,
+    /// Consecutive count of share rejections where the variant scanner
+    /// found no matching byte-order combination (chosen_variant=none).
+    /// Reset to 0 on any accepted share. When this reaches
+    /// VARIANT_NONE_DISCONNECT_THRESHOLD, the session is gracefully
+    /// closed so the miner can reconnect and potentially get a clean
+    /// job assignment.
+    consecutive_variant_none: u64,
 }
 
 #[derive(Clone, Default)]
@@ -1561,6 +1578,7 @@ async fn handle_conn(
         recent_share_outcomes: VecDeque::with_capacity(RESCUE_SAMPLE_CAP),
         last_rescue_at: 0,
         rescue_active: false,
+        consecutive_variant_none: 0,
     };
 
     let (rd, mut wr) = stream.into_split();
@@ -1723,17 +1741,35 @@ async fn handle_message(
                     write_json(wr, &resp).await?;
                 }
                 Err(e) => {
-                    // Detect the stale-share marker from handle_submit_legacy_rewardable
-                    // and surface Stratum error code 21 ("Stale share"). Other
-                    // errors stay on the existing code 23 ("Other / unknown").
+                    // Detect marker errors from handle_submit_legacy_rewardable:
+                    //   __STALE_SHARE__              -> Stratum error 21 ("Stale share")
+                    //   __DISCONNECT_VARIANT_NONE__  -> error 23 + graceful disconnect
+                    // All other errors stay on code 23 ("Other / unknown").
                     let msg = e.to_string();
-                    let (code, reason): (i32, String) = if msg.starts_with("__STALE_SHARE__") {
-                        (21, "Stale share".to_string())
-                    } else {
-                        (23, msg)
-                    };
+                    let (code, reason, disconnect): (i32, String, bool) =
+                        if msg.starts_with("__STALE_SHARE__") {
+                            (21, "Stale share".to_string(), false)
+                        } else if msg.starts_with("__DISCONNECT_VARIANT_NONE__") {
+                            (23, "low_difficulty".to_string(), true)
+                        } else {
+                            (23, msg, false)
+                        };
                     let resp = json!({"id": id, "result": false, "error": [code, reason, null]});
                     write_json(wr, &resp).await?;
+                    if disconnect {
+                        // Graceful disconnect after VARIANT_NONE_DISCONNECT_THRESHOLD
+                        // consecutive variant=none rejections. Send a clean-jobs
+                        // notify so the miner flushes its state, then shut down
+                        // the write half. Outer loop bubbles the Err and the
+                        // _session_guard Drop decrements ACTIVE_SESSIONS.
+                        if let Some(job) = session.current_job.clone() {
+                            let _ = send_notify(wr, session, &job, true).await;
+                        }
+                        let _ = wr.shutdown().await;
+                        return Err(anyhow!(
+                            "disconnect: consecutive_variant_none reached threshold"
+                        ));
+                    }
                 }
             }
         }
@@ -3056,6 +3092,7 @@ async fn handle_submit_legacy_rewardable(
     if ok_share {
         mark_accepted_share();
         record_miner_share_accepted(&worker);
+        session.consecutive_variant_none = 0;
         info!("{}", check_line);
         info!("[share] accepted worker={} hash={}", worker, hex::encode(hash));
     } else if config.soft_accept_invalid_shares {
@@ -3070,6 +3107,18 @@ async fn handle_submit_legacy_rewardable(
         maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         warn!("{}", check_line);
         warn!("[share] reject worker={} reason=low_difficulty", worker);
+        session.consecutive_variant_none =
+            session.consecutive_variant_none.saturating_add(1);
+        if session.consecutive_variant_none >= VARIANT_NONE_DISCONNECT_THRESHOLD {
+            warn!(
+                "[disconnect] worker={} reason=consecutive_variant_none count={}",
+                worker, session.consecutive_variant_none
+            );
+            return Err(anyhow!(
+                "__DISCONNECT_VARIANT_NONE__: {} consecutive chosen_variant=none rejections",
+                session.consecutive_variant_none
+            ));
+        }
         return Err(anyhow!("low_difficulty"));
     }
 
@@ -3613,6 +3662,7 @@ mod tests {
             recent_share_outcomes: std::collections::VecDeque::new(),
             last_rescue_at: 0,
             rescue_active: false,
+            consecutive_variant_none: 0,
         }
     }
 
