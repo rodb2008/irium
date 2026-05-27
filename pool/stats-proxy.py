@@ -4,7 +4,7 @@ import threading
 import time
 import urllib.request
 from collections import deque
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 ASIC_METRICS = "http://127.0.0.1:3334/metrics"
 CPU_METRICS = "http://127.0.0.1:3336/metrics"
@@ -168,6 +168,14 @@ def estimate_miner_hashrate(worker, accepted_now, diff):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Bound per-request socket I/O so a slow/silent client cannot hold a
+    # worker thread indefinitely. With plain HTTPServer the accept loop
+    # itself blocked on recv() from a stuck client (proven via
+    # /proc/PID/stack: main thread wedged in tcp_recvmsg) while new SYNs
+    # piled up in the backlog. ThreadingHTTPServer (below) gives each
+    # request its own thread; timeout caps damage per thread.
+    timeout = 10
+
     def do_GET(self):
         if self.path == "/miners":
             self._handle_miners()
@@ -328,7 +336,12 @@ if __name__ == "__main__":
     # instead of resetting it on every process restart.
     while True:
         try:
-            server = HTTPServer(("0.0.0.0", PUBLIC_PORT), Handler)
+            # ThreadingHTTPServer: one OS thread per request. Required so
+            # a stuck client socket cannot wedge the accept loop and
+            # starve every other request. daemon_threads=True so worker
+            # threads exit cleanly on systemd restart.
+            server = ThreadingHTTPServer(("0.0.0.0", PUBLIC_PORT), Handler)
+            server.daemon_threads = True
             print(f"Pool stats proxy running on :{PUBLIC_PORT}", flush=True)
             server.serve_forever()
         except OSError as e:
