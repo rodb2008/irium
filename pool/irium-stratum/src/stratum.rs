@@ -401,6 +401,11 @@ struct SessionState {
     worker: Option<String>,
     pkh: Option<[u8; 20]>,
     difficulty: f64,
+    /// When Some, the session is using a miner-controlled fixed difficulty
+    /// (set via a "d=NNNN" token in the stratum authorize password).
+    /// Both LWMA vardiff and the rescue path bypass sessions with this
+    /// set so the miner's chosen difficulty is preserved.
+    fixed_difficulty: Option<f64>,
     current_job: Option<Job>,
     current_snapshot: Option<CanonicalJobSnapshot>,
     /// Ring buffer of the most recent accepted-share timestamps. Capped at
@@ -1050,6 +1055,32 @@ pub async fn run(config: StratumConfig) -> Result<()> {
     }
 }
 
+/// Standard stratum miner-controlled difficulty: parse a `d=NNNN` token
+/// from a comma-separated password string and return the requested
+/// difficulty if it is within the accepted range. Returns None on parse
+/// failure or when the value is outside [MIN_REQUESTED, MAX_REQUESTED].
+/// Out-of-range requests cause the session to fall back to vardiff rather
+/// than refusing the connection.
+///
+/// Accepts: "d=8192", "x,d=8192", "anything,d=8192,more", with
+/// whitespace around each segment. The first `d=` token wins.
+fn parse_miner_requested_diff(password: &str) -> Option<f64> {
+    const MIN_REQUESTED: u64 = 256;
+    const MAX_REQUESTED: u64 = 2_000_000;
+    for part in password.split(',') {
+        let trimmed = part.trim();
+        if let Some(value) = trimmed.strip_prefix("d=") {
+            if let Ok(n) = value.parse::<u64>() {
+                if (MIN_REQUESTED..=MAX_REQUESTED).contains(&n) {
+                    return Some(n as f64);
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
 fn select_adapter_kind(config: &StratumConfig) -> AdapterKind {
     match config.adapter_mode {
         AdapterMode::CpuminerCompatOnly => AdapterKind::CpuminerCompatibility,
@@ -1568,6 +1599,7 @@ async fn handle_conn(
         worker: None,
         pkh: None,
         difficulty: config.default_diff,
+        fixed_difficulty: None,
         current_job: None,
         current_snapshot: None,
         recent_share_ts: VecDeque::with_capacity(LWMA_WINDOW + 1),
@@ -1718,6 +1750,22 @@ async fn handle_message(
                         session.adapter_kind.as_str(),
                         config.miner_family_mode.as_str()
                     );
+
+                    // Miner-controlled difficulty via the password field —
+                    // standard stratum pool convention: a comma-separated
+                    // `d=NNNN` token sets a fixed difficulty for the
+                    // session and bypasses vardiff. Values outside the
+                    // accepted range fall back to vardiff silently rather
+                    // than refusing the authorize.
+                    let password = params.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(fixed) = parse_miner_requested_diff(password) {
+                        session.fixed_difficulty = Some(fixed);
+                        session.difficulty = fixed;
+                        info!(
+                            "[diff] worker={} fixed_diff={} source=miner_requested",
+                            user, fixed as u64
+                        );
+                    }
 
                     let cur = current.read().await;
                     if let Some(job) = cur.clone() {
@@ -3226,6 +3274,11 @@ async fn maybe_update_vardiff_after_accepted_share(
     if !config.vardiff_enabled {
         return Ok(());
     }
+    // Miner-controlled fixed difficulty bypasses LWMA entirely — the
+    // miner asked for an exact diff via password and we honor it.
+    if session.fixed_difficulty.is_some() {
+        return Ok(());
+    }
     let now = unix_now_secs();
 
     // Record this share's timestamp in the rolling window.
@@ -3343,6 +3396,11 @@ async fn maybe_apply_vardiff_rescue(
     worker: &str,
     accepted: bool,
 ) {
+    // Miner-controlled fixed difficulty bypasses the rescue path so the
+    // pool never silently lowers a diff the miner explicitly requested.
+    if session.fixed_difficulty.is_some() {
+        return;
+    }
     let now = unix_now_secs();
     session.recent_share_outcomes.push_back((now, accepted));
     // Prune by capacity (oldest first).
@@ -3652,6 +3710,7 @@ mod tests {
             worker: Some("QTestAddress.worker1".to_string()),
             pkh: Some([0x11; 20]),
             difficulty: 0.0001,
+            fixed_difficulty: None,
             current_job: None,
             current_snapshot: None,
             recent_share_ts: std::collections::VecDeque::new(),
