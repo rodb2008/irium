@@ -272,8 +272,13 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 # Per-miner hashrate over the rolling 15-min window. Uses
                 # the same formula as the aggregate hashrate so numbers
-                # are directly comparable.
-                hashrate_15m, _hr_ws = estimate_miner_hashrate(worker, accepted, diff)
+                # are directly comparable. Key the sample lookup by
+                # "{profile}:{worker}" so a wallet connected to BOTH
+                # the ASIC pool (port 3333) and the legacy pool (3335)
+                # does not contaminate a single shared deque with two
+                # different `accepted` counters — that was the root
+                # cause of hashrate_15m=0 on multi-pool miners.
+                hashrate_15m, _hr_ws = estimate_miner_hashrate(f"{profile}:{worker}", accepted, diff)
                 # PPLNS enrichment (ASIC profile only). Strip the worker
                 # suffix to get the payout address — the payout subsystem
                 # aggregates shares per-address since one wallet can
@@ -360,7 +365,10 @@ def background_sampler():
                 for worker, mstats in miners_data.items():
                     try:
                         accepted = int(mstats.get("accepted", 0) or 0)
-                        record_miner_sample(worker, accepted)
+                        # Namespace by profile so a wallet connected to
+                        # BOTH stratum services keeps separate deques per
+                        # pool. See _handle_miners for the full rationale.
+                        record_miner_sample(f"{name}:{worker}", accepted)
                     except Exception as inner_e:
                         print(
                             f"[stats-proxy] miner-sample error for "
