@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import os
 import threading
 import time
 import urllib.request
@@ -40,6 +41,16 @@ _samples = {name: deque() for name in DEFAULTS}
 # per-worker rather than per-profile. Populated by background_sampler
 # from the "miners" subobject in stratum's /metrics JSON.
 _miner_samples = {}
+
+# blocks_found_today persistence: file-backed snapshot of the lifetime
+# total_blocks_found counter as it stood at the start of the current UTC
+# day. The /stats response surfaces today's diff so the Explorer UI can
+# render a "found today" counter that resets at midnight UTC. The file
+# survives proxy restarts so a mid-day systemctl restart does not lose
+# the day's running count.
+SNAPSHOT_FILE = "/opt/irium-pool/data/blocks_today_snapshot.json"
+_today_lock = threading.Lock()
+_today_snapshot = {"utc_date": None, "lifetime_at_snapshot": 0}
 
 
 def fetch(url):
@@ -217,6 +228,70 @@ def _filter_stale_duplicates(miners):
     return out
 
 
+def _load_today_snapshot():
+    """Load the midnight snapshot from disk on startup. Silent on every
+    error path - the snapshot is best-effort and a missing/corrupt file
+    just means today's counter restarts from this point."""
+    global _today_snapshot
+    try:
+        with open(SNAPSHOT_FILE) as f:
+            data = json.load(f)
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("utc_date"), str)
+            and isinstance(data.get("lifetime_at_snapshot"), (int, float))
+        ):
+            with _today_lock:
+                _today_snapshot = {
+                    "utc_date": data["utc_date"],
+                    "lifetime_at_snapshot": int(data["lifetime_at_snapshot"]),
+                }
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+        pass
+
+
+def _save_today_snapshot():
+    """Atomic write via tmp+rename so a crashed write never corrupts the
+    snapshot file. Silent on errors - never crash the proxy for a
+    failed counter save."""
+    try:
+        os.makedirs(os.path.dirname(SNAPSHOT_FILE), exist_ok=True)
+        tmp = SNAPSHOT_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_today_snapshot, f)
+        os.replace(tmp, SNAPSHOT_FILE)
+    except OSError:
+        pass
+
+
+def _blocks_found_today(current_total):
+    """Return today's blocks-found count by diffing the current lifetime
+    counter against the start-of-UTC-day snapshot. Rolls the snapshot
+    forward when a new UTC day begins. On a cold start with no persisted
+    snapshot the first call returns 0 - we don't know how many blocks
+    were found before the proxy started observing today, so the honest
+    answer is "none observed since we started watching". Subsequent
+    calls within the same UTC day return the cumulative increase since
+    that first call (or since the persisted snapshot if it carries
+    today's date)."""
+    today_utc = time.strftime("%Y-%m-%d", time.gmtime())
+    with _today_lock:
+        if _today_snapshot["utc_date"] != today_utc:
+            _today_snapshot["utc_date"] = today_utc
+            _today_snapshot["lifetime_at_snapshot"] = int(current_total)
+            _save_today_snapshot()
+            return 0
+        diff = int(current_total) - int(_today_snapshot["lifetime_at_snapshot"])
+        # Defensive: lifetime counter shouldn't go backwards but if the
+        # upstream stratum lost state and the counter reset, re-baseline
+        # so we never surface a negative number to the UI.
+        if diff < 0:
+            _today_snapshot["lifetime_at_snapshot"] = int(current_total)
+            _save_today_snapshot()
+            return 0
+        return diff
+
+
 class Handler(BaseHTTPRequestHandler):
     # Bound per-request socket I/O so a slow/silent client cannot hold a
     # worker thread indefinitely. With plain HTTPServer the accept loop
@@ -268,6 +343,9 @@ class Handler(BaseHTTPRequestHandler):
             },
             "total_miners": asic_tcp + cpu_tcp,
             "total_blocks_found": asic.get("submit_accepted", 0) + cpu.get("submit_accepted", 0),
+            "blocks_found_today": _blocks_found_today(
+                asic.get("submit_accepted", 0) + cpu.get("submit_accepted", 0)
+            ),
         }
         body = json.dumps(data, indent=2).encode()
         self.send_response(200)
@@ -435,6 +513,7 @@ def background_sampler():
 
 
 if __name__ == "__main__":
+    _load_today_snapshot()
     threading.Thread(target=background_sampler, daemon=True).start()
     # Outer retry loop: if HTTPServer construction or serve_forever raises
     # (port temporarily unavailable, transient OS error, OOM recovery,
