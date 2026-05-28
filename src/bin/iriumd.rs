@@ -7597,7 +7597,7 @@ fn block_json_for(height: u64, block: &Block) -> Value {
             "time": header.time,
             "bits": format!("{:08x}", header.bits),
             "nonce": header.nonce,
-            "hash": hex::encode(header.hash()),
+            "hash": hex::encode(header.hash_for_height(height)),
         },
         "tx_hex": block.transactions.iter().map(|tx| hex::encode(tx.serialize())).collect::<Vec<_>>(),
         "auxpow_hex": block.auxpow.as_ref().map(|ap| hex::encode(irium_node_rs::auxpow::serialize(ap))),
