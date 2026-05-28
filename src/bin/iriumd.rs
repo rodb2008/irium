@@ -4405,6 +4405,61 @@ struct AddSeedRequest {
     addr: String,
 }
 
+/// POST /rpc/stop — graceful shutdown endpoint. Authenticated via the
+/// same Bearer-token mechanism as the other privileged RPCs AND
+/// restricted to loopback callers regardless of token validity. Both
+/// guards are required because the desktop launcher binds iriumd's
+/// RPC to 0.0.0.0:38300 to expose the marketplace feed; a leaked
+/// token must not be usable to remote-DoS arbitrary nodes.
+///
+/// On success the handler kicks off a background task that flushes
+/// peers to the runtime database, drains the persist queue (same
+/// IRIUM_PERSIST_DRAIN_SECS envelope as the SIGTERM handler, default
+/// 15 s, clamped to 20 s), then std::process::exit(0). The HTTP
+/// response (202 Accepted) is flushed before the exit so the desktop
+/// graceful-shutdown helper can confirm iriumd accepted the request.
+async fn stop_handler(
+    ConnectInfo(conn): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<Value>), StatusCode> {
+    if !conn.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    require_rpc_auth(&headers)?;
+
+    let persist_drain_secs = std::env::var("IRIUM_PERSIST_DRAIN_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(15)
+        .clamp(0, 20);
+    let p2p_for_shutdown = state.p2p.clone();
+
+    tokio::spawn(async move {
+        if let Some(ref node) = p2p_for_shutdown {
+            node.flush_peers_to_runtime().await;
+        }
+        let ok = storage::drain_persist_queue(Duration::from_secs(persist_drain_secs));
+        if ok {
+            eprintln!("[i] persist queue drained via /rpc/stop");
+        } else {
+            eprintln!(
+                "[warn] persist queue drain timeout via /rpc/stop; remaining_queue_len={}",
+                storage::persist_queue_len()
+            );
+        }
+        std::process::exit(0);
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "draining",
+            "drain_secs": persist_drain_secs,
+        })),
+    ))
+}
+
 async fn admin_add_seed(
     ConnectInfo(_conn): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -9560,6 +9615,37 @@ async fn main() {
                 }
             });
         }
+
+        // Windows ctrl_c handler — defense-in-depth for users running
+        // iriumd standalone from a console window (the path on which
+        // tokio's ctrl_c() actually fires). The Tauri-sidecar case has
+        // no console attached (CREATE_NO_WINDOW) and uses POST /rpc/stop
+        // instead. Mirrors the Unix block above except for the explicit
+        // std::process::exit after drain — Windows ctrl_c does not
+        // implicitly terminate the process the way the default SIGTERM
+        // action does on Unix.
+        #[cfg(windows)]
+        {
+            let p2p_for_shutdown = app_state.p2p.clone();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                if let Some(ref node) = p2p_for_shutdown {
+                    node.flush_peers_to_runtime().await;
+                }
+                let ok = storage::drain_persist_queue(Duration::from_secs(persist_drain_secs));
+                if ok {
+                    eprintln!("[i] persist queue drained on shutdown (Windows ctrl_c)");
+                } else {
+                    eprintln!(
+                        "[warn] persist queue drain timeout on shutdown (Windows ctrl_c); remaining_queue_len={}",
+                        storage::persist_queue_len()
+                    );
+                }
+                std::process::exit(0);
+            });
+        }
     }
 
 
@@ -10160,6 +10246,7 @@ async fn explorer_stats(
         .route("/rpc/broadcast_offer_take", post(broadcast_offer_take_rpc))
         .route("/ws", get(ws_handler))
         .route("/events", get(sse_handler))
+        .route("/rpc/stop", post(stop_handler))
         .route("/admin/add-seed", post(admin_add_seed))
         .layer(DefaultBodyLimit::max(rpc_body_limit_bytes()))
         .with_state(app_state.clone());
