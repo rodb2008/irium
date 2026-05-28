@@ -22,8 +22,14 @@ DEFAULTS = {
 # samples. We pick the oldest sample for delta computation, yielding a
 # window-sized estimate that smooths out vardiff jitter.
 WINDOW_SECS = 15 * 60
-MIN_SHARES = 4
-MIN_SECONDS = 120
+# Lowered from 4/120 (the original conservative defaults). Slow CPU
+# miners and recently-reconnected workers would never cross 4 shares
+# inside a 15-min window with vardiff at default — they perpetually
+# showed hashrate_15m=0 or null in the Explorer pool stats table. 2
+# shares is still enough to dampen single-share vardiff jitter, and 60s
+# is the shortest warmup that still excludes a same-tick poll burst.
+MIN_SHARES = 2
+MIN_SECONDS = 60
 
 _lock = threading.Lock()
 _samples = {name: deque() for name in DEFAULTS}
@@ -180,6 +186,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/miners":
             self._handle_miners()
             return
+        if self.path == "/payouts":
+            self._handle_payouts()
+            return
         if self.path not in ("/", "/stats", "/api/stats"):
             self.send_response(404)
             self.end_headers()
@@ -239,6 +248,11 @@ class Handler(BaseHTTPRequestHandler):
         """
         asic = fetch(ASIC_METRICS)
         cpu = fetch(CPU_METRICS)
+        # PPLNS standing — only the ASIC pool runs the payout subsystem
+        # right now (legacy + 443 still on the pre-PPLNS binary). Failing
+        # to fetch is non-fatal: the enrichment fields just go to None.
+        payout_view = fetch("http://127.0.0.1:3334/miners_payout")
+        payout_by_addr = (payout_view.get("by_address") or {}) if isinstance(payout_view, dict) else {}
         now = time.time()
         miners_list = []
         for profile, source_metrics in (("asic", asic), ("cpu_gpu", cpu)):
@@ -260,6 +274,14 @@ class Handler(BaseHTTPRequestHandler):
                 # the same formula as the aggregate hashrate so numbers
                 # are directly comparable.
                 hashrate_15m, _hr_ws = estimate_miner_hashrate(worker, accepted, diff)
+                # PPLNS enrichment (ASIC profile only). Strip the worker
+                # suffix to get the payout address — the payout subsystem
+                # aggregates shares per-address since one wallet can
+                # connect with multiple rig names.
+                addr = worker.split(".", 1)[0]
+                miner_payout = payout_by_addr.get(addr) if profile == "asic" else None
+                pending_shares = miner_payout.get("pending_shares") if miner_payout else None
+                estimated_payout_irm = miner_payout.get("estimated_payout_irm") if miner_payout else None
                 miners_list.append({
                     "worker": worker,
                     "profile": profile,
@@ -269,6 +291,8 @@ class Handler(BaseHTTPRequestHandler):
                     "reject_reasons": mstats.get("reject_reasons", {}) or {},
                     "hashrate_15m": hashrate_15m,
                     "last_share_ago_seconds": last_share_ago,
+                    "pending_shares": pending_shares,
+                    "estimated_payout_irm": estimated_payout_irm,
                 })
         # Sort newest-active first so the most informative rows appear at
         # the top of any consumer that doesn't sort itself.
@@ -280,6 +304,28 @@ class Handler(BaseHTTPRequestHandler):
             "miners": miners_list,
         }
         body = json.dumps(response, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_payouts(self):
+        """GET /payouts: proxy of stratum's PPLNS payout log. Returns the
+        last 50 sent/failed payouts with block height, miner address,
+        amount, share count, pct of window, and tx_id where available.
+
+        Only the ASIC pool (port 3333) runs the PPLNS subsystem; legacy
+        and 443 still operate on the pre-PPLNS binary. If the upstream
+        endpoint is unreachable the proxy returns an empty list rather
+        than 5xx — the consumer (Block Explorer pool page) renders this
+        as "no payouts yet" which is correct during cold-start.
+        """
+        payouts = fetch("http://127.0.0.1:3334/payouts")
+        if not isinstance(payouts, dict) or "payouts" not in payouts:
+            payouts = {"count": 0, "payouts": []}
+        body = json.dumps(payouts, indent=2).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
