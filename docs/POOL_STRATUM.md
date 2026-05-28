@@ -39,13 +39,22 @@ Live stats: [https://pool.iriumlabs.org/stats](https://pool.iriumlabs.org/stats)
 (active miners, accepted/rejected shares, current share difficulty per
 profile, blocks found, rolling-window hashrate estimate).
 
-**Block 23,500 hard fork (Fix 2a):** the chain activates Bitcoin-
-standard block-header serialization at block 23,500. After activation
+**Block 22,888 hard fork (Fix 2a):** the chain activates Bitcoin-
+standard block-header serialization at block 22,888. After activation
 every SHA-256d miner — Bitaxe, ASIC, T-Rex, lolMiner, NBMiner,
-cpuminer-opt — that submits a winning share earns the full block
-reward (currently 50 IRM) directly to the IRM address used as the
-Stratum worker name. This pool runs in SOLO payout mode; there is no
-pool fee.
+cpuminer-opt — can submit valid blocks.
+
+**Payout model varies by port:**
+
+- Port **3333** (ASIC) runs **PPLNS proportional payout** with a
+  **1% pool fee**. Your share of each found block's 50 IRM reward is
+  proportional to your contribution over the rolling PPLNS share
+  window. Payouts are credited to the IRM address in your Stratum
+  worker name after coinbase maturity (100 blocks).
+- Ports **3335**, **443**, and **80** run **SOLO payout mode**: when
+  one of your shares meets the network target, the full 50 IRM block
+  reward goes directly to the IRM address in your Stratum worker
+  name. There is no pool fee.
 
 ## Recommended endpoint selection
 
@@ -62,12 +71,27 @@ Recommended failover list for ASIC/strict clients:
 
 Use the DNS hostname only after operator cutover; backend IPs may change and should not be published in public miner configuration.
 
-## Payout model (SOLO)
-This pool runs in SOLO mode.
+## Payout model
+
+Port **3333** (ASIC) runs **PPLNS proportional payout** with a **1%
+pool fee**:
 
 - Your username must start with your IRM address.
-- If your share finds a valid network block, the block reward is paid to that IRM address.
-- Worker suffix (for example `.worker1`) is only for rig identification.
+- Each found block's 50 IRM reward (minus the 1% pool fee) is paid
+  proportionally per-miner based on your share contribution to the
+  rolling PPLNS share window.
+- Payouts are credited after coinbase maturity (100 blocks).
+- Worker suffix (for example `.worker1`) is only for rig
+  identification; payout is per-address.
+
+Ports **3335**, **443**, and **80** run **SOLO payout** with **no pool
+fee**:
+
+- Your username must start with your IRM address.
+- If your share finds a valid network block, the full 50 IRM block
+  reward is paid to that IRM address.
+- Worker suffix (for example `.worker1`) is only for rig
+  identification.
 
 ## Connectivity troubleshooting
 If you cannot connect:
@@ -222,7 +246,7 @@ XMRig is not applicable (RandomX algorithm, not SHA-256d).
 | | |
 |---|---|
 | **Pool address** | `pool.iriumlabs.org` |
-| **ASIC port** | `3333/tcp` (strict canonical profile, default difficulty 16) |
+| **ASIC port** | `3333/tcp` (strict canonical profile, default difficulty 10,000) |
 | **CPU/GPU port** | `3335/tcp` (legacy compat profile, default difficulty 1) |
 | **Stats endpoint** | `http://pool.iriumlabs.org:3337/` |
 | **Algorithm** | SHA-256d (double SHA-256) |
@@ -230,7 +254,7 @@ XMRig is not applicable (RandomX algorithm, not SHA-256d).
 | **Version rolling (AsicBoost)** | Not supported. Firmware that calls `mining.configure` is told `"version-rolling": false` and auto-disables AsicBoost. |
 | **Username format** | `your_irium_address.worker_name` (worker suffix optional, for rig identification) |
 | **Password** | Any non-empty string (commonly `x`) |
-| **Vardiff** | Enabled. Starts at difficulty 16 (ASIC) or 1 (CPU/GPU). Retargets every 30 s to a 15 s share interval. Range: 1 to 2048 (ASIC) / 1024 (CPU/GPU). |
+| **Vardiff** | Enabled. Starts at difficulty 10,000 (ASIC) or 1 (CPU/GPU). Retargets every 30 s to a 15 s share interval. Range: 1 to 2,000,000 (ASIC) / 1024 (CPU/GPU). |
 | **TLS** | Disabled. Connect with plain `stratum+tcp://`, not `stratum+ssl://`. |
 
 ### Example username (mainnet IRM address)

@@ -58,10 +58,10 @@ below; the bundled `irium-miner` is solo-only).
 
 ---
 
-## Important — block 23,500 hard fork
+## Important — block 22,888 hard fork
 
 The chain activates Bitcoin-standard block-header serialization at
-**block 23,500** (Fix 2a). Pre-fork, only the bundled reference miners
+**block 22,888** (Fix 2a). Pre-fork, only the bundled reference miners
 (`irium-miner`, `irium-miner-gpu`) and the official pool's
 `irium-stratum` accepted iriumd's legacy header format. Post-fork, every
 standard SHA-256d miner (Bitaxe, S19, S21, T-Rex, lolMiner, NBMiner,
@@ -69,27 +69,36 @@ cpuminer-opt, ccminer, etc.) produces valid blocks because the chain
 now hashes headers exactly like Bitcoin.
 
 **This means external ASIC and GPU miners earn real block rewards
-starting at block 23,500**, with no special firmware patches.
+starting at block 22,888**, with no special firmware patches.
 
 Make sure your iriumd is on v1.9.28 or newer (latest tag is v1.9.32 —
 see [github.com/iriumlabs/irium/releases/latest](https://github.com/iriumlabs/irium/releases/latest))
-before block 23,500 is mined; older nodes will fork off.
+before block 22,888 is mined; older nodes will fork off.
 
 ---
 
 ## Pool endpoints (official pool)
 
-`pool.iriumlabs.org` is the DNS hostname for the official Irium pool. It
-runs in **SOLO payout mode**: when one of your shares meets the network
-target, the full block reward goes directly to the IRM address you used
-as your Stratum worker name. There is no pool fee.
+`pool.iriumlabs.org` is the DNS hostname for the official Irium pool.
 
-| Port | Use for | Notes |
-|------|---------|-------|
-| **3333** | ASIC (S19, S21, Bitaxe, Whatsminer, Avalon, etc.) | Strict canonical Stratum profile, higher baseline difficulty |
-| **3335** | CPU / GPU / older Stratum clients (cpuminer-opt, ccminer) | Legacy profile, lower baseline difficulty |
-| **443** | Fallback for ISPs that block mining ports (notably China) | Same Stratum protocol, served on the HTTPS port to escape DPI filtering |
-| **80** | Optional second HTTPS-port fallback | Mirrors port 443; same protocol |
+**Payout model varies by port:**
+
+- Port **3333** (ASIC) runs **PPLNS proportional payout** with a **1%
+  pool fee**. Your share of each found block's reward is proportional
+  to your contribution over the rolling PPLNS share window. The pool
+  wallet collects the coinbase and pays out per-miner after coinbase
+  maturity (100 blocks).
+- Ports **3335**, **443**, and **80** run **SOLO payout mode**: when
+  one of your shares meets the network target, the full block reward
+  goes directly to the IRM address you used as your Stratum worker
+  name. There is no pool fee.
+
+| Port | Use for | Payout |
+|------|---------|--------|
+| **3333** | ASIC (S19, S21, Bitaxe, Whatsminer, Avalon, etc.). Strict canonical Stratum profile, higher baseline difficulty. | PPLNS, 1% fee |
+| **3335** | CPU / GPU / older Stratum clients (cpuminer-opt, ccminer). Legacy profile, lower baseline difficulty. | SOLO, no fee |
+| **443** | Fallback for ISPs that block mining ports (notably China). Same Stratum protocol on the HTTPS port to escape DPI filtering. | SOLO, no fee |
+| **80** | Optional second HTTPS-port fallback. Mirrors port 443; same protocol. | SOLO, no fee |
 
 **Worker name format:** `<IRM_ADDRESS>.<worker_id>` — for example
 `Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa.rig1`. The worker suffix is for
@@ -120,7 +129,7 @@ Bitaxe (Antminer S19-compatible firmware) web UI:
 | Algorithm | SHA-256 / SHA-256d |
 | TLS | OFF |
 
-After block 23,500 the Bitaxe earns IRM block rewards directly to the
+After block 22,888 the Bitaxe earns IRM block rewards directly to the
 address you set as the Stratum user.
 
 For S19/S21 firmware, the equivalent commit fields are:
@@ -178,7 +187,7 @@ irium-miner-gpu \
 
 The bundled miner accepts the same Stratum URL as the third-party
 miners above and was the only client that could find blocks pre-fork.
-After block 23,500 it has no special advantage over T-Rex / lolMiner /
+After block 22,888 it has no special advantage over T-Rex / lolMiner /
 NBMiner.
 
 ---
@@ -238,13 +247,15 @@ specific GPU set.
 
 ### Solo via any standard SHA-256d miner (post-fork)
 
-After block 23,500, you can also run any standard SHA-256d miner
-(cpuminer-opt, ccminer, T-Rex) directly against iriumd's built-in solo
-Stratum bridge:
+After block 22,888, you can also run any standard SHA-256d miner
+(cpuminer-opt, ccminer, T-Rex) directly against the solo Stratum
+bridge. The bridge lives in `irium-miner --solo-stratum`, NOT in
+iriumd itself — iriumd exposes only HTTP RPC on port 38300 and has
+no Stratum listener of its own.
 
 ```
-# Start iriumd's solo stratum bridge:
-iriumd  # default solo stratum bound to 127.0.0.1:3333
+# Start the solo Stratum bridge (binds 0.0.0.0:3333 by default).
+irium-miner --solo-stratum --listen 0.0.0.0:3333
 
 # Point your miner at it:
 t-rex -a sha256d -o stratum+tcp://127.0.0.1:3333 -u <YOUR_IRM_ADDRESS>.local -p x
@@ -288,7 +299,7 @@ target block time).
 | Many `rejected_low_difficulty` shares | Hardware below baseline diff | Use port 3335 (lower baseline) instead of 3333 |
 | Many `rejected_stale` shares | High network latency or miner clock skew | Sync system clock (NTP); check round-trip latency to `pool.iriumlabs.org` |
 | Block found but no reward credit yet | Coinbase maturity (100 blocks ≈ 3 hours) | Wait; or `irium-wallet history <address>` to see unmatured coinbase |
-| Pre-fork: standard SHA-256d miner finds shares but no blocks | Header hashing differs pre-Fix-2a | Wait for block 23,500; or use bundled `irium-miner` until then |
+| Pre-fork: standard SHA-256d miner finds shares but no blocks | Header hashing differs pre-Fix-2a | Wait for block 22,888; or use bundled `irium-miner` until then |
 
 ---
 
