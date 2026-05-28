@@ -40,25 +40,6 @@ const LWMA_CHANGE_THRESHOLD: f64 = 0.05;
 const LWMA_INTERVAL_CLAMP_MULTIPLIER: u64 = 4;
 
 // ============================================================
-// Vardiff RESCUE constants
-// ============================================================
-// Defensive supplement to LWMA vardiff: when a miner's rolling reject
-// rate climbs above RESCUE_TRIGGER_PCT and their assigned difficulty is
-// above RESCUE_DIFF_FLOOR, drop their diff by (1 - RESCUE_REDUCTION_FACTOR)
-// to give the miner a chance to recover from stale-share blowback that
-// LWMA alone cannot diagnose (because LWMA only sees ACCEPTED share
-// intervals, not the rejection rate).
-const RESCUE_TRIGGER_PCT: f64 = 99.9;
-const RESCUE_RECOVER_PCT: f64 = 30.0;
-const RESCUE_REDUCTION_FACTOR: f64 = 0.5;
-const RESCUE_DIFF_FLOOR: f64 = 524288.0;
-const RESCUE_COOLDOWN_SECS: u64 = 20;
-const RESCUE_MIN_SAMPLES: usize = 20;
-const RESCUE_MIN_WINDOW_SECS: u64 = 120;
-const RESCUE_SAMPLE_CAP: usize = 200;
-const RESCUE_MAX_AGE_SECS: u64 = 300;
-
-// ============================================================
 // Variant-scanner disconnect threshold
 // ============================================================
 // When a session accumulates this many CONSECUTIVE share rejections
@@ -403,8 +384,8 @@ struct SessionState {
     difficulty: f64,
     /// When Some, the session is using a miner-controlled fixed difficulty
     /// (set via a "d=NNNN" token in the stratum authorize password).
-    /// Both LWMA vardiff and the rescue path bypass sessions with this
-    /// set so the miner's chosen difficulty is preserved.
+    /// LWMA vardiff bypasses sessions with this set so the miner's chosen
+    /// difficulty is preserved.
     fixed_difficulty: Option<f64>,
     current_job: Option<Job>,
     current_snapshot: Option<CanonicalJobSnapshot>,
@@ -420,18 +401,6 @@ struct SessionState {
     /// not currently rotate extranonce1 mid-session - that ack alone is
     /// what unblocks the J19+ AsicBoost xnonce idle-wait state.
     wants_extranonce_updates: bool,
-    /// Rolling per-session share outcome history for the vardiff rescue
-    /// path. Each entry: (timestamp_unix_secs, accepted). Bounded by
-    /// RESCUE_SAMPLE_CAP and RESCUE_MAX_AGE_SECS.
-    recent_share_outcomes: VecDeque<(u64, bool)>,
-    /// Unix seconds of the most recent vardiff-rescue reduction.
-    /// Enforces RESCUE_COOLDOWN_SECS between reductions.
-    last_rescue_at: u64,
-    /// True while the session is in the rescued state. Cleared once
-    /// rolling reject rate drops below RESCUE_RECOVER_PCT. Used by
-    /// maybe_update_vardiff_after_accepted_share to suppress LWMA
-    /// RAISES during the rescue window (lowers still permitted).
-    rescue_active: bool,
     /// Consecutive count of share rejections where the variant scanner
     /// found no matching byte-order combination (chosen_variant=none).
     /// Reset to 0 on any accepted share. When this reaches
@@ -1622,9 +1591,6 @@ async fn handle_conn(
         coinbase_bip34: config.coinbase_bip34,
         adapter_kind: select_adapter_kind(&config),
         wants_extranonce_updates: false,
-        recent_share_outcomes: VecDeque::with_capacity(RESCUE_SAMPLE_CAP),
-        last_rescue_at: 0,
-        rescue_active: false,
         consecutive_variant_none: 0,
     };
 
@@ -2343,7 +2309,6 @@ async fn handle_submit_cpuminer_compat(
         }
         mark_rejected_share();
         record_miner_share_rejected(&worker, REJECT_REASON_LOW_POW);
-        maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         warn!(
             "[SHARE_REJECTED] worker={} adapter_id={} rewardable={} reason=low_difficulty job={} extranonce2={} ntime={} nonce={} raw_submitted_hash={} canonical_hash={} share_target={} block_target={} template_fingerprint={}",
             worker,
@@ -2410,7 +2375,6 @@ async fn handle_submit_cpuminer_compat(
         }
     }
 
-    maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, true).await;
     maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
     Ok(true)
 }
@@ -2534,7 +2498,6 @@ async fn handle_submit_native_rewardable(
     if !solve.share_ok {
         mark_rejected_share();
         record_miner_share_rejected(&worker, REJECT_REASON_LOW_POW);
-        maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         warn!(
             "[share] reject worker={} adapter_id={} reason=low_difficulty",
             worker,
@@ -2632,7 +2595,6 @@ async fn handle_submit_native_rewardable(
         }
     }
 
-    maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, true).await;
     maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
     Ok(true)
 }
@@ -2671,13 +2633,11 @@ async fn handle_submit_auxpow(
             mark_accepted_share();
             record_miner_share_accepted(&worker, session.difficulty);
             warn!("[AUXPOW_SHARE_SOFT_ACCEPTED] worker={}", worker);
-            maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, true).await;
             maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
             return Ok(true);
         }
         mark_rejected_share();
         record_miner_share_rejected(&worker, REJECT_REASON_LOW_POW);
-        maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         warn!("[AUXPOW_SHARE_REJECTED] worker={} reason=low_difficulty hash={}", worker, hex::encode(parent_hash_display));
         return Err(anyhow!("low_difficulty"));
     }
@@ -2772,7 +2732,6 @@ async fn handle_submit_auxpow(
         }
     }
 
-    maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, true).await;
     maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
     Ok(true)
 }
@@ -2811,7 +2770,6 @@ async fn handle_submit_legacy_rewardable(
         );
         mark_rejected_share();
         record_miner_share_rejected(&worker, REJECT_REASON_STALE_JOB);
-        maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         return Err(anyhow!(
             "__STALE_SHARE__: submitted job {} != current job {}",
             submit.job_id,
@@ -2850,7 +2808,6 @@ async fn handle_submit_legacy_rewardable(
         );
         mark_rejected_share();
         record_miner_share_rejected(&worker, REJECT_REASON_STALE_HEIGHT);
-        maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         return Err(anyhow!(
             "__STALE_SHARE__: job height {} is {} blocks behind chain height {}",
             job.height,
@@ -3180,7 +3137,6 @@ async fn handle_submit_legacy_rewardable(
     } else {
         mark_rejected_share();
         record_miner_share_rejected(&worker, REJECT_REASON_LOW_POW);
-        maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, false).await;
         warn!("{}", check_line);
         warn!("[share] reject worker={} reason=low_difficulty", worker);
         session.consecutive_variant_none =
@@ -3291,7 +3247,6 @@ async fn handle_submit_legacy_rewardable(
         }
     }
 
-    maybe_apply_vardiff_rescue(conn_id, wr, session, &worker, true).await;
     maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
     Ok(true)
 }
@@ -3365,15 +3320,6 @@ async fn maybe_update_vardiff_after_accepted_share(
         .max(config.vardiff_min_diff)
         .min(config.vardiff_max_diff);
 
-    // Rescue-aware suppression: while a session is in the rescued
-    // state, LWMA must NOT raise diff (the whole point of the rescue
-    // is to give the miner a lower diff to recover at). Lowers are
-    // still allowed - if the miner is legitimately slowing down, an
-    // additional drop is helpful, not harmful.
-    if session.rescue_active && new_diff > session.difficulty {
-        return Ok(());
-    }
-
     // Suppress no-op micro-adjustments — those just cost the miner
     // stale shares for no benefit.
     let rel_change = ((new_diff - session.difficulty) / session.difficulty).abs();
@@ -3410,119 +3356,6 @@ async fn send_set_difficulty(
     );
     let msg = json!({"id": Value::Null, "method": "mining.set_difficulty", "params": [diff]});
     write_json(wr, &msg).await
-}
-
-// Vardiff RESCUE - called after every share submission (accepted OR
-// rejected), runs alongside the LWMA path which fires only on accepts.
-//
-// Errors from send_set_difficulty are logged via warn! and swallowed -
-// this function MUST NOT propagate errors because callers at reject
-// sites depend on the caller's existing Err(anyhow!) value (containing
-// e.g. the "__STALE_SHARE__" marker that the dispatch layer maps to
-// Stratum error code 21). The rate-tracking side effect always runs
-// regardless of write failures.
-async fn maybe_apply_vardiff_rescue(
-    conn_id: u64,
-    wr: &mut tokio::net::tcp::OwnedWriteHalf,
-    session: &mut SessionState,
-    worker: &str,
-    accepted: bool,
-) {
-    // Miner-controlled fixed difficulty bypasses the rescue path so the
-    // pool never silently lowers a diff the miner explicitly requested.
-    if session.fixed_difficulty.is_some() {
-        return;
-    }
-    let now = unix_now_secs();
-    session.recent_share_outcomes.push_back((now, accepted));
-    // Prune by capacity (oldest first).
-    while session.recent_share_outcomes.len() > RESCUE_SAMPLE_CAP {
-        session.recent_share_outcomes.pop_front();
-    }
-    // Prune by max age.
-    while let Some(&(ts, _)) = session.recent_share_outcomes.front() {
-        if now.saturating_sub(ts) > RESCUE_MAX_AGE_SECS {
-            session.recent_share_outcomes.pop_front();
-        } else {
-            break;
-        }
-    }
-
-    // Sessions at or below the safe floor are exempt.
-    if session.difficulty <= RESCUE_DIFF_FLOOR {
-        return;
-    }
-
-    // Window N = max(RESCUE_MIN_SAMPLES, count_in_last_2_min). The window
-    // grows to satisfy the LARGER of "at least 20 shares" OR "last 2 min".
-    let two_min_ago = now.saturating_sub(RESCUE_MIN_WINDOW_SECS);
-    let count_in_2min = session
-        .recent_share_outcomes
-        .iter()
-        .filter(|(ts, _)| *ts >= two_min_ago)
-        .count();
-    let target_n = std::cmp::max(RESCUE_MIN_SAMPLES, count_in_2min);
-    if session.recent_share_outcomes.len() < target_n {
-        return;
-    }
-
-    // Walk last target_n outcomes newest-first.
-    let mut accepted_count: u64 = 0;
-    let mut rejected_count: u64 = 0;
-    for &(_, ok) in session
-        .recent_share_outcomes
-        .iter()
-        .rev()
-        .take(target_n)
-    {
-        if ok {
-            accepted_count += 1;
-        } else {
-            rejected_count += 1;
-        }
-    }
-    let total = accepted_count + rejected_count;
-    if total == 0 {
-        return;
-    }
-    let reject_rate_pct = (rejected_count as f64) / (total as f64) * 100.0;
-
-    // Recovery first - so a recovered session doesn't immediately re-arm
-    // rescue on a single bad share.
-    if session.rescue_active && reject_rate_pct < RESCUE_RECOVER_PCT {
-        session.rescue_active = false;
-    }
-
-    // Trigger: rate above threshold AND not within cooldown.
-    if reject_rate_pct > RESCUE_TRIGGER_PCT {
-        if now.saturating_sub(session.last_rescue_at) < RESCUE_COOLDOWN_SECS {
-            return;
-        }
-        let old_diff = session.difficulty;
-        let new_diff = (old_diff * RESCUE_REDUCTION_FACTOR).max(RESCUE_DIFF_FLOOR);
-        if new_diff < old_diff {
-            session.difficulty = new_diff;
-            session.last_rescue_at = now;
-            session.rescue_active = true;
-            warn!(
-                "[vardiff-rescue] worker={} old_diff={} new_diff={} reject_rate_pct={} reason=rescue",
-                worker, old_diff, new_diff, reject_rate_pct
-            );
-            if let Err(e) = send_set_difficulty(
-                wr,
-                conn_id,
-                session.worker.as_deref(),
-                session.difficulty,
-            )
-            .await
-            {
-                warn!(
-                    "[vardiff-rescue] worker={} send_set_difficulty failed: {}",
-                    worker, e
-                );
-            }
-        }
-    }
 }
 
 async fn send_notify(
@@ -3750,9 +3583,6 @@ mod tests {
             coinbase_bip34: true,
             adapter_kind: mode,
             wants_extranonce_updates: false,
-            recent_share_outcomes: std::collections::VecDeque::new(),
-            last_rescue_at: 0,
-            rescue_active: false,
             consecutive_variant_none: 0,
         }
     }
