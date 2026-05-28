@@ -22,13 +22,13 @@ DEFAULTS = {
 # samples. We pick the oldest sample for delta computation, yielding a
 # window-sized estimate that smooths out vardiff jitter.
 WINDOW_SECS = 15 * 60
-# Lowered from 4/120 (the original conservative defaults). Slow CPU
-# miners and recently-reconnected workers would never cross 4 shares
-# inside a 15-min window with vardiff at default — they perpetually
-# showed hashrate_15m=0 or null in the Explorer pool stats table. 2
-# shares is still enough to dampen single-share vardiff jitter, and 60s
-# is the shortest warmup that still excludes a same-tick poll burst.
-MIN_SHARES = 2
+# MIN_SHARES lowered from 2 to 1 (was 2, originally 4). At 2, sporadic
+# CPU miners producing ~1 share per 15-min window silently dropped to 0
+# H/s even with a share just seconds old, because the deque's oldest
+# accepted_count was N-1 and delta=1 fell below the threshold. 1 share
+# is enough to surface a rough rate; delta_shares=0 still yields 0 via
+# the formula (correctly indicates a truly idle worker).
+MIN_SHARES = 1
 MIN_SECONDS = 60
 
 _lock = threading.Lock()
