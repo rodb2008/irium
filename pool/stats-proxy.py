@@ -200,23 +200,28 @@ def _is_stale_session(m):
 
 
 def _filter_stale_duplicates(miners):
-    """Drop stale rows whose base address (the part before the first
-    dot in the worker name) has a peer with a more-recent
-    last_share_ago_seconds. Solo rows for a base address are kept even
-    when stale - the row's session_status field already signals that
-    state to the UI, and removing it would hide a wallet that simply
-    has no active session right now."""
-    by_base = {}
+    """Drop stale rows whose (base_address, profile) tuple has a peer
+    with a more-recent last_share_ago_seconds. Grouping by the tuple
+    rather than the base address alone means a wallet connected to BOTH
+    the ASIC pool (port 3333) AND the legacy CPU/GPU pool (3335) under
+    the same address keeps separate rows per profile - the ASIC session
+    and the legacy session are genuinely different mining contexts and
+    should both surface in the UI. Within a single profile, a stale row
+    with a more-recent peer is still dropped (the original intent: kill
+    yesterday's leftover session after the miner reconnected). Solo rows
+    are kept even when stale so a wallet with no active session in
+    either profile is still visible."""
+    by_key = {}
     for m in miners:
-        base = m["worker"].split(".", 1)[0]
-        by_base.setdefault(base, []).append(m)
+        key = (m["worker"].split(".", 1)[0], m.get("profile"))
+        by_key.setdefault(key, []).append(m)
 
     def recency(m):
         ls = m.get("last_share_ago_seconds")
         return ls if ls is not None else 10**9
 
     out = []
-    for group in by_base.values():
+    for group in by_key.values():
         if len(group) <= 1:
             out.extend(group)
             continue
