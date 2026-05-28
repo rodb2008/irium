@@ -173,6 +173,50 @@ def estimate_miner_hashrate(worker, accepted_now, diff):
     return (hashrate_hps, int(delta_seconds))
 
 
+def _is_stale_session(m):
+    """A miner row is 'stale' when its last share was over 10 minutes
+    ago AND its rolling 15-min hashrate is zero or null. A
+    last_share_ago_seconds value of None means the worker has never
+    submitted a share - we treat that as 'just connected' rather than
+    stale so a freshly-authorized session is not hidden."""
+    ls = m.get("last_share_ago_seconds")
+    hr = m.get("hashrate_15m")
+    return (
+        ls is not None
+        and ls > 600
+        and (hr is None or hr == 0)
+    )
+
+
+def _filter_stale_duplicates(miners):
+    """Drop stale rows whose base address (the part before the first
+    dot in the worker name) has a peer with a more-recent
+    last_share_ago_seconds. Solo rows for a base address are kept even
+    when stale - the row's session_status field already signals that
+    state to the UI, and removing it would hide a wallet that simply
+    has no active session right now."""
+    by_base = {}
+    for m in miners:
+        base = m["worker"].split(".", 1)[0]
+        by_base.setdefault(base, []).append(m)
+
+    def recency(m):
+        ls = m.get("last_share_ago_seconds")
+        return ls if ls is not None else 10**9
+
+    out = []
+    for group in by_base.values():
+        if len(group) <= 1:
+            out.extend(group)
+            continue
+        most_recent_age = min(recency(m) for m in group)
+        for m in group:
+            if _is_stale_session(m) and recency(m) > most_recent_age:
+                continue
+            out.append(m)
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     # Bound per-request socket I/O so a slow/silent client cannot hold a
     # worker thread indefinitely. With plain HTTPServer the accept loop
@@ -299,6 +343,16 @@ class Handler(BaseHTTPRequestHandler):
                     "pending_shares": pending_shares,
                     "estimated_payout_irm": estimated_payout_irm,
                 })
+        # Annotate session_status on every row so the UI can render an
+        # "active" vs "stale" pill regardless of whether the row
+        # survives the dedup filter below. Stale = no shares for over
+        # 10 minutes AND zero/null rolling hashrate.
+        for m in miners_list:
+            m["session_status"] = "stale" if _is_stale_session(m) else "active"
+        # Drop redundant stale entries: when the same base address has
+        # both a stale row and a more-recent peer, the stale row is a
+        # yesterday's-session leftover that just clutters the UI.
+        miners_list = _filter_stale_duplicates(miners_list)
         # Sort newest-active first so the most informative rows appear at
         # the top of any consumer that doesn't sort itself.
         miners_list.sort(
