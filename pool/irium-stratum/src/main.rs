@@ -1,6 +1,5 @@
 mod block;
 mod events;
-mod payout;
 mod pow;
 mod stratum;
 mod template;
@@ -148,22 +147,6 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(3600);
 
-    // Solo pool mode (per-session coinbase payout to worker address). When
-    // enabled, each connecting miner authorizes with their own Irium address
-    // as the worker username; the coinbase emits two outputs — worker reward
-    // (99%) and pool fee (1%, configurable via IRIUM_STRATUM_SOLO_FEE_BPS).
-    // PPLNS share-window queuing is bypassed in this mode because the
-    // coinbase already pays the worker directly at block-find time.
-    let solo_mode = env::var("IRIUM_STRATUM_SOLO_MODE")
-        .ok()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    let solo_pool_fee_bps = env::var("IRIUM_STRATUM_SOLO_FEE_BPS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(100)
-        .min(10_000);
-
     if default_diff_raw < 1.0 {
         warn!(
             "[config] STRATUM_DEFAULT_DIFF={} below diff1; clamped to 1",
@@ -214,25 +197,7 @@ async fn main() -> Result<()> {
         conn_window_secs,
         ban_threshold,
         ban_duration_secs,
-        solo_mode,
-        solo_pool_fee_bps,
     };
-
-    if solo_mode {
-        tracing::info!(
-            "[config] solo_mode=on solo_pool_fee_bps={} bind={}",
-            solo_pool_fee_bps, cfg.bind
-        );
-    }
-
-    // Spawn PPLNS payout maturity-poller in the background. It polls
-    // iriumd /status every 30s and processes any pending blocks that have
-    // reached coinbase maturity (block_height + 100). See payout.rs for
-    // the full two-stage design. Both args are cloned because run() takes
-    // cfg by value and consumes it.
-    let payout_rpc_base = cfg.rpc_base.clone();
-    let payout_rpc_token = cfg.rpc_token.clone();
-    tokio::spawn(payout::maturity_poller(payout_rpc_base, payout_rpc_token));
 
     run(cfg).await
 }

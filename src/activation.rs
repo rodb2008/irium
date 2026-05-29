@@ -31,6 +31,59 @@ pub const MAINNET_LWMA_V2_ACTIVATION_HEIGHT: Option<u64> = Some(19_740);
 /// before the first AuxPoW block can appear.
 pub const MAINNET_AUXPOW_ACTIVATION_HEIGHT: Option<u64> = Some(26_500);
 
+/// Mainnet Bitcoin SPV header relay activation height (Phase 1).
+///
+/// `None` keeps the BTC SPV header relay disabled on mainnet. When this is
+/// set to `Some(<height>)`, iriumd blocks at or after that height may carry
+/// a `BtcHeaderBatch` output (script tag `0xc4`) and the validator will
+/// apply such batches into `ChainState.btc_headers`.
+///
+/// Phase 1 ships disabled. Activation requires a dedicated commit and
+/// release per the workflow in docs/htlcv1_activation_commit_workflow.md.
+pub const MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// Mainnet anchor for the BTC SPV header relay.
+///
+/// All four values are zero until the relay is activated on mainnet. They
+/// must be set together (a known finalized BTC mainnet block) at the same
+/// time as `MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT`.
+#[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
+pub const MAINNET_BTC_ANCHOR_HEIGHT: u64 = 0;
+#[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
+pub const MAINNET_BTC_ANCHOR_HASH: [u8; 32] = [0u8; 32];
+#[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
+pub const MAINNET_BTC_ANCHOR_BITS: u32 = 0;
+#[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
+pub const MAINNET_BTC_ANCHOR_TIME: u32 = 0;
+
+/// Mainnet HtlcBtcSwapV1 activation height (Phase 2).
+///
+/// `None` keeps the BTC-proof claim path disabled on mainnet. When set to
+/// `Some(<height>)`, blocks at or after that height may carry HtlcBtcSwapV1
+/// outputs (script tag `0xc3`) and the validator will accept BTC-proof
+/// claim witnesses against them.
+///
+/// Phase 2 ships disabled. Activation requires:
+/// 1. The BTC SPV relay being active (so headers and merkle proofs can be
+///    verified). Setting this height before
+///    `MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT` is meaningless because no
+///    proofs would resolve.
+/// 2. A dedicated activation commit per the workflow in
+///    docs/htlcv1_activation_commit_workflow.md.
+pub const MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// Mainnet SwapOrder activation height (Phase 3).
+///
+/// `None` keeps the on-chain order book disabled on mainnet. When set to
+/// `Some(<height>)`, blocks at or after that height may carry SwapOrder
+/// outputs (script tag `0xc5`) and the validator will accept Fill /
+/// Cancel / ExpireSweep witnesses against them.
+///
+/// Phase 3 ships disabled. Sell-direction fills emit `HtlcBtcSwapV1`
+/// outputs, so this should not be activated before HtlcBtcSwapV1 — the
+/// fill covenant would otherwise reject every spend.
+pub const MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = None;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkKind {
     Mainnet,
@@ -103,6 +156,57 @@ pub fn resolved_auxpow_activation_height(network: NetworkKind) -> Option<u64> {
     match network {
         NetworkKind::Mainnet => MAINNET_AUXPOW_ACTIVATION_HEIGHT,
         NetworkKind::Testnet | NetworkKind::Devnet => runtime_auxpow_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the BTC SPV header relay activation height.
+/// Read from `IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once Phase 1 callers come online
+pub fn runtime_btc_spv_relay_env_override() -> Option<u64> {
+    env::var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once Phase 1 callers come online
+pub fn resolved_btc_spv_relay_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_btc_spv_relay_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the HtlcBtcSwapV1 activation height.
+/// Read from `IRIUM_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once Phase 2 callers come online
+pub fn runtime_htlc_btc_swap_v1_env_override() -> Option<u64> {
+    env::var("IRIUM_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once Phase 2 callers come online
+pub fn resolved_htlc_btc_swap_v1_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_htlc_btc_swap_v1_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the SwapOrder activation height.
+/// Read from `IRIUM_SWAP_ORDER_V1_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once Phase 3 callers come online
+pub fn runtime_swap_order_v1_env_override() -> Option<u64> {
+    env::var("IRIUM_SWAP_ORDER_V1_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once Phase 3 callers come online
+pub fn resolved_swap_order_v1_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_swap_order_v1_env_override(),
     }
 }
 
@@ -263,5 +367,116 @@ mod tests {
             Some(1000)
         );
         std::env::remove_var("IRIUM_AUXPOW_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn mainnet_btc_spv_relay_height_is_none() {
+        assert_eq!(
+            MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT, None,
+            "Phase 1 ships disabled on mainnet"
+        );
+        assert_eq!(
+            resolved_btc_spv_relay_activation_height(NetworkKind::Mainnet),
+            None
+        );
+    }
+
+    #[test]
+    fn mainnet_ignores_btc_spv_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT", "12345");
+        let resolved = resolved_btc_spv_relay_activation_height(NetworkKind::Mainnet);
+        std::env::remove_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT");
+        assert_eq!(resolved, MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn non_mainnet_uses_btc_spv_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT", "50");
+        assert_eq!(
+            resolved_btc_spv_relay_activation_height(NetworkKind::Devnet),
+            Some(50)
+        );
+        assert_eq!(
+            resolved_btc_spv_relay_activation_height(NetworkKind::Testnet),
+            Some(50)
+        );
+        std::env::remove_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn mainnet_htlc_btc_swap_v1_height_is_none() {
+        assert_eq!(
+            MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT, None,
+            "Phase 2 ships disabled on mainnet"
+        );
+        assert_eq!(
+            resolved_htlc_btc_swap_v1_activation_height(NetworkKind::Mainnet),
+            None
+        );
+    }
+
+    #[test]
+    fn mainnet_ignores_htlc_btc_swap_v1_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT", "777");
+        let resolved = resolved_htlc_btc_swap_v1_activation_height(NetworkKind::Mainnet);
+        std::env::remove_var("IRIUM_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT");
+        assert_eq!(resolved, MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn non_mainnet_uses_htlc_btc_swap_v1_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT", "777");
+        assert_eq!(
+            resolved_htlc_btc_swap_v1_activation_height(NetworkKind::Devnet),
+            Some(777)
+        );
+        assert_eq!(
+            resolved_htlc_btc_swap_v1_activation_height(NetworkKind::Testnet),
+            Some(777)
+        );
+        std::env::remove_var("IRIUM_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn mainnet_swap_order_v1_height_is_none() {
+        assert_eq!(
+            MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT, None,
+            "Phase 3 ships disabled on mainnet"
+        );
+        assert_eq!(
+            resolved_swap_order_v1_activation_height(NetworkKind::Mainnet),
+            None
+        );
+    }
+
+    #[test]
+    fn mainnet_ignores_swap_order_v1_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_SWAP_ORDER_V1_ACTIVATION_HEIGHT", "4242");
+        let resolved = resolved_swap_order_v1_activation_height(NetworkKind::Mainnet);
+        std::env::remove_var("IRIUM_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
+        assert_eq!(resolved, MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn non_mainnet_uses_swap_order_v1_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_SWAP_ORDER_V1_ACTIVATION_HEIGHT", "111");
+        assert_eq!(
+            resolved_swap_order_v1_activation_height(NetworkKind::Devnet),
+            Some(111)
+        );
+        assert_eq!(
+            resolved_swap_order_v1_activation_height(NetworkKind::Testnet),
+            Some(111)
+        );
+        std::env::remove_var("IRIUM_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
     }
 }

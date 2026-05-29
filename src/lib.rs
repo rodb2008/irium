@@ -3,6 +3,8 @@ pub mod attestor_bond;
 pub mod auxpow;
 pub mod anchors;
 pub mod block;
+pub mod btc_spv;
+pub mod btc_tx_parse;
 pub mod chain;
 pub mod constants;
 pub mod genesis;

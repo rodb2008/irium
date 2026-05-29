@@ -2,6 +2,8 @@ mod activation;
 mod auxpow;
 mod anchors;
 mod block;
+mod btc_spv;
+mod btc_tx_parse;
 mod chain;
 mod constants;
 mod genesis;
@@ -49,6 +51,9 @@ fn main() {
         lwma_v2: resolved_lwma_v2_activation_height(network)
             .map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: crate::activation::resolved_auxpow_activation_height(network),
+            btc_spv: None,
+            htlc_btc_swap_v1_activation_height: None,
+            swap_order_v1_activation_height: None,
     };
 
     let state = ChainState::new(params);

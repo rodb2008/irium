@@ -13,6 +13,55 @@ pub const MPSO_V1_TAG: u8 = 0xc1;
 pub const MPSO_V1_MAX_SCRIPT_SIZE: usize = 640;
 pub const MPSO_V1_MAX_WITNESS_SIZE: usize = 768;
 
+pub const HTLC_BTC_SWAP_V1_TAG: u8 = 0xc3;
+pub const HTLC_BTC_SWAP_V1_VERSION: u8 = 1;
+pub const HTLC_BTC_SWAP_V1_SCRIPT_LEN: usize = 87;
+
+/// Witness branch selectors inside the HtlcBtcSwapV1 namespace. These
+/// reuse the 0x01/0x02 numeric values that HTLCv1 uses, but they live in
+/// a separate parser (`parse_htlc_btc_swap_witness`) invoked only when the
+/// output type has already been identified as HtlcBtcSwapV1.
+pub const HTLC_BTC_SWAP_WITNESS_CLAIM: u8 = 1;
+pub const HTLC_BTC_SWAP_WITNESS_REFUND: u8 = 2;
+
+/// 6-byte ASCII magic prefixing the OP_RETURN binding payload an HtlcBtcSwap
+/// payment must carry. Total OP_RETURN payload is `magic || funding_binding`
+/// (14 bytes), well inside Bitcoin Core's 80-byte OP_RETURN standardness limit.
+pub const BTC_OP_RETURN_BINDING_MAGIC: [u8; 6] = *b"irmswp";
+pub const BTC_OP_RETURN_BINDING_LEN: usize = 14;
+
+/// Bounds on `confirmations_required` in an HtlcBtcSwapV1 output. 1 is the
+/// loose-trust minimum (one BTC confirmation); 144 is roughly one day at
+/// BTC's 10-minute target, more than enough margin for reorg safety.
+pub const MIN_HTLC_BTC_SWAP_CONFIRMATIONS: u8 = 1;
+pub const MAX_HTLC_BTC_SWAP_CONFIRMATIONS: u8 = 144;
+
+pub const SWAP_ORDER_V1_TAG: u8 = 0xc5;
+pub const SWAP_ORDER_V1_VERSION: u8 = 1;
+pub const SWAP_ORDER_DIRECTION_SELL: u8 = 0x01;
+pub const SWAP_ORDER_DIRECTION_BUY: u8 = 0x02;
+pub const SWAP_ORDER_SELL_SCRIPT_LEN: usize = 76;
+pub const SWAP_ORDER_BUY_SCRIPT_LEN: usize = 108;
+
+/// Witness branch selectors inside the SwapOrder namespace. Parsed only
+/// from inside the SwapOrder match arm of `verify_transaction_signature`
+/// via `parse_swap_order_witness`, so the numeric values do not collide
+/// with HTLCv1's or HtlcBtcSwapV1's same-numbered branches.
+pub const SWAP_ORDER_WITNESS_FILL: u8 = 0x01;
+pub const SWAP_ORDER_WITNESS_CANCEL: u8 = 0x02;
+pub const SWAP_ORDER_WITNESS_EXPIRE_SWEEP: u8 = 0x03;
+
+/// Floor on a SwapOrder output's locked value. Sell-IRM orders lock the
+/// full irm_amount and almost always exceed this; buy-IRM orders use a
+/// small anti-spam value and must clear the same floor so an expire-sweep
+/// has room for `SWAP_ORDER_MAX_SWEEP_FEE`.
+pub const SWAP_ORDER_MIN_LOCKED_VALUE: u64 = 1100;
+
+/// Maximum gap (in sats) between the SwapOrder UTXO's value and the
+/// expire-sweep payout to the maker. The gap becomes block-miner tx fee,
+/// compensating whoever broadcasts the sweep.
+pub const SWAP_ORDER_MAX_SWEEP_FEE: u64 = 1000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxInput {
     pub prev_txid: [u8; 32],
@@ -105,11 +154,85 @@ pub struct MpsoV1Output {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtlcBtcSwapV1Output {
+    pub confirmations_required: u8,
+    pub recipient_pkh: [u8; 20],
+    pub refund_pkh: [u8; 20],
+    pub btc_recipient_pkh: [u8; 20],
+    pub btc_amount_sats: u64,
+    pub timeout_height: u64,
+    pub funding_binding: [u8; 8],
+}
+
+/// SwapOrder lifecycle object: on-chain advertised offer to swap IRM<->BTC.
+/// Sell-IRM (`direction=0x01`) outputs lock `irm_amount` for a taker to
+/// claim via a covenant-enforced HtlcBtcSwapV1 fill. Buy-IRM
+/// (`direction=0x02`) outputs lock anti-spam value and carry the
+/// maker-chosen `expected_hash` hashlock commitment in the script tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwapOrderOutput {
+    pub direction: u8,
+    pub confirmations_required: u8,
+    pub irm_amount: u64,
+    pub btc_amount_sats: u64,
+    pub maker_iriumd_pkh: [u8; 20],
+    pub maker_btc_pkh: [u8; 20],
+    pub expiry_height: u64,
+    pub order_id: [u8; 8],
+    /// Some only when `direction == SWAP_ORDER_DIRECTION_BUY`. Consensus
+    /// enforces the option-tail relationship via strict script length:
+    /// 76 bytes for sell, 108 bytes for buy.
+    pub expected_hash: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputEncumbrance {
     P2pkh([u8; 20]),
     HtlcV1(HtlcV1Output),
     MpsoV1(MpsoV1Output),
+    HtlcBtcSwapV1(HtlcBtcSwapV1Output),
+    SwapOrder(SwapOrderOutput),
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapOrderWitness {
+    /// Sell-IRM fill: taker creates an HtlcBtcSwapV1 in output 0 of the
+    /// spending tx. The validator covenant enforces the exact script.
+    FillSell {
+        sig: Vec<u8>,
+        pubkey: Vec<u8>,
+        taker_iriumd_pkh: [u8; 20],
+        timeout_height: u64,
+    },
+    /// Buy-IRM fill: taker creates an HTLCv1 in output 0 with the
+    /// order's hashlock and the maker as recipient.
+    FillBuy {
+        sig: Vec<u8>,
+        pubkey: Vec<u8>,
+        irm_timeout_height: u64,
+    },
+    /// Maker reclaims the locked value before expiry. No covenant.
+    Cancel { sig: Vec<u8>, pubkey: Vec<u8> },
+    /// Anyone may sweep an expired order. Covenant: output 0 returns
+    /// (locked_value - max_sweep_fee) to the maker via P2PKH.
+    ExpireSweep,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HtlcBtcSwapWitness {
+    Claim {
+        sig: Vec<u8>,
+        pubkey: Vec<u8>,
+        btc_block_hash: [u8; 32],
+        btc_merkle_branch: Vec<[u8; 32]>,
+        btc_merkle_index: u32,
+        btc_tx_raw: Vec<u8>,
+    },
+    Refund {
+        sig: Vec<u8>,
+        pubkey: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,7 +463,515 @@ pub fn parse_output_encumbrance(script: &[u8]) -> OutputEncumbrance {
     if let Some(mpso) = parse_mpso_script(script) {
         return OutputEncumbrance::MpsoV1(mpso);
     }
+    if let Some(swap) = parse_htlc_btc_swap_v1_script(script) {
+        return OutputEncumbrance::HtlcBtcSwapV1(swap);
+    }
+    if let Some(order) = parse_swap_order_script(script) {
+        return OutputEncumbrance::SwapOrder(order);
+    }
     OutputEncumbrance::Unknown
+}
+
+pub fn encode_htlc_btc_swap_v1_script(o: &HtlcBtcSwapV1Output) -> Vec<u8> {
+    let mut s = Vec::with_capacity(HTLC_BTC_SWAP_V1_SCRIPT_LEN);
+    s.push(HTLC_BTC_SWAP_V1_TAG);
+    s.push(HTLC_BTC_SWAP_V1_VERSION);
+    s.push(o.confirmations_required);
+    s.extend_from_slice(&o.recipient_pkh);
+    s.extend_from_slice(&o.refund_pkh);
+    s.extend_from_slice(&o.btc_recipient_pkh);
+    s.extend_from_slice(&o.btc_amount_sats.to_le_bytes());
+    s.extend_from_slice(&o.timeout_height.to_le_bytes());
+    s.extend_from_slice(&o.funding_binding);
+    s
+}
+
+pub fn parse_htlc_btc_swap_v1_script(script: &[u8]) -> Option<HtlcBtcSwapV1Output> {
+    if script.len() != HTLC_BTC_SWAP_V1_SCRIPT_LEN {
+        return None;
+    }
+    if script[0] != HTLC_BTC_SWAP_V1_TAG {
+        return None;
+    }
+    if script[1] != HTLC_BTC_SWAP_V1_VERSION {
+        return None;
+    }
+    let confirmations_required = script[2];
+    let mut recipient_pkh = [0u8; 20];
+    recipient_pkh.copy_from_slice(&script[3..23]);
+    let mut refund_pkh = [0u8; 20];
+    refund_pkh.copy_from_slice(&script[23..43]);
+    let mut btc_recipient_pkh = [0u8; 20];
+    btc_recipient_pkh.copy_from_slice(&script[43..63]);
+    let mut amount_bytes = [0u8; 8];
+    amount_bytes.copy_from_slice(&script[63..71]);
+    let btc_amount_sats = u64::from_le_bytes(amount_bytes);
+    let mut timeout_bytes = [0u8; 8];
+    timeout_bytes.copy_from_slice(&script[71..79]);
+    let timeout_height = u64::from_le_bytes(timeout_bytes);
+    let mut funding_binding = [0u8; 8];
+    funding_binding.copy_from_slice(&script[79..87]);
+    Some(HtlcBtcSwapV1Output {
+        confirmations_required,
+        recipient_pkh,
+        refund_pkh,
+        btc_recipient_pkh,
+        btc_amount_sats,
+        timeout_height,
+        funding_binding,
+    })
+}
+
+/// Deterministic binding tying an HtlcBtcSwapV1 output to its funding
+/// outpoint. The first 8 bytes of `sha256d(txid || vout_le)` are stored
+/// inside the script and must also appear (after the magic prefix) in the
+/// BTC payment's OP_RETURN payload.
+#[allow(dead_code)] // Phase 5 wallet/RPC path will compute this when funding HtlcBtcSwapV1
+pub fn compute_funding_binding(funding_txid: &[u8; 32], vout: u32) -> [u8; 8] {
+    let mut buf = [0u8; 36];
+    buf[0..32].copy_from_slice(funding_txid);
+    buf[32..36].copy_from_slice(&vout.to_le_bytes());
+    let h = sha256d(&buf);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&h[..8]);
+    out
+}
+
+#[allow(dead_code)] // Phase 5 RPC + wallet path will emit this witness
+pub fn encode_htlc_btc_swap_claim_witness(
+    sig: &[u8],
+    pubkey: &[u8],
+    btc_block_hash: &[u8; 32],
+    btc_merkle_branch: &[[u8; 32]],
+    btc_merkle_index: u32,
+    btc_tx_raw: &[u8],
+) -> Option<Vec<u8>> {
+    if sig.is_empty() || sig.len() > 255 {
+        return None;
+    }
+    if pubkey.is_empty() || pubkey.len() > 255 {
+        return None;
+    }
+    if btc_merkle_branch.len() > u16::MAX as usize {
+        return None;
+    }
+    if btc_tx_raw.is_empty() {
+        return None;
+    }
+    let tx_len_varint = if btc_tx_raw.len() < 0xfd {
+        1
+    } else if btc_tx_raw.len() <= 0xffff {
+        3
+    } else if (btc_tx_raw.len() as u64) <= 0xffff_ffff {
+        5
+    } else {
+        9
+    };
+    let cap = 1
+        + 1
+        + sig.len()
+        + 1
+        + pubkey.len()
+        + 32
+        + 2
+        + btc_merkle_branch.len() * 32
+        + 4
+        + tx_len_varint
+        + btc_tx_raw.len();
+    let mut out = Vec::with_capacity(cap);
+    out.push(HTLC_BTC_SWAP_WITNESS_CLAIM);
+    out.push(sig.len() as u8);
+    out.extend_from_slice(sig);
+    out.push(pubkey.len() as u8);
+    out.extend_from_slice(pubkey);
+    out.extend_from_slice(btc_block_hash);
+    out.extend_from_slice(&(btc_merkle_branch.len() as u16).to_le_bytes());
+    for h in btc_merkle_branch {
+        out.extend_from_slice(h);
+    }
+    out.extend_from_slice(&btc_merkle_index.to_le_bytes());
+    write_varint(&mut out, btc_tx_raw.len());
+    out.extend_from_slice(btc_tx_raw);
+    Some(out)
+}
+
+#[allow(dead_code)] // Phase 5 RPC + wallet path will emit this witness
+pub fn encode_htlc_btc_swap_refund_witness(sig: &[u8], pubkey: &[u8]) -> Option<Vec<u8>> {
+    if sig.is_empty() || sig.len() > 255 || pubkey.is_empty() || pubkey.len() > 255 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(3 + sig.len() + pubkey.len());
+    out.push(HTLC_BTC_SWAP_WITNESS_REFUND);
+    out.push(sig.len() as u8);
+    out.extend_from_slice(sig);
+    out.push(pubkey.len() as u8);
+    out.extend_from_slice(pubkey);
+    Some(out)
+}
+
+fn write_varint(out: &mut Vec<u8>, n: usize) {
+    if n < 0xfd {
+        out.push(n as u8);
+    } else if n <= 0xffff {
+        out.push(0xfd);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if (n as u64) <= 0xffff_ffff {
+        out.push(0xfe);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+    } else {
+        out.push(0xff);
+        out.extend_from_slice(&(n as u64).to_le_bytes());
+    }
+}
+
+fn read_varint_at(data: &[u8], offset: &mut usize) -> Option<u64> {
+    if *offset >= data.len() {
+        return None;
+    }
+    let first = data[*offset];
+    *offset += 1;
+    match first {
+        0xff => {
+            if *offset + 8 > data.len() {
+                return None;
+            }
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&data[*offset..*offset + 8]);
+            *offset += 8;
+            Some(u64::from_le_bytes(b))
+        }
+        0xfe => {
+            if *offset + 4 > data.len() {
+                return None;
+            }
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&data[*offset..*offset + 4]);
+            *offset += 4;
+            Some(u32::from_le_bytes(b) as u64)
+        }
+        0xfd => {
+            if *offset + 2 > data.len() {
+                return None;
+            }
+            let mut b = [0u8; 2];
+            b.copy_from_slice(&data[*offset..*offset + 2]);
+            *offset += 2;
+            Some(u16::from_le_bytes(b) as u64)
+        }
+        n => Some(n as u64),
+    }
+}
+
+/// Parse a witness produced by `encode_htlc_btc_swap_claim_witness` or
+/// `encode_htlc_btc_swap_refund_witness`. Returns `None` on any structural
+/// error. Invoked only from inside the HtlcBtcSwapV1 arm of
+/// `verify_transaction_signature`; never substitutes `parse_input_witness`
+/// in the existing HTLCv1 / MPSOv1 / P2PKH code paths.
+pub fn parse_htlc_btc_swap_witness(script_sig: &[u8]) -> Option<HtlcBtcSwapWitness> {
+    if script_sig.is_empty() {
+        return None;
+    }
+    match script_sig[0] {
+        HTLC_BTC_SWAP_WITNESS_CLAIM => {
+            let mut off: usize = 1;
+            let sig_len = *script_sig.get(off)? as usize;
+            off += 1;
+            if sig_len == 0 || off + sig_len > script_sig.len() {
+                return None;
+            }
+            let sig = script_sig[off..off + sig_len].to_vec();
+            off += sig_len;
+            let pk_len = *script_sig.get(off)? as usize;
+            off += 1;
+            if pk_len == 0 || off + pk_len > script_sig.len() {
+                return None;
+            }
+            let pubkey = script_sig[off..off + pk_len].to_vec();
+            off += pk_len;
+            if off + 32 > script_sig.len() {
+                return None;
+            }
+            let mut btc_block_hash = [0u8; 32];
+            btc_block_hash.copy_from_slice(&script_sig[off..off + 32]);
+            off += 32;
+            if off + 2 > script_sig.len() {
+                return None;
+            }
+            let branch_len =
+                u16::from_le_bytes(script_sig[off..off + 2].try_into().ok()?) as usize;
+            off += 2;
+            if branch_len > 32 {
+                // Bitcoin Merkle proofs above depth 32 are nonsensical (would
+                // imply > 4 billion txs per block).
+                return None;
+            }
+            if off + branch_len * 32 > script_sig.len() {
+                return None;
+            }
+            let mut btc_merkle_branch: Vec<[u8; 32]> = Vec::with_capacity(branch_len);
+            for _ in 0..branch_len {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&script_sig[off..off + 32]);
+                btc_merkle_branch.push(h);
+                off += 32;
+            }
+            if off + 4 > script_sig.len() {
+                return None;
+            }
+            let btc_merkle_index =
+                u32::from_le_bytes(script_sig[off..off + 4].try_into().ok()?);
+            off += 4;
+            let tx_len = read_varint_at(script_sig, &mut off)? as usize;
+            if tx_len == 0 || tx_len > 1_000_000 || off + tx_len != script_sig.len() {
+                return None;
+            }
+            let btc_tx_raw = script_sig[off..off + tx_len].to_vec();
+            Some(HtlcBtcSwapWitness::Claim {
+                sig,
+                pubkey,
+                btc_block_hash,
+                btc_merkle_branch,
+                btc_merkle_index,
+                btc_tx_raw,
+            })
+        }
+        HTLC_BTC_SWAP_WITNESS_REFUND => {
+            let mut off: usize = 1;
+            let sig_len = *script_sig.get(off)? as usize;
+            off += 1;
+            if sig_len == 0 || off + sig_len > script_sig.len() {
+                return None;
+            }
+            let sig = script_sig[off..off + sig_len].to_vec();
+            off += sig_len;
+            let pk_len = *script_sig.get(off)? as usize;
+            off += 1;
+            if pk_len == 0 || off + pk_len != script_sig.len() {
+                return None;
+            }
+            let pubkey = script_sig[off..off + pk_len].to_vec();
+            Some(HtlcBtcSwapWitness::Refund { sig, pubkey })
+        }
+        _ => None,
+    }
+}
+
+pub fn encode_swap_order_script(o: &SwapOrderOutput) -> Vec<u8> {
+    let mut s = Vec::with_capacity(SWAP_ORDER_BUY_SCRIPT_LEN);
+    s.push(SWAP_ORDER_V1_TAG);
+    s.push(SWAP_ORDER_V1_VERSION);
+    s.push(o.direction);
+    s.push(o.confirmations_required);
+    s.extend_from_slice(&o.irm_amount.to_le_bytes());
+    s.extend_from_slice(&o.btc_amount_sats.to_le_bytes());
+    s.extend_from_slice(&o.maker_iriumd_pkh);
+    s.extend_from_slice(&o.maker_btc_pkh);
+    s.extend_from_slice(&o.expiry_height.to_le_bytes());
+    s.extend_from_slice(&o.order_id);
+    if o.direction == SWAP_ORDER_DIRECTION_BUY {
+        if let Some(h) = &o.expected_hash {
+            s.extend_from_slice(h);
+        }
+    }
+    s
+}
+
+pub fn parse_swap_order_script(script: &[u8]) -> Option<SwapOrderOutput> {
+    if script.len() != SWAP_ORDER_SELL_SCRIPT_LEN && script.len() != SWAP_ORDER_BUY_SCRIPT_LEN {
+        return None;
+    }
+    if script[0] != SWAP_ORDER_V1_TAG {
+        return None;
+    }
+    if script[1] != SWAP_ORDER_V1_VERSION {
+        return None;
+    }
+    let direction = script[2];
+    if direction != SWAP_ORDER_DIRECTION_SELL && direction != SWAP_ORDER_DIRECTION_BUY {
+        return None;
+    }
+    // Sell layout is 76 bytes; buy layout is 76 + 32 hashlock = 108 bytes.
+    let expects_hash = direction == SWAP_ORDER_DIRECTION_BUY;
+    if expects_hash && script.len() != SWAP_ORDER_BUY_SCRIPT_LEN {
+        return None;
+    }
+    if !expects_hash && script.len() != SWAP_ORDER_SELL_SCRIPT_LEN {
+        return None;
+    }
+    let confirmations_required = script[3];
+    let mut amt = [0u8; 8];
+    amt.copy_from_slice(&script[4..12]);
+    let irm_amount = u64::from_le_bytes(amt);
+    amt.copy_from_slice(&script[12..20]);
+    let btc_amount_sats = u64::from_le_bytes(amt);
+    let mut maker_iriumd_pkh = [0u8; 20];
+    maker_iriumd_pkh.copy_from_slice(&script[20..40]);
+    let mut maker_btc_pkh = [0u8; 20];
+    maker_btc_pkh.copy_from_slice(&script[40..60]);
+    amt.copy_from_slice(&script[60..68]);
+    let expiry_height = u64::from_le_bytes(amt);
+    let mut order_id = [0u8; 8];
+    order_id.copy_from_slice(&script[68..76]);
+    let expected_hash = if expects_hash {
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&script[76..108]);
+        Some(h)
+    } else {
+        None
+    };
+    Some(SwapOrderOutput {
+        direction,
+        confirmations_required,
+        irm_amount,
+        btc_amount_sats,
+        maker_iriumd_pkh,
+        maker_btc_pkh,
+        expiry_height,
+        order_id,
+        expected_hash,
+    })
+}
+
+#[allow(dead_code)] // Phase 5 wallet/RPC path emits this witness
+pub fn encode_swap_order_fill_sell_witness(
+    sig: &[u8],
+    pubkey: &[u8],
+    taker_iriumd_pkh: &[u8; 20],
+    timeout_height: u64,
+) -> Option<Vec<u8>> {
+    if sig.is_empty() || sig.len() > 255 || pubkey.is_empty() || pubkey.len() > 255 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(3 + sig.len() + pubkey.len() + 20 + 8);
+    out.push(SWAP_ORDER_WITNESS_FILL);
+    out.push(sig.len() as u8);
+    out.extend_from_slice(sig);
+    out.push(pubkey.len() as u8);
+    out.extend_from_slice(pubkey);
+    out.extend_from_slice(taker_iriumd_pkh);
+    out.extend_from_slice(&timeout_height.to_le_bytes());
+    Some(out)
+}
+
+#[allow(dead_code)] // Phase 5 wallet/RPC path emits this witness
+pub fn encode_swap_order_fill_buy_witness(
+    sig: &[u8],
+    pubkey: &[u8],
+    irm_timeout_height: u64,
+) -> Option<Vec<u8>> {
+    if sig.is_empty() || sig.len() > 255 || pubkey.is_empty() || pubkey.len() > 255 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(3 + sig.len() + pubkey.len() + 8);
+    out.push(SWAP_ORDER_WITNESS_FILL);
+    out.push(sig.len() as u8);
+    out.extend_from_slice(sig);
+    out.push(pubkey.len() as u8);
+    out.extend_from_slice(pubkey);
+    out.extend_from_slice(&irm_timeout_height.to_le_bytes());
+    Some(out)
+}
+
+#[allow(dead_code)] // Phase 5 wallet/RPC path emits this witness
+pub fn encode_swap_order_cancel_witness(sig: &[u8], pubkey: &[u8]) -> Option<Vec<u8>> {
+    if sig.is_empty() || sig.len() > 255 || pubkey.is_empty() || pubkey.len() > 255 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(3 + sig.len() + pubkey.len());
+    out.push(SWAP_ORDER_WITNESS_CANCEL);
+    out.push(sig.len() as u8);
+    out.extend_from_slice(sig);
+    out.push(pubkey.len() as u8);
+    out.extend_from_slice(pubkey);
+    Some(out)
+}
+
+#[allow(dead_code)] // Phase 5 wallet/RPC path emits this witness
+pub fn encode_swap_order_expire_sweep_witness() -> Vec<u8> {
+    vec![SWAP_ORDER_WITNESS_EXPIRE_SWEEP]
+}
+
+/// Parse a SwapOrder witness. `direction` from the spending UTXO selects
+/// the FillSell vs FillBuy tail shape. Returns `None` on any structural
+/// error. Called only from the SwapOrder arm of `verify_transaction_signature`.
+pub fn parse_swap_order_witness(script_sig: &[u8], direction: u8) -> Option<SwapOrderWitness> {
+    if script_sig.is_empty() {
+        return None;
+    }
+    match script_sig[0] {
+        SWAP_ORDER_WITNESS_FILL => {
+            let mut off: usize = 1;
+            let sig_len = *script_sig.get(off)? as usize;
+            off += 1;
+            if sig_len == 0 || off + sig_len > script_sig.len() {
+                return None;
+            }
+            let sig = script_sig[off..off + sig_len].to_vec();
+            off += sig_len;
+            let pk_len = *script_sig.get(off)? as usize;
+            off += 1;
+            if pk_len == 0 || off + pk_len > script_sig.len() {
+                return None;
+            }
+            let pubkey = script_sig[off..off + pk_len].to_vec();
+            off += pk_len;
+            match direction {
+                SWAP_ORDER_DIRECTION_SELL => {
+                    if off + 20 + 8 != script_sig.len() {
+                        return None;
+                    }
+                    let mut taker_iriumd_pkh = [0u8; 20];
+                    taker_iriumd_pkh.copy_from_slice(&script_sig[off..off + 20]);
+                    off += 20;
+                    let mut tb = [0u8; 8];
+                    tb.copy_from_slice(&script_sig[off..off + 8]);
+                    Some(SwapOrderWitness::FillSell {
+                        sig,
+                        pubkey,
+                        taker_iriumd_pkh,
+                        timeout_height: u64::from_le_bytes(tb),
+                    })
+                }
+                SWAP_ORDER_DIRECTION_BUY => {
+                    if off + 8 != script_sig.len() {
+                        return None;
+                    }
+                    let mut tb = [0u8; 8];
+                    tb.copy_from_slice(&script_sig[off..off + 8]);
+                    Some(SwapOrderWitness::FillBuy {
+                        sig,
+                        pubkey,
+                        irm_timeout_height: u64::from_le_bytes(tb),
+                    })
+                }
+                _ => None,
+            }
+        }
+        SWAP_ORDER_WITNESS_CANCEL => {
+            let mut off: usize = 1;
+            let sig_len = *script_sig.get(off)? as usize;
+            off += 1;
+            if sig_len == 0 || off + sig_len > script_sig.len() {
+                return None;
+            }
+            let sig = script_sig[off..off + sig_len].to_vec();
+            off += sig_len;
+            let pk_len = *script_sig.get(off)? as usize;
+            off += 1;
+            if pk_len == 0 || off + pk_len != script_sig.len() {
+                return None;
+            }
+            let pubkey = script_sig[off..off + pk_len].to_vec();
+            Some(SwapOrderWitness::Cancel { sig, pubkey })
+        }
+        SWAP_ORDER_WITNESS_EXPIRE_SWEEP => {
+            if script_sig.len() != 1 {
+                return None;
+            }
+            Some(SwapOrderWitness::ExpireSweep)
+        }
+        _ => None,
+    }
 }
 
 fn parse_legacy_p2pkh_witness(script_sig: &[u8]) -> Option<InputWitness> {
@@ -794,6 +1425,355 @@ mod tests {
         };
         let script = encode_mpso_script(&o);
         assert!(parse_mpso_script(&script).is_none());
+    }
+
+    fn sample_swap() -> HtlcBtcSwapV1Output {
+        HtlcBtcSwapV1Output {
+            confirmations_required: 6,
+            recipient_pkh: [0x11; 20],
+            refund_pkh: [0x22; 20],
+            btc_recipient_pkh: [0x33; 20],
+            btc_amount_sats: 5_000,
+            timeout_height: 250_000,
+            funding_binding: [0xab; 8],
+        }
+    }
+
+    #[test]
+    fn htlc_btc_swap_v1_script_is_87_bytes_and_roundtrips() {
+        let o = sample_swap();
+        let s = encode_htlc_btc_swap_v1_script(&o);
+        assert_eq!(s.len(), HTLC_BTC_SWAP_V1_SCRIPT_LEN);
+        assert_eq!(s[0], HTLC_BTC_SWAP_V1_TAG);
+        assert_eq!(s[1], HTLC_BTC_SWAP_V1_VERSION);
+        let parsed = parse_htlc_btc_swap_v1_script(&s).expect("parse");
+        assert_eq!(parsed, o);
+    }
+
+    #[test]
+    fn htlc_btc_swap_v1_parse_rejects_wrong_size() {
+        let o = sample_swap();
+        let mut s = encode_htlc_btc_swap_v1_script(&o);
+        s.push(0); // 88 bytes
+        assert!(parse_htlc_btc_swap_v1_script(&s).is_none());
+        assert!(parse_htlc_btc_swap_v1_script(&s[..86]).is_none());
+    }
+
+    #[test]
+    fn htlc_btc_swap_v1_parse_rejects_wrong_tag() {
+        let o = sample_swap();
+        let mut s = encode_htlc_btc_swap_v1_script(&o);
+        s[0] = 0xc0;
+        assert!(parse_htlc_btc_swap_v1_script(&s).is_none());
+    }
+
+    #[test]
+    fn htlc_btc_swap_v1_parse_rejects_wrong_version() {
+        let o = sample_swap();
+        let mut s = encode_htlc_btc_swap_v1_script(&o);
+        s[1] = 0xff;
+        assert!(parse_htlc_btc_swap_v1_script(&s).is_none());
+    }
+
+    #[test]
+    fn output_encumbrance_recognises_htlc_btc_swap_v1() {
+        let o = sample_swap();
+        let s = encode_htlc_btc_swap_v1_script(&o);
+        match parse_output_encumbrance(&s) {
+            OutputEncumbrance::HtlcBtcSwapV1(parsed) => assert_eq!(parsed, o),
+            _ => panic!("expected HtlcBtcSwapV1"),
+        }
+    }
+
+    #[test]
+    fn output_encumbrance_does_not_mistake_htlcv1_for_swap() {
+        // HTLCv1 is 83 bytes; with the 0xc0 tag it must not parse as HtlcBtcSwapV1.
+        let htlc = HtlcV1Output {
+            expected_hash: [0; 32],
+            recipient_pkh: [0; 20],
+            refund_pkh: [0; 20],
+            timeout_height: 100,
+        };
+        let s = encode_htlcv1_script(&htlc);
+        match parse_output_encumbrance(&s) {
+            OutputEncumbrance::HtlcV1(_) => {}
+            other => panic!("HTLCv1 must still parse as HtlcV1, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compute_funding_binding_is_deterministic_and_input_sensitive() {
+        let a = compute_funding_binding(&[0xaa; 32], 0);
+        let b = compute_funding_binding(&[0xaa; 32], 0);
+        let c = compute_funding_binding(&[0xaa; 32], 1);
+        let d = compute_funding_binding(&[0xbb; 32], 0);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn htlc_btc_swap_claim_witness_roundtrip() {
+        let block_hash = [0x99u8; 32];
+        let branch = vec![[0x11u8; 32], [0x22u8; 32], [0x33u8; 32]];
+        let tx_raw = vec![0xde, 0xad, 0xbe, 0xef];
+        let w = encode_htlc_btc_swap_claim_witness(
+            &[1, 2, 3],
+            &[0x02; 33],
+            &block_hash,
+            &branch,
+            7,
+            &tx_raw,
+        )
+        .expect("encode");
+        match parse_htlc_btc_swap_witness(&w).expect("parse") {
+            HtlcBtcSwapWitness::Claim {
+                sig,
+                pubkey,
+                btc_block_hash,
+                btc_merkle_branch,
+                btc_merkle_index,
+                btc_tx_raw,
+            } => {
+                assert_eq!(sig, vec![1, 2, 3]);
+                assert_eq!(pubkey.len(), 33);
+                assert_eq!(btc_block_hash, block_hash);
+                assert_eq!(btc_merkle_branch, branch);
+                assert_eq!(btc_merkle_index, 7);
+                assert_eq!(btc_tx_raw, tx_raw);
+            }
+            _ => panic!("expected Claim variant"),
+        }
+    }
+
+    #[test]
+    fn htlc_btc_swap_refund_witness_roundtrip() {
+        let w = encode_htlc_btc_swap_refund_witness(&[9, 9], &[0x02; 33]).expect("encode");
+        match parse_htlc_btc_swap_witness(&w).expect("parse") {
+            HtlcBtcSwapWitness::Refund { sig, pubkey } => {
+                assert_eq!(sig, vec![9, 9]);
+                assert_eq!(pubkey.len(), 33);
+            }
+            _ => panic!("expected Refund variant"),
+        }
+    }
+
+    #[test]
+    fn htlc_btc_swap_witness_rejects_unknown_selector() {
+        assert!(parse_htlc_btc_swap_witness(&[0x05, 0, 0, 0]).is_none());
+        assert!(parse_htlc_btc_swap_witness(&[]).is_none());
+    }
+
+    #[test]
+    fn htlc_btc_swap_witness_rejects_branch_too_deep() {
+        let mut w = vec![HTLC_BTC_SWAP_WITNESS_CLAIM, 1, 0x42, 1, 0x02];
+        w.extend_from_slice(&[0xaa; 32]); // btc_block_hash
+        w.extend_from_slice(&33u16.to_le_bytes()); // branch_len = 33 > 32
+        w.extend_from_slice(&[0u8; 33 * 32]);
+        w.extend_from_slice(&0u32.to_le_bytes());
+        w.push(1);
+        w.push(0xff);
+        assert!(parse_htlc_btc_swap_witness(&w).is_none());
+    }
+
+    #[test]
+    fn htlc_btc_swap_witness_rejects_trailing_bytes() {
+        let w = encode_htlc_btc_swap_refund_witness(&[1], &[0x02; 33]).expect("encode");
+        let mut bad = w.clone();
+        bad.push(0xff);
+        assert!(parse_htlc_btc_swap_witness(&bad).is_none());
+    }
+
+    fn sample_swap_order(direction: u8) -> SwapOrderOutput {
+        SwapOrderOutput {
+            direction,
+            confirmations_required: 6,
+            irm_amount: 100_000_000,
+            btc_amount_sats: 5_000,
+            maker_iriumd_pkh: [0x11; 20],
+            maker_btc_pkh: [0x22; 20],
+            expiry_height: 250_000,
+            order_id: [0xa; 8],
+            expected_hash: if direction == SWAP_ORDER_DIRECTION_BUY {
+                Some([0xcc; 32])
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn swap_order_sell_script_is_76_bytes_and_roundtrips() {
+        let o = sample_swap_order(SWAP_ORDER_DIRECTION_SELL);
+        let s = encode_swap_order_script(&o);
+        assert_eq!(s.len(), SWAP_ORDER_SELL_SCRIPT_LEN);
+        assert_eq!(s[0], SWAP_ORDER_V1_TAG);
+        assert_eq!(s[1], SWAP_ORDER_V1_VERSION);
+        assert_eq!(s[2], SWAP_ORDER_DIRECTION_SELL);
+        let parsed = parse_swap_order_script(&s).expect("parse");
+        assert_eq!(parsed, o);
+    }
+
+    #[test]
+    fn swap_order_buy_script_is_108_bytes_and_roundtrips() {
+        let o = sample_swap_order(SWAP_ORDER_DIRECTION_BUY);
+        let s = encode_swap_order_script(&o);
+        assert_eq!(s.len(), SWAP_ORDER_BUY_SCRIPT_LEN);
+        assert_eq!(s[2], SWAP_ORDER_DIRECTION_BUY);
+        let parsed = parse_swap_order_script(&s).expect("parse");
+        assert_eq!(parsed, o);
+        assert!(parsed.expected_hash.is_some());
+    }
+
+    #[test]
+    fn swap_order_parse_rejects_wrong_tag() {
+        let o = sample_swap_order(SWAP_ORDER_DIRECTION_SELL);
+        let mut s = encode_swap_order_script(&o);
+        s[0] = 0xc0;
+        assert!(parse_swap_order_script(&s).is_none());
+    }
+
+    #[test]
+    fn swap_order_parse_rejects_wrong_version() {
+        let o = sample_swap_order(SWAP_ORDER_DIRECTION_SELL);
+        let mut s = encode_swap_order_script(&o);
+        s[1] = 0xff;
+        assert!(parse_swap_order_script(&s).is_none());
+    }
+
+    #[test]
+    fn swap_order_parse_rejects_invalid_direction() {
+        let o = sample_swap_order(SWAP_ORDER_DIRECTION_SELL);
+        let mut s = encode_swap_order_script(&o);
+        s[2] = 0x05; // not SELL or BUY
+        assert!(parse_swap_order_script(&s).is_none());
+    }
+
+    #[test]
+    fn swap_order_parse_rejects_size_direction_mismatch() {
+        // Sell at 108 bytes -> invalid (sell expects exactly 76)
+        let mut s = encode_swap_order_script(&sample_swap_order(SWAP_ORDER_DIRECTION_SELL));
+        s.extend_from_slice(&[0u8; 32]);
+        assert!(parse_swap_order_script(&s).is_none());
+        // Buy at 76 bytes -> invalid (buy expects exactly 108)
+        let mut s2 = encode_swap_order_script(&sample_swap_order(SWAP_ORDER_DIRECTION_BUY));
+        s2.truncate(SWAP_ORDER_SELL_SCRIPT_LEN);
+        assert!(parse_swap_order_script(&s2).is_none());
+    }
+
+    #[test]
+    fn output_encumbrance_recognises_swap_order_sell_and_buy() {
+        let sell = encode_swap_order_script(&sample_swap_order(SWAP_ORDER_DIRECTION_SELL));
+        let buy = encode_swap_order_script(&sample_swap_order(SWAP_ORDER_DIRECTION_BUY));
+        match parse_output_encumbrance(&sell) {
+            OutputEncumbrance::SwapOrder(o) => assert_eq!(o.direction, SWAP_ORDER_DIRECTION_SELL),
+            other => panic!("expected SwapOrder sell, got {:?}", other),
+        }
+        match parse_output_encumbrance(&buy) {
+            OutputEncumbrance::SwapOrder(o) => assert_eq!(o.direction, SWAP_ORDER_DIRECTION_BUY),
+            other => panic!("expected SwapOrder buy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn output_encumbrance_does_not_mistake_other_types_for_swap_order() {
+        let htlc = HtlcV1Output {
+            expected_hash: [0; 32],
+            recipient_pkh: [0; 20],
+            refund_pkh: [0; 20],
+            timeout_height: 100,
+        };
+        let s = encode_htlcv1_script(&htlc);
+        assert!(matches!(
+            parse_output_encumbrance(&s),
+            OutputEncumbrance::HtlcV1(_)
+        ));
+    }
+
+    #[test]
+    fn swap_order_fill_sell_witness_roundtrip() {
+        let w = encode_swap_order_fill_sell_witness(&[1, 2, 3], &[0x02; 33], &[0x44; 20], 100_500)
+            .expect("encode");
+        match parse_swap_order_witness(&w, SWAP_ORDER_DIRECTION_SELL).expect("parse") {
+            SwapOrderWitness::FillSell {
+                sig,
+                pubkey,
+                taker_iriumd_pkh,
+                timeout_height,
+            } => {
+                assert_eq!(sig, vec![1, 2, 3]);
+                assert_eq!(pubkey.len(), 33);
+                assert_eq!(taker_iriumd_pkh, [0x44u8; 20]);
+                assert_eq!(timeout_height, 100_500);
+            }
+            other => panic!("expected FillSell, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn swap_order_fill_buy_witness_roundtrip() {
+        let w =
+            encode_swap_order_fill_buy_witness(&[9, 9], &[0x02; 33], 222_222).expect("encode");
+        match parse_swap_order_witness(&w, SWAP_ORDER_DIRECTION_BUY).expect("parse") {
+            SwapOrderWitness::FillBuy {
+                sig,
+                pubkey,
+                irm_timeout_height,
+            } => {
+                assert_eq!(sig, vec![9, 9]);
+                assert_eq!(pubkey.len(), 33);
+                assert_eq!(irm_timeout_height, 222_222);
+            }
+            other => panic!("expected FillBuy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn swap_order_cancel_witness_roundtrip() {
+        let w = encode_swap_order_cancel_witness(&[7, 7, 7], &[0x03; 33]).expect("encode");
+        match parse_swap_order_witness(&w, SWAP_ORDER_DIRECTION_SELL).expect("parse") {
+            SwapOrderWitness::Cancel { sig, pubkey } => {
+                assert_eq!(sig, vec![7, 7, 7]);
+                assert_eq!(pubkey.len(), 33);
+            }
+            other => panic!("expected Cancel, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn swap_order_expire_sweep_witness_is_single_byte() {
+        let w = encode_swap_order_expire_sweep_witness();
+        assert_eq!(w, vec![SWAP_ORDER_WITNESS_EXPIRE_SWEEP]);
+        assert!(matches!(
+            parse_swap_order_witness(&w, SWAP_ORDER_DIRECTION_SELL),
+            Some(SwapOrderWitness::ExpireSweep)
+        ));
+    }
+
+    #[test]
+    fn swap_order_witness_rejects_unknown_selector() {
+        assert!(parse_swap_order_witness(&[0x05, 0, 0], SWAP_ORDER_DIRECTION_SELL).is_none());
+        assert!(parse_swap_order_witness(&[], SWAP_ORDER_DIRECTION_SELL).is_none());
+    }
+
+    #[test]
+    fn swap_order_fill_witness_with_wrong_direction_rejected() {
+        // Encode a SELL-tail Fill witness, then try to parse it as BUY.
+        let w = encode_swap_order_fill_sell_witness(&[1, 2], &[0x02; 33], &[0u8; 20], 100)
+            .expect("encode");
+        assert!(parse_swap_order_witness(&w, SWAP_ORDER_DIRECTION_BUY).is_none());
+        // And vice versa.
+        let w2 = encode_swap_order_fill_buy_witness(&[1], &[0x02; 33], 999).expect("encode");
+        assert!(parse_swap_order_witness(&w2, SWAP_ORDER_DIRECTION_SELL).is_none());
+    }
+
+    #[test]
+    fn swap_order_expire_sweep_witness_rejects_trailing_bytes() {
+        assert!(parse_swap_order_witness(
+            &[SWAP_ORDER_WITNESS_EXPIRE_SWEEP, 0xff],
+            SWAP_ORDER_DIRECTION_SELL
+        )
+        .is_none());
     }
 
     #[test]
