@@ -27,13 +27,18 @@ use crate::constants::{
 use crate::genesis::LockedGenesis;
 use crate::pow::{meets_target, min_difficulty_target, sha256d, Target};
 use crate::tx::{
-    decode_hex, encode_htlc_btc_swap_v1_script, encode_htlcv1_script, encode_mpso_script,
-    parse_htlc_btc_swap_v1_script, parse_htlc_btc_swap_witness, parse_htlcv1_script,
-    parse_input_witness, parse_mpso_script, parse_output_encumbrance, HtlcBtcSwapWitness,
-    InputWitness, MpsoV1Output, OutputEncumbrance, Transaction, TxInput, TxOutput,
+    compute_funding_binding, decode_hex, encode_htlc_btc_swap_v1_script, encode_htlcv1_script,
+    encode_mpso_script, encode_swap_order_script, p2pkh_script, parse_htlc_btc_swap_v1_script,
+    parse_htlc_btc_swap_witness, parse_htlcv1_script, parse_input_witness, parse_mpso_script,
+    parse_output_encumbrance, parse_swap_order_script, parse_swap_order_witness,
+    HtlcBtcSwapV1Output, HtlcBtcSwapWitness, HtlcV1Output, InputWitness, MpsoV1Output,
+    OutputEncumbrance, SwapOrderWitness, Transaction, TxInput, TxOutput,
     BTC_OP_RETURN_BINDING_LEN, BTC_OP_RETURN_BINDING_MAGIC, HTLC_BTC_SWAP_V1_SCRIPT_LEN,
     HTLC_BTC_SWAP_V1_TAG, HTLC_V1_SCRIPT_TAG, MAX_HTLC_BTC_SWAP_CONFIRMATIONS,
     MIN_HTLC_BTC_SWAP_CONFIRMATIONS, MPSO_V1_MAX_WITNESS_SIZE, MPSO_V1_TAG,
+    SWAP_ORDER_BUY_SCRIPT_LEN, SWAP_ORDER_DIRECTION_BUY, SWAP_ORDER_DIRECTION_SELL,
+    SWAP_ORDER_MAX_SWEEP_FEE, SWAP_ORDER_MIN_LOCKED_VALUE, SWAP_ORDER_SELL_SCRIPT_LEN,
+    SWAP_ORDER_V1_TAG,
 };
 
 const MAX_ORPHAN_BLOCKS: usize = 100;
@@ -117,6 +122,11 @@ pub struct ChainParams {
     /// resolve, but consensus does not refuse a misordered configuration
     /// — it just means no claim will ever succeed.
     pub htlc_btc_swap_v1_activation_height: Option<u64>,
+    /// SwapOrder activation height (Phase 3). `None` keeps the on-chain
+    /// order book disabled. Sell-direction fills emit HtlcBtcSwapV1
+    /// outputs, so activating before `htlc_btc_swap_v1_activation_height`
+    /// would cause every fill to fail the output's structural check.
+    pub swap_order_v1_activation_height: Option<u64>,
 }
 
 /// Reference to a specific transaction output.
@@ -273,6 +283,13 @@ impl ChainState {
             .as_ref()
             .map(|p| p.anchor)
             .unwrap_or_else(BtcAnchor::zero)
+    }
+
+    fn swap_order_v1_active_at(&self, height: u64) -> bool {
+        self.params
+            .swap_order_v1_activation_height
+            .map(|h| height >= h)
+            .unwrap_or(false)
     }
 
     fn htlc_btc_swap_v1_active_at(&self, height: u64) -> bool {
@@ -1014,6 +1031,7 @@ impl ChainState {
                 self.mpsov1_active_at(height),
                 self.btc_spv_relay_active_at(height),
                 self.htlc_btc_swap_v1_active_at(height),
+                self.swap_order_v1_active_at(height),
                 height,
             )?;
             coinbase_total = coinbase_total
@@ -1345,6 +1363,7 @@ impl ChainState {
                 self.htlcv1_active_at(height),
                 self.mpsov1_active_at(height),
                 self.htlc_btc_swap_v1_active_at(height),
+                self.swap_order_v1_active_at(height),
                 &view,
                 btc_outpoints_consumed,
             ) {
@@ -1363,6 +1382,7 @@ impl ChainState {
                 self.mpsov1_active_at(height),
                 self.btc_spv_relay_active_at(height),
                 self.htlc_btc_swap_v1_active_at(height),
+                self.swap_order_v1_active_at(height),
                 height,
             )?;
             output_total += output.value as i64;
@@ -1393,6 +1413,7 @@ fn validate_output(
     mpsov1_active: bool,
     btc_spv_relay_active: bool,
     htlc_btc_swap_v1_active: bool,
+    swap_order_v1_active: bool,
     height: u64,
 ) -> Result<(), String> {
     if output.value > MAX_MONEY {
@@ -1467,6 +1488,39 @@ fn validate_output(
         }
         if swap.timeout_height <= height {
             return Err("HtlcBtcSwapV1 timeout_height must exceed current height".to_string());
+        }
+    }
+
+    if tag == Some(SWAP_ORDER_V1_TAG) {
+        if !swap_order_v1_active {
+            return Err("SwapOrder output before activation".to_string());
+        }
+        if output.script_pubkey.len() != SWAP_ORDER_SELL_SCRIPT_LEN
+            && output.script_pubkey.len() != SWAP_ORDER_BUY_SCRIPT_LEN
+        {
+            return Err("SwapOrder script wrong size".to_string());
+        }
+        let order = parse_swap_order_script(&output.script_pubkey)
+            .ok_or_else(|| "Malformed SwapOrder output".to_string())?;
+        if order.expiry_height <= height {
+            return Err("SwapOrder expiry_height must exceed current height".to_string());
+        }
+        if output.value < SWAP_ORDER_MIN_LOCKED_VALUE {
+            return Err("SwapOrder locked value below minimum".to_string());
+        }
+        if order.direction == SWAP_ORDER_DIRECTION_SELL {
+            if output.value != order.irm_amount {
+                return Err(
+                    "Sell-IRM SwapOrder output value must equal irm_amount".to_string(),
+                );
+            }
+            if order.confirmations_required < MIN_HTLC_BTC_SWAP_CONFIRMATIONS
+                || order.confirmations_required > MAX_HTLC_BTC_SWAP_CONFIRMATIONS
+            {
+                return Err(
+                    "SwapOrder confirmations_required out of range".to_string()
+                );
+            }
         }
     }
 
@@ -1550,6 +1604,7 @@ fn verify_transaction_signature(
     htlcv1_active: bool,
     mpsov1_active: bool,
     htlc_btc_swap_v1_active: bool,
+    swap_order_v1_active: bool,
     view: &ConsensusView<'_>,
     btc_outpoints_consumed: &mut Vec<([u8; 32], u32)>,
 ) -> bool {
@@ -1849,6 +1904,120 @@ fn verify_transaction_signature(
                 }
             }
         }
+        OutputEncumbrance::SwapOrder(order) => {
+            if !swap_order_v1_active {
+                return false;
+            }
+            let witness = match parse_swap_order_witness(&txin.script_sig, order.direction) {
+                Some(w) => w,
+                None => return false,
+            };
+            match witness {
+                SwapOrderWitness::FillSell {
+                    sig,
+                    pubkey,
+                    taker_iriumd_pkh,
+                    timeout_height,
+                } => {
+                    if order.direction != SWAP_ORDER_DIRECTION_SELL {
+                        return false;
+                    }
+                    if spend_height > order.expiry_height {
+                        return false;
+                    }
+                    if timeout_height <= spend_height {
+                        return false;
+                    }
+                    if tx.outputs.is_empty() {
+                        return false;
+                    }
+                    let funding_binding = compute_funding_binding(&tx.txid(), 0);
+                    let expected = HtlcBtcSwapV1Output {
+                        confirmations_required: order.confirmations_required,
+                        recipient_pkh: taker_iriumd_pkh,
+                        refund_pkh: order.maker_iriumd_pkh,
+                        btc_recipient_pkh: order.maker_btc_pkh,
+                        btc_amount_sats: order.btc_amount_sats,
+                        timeout_height,
+                        funding_binding,
+                    };
+                    let expected_script = encode_htlc_btc_swap_v1_script(&expected);
+                    if tx.outputs[0].script_pubkey != expected_script {
+                        return false;
+                    }
+                    if tx.outputs[0].value != order.irm_amount {
+                        return false;
+                    }
+                    let scriptcode = encode_swap_order_script(&order);
+                    verify_sig_with_pubkey(tx, input_index, &scriptcode, &sig, &pubkey)
+                }
+                SwapOrderWitness::FillBuy {
+                    sig,
+                    pubkey,
+                    irm_timeout_height,
+                } => {
+                    if order.direction != SWAP_ORDER_DIRECTION_BUY {
+                        return false;
+                    }
+                    if spend_height > order.expiry_height {
+                        return false;
+                    }
+                    if irm_timeout_height <= spend_height {
+                        return false;
+                    }
+                    if tx.outputs.is_empty() {
+                        return false;
+                    }
+                    let expected_hash = match order.expected_hash {
+                        Some(h) => h,
+                        None => return false,
+                    };
+                    let taker_refund_pkh = hash160(&pubkey);
+                    let expected_htlc = HtlcV1Output {
+                        expected_hash,
+                        recipient_pkh: order.maker_iriumd_pkh,
+                        refund_pkh: taker_refund_pkh,
+                        timeout_height: irm_timeout_height,
+                    };
+                    let expected_script = encode_htlcv1_script(&expected_htlc);
+                    if tx.outputs[0].script_pubkey != expected_script {
+                        return false;
+                    }
+                    if tx.outputs[0].value != order.irm_amount {
+                        return false;
+                    }
+                    let scriptcode = encode_swap_order_script(&order);
+                    verify_sig_with_pubkey(tx, input_index, &scriptcode, &sig, &pubkey)
+                }
+                SwapOrderWitness::Cancel { sig, pubkey } => {
+                    if spend_height >= order.expiry_height {
+                        return false;
+                    }
+                    if hash160(&pubkey) != order.maker_iriumd_pkh {
+                        return false;
+                    }
+                    let scriptcode = encode_swap_order_script(&order);
+                    verify_sig_with_pubkey(tx, input_index, &scriptcode, &sig, &pubkey)
+                }
+                SwapOrderWitness::ExpireSweep => {
+                    if spend_height < order.expiry_height {
+                        return false;
+                    }
+                    if tx.outputs.is_empty() {
+                        return false;
+                    }
+                    let expected_p2pkh = p2pkh_script(&order.maker_iriumd_pkh);
+                    if tx.outputs[0].script_pubkey != expected_p2pkh {
+                        return false;
+                    }
+                    let minimum_payout = utxo.value.saturating_sub(SWAP_ORDER_MAX_SWEEP_FEE);
+                    if tx.outputs[0].value < minimum_payout {
+                        return false;
+                    }
+                    true
+                }
+            }
+        }
         OutputEncumbrance::Unknown => false,
     }
 }
@@ -2005,6 +2174,7 @@ mod tests {
         auxpow_activation_height: None,
             btc_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            swap_order_v1_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -2081,6 +2251,7 @@ mod tests {
         auxpow_activation_height: None,
             btc_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            swap_order_v1_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -2788,6 +2959,7 @@ mod tests {
             auxpow_activation_height: None,
             btc_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            swap_order_v1_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -3038,6 +3210,7 @@ mod tests {
         auxpow_activation_height: None,
             btc_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            swap_order_v1_activation_height: None,
         };
         ChainState::new(params)
     }
