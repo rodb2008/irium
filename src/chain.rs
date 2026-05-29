@@ -17,6 +17,7 @@ use crate::btc_spv::{
     BtcHeaderEntry, BtcRelayUpdate, BtcSpvParams, BTC_HEADER_BATCH_TAG,
     MAX_BTC_HEADER_BATCH_BYTES,
 };
+use crate::btc_tx_parse::{btc_txid, parse_btc_tx_outputs, BtcOutputScript};
 use crate::constants::{
     block_reward, BLOCK_TARGET_INTERVAL, COINBASE_MATURITY, DIFFICULTY_RETARGET_INTERVAL,
     LWMA_MAX_TARGET_DOWN_FACTOR, LWMA_MAX_TARGET_UP_FACTOR, LWMA_MIN_DIFFICULTY_FLOOR,
@@ -26,9 +27,13 @@ use crate::constants::{
 use crate::genesis::LockedGenesis;
 use crate::pow::{meets_target, min_difficulty_target, sha256d, Target};
 use crate::tx::{
-    decode_hex, encode_htlcv1_script, encode_mpso_script, parse_htlcv1_script, parse_input_witness,
-    parse_mpso_script, parse_output_encumbrance, InputWitness, MpsoV1Output, OutputEncumbrance,
-    Transaction, TxInput, TxOutput, HTLC_V1_SCRIPT_TAG, MPSO_V1_MAX_WITNESS_SIZE, MPSO_V1_TAG,
+    decode_hex, encode_htlc_btc_swap_v1_script, encode_htlcv1_script, encode_mpso_script,
+    parse_htlc_btc_swap_v1_script, parse_htlc_btc_swap_witness, parse_htlcv1_script,
+    parse_input_witness, parse_mpso_script, parse_output_encumbrance, HtlcBtcSwapWitness,
+    InputWitness, MpsoV1Output, OutputEncumbrance, Transaction, TxInput, TxOutput,
+    BTC_OP_RETURN_BINDING_LEN, BTC_OP_RETURN_BINDING_MAGIC, HTLC_BTC_SWAP_V1_SCRIPT_LEN,
+    HTLC_BTC_SWAP_V1_TAG, HTLC_V1_SCRIPT_TAG, MAX_HTLC_BTC_SWAP_CONFIRMATIONS,
+    MIN_HTLC_BTC_SWAP_CONFIRMATIONS, MPSO_V1_MAX_WITNESS_SIZE, MPSO_V1_TAG,
 };
 
 const MAX_ORPHAN_BLOCKS: usize = 100;
@@ -106,6 +111,12 @@ pub struct ChainParams {
     /// `BtcHeaderBatch` output and `anchor` seeds the relay's view of the
     /// Bitcoin chain.
     pub btc_spv: Option<BtcSpvParams>,
+    /// HtlcBtcSwapV1 activation height (Phase 2). `None` keeps the
+    /// BTC-proof claim path disabled. Activation should not precede the
+    /// `btc_spv` relay's `activation_height`, otherwise proofs cannot
+    /// resolve, but consensus does not refuse a misordered configuration
+    /// — it just means no claim will ever succeed.
+    pub htlc_btc_swap_v1_activation_height: Option<u64>,
 }
 
 /// Reference to a specific transaction output.
@@ -132,6 +143,21 @@ struct BlockUndo {
     /// If this block applied a `BtcHeaderBatch` output, the relay-state
     /// change record needed to roll it back on disconnect.
     btc_relay_update: Option<BtcRelayUpdate>,
+    /// BTC outpoints `(btc_txid, op_return_vout)` newly inserted into
+    /// `ChainState.claimed_btc_outpoints` by HtlcBtcSwapV1 BTC-proof claims
+    /// in this block. Removed on disconnect.
+    claimed_btc_outpoints_added: Vec<([u8; 32], u32)>,
+}
+
+/// Read-only handle over the consensus state fields a transaction validator
+/// needs beyond the UTXO set and the spending tx itself. Built once per
+/// transaction inside `validate_transaction_internal` from the immutable
+/// view of `ChainState` and passed down to `verify_transaction_signature`.
+pub struct ConsensusView<'a> {
+    pub btc_headers: &'a HashMap<[u8; 32], BtcHeaderEntry>,
+    pub btc_heights: &'a HashMap<[u8; 32], u64>,
+    pub btc_tip_height: u64,
+    pub claimed_btc_outpoints: &'a HashSet<([u8; 32], u32)>,
 }
 
 #[derive(Debug)]
@@ -159,6 +185,10 @@ pub struct ChainState {
     pub btc_heights: HashMap<[u8; 32], u64>,
     pub btc_tip: Option<[u8; 32]>,
     pub btc_tip_height: u64,
+    /// Replay-protection set: BTC outpoints `(btc_txid, op_return_vout)`
+    /// already consumed by an HtlcBtcSwapV1 claim. Inserted at apply time,
+    /// removed on disconnect via `BlockUndo.claimed_btc_outpoints_added`.
+    pub claimed_btc_outpoints: HashSet<([u8; 32], u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +220,7 @@ impl ChainState {
             btc_heights: HashMap::new(),
             btc_tip: None,
             btc_tip_height: 0,
+            claimed_btc_outpoints: HashSet::new(),
         };
         let genesis = state.params.genesis_block.clone();
         state
@@ -242,6 +273,22 @@ impl ChainState {
             .as_ref()
             .map(|p| p.anchor)
             .unwrap_or_else(BtcAnchor::zero)
+    }
+
+    fn htlc_btc_swap_v1_active_at(&self, height: u64) -> bool {
+        self.params
+            .htlc_btc_swap_v1_activation_height
+            .map(|h| height >= h)
+            .unwrap_or(false)
+    }
+
+    fn build_consensus_view(&self) -> ConsensusView<'_> {
+        ConsensusView {
+            btc_headers: &self.btc_headers,
+            btc_heights: &self.btc_heights,
+            btc_tip_height: self.btc_tip_height,
+            claimed_btc_outpoints: &self.claimed_btc_outpoints,
+        }
     }
 
     /// Convenience wrapper: compute LWMA target using v1 parameters.
@@ -598,6 +645,10 @@ impl ChainState {
             .remove(&tip_hash)
             .ok_or_else(|| "missing undo data for tip block".to_string())?;
 
+        for consumed in &undo.claimed_btc_outpoints_added {
+            self.claimed_btc_outpoints.remove(consumed);
+        }
+
         if let Some(update) = undo.btc_relay_update.as_ref() {
             undo_btc_relay_update(
                 update,
@@ -902,9 +953,16 @@ impl ChainState {
         let mut seen_inputs: HashSet<OutPoint> = HashSet::new();
         let mut btc_relay_update: Option<BtcRelayUpdate> = None;
         let mut btc_batch_count: usize = 0;
+        let mut btc_outpoints_consumed: Vec<([u8; 32], u32)> = Vec::new();
 
         for tx in block.transactions.iter().skip(1) {
-            self.validate_transaction_internal(tx, height, &mut seen_inputs, &mut fees)?;
+            self.validate_transaction_internal(
+                tx,
+                height,
+                &mut seen_inputs,
+                &mut fees,
+                &mut btc_outpoints_consumed,
+            )?;
             let txid = tx.txid();
             for (index, output) in tx.outputs.iter().cloned().enumerate() {
                 let op = OutPoint {
@@ -955,6 +1013,7 @@ impl ChainState {
                 self.htlcv1_active_at(height),
                 self.mpsov1_active_at(height),
                 self.btc_spv_relay_active_at(height),
+                self.htlc_btc_swap_v1_active_at(height),
                 height,
             )?;
             coinbase_total = coinbase_total
@@ -1011,11 +1070,16 @@ impl ChainState {
             );
         }
 
+        for consumed in &btc_outpoints_consumed {
+            self.claimed_btc_outpoints.insert(*consumed);
+        }
+
         let undo = BlockUndo {
             spent: spent_for_undo,
             created: created_outpoints,
             subsidy_created,
             btc_relay_update,
+            claimed_btc_outpoints_added: btc_outpoints_consumed,
         };
 
         Ok((fees as u64, coinbase_total, subsidy_created, undo))
@@ -1034,14 +1098,28 @@ impl ChainState {
 
         let mut seen_inputs: HashSet<OutPoint> = HashSet::new();
         let mut fees: i64 = 0;
-        self.validate_transaction_internal(tx, self.height, &mut seen_inputs, &mut fees)
+        let mut btc_consumed: Vec<([u8; 32], u32)> = Vec::new();
+        self.validate_transaction_internal(
+            tx,
+            self.height,
+            &mut seen_inputs,
+            &mut fees,
+            &mut btc_consumed,
+        )
     }
 
     /// Calculate transaction fees against the current UTXO set without mutating state.
     pub fn calculate_fees(&self, tx: &Transaction) -> Result<u64, String> {
         let mut seen_inputs: HashSet<OutPoint> = HashSet::new();
         let mut fees: i64 = 0;
-        self.validate_transaction_internal(tx, self.height, &mut seen_inputs, &mut fees)?;
+        let mut btc_consumed: Vec<([u8; 32], u32)> = Vec::new();
+        self.validate_transaction_internal(
+            tx,
+            self.height,
+            &mut seen_inputs,
+            &mut fees,
+            &mut btc_consumed,
+        )?;
         Ok(fees as u64)
     }
 
@@ -1111,6 +1189,7 @@ impl ChainState {
             btc_heights: self.btc_heights.clone(),
             btc_tip: self.btc_tip,
             btc_tip_height: self.btc_tip_height,
+            claimed_btc_outpoints: self.claimed_btc_outpoints.clone(),
         };
 
         let branch = self.gather_branch_to_genesis(tip_hash)?;
@@ -1230,7 +1309,9 @@ impl ChainState {
         height: u64,
         seen_inputs: &mut HashSet<OutPoint>,
         fees: &mut i64,
+        btc_outpoints_consumed: &mut Vec<([u8; 32], u32)>,
     ) -> Result<(), String> {
+        let view = self.build_consensus_view();
         let mut input_total: i64 = 0;
         for (input_index, txin) in tx.inputs.iter().enumerate() {
             if txin.prev_txid.len() != 32 {
@@ -1263,6 +1344,9 @@ impl ChainState {
                 height,
                 self.htlcv1_active_at(height),
                 self.mpsov1_active_at(height),
+                self.htlc_btc_swap_v1_active_at(height),
+                &view,
+                btc_outpoints_consumed,
             ) {
                 return Err("Transaction signature verification failed".to_string());
             }
@@ -1278,6 +1362,7 @@ impl ChainState {
                 self.htlcv1_active_at(height),
                 self.mpsov1_active_at(height),
                 self.btc_spv_relay_active_at(height),
+                self.htlc_btc_swap_v1_active_at(height),
                 height,
             )?;
             output_total += output.value as i64;
@@ -1307,6 +1392,7 @@ fn validate_output(
     htlcv1_active: bool,
     mpsov1_active: bool,
     btc_spv_relay_active: bool,
+    htlc_btc_swap_v1_active: bool,
     height: u64,
 ) -> Result<(), String> {
     if output.value > MAX_MONEY {
@@ -1360,6 +1446,27 @@ fn validate_output(
         }
         if parse_htlcv1_script(&output.script_pubkey).is_none() {
             return Err("Malformed HTLCv1 output".to_string());
+        }
+    }
+
+    if tag == Some(HTLC_BTC_SWAP_V1_TAG) {
+        if !htlc_btc_swap_v1_active {
+            return Err("HtlcBtcSwapV1 output before activation".to_string());
+        }
+        if output.script_pubkey.len() != HTLC_BTC_SWAP_V1_SCRIPT_LEN {
+            return Err("HtlcBtcSwapV1 script wrong size".to_string());
+        }
+        let swap = parse_htlc_btc_swap_v1_script(&output.script_pubkey)
+            .ok_or_else(|| "Malformed HtlcBtcSwapV1 output".to_string())?;
+        if swap.confirmations_required < MIN_HTLC_BTC_SWAP_CONFIRMATIONS
+            || swap.confirmations_required > MAX_HTLC_BTC_SWAP_CONFIRMATIONS
+        {
+            return Err(
+                "HtlcBtcSwapV1 confirmations_required out of allowed range".to_string()
+            );
+        }
+        if swap.timeout_height <= height {
+            return Err("HtlcBtcSwapV1 timeout_height must exceed current height".to_string());
         }
     }
 
@@ -1442,6 +1549,9 @@ fn verify_transaction_signature(
     spend_height: u64,
     htlcv1_active: bool,
     mpsov1_active: bool,
+    htlc_btc_swap_v1_active: bool,
+    view: &ConsensusView<'_>,
+    btc_outpoints_consumed: &mut Vec<([u8; 32], u32)>,
 ) -> bool {
     match parse_output_encumbrance(&utxo.script_pubkey) {
         OutputEncumbrance::P2pkh(expected_pkh) => {
@@ -1623,6 +1733,122 @@ fn verify_transaction_signature(
                 _ => false,
             }
         }
+        OutputEncumbrance::HtlcBtcSwapV1(swap) => {
+            if !htlc_btc_swap_v1_active {
+                return false;
+            }
+            let witness = match parse_htlc_btc_swap_witness(&txin.script_sig) {
+                Some(w) => w,
+                None => return false,
+            };
+            match witness {
+                HtlcBtcSwapWitness::Claim {
+                    sig,
+                    pubkey,
+                    btc_block_hash,
+                    btc_merkle_branch,
+                    btc_merkle_index,
+                    btc_tx_raw,
+                } => {
+                    let proof_height = match view.btc_heights.get(&btc_block_hash) {
+                        Some(h) => *h,
+                        None => return false,
+                    };
+                    let confs = view
+                        .btc_tip_height
+                        .saturating_add(1)
+                        .saturating_sub(proof_height);
+                    if confs < swap.confirmations_required as u64 {
+                        return false;
+                    }
+                    let header_entry = match view.btc_headers.get(&btc_block_hash) {
+                        Some(e) => e,
+                        None => return false,
+                    };
+                    let btc_txid_val = match btc_txid(&btc_tx_raw) {
+                        Ok(t) => t,
+                        Err(_) => return false,
+                    };
+                    let computed_root = crate::auxpow::compute_merkle_root(
+                        &btc_txid_val,
+                        &btc_merkle_branch,
+                        btc_merkle_index,
+                    );
+                    if computed_root != header_entry.header.merkle_root {
+                        return false;
+                    }
+                    let outs = match parse_btc_tx_outputs(&btc_tx_raw) {
+                        Ok(o) => o,
+                        Err(_) => return false,
+                    };
+                    let mut expected_payload =
+                        Vec::with_capacity(BTC_OP_RETURN_BINDING_LEN);
+                    expected_payload.extend_from_slice(&BTC_OP_RETURN_BINDING_MAGIC);
+                    expected_payload.extend_from_slice(&swap.funding_binding);
+                    let mut pays = false;
+                    let mut op_return_vout: Option<u32> = None;
+                    for o in &outs {
+                        match &o.script {
+                            BtcOutputScript::P2pkh(pkh) => {
+                                if *pkh == swap.btc_recipient_pkh
+                                    && o.value >= swap.btc_amount_sats
+                                {
+                                    pays = true;
+                                }
+                            }
+                            BtcOutputScript::OpReturn(data) => {
+                                if data == &expected_payload {
+                                    if op_return_vout.is_some() {
+                                        return false;
+                                    }
+                                    op_return_vout = Some(o.vout);
+                                }
+                            }
+                            BtcOutputScript::Other => {}
+                        }
+                    }
+                    if !pays {
+                        return false;
+                    }
+                    let vout = match op_return_vout {
+                        Some(v) => v,
+                        None => return false,
+                    };
+                    let consumed = (btc_txid_val, vout);
+                    if view.claimed_btc_outpoints.contains(&consumed) {
+                        return false;
+                    }
+                    if btc_outpoints_consumed.contains(&consumed) {
+                        return false;
+                    }
+                    if hash160(&pubkey) != swap.recipient_pkh {
+                        return false;
+                    }
+                    let scriptcode = encode_htlc_btc_swap_v1_script(&swap);
+                    if !verify_sig_with_pubkey(
+                        tx,
+                        input_index,
+                        &scriptcode,
+                        &sig,
+                        &pubkey,
+                    ) {
+                        return false;
+                    }
+                    btc_outpoints_consumed.push(consumed);
+                    true
+                }
+                HtlcBtcSwapWitness::Refund { sig, pubkey } => {
+                    if spend_height < swap.timeout_height {
+                        return false;
+                    }
+                    if hash160(&pubkey) != swap.refund_pkh {
+                        return false;
+                    }
+                    let scriptcode = encode_htlc_btc_swap_v1_script(&swap);
+                    verify_sig_with_pubkey(tx, input_index, &scriptcode, &sig, &pubkey)
+                }
+            }
+        }
         OutputEncumbrance::Unknown => false,
     }
 }
@@ -1778,6 +2004,7 @@ mod tests {
             lwma_v2: None,
         auxpow_activation_height: None,
             btc_spv: None,
+            htlc_btc_swap_v1_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -1853,6 +2080,7 @@ mod tests {
             lwma_v2: None,
         auxpow_activation_height: None,
             btc_spv: None,
+            htlc_btc_swap_v1_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -2559,6 +2787,7 @@ mod tests {
             lwma_v2: v2,
             auxpow_activation_height: None,
             btc_spv: None,
+            htlc_btc_swap_v1_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -2808,6 +3037,7 @@ mod tests {
             lwma_v2: None,
         auxpow_activation_height: None,
             btc_spv: None,
+            htlc_btc_swap_v1_activation_height: None,
         };
         ChainState::new(params)
     }
