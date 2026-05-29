@@ -55,9 +55,9 @@ use num_bigint::BigUint;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -543,6 +543,36 @@ static CONN_RECORDS: Lazy<DashMap<IpAddr, ConnRecord>> = Lazy::new(DashMap::new)
 /// Banned IPs and the Instant at which their ban expires.
 static BAN_LIST: Lazy<DashMap<IpAddr, Instant>> = Lazy::new(DashMap::new);
 
+/// IPs that are permanently allowed through `gate_connection` regardless
+/// of the rate limiter or ban list. Populated once at startup from the
+/// `IRIUM_STRATUM_GATE_ALLOWLIST` env var (comma-separated IPv4/IPv6
+/// literals); `127.0.0.1` is unconditionally inserted so loopback test
+/// sessions and operator-side diagnostic curls can never be locked out
+/// of the pool — irrespective of how aggressive the production
+/// rate-limit / ban knobs become. Malformed entries log to stderr and
+/// are skipped; loopback inclusion happens before env parsing so an
+/// unset / malformed env can never strip it.
+static GATE_ALLOWLIST: Lazy<HashSet<IpAddr>> = Lazy::new(|| {
+    let mut set: HashSet<IpAddr> = HashSet::new();
+    set.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    if let Ok(raw) = std::env::var("IRIUM_STRATUM_GATE_ALLOWLIST") {
+        for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match entry.parse::<IpAddr>() {
+                Ok(ip) => {
+                    set.insert(ip);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[stratum] gate-allowlist: ignoring '{}': {}",
+                        entry, e
+                    );
+                }
+            }
+        }
+    }
+    set
+});
+
 /// Outcome of an accept-time policy check.
 enum GateDecision {
     /// Allow the connection. Caller must spawn the handler.
@@ -561,6 +591,16 @@ enum GateDecision {
 /// or `conn_window_secs=0` skips the per-IP limiter. Sensible production
 /// defaults are wired in main.rs.
 fn gate_connection(ip: IpAddr, cfg: &StratumConfig) -> GateDecision {
+    // 0. Allowlist short-circuit. IPs in GATE_ALLOWLIST (127.0.0.1 by
+    //    default, plus any explicitly listed in IRIUM_STRATUM_GATE_ALLOWLIST)
+    //    skip every other gate — they can never be rate-limited or banned.
+    //    This is what keeps local diagnostic sessions and the operator's
+    //    own monitoring curls permanently usable even when production
+    //    rate-limit / ban thresholds are aggressive.
+    if GATE_ALLOWLIST.contains(&ip) {
+        return GateDecision::Allow;
+    }
+
     // 1. Ban check (and lazy expiry of the entry).
     if let Some(entry) = BAN_LIST.get(&ip) {
         let expires_at = *entry.value();
