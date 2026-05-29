@@ -8,7 +8,11 @@ from collections import deque
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 ASIC_METRICS = "http://127.0.0.1:3334/metrics"
-CPU_METRICS = "http://127.0.0.1:3336/metrics"
+# CPU/GPU legacy metrics moved from 3336 to 3346 when port 3336 was
+# reassigned to the public solo-pool listener (2026-05-29). Keep this
+# string in sync with STRATUM_METRICS_BIND in stratum-legacy.env.
+CPU_METRICS = "http://127.0.0.1:3346/metrics"
+SOLO_METRICS = "http://127.0.0.1:3338/metrics"
 PUBLIC_PORT = 3337
 
 # Configured default share difficulties per profile (kept in sync with
@@ -17,7 +21,14 @@ PUBLIC_PORT = 3337
 DEFAULTS = {
     "asic": {"diff": 2048, "metrics": ASIC_METRICS},
     "cpu_gpu": {"diff": 1024, "metrics": CPU_METRICS},
+    "solo": {"diff": 10000, "metrics": SOLO_METRICS},
 }
+
+# Solo pool fee in basis points; mirrors IRIUM_STRATUM_SOLO_FEE_BPS in
+# stratum-solo.env. Exposed in /solo-stats so the GUI can show the
+# operator's headline "1% pool fee" copy without hardcoding it.
+SOLO_FEE_BPS = 100
+SOLO_PORT = 3336
 
 # Rolling sample window: keep up to 15 minutes of (ts, accepted_shares)
 # samples. We pick the oldest sample for delta computation, yielding a
@@ -313,6 +324,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/payouts":
             self._handle_payouts()
             return
+        if self.path == "/solo-stats":
+            self._handle_solo_stats()
+            return
+        if self.path == "/solo-miners":
+            self._handle_solo_miners()
+            return
         if self.path not in ("/", "/stats", "/api/stats"):
             self.send_response(404)
             self.end_headers()
@@ -438,6 +455,89 @@ class Handler(BaseHTTPRequestHandler):
         miners_list = _filter_stale_duplicates(miners_list)
         # Sort newest-active first so the most informative rows appear at
         # the top of any consumer that doesn't sort itself.
+        miners_list.sort(
+            key=lambda m: (m["last_share_ago_seconds"] if m["last_share_ago_seconds"] is not None else 10**9)
+        )
+        response = {
+            "total_miners": len(miners_list),
+            "miners": miners_list,
+        }
+        body = json.dumps(response, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_solo_stats(self):
+        """GET /solo-stats: aggregate solo pool snapshot. Same shape as
+        each profile inside /stats but scoped to the solo listener on
+        port 3336. Surfaces fee_bps and solo_port up-front so the GUI
+        can render the connection info card without a second fetch.
+        """
+        solo = fetch(SOLO_METRICS)
+        solo_est = record_and_estimate("solo", solo)
+        tcp = solo.get("active_tcp_sessions", 0)
+        # Effective active miners: only count once at least one share has
+        # been accepted, same convention the /stats endpoint uses for the
+        # ASIC and CPU/GPU profiles. Suppresses noise from port scanners.
+        accepted = solo.get("accepted_shares", 0)
+        effective_miners = tcp if accepted > 0 else 0
+        data = {
+            "pool": "Irium Solo Pool",
+            "url": "pool.iriumlabs.org",
+            "solo_port": SOLO_PORT,
+            "fee_bps": SOLO_FEE_BPS,
+            "active_miners": effective_miners,
+            "tcp_sessions": tcp,
+            "accepted_shares": accepted,
+            "rejected_shares": solo.get("rejected_shares", 0),
+            "blocks_found": solo.get("submit_accepted", 0),
+            "integrity": solo.get("pool_integrity", "unknown"),
+            **solo_est,
+        }
+        body = json.dumps(data, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_solo_miners(self):
+        """GET /solo-miners: per-worker accepted/rejected counts and the
+        rolling 15-min hashrate for the solo listener (port 3336). Shape
+        mirrors /miners so the GUI can render the same table component.
+        """
+        solo = fetch(SOLO_METRICS)
+        now = time.time()
+        miners_list = []
+        miners_data = solo.get("miners", {}) or {}
+        diff = DEFAULTS["solo"]["diff"]
+        for worker, mstats in miners_data.items():
+            accepted = int(mstats.get("accepted", 0) or 0)
+            rejected = int(mstats.get("rejected", 0) or 0)
+            total = accepted + rejected
+            reject_rate = (
+                round((rejected / total) * 100, 1)
+                if total >= MIN_SHARES else None
+            )
+            last_share_at = int(mstats.get("last_share_at", 0) or 0)
+            last_share_ago = (
+                int(now - last_share_at) if last_share_at > 0 else None
+            )
+            hashrate_15m, _hr_ws = estimate_miner_hashrate(f"solo:{worker}", accepted, diff)
+            miners_list.append({
+                "worker": worker,
+                "profile": "solo",
+                "accepted": accepted,
+                "rejected": rejected,
+                "reject_rate_pct": reject_rate,
+                "reject_reasons": mstats.get("reject_reasons", {}) or {},
+                "hashrate_15m": hashrate_15m,
+                "last_share_ago_seconds": last_share_ago,
+            })
         miners_list.sort(
             key=lambda m: (m["last_share_ago_seconds"] if m["last_share_ago_seconds"] is not None else 10**9)
         )
