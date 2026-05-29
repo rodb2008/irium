@@ -642,6 +642,46 @@ struct TxLookupResponse {
     output_value: u64,
     is_coinbase: bool,
     tx_hex: String,
+    // Fix C: when the tx is in mempool but not yet in a block, this
+    // field is true and `height` / `index` / `block_hash` carry sentinel
+    // values (0 / 0 / ""). `#[serde(default)]` keeps backward-compat
+    // for any deserializer reading older responses.
+    #[serde(default)]
+    pending: bool,
+}
+
+// Fix D: pending-tx lookup. Returned by /rpc/mempool/by_txid. Slimmer
+// than TxLookupResponse because confirmed-only fields are meaningless
+// for a tx that's still in mempool.
+#[derive(Serialize)]
+struct MempoolByTxidResponse {
+    txid: String,
+    tx_hex: String,
+    fee: u64,
+    size: usize,
+    fee_per_byte: f64,
+    added_unix: u64,
+    inputs: usize,
+    outputs: usize,
+    output_value: u64,
+}
+
+// Fix D: enumerates outpoints currently pending-spent by mempool
+// entries that consume an output owned by the queried address. Wallet
+// uses this (Fix A) to subtract pending-spent UTXOs from /rpc/utxos
+// before coin selection, avoiding the multi-send race that produced
+// ghost-tx symptoms.
+#[derive(Serialize)]
+struct MempoolSpentByResponse {
+    address: String,
+    outpoints: Vec<MempoolSpentEntry>,
+}
+
+#[derive(Serialize)]
+struct MempoolSpentEntry {
+    prev_txid: String,
+    prev_index: u32,
+    claiming_txid: String,
 }
 
 #[derive(Serialize)]
@@ -7707,10 +7747,35 @@ async fn get_tx(
                     output_value,
                     is_coinbase,
                     tx_hex: hex::encode(tx.serialize()),
+                    pending: false,
                 };
                 return Ok(Json(response));
             }
         }
+    }
+    // Fix C: chain miss — fall back to mempool. Without this, every
+    // pending tx looked like a "ghost" to the wallet (printed-txid then
+    // /rpc/tx 404 forever) because /rpc/tx only walked the confirmed
+    // chain. Returning pending=true with sentinel height/index/block_hash
+    // disambiguates "in mempool waiting" from "actually unknown / rejected".
+    drop(guard);
+    let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = mempool.entry(&target) {
+        let output_value: u64 = entry.tx.outputs.iter().map(|o| o.value).sum();
+        let is_coinbase = entry.tx.inputs.len() == 1 && entry.tx.inputs[0].prev_txid == [0u8; 32];
+        let response = TxLookupResponse {
+            txid: hex::encode(target),
+            height: 0,
+            index: 0,
+            block_hash: String::new(),
+            inputs: entry.tx.inputs.len(),
+            outputs: entry.tx.outputs.len(),
+            output_value,
+            is_coinbase,
+            tx_hex: hex::encode(&entry.raw),
+            pending: true,
+        };
+        return Ok(Json(response));
     }
     Err(StatusCode::NOT_FOUND)
 }
@@ -8087,6 +8152,31 @@ async fn submit_tx(
         })));
     }
 
+    // Fix B: input-conflict check. Prior to this, two txs that spent
+    // the same UTXO would BOTH be admitted to mempool (the only
+    // existing check was "same txid"), then get_block_template's
+    // conflict-removal retain loop would silently drop the later one
+    // at template build — producing the ghost-tx pattern where the
+    // wallet printed a txid + exit 0 but the tx never confirmed.
+    // Surfacing the conflict at submit-time gives the wallet (and the
+    // user) an actionable 422 with the conflicting txid in the reason.
+    for input in &tx.inputs {
+        let outpoint = (input.prev_txid, input.prev_index);
+        if let Some(existing) = mempool.find_conflicting(&outpoint) {
+            let reason = format!(
+                "Input outpoint {}:{} already claimed by mempool tx {}",
+                hex::encode(input.prev_txid),
+                input.prev_index,
+                hex::encode(existing),
+            );
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(SubmitTxResponse {
+                txid: hex_txid,
+                accepted: false,
+                reason: Some(reason),
+            })));
+        }
+    }
+
     let raw = bytes;
     let raw_for_broadcast = raw.clone();
     if let Err(e) = mempool.add_transaction(tx, raw, fee) {
@@ -8112,6 +8202,97 @@ async fn submit_tx(
         txid: hex_txid,
         accepted: true,
         reason: None,
+    }))
+}
+
+// Fix D: pending-tx lookup. Returns the raw mempool entry for a txid
+// that's in mempool but not yet on chain. Public (rate-limited but no
+// strict auth) — same policy as /rpc/utxos and /rpc/tx.
+async fn mempool_by_txid(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TxQuery>,
+) -> Result<Json<MempoolByTxidResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+
+    let bytes = hex::decode(&q.txid).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if bytes.len() != 32 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut target = [0u8; 32];
+    target.copy_from_slice(&bytes);
+
+    let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = match mempool.entry(&target) {
+        Some(e) => e,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+    let output_value: u64 = entry.tx.outputs.iter().map(|o| o.value).sum();
+    Ok(Json(MempoolByTxidResponse {
+        txid: hex::encode(target),
+        tx_hex: hex::encode(&entry.raw),
+        fee: entry.fee,
+        size: entry.size,
+        fee_per_byte: entry.fee_per_byte,
+        added_unix: entry.added,
+        inputs: entry.tx.inputs.len(),
+        outputs: entry.tx.outputs.len(),
+        output_value,
+    }))
+}
+
+// Fix D: outpoints pending-spent by mempool, filtered to those whose
+// UTXO belongs to the queried address. Required by the wallet's
+// pending-UTXO awareness (Fix A) — wallet calls this before coin
+// selection to subtract outpoints already committed to an unconfirmed
+// tx, preventing the multi-send race that produced ghost-tx symptoms.
+//
+// Implementation: iterates the (small) mempool, looks up each input's
+// UTXO in chain.utxos, and includes outpoints whose script_pubkey
+// matches p2pkh(address). Linear scan is acceptable because mempool
+// size is bounded and this endpoint is hit at most once per send.
+async fn mempool_spent_by(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<BalanceQuery>,
+) -> Result<Json<MempoolSpentByResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+
+    let pkh_vec = base58_p2pkh_to_hash(&q.address).ok_or(StatusCode::BAD_REQUEST)?;
+    if pkh_vec.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut pkh_arr = [0u8; 20];
+    pkh_arr.copy_from_slice(&pkh_vec);
+    let target_script = p2pkh_script(&pkh_arr);
+
+    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut outpoints: Vec<MempoolSpentEntry> = Vec::new();
+    for (claiming_txid, entry) in mempool.iter_entries() {
+        for input in &entry.tx.inputs {
+            let op = OutPoint {
+                txid: input.prev_txid,
+                index: input.prev_index,
+            };
+            if let Some(utxo) = chain.utxos.get(&op) {
+                if utxo.output.script_pubkey == target_script {
+                    outpoints.push(MempoolSpentEntry {
+                        prev_txid: hex::encode(input.prev_txid),
+                        prev_index: input.prev_index,
+                        claiming_txid: hex::encode(claiming_txid),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(Json(MempoolSpentByResponse {
+        address: q.address.clone(),
+        outpoints,
     }))
 }
 
@@ -10169,6 +10350,12 @@ async fn explorer_stats(
         .route("/rpc/tx", get(get_tx))
         .route("/rpc/submit_block", post(submit_block))
         .route("/rpc/submit_tx", post(submit_tx))
+        // Fix D: pending-tx introspection + per-address pending-spent
+        // outpoints. Both are public (rate-limited only) so the wallet's
+        // Fix A coin-selection check can call /rpc/mempool/spent_by
+        // without an auth token, matching the policy of /rpc/utxos.
+        .route("/rpc/mempool/by_txid", get(mempool_by_txid))
+        .route("/rpc/mempool/spent_by", get(mempool_spent_by))
         .route("/rpc/createagreement", post(create_agreement))
         .route("/rpc/inspectagreement", post(inspect_agreement))
         .route(
