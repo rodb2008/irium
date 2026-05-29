@@ -53,6 +53,17 @@ WINDOW_SECS = 15 * 60
 MIN_SHARES = 1
 MIN_SECONDS = 60
 
+# Per-miner estimate uses a shorter warmup threshold than the aggregate
+# /stats estimate. The aggregate is averaged across all workers and
+# benefits from the steadier 60s smoothing; the per-miner number is
+# what the desktop's Active Miners table renders and needs to surface
+# a usable value within ~20 seconds of a stratum restart instead of
+# showing "—" for a full minute. The formula is the same (delta_shares
+# * current_diff * 2^32 / delta_seconds) — only the minimum window
+# length is shorter, so a single share interval already produces a
+# valid estimate.
+MIN_SECONDS_PER_MINER = 20
+
 _lock = threading.Lock()
 _samples = {name: deque() for name in DEFAULTS}
 
@@ -161,18 +172,32 @@ def record_and_estimate(profile, metrics):
     }
 
 
-def record_miner_sample(worker, accepted):
-    """Append (now, accepted) to the per-worker deque and prune old entries.
+def record_miner_sample(worker, accepted, rejected):
+    """Append (now, accepted, rejected) to the per-worker deque and prune
+    old entries.
 
     Same rolling-window semantics as record_and_estimate but keyed by
     worker. Caller holds no lock - this acquires _lock briefly. Safe to
     call concurrently from background_sampler and the /miners request
     handler.
+
+    Restart detection: stratum restarts reset the upstream `accepted`
+    AND `rejected` counters back to 0 together (same MINER_STATS map).
+    Without a guard, the per-worker deque would hold pre-restart
+    samples with high accepted values plus a fresh entry at 0, and
+    (latest - oldest) would go negative — interpreted by
+    estimate_miner_hashrate as "no new shares", surfacing 0 H/s for an
+    actively-mining worker until the 15-min window naturally evicts the
+    stale entries. Detect the rollback (single counter is sufficient
+    since they reset together) and clear the deque so the new rolling
+    window starts cleanly from this observation.
     """
     now = time.time()
     with _lock:
         buf = _miner_samples.setdefault(worker, deque())
-        buf.append((now, accepted))
+        if buf and accepted < buf[-1][1]:
+            buf.clear()
+        buf.append((now, accepted, rejected))
         cutoff = now - WINDOW_SECS
         while buf and buf[0][0] < cutoff:
             buf.popleft()
@@ -193,16 +218,85 @@ def estimate_miner_hashrate(worker, accepted_now, diff):
         buf = _miner_samples.get(worker)
         if not buf:
             return (None, 0)
-        oldest_ts, oldest_accepted = buf[0]
+        oldest_entry = buf[0]
+        # Tolerate both old 2-tuples (pre-rolling-reject-rate upgrade)
+        # and new 3-tuples for forward compatibility across in-flight
+        # daemon restarts. Hashrate calc only needs (ts, accepted).
+        oldest_ts = oldest_entry[0]
+        oldest_accepted = oldest_entry[1]
     now = time.time()
     delta_shares = accepted_now - oldest_accepted
     delta_seconds = now - oldest_ts
-    if delta_seconds < MIN_SECONDS:
+    # Negative delta means the upstream counter rolled back between the
+    # background sampler's last write and the consumer's read (stratum
+    # restart caught mid-sample). record_miner_sample clears the deque
+    # on rollback, but a race can still produce a transient negative
+    # here. Surface None ("collecting") rather than a bogus value.
+    if delta_shares < 0:
+        return (None, 0)
+    # Per-miner threshold is intentionally lower than the aggregate
+    # MIN_SECONDS so freshly-restarted miners get a usable hashrate
+    # estimate within ~20s instead of being stuck at "—" for a full
+    # minute. Single-share variance is unavoidable at short windows;
+    # the rolling 15-min average smooths it out as more samples land.
+    if delta_seconds < MIN_SECONDS_PER_MINER:
         return (None, int(delta_seconds))
     if delta_shares < MIN_SHARES:
         return (0, int(delta_seconds))
     hashrate_hps = (delta_shares * diff * (1 << 32)) / delta_seconds
     return (hashrate_hps, int(delta_seconds))
+
+
+def estimate_miner_rolling(worker, accepted_now, rejected_now):
+    """Rolling per-worker (delta_accepted, delta_rejected, reject_rate_pct)
+    over the last WINDOW_SECS.
+
+    Mirrors the recent_reject_rate_pct computation already done at the
+    per-profile level in record_and_estimate, but keyed by worker so
+    the /miners table can show rolling counts AND rate instead of the
+    cumulative ones. The cumulative reject count was misleading
+    post-warmup-burst: a worker that rejected 200 shares in the first
+    8 minutes after restart but has been 100% accepting since would
+    still display "rejected: 202" forever until the upstream counter
+    rolls over. With a 15-min window, the same worker shows
+    rejected_15m=0 once the burst falls out.
+
+    Returns (None, None, None) during warmup (no samples), when the
+    upstream counter rolled back since the last record (restart caught
+    mid-poll), or when the buffer carries pre-upgrade 2-tuples. The
+    rate field is None when delta_total < MIN_SHARES even if the
+    deltas themselves are well-defined.
+    """
+    with _lock:
+        buf = _miner_samples.get(worker)
+        if not buf:
+            return (None, None, None)
+        oldest_entry = buf[0]
+        # Old 2-tuples (from a deque populated before this upgrade
+        # rolled out) don't carry rejected history; treat them as
+        # "no data" so the consumer falls back to '—' rather than
+        # rendering a misleading zero.
+        if len(oldest_entry) < 3:
+            return (None, None, None)
+        _, oldest_accepted, oldest_rejected = oldest_entry
+    delta_accepted = accepted_now - oldest_accepted
+    delta_rejected = rejected_now - oldest_rejected
+    if delta_accepted < 0 or delta_rejected < 0:
+        return (None, None, None)
+    delta_total = delta_accepted + delta_rejected
+    rate = (
+        round((delta_rejected / delta_total) * 100, 1)
+        if delta_total >= MIN_SHARES else None
+    )
+    return (delta_accepted, delta_rejected, rate)
+
+
+def estimate_miner_reject_rate(worker, accepted_now, rejected_now):
+    """Backward-compatible shim: returns just the reject_rate_pct from
+    estimate_miner_rolling for any caller that doesn't need the deltas.
+    """
+    _, _, rate = estimate_miner_rolling(worker, accepted_now, rejected_now)
+    return rate
 
 
 def _is_stale_session(m):
@@ -435,10 +529,14 @@ class Handler(BaseHTTPRequestHandler):
             for worker, mstats in miners_data.items():
                 accepted = int(mstats.get("accepted", 0) or 0)
                 rejected = int(mstats.get("rejected", 0) or 0)
-                total = accepted + rejected
-                reject_rate = (
-                    round((rejected / total) * 100, 1)
-                    if total >= MIN_SHARES else None
+                # Rolling deltas + rate over the last WINDOW_SECS. The
+                # accepted_15m / rejected_15m fields let the consumer
+                # render the table without the cumulative warmup burst
+                # contaminating the recent picture. Cumulative `accepted`
+                # and `rejected` are still emitted for backward compat /
+                # lifetime visibility.
+                accepted_15m, rejected_15m, reject_rate = estimate_miner_rolling(
+                    f"{profile}:{worker}", accepted, rejected
                 )
                 last_share_at = int(mstats.get("last_share_at", 0) or 0)
                 last_share_ago = (
@@ -478,6 +576,8 @@ class Handler(BaseHTTPRequestHandler):
                     "profile": profile,
                     "accepted": accepted,
                     "rejected": rejected,
+                    "accepted_15m": accepted_15m,
+                    "rejected_15m": rejected_15m,
                     "reject_rate_pct": reject_rate,
                     "reject_reasons": mstats.get("reject_reasons", {}) or {},
                     "hashrate_15m": hashrate_15m,
@@ -644,10 +744,11 @@ def background_sampler():
                 for worker, mstats in miners_data.items():
                     try:
                         accepted = int(mstats.get("accepted", 0) or 0)
+                        rejected = int(mstats.get("rejected", 0) or 0)
                         # Namespace by profile so a wallet connected to
                         # BOTH stratum services keeps separate deques per
                         # pool. See _handle_miners for the full rationale.
-                        record_miner_sample(f"{name}:{worker}", accepted)
+                        record_miner_sample(f"{name}:{worker}", accepted, rejected)
                     except Exception as inner_e:
                         print(
                             f"[stats-proxy] miner-sample error for "

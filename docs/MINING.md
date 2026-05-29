@@ -46,9 +46,9 @@ on the bundled miner. The macOS scripts additionally remove the
 block the unsigned binary on first launch.
 
 **GPU scripts** connect to the official Irium pool at
-`stratum+tcp://pool.iriumlabs.org:3335` in SOLO payout mode  when one
-of your shares meets the network target, the full block reward goes
-directly to your address. No pool fee.
+`stratum+tcp://pool.iriumlabs.org:3335`. Direct-payout mode: when one
+of your shares meets the network target, the full 50 IRM block reward
+goes directly to the address you used as your worker name. Zero fees.
 
 **CPU scripts** run the bundled `irium-miner` against a local iriumd
 at `http://127.0.0.1:38300`. Start iriumd first  the Irium Core
@@ -81,36 +81,40 @@ before block 22,888 is mined; older nodes will fork off.
 
 `pool.iriumlabs.org` is the DNS hostname for the official Irium pool.
 
-**Payout model varies by port:**
+**Unified direct-payout model:** every port runs the same payout
+behaviour. When one of your shares meets the network target, the
+**full 50 IRM block reward** is paid by the coinbase **directly to the
+IRM address you used as your Stratum worker name**. There is **zero
+pool fee** — the pool operator takes nothing. The pool wallet does
+not accumulate or redistribute funds.
 
-- Port **3333** (ASIC) runs **PPLNS proportional payout** with a **1%
-  pool fee**. Your share of each found block's reward is proportional
-  to your contribution over the rolling PPLNS share window. The pool
-  wallet collects the coinbase and pays out per-miner after coinbase
-  maturity (100 blocks).
-- Ports **3335**, **443**, and **80** run **SOLO payout mode**: when
-  one of your shares meets the network target, the full block reward
-  goes directly to the IRM address you used as your Stratum worker
-  name. There is no pool fee.
-
-| Port | Use for | Payout |
-|------|---------|--------|
-| **3333** | ASIC (S19, S21, Bitaxe, Whatsminer, Avalon, etc.). Strict canonical Stratum profile, higher baseline difficulty. | PPLNS, 1% fee |
-| **3335** | CPU / GPU / older Stratum clients (cpuminer-opt, ccminer). Legacy profile, lower baseline difficulty. | SOLO, no fee |
-| **443** | Fallback for ISPs that block mining ports (notably China). Same Stratum protocol on the HTTPS port to escape DPI filtering. | SOLO, no fee |
-| **80** | Optional second HTTPS-port fallback. Mirrors port 443; same protocol. | SOLO, no fee |
+| Port | Use for |
+|------|---------|
+| **3333** | ASIC (S19, S21, Bitaxe, Whatsminer, Avalon, etc.). Strict canonical Stratum profile, higher baseline difficulty. |
+| **3335** | CPU / GPU / older Stratum clients (cpuminer-opt, ccminer). Legacy profile, lower baseline difficulty. |
+| **443** | Firewall-bypass for ISPs that block mining ports (notably China). Same Stratum protocol on the HTTPS port to escape DPI filtering. |
 
 **Worker name format:** `<IRM_ADDRESS>.<worker_id>` — for example
 `Q8Ni6TJ6Y77vvtMZ1E474kn2jYNawjvaLa.rig1`. The worker suffix is for
-your own bookkeeping only.
+your own bookkeeping only. The IRM address prefix is what the pool
+uses to build your coinbase — **a typo or invalid address means the
+coinbase has no valid output for you**.
 
 **Password:** literally `x` (the conventional Stratum no-op password).
 
 **Live stats:** [https://pool.iriumlabs.org/stats](https://pool.iriumlabs.org/stats)
-shows active miners, accepted/rejected shares, current share difficulty
-per profile, blocks found, and a rolling 15-minute hashrate estimate.
-The raw CORS-enabled JSON proxy is at
-`http://pool.iriumlabs.org:3337/stats`.
+shows active miners, accepted/rejected shares, blocks found, and a
+rolling 15-minute hashrate estimate. The raw CORS-enabled JSON proxy
+is at `http://pool.iriumlabs.org:3337/stats` and per-miner detail at
+`http://pool.iriumlabs.org:3337/miners`.
+
+**Hashrate estimation:** the stats-proxy computes a per-miner hashrate
+over the rolling 15-minute share window using each worker's live
+`current_diff` value scraped from the stratum `/metrics` endpoint.
+This means the estimate tracks vardiff drift accurately rather than
+assuming a fixed baseline. Workers with `rolling_pct=None` are still
+in the warmup window (< 1 minute of samples after a restart or fresh
+connection).
 
 ---
 
@@ -196,10 +200,9 @@ NBMiner.
 
 Some ISPs block outbound TCP to ports commonly associated with mining
 (3333, 4444, etc.). The official pool exposes the same Stratum
-protocol on **port 443** (and a backup on **port 80**) specifically to
-work around this. The bytes on the wire are still Stratum — the port
-number is HTTPS-shaped so that deep-packet-inspection systems pass it
-through.
+protocol on **port 443** specifically to work around this. The bytes
+on the wire are still Stratum — the port number is HTTPS-shaped so
+that deep-packet-inspection systems pass it through.
 
 For any miner, simply swap the port:
 
@@ -207,8 +210,7 @@ For any miner, simply swap the port:
 stratum+tcp://pool.iriumlabs.org:443     # works even when 3333/3335 fail
 ```
 
-If 443 also fails, try port 80 (`stratum+tcp://pool.iriumlabs.org:80`).
-If both still fail, the issue is likely DNS-level filtering — see the
+If 443 also fails, the issue is likely DNS-level filtering — see the
 [POOL_STRATUM connectivity-troubleshooting section](POOL_STRATUM.md).
 
 ---
@@ -306,7 +308,7 @@ target block time).
 ## See also
 
 - [docs/POOL_STRATUM.md](POOL_STRATUM.md) — operator-level pool details, raw connectivity testing
-- [docs/SOLO_STRATUM.md](SOLO_STRATUM.md) — solo stratum bridge inside iriumd
+- [docs/SOLO_STRATUM.md](SOLO_STRATUM.md) — self-hosted solo stratum bridge (run your own node)
 - [docs/POOL-OPERATOR.md](POOL-OPERATOR.md) — running your own Irium Stratum pool
 - [GPU-MINER.md](../GPU-MINER.md) — bundled GPU miner detailed reference
 - [docs/MERGED-MINING.md](MERGED-MINING.md) — AuxPoW merged mining (activates at block 26,500)

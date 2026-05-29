@@ -254,6 +254,45 @@ impl MempoolManager {
         self.entries.get(txid).map(|e| e.raw.clone())
     }
 
+    /// Get a borrowed reference to the full mempool entry for a given txid.
+    /// Used by /rpc/tx's mempool fallback (Fix C) so the wallet can
+    /// distinguish "in mempool waiting" from "rejected / lost" — prior to
+    /// this, /rpc/tx only checked the on-chain Vec and returned 404 for
+    /// every pending tx, which produced the ghost-tx misdiagnosis.
+    pub fn entry(&self, txid: &[u8; 32]) -> Option<&MempoolEntry> {
+        self.entries.get(txid)
+    }
+
+    /// Find an existing mempool entry that already claims `outpoint`
+    /// (prev_txid, prev_index) as one of its inputs. Returns the
+    /// conflicting tx's txid if any. Used by submit_tx (Fix B) to
+    /// surface input-conflict at submission time instead of silently
+    /// admitting both and letting get_block_template's conflict-removal
+    /// retain loop drop the later submission. Linear scan because
+    /// indexing every outpoint would double the mempool's memory cost
+    /// for a check that fires once per inbound tx — N is small (max
+    /// `max_entries`) and the wins from O(1) lookup don't pay back.
+    pub fn find_conflicting(&self, outpoint: &([u8; 32], u32)) -> Option<[u8; 32]> {
+        for (txid, entry) in &self.entries {
+            for input in &entry.tx.inputs {
+                if (input.prev_txid, input.prev_index) == *outpoint {
+                    return Some(*txid);
+                }
+            }
+        }
+        None
+    }
+
+    /// Iterate all entries (read-only borrow). Used by
+    /// /rpc/mempool/spent_by (Fix D) to enumerate every outpoint
+    /// currently pending-spent by some mempool entry, so the wallet
+    /// can subtract those from /rpc/utxos before coin selection
+    /// (Fix A) and avoid re-selecting an outpoint that's already
+    /// committed to an unconfirmed tx.
+    pub fn iter_entries(&self) -> impl Iterator<Item = (&[u8; 32], &MempoolEntry)> {
+        self.entries.iter()
+    }
+
     pub fn relays_for(&self, txid: &[u8; 32]) -> Vec<String> {
         self.entries
             .get(txid)

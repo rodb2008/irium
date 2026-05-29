@@ -13,10 +13,15 @@
 //! enable via `IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT` env override.
 
 use std::collections::HashMap;
+use std::env;
 
 use num_bigint::BigUint;
 use num_traits::Zero;
 
+use crate::activation::{
+    resolved_btc_spv_relay_activation_height, NetworkKind, MAINNET_BTC_ANCHOR_BITS,
+    MAINNET_BTC_ANCHOR_HASH, MAINNET_BTC_ANCHOR_HEIGHT, MAINNET_BTC_ANCHOR_TIME,
+};
 use crate::pow::{meets_target, sha256d, Target};
 
 /// Output script tag for a Bitcoin header batch.
@@ -133,6 +138,74 @@ impl BtcAnchor {
 pub struct BtcSpvParams {
     pub activation_height: u64,
     pub anchor: BtcAnchor,
+}
+
+/// Resolve the SPV relay configuration for a given network. Returns `Some`
+/// only when both an activation height AND a valid anchor are present.
+///
+/// Mainnet uses the code-defined `MAINNET_BTC_ANCHOR_*` constants from
+/// `activation.rs` (zero placeholders until governance flips them in a
+/// dedicated activation commit per `docs/htlcv1_activation_commit_workflow.md`).
+/// The `is_zero()` check refuses to enable the relay until the anchor has
+/// been populated.
+///
+/// Testnet and devnet read the anchor from the four
+/// `IRIUM_BTC_ANCHOR_{HEIGHT,HASH,BITS,TIME}` environment variables alongside
+/// the existing `IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT`. All five must be
+/// present for the relay to enable. Hash is accepted in display-order
+/// (Bitcoin RPC convention — the hex string of bytes reversed) and
+/// canonicalized to natural-order for internal storage. `BITS` accepts
+/// either `0x1d00ffff` or decimal `486604799`.
+#[allow(dead_code)] // wired into ChainParams construction in iriumd.rs production path
+pub fn resolve_btc_spv_params(network: NetworkKind) -> Option<BtcSpvParams> {
+    let activation_height = resolved_btc_spv_relay_activation_height(network)?;
+    let anchor = match network {
+        NetworkKind::Mainnet => {
+            let candidate = BtcAnchor {
+                hash: MAINNET_BTC_ANCHOR_HASH,
+                height: MAINNET_BTC_ANCHOR_HEIGHT,
+                bits: MAINNET_BTC_ANCHOR_BITS,
+                time: MAINNET_BTC_ANCHOR_TIME,
+            };
+            if candidate.is_zero() {
+                return None;
+            }
+            candidate
+        }
+        NetworkKind::Testnet | NetworkKind::Devnet => {
+            let height = env::var("IRIUM_BTC_ANCHOR_HEIGHT")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())?;
+            let hash_str = env::var("IRIUM_BTC_ANCHOR_HASH").ok()?;
+            let hash_bytes = hex::decode(hash_str.trim()).ok()?;
+            if hash_bytes.len() != 32 {
+                return None;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&hash_bytes);
+            hash.reverse();
+            let bits_str = env::var("IRIUM_BTC_ANCHOR_BITS").ok()?;
+            let bits_trim = bits_str.trim();
+            let bits = if let Some(stripped) = bits_trim.strip_prefix("0x") {
+                u32::from_str_radix(stripped, 16).ok()?
+            } else {
+                bits_trim.parse::<u32>().ok()?
+            };
+            let time = env::var("IRIUM_BTC_ANCHOR_TIME")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())?;
+            BtcAnchor {
+                hash,
+                height,
+                bits,
+                time,
+            }
+        }
+    };
+    Some(BtcSpvParams {
+        activation_height,
+        anchor,
+    })
 }
 
 /// Undo record produced by a single successful header batch apply.
@@ -536,6 +609,143 @@ pub fn undo_btc_relay_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn clear_btc_spv_env() {
+        std::env::remove_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_BTC_ANCHOR_HEIGHT");
+        std::env::remove_var("IRIUM_BTC_ANCHOR_HASH");
+        std::env::remove_var("IRIUM_BTC_ANCHOR_BITS");
+        std::env::remove_var("IRIUM_BTC_ANCHOR_TIME");
+    }
+
+    #[test]
+    fn mainnet_btc_spv_returns_none_until_anchor_populated() {
+        let _guard = env_lock().lock().unwrap();
+        clear_btc_spv_env();
+        // Even if mainnet activation height were set in code, the zero
+        // anchor placeholder refuses to enable the relay.
+        let resolved = resolve_btc_spv_params(NetworkKind::Mainnet);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn devnet_btc_spv_returns_some_when_all_env_vars_present() {
+        let _guard = env_lock().lock().unwrap();
+        clear_btc_spv_env();
+        std::env::set_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT", "100");
+        std::env::set_var("IRIUM_BTC_ANCHOR_HEIGHT", "880000");
+        // Display-order hex (Bitcoin RPC convention) — 64 hex chars, no 0x.
+        std::env::set_var(
+            "IRIUM_BTC_ANCHOR_HASH",
+            "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054",
+        );
+        std::env::set_var("IRIUM_BTC_ANCHOR_BITS", "0x1d00ffff");
+        std::env::set_var("IRIUM_BTC_ANCHOR_TIME", "1730000000");
+        let resolved = resolve_btc_spv_params(NetworkKind::Devnet);
+        clear_btc_spv_env();
+        let params = resolved.expect("devnet env-configured relay should resolve");
+        assert_eq!(params.activation_height, 100);
+        assert_eq!(params.anchor.height, 880000);
+        assert_eq!(params.anchor.bits, 0x1d00ffff);
+        assert_eq!(params.anchor.time, 1730000000);
+        // Display-order input should be reversed to natural-order in storage.
+        let mut expected_natural = [0u8; 32];
+        let display_bytes = hex::decode(
+            "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054",
+        )
+        .unwrap();
+        expected_natural.copy_from_slice(&display_bytes);
+        expected_natural.reverse();
+        assert_eq!(params.anchor.hash, expected_natural);
+    }
+
+    #[test]
+    fn devnet_btc_spv_returns_none_when_activation_env_missing() {
+        let _guard = env_lock().lock().unwrap();
+        clear_btc_spv_env();
+        std::env::set_var("IRIUM_BTC_ANCHOR_HEIGHT", "880000");
+        std::env::set_var(
+            "IRIUM_BTC_ANCHOR_HASH",
+            "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054",
+        );
+        std::env::set_var("IRIUM_BTC_ANCHOR_BITS", "0x1d00ffff");
+        std::env::set_var("IRIUM_BTC_ANCHOR_TIME", "1730000000");
+        let resolved = resolve_btc_spv_params(NetworkKind::Devnet);
+        clear_btc_spv_env();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn devnet_btc_spv_returns_none_when_anchor_env_partial() {
+        let _guard = env_lock().lock().unwrap();
+        clear_btc_spv_env();
+        std::env::set_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT", "100");
+        std::env::set_var("IRIUM_BTC_ANCHOR_HEIGHT", "880000");
+        // HASH missing — should refuse.
+        std::env::set_var("IRIUM_BTC_ANCHOR_BITS", "0x1d00ffff");
+        std::env::set_var("IRIUM_BTC_ANCHOR_TIME", "1730000000");
+        let resolved = resolve_btc_spv_params(NetworkKind::Devnet);
+        clear_btc_spv_env();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn devnet_btc_spv_returns_none_on_malformed_anchor_hash() {
+        let _guard = env_lock().lock().unwrap();
+        clear_btc_spv_env();
+        std::env::set_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT", "100");
+        std::env::set_var("IRIUM_BTC_ANCHOR_HEIGHT", "880000");
+        std::env::set_var("IRIUM_BTC_ANCHOR_HASH", "not_valid_hex");
+        std::env::set_var("IRIUM_BTC_ANCHOR_BITS", "0x1d00ffff");
+        std::env::set_var("IRIUM_BTC_ANCHOR_TIME", "1730000000");
+        let resolved = resolve_btc_spv_params(NetworkKind::Devnet);
+        clear_btc_spv_env();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn devnet_btc_spv_accepts_decimal_bits() {
+        let _guard = env_lock().lock().unwrap();
+        clear_btc_spv_env();
+        std::env::set_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT", "100");
+        std::env::set_var("IRIUM_BTC_ANCHOR_HEIGHT", "880000");
+        std::env::set_var(
+            "IRIUM_BTC_ANCHOR_HASH",
+            "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054",
+        );
+        // Decimal form of 0x1d00ffff.
+        std::env::set_var("IRIUM_BTC_ANCHOR_BITS", "486604799");
+        std::env::set_var("IRIUM_BTC_ANCHOR_TIME", "1730000000");
+        let resolved = resolve_btc_spv_params(NetworkKind::Devnet);
+        clear_btc_spv_env();
+        let params = resolved.expect("decimal bits should resolve");
+        assert_eq!(params.anchor.bits, 0x1d00ffff);
+    }
+
+    #[test]
+    fn testnet_btc_spv_uses_same_env_path_as_devnet() {
+        let _guard = env_lock().lock().unwrap();
+        clear_btc_spv_env();
+        std::env::set_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT", "50");
+        std::env::set_var("IRIUM_BTC_ANCHOR_HEIGHT", "100");
+        std::env::set_var(
+            "IRIUM_BTC_ANCHOR_HASH",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        );
+        std::env::set_var("IRIUM_BTC_ANCHOR_BITS", "0x207fffff");
+        std::env::set_var("IRIUM_BTC_ANCHOR_TIME", "1700000000");
+        let resolved = resolve_btc_spv_params(NetworkKind::Testnet);
+        clear_btc_spv_env();
+        let params = resolved.expect("testnet env-configured relay should resolve");
+        assert_eq!(params.activation_height, 50);
+        assert_eq!(params.anchor.height, 100);
+    }
 
     fn regtest_bits() -> u32 {
         0x207f_ffff

@@ -266,6 +266,27 @@ struct UtxoItem {
     script_pubkey: String,
 }
 
+// Fix A: pending-spent outpoints returned by /rpc/mempool/spent_by.
+// Wallet subtracts these from /rpc/utxos before coin selection so two
+// sequential sends from the same wallet don't both pick the same UTXO,
+// producing the ghost-tx pattern (one tx in template, other dropped by
+// the conflict-removal retain loop in get_block_template).
+#[derive(Deserialize, Clone)]
+struct MempoolSpentByResponse {
+    #[allow(dead_code)]
+    address: String,
+    outpoints: Vec<SpentOutpoint>,
+}
+
+#[derive(Deserialize, Clone)]
+struct SpentOutpoint {
+    prev_txid: String,
+    prev_index: u32,
+    #[allow(dead_code)]
+    #[serde(default)]
+    claiming_txid: String,
+}
+
 #[derive(Serialize)]
 struct SubmitTxRequest {
     tx_hex: String,
@@ -2678,6 +2699,49 @@ fn fetch_utxos(client: &Client, base: &str, addr: &str) -> Result<UtxosResponse,
     }
     resp.json::<UtxosResponse>()
         .map_err(|e| format!("parse utxos response: {e}"))
+}
+
+// Fix A: ask the node which outpoints owned by `addr` are currently
+// pending-spent by some mempool tx. Used to filter the /rpc/utxos
+// response BEFORE coin selection so two sequential sends from the
+// same wallet don't both pick the same UTXO (the ghost-tx pattern).
+//
+// Returns a HashSet<(txid_hex, vout)> for fast O(1) lookup at the
+// retain() call site. Errors are non-fatal: if the node is on an
+// older build without /rpc/mempool/spent_by, this function logs a
+// debug-level message and returns an empty set so the caller falls
+// back to the prior (race-prone) behaviour gracefully.
+fn fetch_mempool_spent_by(
+    client: &Client,
+    base: &str,
+    addr: &str,
+) -> std::collections::HashSet<(String, u32)> {
+    let resp = match send_with_https_fallback(base, |b| {
+        let url = format!("{}/rpc/mempool/spent_by?address={}", b, addr);
+        let mut req = client.get(&url);
+        if let Ok(token) = env::var("IRIUM_RPC_TOKEN") {
+            req = req.bearer_auth(token);
+        }
+        req.send()
+    }) {
+        Ok(r) => r,
+        Err(_) => return std::collections::HashSet::new(),
+    };
+    if !resp.status().is_success() {
+        // 404 from an older iriumd that doesn't have this endpoint —
+        // expected during a partial rollout. Silent so the wallet
+        // remains usable against any iriumd >= base release.
+        return std::collections::HashSet::new();
+    }
+    let parsed: MempoolSpentByResponse = match resp.json() {
+        Ok(v) => v,
+        Err(_) => return std::collections::HashSet::new(),
+    };
+    parsed
+        .outpoints
+        .into_iter()
+        .map(|o| (o.prev_txid, o.prev_index))
+        .collect()
 }
 
 fn fetch_history(client: &Client, base: &str, addr: &str) -> Result<HistoryResponse, String> {
@@ -9455,6 +9519,11 @@ fn handle_attestor_register(args: &[String]) -> Result<(), String> {
     let payload = fetch_utxos(&client, base, &addr)?;
     let current_height = payload.height;
     let mut utxos = payload.utxos.clone();
+    // Fix A: drop UTXOs already pending-spent by another mempool tx
+    // from this wallet. Without this, two sequential sends pick the
+    // same outpoint and the second tx silently dies in mempool.
+    let pending_spent = fetch_mempool_spent_by(&client, base, &addr);
+    utxos.retain(|u| !pending_spent.contains(&(u.txid.clone(), u.index)));
     utxos.sort_by_key(|u| u.value);
     let mut fee_per_byte = DEFAULT_FEE_PER_BYTE;
     if let Ok(est) = fetch_fee_estimate(&client, base) {
@@ -9610,6 +9679,11 @@ fn handle_attestor_withdraw_bond(args: &[String]) -> Result<(), String> {
     let key = find_key(&wallet, &addr).ok_or_else(|| format!("address {} not found in wallet", addr))?.clone();
     let payload = fetch_utxos(&client, base, &addr)?;
     let mut utxos = payload.utxos.clone();
+    // Fix A: filter out outpoints already pending-spent by another
+    // mempool tx (see ghost-tx fix rationale at fetch_utxos call site
+    // in attestor-bond-register above).
+    let pending_spent = fetch_mempool_spent_by(&client, base, &addr);
+    utxos.retain(|u| !pending_spent.contains(&(u.txid.clone(), u.index)));
     utxos.sort_by_key(|u| u.value);
     let mut fee_per_byte = DEFAULT_FEE_PER_BYTE;
     if let Ok(est) = fetch_fee_estimate(&client, base) {
@@ -9804,6 +9878,9 @@ fn handle_attestor_slash(args: &[String]) -> Result<(), String> {
         .ok_or_else(|| "no wallet key for slash sender".to_string())?.clone();
     let payload = fetch_utxos(&client, base, &slash_from)?;
     let mut utxos = payload.utxos.clone();
+    // Fix A: filter out pending-spent outpoints (ghost-tx prevention).
+    let pending_spent = fetch_mempool_spent_by(&client, base, &slash_from);
+    utxos.retain(|u| !pending_spent.contains(&(u.txid.clone(), u.index)));
     utxos.sort_by_key(|u| u.value);
     let fee = estimate_tx_size(1, 2).saturating_mul(DEFAULT_FEE_PER_BYTE).max(500);
     let mut selected = Vec::new();
@@ -28331,6 +28408,12 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
                 }
             };
             let mut utxos = payload.utxos.clone();
+            // Fix A: filter out pending-spent outpoints (ghost-tx prevention).
+            // Critical for the `send` command — repeat sends from a
+            // distribution script previously picked the same outpoint
+            // every time, producing the ghost-tx pattern.
+            let pending_spent = fetch_mempool_spent_by(&client, base, from_addr);
+            utxos.retain(|u| !pending_spent.contains(&(u.txid.clone(), u.index)));
             match coin_select.as_str() {
                 "smallest" => utxos.sort_by_key(|u| u.value),
                 "largest" => utxos.sort_by_key(|u| Reverse(u.value)),
@@ -29059,7 +29142,11 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
             let base = rpc_url.trim_end_matches('/');
             let client = rpc_client(base).unwrap_or_else(|e| { eprintln!("HTTP client: {}", e); std::process::exit(1); });
             let payload = fetch_utxos(&client, base, &from_addr).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); });
-            let mut utxos = payload.utxos.clone(); utxos.sort_by_key(|u| u.value);
+            let mut utxos = payload.utxos.clone();
+            // Fix A: ghost-tx prevention via pending-UTXO filter.
+            let pending_spent_mp = fetch_mempool_spent_by(&client, base, &from_addr);
+            utxos.retain(|u| !pending_spent_mp.contains(&(u.txid.clone(), u.index)));
+            utxos.sort_by_key(|u| u.value);
             let mut fee_per_byte = DEFAULT_FEE_PER_BYTE;
             if fee_override.is_none() { if let Ok(est) = fetch_fee_estimate(&client, base) { let ef = est.min_fee_per_byte.ceil() as u64; if ef > fee_per_byte { fee_per_byte = ef; } } }
             let mut selected = Vec::new(); let mut total = 0u64; let mut fee = fee_override.unwrap_or(0);
