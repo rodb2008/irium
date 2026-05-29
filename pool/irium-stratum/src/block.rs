@@ -109,6 +109,77 @@ pub fn coinbase_prefix_suffix(height: u64, reward: u64, pkh: &[u8; 20], bip34_he
     (full[..pos].to_vec(), full[pos + marker.len()..].to_vec())
 }
 
+// Solo-mode coinbase: two outputs in a single transaction.
+//   output 0: worker reward = reward * (10_000 - fee_bps) / 10_000  to worker_pkh
+//   output 1: pool fee      = reward - worker_reward                to pool_pkh
+// fee_bps is capped at 10_000 (100%). A 0 fee still emits two outputs so the
+// hash/wire format stays consistent across the solo path; operators who want
+// zero fee should run a separate non-pool node, not solo mode with bps=0.
+pub fn build_solo_coinbase_tx(
+    height: u64,
+    reward: u64,
+    worker_pkh: &[u8; 20],
+    pool_pkh: &[u8; 20],
+    fee_bps: u64,
+    extranonce: &[u8],
+    bip34_height: bool,
+) -> Vec<u8> {
+    let fee_bps_capped = fee_bps.min(10_000);
+    let pool_fee = reward * fee_bps_capped / 10_000;
+    let worker_reward = reward.saturating_sub(pool_fee);
+
+    let mut tx = Vec::with_capacity(260);
+    tx.extend_from_slice(&1u32.to_le_bytes());
+    put_varint(1, &mut tx);
+    tx.push(32u8);
+    tx.extend_from_slice(&[0u8; 32]);
+    tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+
+    let mut script_sig = if bip34_height {
+        let mut s = encode_bip34_height(height);
+        s.extend_from_slice(b"Irium");
+        s
+    } else {
+        format!("Irium {height}").into_bytes()
+    };
+    script_sig.extend_from_slice(extranonce);
+    put_varint(script_sig.len(), &mut tx);
+    tx.extend_from_slice(&script_sig);
+    tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+
+    put_varint(2, &mut tx);
+
+    tx.extend_from_slice(&worker_reward.to_le_bytes());
+    let worker_spk = p2pkh_script(worker_pkh);
+    put_varint(worker_spk.len(), &mut tx);
+    tx.extend_from_slice(&worker_spk);
+
+    tx.extend_from_slice(&pool_fee.to_le_bytes());
+    let pool_spk = p2pkh_script(pool_pkh);
+    put_varint(pool_spk.len(), &mut tx);
+    tx.extend_from_slice(&pool_spk);
+
+    tx.extend_from_slice(&0u32.to_le_bytes());
+    tx
+}
+
+pub fn solo_coinbase_prefix_suffix(
+    height: u64,
+    reward: u64,
+    worker_pkh: &[u8; 20],
+    pool_pkh: &[u8; 20],
+    fee_bps: u64,
+    bip34_height: bool,
+) -> (Vec<u8>, Vec<u8>) {
+    let marker: [u8; 8] = [0xfa, 0xce, 0xb0, 0x0c, 0x1c, 0xab, 0xad, 0x1d];
+    let full = build_solo_coinbase_tx(height, reward, worker_pkh, pool_pkh, fee_bps, &marker, bip34_height);
+    let pos = full
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .unwrap_or(full.len());
+    (full[..pos].to_vec(), full[pos + marker.len()..].to_vec())
+}
+
 pub fn build_merkle_branches(template_tx_hex: &[String]) -> Result<Vec<[u8; 32]>> {
     let mut level: Vec<[u8; 32]> = Vec::with_capacity(template_tx_hex.len() + 1);
     level.push([0u8; 32]);
