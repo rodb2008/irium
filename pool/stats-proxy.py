@@ -247,45 +247,56 @@ def estimate_miner_hashrate(worker, accepted_now, diff):
     return (hashrate_hps, int(delta_seconds))
 
 
-def estimate_miner_reject_rate(worker, accepted_now, rejected_now):
-    """Rolling per-worker reject rate over the last WINDOW_SECS.
+def estimate_miner_rolling(worker, accepted_now, rejected_now):
+    """Rolling per-worker (delta_accepted, delta_rejected, reject_rate_pct)
+    over the last WINDOW_SECS.
 
     Mirrors the recent_reject_rate_pct computation already done at the
     per-profile level in record_and_estimate, but keyed by worker so
-    the /miners table can show a rolling rate instead of a cumulative
-    one. The cumulative rate was misleading post-restart: a worker that
-    rejected 200 shares in the first 8 minutes (e.g., during vardiff
-    transition) but has been 100% accepting since would still display
-    a 60%+ reject rate forever — until the upstream counter rolls over
-    or the stratum restarts. With a 15-min window, the same worker
-    shows 0% once the rejection burst falls out.
+    the /miners table can show rolling counts AND rate instead of the
+    cumulative ones. The cumulative reject count was misleading
+    post-warmup-burst: a worker that rejected 200 shares in the first
+    8 minutes after restart but has been 100% accepting since would
+    still display "rejected: 202" forever until the upstream counter
+    rolls over. With a 15-min window, the same worker shows
+    rejected_15m=0 once the burst falls out.
 
-    Returns None during warmup (no samples), when the upstream counter
-    rolled back since the last record (restart caught mid-poll), or
-    when delta_total < MIN_SHARES. None is the same JSON-null the
-    cumulative path already surfaced when total < MIN_SHARES, so the
-    consumer (Explorer per-miner table) renders it identically.
+    Returns (None, None, None) during warmup (no samples), when the
+    upstream counter rolled back since the last record (restart caught
+    mid-poll), or when the buffer carries pre-upgrade 2-tuples. The
+    rate field is None when delta_total < MIN_SHARES even if the
+    deltas themselves are well-defined.
     """
     with _lock:
         buf = _miner_samples.get(worker)
         if not buf:
-            return None
+            return (None, None, None)
         oldest_entry = buf[0]
         # Old 2-tuples (from a deque populated before this upgrade
         # rolled out) don't carry rejected history; treat them as
         # "no data" so the consumer falls back to '—' rather than
         # rendering a misleading zero.
         if len(oldest_entry) < 3:
-            return None
+            return (None, None, None)
         _, oldest_accepted, oldest_rejected = oldest_entry
     delta_accepted = accepted_now - oldest_accepted
     delta_rejected = rejected_now - oldest_rejected
     if delta_accepted < 0 or delta_rejected < 0:
-        return None
+        return (None, None, None)
     delta_total = delta_accepted + delta_rejected
-    if delta_total < MIN_SHARES:
-        return None
-    return round((delta_rejected / delta_total) * 100, 1)
+    rate = (
+        round((delta_rejected / delta_total) * 100, 1)
+        if delta_total >= MIN_SHARES else None
+    )
+    return (delta_accepted, delta_rejected, rate)
+
+
+def estimate_miner_reject_rate(worker, accepted_now, rejected_now):
+    """Backward-compatible shim: returns just the reject_rate_pct from
+    estimate_miner_rolling for any caller that doesn't need the deltas.
+    """
+    _, _, rate = estimate_miner_rolling(worker, accepted_now, rejected_now)
+    return rate
 
 
 def _is_stale_session(m):
@@ -518,13 +529,13 @@ class Handler(BaseHTTPRequestHandler):
             for worker, mstats in miners_data.items():
                 accepted = int(mstats.get("accepted", 0) or 0)
                 rejected = int(mstats.get("rejected", 0) or 0)
-                # Rolling reject rate over the last WINDOW_SECS (matches
-                # the hashrate window). Replaces the prior cumulative
-                # `rejected / (accepted+rejected)` which never let a
-                # post-warmup-burst worker recover from a high rate
-                # until the upstream counter reset. Falls back to None
-                # during warmup or when delta_total < MIN_SHARES.
-                reject_rate = estimate_miner_reject_rate(
+                # Rolling deltas + rate over the last WINDOW_SECS. The
+                # accepted_15m / rejected_15m fields let the consumer
+                # render the table without the cumulative warmup burst
+                # contaminating the recent picture. Cumulative `accepted`
+                # and `rejected` are still emitted for backward compat /
+                # lifetime visibility.
+                accepted_15m, rejected_15m, reject_rate = estimate_miner_rolling(
                     f"{profile}:{worker}", accepted, rejected
                 )
                 last_share_at = int(mstats.get("last_share_at", 0) or 0)
@@ -565,6 +576,8 @@ class Handler(BaseHTTPRequestHandler):
                     "profile": profile,
                     "accepted": accepted,
                     "rejected": rejected,
+                    "accepted_15m": accepted_15m,
+                    "rejected_15m": rejected_15m,
                     "reject_rate_pct": reject_rate,
                     "reject_reasons": mstats.get("reject_reasons", {}) or {},
                     "hashrate_15m": hashrate_15m,
