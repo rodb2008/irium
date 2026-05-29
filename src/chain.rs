@@ -1931,7 +1931,18 @@ fn verify_transaction_signature(
                     if tx.outputs.is_empty() {
                         return false;
                     }
-                    let funding_binding = compute_funding_binding(&tx.txid(), 0);
+                    // Derive funding_binding from the SPENT order outpoint
+                    // (txin.prev_txid + txin.prev_index), not from the
+                    // spending tx's own txid. The binding lives inside
+                    // vout 0's script so deriving it from tx.txid() would
+                    // be self-referential — every iteration of the wallet
+                    // changes the tx hash and the expected binding with
+                    // it, with no closed-form fixed point. Using the order
+                    // outpoint breaks the loop: it's known before the
+                    // spending tx is built and matches what the wallet
+                    // (iriumd.rs fillswaporder) writes into the script.
+                    let funding_binding =
+                        compute_funding_binding(&txin.prev_txid, txin.prev_index);
                     let expected = HtlcBtcSwapV1Output {
                         confirmations_required: order.confirmations_required,
                         recipient_pkh: taker_iriumd_pkh,
