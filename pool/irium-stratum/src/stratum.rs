@@ -498,6 +498,10 @@ struct MinerStats {
     rejected: u64,
     reject_reasons: std::collections::HashMap<&'static str, u64>,
     last_share_at: u64,
+    /// Latest vardiff observed for this worker, written on every accept.
+    /// Exposed in /metrics so stats-proxy can compute accurate hashrate
+    /// per-worker instead of falling back to a stale profile baseline.
+    current_diff: f64,
 }
 
 // Per-miner stats keyed by the worker username (typically
@@ -706,6 +710,7 @@ fn record_miner_share_accepted(worker: &str, diff: f64) {
         let entry = map.entry(worker.to_string()).or_default();
         entry.accepted = entry.accepted.saturating_add(1);
         entry.last_share_at = now;
+        entry.current_diff = diff;
     }
 }
 
@@ -849,6 +854,7 @@ async fn metrics_loop(
                                 "rejected": stats.rejected,
                                 "reject_reasons": reasons,
                                 "last_share_at": stats.last_share_at,
+                                "current_diff": stats.current_diff,
                             }),
                         );
                     }
@@ -1216,7 +1222,7 @@ fn build_auxpow_parent_coinbase_prefix_suffix(
     script_sig.extend_from_slice(&1u32.to_le_bytes());
     script_sig.extend_from_slice(&0u32.to_le_bytes());
 
-    let spk = payout_script_from_pkh(&*crate::payout::POOL_PAYOUT_PKH_BYTES);
+    let spk = payout_script_from_pkh(&pkh);
     let mut tx = Vec::with_capacity(256);
     tx.extend_from_slice(&1u32.to_le_bytes()); // version
     tx.push(1u8); // input count
@@ -2946,7 +2952,7 @@ async fn handle_submit_legacy_rewardable(
             config.coinbase_bip34,
         )
     } else {
-        build_coinbase_tx(job.height, job.coinbase_value, &*crate::payout::POOL_PAYOUT_PKH_BYTES, &en, config.coinbase_bip34)
+        build_coinbase_tx(job.height, job.coinbase_value, &pkh, &en, config.coinbase_bip34)
     };
     let cb_hash = sha256d(&cb);
 
@@ -3493,7 +3499,7 @@ async fn send_notify(
     job: &Job,
     clean_jobs: bool,
 ) -> Result<()> {
-    let _pkh = session.pkh.ok_or_else(|| anyhow!("unauthorized"))?;
+    let pkh = session.pkh.ok_or_else(|| anyhow!("unauthorized"))?;
 
     // Evidence-based Fix A (after empirical debugging):
     // iriumd's serialize_for_height does `prev.reverse()` for wire bytes
@@ -3535,7 +3541,7 @@ async fn send_notify(
             )
         }
     } else {
-        let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &*crate::payout::POOL_PAYOUT_PKH_BYTES, session.coinbase_bip34);
+        let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34);
         (prev_hex_for_height(&job.prev_hash, job.height), hex::encode(&cb1), hex::encode(&cb2), job.branches.iter().map(hex::encode).collect())
     };
 

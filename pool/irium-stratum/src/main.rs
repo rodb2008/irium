@@ -225,14 +225,29 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Spawn PPLNS payout maturity-poller in the background. It polls
-    // iriumd /status every 30s and processes any pending blocks that have
-    // reached coinbase maturity (block_height + 100). See payout.rs for
-    // the full two-stage design. Both args are cloned because run() takes
-    // cfg by value and consumes it.
-    let payout_rpc_base = cfg.rpc_base.clone();
-    let payout_rpc_token = cfg.rpc_token.clone();
-    tokio::spawn(payout::maturity_poller(payout_rpc_base, payout_rpc_token));
+    // PPLNS payout maturity-poller is opt-in via env var, default off.
+    // Disabled by default because the 2026-05-29 incident showed the
+    // retry/recompute path is unsafe (1014 IRM over-distribution + ghost
+    // tx-id reports). Set IRIUM_STRATUM_PPLNS_PAYOUT_ENABLED=true to
+    // re-enable after the retry de-dup + snapshot-at-first-compute fixes
+    // land.
+    let pplns_enabled = env::var("IRIUM_STRATUM_PPLNS_PAYOUT_ENABLED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if pplns_enabled {
+        let payout_rpc_base = cfg.rpc_base.clone();
+        let payout_rpc_token = cfg.rpc_token.clone();
+        tokio::spawn(payout::maturity_poller(payout_rpc_base, payout_rpc_token));
+        tracing::info!("[payout] PPLNS maturity-poller spawned (env opt-in)");
+    } else {
+        tracing::info!("[payout] PPLNS maturity-poller DISABLED (default-off; set IRIUM_STRATUM_PPLNS_PAYOUT_ENABLED=true to enable)");
+    }
 
     run(cfg).await
 }
