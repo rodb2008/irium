@@ -86,6 +86,21 @@ static PAID_BLOCKS: LazyLock<Mutex<HashSet<u64>>> =
 static PAYOUT_LOG: LazyLock<Mutex<VecDeque<PayoutEvent>>> =
     LazyLock::new(|| Mutex::new(VecDeque::with_capacity(PAYOUT_LOG_CAP)));
 
+// Serialises the bulk wallet-send loop inside `process_matured_block`.
+// Each invocation of `irium-wallet send` queries iriumd for spendable
+// UTXOs in a fresh subprocess; iriumd's mempool index update for a
+// freshly broadcast payout tx is not instantaneous, so two concurrent
+// payout cycles can pick the same UTXO and the second broadcast comes
+// back with iriumd's generic "Transaction signature verification failed"
+// (the verifier rejects against an output already spent in mempool).
+// The `for to_send` loop is structurally sequential today, but a tokio
+// Mutex here is forward-defensive: any future caller that spawns
+// `process_matured_block` from another task will still see serialised
+// wallet-send execution. The Mutex is async so awaiting it never blocks
+// the runtime.
+static PAYOUT_SEND_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 // Types
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -450,6 +465,12 @@ async fn process_matured_block(
 
     let pool_addr = std::env::var("IRIUM_POOL_PAYOUT_ADDRESS")
         .unwrap_or_else(|_| POOL_PAYOUT_ADDR_DEFAULT.to_string());
+
+    // Acquire the cross-cycle send lock before any wallet subprocess is
+    // spawned. Held for the full bulk loop and released when this
+    // function returns. See PAYOUT_SEND_LOCK comment for the UTXO-race
+    // rationale.
+    let _send_guard = PAYOUT_SEND_LOCK.lock().await;
 
     for (miner_addr, amt_sats) in to_send {
         let count = pending_block.counts.get(&miner_addr).copied().unwrap_or(0);
