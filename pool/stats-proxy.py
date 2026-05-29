@@ -53,6 +53,17 @@ WINDOW_SECS = 15 * 60
 MIN_SHARES = 1
 MIN_SECONDS = 60
 
+# Per-miner estimate uses a shorter warmup threshold than the aggregate
+# /stats estimate. The aggregate is averaged across all workers and
+# benefits from the steadier 60s smoothing; the per-miner number is
+# what the desktop's Active Miners table renders and needs to surface
+# a usable value within ~20 seconds of a stratum restart instead of
+# showing "—" for a full minute. The formula is the same (delta_shares
+# * current_diff * 2^32 / delta_seconds) — only the minimum window
+# length is shorter, so a single share interval already produces a
+# valid estimate.
+MIN_SECONDS_PER_MINER = 20
+
 _lock = threading.Lock()
 _samples = {name: deque() for name in DEFAULTS}
 
@@ -168,10 +179,21 @@ def record_miner_sample(worker, accepted):
     worker. Caller holds no lock - this acquires _lock briefly. Safe to
     call concurrently from background_sampler and the /miners request
     handler.
+
+    Restart detection: stratum restarts reset the upstream `accepted`
+    counter back to 0. Without a guard, the per-worker deque would hold
+    pre-restart samples with high accepted values plus a fresh entry at
+    0, and (latest - oldest) would go negative — interpreted by
+    estimate_miner_hashrate as "no new shares", surfacing 0 H/s for an
+    actively-mining worker until the 15-min window naturally evicts the
+    stale entries. Detect the rollback and clear the deque so the new
+    rolling window starts cleanly from this observation.
     """
     now = time.time()
     with _lock:
         buf = _miner_samples.setdefault(worker, deque())
+        if buf and accepted < buf[-1][1]:
+            buf.clear()
         buf.append((now, accepted))
         cutoff = now - WINDOW_SECS
         while buf and buf[0][0] < cutoff:
@@ -197,7 +219,19 @@ def estimate_miner_hashrate(worker, accepted_now, diff):
     now = time.time()
     delta_shares = accepted_now - oldest_accepted
     delta_seconds = now - oldest_ts
-    if delta_seconds < MIN_SECONDS:
+    # Negative delta means the upstream counter rolled back between the
+    # background sampler's last write and the consumer's read (stratum
+    # restart caught mid-sample). record_miner_sample clears the deque
+    # on rollback, but a race can still produce a transient negative
+    # here. Surface None ("collecting") rather than a bogus value.
+    if delta_shares < 0:
+        return (None, 0)
+    # Per-miner threshold is intentionally lower than the aggregate
+    # MIN_SECONDS so freshly-restarted miners get a usable hashrate
+    # estimate within ~20s instead of being stuck at "—" for a full
+    # minute. Single-share variance is unavoidable at short windows;
+    # the rolling 15-min average smooths it out as more samples land.
+    if delta_seconds < MIN_SECONDS_PER_MINER:
         return (None, int(delta_seconds))
     if delta_shares < MIN_SHARES:
         return (0, int(delta_seconds))
