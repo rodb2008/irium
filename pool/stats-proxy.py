@@ -13,15 +13,25 @@ ASIC_METRICS = "http://127.0.0.1:3334/metrics"
 # string in sync with STRATUM_METRICS_BIND in stratum-legacy.env.
 CPU_METRICS = "http://127.0.0.1:3346/metrics"
 SOLO_METRICS = "http://127.0.0.1:3338/metrics"
+# Port-443 multiplexed cpuminer stratum (irium-stratum-443). Metrics bind
+# is STRATUM_METRICS_BIND=127.0.0.1:3444 in /etc/irium-pool/stratum-443.env.
+# Without this scrape, workers connected only to the port-443 listener
+# never appear in /miners and are excluded from PPLNS share accounting.
+PORT443_METRICS = "http://127.0.0.1:3444/metrics"
 PUBLIC_PORT = 3337
 
-# Configured default share difficulties per profile (kept in sync with
-# /etc/irium-pool/stratum*.env). Vardiff may drift up to MAX_DIFF per
-# session; this constant is the conservative baseline used for estimation.
+# Per-profile FALLBACK share difficulty. The new stratum binary
+# (2026-05-29, Phase B hashrate fix) exposes per-worker `current_diff`
+# in /metrics so vardiff drift is tracked correctly. These DEFAULTS are
+# only used when an older stratum binary (or no /metrics entry yet) is
+# in play. Realigned to match each stratum's STRATUM_DEFAULT_DIFF env at
+# deploy time — the old asic=2048 was ~5x too low vs the env's 10000
+# and contributed to the documented 10x hashrate under-report.
 DEFAULTS = {
-    "asic": {"diff": 2048, "metrics": ASIC_METRICS},
-    "cpu_gpu": {"diff": 1024, "metrics": CPU_METRICS},
-    "solo": {"diff": 10000, "metrics": SOLO_METRICS},
+    "asic":    {"diff": 10000, "metrics": ASIC_METRICS},
+    "cpu_gpu": {"diff": 1,     "metrics": CPU_METRICS},
+    "solo":    {"diff": 10000, "metrics": SOLO_METRICS},
+    "port443": {"diff": 25000, "metrics": PORT443_METRICS},
 }
 
 # Solo pool fee in basis points; mirrors IRIUM_STRATUM_SOLO_FEE_BPS in
@@ -406,6 +416,7 @@ class Handler(BaseHTTPRequestHandler):
         asic = fetch(ASIC_METRICS)
         cpu = fetch(CPU_METRICS)
         solo = fetch(SOLO_METRICS)
+        port443 = fetch(PORT443_METRICS)
         # PPLNS standing — only the ASIC pool runs the payout subsystem
         # right now (legacy + 443 still on the pre-PPLNS binary). Failing
         # to fetch is non-fatal: the enrichment fields just go to None.
@@ -413,7 +424,12 @@ class Handler(BaseHTTPRequestHandler):
         payout_by_addr = (payout_view.get("by_address") or {}) if isinstance(payout_view, dict) else {}
         now = time.time()
         miners_list = []
-        for profile, source_metrics in (("asic", asic), ("cpu_gpu", cpu), ("solo", solo)):
+        for profile, source_metrics in (
+            ("asic", asic),
+            ("cpu_gpu", cpu),
+            ("solo", solo),
+            ("port443", port443),
+        ):
             miners_data = source_metrics.get("miners", {}) or {}
             diff = DEFAULTS[profile]["diff"]
             for worker, mstats in miners_data.items():
@@ -436,7 +452,19 @@ class Handler(BaseHTTPRequestHandler):
                 # does not contaminate a single shared deque with two
                 # different `accepted` counters — that was the root
                 # cause of hashrate_15m=0 on multi-pool miners.
-                hashrate_15m, _hr_ws = estimate_miner_hashrate(f"{profile}:{worker}", accepted, diff)
+                #
+                # Prefer per-worker live vardiff exposed by the stratum
+                # binary (>= 2026-05-29 build). Falls back to the profile
+                # baseline DEFAULTS for older binaries that don't include
+                # current_diff in /metrics. Without this, vardiff drift
+                # away from baseline causes the formula to under-report
+                # hashrate by ~10x for ASIC miners running at retargeted
+                # vardiff.
+                live_diff = mstats.get("current_diff")
+                effective_diff = float(live_diff) if live_diff else diff
+                hashrate_15m, _hr_ws = estimate_miner_hashrate(
+                    f"{profile}:{worker}", accepted, effective_diff
+                )
                 # PPLNS enrichment (ASIC profile only). Strip the worker
                 # suffix to get the payout address — the payout subsystem
                 # aggregates shares per-address since one wallet can
