@@ -44,17 +44,13 @@ standard block-header serialization at block 22,888. After activation
 every SHA-256d miner — Bitaxe, ASIC, T-Rex, lolMiner, NBMiner,
 cpuminer-opt — can submit valid blocks.
 
-**Payout model varies by port:**
-
-- Port **3333** (ASIC) runs **PPLNS proportional payout** with a
-  **1% pool fee**. Your share of each found block's 50 IRM reward is
-  proportional to your contribution over the rolling PPLNS share
-  window. Payouts are credited to the IRM address in your Stratum
-  worker name after coinbase maturity (100 blocks).
-- Ports **3335**, **443**, and **80** run **SOLO payout mode**: when
-  one of your shares meets the network target, the full 50 IRM block
-  reward goes directly to the IRM address in your Stratum worker
-  name. There is no pool fee.
+**Unified direct-payout model:** every port runs the same payout
+behaviour. When one of your shares meets the network target, the
+**full 50 IRM block reward** is paid by the coinbase **directly to
+the IRM address you used as your Stratum worker name**. There is
+**zero pool fee** — the pool operator takes nothing. The pool wallet
+does not accumulate or redistribute funds; every block goes straight
+to its finder.
 
 ## Recommended endpoint selection
 
@@ -73,25 +69,21 @@ Use the DNS hostname only after operator cutover; backend IPs may change and sho
 
 ## Payout model
 
-Port **3333** (ASIC) runs **PPLNS proportional payout** with a **1%
-pool fee**:
+Every port — `3333`, `3335`, and `443` — uses the **same direct-payout
+model**:
 
-- Your username must start with your IRM address.
-- Each found block's 50 IRM reward (minus the 1% pool fee) is paid
-  proportionally per-miner based on your share contribution to the
-  rolling PPLNS share window.
-- Payouts are credited after coinbase maturity (100 blocks).
-- Worker suffix (for example `.worker1`) is only for rig
-  identification; payout is per-address.
+- Your Stratum username must start with your IRM address.
+- If one of your shares finds a valid network block, the full **50 IRM**
+  block reward is paid by the coinbase **directly to that IRM address**.
+- Worker suffix (for example `.worker1`) is for rig identification only.
+- **Zero pool fee.** The pool operator does not take a cut, does not
+  pool incoming rewards, and does not redistribute. Each block belongs
+  entirely to its finder.
 
-Ports **3335**, **443**, and **80** run **SOLO payout** with **no pool
-fee**:
-
-- Your username must start with your IRM address.
-- If your share finds a valid network block, the full 50 IRM block
-  reward is paid to that IRM address.
-- Worker suffix (for example `.worker1`) is only for rig
-  identification.
+This model replaces the prior PPLNS arrangement (which was removed
+after the 2026-05-29 over-distribution incident). There is no longer
+any pool-wallet accumulation, no PPLNS share window, no payout-maturity
+wait, no `/payouts` endpoint, and no `/miners_payout` endpoint.
 
 ## Connectivity troubleshooting
 If you cannot connect:
@@ -133,7 +125,7 @@ From the pool host:
 ```bash
 systemctl status irium-stratum --no-pager
 systemctl status irium-stratum-legacy --no-pager
-ss -lntp | egrep ':3333|:3335|:3334|:3336'
+ss -lntp | egrep ':3333|:3335|:3334|:3443|:3444'
 ```
 
 ## Operator notes

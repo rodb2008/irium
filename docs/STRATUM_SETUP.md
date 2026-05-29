@@ -643,18 +643,16 @@ Two indicators:
 
 ### 9d. When and where do I get paid?
 
-The pool runs in solo-payout mode on most ports: when one of your
-shares solves a block, the full 50 IRM block reward goes directly to
-the IRM address in your worker name. There is no pool fee on that
-path.
+Every port (3333, 3335, 443) runs the **same direct-payout model**:
+when one of your shares solves a block, the **full 50 IRM block
+reward** goes directly to the IRM address in your worker name via the
+coinbase output. **Zero pool fee.** The pool operator takes nothing
+and the pool wallet does not accumulate or redistribute funds.
 
-(Note for operators: port 3333 currently runs the PPLNS-mode binary
-during a 2026-05-28 soak. Shares on port 3333 are credited to a PPLNS
-share window that pays out from the pool wallet after maturity, not
-directly via coinbase to the worker. Port 3335 and the 443/80
-fallbacks still run the original solo-payout binary. The behaviour
-on port 3333 will revert to solo-payout if the PPLNS soak does not
-graduate, and will be announced if it does.)
+(The prior PPLNS share-window arrangement was removed after the
+2026-05-29 over-distribution incident. There is no longer any pool-
+wallet payout queue, no PPLNS share window, no `/payouts` endpoint,
+and no `/miners_payout` endpoint.)
 
 The reward becomes spendable after **100 blocks of coinbase maturity**.
 At the current chain block rate of ~1–2 minutes per block, that is
