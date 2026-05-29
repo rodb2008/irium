@@ -336,15 +336,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         asic = fetch(ASIC_METRICS)
         cpu = fetch(CPU_METRICS)
+        solo = fetch(SOLO_METRICS)
         asic_est = record_and_estimate("asic", asic)
         cpu_est = record_and_estimate("cpu_gpu", cpu)
+        solo_est = record_and_estimate("solo", solo)
         asic_tcp = asic.get("active_tcp_sessions", 0)
         cpu_tcp = cpu.get("active_tcp_sessions", 0)
+        solo_tcp = solo.get("active_tcp_sessions", 0)
         data = {
             "pool": "Irium Official Pool",
             "url": "pool.iriumlabs.org",
             "asic_port": 3333,
             "cpu_gpu_port": 3335,
+            "solo_port": 3336,
             "asic": {
                 "active_miners": asic_tcp,
                 "tcp_sessions": asic_tcp,
@@ -363,10 +367,19 @@ class Handler(BaseHTTPRequestHandler):
                 "integrity": cpu.get("pool_integrity", "unknown"),
                 **cpu_est,
             },
-            "total_miners": asic_tcp + cpu_tcp,
-            "total_blocks_found": asic.get("submit_accepted", 0) + cpu.get("submit_accepted", 0),
+            "solo": {
+                "active_miners": solo_tcp,
+                "tcp_sessions": solo_tcp,
+                "accepted_shares": solo.get("accepted_shares", 0),
+                "rejected_shares": solo.get("rejected_shares", 0),
+                "blocks_found": solo.get("submit_accepted", 0),
+                "integrity": solo.get("pool_integrity", "unknown"),
+                **solo_est,
+            },
+            "total_miners": asic_tcp + cpu_tcp + solo_tcp,
+            "total_blocks_found": asic.get("submit_accepted", 0) + cpu.get("submit_accepted", 0) + solo.get("submit_accepted", 0),
             "blocks_found_today": _blocks_found_today(
-                asic.get("submit_accepted", 0) + cpu.get("submit_accepted", 0)
+                asic.get("submit_accepted", 0) + cpu.get("submit_accepted", 0) + solo.get("submit_accepted", 0)
             ),
         }
         body = json.dumps(data, indent=2).encode()
@@ -392,6 +405,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         asic = fetch(ASIC_METRICS)
         cpu = fetch(CPU_METRICS)
+        solo = fetch(SOLO_METRICS)
         # PPLNS standing — only the ASIC pool runs the payout subsystem
         # right now (legacy + 443 still on the pre-PPLNS binary). Failing
         # to fetch is non-fatal: the enrichment fields just go to None.
@@ -399,7 +413,7 @@ class Handler(BaseHTTPRequestHandler):
         payout_by_addr = (payout_view.get("by_address") or {}) if isinstance(payout_view, dict) else {}
         now = time.time()
         miners_list = []
-        for profile, source_metrics in (("asic", asic), ("cpu_gpu", cpu)):
+        for profile, source_metrics in (("asic", asic), ("cpu_gpu", cpu), ("solo", solo)):
             miners_data = source_metrics.get("miners", {}) or {}
             diff = DEFAULTS[profile]["diff"]
             for worker, mstats in miners_data.items():
