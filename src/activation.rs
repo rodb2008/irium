@@ -31,6 +31,31 @@ pub const MAINNET_LWMA_V2_ACTIVATION_HEIGHT: Option<u64> = Some(19_740);
 /// before the first AuxPoW block can appear.
 pub const MAINNET_AUXPOW_ACTIVATION_HEIGHT: Option<u64> = Some(26_500);
 
+/// Mainnet Bitcoin SPV header relay activation height (Phase 1).
+///
+/// `None` keeps the BTC SPV header relay disabled on mainnet. When this is
+/// set to `Some(<height>)`, iriumd blocks at or after that height may carry
+/// a `BtcHeaderBatch` output (script tag `0xc4`) and the validator will
+/// apply such batches into `ChainState.btc_headers`.
+///
+/// Phase 1 ships disabled. Activation requires a dedicated commit and
+/// release per the workflow in docs/htlcv1_activation_commit_workflow.md.
+pub const MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// Mainnet anchor for the BTC SPV header relay.
+///
+/// All four values are zero until the relay is activated on mainnet. They
+/// must be set together (a known finalized BTC mainnet block) at the same
+/// time as `MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT`.
+#[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
+pub const MAINNET_BTC_ANCHOR_HEIGHT: u64 = 0;
+#[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
+pub const MAINNET_BTC_ANCHOR_HASH: [u8; 32] = [0u8; 32];
+#[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
+pub const MAINNET_BTC_ANCHOR_BITS: u32 = 0;
+#[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
+pub const MAINNET_BTC_ANCHOR_TIME: u32 = 0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkKind {
     Mainnet,
@@ -103,6 +128,23 @@ pub fn resolved_auxpow_activation_height(network: NetworkKind) -> Option<u64> {
     match network {
         NetworkKind::Mainnet => MAINNET_AUXPOW_ACTIVATION_HEIGHT,
         NetworkKind::Testnet | NetworkKind::Devnet => runtime_auxpow_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the BTC SPV header relay activation height.
+/// Read from `IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once Phase 1 callers come online
+pub fn runtime_btc_spv_relay_env_override() -> Option<u64> {
+    env::var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once Phase 1 callers come online
+pub fn resolved_btc_spv_relay_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_btc_spv_relay_env_override(),
     }
 }
 
@@ -263,5 +305,42 @@ mod tests {
             Some(1000)
         );
         std::env::remove_var("IRIUM_AUXPOW_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn mainnet_btc_spv_relay_height_is_none() {
+        assert_eq!(
+            MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT, None,
+            "Phase 1 ships disabled on mainnet"
+        );
+        assert_eq!(
+            resolved_btc_spv_relay_activation_height(NetworkKind::Mainnet),
+            None
+        );
+    }
+
+    #[test]
+    fn mainnet_ignores_btc_spv_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT", "12345");
+        let resolved = resolved_btc_spv_relay_activation_height(NetworkKind::Mainnet);
+        std::env::remove_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT");
+        assert_eq!(resolved, MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn non_mainnet_uses_btc_spv_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT", "50");
+        assert_eq!(
+            resolved_btc_spv_relay_activation_height(NetworkKind::Devnet),
+            Some(50)
+        );
+        assert_eq!(
+            resolved_btc_spv_relay_activation_height(NetworkKind::Testnet),
+            Some(50)
+        );
+        std::env::remove_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT");
     }
 }

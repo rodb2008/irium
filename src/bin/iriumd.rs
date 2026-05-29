@@ -8262,6 +8262,7 @@ async fn main() {
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
+            btc_spv: None,
     };
     let mut state = ChainState::new(params);
     if load_persisted {
@@ -10407,6 +10408,7 @@ mod tests {
             lwma: LwmaParams::new(None, pow_limit),
             lwma_v2: None,
             auxpow_activation_height: None,
+            btc_spv: None,
         };
         let chain = Arc::new(Mutex::new(ChainState::new(params)));
 
@@ -11321,6 +11323,7 @@ mod tests {
             lwma: LwmaParams::new(None, pow_limit),
             lwma_v2: None,
             auxpow_activation_height: None,
+            btc_spv: None,
         };
         let chain = ChainState::new(params);
         let genesis_hash = hex::encode(chain.tip_hash());

@@ -12,6 +12,11 @@ use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
 
 use crate::block::{Block, BlockHeader};
+use crate::btc_spv::{
+    apply_btc_header_batch, parse_btc_header_batch, undo_btc_relay_update, BtcAnchor,
+    BtcHeaderEntry, BtcRelayUpdate, BtcSpvParams, BTC_HEADER_BATCH_TAG,
+    MAX_BTC_HEADER_BATCH_BYTES,
+};
 use crate::constants::{
     block_reward, BLOCK_TARGET_INTERVAL, COINBASE_MATURITY, DIFFICULTY_RETARGET_INTERVAL,
     LWMA_MAX_TARGET_DOWN_FACTOR, LWMA_MAX_TARGET_UP_FACTOR, LWMA_MIN_DIFFICULTY_FLOOR,
@@ -96,6 +101,11 @@ pub struct ChainParams {
     /// replaces v1. None keeps v1 behavior indefinitely.
     pub lwma_v2: Option<LwmaParams>,
     pub auxpow_activation_height: Option<u64>,
+    /// Bitcoin SPV header relay parameters. `None` keeps the relay disabled.
+    /// When `Some`, blocks at or after `activation_height` may carry a
+    /// `BtcHeaderBatch` output and `anchor` seeds the relay's view of the
+    /// Bitcoin chain.
+    pub btc_spv: Option<BtcSpvParams>,
 }
 
 /// Reference to a specific transaction output.
@@ -119,6 +129,9 @@ struct BlockUndo {
     spent: Vec<(OutPoint, UtxoEntry)>,
     created: Vec<OutPoint>,
     subsidy_created: u64,
+    /// If this block applied a `BtcHeaderBatch` output, the relay-state
+    /// change record needed to roll it back on disconnect.
+    btc_relay_update: Option<BtcRelayUpdate>,
 }
 
 #[derive(Debug)]
@@ -141,6 +154,11 @@ pub struct ChainState {
     pub anchors: Option<AnchorManager>,
     pub best_tip: [u8; 32],
     undo_logs: HashMap<[u8; 32], BlockUndo>,
+    /// BTC SPV header relay state — populated only after activation.
+    pub btc_headers: HashMap<[u8; 32], BtcHeaderEntry>,
+    pub btc_heights: HashMap<[u8; 32], u64>,
+    pub btc_tip: Option<[u8; 32]>,
+    pub btc_tip_height: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +186,10 @@ impl ChainState {
             anchors: None,
             best_tip: [0u8; 32],
             undo_logs: HashMap::new(),
+            btc_headers: HashMap::new(),
+            btc_heights: HashMap::new(),
+            btc_tip: None,
+            btc_tip_height: 0,
         };
         let genesis = state.params.genesis_block.clone();
         state
@@ -204,6 +226,22 @@ impl ChainState {
             .mpsov1_activation_height
             .map(|h| height >= h)
             .unwrap_or(false)
+    }
+
+    fn btc_spv_relay_active_at(&self, height: u64) -> bool {
+        self.params
+            .btc_spv
+            .as_ref()
+            .map(|p| height >= p.activation_height)
+            .unwrap_or(false)
+    }
+
+    fn btc_anchor(&self) -> BtcAnchor {
+        self.params
+            .btc_spv
+            .as_ref()
+            .map(|p| p.anchor)
+            .unwrap_or_else(BtcAnchor::zero)
     }
 
     /// Convenience wrapper: compute LWMA target using v1 parameters.
@@ -560,6 +598,16 @@ impl ChainState {
             .remove(&tip_hash)
             .ok_or_else(|| "missing undo data for tip block".to_string())?;
 
+        if let Some(update) = undo.btc_relay_update.as_ref() {
+            undo_btc_relay_update(
+                update,
+                &mut self.btc_headers,
+                &mut self.btc_heights,
+                &mut self.btc_tip,
+                &mut self.btc_tip_height,
+            );
+        }
+
         for op in undo.created {
             self.utxos.remove(&op);
         }
@@ -852,6 +900,8 @@ impl ChainState {
         let mut created: Vec<(OutPoint, TxOutput, bool)> = Vec::new();
         let mut fees: i64 = 0;
         let mut seen_inputs: HashSet<OutPoint> = HashSet::new();
+        let mut btc_relay_update: Option<BtcRelayUpdate> = None;
+        let mut btc_batch_count: usize = 0;
 
         for tx in block.transactions.iter().skip(1) {
             self.validate_transaction_internal(tx, height, &mut seen_inputs, &mut fees)?;
@@ -861,16 +911,50 @@ impl ChainState {
                     txid,
                     index: index as u32,
                 };
+                if output.script_pubkey.first().copied() == Some(BTC_HEADER_BATCH_TAG) {
+                    // Structural validity already enforced by validate_output via
+                    // validate_transaction_internal above. Now apply the batch
+                    // into BTC relay state.
+                    if !self.btc_spv_relay_active_at(height) {
+                        return Err(
+                            "BtcHeaderBatch output before SPV relay activation".to_string(),
+                        );
+                    }
+                    btc_batch_count += 1;
+                    if btc_batch_count > 1 {
+                        return Err("block contains more than one BtcHeaderBatch output".to_string());
+                    }
+                    let headers = parse_btc_header_batch(&output.script_pubkey)
+                        .map_err(|e| format!("BtcHeaderBatch apply parse failed: {}", e))?;
+                    let anchor = self.btc_anchor();
+                    let update = apply_btc_header_batch(
+                        headers,
+                        block.header.time,
+                        &mut self.btc_headers,
+                        &mut self.btc_heights,
+                        &mut self.btc_tip,
+                        &mut self.btc_tip_height,
+                        &anchor,
+                    )?;
+                    btc_relay_update = Some(update);
+                    // Header-batch outputs are consumed at apply time and not
+                    // added to the UTXO set.
+                    continue;
+                }
                 created.push((op, output, false));
             }
         }
 
         let mut coinbase_total: u64 = 0;
         for output in &coinbase.outputs {
+            if output.script_pubkey.first().copied() == Some(BTC_HEADER_BATCH_TAG) {
+                return Err("BtcHeaderBatch output not allowed in coinbase".to_string());
+            }
             validate_output(
                 output,
                 self.htlcv1_active_at(height),
                 self.mpsov1_active_at(height),
+                self.btc_spv_relay_active_at(height),
                 height,
             )?;
             coinbase_total = coinbase_total
@@ -931,6 +1015,7 @@ impl ChainState {
             spent: spent_for_undo,
             created: created_outpoints,
             subsidy_created,
+            btc_relay_update,
         };
 
         Ok((fees as u64, coinbase_total, subsidy_created, undo))
@@ -1022,6 +1107,10 @@ impl ChainState {
             anchors: self.anchors.clone(),
             best_tip: self.best_tip,
             undo_logs: self.undo_logs.clone(),
+            btc_headers: self.btc_headers.clone(),
+            btc_heights: self.btc_heights.clone(),
+            btc_tip: self.btc_tip,
+            btc_tip_height: self.btc_tip_height,
         };
 
         let branch = self.gather_branch_to_genesis(tip_hash)?;
@@ -1188,6 +1277,7 @@ impl ChainState {
                 output,
                 self.htlcv1_active_at(height),
                 self.mpsov1_active_at(height),
+                self.btc_spv_relay_active_at(height),
                 height,
             )?;
             output_total += output.value as i64;
@@ -1216,6 +1306,7 @@ fn validate_output(
     output: &TxOutput,
     htlcv1_active: bool,
     mpsov1_active: bool,
+    btc_spv_relay_active: bool,
     height: u64,
 ) -> Result<(), String> {
     if output.value > MAX_MONEY {
@@ -1241,7 +1332,24 @@ fn validate_output(
         return Ok(());
     }
 
-    // All non-MPSOv1 outputs keep the existing 255-byte limit.
+    // BTC SPV header batch output: exempt from the 255-byte cap (can be up
+    // to 161_284 bytes for a full 2016-header batch), must carry zero value.
+    if tag == Some(BTC_HEADER_BATCH_TAG) {
+        if !btc_spv_relay_active {
+            return Err("BtcHeaderBatch output before SPV relay activation".to_string());
+        }
+        if output.value != 0 {
+            return Err("BtcHeaderBatch output must have value 0".to_string());
+        }
+        if output.script_pubkey.len() > MAX_BTC_HEADER_BATCH_BYTES {
+            return Err("BtcHeaderBatch script_pubkey too large".to_string());
+        }
+        parse_btc_header_batch(&output.script_pubkey)
+            .map_err(|e| format!("Malformed BtcHeaderBatch: {}", e))?;
+        return Ok(());
+    }
+
+    // All non-MPSOv1, non-BtcHeaderBatch outputs keep the existing 255-byte limit.
     if output.script_pubkey.len() > 0xff {
         return Err("script_pubkey too large".to_string());
     }
@@ -1669,6 +1777,7 @@ mod tests {
             lwma: LwmaParams::new(None, pow_limit),
             lwma_v2: None,
         auxpow_activation_height: None,
+            btc_spv: None,
         };
         ChainState::new(params)
     }
@@ -1743,6 +1852,7 @@ mod tests {
             lwma: LwmaParams::new(lwma_activation, pow_limit),
             lwma_v2: None,
         auxpow_activation_height: None,
+            btc_spv: None,
         };
         ChainState::new(params)
     }
@@ -2448,6 +2558,7 @@ mod tests {
             lwma: LwmaParams::new(lwma_v1_activation, pow_limit),
             lwma_v2: v2,
             auxpow_activation_height: None,
+            btc_spv: None,
         };
         ChainState::new(params)
     }
@@ -2696,6 +2807,7 @@ mod tests {
             lwma: LwmaParams::new(None, pow_limit),
             lwma_v2: None,
         auxpow_activation_height: None,
+            btc_spv: None,
         };
         ChainState::new(params)
     }
