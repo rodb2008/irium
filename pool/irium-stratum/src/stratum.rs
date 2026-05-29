@@ -1,7 +1,6 @@
 use crate::block::{
-    build_coinbase_tx, build_merkle_branches, build_solo_coinbase_tx, coinbase_prefix_suffix,
+    build_coinbase_tx, build_merkle_branches, coinbase_prefix_suffix,
     header_bytes, merkle_root_from_coinbase, parse_address_to_pkh, parse_hex32, parse_u32_hex,
-    solo_coinbase_prefix_suffix,
 };
 use crate::pow::{hash_meets_target, sha256d, target_from_bits, target_from_difficulty_with_limit};
 use crate::template::{GetBlockTemplate, TemplateClient};
@@ -179,14 +178,6 @@ pub struct StratumConfig {
     pub conn_window_secs: u64,
     pub ban_threshold: u32,
     pub ban_duration_secs: u64,
-    // Solo pool mode (port 3336 in production). When true, each session's
-    // coinbase pays directly to the worker's parsed address (session.pkh)
-    // rather than the global POOL_PAYOUT_PKH, with a pool fee output of
-    // solo_pool_fee_bps basis points routed to POOL_PAYOUT_PKH. PPLNS
-    // share-window queuing is bypassed because the on-chain coinbase
-    // already settles the payout at block-find time.
-    pub solo_mode: bool,
-    pub solo_pool_fee_bps: u64,
 }
 
 #[derive(Clone)]
@@ -227,12 +218,6 @@ struct CanonicalJobSnapshot {
     auxpow_mode: bool,
     irium_header80: Option<[u8; 80]>,
     irium_coinbase_hex: Option<String>,
-    // Solo-pool fee output: Some((fee_value_sats, fee_script)) when the
-    // snapshot was built in solo mode. When set, build_native_rewardable_coinbase
-    // emits 2 outputs (payout_script for the worker share + this fee output
-    // for the pool) to match the bytes already encoded in coinbase_prefix /
-    // coinbase_suffix. None for PPLNS mode.
-    solo_pool_fee_output: Option<(u64, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -704,7 +689,6 @@ fn mark_rejected_share() {
 // Silently skips on poisoned mutex (should never happen but mining
 // must not stall on observability bookkeeping).
 fn record_miner_share_accepted(worker: &str, diff: f64) {
-    crate::payout::record_share(worker, diff);
     let now = unix_now_secs();
     if let Ok(mut map) = MINER_STATS.lock() {
         let entry = map.entry(worker.to_string()).or_default();
@@ -933,20 +917,6 @@ async fn metrics_loop(
                     })
                     .to_string(),
                 )
-            } else if first.starts_with("GET /payouts") {
-                // PPLNS payout log — last 50 sent/failed payouts, with
-                // block height, miner, amount, share count, pct, tx_id.
-                // Consumed by stats-proxy and the Block Explorer's pool
-                // stats page. See payout.rs for the data shape.
-                let payload = crate::payout::payouts_view_json().to_string();
-                ("200 OK", payload)
-            } else if first.starts_with("GET /miners_payout") {
-                // Per-address PPLNS standing snapshot from the CURRENT
-                // 10k-share window. Adds pending_shares,
-                // estimated_payout_irm, and pct_of_window for each
-                // address. Consumed by stats-proxy's /miners enrichment.
-                let payload = crate::payout::miners_payout_view_json().to_string();
-                ("200 OK", payload)
             } else {
                 ("404 Not Found", "{\"error\":\"not_found\"}".to_string())
             };
@@ -1284,51 +1254,25 @@ fn build_canonical_job_snapshot(job: &Job, session: &SessionState, config: &Stra
     let pkh = session.pkh.ok_or_else(|| anyhow!("unauthorized"))?;
     let ntime = parse_u32_hex(&job.ntime_hex)?;
 
-    // Solo pool mode: the coinbase pays the worker (session.pkh) with a pool
-    // fee output to POOL_PAYOUT_PKH. AuxPoW is not solo-aware in this build —
-    // operators running solo mode must not enable IRIUM_AUXPOW_ACTIVATION_HEIGHT
-    // until per-session auxpow is wired through.
-    let solo_active = config.solo_mode;
-    let pool_pkh = &*crate::payout::POOL_PAYOUT_PKH_BYTES;
-
+    // Coinbase always pays the worker directly (session.pkh). No pool fee output.
     let auxpow_active = config.auxpow_activation_height
         .map(|h| job.height >= h)
-        .unwrap_or(false)
-        && !solo_active;
-
-    let solo_pool_fee_output = if solo_active {
-        let fee_bps = config.solo_pool_fee_bps.min(10_000);
-        let fee_value = job.coinbase_value * fee_bps / 10_000;
-        let fee_script = payout_script_from_pkh(pool_pkh);
-        Some((fee_value, fee_script))
-    } else {
-        None
-    };
+        .unwrap_or(false);
 
     let (coinbase_prefix, coinbase_suffix, prev_hash_internal, branches, auxpow_mode, irium_header80, irium_coinbase_hex) =
         if auxpow_active {
             // AuxPoW: build fixed Irium coinbase, compute Irium block hash, build parent coinbase
-            let irium_coinbase = build_coinbase_tx(job.height, job.coinbase_value, pool_pkh, &[], session.coinbase_bip34);
+            let irium_coinbase = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &[], session.coinbase_bip34);
             let irium_coinbase_hash = sha256d(&irium_coinbase);
             let irium_merkle_root = merkle_root_from_coinbase(irium_coinbase_hash, &job.branches);
             let irium_h80 = build_irium_auxpow_header(job.prev_hash, irium_merkle_root, ntime, job.bits);
             let aux_hash = sha256d(&irium_h80);
             let (pp, ps) = build_auxpow_parent_coinbase_prefix_suffix(
-                job.height, job.coinbase_value, pool_pkh, &aux_hash, session.coinbase_bip34,
+                job.height, job.coinbase_value, &pkh, &aux_hash, session.coinbase_bip34,
             );
             (pp, ps, [0u8; 32], vec![], true, Some(irium_h80), Some(hex::encode(&irium_coinbase)))
-        } else if solo_active {
-            let (cp, cs) = solo_coinbase_prefix_suffix(
-                job.height,
-                job.coinbase_value,
-                &pkh,
-                pool_pkh,
-                config.solo_pool_fee_bps,
-                session.coinbase_bip34,
-            );
-            (cp, cs, job.prev_hash, job.branches.clone(), false, None, None)
         } else {
-            let (cp, cs) = coinbase_prefix_suffix(job.height, job.coinbase_value, pool_pkh, session.coinbase_bip34);
+            let (cp, cs) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34);
             (cp, cs, job.prev_hash, job.branches.clone(), false, None, None)
         };
 
@@ -1352,7 +1296,7 @@ fn build_canonical_job_snapshot(job: &Job, session: &SessionState, config: &Stra
         extranonce2_size: 4,
         coinbase_prefix,
         coinbase_suffix,
-        payout_script: payout_script_from_pkh(if solo_active { &pkh } else { pool_pkh }),
+        payout_script: payout_script_from_pkh(&pkh),
         tx_hex: job.tx_hex.clone(),
         tx_hashes_internal,
         branches,
@@ -1361,7 +1305,6 @@ fn build_canonical_job_snapshot(job: &Job, session: &SessionState, config: &Stra
         auxpow_mode,
         irium_header80,
         irium_coinbase_hex,
-        solo_pool_fee_output,
     })
 }
 
@@ -1439,28 +1382,10 @@ fn build_native_rewardable_coinbase(
     tx.push(script_sig.len() as u8);
     tx.extend_from_slice(&script_sig);
     tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
-    match snapshot.solo_pool_fee_output.as_ref() {
-        Some((fee_value, fee_script)) => {
-            // Solo mode: emit two outputs (worker share + pool fee). Worker
-            // value = coinbase_value - fee_value; ordering must match the
-            // bytes already encoded into coinbase_prefix/coinbase_suffix
-            // by solo_coinbase_prefix_suffix or the share hash check fails.
-            let worker_value = snapshot.coinbase_value.saturating_sub(*fee_value);
-            tx.push(2); // outputs
-            tx.extend_from_slice(&worker_value.to_le_bytes());
-            tx.push(snapshot.payout_script.len() as u8);
-            tx.extend_from_slice(&snapshot.payout_script);
-            tx.extend_from_slice(&fee_value.to_le_bytes());
-            tx.push(fee_script.len() as u8);
-            tx.extend_from_slice(fee_script);
-        }
-        None => {
-            tx.push(1); // outputs
-            tx.extend_from_slice(&snapshot.coinbase_value.to_le_bytes());
-            tx.push(snapshot.payout_script.len() as u8);
-            tx.extend_from_slice(&snapshot.payout_script);
-        }
-    }
+    tx.push(1); // single output: full coinbase value to worker
+    tx.extend_from_slice(&snapshot.coinbase_value.to_le_bytes());
+    tx.push(snapshot.payout_script.len() as u8);
+    tx.extend_from_slice(&snapshot.payout_script);
     tx.extend_from_slice(&0u32.to_le_bytes());
     Ok(tx)
 }
@@ -1838,14 +1763,6 @@ async fn handle_message(
                         session.adapter_kind.as_str(),
                         config.miner_family_mode.as_str()
                     );
-                    if config.solo_mode {
-                        info!(
-                            "[solo-stratum] worker={} payout_pkh={} fee_bps={}",
-                            user,
-                            hex::encode(pkh),
-                            config.solo_pool_fee_bps
-                        );
-                    }
 
                     // Miner-controlled difficulty via the password field —
                     // standard stratum pool convention: a comma-separated
@@ -2467,12 +2384,6 @@ async fn handle_submit_cpuminer_compat(
         match submit_canonical_block(&client, config, &snapshot, &solve).await? {
             NodeSubmitResult::Accepted { .. } => {
                 mark_submit_accepted();
-                if !config.solo_mode {
-                    crate::payout::queue_block_for_payout(
-                        snapshot.height,
-                        hex::encode(solve.canonical_hash),
-                    );
-                }
                 info!("[block] submitted worker={} height={}", worker, snapshot.height);
                 let row = FoundBlockRecord {
                     height: snapshot.height,
@@ -2670,12 +2581,6 @@ async fn handle_submit_native_rewardable(
             } => {
                 mark_submit_accepted();
                 mark_chain_height_advanced_by_pool();
-                if !config.solo_mode {
-                    crate::payout::queue_block_for_payout(
-                        accepted_height,
-                        hex::encode(solve.canonical_hash),
-                    );
-                }
                 info!(
                     "[BLOCK_ACCEPTED] worker={} job={} canonical_hash={} accepted_height={} template_fingerprint={}",
                     worker,
@@ -2821,12 +2726,6 @@ async fn handle_submit_auxpow(
             Ok(resp) if resp.status().is_success() => {
                 mark_submit_accepted();
                 mark_chain_height_advanced_by_pool();
-                if !config.solo_mode {
-                    crate::payout::queue_block_for_payout(
-                        snapshot.height,
-                        hex::encode(irium_hash),
-                    );
-                }
                 info!(
                     "[AUXPOW_BLOCK_ACCEPTED] worker={} height={} irium_hash={}",
                     worker, snapshot.height, hex::encode(irium_hash)
@@ -2941,19 +2840,7 @@ async fn handle_submit_legacy_rewardable(
     let mut en = session.extranonce1.clone();
     en.extend_from_slice(&extra2);
 
-    let cb = if config.solo_mode {
-        build_solo_coinbase_tx(
-            job.height,
-            job.coinbase_value,
-            &pkh,
-            &*crate::payout::POOL_PAYOUT_PKH_BYTES,
-            config.solo_pool_fee_bps,
-            &en,
-            config.coinbase_bip34,
-        )
-    } else {
-        build_coinbase_tx(job.height, job.coinbase_value, &pkh, &en, config.coinbase_bip34)
-    };
+    let cb = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &en, config.coinbase_bip34);
     let cb_hash = sha256d(&cb);
 
     fn fold_merkle(root0: [u8; 32], branches: &[[u8; 32]], rev_branch: bool, rev_each_round: bool) -> [u8; 32] {
@@ -3354,12 +3241,6 @@ async fn handle_submit_legacy_rewardable(
             .await?;
         if resp.status().is_success() {
             mark_submit_accepted();
-            if !config.solo_mode {
-                crate::payout::queue_block_for_payout(
-                    job.height,
-                    hex::encode(hash_display),
-                );
-            }
             info!(
                 "[block] submitted worker={} height={} hash={}",
                 worker,
@@ -3529,10 +3410,9 @@ async fn send_notify(
                 snap.branches.iter().map(hex::encode).collect::<Vec<_>>(),
             )
         } else {
-            // Use the snapshot's prefix/suffix so solo mode (which encodes a
-            // two-output coinbase via solo_coinbase_prefix_suffix) and PPLNS
-            // both stay byte-identical to the share-validation path. The
-            // marker-based prefix/suffix split makes these session-invariant.
+            // Use the snapshot's prefix/suffix so the bytes stay byte-identical
+            // to the share-validation path. The marker-based prefix/suffix split
+            // makes these session-invariant.
             (
                 prev_hex_for_height(&job.prev_hash, job.height),
                 hex::encode(&snap.coinbase_prefix),
@@ -3709,8 +3589,6 @@ mod tests {
             conn_window_secs: 0,
             ban_threshold: 0,
             ban_duration_secs: 0,
-            solo_mode: false,
-            solo_pool_fee_bps: 100,
         }
     }
 
@@ -3808,13 +3686,6 @@ mod tests {
             } => {
                 mark_submit_accepted();
                 mark_chain_height_advanced_by_pool();
-                // Test helper has no StratumConfig in scope; this path is
-                // covered by #[cfg(test)] only. Production solo-mode skip
-                // lives at the equivalent real-submit call site.
-                crate::payout::queue_block_for_payout(
-                    accepted_height,
-                    hex::encode(solve.canonical_hash),
-                );
                 let record = RoundEligibleRecord {
                     height: accepted_height,
                     job_id: snapshot.job_id.clone(),
@@ -3975,7 +3846,6 @@ mod tests {
             auxpow_mode: false,
             irium_header80: None,
             irium_coinbase_hex: None,
-            solo_pool_fee_output: None,
         };
         let solve = CanonicalSolve {
             adapter_id: "cpuminer_compat",
