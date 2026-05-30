@@ -10819,6 +10819,7 @@ async fn main() {
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
             btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
+            ltc_spv: irium_node_rs::ltc_spv::resolve_ltc_spv_params(network),
             htlc_btc_swap_v1_activation_height:
                 irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
             swap_order_v1_activation_height:
@@ -12988,6 +12989,7 @@ mod tests {
             lwma_v2: None,
             auxpow_activation_height: None,
             btc_spv: None,
+            ltc_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
         };
@@ -13905,6 +13907,7 @@ mod tests {
             lwma_v2: None,
             auxpow_activation_height: None,
             btc_spv: None,
+            ltc_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
         };

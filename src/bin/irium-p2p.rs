@@ -48,6 +48,7 @@ async fn main() {
             .map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
             btc_spv: None,
+            ltc_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
     };

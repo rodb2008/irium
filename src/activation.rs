@@ -65,6 +65,39 @@ pub const MAINNET_BTC_ANCHOR_BITS: u32 = 0x17028c61;
 #[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
 pub const MAINNET_BTC_ANCHOR_TIME: u32 = 1_737_337_343;
 
+/// Mainnet Litecoin SPV header relay activation height (Phase B).
+///
+/// `None` keeps the LTC SPV header relay disabled on mainnet. When set to
+/// `Some(<height>)`, iriumd blocks at or after that height may carry an
+/// `LtcHeaderBatch` output (script tag `0xc6`) and the validator will
+/// apply such batches into `ChainState.ltc_headers`.
+///
+/// Phase B ships disabled. Activation requires a dedicated commit per the
+/// same workflow as Phase 1.
+pub const MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// Mainnet anchor for the LTC SPV header relay.
+///
+/// Litecoin mainnet block 3_106_656 (a 2016-block retarget boundary
+/// chosen well-confirmed at pick time). Hash stored here in DISPLAY order
+/// for readability; reversed to natural byte order in
+/// `LtcAnchor::mainnet()` so it lines up with `prev_hash` chain-linkage
+/// fields. These constants take effect only after governance flips
+/// `MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT` to `Some(<height>)`.
+#[allow(dead_code)] // wired through ChainParams once Phase B callers come online
+pub const MAINNET_LTC_ANCHOR_HEIGHT: u64 = 3_106_656;
+#[allow(dead_code)]
+pub const MAINNET_LTC_ANCHOR_HASH_DISPLAY: [u8; 32] = [
+    0x8a, 0x89, 0xd2, 0xe5, 0x23, 0x29, 0xaa, 0xbe,
+    0x63, 0xfa, 0xbe, 0xb9, 0xd4, 0xcf, 0x73, 0x4d,
+    0x8a, 0x44, 0xde, 0x15, 0x85, 0x98, 0xaf, 0xb6,
+    0x56, 0x0f, 0x20, 0xf8, 0xc9, 0x47, 0xbe, 0x64,
+];
+#[allow(dead_code)]
+pub const MAINNET_LTC_ANCHOR_BITS: u32 = 0x1929_b619;
+#[allow(dead_code)]
+pub const MAINNET_LTC_ANCHOR_TIME: u32 = 1_778_676_649;
+
 /// Mainnet HtlcBtcSwapV1 activation height (Phase 2).
 ///
 /// `None` keeps the BTC-proof claim path disabled on mainnet. When set to
@@ -182,6 +215,23 @@ pub fn resolved_btc_spv_relay_activation_height(network: NetworkKind) -> Option<
     match network {
         NetworkKind::Mainnet => MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT,
         NetworkKind::Testnet | NetworkKind::Devnet => runtime_btc_spv_relay_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the LTC SPV header relay activation height.
+/// Read from `IRIUM_LTC_SPV_RELAY_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once Phase B callers come online
+pub fn runtime_ltc_spv_relay_env_override() -> Option<u64> {
+    env::var("IRIUM_LTC_SPV_RELAY_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once Phase B callers come online
+pub fn resolved_ltc_spv_relay_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_ltc_spv_relay_env_override(),
     }
 }
 
@@ -487,5 +537,50 @@ mod tests {
             Some(111)
         );
         std::env::remove_var("IRIUM_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn mainnet_ltc_spv_height_is_none_pending_governance() {
+        assert!(
+            MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT.is_none(),
+            "LTC SPV must stay disabled on mainnet until governance flips this constant"
+        );
+        assert!(resolved_ltc_spv_relay_activation_height(NetworkKind::Mainnet).is_none());
+    }
+
+    #[test]
+    fn mainnet_ignores_ltc_spv_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_LTC_SPV_RELAY_ACTIVATION_HEIGHT", "5555");
+        let resolved = resolved_ltc_spv_relay_activation_height(NetworkKind::Mainnet);
+        std::env::remove_var("IRIUM_LTC_SPV_RELAY_ACTIVATION_HEIGHT");
+        assert_eq!(resolved, MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn non_mainnet_uses_ltc_spv_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_LTC_SPV_RELAY_ACTIVATION_HEIGHT", "77");
+        assert_eq!(
+            resolved_ltc_spv_relay_activation_height(NetworkKind::Devnet),
+            Some(77)
+        );
+        assert_eq!(
+            resolved_ltc_spv_relay_activation_height(NetworkKind::Testnet),
+            Some(77)
+        );
+        std::env::remove_var("IRIUM_LTC_SPV_RELAY_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn mainnet_ltc_anchor_constants_have_expected_values() {
+        // Display-order hash (from litecoinspace.org / Litecoin Core RPC).
+        // Reversed to natural order in `LtcAnchor::mainnet()`.
+        assert_eq!(MAINNET_LTC_ANCHOR_HEIGHT, 3_106_656);
+        assert_eq!(MAINNET_LTC_ANCHOR_BITS, 0x1929_b619);
+        assert_eq!(MAINNET_LTC_ANCHOR_TIME, 1_778_676_649);
+        assert_eq!(MAINNET_LTC_ANCHOR_HASH_DISPLAY[0], 0x8a);
+        assert_eq!(MAINNET_LTC_ANCHOR_HASH_DISPLAY[31], 0x64);
     }
 }

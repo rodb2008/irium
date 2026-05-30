@@ -29,13 +29,26 @@
 //! the wiring in a single PR.
 
 use std::collections::HashMap;
+use std::env;
 
 use num_bigint::BigUint;
 use num_traits::Zero;
 use rayon::prelude::*;
 
+use crate::activation::{resolved_ltc_spv_relay_activation_height, NetworkKind};
 use crate::pow::{sha256d, Target};
 use crate::scrypt_pow::meets_target_ltc;
+
+// Re-export the activation-side LTC anchor constants so downstream
+// modules (and the tests in this module) can keep referring to them via
+// `crate::ltc_spv::MAINNET_LTC_*` exactly the way they referred to the
+// inline forms before Phase B moved the source-of-truth into
+// `activation.rs` (mirroring how the BTC SPV anchor constants are
+// declared there and reused across the codebase).
+pub use crate::activation::{
+    MAINNET_LTC_ANCHOR_BITS, MAINNET_LTC_ANCHOR_HASH_DISPLAY, MAINNET_LTC_ANCHOR_HEIGHT,
+    MAINNET_LTC_ANCHOR_TIME, MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT,
+};
 
 /// Output script tag reserved for a Litecoin header batch. Consensus
 /// dispatch is wired in a later phase once governance assigns an
@@ -63,30 +76,6 @@ pub const LTC_MTP_WINDOW: usize = 11;
 /// block time that carried it: 2 hours, matching Litecoin Core's
 /// `nMaxFutureBlockTime`.
 pub const LTC_MAX_FUTURE_TIME_SECS: u32 = 2 * 60 * 60;
-
-/// Mainnet activation height. Disabled until governance flips this
-/// constant in a dedicated activation commit per
-/// `docs/htlcv1_activation_commit_workflow.md`. Kept as a `pub const`
-/// (not a runtime resolver) so a future test can assert the
-/// disabled-by-default invariant at compile-relevant times.
-pub const MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = None;
-
-/// LTC anchor candidate: hardcoded checkpoint chosen at a recent retarget
-/// boundary (height 3_106_656 ≡ 0 mod 2016, ≥17 days deep at pick time).
-/// The hash is stored here in **display order** (Litecoin Core RPC
-/// convention — the way the hash appears on litecoinspace.org); it is
-/// reversed to natural byte order when constructing `LtcAnchor::mainnet()`
-/// so storage and on-the-wire comparisons stay consistent with how
-/// `LtcHeader::block_hash()` returns its sha256d.
-pub const MAINNET_LTC_ANCHOR_HEIGHT: u64 = 3_106_656;
-pub const MAINNET_LTC_ANCHOR_HASH_DISPLAY: [u8; 32] = [
-    0x8a, 0x89, 0xd2, 0xe5, 0x23, 0x29, 0xaa, 0xbe,
-    0x63, 0xfa, 0xbe, 0xb9, 0xd4, 0xcf, 0x73, 0x4d,
-    0x8a, 0x44, 0xde, 0x15, 0x85, 0x98, 0xaf, 0xb6,
-    0x56, 0x0f, 0x20, 0xf8, 0xc9, 0x47, 0xbe, 0x64,
-];
-pub const MAINNET_LTC_ANCHOR_BITS: u32 = 0x1929_b619;
-pub const MAINNET_LTC_ANCHOR_TIME: u32 = 1_778_676_649;
 
 /// Difficulty-retarget parameter bundle for chains that share the
 /// Bitcoin-style window algorithm (actual vs expected timespan over a
@@ -250,6 +239,71 @@ pub struct LtcSpvParams {
     pub activation_height: u64,
     pub anchor: LtcAnchor,
     pub retarget: RetargetParams,
+}
+
+/// Resolve the LTC SPV relay configuration for a given network. Returns
+/// `Some` only when an activation height AND a valid anchor are both
+/// present. Mirrors `btc_spv::resolve_btc_spv_params` so production
+/// `ChainParams` construction can call this uniformly.
+///
+/// Mainnet uses the code-defined `MAINNET_LTC_*` constants from
+/// `activation.rs` (currently `None` placeholders until governance flips
+/// them in a dedicated activation commit per the workflow in
+/// `docs/htlcv1_activation_commit_workflow.md`).
+///
+/// Testnet and devnet read the anchor from the four
+/// `IRIUM_LTC_ANCHOR_{HEIGHT,HASH,BITS,TIME}` environment variables
+/// alongside the existing `IRIUM_LTC_SPV_RELAY_ACTIVATION_HEIGHT`. All
+/// five must be present for the relay to enable. Hash is accepted in
+/// display order (Litecoin RPC convention) and canonicalised to
+/// natural order for internal storage. `BITS` accepts either
+/// `0x1929b619` or decimal.
+#[allow(dead_code)]
+pub fn resolve_ltc_spv_params(network: NetworkKind) -> Option<LtcSpvParams> {
+    let activation_height = resolved_ltc_spv_relay_activation_height(network)?;
+    let anchor = match network {
+        NetworkKind::Mainnet => {
+            let candidate = LtcAnchor::mainnet();
+            if candidate.is_zero() {
+                return None;
+            }
+            candidate
+        }
+        NetworkKind::Testnet | NetworkKind::Devnet => {
+            let height = env::var("IRIUM_LTC_ANCHOR_HEIGHT")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())?;
+            let hash_str = env::var("IRIUM_LTC_ANCHOR_HASH").ok()?;
+            let hash_bytes = hex::decode(hash_str.trim()).ok()?;
+            if hash_bytes.len() != 32 {
+                return None;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&hash_bytes);
+            hash.reverse();
+            let bits_str = env::var("IRIUM_LTC_ANCHOR_BITS").ok()?;
+            let bits_trim = bits_str.trim();
+            let bits = if let Some(stripped) = bits_trim.strip_prefix("0x") {
+                u32::from_str_radix(stripped, 16).ok()?
+            } else {
+                bits_trim.parse::<u32>().ok()?
+            };
+            let time = env::var("IRIUM_LTC_ANCHOR_TIME")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())?;
+            LtcAnchor {
+                hash,
+                height,
+                bits,
+                time,
+            }
+        }
+    };
+    Some(LtcSpvParams {
+        activation_height,
+        anchor,
+        retarget: RetargetParams::LITECOIN,
+    })
 }
 
 /// Undo record produced by one successful header batch apply. Stored
