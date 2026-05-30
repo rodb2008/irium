@@ -663,8 +663,15 @@ fn mempool_entries_from_template(
             eprintln!("Skipping conflicting template tx (double-spend within block)");
             continue;
         }
-        if let Err(e) = chain.validate_transaction(&tx_obj) {
-            eprintln!("Skipping invalid template tx: {e}");
+        // Trust iriumd's template txs. iriumd has already validated each tx
+        // before placing it in the mempool, so re-validating here against the
+        // miner's local ChainState is redundant and brittle: any tx whose
+        // validation depends on consensus state the miner hasn't fully synced
+        // (BTC SPV anchor, swap-order book, activation gates) silently fails
+        // and the block ships without it. A lightweight structural sanity
+        // check is enough to defend against a malformed-template attack.
+        if tx_obj.inputs.is_empty() || tx_obj.outputs.is_empty() {
+            eprintln!("Skipping malformed template tx (no inputs or outputs)");
             continue;
         }
         for inp in &tx_obj.inputs {
@@ -1973,7 +1980,15 @@ fn mine_once(
             }
         }
 
-        chain.connect_block(block.clone())?;
+        // Local connect_block can fail when the miner's ChainState diverges
+        // from iriumd's authoritative view (e.g., BTC SPV anchor state not
+        // populated, swap-order state out of sync, etc.). iriumd does its own
+        // full validation on submit_block, so we log the local error and
+        // proceed. If iriumd accepts, the next template fetch advances the
+        // miner past the now-stale local tip.
+        if let Err(e) = chain.connect_block(block.clone()) {
+            eprintln!("[warn] local connect_block failed, submitting to node anyway: {e}");
+        }
         write_block_json(height as u64, &block).map_err(|e| e.to_string())?;
 
         match submit_block_to_node(height as u64, &block) {
