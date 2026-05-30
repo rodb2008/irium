@@ -9,6 +9,8 @@ mod constants;
 mod genesis;
 #[allow(dead_code)]
 mod ltc_spv;
+#[allow(dead_code)]
+mod doge_spv;
 // Pulled in so chain.rs's `#[cfg(test)] mod tests` can reference
 // `crate::mempool::evict_invalid_mempool_entries` and `MempoolManager`
 // when `cargo test --all` builds tests for this thin secondary binary.
@@ -57,6 +59,7 @@ fn main() {
         auxpow_activation_height: crate::activation::resolved_auxpow_activation_height(network),
             btc_spv: None,
             ltc_spv: None,
+            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
