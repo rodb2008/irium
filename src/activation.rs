@@ -98,6 +98,18 @@ pub const MAINNET_LTC_ANCHOR_BITS: u32 = 0x1929_b619;
 #[allow(dead_code)]
 pub const MAINNET_LTC_ANCHOR_TIME: u32 = 1_778_676_649;
 
+/// Mainnet HtlcLtcSwapV1 activation height (Phase C).
+///
+/// `None` keeps the LTC-proof claim path disabled on mainnet. When set
+/// to `Some(<height>)`, blocks at or after that height may carry
+/// HtlcLtcSwapV1 outputs (script tag `0xc7`) and the validator will
+/// accept LTC-proof claim witnesses against them.
+///
+/// Phase C ships disabled. Activation should not precede
+/// `MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT`, otherwise no proof would
+/// resolve.
+pub const MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = None;
+
 /// Mainnet HtlcBtcSwapV1 activation height (Phase 2).
 ///
 /// `None` keeps the BTC-proof claim path disabled on mainnet. When set to
@@ -232,6 +244,23 @@ pub fn resolved_ltc_spv_relay_activation_height(network: NetworkKind) -> Option<
     match network {
         NetworkKind::Mainnet => MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT,
         NetworkKind::Testnet | NetworkKind::Devnet => runtime_ltc_spv_relay_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the HtlcLtcSwapV1 activation height.
+/// Read from `IRIUM_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once Phase C callers come online
+pub fn runtime_htlc_ltc_swap_v1_env_override() -> Option<u64> {
+    env::var("IRIUM_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once Phase C callers come online
+pub fn resolved_htlc_ltc_swap_v1_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_htlc_ltc_swap_v1_env_override(),
     }
 }
 
@@ -582,5 +611,39 @@ mod tests {
         assert_eq!(MAINNET_LTC_ANCHOR_TIME, 1_778_676_649);
         assert_eq!(MAINNET_LTC_ANCHOR_HASH_DISPLAY[0], 0x8a);
         assert_eq!(MAINNET_LTC_ANCHOR_HASH_DISPLAY[31], 0x64);
+    }
+
+    #[test]
+    fn mainnet_htlc_ltc_swap_v1_height_is_none_pending_governance() {
+        assert!(
+            MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT.is_none(),
+            "HtlcLtcSwapV1 must stay disabled on mainnet until governance flips this constant"
+        );
+        assert!(resolved_htlc_ltc_swap_v1_activation_height(NetworkKind::Mainnet).is_none());
+    }
+
+    #[test]
+    fn mainnet_ignores_htlc_ltc_swap_v1_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT", "8888");
+        let resolved = resolved_htlc_ltc_swap_v1_activation_height(NetworkKind::Mainnet);
+        std::env::remove_var("IRIUM_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT");
+        assert_eq!(resolved, MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn non_mainnet_uses_htlc_ltc_swap_v1_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT", "99");
+        assert_eq!(
+            resolved_htlc_ltc_swap_v1_activation_height(NetworkKind::Devnet),
+            Some(99)
+        );
+        assert_eq!(
+            resolved_htlc_ltc_swap_v1_activation_height(NetworkKind::Testnet),
+            Some(99)
+        );
+        std::env::remove_var("IRIUM_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT");
     }
 }
