@@ -8596,6 +8596,7 @@ mod tests {
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
         };
         let mut chain = ChainState::new(params);
 
@@ -8658,6 +8659,7 @@ mod tests {
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
         };
         let chain = ChainState::new(params);
 
@@ -8705,6 +8707,7 @@ mod tests {
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
         };
         let chain = ChainState::new(params);
 

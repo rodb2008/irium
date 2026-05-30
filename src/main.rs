@@ -60,6 +60,7 @@ fn main() {
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
     };
 
     let state = ChainState::new(params);

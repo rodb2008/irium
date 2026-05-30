@@ -110,6 +110,19 @@ pub const MAINNET_LTC_ANCHOR_TIME: u32 = 1_778_676_649;
 /// resolve.
 pub const MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = None;
 
+/// Mainnet LtcSwapOrder activation height (Phase D).
+///
+/// `None` keeps the LTC on-chain order book disabled on mainnet. When
+/// set to `Some(<height>)`, blocks at or after that height may carry
+/// LtcSwapOrder outputs (script tag `0xc8`) and the validator will
+/// accept Fill / Cancel / ExpireSweep witnesses against them.
+///
+/// Phase D ships disabled. Sell-direction fills emit `HtlcLtcSwapV1`
+/// outputs (Phase C), so this should not be activated before
+/// `MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT` — the fill covenant
+/// would otherwise reject every spend.
+pub const MAINNET_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = None;
+
 /// Mainnet HtlcBtcSwapV1 activation height (Phase 2).
 ///
 /// `None` keeps the BTC-proof claim path disabled on mainnet. When set to
@@ -261,6 +274,23 @@ pub fn resolved_htlc_ltc_swap_v1_activation_height(network: NetworkKind) -> Opti
     match network {
         NetworkKind::Mainnet => MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT,
         NetworkKind::Testnet | NetworkKind::Devnet => runtime_htlc_ltc_swap_v1_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the LtcSwapOrder activation height.
+/// Read from `IRIUM_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once Phase D callers come online
+pub fn runtime_ltc_swap_order_v1_env_override() -> Option<u64> {
+    env::var("IRIUM_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once Phase D callers come online
+pub fn resolved_ltc_swap_order_v1_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_ltc_swap_order_v1_env_override(),
     }
 }
 
@@ -645,5 +675,39 @@ mod tests {
             Some(99)
         );
         std::env::remove_var("IRIUM_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn mainnet_ltc_swap_order_v1_height_is_none_pending_governance() {
+        assert!(
+            MAINNET_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT.is_none(),
+            "LtcSwapOrder must stay disabled on mainnet until governance flips this constant"
+        );
+        assert!(resolved_ltc_swap_order_v1_activation_height(NetworkKind::Mainnet).is_none());
+    }
+
+    #[test]
+    fn mainnet_ignores_ltc_swap_order_v1_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT", "3333");
+        let resolved = resolved_ltc_swap_order_v1_activation_height(NetworkKind::Mainnet);
+        std::env::remove_var("IRIUM_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
+        assert_eq!(resolved, MAINNET_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn non_mainnet_uses_ltc_swap_order_v1_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT", "222");
+        assert_eq!(
+            resolved_ltc_swap_order_v1_activation_height(NetworkKind::Devnet),
+            Some(222)
+        );
+        assert_eq!(
+            resolved_ltc_swap_order_v1_activation_height(NetworkKind::Testnet),
+            Some(222)
+        );
+        std::env::remove_var("IRIUM_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
     }
 }

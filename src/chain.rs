@@ -34,16 +34,21 @@ use crate::pow::{meets_target, min_difficulty_target, sha256d, Target};
 use crate::tx::{
     compute_funding_binding, decode_hex, encode_htlc_btc_swap_v1_script,
     encode_htlc_ltc_swap_v1_script, encode_htlcv1_script,
+    encode_ltc_swap_order_script,
     encode_mpso_script, encode_swap_order_script, p2pkh_script, parse_htlc_btc_swap_v1_script,
     parse_htlc_btc_swap_witness, parse_htlc_ltc_swap_v1_script, parse_htlc_ltc_swap_witness,
-    parse_htlcv1_script, parse_input_witness, parse_mpso_script,
+    parse_htlcv1_script, parse_input_witness, parse_ltc_swap_order_script,
+    parse_ltc_swap_order_witness, parse_mpso_script,
     parse_output_encumbrance, parse_swap_order_script, parse_swap_order_witness,
     HtlcBtcSwapV1Output, HtlcBtcSwapWitness, HtlcLtcSwapV1Output, HtlcLtcSwapWitness,
-    HtlcV1Output, InputWitness, MpsoV1Output,
+    HtlcV1Output, InputWitness, LtcSwapOrderWitness, MpsoV1Output,
     OutputEncumbrance, SwapOrderWitness, Transaction, TxInput, TxOutput,
     BTC_OP_RETURN_BINDING_LEN, BTC_OP_RETURN_BINDING_MAGIC, HTLC_BTC_SWAP_V1_SCRIPT_LEN,
     HTLC_BTC_SWAP_V1_TAG, HTLC_LTC_SWAP_V1_SCRIPT_LEN, HTLC_LTC_SWAP_V1_TAG,
     HTLC_V1_SCRIPT_TAG, LTC_OP_RETURN_BINDING_LEN, LTC_OP_RETURN_BINDING_MAGIC,
+    LTC_SWAP_ORDER_BUY_SCRIPT_LEN, LTC_SWAP_ORDER_DIRECTION_BUY,
+    LTC_SWAP_ORDER_DIRECTION_SELL, LTC_SWAP_ORDER_MAX_SWEEP_FEE,
+    LTC_SWAP_ORDER_MIN_LOCKED_VALUE, LTC_SWAP_ORDER_SELL_SCRIPT_LEN, LTC_SWAP_ORDER_V1_TAG,
     MAX_HTLC_BTC_SWAP_CONFIRMATIONS, MAX_HTLC_LTC_SWAP_CONFIRMATIONS,
     MIN_HTLC_BTC_SWAP_CONFIRMATIONS, MIN_HTLC_LTC_SWAP_CONFIRMATIONS,
     MPSO_V1_MAX_WITNESS_SIZE, MPSO_V1_TAG,
@@ -149,6 +154,12 @@ pub struct ChainParams {
     /// outputs, so activating before `htlc_btc_swap_v1_activation_height`
     /// would cause every fill to fail the output's structural check.
     pub swap_order_v1_activation_height: Option<u64>,
+    /// LtcSwapOrder activation height (Phase D). `None` keeps the LTC
+    /// on-chain order book disabled. Sell-direction fills emit
+    /// HtlcLtcSwapV1 outputs (Phase C), so activating before
+    /// `htlc_ltc_swap_v1_activation_height` would cause every sell-fill
+    /// to fail the output's structural check.
+    pub ltc_swap_order_v1_activation_height: Option<u64>,
 }
 
 /// Reference to a specific transaction output.
@@ -360,6 +371,13 @@ impl ChainState {
     fn htlc_ltc_swap_v1_active_at(&self, height: u64) -> bool {
         self.params
             .htlc_ltc_swap_v1_activation_height
+            .map(|h| height >= h)
+            .unwrap_or(false)
+    }
+
+    fn ltc_swap_order_v1_active_at(&self, height: u64) -> bool {
+        self.params
+            .ltc_swap_order_v1_activation_height
             .map(|h| height >= h)
             .unwrap_or(false)
     }
@@ -1192,6 +1210,7 @@ impl ChainState {
                 self.htlc_btc_swap_v1_active_at(height),
                 self.htlc_ltc_swap_v1_active_at(height),
                 self.swap_order_v1_active_at(height),
+                self.ltc_swap_order_v1_active_at(height),
                 height,
             )?;
             coinbase_total = coinbase_total
@@ -1540,6 +1559,7 @@ impl ChainState {
                 self.htlc_btc_swap_v1_active_at(height),
                 self.htlc_ltc_swap_v1_active_at(height),
                 self.swap_order_v1_active_at(height),
+                self.ltc_swap_order_v1_active_at(height),
                 &view,
                 btc_outpoints_consumed,
                 ltc_outpoints_consumed,
@@ -1562,6 +1582,7 @@ impl ChainState {
                 self.htlc_btc_swap_v1_active_at(height),
                 self.htlc_ltc_swap_v1_active_at(height),
                 self.swap_order_v1_active_at(height),
+                self.ltc_swap_order_v1_active_at(height),
                 height,
             )?;
             output_total += output.value as i64;
@@ -1595,6 +1616,7 @@ fn validate_output(
     htlc_btc_swap_v1_active: bool,
     htlc_ltc_swap_v1_active: bool,
     swap_order_v1_active: bool,
+    ltc_swap_order_v1_active: bool,
     height: u64,
 ) -> Result<(), String> {
     if output.value > MAX_MONEY {
@@ -1744,6 +1766,39 @@ fn validate_output(
         }
     }
 
+    if tag == Some(LTC_SWAP_ORDER_V1_TAG) {
+        if !ltc_swap_order_v1_active {
+            return Err("LtcSwapOrder output before activation".to_string());
+        }
+        if output.script_pubkey.len() != LTC_SWAP_ORDER_SELL_SCRIPT_LEN
+            && output.script_pubkey.len() != LTC_SWAP_ORDER_BUY_SCRIPT_LEN
+        {
+            return Err("LtcSwapOrder script wrong size".to_string());
+        }
+        let order = parse_ltc_swap_order_script(&output.script_pubkey)
+            .ok_or_else(|| "Malformed LtcSwapOrder output".to_string())?;
+        if order.expiry_height <= height {
+            return Err("LtcSwapOrder expiry_height must exceed current height".to_string());
+        }
+        if output.value < LTC_SWAP_ORDER_MIN_LOCKED_VALUE {
+            return Err("LtcSwapOrder locked value below minimum".to_string());
+        }
+        if order.direction == LTC_SWAP_ORDER_DIRECTION_SELL {
+            if output.value != order.irm_amount {
+                return Err(
+                    "Sell-IRM LtcSwapOrder output value must equal irm_amount".to_string(),
+                );
+            }
+            if order.confirmations_required < MIN_HTLC_LTC_SWAP_CONFIRMATIONS
+                || order.confirmations_required > MAX_HTLC_LTC_SWAP_CONFIRMATIONS
+            {
+                return Err(
+                    "LtcSwapOrder confirmations_required out of range".to_string()
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1826,6 +1881,7 @@ fn verify_transaction_signature(
     htlc_btc_swap_v1_active: bool,
     htlc_ltc_swap_v1_active: bool,
     swap_order_v1_active: bool,
+    ltc_swap_order_v1_active: bool,
     view: &ConsensusView<'_>,
     btc_outpoints_consumed: &mut Vec<([u8; 32], u32)>,
     ltc_outpoints_consumed: &mut Vec<([u8; 32], u32)>,
@@ -2374,6 +2430,129 @@ fn verify_transaction_signature(
                 }
             }
         }
+        OutputEncumbrance::LtcSwapOrder(order) => {
+            // Phase D: byte-level mirror of the SwapOrder arm. Sell-fill
+            // covenant builds an HtlcLtcSwapV1 (not BTC); buy-fill covenant
+            // builds an HtlcV1 identical to the BTC SwapOrder buy-fill
+            // (chain-agnostic preimage hashlock); cancel and expire-sweep
+            // mirror BTC's behaviour exactly.
+            if !ltc_swap_order_v1_active {
+                return false;
+            }
+            let witness = match parse_ltc_swap_order_witness(&txin.script_sig, order.direction) {
+                Some(w) => w,
+                None => return false,
+            };
+            match witness {
+                LtcSwapOrderWitness::FillSell {
+                    sig,
+                    pubkey,
+                    taker_iriumd_pkh,
+                    timeout_height,
+                } => {
+                    if order.direction != LTC_SWAP_ORDER_DIRECTION_SELL {
+                        return false;
+                    }
+                    if spend_height > order.expiry_height {
+                        return false;
+                    }
+                    if timeout_height <= spend_height {
+                        return false;
+                    }
+                    if tx.outputs.is_empty() {
+                        return false;
+                    }
+                    // Funding binding derived from the spent order outpoint,
+                    // matching the BTC SwapOrder pattern — using tx.txid()
+                    // would be self-referential.
+                    let funding_binding =
+                        compute_funding_binding(&txin.prev_txid, txin.prev_index);
+                    let expected = HtlcLtcSwapV1Output {
+                        confirmations_required: order.confirmations_required,
+                        recipient_pkh: taker_iriumd_pkh,
+                        refund_pkh: order.maker_iriumd_pkh,
+                        ltc_recipient_pkh: order.maker_ltc_pkh,
+                        ltc_amount_sats: order.ltc_amount_sats,
+                        timeout_height,
+                        funding_binding,
+                    };
+                    let expected_script = encode_htlc_ltc_swap_v1_script(&expected);
+                    if tx.outputs[0].script_pubkey != expected_script {
+                        return false;
+                    }
+                    if tx.outputs[0].value != order.irm_amount {
+                        return false;
+                    }
+                    let scriptcode = encode_ltc_swap_order_script(&order);
+                    verify_sig_with_pubkey(tx, input_index, &scriptcode, &sig, &pubkey)
+                }
+                LtcSwapOrderWitness::FillBuy {
+                    sig,
+                    pubkey,
+                    irm_timeout_height,
+                } => {
+                    if order.direction != LTC_SWAP_ORDER_DIRECTION_BUY {
+                        return false;
+                    }
+                    if spend_height > order.expiry_height {
+                        return false;
+                    }
+                    if irm_timeout_height <= spend_height {
+                        return false;
+                    }
+                    if tx.outputs.is_empty() {
+                        return false;
+                    }
+                    let expected_hash = match order.expected_hash {
+                        Some(h) => h,
+                        None => return false,
+                    };
+                    let taker_refund_pkh = hash160(&pubkey);
+                    let expected_htlc = HtlcV1Output {
+                        expected_hash,
+                        recipient_pkh: order.maker_iriumd_pkh,
+                        refund_pkh: taker_refund_pkh,
+                        timeout_height: irm_timeout_height,
+                    };
+                    let expected_script = encode_htlcv1_script(&expected_htlc);
+                    if tx.outputs[0].script_pubkey != expected_script {
+                        return false;
+                    }
+                    if tx.outputs[0].value != order.irm_amount {
+                        return false;
+                    }
+                    let scriptcode = encode_ltc_swap_order_script(&order);
+                    verify_sig_with_pubkey(tx, input_index, &scriptcode, &sig, &pubkey)
+                }
+                LtcSwapOrderWitness::Cancel { sig, pubkey } => {
+                    if spend_height >= order.expiry_height {
+                        return false;
+                    }
+                    if hash160(&pubkey) != order.maker_iriumd_pkh {
+                        return false;
+                    }
+                    let scriptcode = encode_ltc_swap_order_script(&order);
+                    verify_sig_with_pubkey(tx, input_index, &scriptcode, &sig, &pubkey)
+                }
+                LtcSwapOrderWitness::ExpireSweep => {
+                    if spend_height < order.expiry_height {
+                        return false;
+                    }
+                    if tx.outputs.is_empty() {
+                        return false;
+                    }
+                    let expected_p2pkh = p2pkh_script(&order.maker_iriumd_pkh);
+                    if tx.outputs[0].script_pubkey != expected_p2pkh {
+                        return false;
+                    }
+                    let minimum_payout = utxo.value.saturating_sub(LTC_SWAP_ORDER_MAX_SWEEP_FEE);
+                    if tx.outputs[0].value < minimum_payout {
+                        return false;
+                    }
+                    true
+                }
+            }
+        }
         OutputEncumbrance::Unknown => false,
     }
 }
@@ -2538,6 +2717,7 @@ mod tests {
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -2617,6 +2797,7 @@ mod tests {
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -3327,6 +3508,7 @@ mod tests {
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -3580,6 +3762,7 @@ mod tests {
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
         };
         ChainState::new(params)
     }

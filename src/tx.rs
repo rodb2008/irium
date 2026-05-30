@@ -61,6 +61,33 @@ pub const LTC_OP_RETURN_BINDING_LEN: usize = 14;
 pub const MIN_HTLC_LTC_SWAP_CONFIRMATIONS: u8 = 1;
 pub const MAX_HTLC_LTC_SWAP_CONFIRMATIONS: u8 = 144;
 
+// ---- LtcSwapOrder (Phase D) — mirrors SwapOrder with LTC payment side ----
+
+pub const LTC_SWAP_ORDER_V1_TAG: u8 = 0xc8;
+pub const LTC_SWAP_ORDER_V1_VERSION: u8 = 1;
+pub const LTC_SWAP_ORDER_DIRECTION_SELL: u8 = 0x01;
+pub const LTC_SWAP_ORDER_DIRECTION_BUY: u8 = 0x02;
+pub const LTC_SWAP_ORDER_SELL_SCRIPT_LEN: usize = 76;
+pub const LTC_SWAP_ORDER_BUY_SCRIPT_LEN: usize = 108;
+
+/// Witness branch selectors inside the LtcSwapOrder namespace. Numeric
+/// values match the BTC SwapOrder selectors but parser dispatch happens
+/// only after the output type has been identified as LtcSwapOrder, so
+/// there is no collision with SwapOrder's same-numbered branches.
+pub const LTC_SWAP_ORDER_WITNESS_FILL: u8 = 0x01;
+pub const LTC_SWAP_ORDER_WITNESS_CANCEL: u8 = 0x02;
+pub const LTC_SWAP_ORDER_WITNESS_EXPIRE_SWEEP: u8 = 0x03;
+
+/// Floor on an LtcSwapOrder output's locked value, identical to the BTC
+/// SwapOrder floor. Sell-IRM orders lock the full irm_amount and almost
+/// always exceed this; buy-IRM orders use a small anti-spam value that
+/// must still leave room for `LTC_SWAP_ORDER_MAX_SWEEP_FEE`.
+pub const LTC_SWAP_ORDER_MIN_LOCKED_VALUE: u64 = 1100;
+
+/// Maximum gap (in sats) between the LtcSwapOrder UTXO's value and the
+/// expire-sweep output's value. Mirrors the BTC SwapOrder ceiling.
+pub const LTC_SWAP_ORDER_MAX_SWEEP_FEE: u64 = 1000;
+
 pub const SWAP_ORDER_V1_TAG: u8 = 0xc5;
 pub const SWAP_ORDER_V1_VERSION: u8 = 1;
 pub const SWAP_ORDER_DIRECTION_SELL: u8 = 0x01;
@@ -232,6 +259,28 @@ pub struct SwapOrderOutput {
     pub expected_hash: Option<[u8; 32]>,
 }
 
+/// LtcSwapOrder lifecycle object (Phase D). Same on-chain shape as
+/// `SwapOrderOutput`, just LTC payment side. Sell-IRM fills emit
+/// `HtlcLtcSwapV1` outputs (not `HtlcBtcSwapV1`); buy-IRM fills emit
+/// HTLCv1 outputs identical to the BTC SwapOrder buy-fill — the IRM
+/// hashlock is chain-agnostic and the off-chain LTC HTLC dance is the
+/// maker's responsibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LtcSwapOrderOutput {
+    pub direction: u8,
+    pub confirmations_required: u8,
+    pub irm_amount: u64,
+    pub ltc_amount_sats: u64,
+    pub maker_iriumd_pkh: [u8; 20],
+    pub maker_ltc_pkh: [u8; 20],
+    pub expiry_height: u64,
+    pub order_id: [u8; 8],
+    /// Some only when `direction == LTC_SWAP_ORDER_DIRECTION_BUY`.
+    /// Consensus enforces the option-tail relationship via strict script
+    /// length: 76 bytes for sell, 108 bytes for buy.
+    pub expected_hash: Option<[u8; 32]>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputEncumbrance {
     P2pkh([u8; 20]),
@@ -240,6 +289,7 @@ pub enum OutputEncumbrance {
     HtlcBtcSwapV1(HtlcBtcSwapV1Output),
     HtlcLtcSwapV1(HtlcLtcSwapV1Output),
     SwapOrder(SwapOrderOutput),
+    LtcSwapOrder(LtcSwapOrderOutput),
     Unknown,
 }
 
@@ -264,6 +314,28 @@ pub enum SwapOrderWitness {
     Cancel { sig: Vec<u8>, pubkey: Vec<u8> },
     /// Anyone may sweep an expired order. Covenant: output 0 returns
     /// (locked_value - max_sweep_fee) to the maker via P2PKH.
+    ExpireSweep,
+}
+
+/// LtcSwapOrder witness branches. Byte-level mirror of `SwapOrderWitness`
+/// — selector numbers and field shapes are identical. The sell-fill
+/// covenant builds an `HtlcLtcSwapV1` output (not BTC); the buy-fill
+/// covenant builds an `HtlcV1` output (chain-agnostic preimage hashlock,
+/// same as the BTC SwapOrder buy-fill).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LtcSwapOrderWitness {
+    FillSell {
+        sig: Vec<u8>,
+        pubkey: Vec<u8>,
+        taker_iriumd_pkh: [u8; 20],
+        timeout_height: u64,
+    },
+    FillBuy {
+        sig: Vec<u8>,
+        pubkey: Vec<u8>,
+        irm_timeout_height: u64,
+    },
+    Cancel { sig: Vec<u8>, pubkey: Vec<u8> },
     ExpireSweep,
 }
 
@@ -538,6 +610,9 @@ pub fn parse_output_encumbrance(script: &[u8]) -> OutputEncumbrance {
     }
     if let Some(order) = parse_swap_order_script(script) {
         return OutputEncumbrance::SwapOrder(order);
+    }
+    if let Some(order) = parse_ltc_swap_order_script(script) {
+        return OutputEncumbrance::LtcSwapOrder(order);
     }
     OutputEncumbrance::Unknown
 }
@@ -1257,6 +1332,235 @@ pub fn parse_swap_order_witness(script_sig: &[u8], direction: u8) -> Option<Swap
                 return None;
             }
             Some(SwapOrderWitness::ExpireSweep)
+        }
+        _ => None,
+    }
+}
+
+// ---- LtcSwapOrder script + witness codecs (Phase D) ----
+// Byte-level mirror of the SwapOrder codecs above; the only structural
+// differences are the script tag (0xc8 vs 0xc5) and the LTC-side field
+// names (ltc_amount_sats, maker_ltc_pkh). Same 76/108 byte sell/buy
+// layouts, same 32-byte hashlock tail for buy direction.
+
+pub fn encode_ltc_swap_order_script(o: &LtcSwapOrderOutput) -> Vec<u8> {
+    let mut s = Vec::with_capacity(LTC_SWAP_ORDER_BUY_SCRIPT_LEN);
+    s.push(LTC_SWAP_ORDER_V1_TAG);
+    s.push(LTC_SWAP_ORDER_V1_VERSION);
+    s.push(o.direction);
+    s.push(o.confirmations_required);
+    s.extend_from_slice(&o.irm_amount.to_le_bytes());
+    s.extend_from_slice(&o.ltc_amount_sats.to_le_bytes());
+    s.extend_from_slice(&o.maker_iriumd_pkh);
+    s.extend_from_slice(&o.maker_ltc_pkh);
+    s.extend_from_slice(&o.expiry_height.to_le_bytes());
+    s.extend_from_slice(&o.order_id);
+    if o.direction == LTC_SWAP_ORDER_DIRECTION_BUY {
+        if let Some(h) = &o.expected_hash {
+            s.extend_from_slice(h);
+        }
+    }
+    s
+}
+
+pub fn parse_ltc_swap_order_script(script: &[u8]) -> Option<LtcSwapOrderOutput> {
+    if script.len() != LTC_SWAP_ORDER_SELL_SCRIPT_LEN
+        && script.len() != LTC_SWAP_ORDER_BUY_SCRIPT_LEN
+    {
+        return None;
+    }
+    if script[0] != LTC_SWAP_ORDER_V1_TAG {
+        return None;
+    }
+    if script[1] != LTC_SWAP_ORDER_V1_VERSION {
+        return None;
+    }
+    let direction = script[2];
+    if direction != LTC_SWAP_ORDER_DIRECTION_SELL && direction != LTC_SWAP_ORDER_DIRECTION_BUY {
+        return None;
+    }
+    let expects_hash = direction == LTC_SWAP_ORDER_DIRECTION_BUY;
+    if expects_hash && script.len() != LTC_SWAP_ORDER_BUY_SCRIPT_LEN {
+        return None;
+    }
+    if !expects_hash && script.len() != LTC_SWAP_ORDER_SELL_SCRIPT_LEN {
+        return None;
+    }
+    let confirmations_required = script[3];
+    let mut amt = [0u8; 8];
+    amt.copy_from_slice(&script[4..12]);
+    let irm_amount = u64::from_le_bytes(amt);
+    amt.copy_from_slice(&script[12..20]);
+    let ltc_amount_sats = u64::from_le_bytes(amt);
+    let mut maker_iriumd_pkh = [0u8; 20];
+    maker_iriumd_pkh.copy_from_slice(&script[20..40]);
+    let mut maker_ltc_pkh = [0u8; 20];
+    maker_ltc_pkh.copy_from_slice(&script[40..60]);
+    amt.copy_from_slice(&script[60..68]);
+    let expiry_height = u64::from_le_bytes(amt);
+    let mut order_id = [0u8; 8];
+    order_id.copy_from_slice(&script[68..76]);
+    let expected_hash = if expects_hash {
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&script[76..108]);
+        Some(h)
+    } else {
+        None
+    };
+    Some(LtcSwapOrderOutput {
+        direction,
+        confirmations_required,
+        irm_amount,
+        ltc_amount_sats,
+        maker_iriumd_pkh,
+        maker_ltc_pkh,
+        expiry_height,
+        order_id,
+        expected_hash,
+    })
+}
+
+#[allow(dead_code)] // Phase D wallet/RPC path emits this witness
+pub fn encode_ltc_swap_order_fill_sell_witness(
+    sig: &[u8],
+    pubkey: &[u8],
+    taker_iriumd_pkh: &[u8; 20],
+    timeout_height: u64,
+) -> Option<Vec<u8>> {
+    if sig.is_empty() || sig.len() > 255 || pubkey.is_empty() || pubkey.len() > 255 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(3 + sig.len() + pubkey.len() + 20 + 8);
+    out.push(LTC_SWAP_ORDER_WITNESS_FILL);
+    out.push(sig.len() as u8);
+    out.extend_from_slice(sig);
+    out.push(pubkey.len() as u8);
+    out.extend_from_slice(pubkey);
+    out.extend_from_slice(taker_iriumd_pkh);
+    out.extend_from_slice(&timeout_height.to_le_bytes());
+    Some(out)
+}
+
+#[allow(dead_code)] // Phase D wallet/RPC path emits this witness
+pub fn encode_ltc_swap_order_fill_buy_witness(
+    sig: &[u8],
+    pubkey: &[u8],
+    irm_timeout_height: u64,
+) -> Option<Vec<u8>> {
+    if sig.is_empty() || sig.len() > 255 || pubkey.is_empty() || pubkey.len() > 255 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(3 + sig.len() + pubkey.len() + 8);
+    out.push(LTC_SWAP_ORDER_WITNESS_FILL);
+    out.push(sig.len() as u8);
+    out.extend_from_slice(sig);
+    out.push(pubkey.len() as u8);
+    out.extend_from_slice(pubkey);
+    out.extend_from_slice(&irm_timeout_height.to_le_bytes());
+    Some(out)
+}
+
+#[allow(dead_code)] // Phase D wallet/RPC path emits this witness
+pub fn encode_ltc_swap_order_cancel_witness(sig: &[u8], pubkey: &[u8]) -> Option<Vec<u8>> {
+    if sig.is_empty() || sig.len() > 255 || pubkey.is_empty() || pubkey.len() > 255 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(3 + sig.len() + pubkey.len());
+    out.push(LTC_SWAP_ORDER_WITNESS_CANCEL);
+    out.push(sig.len() as u8);
+    out.extend_from_slice(sig);
+    out.push(pubkey.len() as u8);
+    out.extend_from_slice(pubkey);
+    Some(out)
+}
+
+#[allow(dead_code)] // Phase D wallet/RPC path emits this witness
+pub fn encode_ltc_swap_order_expire_sweep_witness() -> Vec<u8> {
+    vec![LTC_SWAP_ORDER_WITNESS_EXPIRE_SWEEP]
+}
+
+/// Parse an LtcSwapOrder witness. `direction` from the spending UTXO
+/// selects the FillSell vs FillBuy tail shape. Returns `None` on any
+/// structural error. Called only from the LtcSwapOrder arm of
+/// `verify_transaction_signature`.
+pub fn parse_ltc_swap_order_witness(
+    script_sig: &[u8],
+    direction: u8,
+) -> Option<LtcSwapOrderWitness> {
+    if script_sig.is_empty() {
+        return None;
+    }
+    match script_sig[0] {
+        LTC_SWAP_ORDER_WITNESS_FILL => {
+            let mut off: usize = 1;
+            let sig_len = *script_sig.get(off)? as usize;
+            off += 1;
+            if sig_len == 0 || off + sig_len > script_sig.len() {
+                return None;
+            }
+            let sig = script_sig[off..off + sig_len].to_vec();
+            off += sig_len;
+            let pk_len = *script_sig.get(off)? as usize;
+            off += 1;
+            if pk_len == 0 || off + pk_len > script_sig.len() {
+                return None;
+            }
+            let pubkey = script_sig[off..off + pk_len].to_vec();
+            off += pk_len;
+            match direction {
+                LTC_SWAP_ORDER_DIRECTION_SELL => {
+                    if off + 20 + 8 != script_sig.len() {
+                        return None;
+                    }
+                    let mut taker_iriumd_pkh = [0u8; 20];
+                    taker_iriumd_pkh.copy_from_slice(&script_sig[off..off + 20]);
+                    off += 20;
+                    let timeout_height =
+                        u64::from_le_bytes(script_sig[off..off + 8].try_into().ok()?);
+                    Some(LtcSwapOrderWitness::FillSell {
+                        sig,
+                        pubkey,
+                        taker_iriumd_pkh,
+                        timeout_height,
+                    })
+                }
+                LTC_SWAP_ORDER_DIRECTION_BUY => {
+                    if off + 8 != script_sig.len() {
+                        return None;
+                    }
+                    let irm_timeout_height =
+                        u64::from_le_bytes(script_sig[off..off + 8].try_into().ok()?);
+                    Some(LtcSwapOrderWitness::FillBuy {
+                        sig,
+                        pubkey,
+                        irm_timeout_height,
+                    })
+                }
+                _ => None,
+            }
+        }
+        LTC_SWAP_ORDER_WITNESS_CANCEL => {
+            let mut off: usize = 1;
+            let sig_len = *script_sig.get(off)? as usize;
+            off += 1;
+            if sig_len == 0 || off + sig_len > script_sig.len() {
+                return None;
+            }
+            let sig = script_sig[off..off + sig_len].to_vec();
+            off += sig_len;
+            let pk_len = *script_sig.get(off)? as usize;
+            off += 1;
+            if pk_len == 0 || off + pk_len != script_sig.len() {
+                return None;
+            }
+            let pubkey = script_sig[off..off + pk_len].to_vec();
+            Some(LtcSwapOrderWitness::Cancel { sig, pubkey })
+        }
+        LTC_SWAP_ORDER_WITNESS_EXPIRE_SWEEP => {
+            if script_sig.len() != 1 {
+                return None;
+            }
+            Some(LtcSwapOrderWitness::ExpireSweep)
         }
         _ => None,
     }
@@ -2197,5 +2501,176 @@ mod tests {
         assert_ne!(LTC_OP_RETURN_BINDING_MAGIC, BTC_OP_RETURN_BINDING_MAGIC);
         assert_eq!(LTC_OP_RETURN_BINDING_LEN, 14);
         assert_eq!(LTC_OP_RETURN_BINDING_MAGIC.len(), 6);
+    }
+
+    // ---- LtcSwapOrder tests (Phase D) ----
+
+    fn sample_ltc_swap_order(direction: u8) -> LtcSwapOrderOutput {
+        LtcSwapOrderOutput {
+            direction,
+            confirmations_required: 6,
+            irm_amount: 100_000_000,
+            ltc_amount_sats: 50_000,
+            maker_iriumd_pkh: [0xa1u8; 20],
+            maker_ltc_pkh: [0xb2u8; 20],
+            expiry_height: 250_000,
+            order_id: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            expected_hash: if direction == LTC_SWAP_ORDER_DIRECTION_BUY {
+                Some([0xcc; 32])
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn ltc_swap_order_sell_script_roundtrip() {
+        let o = sample_ltc_swap_order(LTC_SWAP_ORDER_DIRECTION_SELL);
+        let s = encode_ltc_swap_order_script(&o);
+        assert_eq!(s.len(), LTC_SWAP_ORDER_SELL_SCRIPT_LEN);
+        assert_eq!(s[0], LTC_SWAP_ORDER_V1_TAG);
+        assert_eq!(s[1], LTC_SWAP_ORDER_V1_VERSION);
+        let parsed = parse_ltc_swap_order_script(&s).expect("parse");
+        assert_eq!(parsed, o);
+    }
+
+    #[test]
+    fn ltc_swap_order_buy_script_roundtrip() {
+        let o = sample_ltc_swap_order(LTC_SWAP_ORDER_DIRECTION_BUY);
+        let s = encode_ltc_swap_order_script(&o);
+        assert_eq!(s.len(), LTC_SWAP_ORDER_BUY_SCRIPT_LEN);
+        let parsed = parse_ltc_swap_order_script(&s).expect("parse");
+        assert_eq!(parsed, o);
+    }
+
+    #[test]
+    fn ltc_swap_order_dispatches_through_output_encumbrance() {
+        let sell = encode_ltc_swap_order_script(&sample_ltc_swap_order(
+            LTC_SWAP_ORDER_DIRECTION_SELL,
+        ));
+        let buy = encode_ltc_swap_order_script(&sample_ltc_swap_order(
+            LTC_SWAP_ORDER_DIRECTION_BUY,
+        ));
+        match parse_output_encumbrance(&sell) {
+            OutputEncumbrance::LtcSwapOrder(o) => {
+                assert_eq!(o.direction, LTC_SWAP_ORDER_DIRECTION_SELL)
+            }
+            _ => panic!("expected LtcSwapOrder sell"),
+        }
+        match parse_output_encumbrance(&buy) {
+            OutputEncumbrance::LtcSwapOrder(o) => {
+                assert_eq!(o.direction, LTC_SWAP_ORDER_DIRECTION_BUY)
+            }
+            _ => panic!("expected LtcSwapOrder buy"),
+        }
+    }
+
+    #[test]
+    fn ltc_swap_order_rejects_wrong_tag() {
+        let mut s = encode_ltc_swap_order_script(&sample_ltc_swap_order(
+            LTC_SWAP_ORDER_DIRECTION_SELL,
+        ));
+        s[0] = SWAP_ORDER_V1_TAG;
+        assert!(parse_ltc_swap_order_script(&s).is_none());
+    }
+
+    #[test]
+    fn ltc_swap_order_rejects_wrong_direction() {
+        let mut s = encode_ltc_swap_order_script(&sample_ltc_swap_order(
+            LTC_SWAP_ORDER_DIRECTION_SELL,
+        ));
+        s[2] = 0x07;
+        assert!(parse_ltc_swap_order_script(&s).is_none());
+    }
+
+    #[test]
+    fn ltc_swap_order_rejects_sell_with_hash_tail() {
+        let o = sample_ltc_swap_order(LTC_SWAP_ORDER_DIRECTION_SELL);
+        let mut s = encode_ltc_swap_order_script(&o);
+        s.extend_from_slice(&[0xdd; 32]);
+        assert!(parse_ltc_swap_order_script(&s).is_none());
+    }
+
+    #[test]
+    fn ltc_swap_order_rejects_buy_without_hash_tail() {
+        let mut o = sample_ltc_swap_order(LTC_SWAP_ORDER_DIRECTION_BUY);
+        o.expected_hash = None;
+        let s = encode_ltc_swap_order_script(&o);
+        // Encoder still emits 76 bytes when expected_hash is None even with
+        // direction=BUY; parser must reject the length/direction mismatch.
+        assert_eq!(s.len(), LTC_SWAP_ORDER_SELL_SCRIPT_LEN);
+        assert!(parse_ltc_swap_order_script(&s).is_none());
+    }
+
+    #[test]
+    fn ltc_swap_order_fill_sell_witness_roundtrip() {
+        let sig = vec![0x30, 0x44];
+        let pubkey = vec![0x02; 33];
+        let taker_pkh = [0x11u8; 20];
+        let w = encode_ltc_swap_order_fill_sell_witness(&sig, &pubkey, &taker_pkh, 99_999)
+            .expect("encode");
+        match parse_ltc_swap_order_witness(&w, LTC_SWAP_ORDER_DIRECTION_SELL).expect("parse") {
+            LtcSwapOrderWitness::FillSell {
+                sig: s,
+                pubkey: pk,
+                taker_iriumd_pkh,
+                timeout_height,
+            } => {
+                assert_eq!(s, sig);
+                assert_eq!(pk, pubkey);
+                assert_eq!(taker_iriumd_pkh, taker_pkh);
+                assert_eq!(timeout_height, 99_999);
+            }
+            _ => panic!("expected FillSell"),
+        }
+    }
+
+    #[test]
+    fn ltc_swap_order_fill_buy_witness_roundtrip() {
+        let sig = vec![0x30, 0x44];
+        let pubkey = vec![0x02; 33];
+        let w = encode_ltc_swap_order_fill_buy_witness(&sig, &pubkey, 42_424).expect("encode");
+        match parse_ltc_swap_order_witness(&w, LTC_SWAP_ORDER_DIRECTION_BUY).expect("parse") {
+            LtcSwapOrderWitness::FillBuy {
+                sig: s,
+                pubkey: pk,
+                irm_timeout_height,
+            } => {
+                assert_eq!(s, sig);
+                assert_eq!(pk, pubkey);
+                assert_eq!(irm_timeout_height, 42_424);
+            }
+            _ => panic!("expected FillBuy"),
+        }
+    }
+
+    #[test]
+    fn ltc_swap_order_cancel_witness_roundtrip() {
+        let sig = vec![0x30, 0x44];
+        let pubkey = vec![0x03; 33];
+        let w = encode_ltc_swap_order_cancel_witness(&sig, &pubkey).expect("encode");
+        match parse_ltc_swap_order_witness(&w, LTC_SWAP_ORDER_DIRECTION_SELL).expect("parse") {
+            LtcSwapOrderWitness::Cancel { sig: s, pubkey: pk } => {
+                assert_eq!(s, sig);
+                assert_eq!(pk, pubkey);
+            }
+            _ => panic!("expected Cancel"),
+        }
+    }
+
+    #[test]
+    fn ltc_swap_order_expire_sweep_witness_is_single_byte() {
+        let w = encode_ltc_swap_order_expire_sweep_witness();
+        assert_eq!(w, vec![LTC_SWAP_ORDER_WITNESS_EXPIRE_SWEEP]);
+        assert!(matches!(
+            parse_ltc_swap_order_witness(&w, LTC_SWAP_ORDER_DIRECTION_SELL),
+            Some(LtcSwapOrderWitness::ExpireSweep)
+        ));
+    }
+
+    #[test]
+    fn ltc_swap_order_witness_rejects_unknown_selector() {
+        let w = vec![0xff, 0, 0, 0];
+        assert!(parse_ltc_swap_order_witness(&w, LTC_SWAP_ORDER_DIRECTION_SELL).is_none());
     }
 }
