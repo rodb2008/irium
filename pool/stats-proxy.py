@@ -661,7 +661,7 @@ class Handler(BaseHTTPRequestHandler):
                 # aggregates shares per-address since one wallet can
                 # connect with multiple rig names.
                 addr = worker.split(".", 1)[0]
-                miner_payout = payout_by_addr.get(addr) if profile == "asic" else None
+                miner_payout = payout_by_addr.get(addr) if profile in ("asic", "port443") else None
                 pending_shares = miner_payout.get("pending_shares") if miner_payout else None
                 estimated_payout_irm = miner_payout.get("estimated_payout_irm") if miner_payout else None
                 miners_list.append({
