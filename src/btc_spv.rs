@@ -625,13 +625,19 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_btc_spv_returns_none_until_anchor_populated() {
+    fn mainnet_btc_spv_resolves_with_populated_anchor() {
         let _guard = env_lock().lock().unwrap();
         clear_btc_spv_env();
-        // Even if mainnet activation height were set in code, the zero
-        // anchor placeholder refuses to enable the relay.
+        // Mainnet activation height and anchor are both populated as of
+        // the height-23850 activation commit; resolve must return Some
+        // with the production anchor.
         let resolved = resolve_btc_spv_params(NetworkKind::Mainnet);
-        assert!(resolved.is_none());
+        let params = resolved.expect("mainnet BTC SPV should resolve");
+        assert_eq!(params.activation_height, 23_850);
+        assert_eq!(params.anchor.height, MAINNET_BTC_ANCHOR_HEIGHT);
+        assert_eq!(params.anchor.bits, MAINNET_BTC_ANCHOR_BITS);
+        assert_eq!(params.anchor.time, MAINNET_BTC_ANCHOR_TIME);
+        assert_eq!(params.anchor.hash, MAINNET_BTC_ANCHOR_HASH);
     }
 
     #[test]
