@@ -98,6 +98,52 @@ pub const MAINNET_LTC_ANCHOR_BITS: u32 = 0x1929_b619;
 #[allow(dead_code)]
 pub const MAINNET_LTC_ANCHOR_TIME: u32 = 1_778_676_649;
 
+/// Mainnet Dogecoin SPV header relay activation height (Phase A1).
+///
+/// `None` keeps the DOGE SPV header relay disabled on mainnet. When set
+/// to `Some(<height>)`, iriumd blocks at or after that height may carry
+/// a `DogeHeaderBatch` output (script tag `0xc9`) and the validator
+/// will apply such batches into `ChainState.doge_headers`.
+///
+/// Phase A1 ships disabled. Mainnet activation additionally requires
+/// Phase A2 (AuxPoW proof verification) to land first, since ~100% of
+/// live Dogecoin blocks since height 371,337 are merged-mined and their
+/// PoW lives on a parent Litecoin header rather than the DOGE header
+/// itself. Without A2, the relay would only accept solo-mined DOGE
+/// blocks — none in practice.
+pub const MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = None;
+
+/// Mainnet anchor for the DOGE SPV header relay.
+///
+/// Dogecoin mainnet block 6,225,000, picked ~3,374 confirmations deep
+/// (about 56 hours of finality buffer past the 720-confirmation
+/// minimum). Hash stored here in DISPLAY order for readability;
+/// reversed to natural byte order in `DogeAnchor::mainnet()` so it
+/// lines up with `prev_hash` chain-linkage fields.
+///
+/// `PREV_TIME` is the timestamp of block 6,224,999 — needed because
+/// Digishield's per-block retarget reads the grandparent's timestamp,
+/// and for the first relayed header the grandparent IS the block one
+/// step below the anchor.
+///
+/// These constants take effect only after governance flips
+/// `MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT` to `Some(<height>)`.
+#[allow(dead_code)] // wired through ChainParams once Phase B callers come online
+pub const MAINNET_DOGE_ANCHOR_HEIGHT: u64 = 6_225_000;
+#[allow(dead_code)]
+pub const MAINNET_DOGE_ANCHOR_HASH_DISPLAY: [u8; 32] = [
+    0x26, 0x55, 0xf8, 0x96, 0xbd, 0xf6, 0xdd, 0x40,
+    0xb9, 0x3e, 0xa4, 0xbb, 0x5d, 0xc4, 0x68, 0xcb,
+    0x3d, 0x2d, 0xb2, 0x5b, 0x60, 0x1e, 0x06, 0xe4,
+    0xcb, 0x18, 0x41, 0x8a, 0x0c, 0xb9, 0x1f, 0xb4,
+];
+#[allow(dead_code)]
+pub const MAINNET_DOGE_ANCHOR_BITS: u32 = 0x1a00_97af;
+#[allow(dead_code)]
+pub const MAINNET_DOGE_ANCHOR_TIME: u32 = 1_779_953_962;
+#[allow(dead_code)]
+pub const MAINNET_DOGE_ANCHOR_PREV_TIME: u32 = 1_779_953_888;
+
 /// Mainnet HtlcLtcSwapV1 activation height (Phase C).
 ///
 /// `None` keeps the LTC-proof claim path disabled on mainnet. When set
@@ -257,6 +303,23 @@ pub fn resolved_ltc_spv_relay_activation_height(network: NetworkKind) -> Option<
     match network {
         NetworkKind::Mainnet => MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT,
         NetworkKind::Testnet | NetworkKind::Devnet => runtime_ltc_spv_relay_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the DOGE SPV header relay activation height.
+/// Read from `IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once Phase B (doge) callers come online
+pub fn runtime_doge_spv_relay_env_override() -> Option<u64> {
+    env::var("IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once Phase B (doge) callers come online
+pub fn resolved_doge_spv_relay_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_doge_spv_relay_env_override(),
     }
 }
 
@@ -641,6 +704,52 @@ mod tests {
         assert_eq!(MAINNET_LTC_ANCHOR_TIME, 1_778_676_649);
         assert_eq!(MAINNET_LTC_ANCHOR_HASH_DISPLAY[0], 0x8a);
         assert_eq!(MAINNET_LTC_ANCHOR_HASH_DISPLAY[31], 0x64);
+    }
+
+    #[test]
+    fn mainnet_doge_spv_height_is_none_pending_governance() {
+        assert!(
+            MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT.is_none(),
+            "DOGE SPV must stay disabled on mainnet until governance flips this constant"
+        );
+        assert!(resolved_doge_spv_relay_activation_height(NetworkKind::Mainnet).is_none());
+    }
+
+    #[test]
+    fn mainnet_ignores_doge_spv_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT", "6666");
+        let resolved = resolved_doge_spv_relay_activation_height(NetworkKind::Mainnet);
+        std::env::remove_var("IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT");
+        assert_eq!(resolved, MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn non_mainnet_uses_doge_spv_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT", "88");
+        assert_eq!(
+            resolved_doge_spv_relay_activation_height(NetworkKind::Devnet),
+            Some(88)
+        );
+        assert_eq!(
+            resolved_doge_spv_relay_activation_height(NetworkKind::Testnet),
+            Some(88)
+        );
+        std::env::remove_var("IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn mainnet_doge_anchor_constants_have_expected_values() {
+        // Display-order hash (from blockchair.com / Dogecoin Core RPC).
+        // Reversed to natural order in `DogeAnchor::mainnet()`.
+        assert_eq!(MAINNET_DOGE_ANCHOR_HEIGHT, 6_225_000);
+        assert_eq!(MAINNET_DOGE_ANCHOR_BITS, 0x1a00_97af);
+        assert_eq!(MAINNET_DOGE_ANCHOR_TIME, 1_779_953_962);
+        assert_eq!(MAINNET_DOGE_ANCHOR_PREV_TIME, 1_779_953_888);
+        assert_eq!(MAINNET_DOGE_ANCHOR_HASH_DISPLAY[0], 0x26);
+        assert_eq!(MAINNET_DOGE_ANCHOR_HASH_DISPLAY[31], 0xb4);
     }
 
     #[test]
