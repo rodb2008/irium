@@ -107,6 +107,18 @@ pub fn meets_target(hash: &[u8; 32], target: Target) -> bool {
     value <= target.to_target()
 }
 
+/// Bitcoin-convention PoW check. Bitcoin block hashes are interpreted as
+/// little-endian integers when compared to target (display hex is the
+/// natural-order bytes reversed, which is why real BTC hashes look like
+/// 0x0000...something - those leading zeros are the high-order bytes after
+/// reversal). iriumd's own meets_target uses big-endian which works for
+/// iriumd-native hashes but mis-interprets BTC headers. Apply this when
+/// validating real Bitcoin headers (BTC SPV relay).
+pub fn meets_target_btc(hash: &[u8; 32], target: Target) -> bool {
+    let value = BigUint::from_bytes_le(hash);
+    value <= target.to_target()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

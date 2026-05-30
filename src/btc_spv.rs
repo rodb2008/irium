@@ -22,7 +22,7 @@ use crate::activation::{
     resolved_btc_spv_relay_activation_height, NetworkKind, MAINNET_BTC_ANCHOR_BITS,
     MAINNET_BTC_ANCHOR_HASH, MAINNET_BTC_ANCHOR_HEIGHT, MAINNET_BTC_ANCHOR_TIME,
 };
-use crate::pow::{meets_target, sha256d, Target};
+use crate::pow::{meets_target, meets_target_btc, sha256d, Target};
 
 /// Output script tag for a Bitcoin header batch.
 pub const BTC_HEADER_BATCH_TAG: u8 = 0xc4;
@@ -506,7 +506,7 @@ pub fn apply_btc_header_batch(
         }
 
         let header_target = Target { bits: header.bits };
-        if !meets_target(&hash, header_target) {
+        if !meets_target_btc(&hash, header_target) {
             return Err(format!("apply_btc_header_batch: header {} fails PoW", i));
         }
 
@@ -762,7 +762,7 @@ mod tests {
                 bits,
                 nonce,
             };
-            if meets_target(&header.block_hash(), Target { bits }) {
+            if meets_target_btc(&header.block_hash(), Target { bits }) {
                 return header;
             }
             nonce = nonce.wrapping_add(1);

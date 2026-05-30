@@ -10819,8 +10819,10 @@ async fn main() {
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
             btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
-            htlc_btc_swap_v1_activation_height: None,
-            swap_order_v1_activation_height: None,
+            htlc_btc_swap_v1_activation_height:
+                irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
+            swap_order_v1_activation_height:
+                irium_node_rs::activation::resolved_swap_order_v1_activation_height(network),
     };
     let mut state = ChainState::new(params);
     if load_persisted {
