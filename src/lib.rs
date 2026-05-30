@@ -8,6 +8,7 @@ pub mod btc_tx_parse;
 pub mod chain;
 pub mod constants;
 pub mod genesis;
+pub mod ltc_spv;
 pub mod mempool;
 pub mod network;
 pub mod network_era;
