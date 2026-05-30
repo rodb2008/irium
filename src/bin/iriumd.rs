@@ -99,6 +99,10 @@ use irium_node_rs::btc_spv::{
     encode_btc_header_batch, BtcAnchor, BtcHeader, BtcHeaderEntry, BTC_HEADER_BYTES,
     MAX_BTC_HEADERS_PER_BATCH,
 };
+use irium_node_rs::ltc_spv::{
+    encode_ltc_header_batch, LtcAnchor, LtcHeader, LtcHeaderEntry, LTC_HEADER_BYTES,
+    MAX_LTC_HEADERS_PER_BATCH,
+};
 use irium_node_rs::wallet_store::{WalletKey, WalletManager};
 use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use k256::ecdsa::{Signature, SigningKey};
@@ -6337,6 +6341,399 @@ async fn btc_header(
             on_canonical_chain: Some(canonical),
         })),
         None => Ok(Json(BtcHeaderResponse {
+            found: false,
+            hash: None,
+            height: None,
+            version: None,
+            prev_hash: None,
+            merkle_root: None,
+            time: None,
+            bits: None,
+            nonce: None,
+            on_canonical_chain: None,
+        })),
+    }
+}
+
+// Phase E.1 — LTC SPV header relay RPC endpoints. Byte-level mirror of the
+// BTC SPV trio above; gated on `chain.params.ltc_spv` being `Some` and
+// `chain.height >= activation_height`. Sha256d display-order helpers
+// (`btc_hash_to_display`, `parse_btc_display_hash`) are reused as-is —
+// Litecoin block hashes are sha256d in the same byte order.
+
+#[derive(Debug, Deserialize)]
+struct SubmitLtcHeadersRequest {
+    headers_hex: String,
+    #[serde(default)]
+    broadcast: Option<bool>,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitLtcHeadersResponse {
+    txid: String,
+    accepted: bool,
+    headers_count: u32,
+    new_tip_hash: Option<String>,
+    new_tip_height: Option<u64>,
+    fee: u64,
+    raw_tx_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LtcRelayTipResponse {
+    active: bool,
+    anchor_hash: String,
+    anchor_height: u64,
+    anchor_bits: String,
+    anchor_time: u32,
+    tip_hash: String,
+    tip_height: u64,
+    tip_time: u32,
+    tip_total_work_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LtcHeaderQuery {
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    height: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct LtcHeaderResponse {
+    found: bool,
+    hash: Option<String>,
+    height: Option<u64>,
+    version: Option<i32>,
+    prev_hash: Option<String>,
+    merkle_root: Option<String>,
+    time: Option<u32>,
+    bits: Option<String>,
+    nonce: Option<u32>,
+    on_canonical_chain: Option<bool>,
+}
+
+async fn submit_ltc_headers(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SubmitLtcHeadersRequest>,
+) -> Result<Json<SubmitLtcHeadersResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[submit_ltc_headers] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .ltc_spv
+            .as_ref()
+            .map(|p| chain.height >= p.activation_height)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ltc_spv_relay_not_active".to_string(),
+            ));
+        }
+    }
+
+    let raw = hex::decode(req.headers_hex.trim())
+        .map_err(|_| bad("headers_hex_decode_failed"))?;
+    if raw.is_empty() || raw.len() % LTC_HEADER_BYTES != 0 {
+        return Err(bad("headers_hex_length_not_multiple_of_80"));
+    }
+    let header_count = raw.len() / LTC_HEADER_BYTES;
+    if header_count == 0 || header_count > MAX_LTC_HEADERS_PER_BATCH as usize {
+        return Err(bad("header_count_out_of_range"));
+    }
+    let mut parsed_headers: Vec<LtcHeader> = Vec::with_capacity(header_count);
+    for i in 0..header_count {
+        let chunk = &raw[i * LTC_HEADER_BYTES..(i + 1) * LTC_HEADER_BYTES];
+        let h = LtcHeader::deserialize(chunk).map_err(|_| bad("ltc_header_deserialize_failed"))?;
+        parsed_headers.push(h);
+    }
+
+    let batch_script = encode_ltc_header_batch(&parsed_headers)
+        .map_err(|_| bad("encode_ltc_header_batch_failed"))?;
+
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        for key in keys {
+            let bytes = hex::decode(&key.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            key_map.insert(arr, key);
+        }
+    }
+    if key_map.is_empty() {
+        return Err(bad("wallet_key_map_empty"));
+    }
+
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if key_map.contains_key(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+    if utxos.is_empty() {
+        return Err(bad("wallet_utxo_set_empty"));
+    }
+    utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
+
+    let mut fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    if fee_per_byte == 0 {
+        fee_per_byte = 1;
+    }
+
+    let mut selected: Vec<WalletUtxo> = Vec::new();
+    let mut total: u64 = 0;
+    let mut fee: u64 = 0;
+    for utxo in utxos.iter() {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
+            continue;
+        }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.output.value);
+        let base_size = estimate_tx_size(selected.len(), 2);
+        fee = base_size
+            .saturating_add(batch_script.len() as u64)
+            .saturating_mul(fee_per_byte);
+        if total >= fee {
+            break;
+        }
+    }
+    if total < fee {
+        return Err(bad("insufficient_spendable_funds_for_header_batch_fee"));
+    }
+
+    let change_pkh = selected
+        .first()
+        .map(|u| u.pkh)
+        .ok_or_else(|| bad("no_change_pkh_available"))?;
+    let mut change = total.saturating_sub(fee);
+
+    let inputs: Vec<TxInput> = selected
+        .iter()
+        .map(|u| TxInput {
+            prev_txid: u.outpoint.txid,
+            prev_index: u.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        })
+        .collect();
+
+    let outputs = vec![
+        TxOutput {
+            value: change,
+            script_pubkey: p2pkh_script(&change_pkh),
+        },
+        TxOutput {
+            value: 0,
+            script_pubkey: batch_script,
+        },
+    ];
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+
+    for _ in 0..2 {
+        sign_wallet_inputs(&mut tx, &selected, &key_map)
+            .map_err(|_| bad("sign_wallet_inputs_failed"))?;
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if change >= extra {
+                fee = needed_fee;
+                change = change.saturating_sub(extra);
+                tx.outputs[0].value = change;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_change"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("chain_fee_calculation_failed"))?
+    };
+
+    let raw_tx = tx.serialize();
+    let txid = tx.txid();
+    let txid_hex = hex::encode(txid);
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(true) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid) {
+            match mempool.add_transaction(tx.clone(), raw_tx.clone(), fee_checked) {
+                Ok(_) => accepted = true,
+                Err(e) => {
+                    eprintln!("[submit_ltc_headers] mempool_reject reason={}", e);
+                }
+            }
+        }
+    }
+
+    Ok(Json(SubmitLtcHeadersResponse {
+        txid: txid_hex,
+        accepted,
+        headers_count: header_count as u32,
+        new_tip_hash: None,
+        new_tip_height: None,
+        fee: fee_checked,
+        raw_tx_hex: hex::encode(raw_tx),
+    }))
+}
+
+async fn ltc_relay_tip(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+) -> Result<Json<LtcRelayTipResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers_map)?;
+    require_rpc_auth(&headers_map)?;
+
+    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let (active, anchor) = match chain.params.ltc_spv.as_ref() {
+        Some(p) => (chain.height >= p.activation_height, p.anchor),
+        None => (false, LtcAnchor::zero()),
+    };
+
+    let (tip_hash_display, tip_height, tip_time, tip_total_work_hex) = match chain.ltc_tip {
+        Some(h) => {
+            let entry = chain.ltc_headers.get(&h);
+            let time = entry.map(|e| e.header.time).unwrap_or(0);
+            let work_hex = entry
+                .map(|e| e.total_work.to_str_radix(16))
+                .unwrap_or_else(|| "0".to_string());
+            (
+                btc_hash_to_display(&h),
+                chain.ltc_tip_height,
+                time,
+                work_hex,
+            )
+        }
+        None => (
+            btc_hash_to_display(&anchor.hash),
+            anchor.height,
+            anchor.time,
+            "0".to_string(),
+        ),
+    };
+
+    Ok(Json(LtcRelayTipResponse {
+        active,
+        anchor_hash: btc_hash_to_display(&anchor.hash),
+        anchor_height: anchor.height,
+        anchor_bits: format!("0x{:08x}", anchor.bits),
+        anchor_time: anchor.time,
+        tip_hash: tip_hash_display,
+        tip_height,
+        tip_time,
+        tip_total_work_hex,
+    }))
+}
+
+async fn ltc_header(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    Query(q): Query<LtcHeaderQuery>,
+) -> Result<Json<LtcHeaderResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers_map)?;
+    require_rpc_auth(&headers_map)?;
+
+    if q.hash.is_none() && q.height.is_none() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if q.hash.is_some() && q.height.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+
+    let found: Option<([u8; 32], LtcHeaderEntry, bool)> = if let Some(hash_display) = &q.hash {
+        let natural = match parse_btc_display_hash(hash_display) {
+            Ok(h) => h,
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        };
+        chain.ltc_headers.get(&natural).map(|e| {
+            let canonical = chain
+                .ltc_heights
+                .get(&natural)
+                .copied()
+                .map(|h| h <= chain.ltc_tip_height)
+                .unwrap_or(false);
+            (natural, e.clone(), canonical)
+        })
+    } else if let Some(h) = q.height {
+        let mut hit: Option<[u8; 32]> = None;
+        for (hash, bh) in chain.ltc_heights.iter() {
+            if *bh == h {
+                hit = Some(*hash);
+                break;
+            }
+        }
+        hit.and_then(|hash| {
+            chain
+                .ltc_headers
+                .get(&hash)
+                .cloned()
+                .map(|e| (hash, e, true))
+        })
+    } else {
+        None
+    };
+
+    match found {
+        Some((hash, entry, canonical)) => Ok(Json(LtcHeaderResponse {
+            found: true,
+            hash: Some(btc_hash_to_display(&hash)),
+            height: Some(entry.height),
+            version: Some(entry.header.version),
+            prev_hash: Some(btc_hash_to_display(&entry.header.prev_hash)),
+            merkle_root: Some(btc_hash_to_display(&entry.header.merkle_root)),
+            time: Some(entry.header.time),
+            bits: Some(format!("0x{:08x}", entry.header.bits)),
+            nonce: Some(entry.header.nonce),
+            on_canonical_chain: Some(canonical),
+        })),
+        None => Ok(Json(LtcHeaderResponse {
             found: false,
             hash: None,
             height: None,
@@ -14600,6 +14997,9 @@ async fn explorer_stats(
         .route("/rpc/submitbtcheaders", post(submit_btc_headers))
         .route("/rpc/btcrelaytip", get(btc_relay_tip))
         .route("/rpc/btcheader", get(btc_header))
+        .route("/rpc/submitltcheaders", post(submit_ltc_headers))
+        .route("/rpc/ltcrelaytip", get(ltc_relay_tip))
+        .route("/rpc/ltcheader", get(ltc_header))
         .route("/rpc/createbtcswap", post(create_btc_swap))
         .route("/rpc/claimbtcswap", post(claim_btc_swap))
         .route("/rpc/refundbtcswap", post(refund_btc_swap))
