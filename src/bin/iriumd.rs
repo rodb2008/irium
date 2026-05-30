@@ -78,12 +78,13 @@ use irium_node_rs::tx::{
     encode_htlc_btc_swap_refund_witness, encode_htlc_btc_swap_v1_script,
     encode_htlc_ltc_swap_claim_witness, encode_htlc_ltc_swap_refund_witness,
     encode_htlc_ltc_swap_v1_script, encode_ltc_swap_order_cancel_witness,
+    encode_ltc_swap_order_expire_sweep_witness,
     encode_ltc_swap_order_fill_buy_witness, encode_ltc_swap_order_fill_sell_witness,
     encode_ltc_swap_order_script, parse_htlc_ltc_swap_v1_script,
     parse_ltc_swap_order_script,
     HtlcLtcSwapV1Output, LtcSwapOrderOutput, HTLC_LTC_SWAP_V1_SCRIPT_LEN,
     LTC_SWAP_ORDER_DIRECTION_BUY, LTC_SWAP_ORDER_DIRECTION_SELL,
-    LTC_SWAP_ORDER_MIN_LOCKED_VALUE,
+    LTC_SWAP_ORDER_MAX_SWEEP_FEE, LTC_SWAP_ORDER_MIN_LOCKED_VALUE,
     MAX_HTLC_LTC_SWAP_CONFIRMATIONS, MIN_HTLC_LTC_SWAP_CONFIRMATIONS,
     encode_htlcv1_claim_witness, encode_htlcv1_refund_witness, encode_htlcv1_script,
     encode_swap_order_cancel_witness, encode_swap_order_expire_sweep_witness,
@@ -9461,6 +9462,112 @@ async fn sweep_expired_order(
     }))
 }
 
+async fn sweep_ltc_expired_order(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SweepExpiredOrderRequest>,
+) -> Result<Json<SwapSpendResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[sweep_ltc_expired_order] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .ltc_swap_order_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ltc_swap_order_v1_not_active".to_string(),
+            ));
+        }
+    }
+
+    let txid_arr =
+        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let key = OutPoint {
+        txid: txid_arr,
+        index: req.order_vout,
+    };
+
+    let (funding_out, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let utxo = chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| bad("order_outpoint_unspent_or_unknown"))?;
+        (utxo, chain.tip_height())
+    };
+
+    let order = parse_ltc_swap_order_script(&funding_out.output.script_pubkey)
+        .ok_or_else(|| bad("funding_output_not_ltc_swap_order"))?;
+    if tip_height < order.expiry_height {
+        return Err(bad("expiry_height_not_reached"));
+    }
+
+    let utxo_value = funding_out.output.value;
+    let minimum_payout = utxo_value.saturating_sub(LTC_SWAP_ORDER_MAX_SWEEP_FEE);
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let est_fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let payout = if utxo_value >= est_fee.saturating_add(minimum_payout) {
+        utxo_value - est_fee
+    } else {
+        minimum_payout
+    };
+    if payout < minimum_payout {
+        return Err(bad("payout_below_consensus_minimum"));
+    }
+
+    let tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: txid_arr,
+            prev_index: req.order_vout,
+            script_sig: encode_ltc_swap_order_expire_sweep_witness(),
+            sequence: 0xffff_fffe,
+        }],
+        outputs: vec![TxOutput {
+            value: payout,
+            script_pubkey: p2pkh_script(&order.maker_iriumd_pkh),
+        }],
+        locktime: 0,
+    };
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("calculate_fees_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_out = tx.txid();
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_out) {
+            accepted = mempool
+                .add_transaction(tx.clone(), raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+    Ok(Json(SwapSpendResponse {
+        txid: hex::encode(txid_out),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    }))
+}
+
 // ---- Phase D — LtcSwapOrder RPC endpoints. Byte-level mirror of the
 // BTC SwapOrder RPCs above, gated on `ltc_swap_order_v1_activation_height`.
 // Sell-direction fills emit `HtlcLtcSwapV1` outputs (Phase C); buy-direction
@@ -15018,6 +15125,7 @@ async fn explorer_stats(
         .route("/rpc/getltcswaporder", get(get_ltc_swap_order))
         .route("/rpc/cancelltcswaporder", post(cancel_ltc_swap_order))
         .route("/rpc/fillltcswaporder", post(fill_ltc_swap_order))
+        .route("/rpc/sweepltcexpiredorder", post(sweep_ltc_expired_order))
         .route("/rpc/sweepexpiredorder", post(sweep_expired_order))
         .route("/wallet/create", post(wallet_create))
         .route("/wallet/unlock", post(wallet_unlock))
