@@ -40,7 +40,7 @@ pub const MAINNET_AUXPOW_ACTIVATION_HEIGHT: Option<u64> = Some(26_500);
 ///
 /// Phase 1 ships disabled. Activation requires a dedicated commit and
 /// release per the workflow in docs/htlcv1_activation_commit_workflow.md.
-pub const MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = Some(23_850);
 
 /// Mainnet anchor for the BTC SPV header relay.
 ///
@@ -48,13 +48,22 @@ pub const MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = None;
 /// must be set together (a known finalized BTC mainnet block) at the same
 /// time as `MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT`.
 #[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
-pub const MAINNET_BTC_ANCHOR_HEIGHT: u64 = 0;
+pub const MAINNET_BTC_ANCHOR_HEIGHT: u64 = 880_000;
 #[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
-pub const MAINNET_BTC_ANCHOR_HASH: [u8; 32] = [0u8; 32];
+pub const MAINNET_BTC_ANCHOR_HASH: [u8; 32] = [
+    // Bitcoin mainnet block 880000 hash in NATURAL byte order
+    // (display hex 000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880
+    // reversed - chain-linkage checks compare to header.prev_hash which is also
+    // stored in natural order).
+    0x80, 0x28, 0xca, 0x5c, 0xec, 0x82, 0x20, 0xcf,
+    0x1d, 0xfd, 0x2a, 0x9c, 0x9a, 0x96, 0x07, 0x05,
+    0x40, 0x3c, 0x3c, 0x28, 0x17, 0x0b, 0x01, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
 #[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
-pub const MAINNET_BTC_ANCHOR_BITS: u32 = 0;
+pub const MAINNET_BTC_ANCHOR_BITS: u32 = 0x17028c61;
 #[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
-pub const MAINNET_BTC_ANCHOR_TIME: u32 = 0;
+pub const MAINNET_BTC_ANCHOR_TIME: u32 = 1_737_337_343;
 
 /// Mainnet HtlcBtcSwapV1 activation height (Phase 2).
 ///
@@ -70,7 +79,7 @@ pub const MAINNET_BTC_ANCHOR_TIME: u32 = 0;
 ///    proofs would resolve.
 /// 2. A dedicated activation commit per the workflow in
 ///    docs/htlcv1_activation_commit_workflow.md.
-pub const MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = Some(23_850);
 
 /// Mainnet SwapOrder activation height (Phase 3).
 ///
@@ -82,7 +91,7 @@ pub const MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = None;
 /// Phase 3 ships disabled. Sell-direction fills emit `HtlcBtcSwapV1`
 /// outputs, so this should not be activated before HtlcBtcSwapV1 — the
 /// fill covenant would otherwise reject every spend.
-pub const MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = Some(23_850);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkKind {
@@ -370,14 +379,14 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_btc_spv_relay_height_is_none() {
+    fn mainnet_btc_spv_relay_height_is_23850() {
         assert_eq!(
-            MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT, None,
-            "Phase 1 ships disabled on mainnet"
+            MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT, Some(23_850),
+            "Phase 1 activated on mainnet at height 23850"
         );
         assert_eq!(
             resolved_btc_spv_relay_activation_height(NetworkKind::Mainnet),
-            None
+            Some(23_850)
         );
     }
 
@@ -388,7 +397,7 @@ mod tests {
         let resolved = resolved_btc_spv_relay_activation_height(NetworkKind::Mainnet);
         std::env::remove_var("IRIUM_BTC_SPV_RELAY_ACTIVATION_HEIGHT");
         assert_eq!(resolved, MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT);
-        assert_eq!(resolved, None);
+        assert_eq!(resolved, Some(23_850));
     }
 
     #[test]
@@ -407,14 +416,14 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_htlc_btc_swap_v1_height_is_none() {
+    fn mainnet_htlc_btc_swap_v1_height_is_23850() {
         assert_eq!(
-            MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT, None,
-            "Phase 2 ships disabled on mainnet"
+            MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT, Some(23_850),
+            "Phase 2 activated on mainnet at height 23850"
         );
         assert_eq!(
             resolved_htlc_btc_swap_v1_activation_height(NetworkKind::Mainnet),
-            None
+            Some(23_850)
         );
     }
 
@@ -425,7 +434,7 @@ mod tests {
         let resolved = resolved_htlc_btc_swap_v1_activation_height(NetworkKind::Mainnet);
         std::env::remove_var("IRIUM_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT");
         assert_eq!(resolved, MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT);
-        assert_eq!(resolved, None);
+        assert_eq!(resolved, Some(23_850));
     }
 
     #[test]
@@ -444,14 +453,14 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_swap_order_v1_height_is_none() {
+    fn mainnet_swap_order_v1_height_is_23850() {
         assert_eq!(
-            MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT, None,
-            "Phase 3 ships disabled on mainnet"
+            MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT, Some(23_850),
+            "Phase 3 activated on mainnet at height 23850"
         );
         assert_eq!(
             resolved_swap_order_v1_activation_height(NetworkKind::Mainnet),
-            None
+            Some(23_850)
         );
     }
 
@@ -462,7 +471,7 @@ mod tests {
         let resolved = resolved_swap_order_v1_activation_height(NetworkKind::Mainnet);
         std::env::remove_var("IRIUM_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
         assert_eq!(resolved, MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT);
-        assert_eq!(resolved, None);
+        assert_eq!(resolved, Some(23_850));
     }
 
     #[test]
