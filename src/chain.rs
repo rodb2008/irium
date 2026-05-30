@@ -2165,7 +2165,12 @@ pub fn decode_compact_tx(raw: &[u8]) -> Transaction {
     let mut outputs = Vec::with_capacity(output_count);
     for _ in 0..output_count {
         let value = read_u64(raw, &mut offset);
-        let script_len = read_u8(raw, &mut offset) as usize;
+        // Bug fix: outputs with script_pubkey > 252 bytes (BtcHeaderBatch
+        // header batches, large MPSO covenants, etc.) need varint length
+        // decoding. Backward-compatible: for n < 253 the encoding is a
+        // single byte identical to the previous u8.
+        let script_len = crate::tx::read_varint_at(raw, &mut offset)
+            .unwrap_or(0) as usize;
         let script_pubkey = read_bytes(raw, &mut offset, script_len);
         outputs.push(TxOutput {
             value,

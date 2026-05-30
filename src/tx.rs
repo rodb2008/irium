@@ -91,9 +91,15 @@ pub struct TxOutput {
 
 impl TxOutput {
     pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 1 + self.script_pubkey.len());
+        let mut out = Vec::with_capacity(8 + 3 + self.script_pubkey.len());
         out.extend_from_slice(&self.value.to_le_bytes());
-        out.push(self.script_pubkey.len() as u8);
+        // Bitcoin-style varint script length. Bug fix: previously u8 cast
+        // truncated script_pubkey.len() for outputs longer than 255 bytes
+        // (BtcHeaderBatch, large MPSO, etc.), corrupting the serialized tx
+        // and breaking signature verification on the block-connect path.
+        // Backward-compatible: varint encoding for n < 253 is identical to
+        // a single-byte u8, so existing short-script txs serialize identically.
+        write_varint(&mut out, self.script_pubkey.len());
         out.extend_from_slice(&self.script_pubkey);
         out
     }
@@ -609,7 +615,7 @@ pub fn encode_htlc_btc_swap_refund_witness(sig: &[u8], pubkey: &[u8]) -> Option<
     Some(out)
 }
 
-fn write_varint(out: &mut Vec<u8>, n: usize) {
+pub fn write_varint(out: &mut Vec<u8>, n: usize) {
     if n < 0xfd {
         out.push(n as u8);
     } else if n <= 0xffff {
@@ -624,7 +630,7 @@ fn write_varint(out: &mut Vec<u8>, n: usize) {
     }
 }
 
-fn read_varint_at(data: &[u8], offset: &mut usize) -> Option<u64> {
+pub fn read_varint_at(data: &[u8], offset: &mut usize) -> Option<u64> {
     if *offset >= data.len() {
         return None;
     }
@@ -1202,7 +1208,9 @@ pub fn decode_full_tx_at(raw: &[u8], offset: &mut usize) -> Result<Transaction, 
     let mut outputs = Vec::with_capacity(output_count);
     for _ in 0..output_count {
         let value = read_u64(raw, offset)?;
-        let script_len = read_u8(raw, offset)? as usize;
+        let script_len = read_varint_at(raw, offset)
+            .ok_or_else(|| "unexpected EOF reading output script_len varint".to_string())?
+            as usize;
         let script_pubkey = read_bytes(raw, offset, script_len)?;
         outputs.push(TxOutput {
             value,
