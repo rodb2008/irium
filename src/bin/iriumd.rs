@@ -42,7 +42,7 @@ use irium_node_rs::block::{Block, BlockHeader};
 use irium_node_rs::chain::{
     block_from_locked, ChainParams, ChainState, HeaderWork, LwmaParams, OutPoint,
 };
-use irium_node_rs::constants::{block_reward, COINBASE_MATURITY};
+use irium_node_rs::constants::{block_reward, coinbase_maturity, COINBASE_MATURITY};
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::{evict_invalid_mempool_entries, MempoolManager};
 use irium_node_rs::network::SeedlistManager;
@@ -5238,7 +5238,7 @@ async fn fund_agreement(
     let base_outputs = legs.len().saturating_mul(2);
     for utxo in &utxos {
         let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
             continue;
         }
         selected.push(utxo.clone());
@@ -5810,7 +5810,7 @@ async fn wallet_send(
     let mut fee = 0u64;
     for utxo in utxos.iter() {
         let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
             continue;
         }
         selected.push(utxo.clone());
@@ -6111,7 +6111,7 @@ async fn submit_btc_headers(
     let mut fee: u64 = 0;
     for utxo in utxos.iter() {
         let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
             continue;
         }
         selected.push(utxo.clone());
@@ -6566,7 +6566,7 @@ async fn create_btc_swap(
     let mut fee = 0u64;
     for utxo in utxos.iter() {
         let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
             continue;
         }
         selected.push(utxo.clone());
@@ -7450,7 +7450,7 @@ async fn post_swap_order(
     let mut fee = 0u64;
     for utxo in utxos.iter() {
         let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
             continue;
         }
         selected.push(utxo.clone());
@@ -8078,7 +8078,7 @@ async fn fill_swap_order(
         wallet_utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
         for u in wallet_utxos.iter() {
             if u.is_coinbase
-                && tip_height.saturating_sub(u.height) < COINBASE_MATURITY
+                && tip_height.saturating_sub(u.height) < coinbase_maturity()
             {
                 continue;
             }
@@ -8396,7 +8396,7 @@ async fn create_htlc(
     let mut fee = 0u64;
     for utxo in utxos.iter() {
         let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
             continue;
         }
         selected.push(utxo.clone());
@@ -20449,7 +20449,7 @@ fn build_and_broadcast_anchor_tx(
     let mut chosen: Option<WalletUtxo> = None;
     for utxo in &utxos {
         let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
             continue;
         }
         if utxo.output.value > estimated_fee {
@@ -20596,7 +20596,7 @@ fn build_and_broadcast_rep_event_tx(
     let mut chosen: Option<WalletUtxo> = None;
     for utxo in &utxos {
         let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
             continue;
         }
         if utxo.output.value > estimated_fee {

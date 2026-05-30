@@ -1,4 +1,4 @@
-use irium_node_rs::constants::COINBASE_MATURITY;
+use irium_node_rs::constants::{coinbase_maturity, COINBASE_MATURITY};
 use irium_node_rs::pow::sha256d;
 use irium_node_rs::qr::{render_ascii, render_svg};
 use irium_node_rs::settlement::{
@@ -9535,7 +9535,7 @@ fn handle_attestor_register(args: &[String]) -> Result<(), String> {
     let mut total = 0u64;
     for utxo in utxos.iter() {
         let confirmations = current_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < COINBASE_MATURITY { continue; }
+        if utxo.is_coinbase && confirmations < coinbase_maturity() { continue; }
         selected.push(utxo.clone());
         total = total.saturating_add(utxo.value);
         if total >= fee { break; }
@@ -9695,7 +9695,7 @@ fn handle_attestor_withdraw_bond(args: &[String]) -> Result<(), String> {
     let mut total = 0u64;
     for utxo in utxos.iter() {
         let confirmations = current_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < COINBASE_MATURITY { continue; }
+        if utxo.is_coinbase && confirmations < coinbase_maturity() { continue; }
         selected.push(utxo.clone());
         total = total.saturating_add(utxo.value);
         if total >= fee { break; }
@@ -9887,7 +9887,7 @@ fn handle_attestor_slash(args: &[String]) -> Result<(), String> {
     let mut total = 0u64;
     for utxo in utxos.iter() {
         let confirmations = current_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < COINBASE_MATURITY { continue; }
+        if utxo.is_coinbase && confirmations < coinbase_maturity() { continue; }
         selected.push(utxo.clone());
         total = total.saturating_add(utxo.value);
         if total >= fee { break; }
@@ -24359,7 +24359,7 @@ fn main() {
             };
             for utxo in payload.utxos {
                 let confirmations = payload.height.saturating_sub(utxo.height);
-                if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+                if utxo.is_coinbase && confirmations < coinbase_maturity() {
                     continue;
                 }
                 let val = format_irm(utxo.value);
@@ -28435,7 +28435,7 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
             let mut fee = fee_override.unwrap_or(0);
             for utxo in utxos.iter() {
                 let confirmations = payload.height.saturating_sub(utxo.height);
-                if utxo.is_coinbase && confirmations < COINBASE_MATURITY {
+                if utxo.is_coinbase && confirmations < coinbase_maturity() {
                     continue;
                 }
                 selected.push(utxo.clone());
@@ -29152,7 +29152,7 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
             let mut selected = Vec::new(); let mut total = 0u64; let mut fee = fee_override.unwrap_or(0);
             for utxo in &utxos {
                 let confs = payload.height.saturating_sub(utxo.height);
-                if utxo.is_coinbase && confs < COINBASE_MATURITY { continue; }
+                if utxo.is_coinbase && confs < coinbase_maturity() { continue; }
                 selected.push(utxo.clone()); total = total.saturating_add(utxo.value);
                 if fee_override.is_none() { fee = estimate_tx_size(selected.len(), 2).saturating_mul(fee_per_byte); }
                 if total >= amount.saturating_add(fee) { break; }
