@@ -19,7 +19,7 @@ use crate::btc_spv::{
 };
 use crate::btc_tx_parse::{btc_txid, parse_btc_tx_outputs, BtcOutputScript};
 use crate::constants::{
-    block_reward, BLOCK_TARGET_INTERVAL, COINBASE_MATURITY, DIFFICULTY_RETARGET_INTERVAL,
+    block_reward, coinbase_maturity, BLOCK_TARGET_INTERVAL, COINBASE_MATURITY, DIFFICULTY_RETARGET_INTERVAL,
     LWMA_MAX_TARGET_DOWN_FACTOR, LWMA_MAX_TARGET_UP_FACTOR, LWMA_MIN_DIFFICULTY_FLOOR,
     LWMA_SOLVETIME_CLAMP_FACTOR, LWMA_V2_MAX_TARGET_DOWN_FACTOR, LWMA_V2_MAX_TARGET_UP_FACTOR,
     LWMA_V2_SOLVETIME_CLAMP_FACTOR, LWMA_V2_WINDOW, LWMA_WINDOW, MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
@@ -410,6 +410,18 @@ impl ChainState {
     }
 
     fn legacy_target_for_height(&self, height: u64) -> Target {
+        // Devnet/regtest fast-mining override: return a near-maximum target so
+        // commodity CPU mining finds blocks effectively instantly. Skip for
+        // height 0 - the genesis block keeps its locked bits; otherwise
+        // connect_genesis panics with a bits mismatch. Override is applied
+        // at the target-lookup layer so miner-expected and validator-required
+        // bits agree, avoiding a fork between them.
+        if height > 0 && matches!(
+            std::env::var("IRIUM_NETWORK").as_deref(),
+            Ok("devnet") | Ok("regtest")
+        ) {
+            return Target { bits: 0x207fffff };
+        }
         if height == 0 {
             return self.params.genesis_block.header.target();
         }
@@ -472,6 +484,18 @@ impl ChainState {
     /// All arithmetic is integer-only and deterministic. Compact bits encoding
     /// is used only at the boundaries.
     fn lwma_target_for_height_with(&self, params: &LwmaParams) -> Target {
+        // Devnet/regtest fast-mining override: return a near-maximum target so
+        // commodity CPU mining finds blocks effectively instantly. Skip for
+        // height 0 - the genesis block keeps its locked bits; otherwise
+        // connect_genesis panics with a bits mismatch. Override is applied
+        // at the target-lookup layer so miner-expected and validator-required
+        // bits agree, avoiding a fork between them.
+        if self.chain.len() > 1 && matches!(
+            std::env::var("IRIUM_NETWORK").as_deref(),
+            Ok("devnet") | Ok("regtest")
+        ) {
+            return Target { bits: 0x207fffff };
+        }
         let last_block = self
             .chain
             .last()
@@ -1349,7 +1373,7 @@ impl ChainState {
 
             if utxo_entry.is_coinbase {
                 let confirmations = height.saturating_sub(utxo_entry.height);
-                if confirmations < COINBASE_MATURITY {
+                if confirmations < coinbase_maturity() {
                     return Err("Coinbase UTXO not mature".to_string());
                 }
             }

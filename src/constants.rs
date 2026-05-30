@@ -62,3 +62,17 @@ pub const LWMA_V2_MAX_TARGET_DOWN_FACTOR: u64 = 2; // unchanged: max 2x harden p
 /// See src/block.rs::BlockHeader::serialize_for_height for the implementation
 /// and the Fix 2a plan for the migration / activation rationale.
 pub const STANDARD_HEADER_ACTIVATION_HEIGHT: u64 = 22_888;
+
+/// Network-aware coinbase maturity. Mainnet uses the const `COINBASE_MATURITY`
+/// (100 blocks). Devnet/regtest reads `IRIUM_COINBASE_MATURITY` (default 5)
+/// so end-to-end tests don't have to mine 100 real blocks before spending
+/// coinbase outputs.
+pub fn coinbase_maturity() -> u64 {
+    match std::env::var("IRIUM_NETWORK").as_deref() {
+        Ok("devnet") | Ok("regtest") => std::env::var("IRIUM_COINBASE_MATURITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5),
+        _ => COINBASE_MATURITY,
+    }
+}
