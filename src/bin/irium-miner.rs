@@ -696,6 +696,11 @@ fn mempool_entries_from_template(
             added: 0,
             relays: Vec::new(),
             relay_addresses: tx.relay_addresses.clone().unwrap_or_default(),
+            // Synthesised entry — the miner never persists or evicts
+            // these. Standard is the safe default since this code path
+            // pre-dates the priority field and the new admission policy
+            // only matters at /rpc/submit and P2P ingress.
+            priority: irium_node_rs::mempool::MempoolPriority::Standard,
         });
     }
     out
@@ -760,6 +765,7 @@ fn load_mempool_entries(
             added: 0,
             relays: Vec::new(),
             relay_addresses: Vec::new(),
+            priority: irium_node_rs::mempool::MempoolPriority::Standard,
         });
     }
     out
@@ -3209,9 +3215,17 @@ fn main() {
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
-            btc_spv: None,
-            htlc_btc_swap_v1_activation_height: None,
-            swap_order_v1_activation_height: None,
+            btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
+            ltc_spv: irium_node_rs::ltc_spv::resolve_ltc_spv_params(network),
+            doge_spv: irium_node_rs::doge_spv::resolve_doge_spv_params(network),
+            htlc_btc_swap_v1_activation_height:
+                irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
+            htlc_ltc_swap_v1_activation_height:
+                irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
+            swap_order_v1_activation_height:
+                irium_node_rs::activation::resolved_swap_order_v1_activation_height(network),
+            ltc_swap_order_v1_activation_height:
+                irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
     };
 
     let mut state = ChainState::new(params.clone());

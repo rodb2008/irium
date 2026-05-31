@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use crate::block::{Block, BlockHeader};
 use crate::chain::ChainState;
+use crate::chain::classify_tx_priority;
 use crate::mempool::{evict_invalid_mempool_entries, MempoolManager};
 use crate::network::{PeerDirectory, PeerRecord};
 use crate::pow::meets_target;
@@ -6008,11 +6009,11 @@ impl P2PNode {
                                         (&chain_for_sync, &mempool_for_sync)
                                     {
                                         let inv_bytes = {
-                                            let fee = {
+                                            let (fee, priority) = {
                                                 let guard = chain_arc
                                                     .lock()
                                                     .unwrap_or_else(|e| e.into_inner());
-                                                match guard.calculate_fees(&tx) {
+                                                let fee = match guard.calculate_fees(&tx) {
                                                     Ok(f) => f,
                                                     Err(e) => {
                                                         eprintln!(
@@ -6021,7 +6022,10 @@ impl P2PNode {
                                                         );
                                                         continue;
                                                     }
-                                                }
+                                                };
+                                                let priority =
+                                                    classify_tx_priority(&tx, &guard);
+                                                (fee, priority)
                                             };
                                             let relay_addr = {
                                                 let dir = dir.lock().await;
@@ -6032,10 +6036,12 @@ impl P2PNode {
                                             let peer_addr = addr.to_string();
                                             let txid = tx.txid();
                                             let txid_hex = hex::encode(txid);
-                                            match mem_guard.add_transaction(
+                                            match mem_guard.add_transaction_with_priority(
                                                 tx.clone(),
                                                 payload.tx_data.clone(),
                                                 fee,
+                                                priority,
+                                                Some(addr.ip()),
                                             ) {
                                                 Ok(outcome) => {
                                                     P2PNode::log_event(
@@ -8278,16 +8284,18 @@ async fn handle_incoming_with_sybil(
                         Ok(tx) => {
                             if let (Some(ref chain_arc), Some(ref mem)) = (&chain, &mempool) {
                                 let inv_bytes = {
-                                    let fee = {
+                                    let (fee, priority) = {
                                         let guard =
                                             chain_arc.lock().unwrap_or_else(|e| e.into_inner());
-                                        match guard.calculate_fees(&tx) {
+                                        let fee = match guard.calculate_fees(&tx) {
                                             Ok(f) => f,
                                             Err(e) => {
                                                 eprintln!("Rejecting tx from {}: {}", addr, e);
                                                 continue;
                                             }
-                                        }
+                                        };
+                                        let priority = classify_tx_priority(&tx, &guard);
+                                        (fee, priority)
                                     };
                                     let relay_addr = {
                                         let dir = directory.lock().await;
@@ -8296,10 +8304,12 @@ async fn handle_incoming_with_sybil(
                                     let mut mem_guard =
                                         mem.lock().unwrap_or_else(|e| e.into_inner());
                                     let peer_addr = addr.to_string();
-                                    match mem_guard.add_transaction(
+                                    match mem_guard.add_transaction_with_priority(
                                         tx.clone(),
                                         payload.tx_data.clone(),
                                         fee,
+                                        priority,
+                                        Some(addr.ip()),
                                     ) {
                                         Ok(outcome) => {
                                             mem_guard
@@ -8592,8 +8602,12 @@ mod tests {
             lwma_v2: None,
             auxpow_activation_height: None,
             btc_spv: None,
+            ltc_spv: None,
+            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
         };
         let mut chain = ChainState::new(params);
 
@@ -8652,8 +8666,12 @@ mod tests {
             lwma_v2: None,
             auxpow_activation_height: None,
             btc_spv: None,
+            ltc_spv: None,
+            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
         };
         let chain = ChainState::new(params);
 
@@ -8697,8 +8715,12 @@ mod tests {
             lwma_v2: None,
             auxpow_activation_height: None,
             btc_spv: None,
+            ltc_spv: None,
+            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
         };
         let chain = ChainState::new(params);
 
