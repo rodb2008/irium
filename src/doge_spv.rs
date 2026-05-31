@@ -79,6 +79,13 @@ pub const DOGE_HEADER_BATCH_TAG: u8 = 0xc9;
 pub const DOGE_HEADER_BATCH_VERSION: u8 = 0x01;
 pub const DOGE_HEADER_BYTES: usize = 80;
 
+/// Regtest proof-of-work limit (`bnProofOfWorkLimit` in dogecoind/regtest).
+/// When the anchor uses this value the Digishield retarget is
+/// short-circuited and all headers must use this same `bits`. Mainnet
+/// anchors carry real DOGE difficulty (e.g. 0x1a0097af) so this branch
+/// never fires there.
+pub const DOGE_REGTEST_POW_LIMIT_BITS: u32 = 0x207fffff;
+
 /// Dogecoin scrypt PoW costs ~10 ms per header on commodity hardware —
 /// same cost as Litecoin since the parameters are identical. A 144-cap
 /// batch verified across 8 cores via rayon completes in well under
@@ -602,6 +609,17 @@ fn expected_bits_for_v(
     anchor: &DogeAnchor,
     params: &DigishieldParams,
 ) -> Result<u32, String> {
+    // Regtest carve-out: dogecoind regtest hardcodes bits to its
+    // pow_limit (0x207fffff) and never retargets. Mirror that:
+    // when the anchor itself is regtest, every subsequent header
+    // must also use the regtest limit. `expected_bits_digishield`
+    // is otherwise correct for mainnet, which is why we short-circuit
+    // here instead of inside that function.
+    if anchor.bits == DOGE_REGTEST_POW_LIMIT_BITS {
+        let _ = (view, params);
+        return Ok(DOGE_REGTEST_POW_LIMIT_BITS);
+    }
+
     let (parent_bits, parent_time, parent_prev_hash) = if *parent_hash == anchor.hash {
         (anchor.bits, anchor.time, [0u8; 32])
     } else {
