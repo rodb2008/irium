@@ -27,7 +27,6 @@ Port profiles:
   - Use for: CPU/GPU and older Stratum clients (cpuminer-opt, ccminer, T-Rex, lolMiner, NBMiner, legacy cgminer family)
 - `443` (ISP-block fallback): `stratum+tcp://pool.iriumlabs.org:443`
   - Use when: outbound TCP/3333 or TCP/3335 is filtered by your ISP (notably common in mainland China). Same Stratum protocol served on the HTTPS port to bypass DPI filtering.
-  - **MUST use `stratum+tcp://`, NOT `stratum+ssl://`. Port 443 is plain-TCP multiplexed via sslh — it is NOT a TLS endpoint. Many miner firmwares default to TLS when they see port 443 in the URL; you must explicitly disable TLS / SSL in your miner config or the connection will be silently classified as HTTPS and dropped.**
 - `80` (second fallback): `stratum+tcp://pool.iriumlabs.org:80`
   - Use when: both 3333/3335 and 443 are filtered. Same protocol, HTTP port.
 - Username: `IRM_ADDRESS.worker1`

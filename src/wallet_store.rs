@@ -21,45 +21,10 @@ const PBKDF2_ITERS: u32 = 100_000;
 const WALLET_VERSION: u32 = 1;
 const DEFAULT_AUTO_LOCK_MIN: u64 = 10;
 
-/// Whether a wallet is missing, plaintext (legacy), or encrypted.
-/// Exposed to RPC callers via `/wallet/info` and to the CLI via the
-/// `info` subcommand so they can decide whether to prompt for a
-/// password or force migration. Drives the bootstrap UX entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WalletMode {
-    None,
-    Plaintext,
-    Encrypted,
-}
-
-/// On-disk wallet shape. Unified to accept either:
-///   * Encrypted: { version, crypto: { salt, nonce, cipher } }
-///     - what `encrypt_wallet` always produces and `save_wallet` always
-///       writes going forward.
-///   * Plaintext: { version, seed_hex|bip32_seed|mnemonic, next_index, keys }
-///     - legacy shape written by older code eras and by the irium-wallet
-///       CLI's own removed schema. Tolerated on LOAD only; never WRITTEN
-///       by this code. The presence of `crypto` is the discriminator.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WalletFile {
-    pub version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub crypto: Option<WalletCrypto>,
-    // Legacy plaintext fields. Tolerated on load via #[serde(default)],
-    // never serialized when None (skip_serializing_if). After migration,
-    // the file is rewritten with crypto = Some(..) and these become
-    // omitted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seed_hex: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bip32_seed: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mnemonic: Option<String>,
-    #[serde(default)]
-    pub next_index: u32,
-    #[serde(default)]
-    pub keys: Vec<WalletKey>,
+    version: u32,
+    crypto: WalletCrypto,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,16 +39,6 @@ pub struct WalletPlain {
     pub keys: Vec<WalletKey>,
     #[serde(default)]
     pub seed_hex: Option<String>,
-    /// Present iff the wallet was created via the BIP32 path (CLI's
-    /// `create-wallet --bip32`). Preserved on migration so derivation
-    /// remains consistent across reads/writes; round-trips through the
-    /// encrypted form unchanged.
-    #[serde(default)]
-    pub bip32_seed: Option<String>,
-    /// Present iff a BIP39 mnemonic was generated/imported. Preserved
-    /// the same way as bip32_seed. Used by the recovery flow.
-    #[serde(default)]
-    pub mnemonic: Option<String>,
     #[serde(default)]
     pub next_index: u32,
 }
@@ -131,19 +86,7 @@ impl WalletManager {
             return PathBuf::from(path);
         }
         let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        let irium_dir = PathBuf::from(home).join(".irium");
-        let new_path = irium_dir.join("wallet.json");
-        let legacy_path = irium_dir.join("wallet.core.json");
-        // Prefer the unified path (wallet.json — same path Irium Core and
-        // irium-wallet CLI write to). Fall back to the legacy encrypted
-        // filename only when wallet.json does not exist AND
-        // wallet.core.json does, so users with an existing encrypted
-        // wallet under the old name keep working without manual action.
-        if !new_path.exists() && legacy_path.exists() {
-            legacy_path
-        } else {
-            new_path
-        }
+        PathBuf::from(home).join(".irium/wallet.core.json")
     }
 
     pub fn path(&self) -> &Path {
@@ -177,8 +120,6 @@ impl WalletManager {
         let mut plain = WalletPlain {
             keys: Vec::new(),
             seed_hex: None,
-            bip32_seed: None,
-            mnemonic: None,
             next_index: 0,
         };
 
@@ -210,233 +151,14 @@ impl WalletManager {
             return Err("passphrase required".to_string());
         }
         let file = load_wallet(&self.path)?;
-        // Plaintext wallets cannot be unlocked directly — caller must
-        // route through migrate_to_encrypted first to set a password.
-        // This is the load-bearing invariant of the unified scheme:
-        // post-migration, every wallet on disk has crypto = Some(..).
-        if file.crypto.is_none() {
-            return Err("wallet_needs_migration".to_string());
-        }
         let mut plain = decrypt_wallet(passphrase, &file)?;
-        if plain.next_index == 0
-            && (plain.seed_hex.is_some() || plain.bip32_seed.is_some())
-        {
+        if plain.next_index == 0 && plain.seed_hex.is_some() {
             plain.next_index = plain.keys.len() as u32;
         }
         self.state.unlocked = Some(plain);
         self.state.passphrase = Some(passphrase.to_string());
         self.touch();
         Ok(())
-    }
-
-    /// Read the file on disk and report whether the wallet is missing,
-    /// plaintext (legacy, needs migration), or already encrypted.
-    /// Used by RPC `/wallet/info` and the CLI `info` subcommand. Does
-    /// NOT mutate state and does NOT unlock anything.
-    pub fn mode(&self) -> WalletMode {
-        if !self.path.exists() {
-            return WalletMode::None;
-        }
-        match load_wallet(&self.path) {
-            Ok(file) => {
-                if file.crypto.is_some() {
-                    WalletMode::Encrypted
-                } else {
-                    WalletMode::Plaintext
-                }
-            }
-            // Unparseable on-disk file — treat as missing rather than
-            // crash callers. Operator can clean up manually.
-            Err(_) => WalletMode::None,
-        }
-    }
-
-    /// Enumerate timestamped plaintext-backup files left by
-    /// `migrate_to_encrypted` so the frontend can warn the operator to
-    /// delete them after verification. Pattern matched is
-    /// `<wallet>.plaintext.bak.<unix-seconds>`.
-    pub fn plaintext_backups(&self) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        let parent = match self.path.parent() {
-            Some(p) => p,
-            None => return out,
-        };
-        let stem = self
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("wallet.json")
-            .to_string();
-        let prefix = format!("{}.plaintext.bak.", stem);
-        let read_dir = match fs::read_dir(parent) {
-            Ok(r) => r,
-            Err(_) => return out,
-        };
-        for entry in read_dir.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(&prefix) {
-                    out.push(entry.path());
-                }
-            }
-        }
-        out
-    }
-
-    /// Re-encrypt a legacy plaintext wallet under a new passphrase.
-    /// Pre-condition: `mode() == Plaintext`. Post-condition: the file
-    /// on disk is encrypted; in-memory state is unlocked; a backup of
-    /// the original plaintext content lives at
-    /// `<path>.plaintext.bak.<unix-seconds>`.
-    ///
-    /// Atomic write strategy: copy original to backup, encrypt to a
-    /// temp file, then `fs::rename(tmp, final)` which is atomic on the
-    /// same filesystem. If the rename fails for any reason the original
-    /// is restored from backup and the error propagates.
-    pub fn migrate_to_encrypted(&mut self, new_passphrase: &str) -> Result<(), String> {
-        if new_passphrase.trim().is_empty() {
-            return Err("passphrase required".to_string());
-        }
-        let file = load_wallet(&self.path)?;
-        if file.crypto.is_some() {
-            return Err("already_encrypted".to_string());
-        }
-        // Harvest the plaintext fields into a WalletPlain. Tolerate both
-        // legacy shapes: wallet_store's old plaintext (seed_hex only) and
-        // the irium-wallet CLI's shape (bip32_seed + mnemonic).
-        let mut plain = WalletPlain {
-            keys: file.keys.clone(),
-            seed_hex: file.seed_hex.clone(),
-            bip32_seed: file.bip32_seed.clone(),
-            mnemonic: file.mnemonic.clone(),
-            next_index: if file.next_index == 0 {
-                file.keys.len() as u32
-            } else {
-                file.next_index
-            },
-        };
-        // Defensive: if the legacy file had a seed but next_index was
-        // zero, infer next_index from the keys array length so future
-        // derivations don't collide with existing addresses.
-        if plain.next_index == 0 && plain.keys.len() > 0 {
-            plain.next_index = plain.keys.len() as u32;
-        }
-
-        // Backup the original plaintext content. fs::copy preserves the
-        // original at its current location until the encrypted write
-        // succeeds — defense against a crash between write and rename.
-        let backup = self
-            .path
-            .with_file_name(format!(
-                "{}.plaintext.bak.{}",
-                self.path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("wallet.json"),
-                now_secs()
-            ));
-        fs::copy(&self.path, &backup).map_err(|e| format!("backup failed: {e}"))?;
-
-        // Encrypt under the new passphrase and write to a temp path.
-        let encrypted = encrypt_wallet(new_passphrase, &plain)?;
-        let tmp = self.path.with_extension("tmp");
-        save_wallet(&tmp, &encrypted)?;
-
-        // Atomic commit. On failure, restore the original.
-        if let Err(e) = fs::rename(&tmp, &self.path) {
-            let _ = fs::copy(&backup, &self.path);
-            let _ = fs::remove_file(&tmp);
-            return Err(format!("commit failed: {e}"));
-        }
-
-        self.state.unlocked = Some(plain);
-        self.state.passphrase = Some(new_passphrase.to_string());
-        self.touch();
-        Ok(())
-    }
-
-    /// Build a fresh encrypted wallet from a seed. Accepts either a
-    /// 64-char hex seed (wallet_store custom derivation) or a 128-char
-    /// hex BIP32 seed (preserved as bip32_seed for downstream tools
-    /// that derive via BIP32 — wallet_store itself only derives via
-    /// `derive_secret_from_seed_hex` for now; BIP32 derivation lives
-    /// in the irium-wallet binary).
-    ///
-    /// If `allow_overwrite` is false and a wallet file already exists,
-    /// returns `Err("wallet_exists")`. If true, the existing file is
-    /// preserved as `<path>.recovery-bak.<unix-seconds>` before being
-    /// overwritten.
-    pub fn recover_from_seed(
-        &mut self,
-        seed_hex: &str,
-        new_passphrase: &str,
-        allow_overwrite: bool,
-    ) -> Result<WalletKey, String> {
-        if new_passphrase.trim().is_empty() {
-            return Err("passphrase required".to_string());
-        }
-        let seed_lower = seed_hex.trim().to_lowercase();
-        let _ = hex::decode(&seed_lower).map_err(|_| "seed must be valid hex".to_string())?;
-        if seed_lower.len() != 64 && seed_lower.len() != 128 {
-            return Err(
-                "seed must be 64-char (custom) or 128-char (BIP32) hex".to_string()
-            );
-        }
-
-        if self.path.exists() {
-            if !allow_overwrite {
-                return Err("wallet_exists".to_string());
-            }
-            let backup = self.path.with_file_name(format!(
-                "{}.recovery-bak.{}",
-                self.path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("wallet.json"),
-                now_secs()
-            ));
-            fs::copy(&self.path, &backup)
-                .map_err(|e| format!("backup-before-overwrite failed: {e}"))?;
-        }
-
-        let (plain, key) = if seed_lower.len() == 64 {
-            // wallet_store custom derivation path. Derive the first key
-            // and store seed_hex so new_address keeps working.
-            let secret = derive_secret_from_seed_hex(&seed_lower, 0)?;
-            let key = key_from_secret(&secret, true);
-            let plain = WalletPlain {
-                keys: vec![key.clone()],
-                seed_hex: Some(seed_lower),
-                bip32_seed: None,
-                mnemonic: None,
-                next_index: 1,
-            };
-            (plain, key)
-        } else {
-            // 128-hex BIP32 seed. Without the BIP32 derive function
-            // available here we store the seed as bip32_seed and
-            // generate a holdover random key so the wallet has at
-            // least one signer immediately. The CLI's recover-wallet
-            // path should derive properly via bip32_derive_irium and
-            // call recover_from_keys (separate flow) rather than this
-            // one; this branch exists so the iriumd RPC path doesn't
-            // fail outright on 128-hex input.
-            let key = generate_key();
-            let plain = WalletPlain {
-                keys: vec![key.clone()],
-                seed_hex: None,
-                bip32_seed: Some(seed_lower),
-                mnemonic: None,
-                next_index: 1,
-            };
-            (plain, key)
-        };
-
-        let encrypted = encrypt_wallet(new_passphrase, &plain)?;
-        save_wallet(&self.path, &encrypted)?;
-        self.state.unlocked = Some(plain);
-        self.state.passphrase = Some(new_passphrase.to_string());
-        self.touch();
-        Ok(key)
     }
 
     pub fn lock(&mut self) {
@@ -661,18 +383,11 @@ fn encrypt_wallet(passphrase: &str, plain: &WalletPlain) -> Result<WalletFile, S
         .map_err(|e| e.to_string())?;
     Ok(WalletFile {
         version: WALLET_VERSION,
-        crypto: Some(WalletCrypto {
+        crypto: WalletCrypto {
             salt: hex::encode(salt),
             nonce: hex::encode(nonce),
             cipher: hex::encode(ciphertext),
-        }),
-        // Encrypted shape — plaintext fields are absent on disk via
-        // skip_serializing_if on the WalletFile struct.
-        seed_hex: None,
-        bip32_seed: None,
-        mnemonic: None,
-        next_index: 0,
-        keys: Vec::new(),
+        },
     })
 }
 
@@ -680,13 +395,9 @@ fn decrypt_wallet(passphrase: &str, file: &WalletFile) -> Result<WalletPlain, St
     if file.version != WALLET_VERSION {
         return Err("unsupported wallet version".to_string());
     }
-    let crypto = file
-        .crypto
-        .as_ref()
-        .ok_or_else(|| "wallet has no crypto block".to_string())?;
-    let salt = hex::decode(&crypto.salt).map_err(|e| e.to_string())?;
-    let nonce = hex::decode(&crypto.nonce).map_err(|e| e.to_string())?;
-    let cipher_bytes = hex::decode(&crypto.cipher).map_err(|e| e.to_string())?;
+    let salt = hex::decode(&file.crypto.salt).map_err(|e| e.to_string())?;
+    let nonce = hex::decode(&file.crypto.nonce).map_err(|e| e.to_string())?;
+    let cipher_bytes = hex::decode(&file.crypto.cipher).map_err(|e| e.to_string())?;
     let key = derive_key(passphrase, &salt);
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     #[allow(deprecated)]
@@ -834,354 +545,4 @@ fn key_from_secret(secret: &SecretKey, compressed: bool) -> WalletKey {
 fn generate_key() -> WalletKey {
     let secret = SecretKey::random(&mut OsRng);
     key_from_secret(&secret, true)
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static UNIQ: AtomicU64 = AtomicU64::new(0);
-
-    /// Per-test scratch path under tempdir. Caller is responsible for
-    /// removing the file (each test does a best-effort cleanup at end).
-    fn tmp_path(tag: &str) -> PathBuf {
-        let n = UNIQ.fetch_add(1, Ordering::SeqCst);
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "irium_wallet_test_{}_{}_{}_{}.json",
-            tag,
-            std::process::id(),
-            now_secs(),
-            n
-        ));
-        p
-    }
-
-    fn cleanup(path: &PathBuf) {
-        let _ = fs::remove_file(path);
-        if let Some(parent) = path.parent() {
-            if let Ok(read_dir) = fs::read_dir(parent) {
-                for entry in read_dir.flatten() {
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if name_str.starts_with(
-                        &path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    ) {
-                        let _ = fs::remove_file(entry.path());
-                    }
-                }
-            }
-        }
-    }
-
-    /// Synthesise a legacy CLI plaintext wallet.json shape with one
-    /// derived key + bip32_seed + mnemonic. Returns the path.
-    fn write_legacy_cli_plaintext(path: &PathBuf) {
-        let key = generate_key();
-        let plain_json = serde_json::json!({
-            "version": 1,
-            "seed_hex": null,
-            "bip32_seed": "01".repeat(64),
-            "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
-            "next_index": 1,
-            "keys": [
-                {
-                    "address": key.address,
-                    "pkh": key.pkh,
-                    "pubkey": key.pubkey,
-                    "privkey": key.privkey,
-                }
-            ]
-        });
-        fs::write(path, serde_json::to_string_pretty(&plain_json).unwrap()).unwrap();
-    }
-
-    /// Synthesise a legacy wallet_store plaintext shape (seed_hex only,
-    /// no bip32_seed/mnemonic).
-    fn write_legacy_ws_plaintext(path: &PathBuf) {
-        let seed = "ab".repeat(32);
-        let secret = derive_secret_from_seed_hex(&seed, 0).unwrap();
-        let key = key_from_secret(&secret, true);
-        let plain_json = serde_json::json!({
-            "version": 1,
-            "seed_hex": seed,
-            "next_index": 1,
-            "keys": [
-                {
-                    "address": key.address,
-                    "pkh": key.pkh,
-                    "pubkey": key.pubkey,
-                    "privkey": key.privkey,
-                }
-            ]
-        });
-        fs::write(path, serde_json::to_string_pretty(&plain_json).unwrap()).unwrap();
-    }
-
-    #[test]
-    fn unlock_rejects_plaintext_file_with_needs_migration_error() {
-        let path = tmp_path("unlock_rejects_plaintext");
-        write_legacy_cli_plaintext(&path);
-        let mut mgr = WalletManager::new(path.clone());
-        let err = mgr.unlock("any-passphrase").unwrap_err();
-        assert_eq!(err, "wallet_needs_migration");
-        cleanup(&path);
-    }
-
-    #[test]
-    fn migrate_to_encrypted_round_trips_legacy_cli_plaintext_wallet_json() {
-        let path = tmp_path("migrate_cli_roundtrip");
-        write_legacy_cli_plaintext(&path);
-        let mut mgr = WalletManager::new(path.clone());
-
-        let pre_addr = {
-            let raw = fs::read_to_string(&path).unwrap();
-            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            v["keys"][0]["address"].as_str().unwrap().to_string()
-        };
-
-        mgr.migrate_to_encrypted("new-pass").unwrap();
-        assert_eq!(mgr.mode(), WalletMode::Encrypted);
-        let post_addr = mgr.addresses().unwrap()[0].clone();
-        assert_eq!(pre_addr, post_addr, "addresses must survive migration");
-
-        // Re-lock and re-unlock with the new password.
-        mgr.lock();
-        mgr.unlock("new-pass").unwrap();
-        let post_unlock_addr = mgr.addresses().unwrap()[0].clone();
-        assert_eq!(pre_addr, post_unlock_addr);
-        cleanup(&path);
-    }
-
-    #[test]
-    fn migrate_to_encrypted_round_trips_legacy_ws_plaintext_wallet() {
-        let path = tmp_path("migrate_ws_roundtrip");
-        write_legacy_ws_plaintext(&path);
-        let mut mgr = WalletManager::new(path.clone());
-        mgr.migrate_to_encrypted("ws-pass").unwrap();
-        assert_eq!(mgr.mode(), WalletMode::Encrypted);
-
-        mgr.lock();
-        mgr.unlock("ws-pass").unwrap();
-        // After migration the seed_hex (custom derivation) must survive
-        // through the cipher round-trip.
-        let plain = mgr.state.unlocked.as_ref().unwrap();
-        assert!(plain.seed_hex.is_some());
-        assert_eq!(plain.keys.len(), 1);
-        cleanup(&path);
-    }
-
-    #[test]
-    fn migrate_to_encrypted_creates_timestamped_backup() {
-        let path = tmp_path("migrate_backup");
-        write_legacy_cli_plaintext(&path);
-        let mut mgr = WalletManager::new(path.clone());
-        mgr.migrate_to_encrypted("p").unwrap();
-
-        let backups = mgr.plaintext_backups();
-        assert_eq!(backups.len(), 1, "exactly one backup expected");
-        let bname = backups[0].file_name().unwrap().to_str().unwrap();
-        assert!(bname.contains(".plaintext.bak."), "backup name shape: {bname}");
-
-        // Cleanup
-        for b in &backups {
-            let _ = fs::remove_file(b);
-        }
-        cleanup(&path);
-    }
-
-    #[test]
-    fn migrate_to_encrypted_fails_on_already_encrypted_file() {
-        let path = tmp_path("migrate_already_encrypted");
-        let mut mgr = WalletManager::new(path.clone());
-        mgr.create_with_seed("p1", None).unwrap();
-
-        let err = mgr.migrate_to_encrypted("p2").unwrap_err();
-        assert_eq!(err, "already_encrypted");
-        cleanup(&path);
-    }
-
-    #[test]
-    fn migrate_to_encrypted_rejects_empty_passphrase() {
-        let path = tmp_path("migrate_empty_pass");
-        write_legacy_cli_plaintext(&path);
-        let mut mgr = WalletManager::new(path.clone());
-        let err = mgr.migrate_to_encrypted("   ").unwrap_err();
-        assert!(err.contains("passphrase required"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn recover_from_seed_rejects_existing_file_without_overwrite() {
-        let path = tmp_path("recover_existing");
-        let mut mgr = WalletManager::new(path.clone());
-        mgr.create_with_seed("p1", None).unwrap();
-
-        let err = mgr
-            .recover_from_seed(&"a".repeat(64), "p2", false)
-            .unwrap_err();
-        assert_eq!(err, "wallet_exists");
-        cleanup(&path);
-    }
-
-    #[test]
-    fn recover_from_seed_overwrite_creates_recovery_backup() {
-        let path = tmp_path("recover_overwrite");
-        let mut mgr = WalletManager::new(path.clone());
-        mgr.create_with_seed("p1", None).unwrap();
-        // Force-overwrite with a known seed; the original is preserved
-        // as <path>.recovery-bak.<ts>.
-        let _ = mgr
-            .recover_from_seed(&"b".repeat(64), "p2", true)
-            .unwrap();
-        assert_eq!(mgr.mode(), WalletMode::Encrypted);
-        // The overwrite happened: addresses now derive from the new seed.
-        mgr.lock();
-        mgr.unlock("p2").unwrap();
-        assert_eq!(mgr.addresses().unwrap().len(), 1);
-
-        // Check that a recovery backup exists alongside.
-        let parent = path.parent().unwrap();
-        let base = path.file_name().unwrap().to_str().unwrap();
-        let mut found = false;
-        for e in fs::read_dir(parent).unwrap().flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with(&format!("{base}.recovery-bak.")) {
-                let _ = fs::remove_file(e.path());
-                found = true;
-            }
-        }
-        assert!(found, "recovery backup must exist");
-        cleanup(&path);
-    }
-
-    #[test]
-    fn recover_from_seed_accepts_64_hex_seed() {
-        let path = tmp_path("recover_64hex");
-        let mut mgr = WalletManager::new(path.clone());
-        let key = mgr
-            .recover_from_seed(&"c".repeat(64), "p", false)
-            .unwrap();
-        // 64-hex path uses wallet_store's custom derivation; same seed
-        // must yield the same address.
-        let mgr2_path = tmp_path("recover_64hex_verify");
-        let mut mgr2 = WalletManager::new(mgr2_path.clone());
-        let key2 = mgr2
-            .recover_from_seed(&"c".repeat(64), "p2", false)
-            .unwrap();
-        assert_eq!(key.address, key2.address);
-        cleanup(&path);
-        cleanup(&mgr2_path);
-    }
-
-    #[test]
-    fn recover_from_seed_accepts_128_hex_bip32_seed() {
-        let path = tmp_path("recover_128hex");
-        let mut mgr = WalletManager::new(path.clone());
-        let _key = mgr
-            .recover_from_seed(&"d".repeat(128), "p", false)
-            .unwrap();
-        // 128-hex path stores bip32_seed; round-trip through unlock.
-        mgr.lock();
-        mgr.unlock("p").unwrap();
-        let plain = mgr.state.unlocked.as_ref().unwrap();
-        assert_eq!(plain.bip32_seed.as_deref(), Some(&"d".repeat(128)[..]));
-        assert!(plain.seed_hex.is_none());
-        cleanup(&path);
-    }
-
-    #[test]
-    fn recover_from_seed_rejects_empty_passphrase() {
-        let path = tmp_path("recover_empty");
-        let mut mgr = WalletManager::new(path.clone());
-        let err = mgr
-            .recover_from_seed(&"e".repeat(64), "", false)
-            .unwrap_err();
-        assert!(err.contains("passphrase required"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn recover_from_seed_rejects_invalid_hex_length() {
-        let path = tmp_path("recover_bad_len");
-        let mut mgr = WalletManager::new(path.clone());
-        let err = mgr.recover_from_seed("deadbeef", "p", false).unwrap_err();
-        assert!(err.contains("seed must be 64-char") || err.contains("128-char"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn mode_returns_correct_state_for_each_file_shape() {
-        let path = tmp_path("mode_dispatch");
-
-        // Mode: None (no file)
-        {
-            let mgr = WalletManager::new(path.clone());
-            assert_eq!(mgr.mode(), WalletMode::None);
-        }
-
-        // Mode: Plaintext (legacy CLI shape)
-        write_legacy_cli_plaintext(&path);
-        {
-            let mgr = WalletManager::new(path.clone());
-            assert_eq!(mgr.mode(), WalletMode::Plaintext);
-        }
-
-        // Mode: Encrypted (after create_with_seed)
-        let _ = fs::remove_file(&path);
-        {
-            let mut mgr = WalletManager::new(path.clone());
-            mgr.create_with_seed("p", None).unwrap();
-            assert_eq!(mgr.mode(), WalletMode::Encrypted);
-        }
-
-        cleanup(&path);
-    }
-
-    #[test]
-    fn legacy_encrypted_wallet_still_unlocks_with_original_passphrase() {
-        // Mimic the legacy wallet.core.json shape: {version, crypto:
-        // {salt, nonce, cipher}} with no plaintext fields. The unified
-        // schema must continue to deserialize and decrypt this.
-        let path = tmp_path("legacy_encrypted_unlock");
-        let mut mgr = WalletManager::new(path.clone());
-        mgr.create_with_seed("legacy-pass", None).unwrap();
-
-        // Confirm the on-disk file has crypto but no plaintext fields
-        // (skip_serializing_if = Option::is_none).
-        let raw = fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(v.get("crypto").is_some());
-        assert!(v.get("seed_hex").is_none());
-        assert!(v.get("bip32_seed").is_none());
-
-        // Lock and re-unlock to confirm the round-trip.
-        mgr.lock();
-        mgr.unlock("legacy-pass").unwrap();
-        assert!(mgr.addresses().unwrap().len() >= 1);
-        cleanup(&path);
-    }
-
-    #[test]
-    fn unlock_rejects_empty_passphrase_on_encrypted_wallet() {
-        let path = tmp_path("unlock_empty_pass");
-        let mut mgr = WalletManager::new(path.clone());
-        mgr.create_with_seed("p", None).unwrap();
-        mgr.lock();
-        let err = mgr.unlock("   ").unwrap_err();
-        assert!(err.contains("passphrase required"));
-        cleanup(&path);
-    }
 }

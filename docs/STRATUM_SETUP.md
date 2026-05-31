@@ -58,7 +58,7 @@ You need this information almost everywhere below.
 | Pool hostname       | `pool.iriumlabs.org`                                                                        |
 | ASIC port           | `3333`                                                                                      |
 | CPU/GPU port        | `3335`                                                                                      |
-| ISP-block fallback  | `443` (HTTPS port — same Stratum bytes, just routed through a port DPI cannot easily block). **Use `stratum+tcp://`, NOT `stratum+ssl://`. Many firmwares default to TLS when they see port 443 — disable TLS / SSL in miner config or sslh will route the connection to its HTTPS bucket and drop it.** |
+| ISP-block fallback  | `443` (HTTPS port — same Stratum bytes, just routed through a port DPI cannot easily block) |
 | Second fallback     | `80` (HTTP port)                                                                            |
 | Stats page (humans) | `https://pool.iriumlabs.org/stats`                                                          |
 | Stats JSON (scripts)| `http://pool.iriumlabs.org:3337/stats`                                                       |

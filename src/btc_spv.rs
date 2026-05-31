@@ -510,31 +510,21 @@ pub fn apply_btc_header_batch(
             return Err(format!("apply_btc_header_batch: header {} fails PoW", i));
         }
 
-        let (expected_bits_opt, mtp) = {
+        let (expected_bits, mtp) = {
             let view = LookupView {
                 committed: btc_headers,
                 staged: &staged,
             };
-            // At a post-anchor pre-2x2016 retarget boundary the relay never
-            // saw the headers needed to compute the new target. PoW for
-            // header.bits is still validated separately above, so accept
-            // any claimed bits here without enforcing the equality check.
-            let bits = match expected_bits_for_v(height, &prev_hash, &view, anchor) {
-                Ok(b) => Some(b),
-                Err(e) if e == "expected_bits: retarget window reaches before anchor" => None,
-                Err(e) => return Err(e),
-            };
+            let bits = expected_bits_for_v(height, &prev_hash, &view, anchor)?;
             let mtp = median_time_past_v(&prev_hash, &view, anchor);
             (bits, mtp)
         };
-        if let Some(expected_bits) = expected_bits_opt {
-            let expected_target = Target { bits: expected_bits }.to_target();
-            if header_target.to_target() != expected_target {
-                return Err(format!(
-                    "apply_btc_header_batch: header {} bits mismatch (expected {:#010x}, got {:#010x})",
-                    i, expected_bits, header.bits
-                ));
-            }
+        let expected_target = Target { bits: expected_bits }.to_target();
+        if header_target.to_target() != expected_target {
+            return Err(format!(
+                "apply_btc_header_batch: header {} bits mismatch (expected {:#010x}, got {:#010x})",
+                i, expected_bits, header.bits
+            ));
         }
 
         if header.time <= mtp {

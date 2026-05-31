@@ -46,8 +46,6 @@ bip39 = { version = "2", features = ["rand"] }
 subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
 ocl = { version = "0.19", optional = true }
-scrypt = "0.11"
-rayon = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
