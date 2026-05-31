@@ -81,11 +81,12 @@ use irium_node_rs::tx::{
     HtlcDogeSwapV1Output, HTLC_DOGE_SWAP_V1_SCRIPT_LEN,
     MAX_HTLC_DOGE_SWAP_CONFIRMATIONS, MIN_HTLC_DOGE_SWAP_CONFIRMATIONS,
     encode_doge_swap_order_cancel_witness,
+    encode_doge_swap_order_expire_sweep_witness,
     encode_doge_swap_order_fill_buy_witness, encode_doge_swap_order_fill_sell_witness,
     encode_doge_swap_order_script, parse_doge_swap_order_script,
     DogeSwapOrderOutput,
     DOGE_SWAP_ORDER_DIRECTION_BUY, DOGE_SWAP_ORDER_DIRECTION_SELL,
-    DOGE_SWAP_ORDER_MIN_LOCKED_VALUE,
+    DOGE_SWAP_ORDER_MAX_SWEEP_FEE, DOGE_SWAP_ORDER_MIN_LOCKED_VALUE,
     encode_htlc_ltc_swap_claim_witness, encode_htlc_ltc_swap_refund_witness,
     encode_htlc_ltc_swap_v1_script, encode_ltc_swap_order_cancel_witness,
     encode_ltc_swap_order_expire_sweep_witness,
@@ -7528,11 +7529,11 @@ async fn refund_btc_swap(
     dest_pkh.copy_from_slice(&dest);
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(bad("funding_value_le_fee"));
     }
-    let payout = funding_out.output.value - fee;
+    let mut payout = funding_out.output.value - fee;
 
     let mut tx = Transaction {
         version: 1,
@@ -7549,7 +7550,6 @@ async fn refund_btc_swap(
         locktime: 0,
     };
 
-    let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
     let priv_bytes =
         hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
@@ -7559,21 +7559,42 @@ async fn refund_btc_swap(
     sk_bytes.copy_from_slice(&priv_bytes);
     let signing_key = SigningKey::from_bytes((&sk_bytes).into())
         .map_err(|_| bad("signing_key_init_failed"))?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
 
-    let witness = encode_htlc_btc_swap_refund_witness(&sig_bytes, &pubkey)
-        .ok_or_else(|| bad("encode_refund_witness_failed"))?;
-    tx.inputs[0].script_sig = witness;
+    // 2-pass fee recalc: refund witness pushes tx above the
+    // estimate_tx_size(1,1) baseline. Same pattern as claim_btc_swap fix
+    // (1d9519f) and claim_ltc_swap fix (58ca801).
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_htlc_btc_swap_refund_witness(&sig_bytes, &pubkey)
+            .ok_or_else(|| bad("encode_refund_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -8313,11 +8334,11 @@ async fn refund_ltc_swap(
     dest_pkh.copy_from_slice(&dest);
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(bad("funding_value_le_fee"));
     }
-    let payout = funding_out.output.value - fee;
+    let mut payout = funding_out.output.value - fee;
 
     let mut tx = Transaction {
         version: 1,
@@ -8334,7 +8355,6 @@ async fn refund_ltc_swap(
         locktime: 0,
     };
 
-    let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
     let priv_bytes =
         hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
@@ -8344,21 +8364,39 @@ async fn refund_ltc_swap(
     sk_bytes.copy_from_slice(&priv_bytes);
     let signing_key = SigningKey::from_bytes((&sk_bytes).into())
         .map_err(|_| bad("signing_key_init_failed"))?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
 
-    let witness = encode_htlc_ltc_swap_refund_witness(&sig_bytes, &pubkey)
-        .ok_or_else(|| bad("encode_refund_witness_failed"))?;
-    tx.inputs[0].script_sig = witness;
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_htlc_ltc_swap_refund_witness(&sig_bytes, &pubkey)
+            .ok_or_else(|| bad("encode_refund_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -8915,11 +8953,11 @@ async fn claim_doge_swap(
     }
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(bad("funding_value_le_fee"));
     }
-    let payout = funding_out.output.value - fee;
+    let mut payout = funding_out.output.value - fee;
 
     let mut tx = Transaction {
         version: 1,
@@ -8936,7 +8974,6 @@ async fn claim_doge_swap(
         locktime: 0,
     };
 
-    let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
     let priv_bytes =
         hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
@@ -8946,28 +8983,46 @@ async fn claim_doge_swap(
     sk_bytes.copy_from_slice(&priv_bytes);
     let signing_key = SigningKey::from_bytes((&sk_bytes).into())
         .map_err(|_| bad("signing_key_init_failed"))?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
 
-    let witness = encode_htlc_doge_swap_claim_witness(
-        &sig_bytes,
-        &pubkey,
-        &doge_block_hash,
-        &branch,
-        req.doge_merkle_index,
-        &doge_tx_raw,
-    )
-    .ok_or_else(|| bad("encode_claim_witness_failed"))?;
-    tx.inputs[0].script_sig = witness;
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_htlc_doge_swap_claim_witness(
+            &sig_bytes,
+            &pubkey,
+            &doge_block_hash,
+            &branch,
+            req.doge_merkle_index,
+            &doge_tx_raw,
+        )
+        .ok_or_else(|| bad("encode_claim_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -9076,11 +9131,11 @@ async fn refund_doge_swap(
     dest_pkh.copy_from_slice(&dest);
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(bad("funding_value_le_fee"));
     }
-    let payout = funding_out.output.value - fee;
+    let mut payout = funding_out.output.value - fee;
 
     let mut tx = Transaction {
         version: 1,
@@ -9097,7 +9152,6 @@ async fn refund_doge_swap(
         locktime: 0,
     };
 
-    let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
     let priv_bytes =
         hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
@@ -9107,21 +9161,39 @@ async fn refund_doge_swap(
     sk_bytes.copy_from_slice(&priv_bytes);
     let signing_key = SigningKey::from_bytes((&sk_bytes).into())
         .map_err(|_| bad("signing_key_init_failed"))?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
 
-    let witness = encode_htlc_doge_swap_refund_witness(&sig_bytes, &pubkey)
-        .ok_or_else(|| bad("encode_refund_witness_failed"))?;
-    tx.inputs[0].script_sig = witness;
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_htlc_doge_swap_refund_witness(&sig_bytes, &pubkey)
+            .ok_or_else(|| bad("encode_refund_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -9939,11 +10011,11 @@ async fn cancel_swap_order(
     dest_pkh.copy_from_slice(&dest);
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(bad("funding_value_le_fee"));
     }
-    let payout = funding_out.output.value - fee;
+    let mut payout = funding_out.output.value - fee;
 
     let mut tx = Transaction {
         version: 1,
@@ -9961,7 +10033,6 @@ async fn cancel_swap_order(
     };
 
     let scriptcode = encode_swap_order_script(&order);
-    let digest = signature_digest(&tx, 0, &scriptcode);
     let priv_bytes =
         hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
@@ -9971,21 +10042,39 @@ async fn cancel_swap_order(
     sk_bytes.copy_from_slice(&priv_bytes);
     let signing_key = SigningKey::from_bytes((&sk_bytes).into())
         .map_err(|_| bad("signing_key_init_failed"))?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
 
-    let witness = encode_swap_order_cancel_witness(&sig_bytes, &pubkey)
-        .ok_or_else(|| bad("encode_cancel_witness_failed"))?;
-    tx.inputs[0].script_sig = witness;
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &scriptcode);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_swap_order_cancel_witness(&sig_bytes, &pubkey)
+            .ok_or_else(|| bad("encode_cancel_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -10417,10 +10506,7 @@ async fn sweep_expired_order(
     let minimum_payout = utxo_value.saturating_sub(SWAP_ORDER_MAX_SWEEP_FEE);
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
     let est_fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
-    // Output value sits between the consensus minimum (utxo - 1000) and
-    // utxo_value itself; chain.calculate_fees will accept any value in
-    // that band so long as the actual tx fee is non-negative.
-    let payout = if utxo_value >= est_fee.saturating_add(minimum_payout) {
+    let mut payout = if utxo_value >= est_fee.saturating_add(minimum_payout) {
         utxo_value - est_fee
     } else {
         minimum_payout
@@ -10429,7 +10515,7 @@ async fn sweep_expired_order(
         return Err(bad("payout_below_consensus_minimum"));
     }
 
-    let tx = Transaction {
+    let mut tx = Transaction {
         version: 1,
         inputs: vec![TxInput {
             prev_txid: txid_arr,
@@ -10443,6 +10529,22 @@ async fn sweep_expired_order(
         }],
         locktime: 0,
     };
+
+    // Fee recalc against the actual serialized size. The 1-byte
+    // expire-sweep witness is constant so a single pass suffices;
+    // we only need to absorb the delta between estimate_tx_size(1,1)
+    // and the real tx into the single payout output, subject to the
+    // consensus minimum_payout floor.
+    let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+    if needed_fee > est_fee {
+        let extra = needed_fee - est_fee;
+        if payout >= minimum_payout.saturating_add(extra) {
+            payout -= extra;
+            tx.outputs[0].value = payout;
+        } else {
+            return Err(bad("fee_recalculation_exceeded_payout_floor"));
+        }
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -10526,7 +10628,7 @@ async fn sweep_ltc_expired_order(
     let minimum_payout = utxo_value.saturating_sub(LTC_SWAP_ORDER_MAX_SWEEP_FEE);
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
     let est_fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
-    let payout = if utxo_value >= est_fee.saturating_add(minimum_payout) {
+    let mut payout = if utxo_value >= est_fee.saturating_add(minimum_payout) {
         utxo_value - est_fee
     } else {
         minimum_payout
@@ -10535,7 +10637,7 @@ async fn sweep_ltc_expired_order(
         return Err(bad("payout_below_consensus_minimum"));
     }
 
-    let tx = Transaction {
+    let mut tx = Transaction {
         version: 1,
         inputs: vec![TxInput {
             prev_txid: txid_arr,
@@ -10549,6 +10651,19 @@ async fn sweep_ltc_expired_order(
         }],
         locktime: 0,
     };
+
+    // Fee recalc against the actual serialized size. The 1-byte
+    // expire-sweep witness is constant so a single pass suffices.
+    let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+    if needed_fee > est_fee {
+        let extra = needed_fee - est_fee;
+        if payout >= minimum_payout.saturating_add(extra) {
+            payout -= extra;
+            tx.outputs[0].value = payout;
+        } else {
+            return Err(bad("fee_recalculation_exceeded_payout_floor"));
+        }
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -10730,6 +10845,125 @@ fn parse_ltc_swap_direction(s: &str) -> Option<u8> {
         "buy_irm" | "buy" => Some(LTC_SWAP_ORDER_DIRECTION_BUY),
         _ => None,
     }
+}
+
+async fn sweep_doge_expired_order(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SweepExpiredOrderRequest>,
+) -> Result<Json<SwapSpendResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[sweep_doge_expired_order] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .doge_swap_order_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "doge_swap_order_v1_not_active".to_string(),
+            ));
+        }
+    }
+
+    let txid_arr =
+        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let key = OutPoint {
+        txid: txid_arr,
+        index: req.order_vout,
+    };
+
+    let (funding_out, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let utxo = chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| bad("order_outpoint_unspent_or_unknown"))?;
+        (utxo, chain.tip_height())
+    };
+
+    let order = parse_doge_swap_order_script(&funding_out.output.script_pubkey)
+        .ok_or_else(|| bad("funding_output_not_doge_swap_order"))?;
+    if tip_height < order.expiry_height {
+        return Err(bad("expiry_height_not_reached"));
+    }
+
+    let utxo_value = funding_out.output.value;
+    let minimum_payout = utxo_value.saturating_sub(DOGE_SWAP_ORDER_MAX_SWEEP_FEE);
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let est_fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut payout = if utxo_value >= est_fee.saturating_add(minimum_payout) {
+        utxo_value - est_fee
+    } else {
+        minimum_payout
+    };
+    if payout < minimum_payout {
+        return Err(bad("payout_below_consensus_minimum"));
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: txid_arr,
+            prev_index: req.order_vout,
+            script_sig: encode_doge_swap_order_expire_sweep_witness(),
+            sequence: 0xffff_fffe,
+        }],
+        outputs: vec![TxOutput {
+            value: payout,
+            script_pubkey: p2pkh_script(&order.maker_iriumd_pkh),
+        }],
+        locktime: 0,
+    };
+
+    // Fee recalc against the actual serialized size. The 1-byte
+    // expire-sweep witness is constant so a single pass suffices.
+    let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+    if needed_fee > est_fee {
+        let extra = needed_fee - est_fee;
+        if payout >= minimum_payout.saturating_add(extra) {
+            payout -= extra;
+            tx.outputs[0].value = payout;
+        } else {
+            return Err(bad("fee_recalculation_exceeded_payout_floor"));
+        }
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("calculate_fees_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_out = tx.txid();
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_out) {
+            accepted = mempool
+                .add_transaction(tx.clone(), raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+    Ok(Json(SwapSpendResponse {
+        txid: hex::encode(txid_out),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    }))
 }
 
 async fn post_ltc_swap_order(
@@ -11238,11 +11472,11 @@ async fn cancel_ltc_swap_order(
     dest_pkh.copy_from_slice(&dest);
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(bad("funding_value_le_fee"));
     }
-    let payout = funding_out.output.value - fee;
+    let mut payout = funding_out.output.value - fee;
 
     let mut tx = Transaction {
         version: 1,
@@ -11260,7 +11494,6 @@ async fn cancel_ltc_swap_order(
     };
 
     let scriptcode = encode_ltc_swap_order_script(&order);
-    let digest = signature_digest(&tx, 0, &scriptcode);
     let priv_bytes =
         hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
@@ -11270,21 +11503,39 @@ async fn cancel_ltc_swap_order(
     sk_bytes.copy_from_slice(&priv_bytes);
     let signing_key = SigningKey::from_bytes((&sk_bytes).into())
         .map_err(|_| bad("signing_key_init_failed"))?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
 
-    let witness = encode_ltc_swap_order_cancel_witness(&sig_bytes, &pubkey)
-        .ok_or_else(|| bad("encode_cancel_witness_failed"))?;
-    tx.inputs[0].script_sig = witness;
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &scriptcode);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_ltc_swap_order_cancel_witness(&sig_bytes, &pubkey)
+            .ok_or_else(|| bad("encode_cancel_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -12297,11 +12548,11 @@ async fn cancel_doge_swap_order(
     dest_pkh.copy_from_slice(&dest);
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(bad("funding_value_le_fee"));
     }
-    let payout = funding_out.output.value - fee;
+    let mut payout = funding_out.output.value - fee;
 
     let mut tx = Transaction {
         version: 1,
@@ -12319,7 +12570,6 @@ async fn cancel_doge_swap_order(
     };
 
     let scriptcode = encode_doge_swap_order_script(&order);
-    let digest = signature_digest(&tx, 0, &scriptcode);
     let priv_bytes =
         hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
@@ -12329,21 +12579,39 @@ async fn cancel_doge_swap_order(
     sk_bytes.copy_from_slice(&priv_bytes);
     let signing_key = SigningKey::from_bytes((&sk_bytes).into())
         .map_err(|_| bad("signing_key_init_failed"))?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
 
-    let witness = encode_doge_swap_order_cancel_witness(&sig_bytes, &pubkey)
-        .ok_or_else(|| bad("encode_cancel_witness_failed"))?;
-    tx.inputs[0].script_sig = witness;
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &scriptcode);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_doge_swap_order_cancel_witness(&sig_bytes, &pubkey)
+            .ok_or_else(|| bad("encode_cancel_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -12511,7 +12779,7 @@ async fn fill_doge_swap_order(
     };
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if order.direction == DOGE_SWAP_ORDER_DIRECTION_SELL
         && funding_out.output.value < order.irm_amount
     {
@@ -12597,37 +12865,60 @@ async fn fill_doge_swap_order(
     };
 
     let scriptcode_order = encode_doge_swap_order_script(&order);
-    let digest_order = signature_digest(&tx, 0, &scriptcode_order);
-    let order_sig: Signature = signing_key
-        .sign_prehash(&digest_order)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let order_sig = order_sig.normalize_s().unwrap_or(order_sig);
-    let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
-    order_sig_bytes.push(0x01);
 
-    let witness = match order.direction {
-        DOGE_SWAP_ORDER_DIRECTION_SELL => encode_doge_swap_order_fill_sell_witness(
-            &order_sig_bytes,
-            &pubkey,
-            &taker_iriumd_pkh,
-            timeout_height,
-        )
-        .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
-        DOGE_SWAP_ORDER_DIRECTION_BUY => encode_doge_swap_order_fill_buy_witness(
-            &order_sig_bytes,
-            &pubkey,
-            timeout_height,
-        )
-        .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
-        _ => return Err(bad("order_direction_unknown")),
-    };
-    tx.inputs[0].script_sig = witness;
+    for _ in 0..2 {
+        let digest_order = signature_digest(&tx, 0, &scriptcode_order);
+        let order_sig: Signature = signing_key
+            .sign_prehash(&digest_order)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let order_sig = order_sig.normalize_s().unwrap_or(order_sig);
+        let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
+        order_sig_bytes.push(0x01);
 
-    if !extra_inputs.is_empty() {
-        let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
-        key_map.insert(taker_iriumd_pkh, wallet_key.clone());
-        sign_wallet_inputs(&mut tx, &extra_inputs, &key_map)
-            .map_err(|_| bad("sign_extra_inputs_failed"))?;
+        let witness = match order.direction {
+            DOGE_SWAP_ORDER_DIRECTION_SELL => encode_doge_swap_order_fill_sell_witness(
+                &order_sig_bytes,
+                &pubkey,
+                &taker_iriumd_pkh,
+                timeout_height,
+            )
+            .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
+            DOGE_SWAP_ORDER_DIRECTION_BUY => encode_doge_swap_order_fill_buy_witness(
+                &order_sig_bytes,
+                &pubkey,
+                timeout_height,
+            )
+            .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
+            _ => return Err(bad("order_direction_unknown")),
+        };
+        tx.inputs[0].script_sig = witness;
+
+        if !extra_inputs.is_empty() {
+            let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+            key_map.insert(taker_iriumd_pkh, wallet_key.clone());
+            sign_wallet_inputs(&mut tx, &extra_inputs, &key_map)
+                .map_err(|_| bad("sign_extra_inputs_failed"))?;
+        }
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            // Covenant output 0 is pinned by the sell/buy fill rule; only
+            // change (last output) can absorb the shortfall.
+            if tx.outputs.len() > 1 {
+                let change_idx = tx.outputs.len() - 1;
+                if tx.outputs[change_idx].value > extra {
+                    fee = needed_fee;
+                    tx.outputs[change_idx].value -= extra;
+                    continue;
+                } else {
+                    return Err(bad("fee_recalculation_exceeded_change"));
+                }
+            } else {
+                return Err(bad("fee_recalculation_no_change_to_reduce"));
+            }
+        }
+        break;
     }
 
     let fee_checked = {
