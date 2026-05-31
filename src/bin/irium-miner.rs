@@ -714,7 +714,7 @@ fn load_mempool_entries(
         return mempool_entries_from_template(chain, template);
     }
     // First try the structured mempool manager.
-    let mgr = MempoolManager::new(mempool_file(), 1000, 1.0);
+    let mgr = MempoolManager::new(mempool_file(), 1000, 100.0, 10_000);
     let mut out = Vec::new();
     for entry in mgr.ordered_entries() {
         if let Err(e) = chain.validate_transaction(&entry.tx) {

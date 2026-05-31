@@ -99,6 +99,11 @@ pub struct MempoolManager {
     path: PathBuf,
     max_entries: usize,
     min_fee_per_byte: f64,
+    /// Absolute per-tx fee floor in satoshis. Standard-priority txs
+    /// must pay at least this much in total fee in addition to
+    /// clearing `min_fee_per_byte`. `ZeroFeeAllowed` bypasses both
+    /// floors. `0` disables the floor (used in tests).
+    min_total_fee: u64,
     /// Last admission time per source IP for `ZeroFeeAllowed` entries.
     /// In-memory only by design — an iriumd restart re-opens the rate
     /// window. The attacker model here is network spam, and a restart
@@ -107,12 +112,18 @@ pub struct MempoolManager {
 }
 
 impl MempoolManager {
-    pub fn new(path: PathBuf, max_entries: usize, min_fee_per_byte: f64) -> MempoolManager {
+    pub fn new(
+        path: PathBuf,
+        max_entries: usize,
+        min_fee_per_byte: f64,
+        min_total_fee: u64,
+    ) -> MempoolManager {
         let mut mgr = MempoolManager {
             entries: HashMap::new(),
             path,
             max_entries,
             min_fee_per_byte,
+            min_total_fee,
             header_relay_last_seen: HashMap::new(),
         };
         mgr.load_from_disk();
@@ -269,6 +280,11 @@ impl MempoolManager {
         if priority == MempoolPriority::Standard && fee_per_byte < self.min_fee_per_byte {
             return Err("Fee per byte below minimum policy".to_string());
         }
+        // Absolute per-tx fee floor. Symmetric with the per-byte check
+        // above: Standard priority enforces, ZeroFeeAllowed bypasses.
+        if priority == MempoolPriority::Standard && fee < self.min_total_fee {
+            return Err("Fee below minimum total policy".to_string());
+        }
 
         let mut evicted = None;
         if self.entries.len() >= self.max_entries {
@@ -382,6 +398,10 @@ impl MempoolManager {
 
     pub fn min_fee_per_byte(&self) -> f64 {
         self.min_fee_per_byte
+    }
+
+    pub fn min_total_fee(&self) -> u64 {
+        self.min_total_fee
     }
 
     pub fn ordered_transactions(&self) -> Vec<Transaction> {
@@ -563,7 +583,7 @@ mod tests {
     #[test]
     fn adds_and_evicts_by_fee() {
         let path = tmp_path("evict");
-        let mut mgr = MempoolManager::new(path.clone(), 1, 0.0);
+        let mut mgr = MempoolManager::new(path.clone(), 1, 0.0, 0);
 
         let tx_low = dummy_tx(10);
         let raw_low = tx_low.serialize();
@@ -584,7 +604,7 @@ mod tests {
     #[test]
     fn records_relay_and_address() {
         let path = tmp_path("relay");
-        let mut mgr = MempoolManager::new(path.clone(), 10, 0.0);
+        let mut mgr = MempoolManager::new(path.clone(), 10, 0.0, 0);
         let tx = dummy_tx(5);
         let raw = tx.serialize();
         let txid = tx.txid();
@@ -605,7 +625,7 @@ mod tests {
     #[test]
     fn zero_fee_admitted_when_priority_is_zero_fee_allowed() {
         let path = tmp_path("zfa_admit");
-        let mut mgr = MempoolManager::new(path.clone(), 10, 1.0);
+        let mut mgr = MempoolManager::new(path.clone(), 10, 1.0, 0);
         let tx = dummy_tx_tagged(0xaa, 100);
         let raw = tx.serialize();
 
@@ -625,7 +645,7 @@ mod tests {
     #[test]
     fn standard_still_rejected_below_min_fee() {
         let path = tmp_path("std_min");
-        let mut mgr = MempoolManager::new(path.clone(), 10, 1.0);
+        let mut mgr = MempoolManager::new(path.clone(), 10, 1.0, 0);
         let tx = dummy_tx_tagged(0xbb, 100);
         let raw = tx.serialize();
         let res = mgr.add_transaction(tx.clone(), raw, 1);
@@ -640,7 +660,7 @@ mod tests {
     #[test]
     fn zero_fee_cannot_evict_standard_when_full() {
         let path = tmp_path("zfa_no_evict");
-        let mut mgr = MempoolManager::new(path.clone(), 1, 0.0);
+        let mut mgr = MempoolManager::new(path.clone(), 1, 0.0, 0);
 
         let std_tx = dummy_tx_tagged(0x10, 100);
         let std_raw = std_tx.serialize();
@@ -669,7 +689,7 @@ mod tests {
     #[test]
     fn standard_evicts_zero_fee_regardless_of_fee() {
         let path = tmp_path("std_evicts_zfa");
-        let mut mgr = MempoolManager::new(path.clone(), 1, 0.0);
+        let mut mgr = MempoolManager::new(path.clone(), 1, 0.0, 0);
 
         let zfa_tx = dummy_tx_tagged(0x20, 100);
         let zfa_raw = zfa_tx.serialize();
@@ -700,7 +720,7 @@ mod tests {
     #[test]
     fn rate_limit_per_ip_with_loopback_exempt() {
         let path = tmp_path("rate_limit");
-        let mut mgr = MempoolManager::new(path.clone(), 100, 1.0);
+        let mut mgr = MempoolManager::new(path.clone(), 100, 1.0, 0);
 
         let peer_a = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
         let peer_b = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11));

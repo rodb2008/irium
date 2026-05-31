@@ -15796,7 +15796,7 @@ async fn main() {
             era.era_name, era.era_description
         );
     }
-    let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));
+    let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 100.0, 10_000)));
     let limiter = Arc::new(Mutex::new(rate_limiter()));
     let wallet = Arc::new(Mutex::new(
         WalletManager::new(WalletManager::default_path()),
@@ -17986,7 +17986,7 @@ mod tests {
         let chain = Arc::new(Mutex::new(ChainState::new(params)));
 
         let mempool_path = unique_path("irium_htlc_mempool", "json");
-        let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_path, 1024, 0.0)));
+        let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_path, 1024, 0.0, 0)));
 
         let wallet_path = unique_path("irium_htlc_wallet", "json");
         let wallet = Arc::new(Mutex::new(WalletManager::new(wallet_path)));
@@ -25236,7 +25236,7 @@ mod tests {
         let size = raw.len() as u64;
 
         let path = unique_path("mempool_claim_admit", "json");
-        let mut mempool = MempoolManager::new(path.clone(), 100, 1.0);
+        let mut mempool = MempoolManager::new(path.clone(), 100, 1.0, 0);
 
         // Correct fee = size * 1 satisfies min_fee_per_byte=1.0.
         let res = mempool.add_transaction(tx.clone(), raw.clone(), size);
@@ -25288,7 +25288,7 @@ mod tests {
         );
 
         let path = unique_path("mempool_claim_reject", "json");
-        let mut mempool = MempoolManager::new(path.clone(), 100, 1.0);
+        let mut mempool = MempoolManager::new(path.clone(), 100, 1.0, 0);
 
         let res = mempool.add_transaction(tx.clone(), raw.clone(), buggy_fee);
         assert!(
@@ -25336,7 +25336,7 @@ mod tests {
         };
         let chain = Arc::new(Mutex::new(ChainState::new(params)));
         let mempool_path = unique_path("irium_wallet_test_mempool", "json");
-        let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_path, 256, 0.0)));
+        let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_path, 256, 0.0, 0)));
         let wallet = Arc::new(Mutex::new(WalletManager::new(wallet_path)));
 
         AppState {

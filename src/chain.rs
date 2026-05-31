@@ -5234,7 +5234,7 @@ mod tests {
 
         let path = fresh_mempool_path("double_spend");
         let mut mempool =
-            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0);
+            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0, 0);
         let raw = tx.serialize();
         mempool
             .add_transaction(tx.clone(), raw, 0)
@@ -5265,7 +5265,7 @@ mod tests {
 
         let path = fresh_mempool_path("valid_kept");
         let mut mempool =
-            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0);
+            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0, 0);
         let raw = tx.serialize();
         mempool
             .add_transaction(tx.clone(), raw, 0)
@@ -5325,7 +5325,7 @@ mod tests {
 
         let path = fresh_mempool_path("multi_conflict");
         let mut mempool =
-            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0);
+            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0, 0);
         for (i, prev) in [&prev0, &prev1, &prev2].iter().enumerate() {
             let tx = build_signed_spend(
                 &chain,
