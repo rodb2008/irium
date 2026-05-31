@@ -8120,11 +8120,11 @@ async fn claim_ltc_swap(
     }
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(bad("funding_value_le_fee"));
     }
-    let payout = funding_out.output.value - fee;
+    let mut payout = funding_out.output.value - fee;
 
     let mut tx = Transaction {
         version: 1,
@@ -8141,7 +8141,6 @@ async fn claim_ltc_swap(
         locktime: 0,
     };
 
-    let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
     let priv_bytes =
         hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
@@ -8151,28 +8150,51 @@ async fn claim_ltc_swap(
     sk_bytes.copy_from_slice(&priv_bytes);
     let signing_key = SigningKey::from_bytes((&sk_bytes).into())
         .map_err(|_| bad("signing_key_init_failed"))?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
 
-    let witness = encode_htlc_ltc_swap_claim_witness(
-        &sig_bytes,
-        &pubkey,
-        &ltc_block_hash,
-        &branch,
-        req.ltc_merkle_index,
-        &ltc_tx_raw,
-    )
-    .ok_or_else(|| bad("encode_claim_witness_failed"))?;
-    tx.inputs[0].script_sig = witness;
+    // 2-pass fee recalc: estimate_tx_size(1,1) returns 192 bytes, but the
+    // real claim witness (sig + pubkey + ltc_block_hash + merkle branch +
+    // raw LTC tx) pushes the actual tx well above that. Without this loop
+    // the computed fee falls below the 1.0 sat/B mempool floor and
+    // add_transaction rejects with "Fee per byte below minimum policy".
+    // Same pattern as claim_btc_swap fix in 1d9519f.
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+        let witness = encode_htlc_ltc_swap_claim_witness(
+            &sig_bytes,
+            &pubkey,
+            &ltc_block_hash,
+            &branch,
+            req.ltc_merkle_index,
+            &ltc_tx_raw,
+        )
+        .ok_or_else(|| bad("encode_claim_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -10657,7 +10679,7 @@ async fn fill_ltc_swap_order(
     };
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if order.direction == LTC_SWAP_ORDER_DIRECTION_SELL
         && funding_out.output.value < order.irm_amount
     {
@@ -10743,37 +10765,69 @@ async fn fill_ltc_swap_order(
     };
 
     let scriptcode_order = encode_ltc_swap_order_script(&order);
-    let digest_order = signature_digest(&tx, 0, &scriptcode_order);
-    let order_sig: Signature = signing_key
-        .sign_prehash(&digest_order)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let order_sig = order_sig.normalize_s().unwrap_or(order_sig);
-    let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
-    order_sig_bytes.push(0x01);
 
-    let witness = match order.direction {
-        LTC_SWAP_ORDER_DIRECTION_SELL => encode_ltc_swap_order_fill_sell_witness(
-            &order_sig_bytes,
-            &pubkey,
-            &taker_iriumd_pkh,
-            timeout_height,
-        )
-        .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
-        LTC_SWAP_ORDER_DIRECTION_BUY => encode_ltc_swap_order_fill_buy_witness(
-            &order_sig_bytes,
-            &pubkey,
-            timeout_height,
-        )
-        .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
-        _ => return Err(bad("order_direction_unknown")),
-    };
-    tx.inputs[0].script_sig = witness;
+    // 2-pass fee recalc: estimate_tx_size(1,1) under-counts the order
+    // fill witness (sig + pubkey + taker_pkh + timeout) and any extra
+    // P2PKH wallet inputs. Without this loop a 1-input/1-output sell
+    // fill at fee_per_byte=1 produces ~0.66 sat/B and mempool admission
+    // fails at min_fee_per_byte=1.0. Same pattern as fill_swap_order
+    // fix in 1d9519f.
+    for _ in 0..2 {
+        let digest_order = signature_digest(&tx, 0, &scriptcode_order);
+        let order_sig: Signature = signing_key
+            .sign_prehash(&digest_order)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let order_sig = order_sig.normalize_s().unwrap_or(order_sig);
+        let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
+        order_sig_bytes.push(0x01);
 
-    if !extra_inputs.is_empty() {
-        let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
-        key_map.insert(taker_iriumd_pkh, wallet_key.clone());
-        sign_wallet_inputs(&mut tx, &extra_inputs, &key_map)
-            .map_err(|_| bad("sign_extra_inputs_failed"))?;
+        let witness = match order.direction {
+            LTC_SWAP_ORDER_DIRECTION_SELL => encode_ltc_swap_order_fill_sell_witness(
+                &order_sig_bytes,
+                &pubkey,
+                &taker_iriumd_pkh,
+                timeout_height,
+            )
+            .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
+            LTC_SWAP_ORDER_DIRECTION_BUY => encode_ltc_swap_order_fill_buy_witness(
+                &order_sig_bytes,
+                &pubkey,
+                timeout_height,
+            )
+            .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
+            _ => return Err(bad("order_direction_unknown")),
+        };
+        tx.inputs[0].script_sig = witness;
+
+        if !extra_inputs.is_empty() {
+            let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+            key_map.insert(taker_iriumd_pkh, wallet_key.clone());
+            sign_wallet_inputs(&mut tx, &extra_inputs, &key_map)
+                .map_err(|_| bad("sign_extra_inputs_failed"))?;
+        }
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            // Reduce change (always the last output when there is one) to
+            // absorb the shortfall. Covenant output 0 is fixed by spec; we
+            // cannot touch it. If no change exists or change can't cover
+            // the delta, reject \xe2\x80\x94 caller can retry with a higher
+            // fee_per_byte or pre-funded inputs.
+            if tx.outputs.len() > 1 {
+                let change_idx = tx.outputs.len() - 1;
+                if tx.outputs[change_idx].value > extra {
+                    fee = needed_fee;
+                    tx.outputs[change_idx].value -= extra;
+                    continue;
+                } else {
+                    return Err(bad("fee_recalculation_exceeded_change"));
+                }
+            } else {
+                return Err(bad("fee_recalculation_no_change_to_reduce"));
+            }
+        }
+        break;
     }
 
     let fee_checked = {
