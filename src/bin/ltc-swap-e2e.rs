@@ -241,9 +241,8 @@ fn step_0_probe(iriumd: &Iriumd) -> Result<u64, String> {
     if !active {
         return Err(format!("LTC SPV relay not active (tip_height={height})"));
     }
-    if height < 1 {
-        return Err(format!("LTC SPV tip too low for swap test: {height}"));
-    }
+    // tip_height=0 (anchor only) is acceptable; step 9's catch-up loop
+    // will push headers up to litecoind's current tip before claim.
     log("0", "ok", &format!("ltcrelaytip active=true height={height} hash={hash}"));
     Ok(height)
 }
@@ -535,19 +534,28 @@ fn step_8_merkle_proof(
     Ok((block_hash, branch_display, tx_index))
 }
 
-fn step_9_relay_ltc_headers(target_height: u64) -> Result<(), String> {
-    log("9", "start", &format!("ltc-header-sync to push headers to iriumd (target ltc tip ~{target_height})"));
+fn step_9_relay_ltc_headers(iriumd: &Iriumd, target_height: u64) -> Result<(), String> {
+    log("9", "start", &format!("ltc-header-sync loop until iriumd LTC SPV tip >= {target_height}"));
     let script = env::var("LTC_E2E_SYNC_SCRIPT")
         .unwrap_or_else(|_| "/home/irium/.irium-devnet/ltc-sync.sh".to_string());
 
-    // Run repeatedly until the binary reports it has nothing more to do.
-    // The binary exits 0 once it's caught up; loop just in case multiple
-    // cycles are needed (LTC tip is well below batch cap so usually 1).
+    // Each ltc-header-sync invocation submits up to 144 headers to iriumd's
+    // mempool as one LtcHeaderBatch tx. We then need to mine an iriumd
+    // block so the batch enters SPV state. Loop both until the iriumd LTC
+    // SPV tip catches up to litecoind's tip (or we exhaust our budget).
     let mut cycles = 0;
     loop {
         cycles += 1;
-        if cycles > 10 {
+        if cycles > 16 {
             return Err(format!("ltc-header-sync did not converge after {cycles} cycles"));
+        }
+        let current = iriumd
+            .get("/rpc/ltcrelaytip")
+            .map(|v| v["tip_height"].as_u64().unwrap_or(0))
+            .unwrap_or(0);
+        if current >= target_height {
+            log("9", "ok", &format!("LTC SPV caught up to h={current} in {cycles} probe(s)"));
+            return Ok(());
         }
         let status = Command::new(&script)
             .stdout(Stdio::null())
@@ -558,13 +566,11 @@ fn step_9_relay_ltc_headers(target_height: u64) -> Result<(), String> {
         if !status.success() {
             return Err(format!("ltc-header-sync cycle {cycles} exited code={:?}", status.code()));
         }
-        // Each cycle submits one batch tx to mempool. We then need a separate
-        // iriumd mining step to confirm. For Phase 1 of this binary we run
-        // exactly one cycle; subsequent extensions can loop on relay-tip.
-        break;
+        // Mine one iriumd block so the just-submitted batch confirms and
+        // the SPV tip advances. Use mine_iriumd_to with the current tip.
+        let irm_tip = iriumd.current_tip_height()?;
+        let _ = mine_iriumd_to(iriumd, irm_tip, "confirm ltc header batch")?;
     }
-    log("9", "ok", &format!("ltc-header-sync cycle(s)={cycles}"));
-    Ok(())
 }
 
 fn step_10_confirm_headers(iriumd: &Iriumd, start_height: u64) -> Result<u64, String> {
@@ -584,17 +590,12 @@ fn step_11_claim(
     ltc_merkle_index: u32,
 ) -> Result<String, String> {
     log("11", "start", "POST /rpc/claimltcswap");
-    // Workaround for single-pass fee estimate in iriumd's claim_ltc_swap:
-    // estimate_tx_size(1,1) returns ~192B for a bare P2PKH spend, but the
-    // actual claim tx embeds the LTC payment proof (raw LTC tx + merkle
-    // branch + block hash) in its scriptsig and lands at ~430B. With
-    // fee_per_byte=1, the resulting 192-sat fee divided by 430-byte real
-    // size is 0.45 sat/byte — below the 1.0 sat/byte mempool floor —
-    // and mempool.add_transaction returns Err so accepted=false. Bumping
-    // fee_per_byte to 10 lifts the fee to 1920 sats which yields 4.4
-    // sat/byte on the real tx (>1 floor, mempool accepts). The proper
-    // fix is a 2-pass fee recalc mirroring the claim_btc_swap path
-    // shipped in task #103; tracked as a follow-up to iriumd.
+    // The 2-pass fee recalc fix in iriumd's claim_ltc_swap (commit
+    // 58ca801) makes fee_per_byte=1 produce a real-tx fee that
+    // satisfies the 1.0 sat/B mempool floor. Prior to that fix the
+    // single-pass estimate produced ~0.45 sat/B and mempool admission
+    // rejected with "Fee per byte below minimum policy"; this binary
+    // had to pass fee_per_byte=10 as a workaround.
     let body = json!({
         "funding_txid": handle.funding_txid,
         "vout": handle.swap_vout,
@@ -603,7 +604,7 @@ fn step_11_claim(
         "ltc_tx_hex": ltc_tx_hex,
         "ltc_merkle_branch_hex": ltc_merkle_branch_hex,
         "ltc_merkle_index": ltc_merkle_index,
-        "fee_per_byte": 10,
+        "fee_per_byte": 1,
         "broadcast": true,
     });
     let resp = iriumd.post("/rpc/claimltcswap", body)?;
@@ -670,8 +671,8 @@ fn run() -> Result<(), String> {
     let _ltc_tip_after_mine = step_7_mine_ltc(&litecoind, handle.confirmations_required)?;
     let (ltc_block_hash, branch_hex, idx) = step_8_merkle_proof(&litecoind, &ltc_txid)?;
 
-    step_9_relay_ltc_headers(_ltc_tip_after_mine)?;
-    let irm_height_after_headers = step_10_confirm_headers(&iriumd, irm_height_after_funding)?;
+    step_9_relay_ltc_headers(&iriumd, _ltc_tip_after_mine)?;
+    let irm_height_after_headers = step_10_confirm_headers(&iriumd, iriumd.current_tip_height()?)?;
 
     let _claim_tx = step_11_claim(
         &iriumd,
