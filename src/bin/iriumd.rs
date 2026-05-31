@@ -7668,7 +7668,7 @@ async fn claim_btc_swap(
     // real claim witness (sig + pubkey + btc_block_hash + merkle branch +
     // raw BTC tx) pushes the actual tx to ~810 bytes. Without this loop the
     // computed fee is ~0.24 sat/B and mempool admission fails at
-    // min_fee_per_byte=1.0. Same pattern as submit_btc_headers.
+    // min_fee_per_byte=100.0. Same pattern as submit_btc_headers.
     for _ in 0..2 {
         let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
         let sig: Signature = signing_key
@@ -10634,7 +10634,7 @@ async fn fill_swap_order(
     // witness (sig + pubkey + taker_pkh + timeout) and any extra P2PKH
     // wallet inputs. Without this loop a 1-input/1-output sell fill at
     // fee_per_byte=1 produces ~0.66 sat/B and mempool admission fails at
-    // min_fee_per_byte=1.0. Same pattern as submit_btc_headers.
+    // min_fee_per_byte=100.0. Same pattern as submit_btc_headers.
     for _ in 0..2 {
         let digest_order = signature_digest(&tx, 0, &scriptcode_order);
         let order_sig: Signature = signing_key
@@ -12084,7 +12084,7 @@ async fn fill_ltc_swap_order(
     // fill witness (sig + pubkey + taker_pkh + timeout) and any extra
     // P2PKH wallet inputs. Without this loop a 1-input/1-output sell
     // fill at fee_per_byte=1 produces ~0.66 sat/B and mempool admission
-    // fails at min_fee_per_byte=1.0. Same pattern as fill_swap_order
+    // fails at min_fee_per_byte=100.0. Same pattern as fill_swap_order
     // fix in 1d9519f.
     for _ in 0..2 {
         let digest_order = signature_digest(&tx, 0, &scriptcode_order);
@@ -25208,7 +25208,7 @@ mod tests {
     /// fee = estimate_tx_size(1, 1) * fee_per_byte = 192 sats at fpb=1,
     /// but the actual serialized tx — with the heavy claim or fill
     /// witness — is several times larger. The handler-produced tx was
-    /// then rejected by the production mempool (min_fee_per_byte=1.0).
+    /// then rejected by the production mempool (min_fee_per_byte=100.0).
     /// This test asserts the property the fix delivers: a tx whose
     /// declared fee equals serialize().len() * 1 IS admitted.
     #[test]
