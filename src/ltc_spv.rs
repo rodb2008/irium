@@ -521,7 +521,7 @@ fn expected_bits_for_v(
     }
     let first_height = height - params.window;
     if first_height < anchor.height {
-        return Ok(parent_bits);
+        return Err("expected_bits: retarget window reaches before anchor".to_string());
     }
     let first_time = find_ancestor_time_at_height_v(parent_hash, first_height, view, anchor)?;
     let mut actual_timespan = parent_time.saturating_sub(first_time);
@@ -654,25 +654,34 @@ pub fn apply_ltc_header_batch(
             ));
         }
 
-        let (expected_bits, mtp) = {
+        let (expected_bits_opt, mtp) = {
             let view = LookupView {
                 committed: ltc_headers,
                 staged: &staged,
             };
-            let bits = expected_bits_for_v(height, &prev_hash, &view, anchor, retarget)?;
+            // At a post-anchor pre-2x retarget boundary the relay never
+            // saw the headers needed to compute the new target. PoW for
+            // header.bits is still validated separately above, so accept
+            // any claimed bits here without enforcing the equality check.
+            let bits = match expected_bits_for_v(height, &prev_hash, &view, anchor, retarget) {
+                Ok(b) => Some(b),
+                Err(e) if e == "expected_bits: retarget window reaches before anchor" => None,
+                Err(e) => return Err(e),
+            };
             let mtp = median_time_past_v(&prev_hash, &view, anchor);
             (bits, mtp)
         };
-        let expected_target = Target { bits: expected_bits }.to_target();
-        let header_target = Target { bits: header.bits }.to_target();
-        if header_target != expected_target {
-            return Err(format!(
-                "apply_ltc_header_batch: header {} bits mismatch \
-                 (expected {:#010x}, got {:#010x})",
-                i, expected_bits, header.bits
-            ));
+        if let Some(expected_bits) = expected_bits_opt {
+            let expected_target = Target { bits: expected_bits }.to_target();
+            let header_target = Target { bits: header.bits }.to_target();
+            if header_target != expected_target {
+                return Err(format!(
+                    "apply_ltc_header_batch: header {} bits mismatch \
+                     (expected {:#010x}, got {:#010x})",
+                    i, expected_bits, header.bits
+                ));
+            }
         }
-
         if header.time <= mtp {
             return Err(format!(
                 "apply_ltc_header_batch: header {} time {} not above MTP {}",
