@@ -84,6 +84,21 @@ SNAPSHOT_FILE = "/opt/irium-pool/data/blocks_today_snapshot.json"
 _today_lock = threading.Lock()
 _today_snapshot = {"utc_date": None, "lifetime_at_snapshot": 0}
 
+# Pool blocks by address: file-backed counter of blocks each coinbase
+# address has found at the pool. Polled by background_sampler from the
+# local irium-explorer (127.0.0.1:38310). The /miners endpoint enriches
+# each row with the count for that worker's base address so the
+# desktop's Active Miners table can show per-worker block credit.
+# Address-level (not worker-level) attribution: a wallet with multiple
+# rig names gets the same total credited to each rig — fine because the
+# desktop already merges rows by base address.
+EXPLORER_BLOCKS_URL = "http://127.0.0.1:38310/api/blocks"
+POOL_BLOCKS_FILE = "/opt/irium-pool/data/pool_blocks_by_address.json"
+_pool_blocks_lock = threading.Lock()
+_pool_blocks_by_address = {}
+_pool_blocks_last_height = 0
+_pool_blocks_tick = 0
+
 
 def fetch(url):
     try:
@@ -412,6 +427,84 @@ def _blocks_found_today(current_total):
         return diff
 
 
+def _load_pool_blocks():
+    """Restore the pool_blocks_by_address counter from disk at startup.
+    A missing file means cold start; corrupt JSON is treated the same as
+    missing so a half-written file never wedges startup."""
+    global _pool_blocks_last_height
+    try:
+        with open(POOL_BLOCKS_FILE) as f:
+            data = json.load(f)
+        with _pool_blocks_lock:
+            _pool_blocks_by_address.clear()
+            _pool_blocks_by_address.update(data.get("by_address", {}) or {})
+            _pool_blocks_last_height = int(data.get("last_polled_height", 0))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+
+def _save_pool_blocks():
+    """Atomically persist the counter. Mkdir on first write so a fresh
+    install without /opt/irium-pool/data still works. Silent on error —
+    a save failure must never kill the sampler thread."""
+    try:
+        os.makedirs(os.path.dirname(POOL_BLOCKS_FILE), exist_ok=True)
+        tmp = POOL_BLOCKS_FILE + ".tmp"
+        with _pool_blocks_lock:
+            payload = {
+                "by_address": dict(_pool_blocks_by_address),
+                "last_polled_height": _pool_blocks_last_height,
+            }
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, POOL_BLOCKS_FILE)
+    except Exception as e:
+        print(f"[stats-proxy] pool_blocks save error: {e}", flush=True)
+
+
+def _refresh_pool_blocks():
+    """Pull recent blocks from irium-explorer, credit each new block's
+    coinbase address. Blocks at or below _pool_blocks_last_height are
+    skipped, giving at-least-once monotone semantics across restarts.
+    Silent on transient explorer failures — the column just stays at
+    last known counts."""
+    global _pool_blocks_last_height
+    try:
+        with urllib.request.urlopen(f"{EXPLORER_BLOCKS_URL}?limit=200", timeout=5) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return
+    blocks = data.get("blocks", []) or []
+    blocks.sort(key=lambda b: int(b.get("height") or 0))
+    updated = False
+    with _pool_blocks_lock:
+        last = _pool_blocks_last_height
+        for b in blocks:
+            h = int(b.get("height") or 0)
+            if h <= last:
+                continue
+            addr = b.get("miner_address") or ""
+            if addr:
+                _pool_blocks_by_address[addr] = _pool_blocks_by_address.get(addr, 0) + 1
+                updated = True
+            if h > last:
+                last = h
+        _pool_blocks_last_height = last
+    if updated:
+        _save_pool_blocks()
+
+
+def _get_pool_blocks_count(address):
+    """Per-address lookup for /miners enrichment. Returns 0 when the
+    address has been credited zero blocks; returns None when the cache
+    is entirely empty (cold start or sustained explorer failure) so
+    the desktop UI renders '—' rather than '0' until real data lands."""
+    with _pool_blocks_lock:
+        if not _pool_blocks_by_address:
+            return None
+        return _pool_blocks_by_address.get(address, 0)
+
+
 class Handler(BaseHTTPRequestHandler):
     # Bound per-request socket I/O so a slow/silent client cannot hold a
     # worker thread indefinitely. With plain HTTPServer the accept loop
@@ -568,7 +661,7 @@ class Handler(BaseHTTPRequestHandler):
                 # aggregates shares per-address since one wallet can
                 # connect with multiple rig names.
                 addr = worker.split(".", 1)[0]
-                miner_payout = payout_by_addr.get(addr) if profile == "asic" else None
+                miner_payout = payout_by_addr.get(addr) if profile in ("asic", "port443") else None
                 pending_shares = miner_payout.get("pending_shares") if miner_payout else None
                 estimated_payout_irm = miner_payout.get("estimated_payout_irm") if miner_payout else None
                 miners_list.append({
@@ -582,6 +675,7 @@ class Handler(BaseHTTPRequestHandler):
                     "reject_reasons": mstats.get("reject_reasons", {}) or {},
                     "hashrate_15m": hashrate_15m,
                     "last_share_ago_seconds": last_share_ago,
+                    "blocks_found": _get_pool_blocks_count(worker.split(".", 1)[0]),
                     "pending_shares": pending_shares,
                     "estimated_payout_irm": estimated_payout_irm,
                 })
@@ -722,6 +816,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def background_sampler():
+    global _pool_blocks_tick
     # Periodically self-scrape so the rolling window stays populated even
     # when no client is requesting /stats. Without this, the first GUI
     # fetch always returns null until two requests are far enough apart.
@@ -755,6 +850,13 @@ def background_sampler():
                             f"{worker}: {inner_e}",
                             flush=True,
                         )
+            # Pool-blocks refresh: poll irium-explorer every other tick
+            # (~60 s) so the per-worker blocks_found counter in /miners
+            # stays current. Silent on transient failure — the column
+            # just stays at last known counts.
+            _pool_blocks_tick += 1
+            if _pool_blocks_tick % 2 == 0:
+                _refresh_pool_blocks()
         except Exception as e:
             print(f"[stats-proxy] background sampler error: {e}", flush=True)
         time.sleep(30)
@@ -762,6 +864,7 @@ def background_sampler():
 
 if __name__ == "__main__":
     _load_today_snapshot()
+    _load_pool_blocks()
     threading.Thread(target=background_sampler, daemon=True).start()
     # Outer retry loop: if HTTPServer construction or serve_forever raises
     # (port temporarily unavailable, transient OS error, OOM recovery,

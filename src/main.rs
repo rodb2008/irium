@@ -7,6 +7,10 @@ mod btc_tx_parse;
 mod chain;
 mod constants;
 mod genesis;
+#[allow(dead_code)]
+mod ltc_spv;
+#[allow(dead_code)]
+mod doge_spv;
 // Pulled in so chain.rs's `#[cfg(test)] mod tests` can reference
 // `crate::mempool::evict_invalid_mempool_entries` and `MempoolManager`
 // when `cargo test --all` builds tests for this thin secondary binary.
@@ -14,6 +18,8 @@ mod genesis;
 #[allow(dead_code)]
 mod mempool;
 mod pow;
+#[allow(dead_code)]
+mod scrypt_pow;
 mod tx;
 
 use crate::activation::{
@@ -56,6 +62,7 @@ fn main() {
             ltc_spv: None,
             doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
             doge_swap_order_v1_activation_height: None,

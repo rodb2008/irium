@@ -1,12 +1,62 @@
 use std::collections::HashMap;
 use std::fs;
+use std::net::IpAddr;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::chain::ChainState;
 use crate::tx::{decode_full_tx, Transaction};
+
+/// Per-IP minimum interval between successive `ZeroFeeAllowed` admissions.
+/// Buyer-side BTC swap operations (header relay, claim, sell-direction
+/// fill) bypass `min_fee_per_byte` but must space themselves out so that
+/// a single source IP cannot flood the exempt class. Loopback addresses
+/// (127.0.0.1, ::1) bypass this gate so the local operator and Tauri
+/// client can act unthrottled.
+pub const HEADER_RELAY_PER_IP_INTERVAL_SECS: u64 = 600;
+
+/// Mempool admission class. `ZeroFeeAllowed` covers the three buyer-side
+/// shapes that a BTC-only wallet has to broadcast and cannot fund from
+/// its own IRM balance: BTC/LTC/DOGE `*HeaderBatch` carriers, HtlcBtcSwap
+/// claim spends (witness selector `0x01`), and sell-direction SwapOrder
+/// fills (witness selector `0x01`). The class is exempt from
+/// `min_fee_per_byte` and is the first to be evicted when the mempool
+/// reaches capacity — paying transactions can never be displaced by a
+/// zero-fee one. Every other tx is `Standard` and follows the original
+/// fee policy unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MempoolPriority {
+    ZeroFeeAllowed,
+    Standard,
+}
+
+impl MempoolPriority {
+    /// Numeric rank used as the primary key in the eviction comparator.
+    /// Lower is evicted first.
+    fn rank(&self) -> u8 {
+        match self {
+            Self::ZeroFeeAllowed => 0,
+            Self::Standard => 1,
+        }
+    }
+
+    fn as_disk_str(&self) -> &'static str {
+        match self {
+            Self::ZeroFeeAllowed => "zero_fee_allowed",
+            Self::Standard => "standard",
+        }
+    }
+
+    fn from_disk_str(s: &str) -> Option<Self> {
+        match s {
+            "zero_fee_allowed" => Some(Self::ZeroFeeAllowed),
+            "standard" => Some(Self::Standard),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct MempoolEntry {
@@ -18,6 +68,7 @@ pub struct MempoolEntry {
     pub added: u64,
     pub relays: Vec<String>,
     pub relay_addresses: Vec<String>,
+    pub priority: MempoolPriority,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +87,11 @@ struct DiskEntry {
     txid: Option<String>,
     relays: Option<Vec<String>>,
     relay_addresses: Option<Vec<String>>,
+    /// Stored as the string returned by `MempoolPriority::as_disk_str`.
+    /// `None` on legacy on-disk entries that pre-date the priority field;
+    /// those entries load as `Standard` so they keep their original
+    /// admission semantics.
+    priority: Option<String>,
 }
 
 pub struct MempoolManager {
@@ -115,6 +171,11 @@ impl MempoolManager {
             let added = entry.added.unwrap_or_else(now_secs);
             let relays = entry.relays.unwrap_or_default();
             let relay_addresses = entry.relay_addresses.unwrap_or_default();
+            let priority = entry
+                .priority
+                .as_deref()
+                .and_then(MempoolPriority::from_disk_str)
+                .unwrap_or(MempoolPriority::Standard);
             self.entries.insert(
                 txid,
                 MempoolEntry {
@@ -126,6 +187,7 @@ impl MempoolManager {
                     added,
                     relays,
                     relay_addresses,
+                    priority,
                 },
             );
         }
@@ -146,29 +208,76 @@ impl MempoolManager {
                 txid: Some(hex::encode(txid)),
                 relays: Some(entry.relays.clone()),
                 relay_addresses: Some(entry.relay_addresses.clone()),
+                priority: Some(entry.priority.as_disk_str().to_string()),
             });
         }
         let json = serde_json::to_string_pretty(&disk_entries).map_err(|e| e.to_string())?;
         fs::write(&self.path, json).map_err(|e| e.to_string())
     }
 
+    /// Convenience wrapper that classifies the tx as `Standard` and
+    /// preserves the original fee policy. Existing call sites that don't
+    /// distinguish the buyer-side exemption keep using this path
+    /// unchanged. Buyer-side handlers and the P2P relay path call
+    /// [`add_transaction_with_priority`] directly.
     pub fn add_transaction(
         &mut self,
         tx: Transaction,
         raw: Vec<u8>,
         fee: u64,
     ) -> Result<AddOutcome, String> {
+        self.add_transaction_with_priority(tx, raw, fee, MempoolPriority::Standard, None)
+    }
+
+    /// Full-control admission. `priority` is determined by the caller —
+    /// handlers know the shape of the tx they built; the P2P ingress
+    /// path classifies incoming peer txs via
+    /// `crate::chain::classify_tx_priority`. `peer_ip` is the source IP
+    /// for rate-limiting `ZeroFeeAllowed` admissions; loopback
+    /// (127.0.0.1, ::1) bypasses the rate limit so local operator
+    /// scripts and the Tauri client are unthrottled.
+    pub fn add_transaction_with_priority(
+        &mut self,
+        tx: Transaction,
+        raw: Vec<u8>,
+        fee: u64,
+        priority: MempoolPriority,
+        peer_ip: Option<IpAddr>,
+    ) -> Result<AddOutcome, String> {
         let txid = tx.txid();
         if self.entries.contains_key(&txid) {
             return Err("Transaction already in mempool".to_string());
         }
+
+        if priority == MempoolPriority::ZeroFeeAllowed {
+            if let Some(ip) = peer_ip {
+                if !ip.is_loopback() {
+                    let now = SystemTime::now();
+                    self.gc_header_relay_rate_table(now);
+                    if let Some(prev) = self.header_relay_last_seen.get(&ip).copied() {
+                        let elapsed_under_limit = now
+                            .duration_since(prev)
+                            .map(|d| d.as_secs() < HEADER_RELAY_PER_IP_INTERVAL_SECS)
+                            .unwrap_or(false);
+                        if elapsed_under_limit {
+                            return Err("header_relay_rate_limit_per_ip".to_string());
+                        }
+                    }
+                }
+            }
+        }
+
         let size = raw.len();
         let fee_per_byte = if size > 0 {
             fee as f64 / size as f64
         } else {
             0.0
         };
-        if fee_per_byte < self.min_fee_per_byte {
+
+        // Standard txs must clear the configured floor. ZeroFeeAllowed
+        // bypasses it — the eviction policy below ensures they cannot
+        // displace any paying tx, which is what makes the bypass safe.
+        if priority == MempoolPriority::Standard && fee_per_byte < self.min_fee_per_byte {
             return Err("Fee per byte below minimum policy".to_string());
         }
         // Absolute per-tx fee floor. Symmetric with the per-byte check
@@ -179,15 +288,9 @@ impl MempoolManager {
 
         let mut evicted = None;
         if self.entries.len() >= self.max_entries {
-            if let Some((lowest_txid, lowest)) = self
-                .entries
-                .iter()
-                .min_by(|a, b| a.1.fee_per_byte.total_cmp(&b.1.fee_per_byte))
-            {
-                if fee_per_byte <= lowest.fee_per_byte {
-                    return Err("Mempool full and fee too low".to_string());
-                }
-                evicted = Some(*lowest_txid);
+            match self.pick_eviction_target(priority, fee_per_byte) {
+                Some(t) => evicted = Some(t),
+                None => return Err("Mempool full and fee/priority too low".to_string()),
             }
         }
         if let Some(e) = evicted {
@@ -203,11 +306,60 @@ impl MempoolManager {
             added: now_secs(),
             relays: Vec::new(),
             relay_addresses: Vec::new(),
+            priority,
         };
         self.entries.insert(txid, entry);
         self.persist()?;
 
+        // Record the rate-limit clock only after a successful admission
+        // so a failed insert doesn't lock the IP out for the next 600s.
+        if priority == MempoolPriority::ZeroFeeAllowed {
+            if let Some(ip) = peer_ip {
+                if !ip.is_loopback() {
+                    self.header_relay_last_seen.insert(ip, SystemTime::now());
+                }
+            }
+        }
+
         Ok(AddOutcome { txid, evicted })
+    }
+
+    /// Pick the entry to evict. Lexicographic comparison on
+    /// (priority rank, fee_per_byte). A `Standard` tx (rank 1) always
+    /// outranks a `ZeroFeeAllowed` tx (rank 0) regardless of fpb — that
+    /// is the buyer-side exemption's structural guarantee. Within the
+    /// same class, lower fpb evicts first. Strict-greater comparison
+    /// — ties keep the older entry.
+    fn pick_eviction_target(
+        &self,
+        incoming_priority: MempoolPriority,
+        incoming_fpb: f64,
+    ) -> Option<[u8; 32]> {
+        let (lowest_txid, lowest_entry) = self
+            .entries
+            .iter()
+            .min_by(|(_, a), (_, b)| {
+                a.priority
+                    .rank()
+                    .cmp(&b.priority.rank())
+                    .then(a.fee_per_byte.total_cmp(&b.fee_per_byte))
+            })?;
+        let incoming_rank = incoming_priority.rank();
+        let lowest_rank = lowest_entry.priority.rank();
+        if incoming_rank > lowest_rank
+            || (incoming_rank == lowest_rank && incoming_fpb > lowest_entry.fee_per_byte)
+        {
+            Some(*lowest_txid)
+        } else {
+            None
+        }
+    }
+
+    fn gc_header_relay_rate_table(&mut self, now: SystemTime) {
+        let interval = Duration::from_secs(HEADER_RELAY_PER_IP_INTERVAL_SECS);
+        self.header_relay_last_seen.retain(|_, t| {
+            now.duration_since(*t).map(|d| d < interval).unwrap_or(false)
+        });
     }
 
     pub fn record_relay(&mut self, txid: &[u8; 32], peer: String) {
@@ -374,6 +526,7 @@ pub fn evict_invalid_mempool_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     fn tmp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -391,6 +544,28 @@ mod tests {
             prev_txid: [1u8; 32],
             prev_index: 0,
             script_sig: vec![0u8; 1],
+            sequence: 0xffff_fffe,
+        };
+        let output = crate::tx::TxOutput {
+            value,
+            script_pubkey: vec![0u8],
+        };
+        Transaction {
+            version: 1,
+            inputs: vec![input],
+            outputs: vec![output],
+            locktime: 0,
+        }
+    }
+
+    /// Make a dummy tx whose first-input prev_txid is `tag` so the txid
+    /// differs between calls in the same test (avoids "already in
+    /// mempool" duplicate-detection collisions).
+    fn dummy_tx_tagged(tag: u8, value: u64) -> Transaction {
+        let input = crate::tx::TxInput {
+            prev_txid: [tag; 32],
+            prev_index: 0,
+            script_sig: vec![tag],
             sequence: 0xffff_fffe,
         };
         let output = crate::tx::TxOutput {

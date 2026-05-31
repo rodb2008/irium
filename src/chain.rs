@@ -18,6 +18,16 @@ use crate::btc_spv::{
     MAX_BTC_HEADER_BATCH_BYTES,
 };
 use crate::btc_tx_parse::{btc_txid, parse_btc_tx_outputs, BtcOutputScript};
+use crate::ltc_spv::{
+    apply_ltc_header_batch, parse_ltc_header_batch, undo_ltc_relay_update, LtcAnchor,
+    LtcHeaderEntry, LtcRelayUpdate, LtcSpvParams, RetargetParams, LTC_HEADER_BATCH_TAG,
+    MAX_LTC_HEADER_BATCH_BYTES,
+};
+use crate::doge_spv::{
+    apply_doge_header_batch, parse_doge_header_batch, undo_doge_relay_update, DigishieldParams,
+    DogeAnchor, DogeHeaderEntry, DogeRelayUpdate, DogeSpvParams, DOGE_HEADER_BATCH_TAG,
+    MAX_DOGE_HEADER_BATCH_BYTES,
+};
 use crate::constants::{
     block_reward, coinbase_maturity, BLOCK_TARGET_INTERVAL, COINBASE_MATURITY, DIFFICULTY_RETARGET_INTERVAL,
     LWMA_MAX_TARGET_DOWN_FACTOR, LWMA_MAX_TARGET_UP_FACTOR, LWMA_MIN_DIFFICULTY_FLOOR,
@@ -143,6 +153,25 @@ pub struct ChainParams {
     /// `BtcHeaderBatch` output and `anchor` seeds the relay's view of the
     /// Bitcoin chain.
     pub btc_spv: Option<BtcSpvParams>,
+    /// Litecoin SPV header relay parameters (Phase B). `None` keeps the
+    /// LTC relay disabled. When `Some`, blocks at or after
+    /// `activation_height` may carry an `LtcHeaderBatch` output (tag
+    /// `0xc6`) and the validator will apply such batches into
+    /// `ChainState.ltc_headers`. No claim path consumes these yet —
+    /// Phase B is header relay only.
+    pub ltc_spv: Option<LtcSpvParams>,
+    /// Dogecoin SPV header relay parameters (DOGE Phase B). `None`
+    /// keeps the DOGE relay disabled. When `Some`, blocks at or after
+    /// `activation_height` may carry a `DogeHeaderBatch` output (tag
+    /// `0xc9`) and the validator will apply such batches into
+    /// `ChainState.doge_headers`. No claim path consumes these yet —
+    /// DOGE Phase B is header relay only. Mainnet activation
+    /// additionally gates on Phase A2 (AuxPoW proof verification)
+    /// landing first; the Phase A1 relay accepts only solo-mined DOGE
+    /// blocks, which is fine for devnet/regtest but useless for live
+    /// mainnet where ~100% of blocks since height 371,337 are
+    /// merged-mined with Litecoin.
+    pub doge_spv: Option<DogeSpvParams>,
     /// HtlcBtcSwapV1 activation height (Phase 2). `None` keeps the
     /// BTC-proof claim path disabled. Activation should not precede the
     /// `btc_spv` relay's `activation_height`, otherwise proofs cannot
@@ -192,6 +221,12 @@ struct BlockUndo {
     /// If this block applied a `BtcHeaderBatch` output, the relay-state
     /// change record needed to roll it back on disconnect.
     btc_relay_update: Option<BtcRelayUpdate>,
+    /// If this block applied an `LtcHeaderBatch` output (Phase B), the
+    /// relay-state change record needed to roll it back on disconnect.
+    ltc_relay_update: Option<LtcRelayUpdate>,
+    /// If this block applied a `DogeHeaderBatch` output (DOGE Phase B),
+    /// the relay-state change record needed to roll it back on disconnect.
+    doge_relay_update: Option<DogeRelayUpdate>,
     /// BTC outpoints `(btc_txid, op_return_vout)` newly inserted into
     /// `ChainState.claimed_btc_outpoints` by HtlcBtcSwapV1 BTC-proof claims
     /// in this block. Removed on disconnect.
@@ -1238,6 +1273,69 @@ impl ChainState {
                     // added to the UTXO set.
                     continue;
                 }
+                if output.script_pubkey.first().copied() == Some(LTC_HEADER_BATCH_TAG) {
+                    // Phase B: LtcHeaderBatch apply path. Structural validity
+                    // already enforced by validate_output. Now thread the batch
+                    // into LTC relay state, parallel to the BTC arm above.
+                    if !self.ltc_spv_relay_active_at(height) {
+                        return Err(
+                            "LtcHeaderBatch output before SPV relay activation".to_string(),
+                        );
+                    }
+                    ltc_batch_count += 1;
+                    if ltc_batch_count > 1 {
+                        return Err("block contains more than one LtcHeaderBatch output".to_string());
+                    }
+                    let headers = parse_ltc_header_batch(&output.script_pubkey)
+                        .map_err(|e| format!("LtcHeaderBatch apply parse failed: {}", e))?;
+                    let anchor = self.ltc_anchor();
+                    let retarget = self.ltc_retarget_params();
+                    let update = apply_ltc_header_batch(
+                        headers,
+                        block.header.time,
+                        &mut self.ltc_headers,
+                        &mut self.ltc_heights,
+                        &mut self.ltc_tip,
+                        &mut self.ltc_tip_height,
+                        &anchor,
+                        &retarget,
+                    )?;
+                    ltc_relay_update = Some(update);
+                    continue;
+                }
+                if output.script_pubkey.first().copied() == Some(DOGE_HEADER_BATCH_TAG) {
+                    // DOGE Phase B: DogeHeaderBatch apply path. Structural
+                    // validity already enforced by validate_output. Now
+                    // thread the batch into DOGE relay state, parallel to
+                    // the BTC and LTC arms above.
+                    if !self.doge_spv_relay_active_at(height) {
+                        return Err(
+                            "DogeHeaderBatch output before SPV relay activation".to_string(),
+                        );
+                    }
+                    doge_batch_count += 1;
+                    if doge_batch_count > 1 {
+                        return Err(
+                            "block contains more than one DogeHeaderBatch output".to_string(),
+                        );
+                    }
+                    let headers = parse_doge_header_batch(&output.script_pubkey)
+                        .map_err(|e| format!("DogeHeaderBatch apply parse failed: {}", e))?;
+                    let anchor = self.doge_anchor();
+                    let retarget = self.doge_retarget_params();
+                    let update = apply_doge_header_batch(
+                        headers,
+                        block.header.time,
+                        &mut self.doge_headers,
+                        &mut self.doge_heights,
+                        &mut self.doge_tip,
+                        &mut self.doge_tip_height,
+                        &anchor,
+                        &retarget,
+                    )?;
+                    doge_relay_update = Some(update);
+                    continue;
+                }
                 created.push((op, output, false));
             }
         }
@@ -1247,11 +1345,19 @@ impl ChainState {
             if output.script_pubkey.first().copied() == Some(BTC_HEADER_BATCH_TAG) {
                 return Err("BtcHeaderBatch output not allowed in coinbase".to_string());
             }
+            if output.script_pubkey.first().copied() == Some(LTC_HEADER_BATCH_TAG) {
+                return Err("LtcHeaderBatch output not allowed in coinbase".to_string());
+            }
+            if output.script_pubkey.first().copied() == Some(DOGE_HEADER_BATCH_TAG) {
+                return Err("DogeHeaderBatch output not allowed in coinbase".to_string());
+            }
             validate_output(
                 output,
                 self.htlcv1_active_at(height),
                 self.mpsov1_active_at(height),
                 self.btc_spv_relay_active_at(height),
+                self.ltc_spv_relay_active_at(height),
+                self.doge_spv_relay_active_at(height),
                 self.htlc_btc_swap_v1_active_at(height),
                 self.htlc_ltc_swap_v1_active_at(height),
                 self.htlc_doge_swap_v1_active_at(height),
@@ -1329,6 +1435,8 @@ impl ChainState {
             created: created_outpoints,
             subsidy_created,
             btc_relay_update,
+            ltc_relay_update,
+            doge_relay_update,
             claimed_btc_outpoints_added: btc_outpoints_consumed,
             claimed_ltc_outpoints_added: ltc_outpoints_consumed,
             claimed_doge_outpoints_added: doge_outpoints_consumed,
@@ -1641,6 +1749,8 @@ impl ChainState {
                 self.htlcv1_active_at(height),
                 self.mpsov1_active_at(height),
                 self.btc_spv_relay_active_at(height),
+                self.ltc_spv_relay_active_at(height),
+                self.doge_spv_relay_active_at(height),
                 self.htlc_btc_swap_v1_active_at(height),
                 self.htlc_ltc_swap_v1_active_at(height),
                 self.htlc_doge_swap_v1_active_at(height),
@@ -1676,6 +1786,8 @@ fn validate_output(
     htlcv1_active: bool,
     mpsov1_active: bool,
     btc_spv_relay_active: bool,
+    ltc_spv_relay_active: bool,
+    doge_spv_relay_active: bool,
     htlc_btc_swap_v1_active: bool,
     htlc_ltc_swap_v1_active: bool,
     htlc_doge_swap_v1_active: bool,
@@ -1724,7 +1836,43 @@ fn validate_output(
         return Ok(());
     }
 
-    // All non-MPSOv1, non-BtcHeaderBatch outputs keep the existing 255-byte limit.
+    // LTC SPV header batch output (Phase B): exempt from the 255-byte cap
+    // (can be up to ~11.5 KB for a full 144-header batch), must carry zero
+    // value. Mirrors the BTC SPV gate exactly.
+    if tag == Some(LTC_HEADER_BATCH_TAG) {
+        if !ltc_spv_relay_active {
+            return Err("LtcHeaderBatch output before SPV relay activation".to_string());
+        }
+        if output.value != 0 {
+            return Err("LtcHeaderBatch output must have value 0".to_string());
+        }
+        if output.script_pubkey.len() > MAX_LTC_HEADER_BATCH_BYTES {
+            return Err("LtcHeaderBatch script_pubkey too large".to_string());
+        }
+        parse_ltc_header_batch(&output.script_pubkey)
+            .map_err(|e| format!("Malformed LtcHeaderBatch: {}", e))?;
+        return Ok(());
+    }
+
+    // DOGE SPV header batch output (DOGE Phase B): exempt from the
+    // 255-byte cap (can be up to ~11.5 KB for a full 144-header batch),
+    // must carry zero value. Mirrors the BTC and LTC SPV gates exactly.
+    if tag == Some(DOGE_HEADER_BATCH_TAG) {
+        if !doge_spv_relay_active {
+            return Err("DogeHeaderBatch output before SPV relay activation".to_string());
+        }
+        if output.value != 0 {
+            return Err("DogeHeaderBatch output must have value 0".to_string());
+        }
+        if output.script_pubkey.len() > MAX_DOGE_HEADER_BATCH_BYTES {
+            return Err("DogeHeaderBatch script_pubkey too large".to_string());
+        }
+        parse_doge_header_batch(&output.script_pubkey)
+            .map_err(|e| format!("Malformed DogeHeaderBatch: {}", e))?;
+        return Ok(());
+    }
+
+    // All non-MPSOv1, non-{Btc,Ltc,Doge}HeaderBatch outputs keep the existing 255-byte limit.
     if output.script_pubkey.len() > 0xff {
         return Err("script_pubkey too large".to_string());
     }
@@ -3151,6 +3299,8 @@ mod tests {
             lwma_v2: None,
         auxpow_activation_height: None,
             btc_spv: None,
+            ltc_spv: None,
+            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,
@@ -3232,6 +3382,8 @@ mod tests {
             lwma_v2: None,
         auxpow_activation_height: None,
             btc_spv: None,
+            ltc_spv: None,
+            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,
@@ -3944,6 +4096,8 @@ mod tests {
             lwma_v2: v2,
             auxpow_activation_height: None,
             btc_spv: None,
+            ltc_spv: None,
+            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,
@@ -4199,6 +4353,8 @@ mod tests {
             lwma_v2: None,
         auxpow_activation_height: None,
             btc_spv: None,
+            ltc_spv: None,
+            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,

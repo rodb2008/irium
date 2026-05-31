@@ -249,6 +249,22 @@ pub struct HtlcBtcSwapV1Output {
     pub funding_binding: [u8; 8],
 }
 
+/// HtlcLtcSwapV1 output (Phase C). Same layout as HtlcBtcSwapV1, just
+/// referencing the LTC payment side. The 8-byte funding_binding is
+/// computed identically (`compute_funding_binding` is chain-agnostic),
+/// and the LTC OP_RETURN payload uses `LTC_OP_RETURN_BINDING_MAGIC`
+/// instead of BTC's magic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtlcLtcSwapV1Output {
+    pub confirmations_required: u8,
+    pub recipient_pkh: [u8; 20],
+    pub refund_pkh: [u8; 20],
+    pub ltc_recipient_pkh: [u8; 20],
+    pub ltc_amount_sats: u64,
+    pub timeout_height: u64,
+    pub funding_binding: [u8; 8],
+}
+
 /// SwapOrder lifecycle object: on-chain advertised offer to swap IRM<->BTC.
 /// Sell-IRM (`direction=0x01`) outputs lock `irm_amount` for a taker to
 /// claim via a covenant-enforced HtlcBtcSwapV1 fill. Buy-IRM
@@ -324,6 +340,7 @@ pub enum OutputEncumbrance {
     HtlcDogeSwapV1(HtlcDogeSwapV1Output),
     DogeSwapOrder(DogeSwapOrderOutput),
     SwapOrder(SwapOrderOutput),
+    LtcSwapOrder(LtcSwapOrderOutput),
     Unknown,
 }
 
@@ -404,6 +421,25 @@ pub enum HtlcBtcSwapWitness {
         btc_merkle_branch: Vec<[u8; 32]>,
         btc_merkle_index: u32,
         btc_tx_raw: Vec<u8>,
+    },
+    Refund {
+        sig: Vec<u8>,
+        pubkey: Vec<u8>,
+    },
+}
+
+/// HtlcLtcSwapV1 witness branches. Mirrors HtlcBtcSwapWitness — the LTC
+/// payment proof is structurally identical (sha256d Merkle tree, same
+/// branch encoding, same P2PKH-style payment recognition).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HtlcLtcSwapWitness {
+    Claim {
+        sig: Vec<u8>,
+        pubkey: Vec<u8>,
+        ltc_block_hash: [u8; 32],
+        ltc_merkle_branch: Vec<[u8; 32]>,
+        ltc_merkle_index: u32,
+        ltc_tx_raw: Vec<u8>,
     },
     Refund {
         sig: Vec<u8>,

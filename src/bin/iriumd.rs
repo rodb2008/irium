@@ -44,7 +44,7 @@ use irium_node_rs::chain::{
 };
 use irium_node_rs::constants::{block_reward, coinbase_maturity, COINBASE_MATURITY};
 use irium_node_rs::genesis::load_locked_genesis;
-use irium_node_rs::mempool::{evict_invalid_mempool_entries, MempoolManager};
+use irium_node_rs::mempool::{evict_invalid_mempool_entries, MempoolManager, MempoolPriority};
 use irium_node_rs::network::SeedlistManager;
 use irium_node_rs::network_era::network_era;
 use irium_node_rs::p2p::P2PNode;
@@ -802,6 +802,42 @@ struct WalletReceiveResponse {
 #[derive(Serialize)]
 struct WalletLockResponse {
     locked: bool,
+}
+
+#[derive(Serialize)]
+struct WalletInfoResponse {
+    exists: bool,
+    mode: WalletMode,
+    path: String,
+    is_unlocked: bool,
+    plaintext_backups: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct WalletMigrateRequest {
+    passphrase: String,
+}
+
+#[derive(Serialize)]
+struct WalletMigrateResponse {
+    path: String,
+    addresses: Vec<String>,
+    mode: WalletMode,
+}
+
+#[derive(Deserialize)]
+struct WalletRecoverRequest {
+    /// 64-hex (custom derivation) or 128-hex (BIP32 seed bytes).
+    seed_hex: String,
+    passphrase: String,
+    #[serde(default)]
+    allow_overwrite: bool,
+}
+
+#[derive(Serialize)]
+struct WalletRecoverResponse {
+    address: String,
+    path: String,
 }
 
 #[derive(Serialize)]
@@ -5566,9 +5602,16 @@ async fn wallet_unlock(
     require_rpc_auth(&headers)?;
 
     let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-    wallet
-        .unlock(&req.passphrase)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Distinguish "wallet needs migration" (file is plaintext, caller
+    // must POST /wallet/migrate_to_encrypted first) from "wrong
+    // passphrase" so the frontend can route correctly. 409 = state
+    // conflict; 400 = bad credentials.
+    if let Err(e) = wallet.unlock(&req.passphrase) {
+        if e == "wallet_needs_migration" {
+            return Err(StatusCode::CONFLICT);
+        }
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let addresses = wallet.addresses().map_err(|_| StatusCode::BAD_REQUEST)?;
     let current = wallet
         .current_address()
@@ -5577,6 +5620,89 @@ async fn wallet_unlock(
     Ok(Json(WalletUnlockResponse {
         addresses,
         current_address: current,
+    }))
+}
+
+async fn wallet_info(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WalletInfoResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let mode = wallet.mode();
+    let exists = !matches!(mode, WalletMode::None);
+    let is_unlocked = wallet.is_unlocked();
+    let path = wallet.path().display().to_string();
+    let plaintext_backups: Vec<String> = wallet
+        .plaintext_backups()
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect();
+
+    Ok(Json(WalletInfoResponse {
+        exists,
+        mode,
+        path,
+        is_unlocked,
+        plaintext_backups,
+    }))
+}
+
+async fn wallet_migrate_to_encrypted(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<WalletMigrateRequest>,
+) -> Result<Json<WalletMigrateResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = wallet.migrate_to_encrypted(&req.passphrase) {
+        if e == "already_encrypted" {
+            return Err(StatusCode::CONFLICT);
+        }
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let addresses = wallet.addresses().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let path = wallet.path().display().to_string();
+    Ok(Json(WalletMigrateResponse {
+        path,
+        addresses,
+        mode: WalletMode::Encrypted,
+    }))
+}
+
+async fn wallet_recover_from_seed(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<WalletRecoverRequest>,
+) -> Result<Json<WalletRecoverResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let key = match wallet.recover_from_seed(
+        &req.seed_hex,
+        &req.passphrase,
+        req.allow_overwrite,
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            if e == "wallet_exists" {
+                return Err(StatusCode::CONFLICT);
+            }
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+    let path = wallet.path().display().to_string();
+    Ok(Json(WalletRecoverResponse {
+        address: key.address,
+        path,
     }))
 }
 
@@ -6223,7 +6349,17 @@ async fn submit_btc_headers(
     if req.broadcast.unwrap_or(true) {
         let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         if !mempool.contains(&txid) {
-            match mempool.add_transaction(tx.clone(), raw_tx.clone(), fee_checked) {
+            // BtcHeaderBatch carrier tx: ZeroFeeAllowed so a BTC-only
+            // buyer can extend the relay before their claim. peer_ip is
+            // the caller's RPC source; loopback bypasses the rate limit
+            // so the local operator and Tauri client are unthrottled.
+            match mempool.add_transaction_with_priority(
+                tx.clone(),
+                raw_tx.clone(),
+                fee_checked,
+                MempoolPriority::ZeroFeeAllowed,
+                Some(addr.ip()),
+            ) {
                 Ok(_) => accepted = true,
                 Err(e) => {
                     eprintln!("[submit_btc_headers] mempool_reject reason={}", e);
@@ -7492,11 +7628,11 @@ async fn claim_btc_swap(
     }
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(bad("funding_value_le_fee"));
     }
-    let payout = funding_out.output.value - fee;
+    let mut payout = funding_out.output.value - fee;
 
     let mut tx = Transaction {
         version: 1,
@@ -7513,7 +7649,6 @@ async fn claim_btc_swap(
         locktime: 0,
     };
 
-    let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
     let priv_bytes =
         hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
@@ -7523,12 +7658,6 @@ async fn claim_btc_swap(
     sk_bytes.copy_from_slice(&priv_bytes);
     let signing_key = SigningKey::from_bytes((&sk_bytes).into())
         .map_err(|_| bad("signing_key_init_failed"))?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
@@ -7586,8 +7715,17 @@ async fn claim_btc_swap(
     if req.broadcast.unwrap_or(false) {
         let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         if !mempool.contains(&txid_out) {
+            // HtlcBtcSwapV1 BTC-proof claim: ZeroFeeAllowed so a buyer
+            // with no IRM can receive the full swap value with zero
+            // network deduction.
             accepted = mempool
-                .add_transaction(tx, raw.clone(), fee_checked)
+                .add_transaction_with_priority(
+                    tx,
+                    raw.clone(),
+                    fee_checked,
+                    MempoolPriority::ZeroFeeAllowed,
+                    Some(addr.ip()),
+                )
                 .is_ok();
         }
     }
@@ -10401,7 +10539,7 @@ async fn fill_swap_order(
     };
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee.saturating_add(order.irm_amount).saturating_sub(funding_out.output.value)
         && order.direction == SWAP_ORDER_DIRECTION_SELL
         && funding_out.output.value < order.irm_amount
@@ -10491,13 +10629,6 @@ async fn fill_swap_order(
     };
 
     let scriptcode_order = encode_swap_order_script(&order);
-    let digest_order = signature_digest(&tx, 0, &scriptcode_order);
-    let order_sig: Signature = signing_key
-        .sign_prehash(&digest_order)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let order_sig = order_sig.normalize_s().unwrap_or(order_sig);
-    let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
-    order_sig_bytes.push(0x01);
 
     // 2-pass fee recalc: estimate_tx_size(1,1) under-counts the order fill
     // witness (sig + pubkey + taker_pkh + timeout) and any extra P2PKH
@@ -10513,11 +10644,53 @@ async fn fill_swap_order(
         let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
         order_sig_bytes.push(0x01);
 
-    if !extra_inputs.is_empty() {
-        let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
-        key_map.insert(taker_iriumd_pkh, wallet_key.clone());
-        sign_wallet_inputs(&mut tx, &extra_inputs, &key_map)
-            .map_err(|_| bad("sign_extra_inputs_failed"))?;
+        let witness = match order.direction {
+            SWAP_ORDER_DIRECTION_SELL => encode_swap_order_fill_sell_witness(
+                &order_sig_bytes,
+                &pubkey,
+                &taker_iriumd_pkh,
+                timeout_height,
+            )
+            .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
+            SWAP_ORDER_DIRECTION_BUY => encode_swap_order_fill_buy_witness(
+                &order_sig_bytes,
+                &pubkey,
+                timeout_height,
+            )
+            .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
+            _ => return Err(bad("order_direction_unknown")),
+        };
+        tx.inputs[0].script_sig = witness;
+
+        if !extra_inputs.is_empty() {
+            let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+            key_map.insert(taker_iriumd_pkh, wallet_key.clone());
+            sign_wallet_inputs(&mut tx, &extra_inputs, &key_map)
+                .map_err(|_| bad("sign_extra_inputs_failed"))?;
+        }
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            // Reduce change (always the last output when there is one) to
+            // absorb the shortfall. Covenant output 0 is fixed by spec; we
+            // cannot touch it. If no change exists or change can't cover
+            // the delta, reject — caller can retry with a higher
+            // fee_per_byte or pre-funded inputs.
+            if tx.outputs.len() > 1 {
+                let change_idx = tx.outputs.len() - 1;
+                if tx.outputs[change_idx].value > extra {
+                    fee = needed_fee;
+                    tx.outputs[change_idx].value -= extra;
+                    continue;
+                } else {
+                    return Err(bad("fee_recalculation_exceeded_change"));
+                }
+            } else {
+                return Err(bad("fee_recalculation_no_change_to_reduce"));
+            }
+        }
+        break;
     }
 
     let fee_checked = {
@@ -10532,8 +10705,23 @@ async fn fill_swap_order(
     if req.broadcast.unwrap_or(false) {
         let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         if !mempool.contains(&txid_out) {
+            // sell_irm fill is the BTC-buyer covenant tx: ZeroFeeAllowed
+            // so the taker (who has no IRM) can fill at zero fee. buy_irm
+            // fillers DO have IRM (they're providing the IRM side) so
+            // their fills remain Standard.
+            let priority = if order.direction == SWAP_ORDER_DIRECTION_SELL {
+                MempoolPriority::ZeroFeeAllowed
+            } else {
+                MempoolPriority::Standard
+            };
             accepted = mempool
-                .add_transaction(tx, raw.clone(), fee_checked)
+                .add_transaction_with_priority(
+                    tx,
+                    raw.clone(),
+                    fee_checked,
+                    priority,
+                    Some(addr.ip()),
+                )
                 .is_ok();
         }
     }
@@ -15580,6 +15768,8 @@ async fn main() {
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
             btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
+            ltc_spv: irium_node_rs::ltc_spv::resolve_ltc_spv_params(network),
+            doge_spv: irium_node_rs::doge_spv::resolve_doge_spv_params(network),
             htlc_btc_swap_v1_activation_height:
                 irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
             htlc_ltc_swap_v1_activation_height:
@@ -17603,6 +17793,9 @@ async fn explorer_stats(
         .route("/wallet/create", post(wallet_create))
         .route("/wallet/unlock", post(wallet_unlock))
         .route("/wallet/lock", post(wallet_lock))
+        .route("/wallet/info", get(wallet_info))
+        .route("/wallet/migrate_to_encrypted", post(wallet_migrate_to_encrypted))
+        .route("/wallet/recover_from_seed", post(wallet_recover_from_seed))
         .route("/wallet/addresses", get(wallet_addresses))
         .route("/wallet/receive", get(wallet_receive))
         .route("/wallet/new_address", post(wallet_new_address))
@@ -17782,6 +17975,8 @@ mod tests {
             lwma_v2: None,
             auxpow_activation_height: None,
             btc_spv: None,
+            ltc_spv: None,
+            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,
@@ -18703,6 +18898,8 @@ mod tests {
             lwma_v2: None,
             auxpow_activation_height: None,
             btc_spv: None,
+            ltc_spv: None,
+            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,

@@ -338,6 +338,108 @@ pub fn resolved_btc_spv_relay_activation_height(network: NetworkKind) -> Option<
     }
 }
 
+/// Devnet/testnet override for the LTC SPV header relay activation height.
+/// Read from `IRIUM_LTC_SPV_RELAY_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once Phase B callers come online
+pub fn runtime_ltc_spv_relay_env_override() -> Option<u64> {
+    env::var("IRIUM_LTC_SPV_RELAY_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once Phase B callers come online
+pub fn resolved_ltc_spv_relay_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_ltc_spv_relay_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the DOGE SPV header relay activation height.
+/// Read from `IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once Phase B (doge) callers come online
+pub fn runtime_doge_spv_relay_env_override() -> Option<u64> {
+    env::var("IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once Phase B (doge) callers come online
+pub fn resolved_doge_spv_relay_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_doge_spv_relay_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the HtlcLtcSwapV1 activation height.
+/// Read from `IRIUM_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once Phase C callers come online
+pub fn runtime_htlc_ltc_swap_v1_env_override() -> Option<u64> {
+    env::var("IRIUM_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once Phase C callers come online
+pub fn resolved_htlc_ltc_swap_v1_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_htlc_ltc_swap_v1_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the LtcSwapOrder activation height.
+/// Read from `IRIUM_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once Phase D callers come online
+pub fn runtime_ltc_swap_order_v1_env_override() -> Option<u64> {
+    env::var("IRIUM_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once Phase D callers come online
+pub fn resolved_ltc_swap_order_v1_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_ltc_swap_order_v1_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the HtlcDogeSwapV1 activation height.
+/// Read from `IRIUM_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once DOGE Phase C callers come online
+pub fn runtime_htlc_doge_swap_v1_env_override() -> Option<u64> {
+    env::var("IRIUM_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once DOGE Phase C callers come online
+pub fn resolved_htlc_doge_swap_v1_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_htlc_doge_swap_v1_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the DogeSwapOrder activation height.
+/// Read from `IRIUM_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT`. Ignored on mainnet.
+#[allow(dead_code)] // wired through ChainParams once DOGE Phase D callers come online
+pub fn runtime_doge_swap_order_v1_env_override() -> Option<u64> {
+    env::var("IRIUM_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once DOGE Phase D callers come online
+pub fn resolved_doge_swap_order_v1_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_doge_swap_order_v1_env_override(),
+    }
+}
+
 /// Devnet/testnet override for the HtlcBtcSwapV1 activation height.
 /// Read from `IRIUM_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT`. Ignored on mainnet.
 #[allow(dead_code)] // wired through ChainParams once Phase 2 callers come online

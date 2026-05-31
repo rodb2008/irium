@@ -696,6 +696,11 @@ fn mempool_entries_from_template(
             added: 0,
             relays: Vec::new(),
             relay_addresses: tx.relay_addresses.clone().unwrap_or_default(),
+            // Synthesised entry — the miner never persists or evicts
+            // these. Standard is the safe default since this code path
+            // pre-dates the priority field and the new admission policy
+            // only matters at /rpc/submit and P2P ingress.
+            priority: irium_node_rs::mempool::MempoolPriority::Standard,
         });
     }
     out
@@ -760,6 +765,7 @@ fn load_mempool_entries(
             added: 0,
             relays: Vec::new(),
             relay_addresses: Vec::new(),
+            priority: irium_node_rs::mempool::MempoolPriority::Standard,
         });
     }
     out
