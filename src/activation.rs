@@ -207,6 +207,17 @@ pub const MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = None;
 /// consensus-wiring commit.
 pub const MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = None;
 
+/// Mainnet HtlcDogeSwapV1 activation height (Phase C).
+///
+/// `None` keeps the DOGE-proof claim path disabled on mainnet. When set
+/// to `Some(<height>)`, blocks at or after that height may carry
+/// HtlcDogeSwapV1 outputs (script tag `0xca`) and the validator will
+/// accept DOGE-proof claim witnesses against them.
+///
+/// Phase C ships disabled. Activation should not precede
+/// `MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT`, otherwise no proof would
+/// resolve.
+
 /// Mainnet HtlcBtcSwapV1 activation height (Phase 2).
 ///
 /// `None` keeps the BTC-proof claim path disabled on mainnet. When set to
@@ -959,4 +970,5 @@ mod tests {
         );
         std::env::remove_var("IRIUM_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
     }
+
 }

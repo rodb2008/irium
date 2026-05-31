@@ -50,6 +50,7 @@ async fn main() {
             btc_spv: None,
             ltc_spv: None,
             doge_spv: None,
+            htlc_doge_swap_v1_activation_height: None,
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,

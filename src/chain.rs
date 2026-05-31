@@ -37,25 +37,36 @@ use crate::constants::{
 use crate::genesis::LockedGenesis;
 use crate::pow::{meets_target, min_difficulty_target, sha256d, Target};
 use crate::tx::{
-    compute_funding_binding, decode_hex, encode_htlc_btc_swap_v1_script,
-    encode_htlc_ltc_swap_v1_script, encode_htlcv1_script,
-    encode_ltc_swap_order_script,
-    encode_mpso_script, encode_swap_order_script, p2pkh_script, parse_htlc_btc_swap_v1_script,
-    parse_htlc_btc_swap_witness, parse_htlc_ltc_swap_v1_script, parse_htlc_ltc_swap_witness,
-    parse_htlcv1_script, parse_input_witness, parse_ltc_swap_order_script,
-    parse_ltc_swap_order_witness, parse_mpso_script,
+    compute_funding_binding, decode_hex,
+    encode_htlc_btc_swap_v1_script, encode_htlc_ltc_swap_v1_script,
+    encode_htlc_doge_swap_v1_script, encode_htlcv1_script,
+    encode_ltc_swap_order_script, encode_mpso_script, encode_swap_order_script,
+    p2pkh_script,
+    parse_htlc_btc_swap_v1_script, parse_htlc_btc_swap_witness,
+    parse_htlc_ltc_swap_v1_script, parse_htlc_ltc_swap_witness,
+    parse_htlc_doge_swap_v1_script, parse_htlc_doge_swap_witness,
+    parse_htlcv1_script, parse_input_witness,
+    parse_ltc_swap_order_script, parse_ltc_swap_order_witness, parse_mpso_script,
     parse_output_encumbrance, parse_swap_order_script, parse_swap_order_witness,
-    HtlcBtcSwapV1Output, HtlcBtcSwapWitness, HtlcLtcSwapV1Output, HtlcLtcSwapWitness,
+    HtlcBtcSwapV1Output, HtlcBtcSwapWitness,
+    HtlcLtcSwapV1Output, HtlcLtcSwapWitness,
+    HtlcDogeSwapV1Output, HtlcDogeSwapWitness,
     HtlcV1Output, InputWitness, LtcSwapOrderWitness, MpsoV1Output,
     OutputEncumbrance, SwapOrderWitness, Transaction, TxInput, TxOutput,
-    BTC_OP_RETURN_BINDING_LEN, BTC_OP_RETURN_BINDING_MAGIC, HTLC_BTC_SWAP_V1_SCRIPT_LEN,
-    HTLC_BTC_SWAP_V1_TAG, HTLC_LTC_SWAP_V1_SCRIPT_LEN, HTLC_LTC_SWAP_V1_TAG,
-    HTLC_V1_SCRIPT_TAG, LTC_OP_RETURN_BINDING_LEN, LTC_OP_RETURN_BINDING_MAGIC,
+    BTC_OP_RETURN_BINDING_LEN, BTC_OP_RETURN_BINDING_MAGIC,
+    LTC_OP_RETURN_BINDING_LEN, LTC_OP_RETURN_BINDING_MAGIC,
+    DOGE_OP_RETURN_BINDING_LEN, DOGE_OP_RETURN_BINDING_MAGIC,
+    HTLC_BTC_SWAP_V1_SCRIPT_LEN, HTLC_BTC_SWAP_V1_TAG,
+    HTLC_LTC_SWAP_V1_SCRIPT_LEN, HTLC_LTC_SWAP_V1_TAG,
+    HTLC_DOGE_SWAP_V1_SCRIPT_LEN, HTLC_DOGE_SWAP_V1_TAG,
+    HTLC_V1_SCRIPT_TAG,
     LTC_SWAP_ORDER_BUY_SCRIPT_LEN, LTC_SWAP_ORDER_DIRECTION_BUY,
     LTC_SWAP_ORDER_DIRECTION_SELL, LTC_SWAP_ORDER_MAX_SWEEP_FEE,
     LTC_SWAP_ORDER_MIN_LOCKED_VALUE, LTC_SWAP_ORDER_SELL_SCRIPT_LEN, LTC_SWAP_ORDER_V1_TAG,
     MAX_HTLC_BTC_SWAP_CONFIRMATIONS, MAX_HTLC_LTC_SWAP_CONFIRMATIONS,
+    MAX_HTLC_DOGE_SWAP_CONFIRMATIONS,
     MIN_HTLC_BTC_SWAP_CONFIRMATIONS, MIN_HTLC_LTC_SWAP_CONFIRMATIONS,
+    MIN_HTLC_DOGE_SWAP_CONFIRMATIONS,
     MPSO_V1_MAX_WITNESS_SIZE, MPSO_V1_TAG,
     SWAP_ORDER_BUY_SCRIPT_LEN, SWAP_ORDER_DIRECTION_BUY, SWAP_ORDER_DIRECTION_SELL,
     SWAP_ORDER_MAX_SWEEP_FEE, SWAP_ORDER_MIN_LOCKED_VALUE, SWAP_ORDER_SELL_SCRIPT_LEN,
@@ -166,6 +177,7 @@ pub struct ChainParams {
     /// LTC-proof claim path disabled. Same precondition relationship to
     /// `ltc_spv.activation_height` as the BTC pair above.
     pub htlc_ltc_swap_v1_activation_height: Option<u64>,
+    pub htlc_doge_swap_v1_activation_height: Option<u64>,
     /// SwapOrder activation height (Phase 3). `None` keeps the on-chain
     /// order book disabled. Sell-direction fills emit HtlcBtcSwapV1
     /// outputs, so activating before `htlc_btc_swap_v1_activation_height`
@@ -217,6 +229,7 @@ struct BlockUndo {
     /// by HtlcLtcSwapV1 LTC-proof claims in this block (Phase C). Removed
     /// on disconnect.
     claimed_ltc_outpoints_added: Vec<([u8; 32], u32)>,
+    claimed_doge_outpoints_added: Vec<([u8; 32], u32)>,
 }
 
 /// Read-only handle over the consensus state fields a transaction validator
@@ -230,9 +243,13 @@ pub struct ConsensusView<'a> {
     pub claimed_btc_outpoints: &'a HashSet<([u8; 32], u32)>,
     /// Phase C: LTC SPV state needed by HtlcLtcSwapV1 claim verification.
     pub ltc_headers: &'a HashMap<[u8; 32], LtcHeaderEntry>,
+    pub doge_headers: &'a HashMap<[u8; 32], DogeHeaderEntry>,
     pub ltc_heights: &'a HashMap<[u8; 32], u64>,
+    pub doge_heights: &'a HashMap<[u8; 32], u64>,
     pub ltc_tip_height: u64,
+    pub doge_tip_height: u64,
     pub claimed_ltc_outpoints: &'a HashSet<([u8; 32], u32)>,
+    pub claimed_doge_outpoints: &'a HashSet<([u8; 32], u32)>,
 }
 
 #[derive(Debug)]
@@ -273,6 +290,7 @@ pub struct ChainState {
     /// Replay-protection set: LTC outpoints already consumed by an
     /// HtlcLtcSwapV1 claim (Phase C). Mirrors `claimed_btc_outpoints`.
     pub claimed_ltc_outpoints: HashSet<([u8; 32], u32)>,
+    pub claimed_doge_outpoints: HashSet<([u8; 32], u32)>,
     /// DOGE SPV header relay state — populated only after DOGE Phase B
     /// activation. Mirrors the BTC and LTC SPV layouts.
     pub doge_headers: HashMap<[u8; 32], DogeHeaderEntry>,
@@ -316,6 +334,7 @@ impl ChainState {
             ltc_tip: None,
             ltc_tip_height: 0,
             claimed_ltc_outpoints: HashSet::new(),
+            claimed_doge_outpoints: HashSet::new(),
             doge_headers: HashMap::new(),
             doge_heights: HashMap::new(),
             doge_tip: None,
@@ -429,6 +448,13 @@ impl ChainState {
             .unwrap_or(false)
     }
 
+    fn htlc_doge_swap_v1_active_at(&self, height: u64) -> bool {
+        self.params
+            .htlc_doge_swap_v1_activation_height
+            .map(|h| height >= h)
+            .unwrap_or(false)
+    }
+
     fn ltc_swap_order_v1_active_at(&self, height: u64) -> bool {
         self.params
             .ltc_swap_order_v1_activation_height
@@ -457,9 +483,13 @@ impl ChainState {
             btc_tip_height: self.btc_tip_height,
             claimed_btc_outpoints: &self.claimed_btc_outpoints,
             ltc_headers: &self.ltc_headers,
+            doge_headers: &self.doge_headers,
             ltc_heights: &self.ltc_heights,
+            doge_heights: &self.doge_heights,
             ltc_tip_height: self.ltc_tip_height,
+            doge_tip_height: self.doge_tip_height,
             claimed_ltc_outpoints: &self.claimed_ltc_outpoints,
+            claimed_doge_outpoints: &self.claimed_doge_outpoints,
         }
     }
 
@@ -878,6 +908,9 @@ impl ChainState {
         for consumed in &undo.claimed_ltc_outpoints_added {
             self.claimed_ltc_outpoints.remove(consumed);
         }
+        for consumed in &undo.claimed_doge_outpoints_added {
+            self.claimed_doge_outpoints.remove(consumed);
+        }
 
         for op in undo.created {
             self.utxos.remove(&op);
@@ -1177,6 +1210,7 @@ impl ChainState {
         let mut ltc_relay_update: Option<LtcRelayUpdate> = None;
         let mut ltc_batch_count: usize = 0;
         let mut ltc_outpoints_consumed: Vec<([u8; 32], u32)> = Vec::new();
+        let mut doge_outpoints_consumed: Vec<([u8; 32], u32)> = Vec::new();
         let mut doge_relay_update: Option<DogeRelayUpdate> = None;
         let mut doge_batch_count: usize = 0;
 
@@ -1188,6 +1222,7 @@ impl ChainState {
                 &mut fees,
                 &mut btc_outpoints_consumed,
                 &mut ltc_outpoints_consumed,
+                &mut doge_outpoints_consumed,
             )?;
             let txid = tx.txid();
             for (index, output) in tx.outputs.iter().cloned().enumerate() {
@@ -1312,6 +1347,7 @@ impl ChainState {
                 self.doge_spv_relay_active_at(height),
                 self.htlc_btc_swap_v1_active_at(height),
                 self.htlc_ltc_swap_v1_active_at(height),
+                self.htlc_doge_swap_v1_active_at(height),
                 self.swap_order_v1_active_at(height),
                 self.ltc_swap_order_v1_active_at(height),
                 height,
@@ -1376,6 +1412,9 @@ impl ChainState {
         for consumed in &ltc_outpoints_consumed {
             self.claimed_ltc_outpoints.insert(*consumed);
         }
+        for consumed in &doge_outpoints_consumed {
+            self.claimed_doge_outpoints.insert(*consumed);
+        }
 
         let undo = BlockUndo {
             spent: spent_for_undo,
@@ -1386,6 +1425,7 @@ impl ChainState {
             doge_relay_update,
             claimed_btc_outpoints_added: btc_outpoints_consumed,
             claimed_ltc_outpoints_added: ltc_outpoints_consumed,
+            claimed_doge_outpoints_added: doge_outpoints_consumed,
         };
 
         Ok((fees as u64, coinbase_total, subsidy_created, undo))
@@ -1406,6 +1446,7 @@ impl ChainState {
         let mut fees: i64 = 0;
         let mut btc_consumed: Vec<([u8; 32], u32)> = Vec::new();
         let mut ltc_consumed: Vec<([u8; 32], u32)> = Vec::new();
+        let mut doge_consumed: Vec<([u8; 32], u32)> = Vec::new();
         self.validate_transaction_internal(
             tx,
             self.height,
@@ -1413,6 +1454,7 @@ impl ChainState {
             &mut fees,
             &mut btc_consumed,
             &mut ltc_consumed,
+            &mut doge_consumed,
         )
     }
 
@@ -1422,6 +1464,7 @@ impl ChainState {
         let mut fees: i64 = 0;
         let mut btc_consumed: Vec<([u8; 32], u32)> = Vec::new();
         let mut ltc_consumed: Vec<([u8; 32], u32)> = Vec::new();
+        let mut doge_consumed: Vec<([u8; 32], u32)> = Vec::new();
         self.validate_transaction_internal(
             tx,
             self.height,
@@ -1429,6 +1472,7 @@ impl ChainState {
             &mut fees,
             &mut btc_consumed,
             &mut ltc_consumed,
+            &mut doge_consumed,
         )?;
         Ok(fees as u64)
     }
@@ -1505,6 +1549,7 @@ impl ChainState {
             ltc_tip: self.ltc_tip,
             ltc_tip_height: self.ltc_tip_height,
             claimed_ltc_outpoints: self.claimed_ltc_outpoints.clone(),
+            claimed_doge_outpoints: self.claimed_doge_outpoints.clone(),
             doge_headers: self.doge_headers.clone(),
             doge_heights: self.doge_heights.clone(),
             doge_tip: self.doge_tip,
@@ -1630,6 +1675,7 @@ impl ChainState {
         fees: &mut i64,
         btc_outpoints_consumed: &mut Vec<([u8; 32], u32)>,
         ltc_outpoints_consumed: &mut Vec<([u8; 32], u32)>,
+        doge_outpoints_consumed: &mut Vec<([u8; 32], u32)>,
     ) -> Result<(), String> {
         let view = self.build_consensus_view();
         let mut input_total: i64 = 0;
@@ -1666,11 +1712,13 @@ impl ChainState {
                 self.mpsov1_active_at(height),
                 self.htlc_btc_swap_v1_active_at(height),
                 self.htlc_ltc_swap_v1_active_at(height),
+                self.htlc_doge_swap_v1_active_at(height),
                 self.swap_order_v1_active_at(height),
                 self.ltc_swap_order_v1_active_at(height),
                 &view,
                 btc_outpoints_consumed,
                 ltc_outpoints_consumed,
+                doge_outpoints_consumed,
             ) {
                 return Err("Transaction signature verification failed".to_string());
             }
@@ -1690,6 +1738,7 @@ impl ChainState {
                 self.doge_spv_relay_active_at(height),
                 self.htlc_btc_swap_v1_active_at(height),
                 self.htlc_ltc_swap_v1_active_at(height),
+                self.htlc_doge_swap_v1_active_at(height),
                 self.swap_order_v1_active_at(height),
                 self.ltc_swap_order_v1_active_at(height),
                 height,
@@ -1725,6 +1774,7 @@ fn validate_output(
     doge_spv_relay_active: bool,
     htlc_btc_swap_v1_active: bool,
     htlc_ltc_swap_v1_active: bool,
+    htlc_doge_swap_v1_active: bool,
     swap_order_v1_active: bool,
     ltc_swap_order_v1_active: bool,
     height: u64,
@@ -1858,6 +1908,26 @@ fn validate_output(
         }
         if swap.timeout_height <= height {
             return Err("HtlcLtcSwapV1 timeout_height must exceed current height".to_string());
+        }
+    }
+    if tag == Some(HTLC_DOGE_SWAP_V1_TAG) {
+        if !htlc_doge_swap_v1_active {
+            return Err("HtlcDogeSwapV1 output before activation".to_string());
+        }
+        if output.script_pubkey.len() != HTLC_DOGE_SWAP_V1_SCRIPT_LEN {
+            return Err("HtlcDogeSwapV1 script wrong size".to_string());
+        }
+        let swap = parse_htlc_doge_swap_v1_script(&output.script_pubkey)
+            .ok_or_else(|| "Malformed HtlcDogeSwapV1 output".to_string())?;
+        if swap.confirmations_required < MIN_HTLC_DOGE_SWAP_CONFIRMATIONS
+            || swap.confirmations_required > MAX_HTLC_DOGE_SWAP_CONFIRMATIONS
+        {
+            return Err(
+                "HtlcDogeSwapV1 confirmations_required out of allowed range".to_string()
+            );
+        }
+        if swap.timeout_height <= height {
+            return Err("HtlcDogeSwapV1 timeout_height must exceed current height".to_string());
         }
     }
 
@@ -2008,11 +2078,13 @@ fn verify_transaction_signature(
     mpsov1_active: bool,
     htlc_btc_swap_v1_active: bool,
     htlc_ltc_swap_v1_active: bool,
+    htlc_doge_swap_v1_active: bool,
     swap_order_v1_active: bool,
     ltc_swap_order_v1_active: bool,
     view: &ConsensusView<'_>,
     btc_outpoints_consumed: &mut Vec<([u8; 32], u32)>,
     ltc_outpoints_consumed: &mut Vec<([u8; 32], u32)>,
+    doge_outpoints_consumed: &mut Vec<([u8; 32], u32)>,
 ) -> bool {
     match parse_output_encumbrance(&utxo.script_pubkey) {
         OutputEncumbrance::P2pkh(expected_pkh) => {
@@ -2429,6 +2501,129 @@ fn verify_transaction_signature(
                         return false;
                     }
                     let scriptcode = encode_htlc_ltc_swap_v1_script(&swap);
+                    verify_sig_with_pubkey(tx, input_index, &scriptcode, &sig, &pubkey)
+                }
+            }
+        }
+        OutputEncumbrance::HtlcDogeSwapV1(swap) => {
+            // Phase C: byte-level mirror of the HtlcBtcSwapV1 arm above,
+            // reading LTC SPV state from `view.ltc_*` instead of BTC's
+            // and threading `doge_outpoints_consumed` for replay protection.
+            // The Bitcoin tx parser (`btc_txid`, `parse_btc_tx_outputs`) is
+            // reused as-is because LTC transactions are byte-identical to
+            // BTC's; only the PoW algorithm differs and that was already
+            // validated by the LTC SPV relay when the header was applied.
+            if !htlc_doge_swap_v1_active {
+                return false;
+            }
+            let witness = match parse_htlc_doge_swap_witness(&txin.script_sig) {
+                Some(w) => w,
+                None => return false,
+            };
+            match witness {
+                HtlcDogeSwapWitness::Claim {
+                    sig,
+                    pubkey,
+                    doge_block_hash,
+                    doge_merkle_branch,
+                    doge_merkle_index,
+                    doge_tx_raw,
+                } => {
+                    let proof_height = match view.doge_heights.get(&doge_block_hash) {
+                        Some(h) => *h,
+                        None => return false,
+                    };
+                    let confs = view
+                        .doge_tip_height
+                        .saturating_add(1)
+                        .saturating_sub(proof_height);
+                    if confs < swap.confirmations_required as u64 {
+                        return false;
+                    }
+                    let header_entry = match view.doge_headers.get(&doge_block_hash) {
+                        Some(e) => e,
+                        None => return false,
+                    };
+                    let doge_txid_val = match btc_txid(&doge_tx_raw) {
+                        Ok(t) => t,
+                        Err(_) => return false,
+                    };
+                    let computed_root = crate::auxpow::compute_merkle_root(
+                        &doge_txid_val,
+                        &doge_merkle_branch,
+                        doge_merkle_index,
+                    );
+                    if computed_root != header_entry.header.merkle_root {
+                        return false;
+                    }
+                    let outs = match parse_btc_tx_outputs(&doge_tx_raw) {
+                        Ok(o) => o,
+                        Err(_) => return false,
+                    };
+                    let mut expected_payload =
+                        Vec::with_capacity(DOGE_OP_RETURN_BINDING_LEN);
+                    expected_payload.extend_from_slice(&DOGE_OP_RETURN_BINDING_MAGIC);
+                    expected_payload.extend_from_slice(&swap.funding_binding);
+                    let mut pays = false;
+                    let mut op_return_vout: Option<u32> = None;
+                    for o in &outs {
+                        match &o.script {
+                            BtcOutputScript::P2pkh(pkh) => {
+                                if *pkh == swap.doge_recipient_pkh
+                                    && o.value >= swap.doge_amount_sats
+                                {
+                                    pays = true;
+                                }
+                            }
+                            BtcOutputScript::OpReturn(data) => {
+                                if data == &expected_payload {
+                                    if op_return_vout.is_some() {
+                                        return false;
+                                    }
+                                    op_return_vout = Some(o.vout);
+                                }
+                            }
+                            BtcOutputScript::Other => {}
+                        }
+                    }
+                    if !pays {
+                        return false;
+                    }
+                    let vout = match op_return_vout {
+                        Some(v) => v,
+                        None => return false,
+                    };
+                    let consumed = (doge_txid_val, vout);
+                    if view.claimed_doge_outpoints.contains(&consumed) {
+                        return false;
+                    }
+                    if doge_outpoints_consumed.contains(&consumed) {
+                        return false;
+                    }
+                    if hash160(&pubkey) != swap.recipient_pkh {
+                        return false;
+                    }
+                    let scriptcode = encode_htlc_doge_swap_v1_script(&swap);
+                    if !verify_sig_with_pubkey(
+                        tx,
+                        input_index,
+                        &scriptcode,
+                        &sig,
+                        &pubkey,
+                    ) {
+                        return false;
+                    }
+                    doge_outpoints_consumed.push(consumed);
+                    true
+                }
+                HtlcDogeSwapWitness::Refund { sig, pubkey } => {
+                    if spend_height < swap.timeout_height {
+                        return false;
+                    }
+                    if hash160(&pubkey) != swap.refund_pkh {
+                        return false;
+                    }
+                    let scriptcode = encode_htlc_doge_swap_v1_script(&swap);
                     verify_sig_with_pubkey(tx, input_index, &scriptcode, &sig, &pubkey)
                 }
             }
@@ -2905,6 +3100,7 @@ mod tests {
             doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
+            htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
         };
@@ -2986,6 +3182,7 @@ mod tests {
             doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
+            htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
         };
@@ -3698,6 +3895,7 @@ mod tests {
             doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
+            htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
         };
@@ -3953,6 +4151,7 @@ mod tests {
             doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
+            htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
         };
