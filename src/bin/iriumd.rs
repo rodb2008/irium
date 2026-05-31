@@ -17788,6 +17788,7 @@ async fn explorer_stats(
         .route("/rpc/cancelltcswaporder", post(cancel_ltc_swap_order))
         .route("/rpc/fillltcswaporder", post(fill_ltc_swap_order))
         .route("/rpc/sweepltcexpiredorder", post(sweep_ltc_expired_order))
+        .route("/rpc/sweepdogeexpiredorder", post(sweep_doge_expired_order))
         .route("/rpc/sweepexpiredorder", post(sweep_expired_order))
         .route("/wallet/create", post(wallet_create))
         .route("/wallet/unlock", post(wallet_unlock))
