@@ -3212,7 +3212,8 @@ fn main() {
         pow_limit,
         htlcv1_activation_height: htlc_activation,
         mpsov1_activation_height: resolved_mpsov1_activation_height(network),
-            htlc_doge_swap_v1_activation_height: None,
+            htlc_doge_swap_v1_activation_height:
+                irium_node_rs::activation::resolved_htlc_doge_swap_v1_activation_height(network),
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
