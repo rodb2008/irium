@@ -138,7 +138,12 @@ fn run() -> Result<(), String> {
         "INFO",
         &format!(
             "accepted=true headers_count={} new_tip_height={} txid={}",
-            submitted.headers_count, submitted.new_tip_height, submitted.txid
+            submitted.headers_count,
+            submitted
+                .new_tip_height
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "pending".to_string()),
+            submitted.txid
         ),
     );
 
@@ -176,7 +181,12 @@ struct SubmitResp {
     accepted: bool,
     txid: String,
     headers_count: u64,
-    new_tip_height: u64,
+    // iriumd returns null until the carrier tx is mined into a block and
+    // the BtcHeaderBatch is applied to chain state. Pending submissions
+    // therefore have new_tip_height=None; only confirmed batches see a
+    // u64 here.
+    #[serde(default)]
+    new_tip_height: Option<u64>,
 }
 
 fn submit_headers(
