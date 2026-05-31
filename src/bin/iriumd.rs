@@ -104,7 +104,7 @@ use irium_node_rs::ltc_spv::{
     encode_ltc_header_batch, LtcAnchor, LtcHeader, LtcHeaderEntry, LTC_HEADER_BYTES,
     MAX_LTC_HEADERS_PER_BATCH,
 };
-use irium_node_rs::wallet_store::{WalletKey, WalletManager};
+use irium_node_rs::wallet_store::{WalletKey, WalletManager, WalletMode};
 use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use k256::ecdsa::{Signature, SigningKey};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -787,6 +787,42 @@ struct WalletReceiveResponse {
 #[derive(Serialize)]
 struct WalletLockResponse {
     locked: bool,
+}
+
+#[derive(Serialize)]
+struct WalletInfoResponse {
+    exists: bool,
+    mode: WalletMode,
+    path: String,
+    is_unlocked: bool,
+    plaintext_backups: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct WalletMigrateRequest {
+    passphrase: String,
+}
+
+#[derive(Serialize)]
+struct WalletMigrateResponse {
+    path: String,
+    addresses: Vec<String>,
+    mode: WalletMode,
+}
+
+#[derive(Deserialize)]
+struct WalletRecoverRequest {
+    /// 64-hex (custom derivation) or 128-hex (BIP32 seed bytes).
+    seed_hex: String,
+    passphrase: String,
+    #[serde(default)]
+    allow_overwrite: bool,
+}
+
+#[derive(Serialize)]
+struct WalletRecoverResponse {
+    address: String,
+    path: String,
 }
 
 #[derive(Serialize)]
@@ -5551,9 +5587,16 @@ async fn wallet_unlock(
     require_rpc_auth(&headers)?;
 
     let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-    wallet
-        .unlock(&req.passphrase)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Distinguish "wallet needs migration" (file is plaintext, caller
+    // must POST /wallet/migrate_to_encrypted first) from "wrong
+    // passphrase" so the frontend can route correctly. 409 = state
+    // conflict; 400 = bad credentials.
+    if let Err(e) = wallet.unlock(&req.passphrase) {
+        if e == "wallet_needs_migration" {
+            return Err(StatusCode::CONFLICT);
+        }
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let addresses = wallet.addresses().map_err(|_| StatusCode::BAD_REQUEST)?;
     let current = wallet
         .current_address()
@@ -5562,6 +5605,89 @@ async fn wallet_unlock(
     Ok(Json(WalletUnlockResponse {
         addresses,
         current_address: current,
+    }))
+}
+
+async fn wallet_info(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WalletInfoResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let mode = wallet.mode();
+    let exists = !matches!(mode, WalletMode::None);
+    let is_unlocked = wallet.is_unlocked();
+    let path = wallet.path().display().to_string();
+    let plaintext_backups: Vec<String> = wallet
+        .plaintext_backups()
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect();
+
+    Ok(Json(WalletInfoResponse {
+        exists,
+        mode,
+        path,
+        is_unlocked,
+        plaintext_backups,
+    }))
+}
+
+async fn wallet_migrate_to_encrypted(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<WalletMigrateRequest>,
+) -> Result<Json<WalletMigrateResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = wallet.migrate_to_encrypted(&req.passphrase) {
+        if e == "already_encrypted" {
+            return Err(StatusCode::CONFLICT);
+        }
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let addresses = wallet.addresses().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let path = wallet.path().display().to_string();
+    Ok(Json(WalletMigrateResponse {
+        path,
+        addresses,
+        mode: WalletMode::Encrypted,
+    }))
+}
+
+async fn wallet_recover_from_seed(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<WalletRecoverRequest>,
+) -> Result<Json<WalletRecoverResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let key = match wallet.recover_from_seed(
+        &req.seed_hex,
+        &req.passphrase,
+        req.allow_overwrite,
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            if e == "wallet_exists" {
+                return Err(StatusCode::CONFLICT);
+            }
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+    let path = wallet.path().display().to_string();
+    Ok(Json(WalletRecoverResponse {
+        address: key.address,
+        path,
     }))
 }
 
@@ -15217,6 +15343,9 @@ async fn explorer_stats(
         .route("/wallet/create", post(wallet_create))
         .route("/wallet/unlock", post(wallet_unlock))
         .route("/wallet/lock", post(wallet_lock))
+        .route("/wallet/info", get(wallet_info))
+        .route("/wallet/migrate_to_encrypted", post(wallet_migrate_to_encrypted))
+        .route("/wallet/recover_from_seed", post(wallet_recover_from_seed))
         .route("/wallet/addresses", get(wallet_addresses))
         .route("/wallet/receive", get(wallet_receive))
         .route("/wallet/new_address", post(wallet_new_address))
@@ -22717,6 +22846,293 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    // ============================================================================
+    // Unified wallet RPC tests (Commit 1)
+    // ============================================================================
+
+    /// Construct a minimal AppState whose wallet manager points at a
+    /// caller-supplied path. Skips the full chain/mempool setup that
+    /// `create_test_state` does; these wallet tests only exercise the
+    /// wallet-side handlers.
+    fn make_wallet_app_state(wallet_path: PathBuf) -> AppState {
+        // Bare minimum chain (needed because AppState requires it).
+        let locked = load_locked_genesis().expect("genesis");
+        let block = block_from_locked(&locked).expect("block_from_locked");
+        let params = ChainParams {
+            genesis_block: block,
+            pow_limit: irium_node_rs::pow::Target { bits: 0x1d00_ffff },
+            htlcv1_activation_height: None,
+            mpsov1_activation_height: None,
+            lwma: irium_node_rs::chain::LwmaParams::new(
+                None,
+                irium_node_rs::pow::Target { bits: 0x1d00_ffff },
+            ),
+            lwma_v2: None,
+            auxpow_activation_height: None,
+            btc_spv: None,
+            ltc_spv: None,
+            doge_spv: None,
+            htlc_btc_swap_v1_activation_height: None,
+            htlc_ltc_swap_v1_activation_height: None,
+            swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
+        };
+        let chain = Arc::new(Mutex::new(ChainState::new(params)));
+        let mempool_path = unique_path("irium_wallet_test_mempool", "json");
+        let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_path, 256, 0.0)));
+        let wallet = Arc::new(Mutex::new(WalletManager::new(wallet_path)));
+
+        AppState {
+            chain,
+            genesis_hash: "00".repeat(32),
+            mempool,
+            wallet,
+            anchors: None,
+            p2p: None,
+            limiter: Arc::new(Mutex::new(rate_limiter())),
+            status_height_cache: Arc::new(AtomicU64::new(0)),
+            status_peer_count_cache: Arc::new(AtomicUsize::new(0)),
+            status_sybil_cache: Arc::new(AtomicU8::new(0)),
+            status_persisted_height_cache: Arc::new(AtomicU64::new(0)),
+            status_persist_queue_cache: Arc::new(AtomicUsize::new(0)),
+            status_persisted_contiguous_cache: Arc::new(AtomicU64::new(0)),
+            status_persisted_max_on_disk_cache: Arc::new(AtomicU64::new(0)),
+            status_quarantine_count_cache: Arc::new(AtomicU64::new(0)),
+            status_persisted_window_tip_cache: Arc::new(AtomicU64::new(0)),
+            status_missing_persisted_in_window_cache: Arc::new(AtomicU64::new(0)),
+            status_missing_or_mismatch_in_window_cache: Arc::new(AtomicU64::new(0)),
+            status_expected_hash_coverage_in_window_cache: Arc::new(AtomicU64::new(0)),
+            status_expected_hash_window_span_cache: Arc::new(AtomicU64::new(0)),
+            status_best_header_hash_cache: Arc::new(Mutex::new(String::new())),
+            proof_store: Arc::new(Mutex::new(ProofStore::new(unique_path(
+                "irium_proofs_wallet",
+                "json",
+            )))),
+            policy_store: Arc::new(Mutex::new(PolicyStore::new(unique_path(
+                "irium_policies_wallet",
+                "json",
+            )))),
+            event_tx: tokio::sync::broadcast::channel::<std::sync::Arc<String>>(
+                WS_BROADCAST_CAPACITY,
+            )
+            .0,
+            proof_heights: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            disputes_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            resolvers_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Empty headers; with IRIUM_RPC_TOKEN unset (which
+    /// `ensure_rpc_token_env` enforces) the require_rpc_auth path
+    /// short-circuits to Ok and these tests don't need to fabricate
+    /// a Bearer token. Matches the convention used by the
+    /// dispute/proof RPC tests in this same file via
+    /// `create_test_state`.
+    fn auth_headers() -> HeaderMap {
+        HeaderMap::new()
+    }
+
+    fn ensure_rpc_token_env() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+    }
+
+    fn write_legacy_plaintext_at(path: &PathBuf) {
+        let plain_json = serde_json::json!({
+            "version": 1,
+            "seed_hex": null,
+            "bip32_seed": "01".repeat(64),
+            "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "next_index": 1,
+            "keys": [],
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&plain_json).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wallet_info_reports_none_when_no_file() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletinfo_none", "json");
+        let state = make_wallet_app_state(path.clone());
+        let resp = wallet_info(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+        )
+        .await
+        .expect("Ok");
+        let body = resp.0;
+        assert!(!body.exists);
+        assert_eq!(body.mode, WalletMode::None);
+        assert!(!body.is_unlocked);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn wallet_info_reports_plaintext_when_legacy_file_present() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletinfo_plain", "json");
+        write_legacy_plaintext_at(&path);
+        let state = make_wallet_app_state(path.clone());
+        let resp = wallet_info(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+        )
+        .await
+        .expect("Ok");
+        assert!(resp.0.exists);
+        assert_eq!(resp.0.mode, WalletMode::Plaintext);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn wallet_info_reports_encrypted_after_create() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletinfo_enc", "json");
+        let state = make_wallet_app_state(path.clone());
+        // Use create_with_seed directly on the wallet to set up state.
+        {
+            let mut w = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+            w.create_with_seed("p", None).expect("create");
+        }
+        let resp = wallet_info(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+        )
+        .await
+        .expect("Ok");
+        assert_eq!(resp.0.mode, WalletMode::Encrypted);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn wallet_unlock_returns_409_on_plaintext_file() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletunlock_plain", "json");
+        write_legacy_plaintext_at(&path);
+        let state = make_wallet_app_state(path.clone());
+        let result = wallet_unlock(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(WalletUnlockRequest {
+                passphrase: "irrelevant".to_string(),
+            }),
+        )
+        .await;
+        let status = result.err().expect("must error");
+        assert_eq!(status, StatusCode::CONFLICT);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn wallet_migrate_to_encrypted_succeeds_on_plaintext() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletmigrate_ok", "json");
+        write_legacy_plaintext_at(&path);
+        let state = make_wallet_app_state(path.clone());
+        let resp = wallet_migrate_to_encrypted(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            auth_headers(),
+            AxumJson(WalletMigrateRequest {
+                passphrase: "new-pass".to_string(),
+            }),
+        )
+        .await
+        .expect("Ok");
+        assert_eq!(resp.0.mode, WalletMode::Encrypted);
+        // wallet_info should now report encrypted+unlocked
+        let info = wallet_info(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            auth_headers(),
+        )
+        .await
+        .expect("Ok");
+        assert_eq!(info.0.mode, WalletMode::Encrypted);
+        assert!(info.0.is_unlocked);
+        let _ = std::fs::remove_file(&path);
+        // Cleanup the backup
+        let parent = path.parent().unwrap();
+        if let Ok(dir) = std::fs::read_dir(parent) {
+            for e in dir.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.contains(".plaintext.bak.") {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_migrate_to_encrypted_returns_409_on_already_encrypted() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletmigrate_conflict", "json");
+        let state = make_wallet_app_state(path.clone());
+        {
+            let mut w = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+            w.create_with_seed("first", None).expect("create");
+        }
+        let result = wallet_migrate_to_encrypted(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(WalletMigrateRequest {
+                passphrase: "second".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(result.err().unwrap(), StatusCode::CONFLICT);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn wallet_recover_from_seed_succeeds_when_no_wallet_exists() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletrecover_ok", "json");
+        let state = make_wallet_app_state(path.clone());
+        let resp = wallet_recover_from_seed(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(WalletRecoverRequest {
+                seed_hex: "ab".repeat(32),
+                passphrase: "p".to_string(),
+                allow_overwrite: false,
+            }),
+        )
+        .await
+        .expect("Ok");
+        assert!(!resp.0.address.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn wallet_recover_from_seed_returns_409_when_wallet_exists_without_overwrite() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletrecover_conflict", "json");
+        let state = make_wallet_app_state(path.clone());
+        {
+            let mut w = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+            w.create_with_seed("first", None).expect("create");
+        }
+        let result = wallet_recover_from_seed(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(WalletRecoverRequest {
+                seed_hex: "cd".repeat(32),
+                passphrase: "second".to_string(),
+                allow_overwrite: false,
+            }),
+        )
+        .await;
+        assert_eq!(result.err().unwrap(), StatusCode::CONFLICT);
+        let _ = std::fs::remove_file(&path);
     }
 }
 
