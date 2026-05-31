@@ -3185,13 +3185,16 @@ pub fn decode_compact_tx(raw: &[u8]) -> Transaction {
 }
 
 /// Classify a tx for mempool admission. Returns
-/// [`MempoolPriority::ZeroFeeAllowed`] for the three buyer-side shapes:
+/// [`MempoolPriority::ZeroFeeAllowed`] for the buyer-side shapes
+/// across BTC, LTC, and DOGE:
 ///   - any tx whose outputs include a `BtcHeaderBatch`, `LtcHeaderBatch`,
 ///     or `DogeHeaderBatch` script tag,
-///   - any tx whose input 0 spends an `HtlcBtcSwapV1` UTXO with witness
-///     selector `0x01` (BTC-proof claim),
-///   - any tx whose input 0 spends a `SwapOrder` UTXO of sell_irm
-///     direction with witness selector `0x01` (sell-direction fill).
+///   - any tx whose input 0 spends an `HtlcBtcSwapV1`, `HtlcLtcSwapV1`,
+///     or `HtlcDogeSwapV1` UTXO with witness selector `0x01`
+///     (chain-proof claim),
+///   - any tx whose input 0 spends a `SwapOrder`, `LtcSwapOrder`, or
+///     `DogeSwapOrder` UTXO of sell_irm direction with witness selector
+///     `0x01` (sell-direction fill).
 ///
 /// All other shapes return [`MempoolPriority::Standard`]. Used by the
 /// P2P ingress path so peer-relayed buyer-side txs receive the same
@@ -3226,6 +3229,7 @@ pub fn classify_tx_priority(
         if let Some(utxo) = chain.utxos.get(&outpoint) {
             let script = &utxo.output.script_pubkey;
             let first_witness_byte = input0.script_sig.first().copied();
+            // BTC buyer paths.
             if parse_htlc_btc_swap_v1_script(script).is_some()
                 && first_witness_byte == Some(0x01)
             {
@@ -3233,6 +3237,32 @@ pub fn classify_tx_priority(
             }
             if let Some(order) = parse_swap_order_script(script) {
                 if order.direction == SWAP_ORDER_DIRECTION_SELL
+                    && first_witness_byte == Some(0x01)
+                {
+                    return MempoolPriority::ZeroFeeAllowed;
+                }
+            }
+            // LTC buyer paths (Phase C/D parity).
+            if parse_htlc_ltc_swap_v1_script(script).is_some()
+                && first_witness_byte == Some(0x01)
+            {
+                return MempoolPriority::ZeroFeeAllowed;
+            }
+            if let Some(order) = parse_ltc_swap_order_script(script) {
+                if order.direction == LTC_SWAP_ORDER_DIRECTION_SELL
+                    && first_witness_byte == Some(0x01)
+                {
+                    return MempoolPriority::ZeroFeeAllowed;
+                }
+            }
+            // DOGE buyer paths (Phase C/D parity).
+            if parse_htlc_doge_swap_v1_script(script).is_some()
+                && first_witness_byte == Some(0x01)
+            {
+                return MempoolPriority::ZeroFeeAllowed;
+            }
+            if let Some(order) = parse_doge_swap_order_script(script) {
+                if order.direction == DOGE_SWAP_ORDER_DIRECTION_SELL
                     && first_witness_byte == Some(0x01)
                 {
                     return MempoolPriority::ZeroFeeAllowed;
