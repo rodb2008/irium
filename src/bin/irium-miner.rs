@@ -3215,13 +3215,17 @@ fn main() {
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
-            btc_spv: None,
-            ltc_spv: None,
-            doge_spv: None,
-            htlc_btc_swap_v1_activation_height: None,
-            htlc_ltc_swap_v1_activation_height: None,
-            swap_order_v1_activation_height: None,
-            ltc_swap_order_v1_activation_height: None,
+            btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
+            ltc_spv: irium_node_rs::ltc_spv::resolve_ltc_spv_params(network),
+            doge_spv: irium_node_rs::doge_spv::resolve_doge_spv_params(network),
+            htlc_btc_swap_v1_activation_height:
+                irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
+            htlc_ltc_swap_v1_activation_height:
+                irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
+            swap_order_v1_activation_height:
+                irium_node_rs::activation::resolved_swap_order_v1_activation_height(network),
+            ltc_swap_order_v1_activation_height:
+                irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
     };
 
     let mut state = ChainState::new(params.clone());
