@@ -1095,4 +1095,135 @@ mod tests {
         );
         assert!(res.is_err());
     }
+
+    #[test]
+    fn apply_skips_bits_check_at_post_anchor_pre_first_retarget() {
+        // Regression for the BTC/LTC SPV stall fix (commit 0bc5463).
+        // When the anchor lands mid-retarget-window, the first 2016-boundary
+        // retarget after the anchor has lookback < anchor.height — the relay
+        // cannot compute proper expected_bits there. The fix skips the
+        // bits-equality check at that single boundary; PoW for header.bits
+        // is still enforced separately.
+        let bits_a: u32 = 0x207f_ffff;
+        let bits_b: u32 = 0x207f_fffe;
+        let anchor_header = mine_ltc_header([0u8; 32], 1_700_000_000, bits_a);
+        let anchor = LtcAnchor {
+            hash: anchor_header.block_hash(),
+            height: 5,
+            bits: bits_a,
+            time: anchor_header.time,
+        };
+        let test_params = RetargetParams {
+            window: 8,
+            expected_timespan_secs: 7 * 60,
+            max_target_bits: 0x207f_ffff,
+            min_timespan_divisor: 4,
+            max_timespan_multiplier: 4,
+        };
+
+        let mut chain = Vec::new();
+        let mut prev_hash = anchor.hash;
+        let mut t = anchor.time;
+        for h in 6..=13u64 {
+            t += 60;
+            let header_bits = if h >= 8 { bits_b } else { bits_a };
+            let header = mine_ltc_header(prev_hash, t, header_bits);
+            prev_hash = header.block_hash();
+            chain.push(header);
+        }
+
+        let mut headers_db = HashMap::new();
+        let mut heights_db = HashMap::new();
+        let mut tip: Option<[u8; 32]> = None;
+        let mut tip_height: u64 = 0;
+        let res = apply_ltc_header_batch(
+            chain.clone(),
+            t + 120,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &test_params,
+        );
+        assert!(res.is_ok(), "expected batch accepted at affected retarget, got: {:?}", res);
+        assert_eq!(tip_height, 13);
+    }
+
+    #[test]
+    fn apply_validates_computed_bits_at_subsequent_retarget() {
+        // Second retarget after the affected first one MUST compute
+        // expected_bits normally (first_height >= anchor.height). With
+        // actual_timespan == expected_timespan the new target equals the
+        // parent target, so header.bits stays at the post-affected value.
+        let bits_a: u32 = 0x207f_ffff;
+        let bits_b: u32 = 0x207f_fffe;
+        let anchor_header = mine_ltc_header([0u8; 32], 1_700_000_000, bits_a);
+        let anchor = LtcAnchor {
+            hash: anchor_header.block_hash(),
+            height: 5,
+            bits: bits_a,
+            time: anchor_header.time,
+        };
+        let test_params = RetargetParams {
+            window: 8,
+            expected_timespan_secs: 7 * 60,
+            max_target_bits: 0x207f_ffff,
+            min_timespan_divisor: 4,
+            max_timespan_multiplier: 4,
+        };
+
+        let mut chain = Vec::new();
+        let mut prev_hash = anchor.hash;
+        let mut t = anchor.time;
+        for h in 6..=16u64 {
+            t += 60;
+            let header_bits = if h >= 8 { bits_b } else { bits_a };
+            let header = mine_ltc_header(prev_hash, t, header_bits);
+            prev_hash = header.block_hash();
+            chain.push(header);
+        }
+
+        let mut headers_db = HashMap::new();
+        let mut heights_db = HashMap::new();
+        let mut tip: Option<[u8; 32]> = None;
+        let mut tip_height: u64 = 0;
+        let res = apply_ltc_header_batch(
+            chain.clone(),
+            t + 120,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &test_params,
+        );
+        assert!(res.is_ok(), "expected batch accepted (h=16 normal retarget), got: {:?}", res);
+        assert_eq!(tip_height, 16);
+    }
+
+    #[test]
+    fn apply_rejects_bits_change_at_non_retarget_height() {
+        // Mirrors btc_spv::tests::apply_rejects_bits_change_at_non_retarget_height.
+        // At non-retarget heights bits must equal parent's; mismatch must reject
+        // (and the skip-at-affected-retarget path must not soften this elsewhere).
+        let (anchor, anchor_header) = fresh_anchor();
+        let bad_bits: u32 = 0x207e_ffff;
+        let h1 = mine_ltc_header(anchor.hash, anchor_header.time + 150, bad_bits);
+        let mut headers_db = HashMap::new();
+        let mut heights_db = HashMap::new();
+        let mut tip: Option<[u8; 32]> = None;
+        let mut tip_height: u64 = 0;
+        let res = apply_ltc_header_batch(
+            vec![h1],
+            anchor_header.time + 150,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &RetargetParams::LITECOIN,
+        );
+        assert!(res.is_err());
+    }
 }
