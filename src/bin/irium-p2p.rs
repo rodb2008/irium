@@ -48,11 +48,16 @@ async fn main() {
             .map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
             btc_spv: None,
+            ltc_spv: None,
+            doge_spv: None,
+            htlc_doge_swap_v1_activation_height: None,
             htlc_btc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
+            doge_swap_order_v1_activation_height: None,
     };
     let chain = Arc::new(Mutex::new(ChainState::new(params)));
-    let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));
+    let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 100.0, 10_000)));
 
     let bind: SocketAddr = std::env::var("IRIUM_P2P_BIND")
         .unwrap_or_else(|_| {

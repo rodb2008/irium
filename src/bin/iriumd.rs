@@ -76,6 +76,27 @@ use irium_node_rs::storage;
 use irium_node_rs::tx::{
     compute_funding_binding, decode_full_tx, encode_htlc_btc_swap_claim_witness,
     encode_htlc_btc_swap_refund_witness, encode_htlc_btc_swap_v1_script,
+    encode_htlc_doge_swap_claim_witness, encode_htlc_doge_swap_refund_witness,
+    encode_htlc_doge_swap_v1_script, parse_htlc_doge_swap_v1_script,
+    HtlcDogeSwapV1Output, HTLC_DOGE_SWAP_V1_SCRIPT_LEN,
+    MAX_HTLC_DOGE_SWAP_CONFIRMATIONS, MIN_HTLC_DOGE_SWAP_CONFIRMATIONS,
+    encode_doge_swap_order_cancel_witness,
+    encode_doge_swap_order_expire_sweep_witness,
+    encode_doge_swap_order_fill_buy_witness, encode_doge_swap_order_fill_sell_witness,
+    encode_doge_swap_order_script, parse_doge_swap_order_script,
+    DogeSwapOrderOutput,
+    DOGE_SWAP_ORDER_DIRECTION_BUY, DOGE_SWAP_ORDER_DIRECTION_SELL,
+    DOGE_SWAP_ORDER_MAX_SWEEP_FEE, DOGE_SWAP_ORDER_MIN_LOCKED_VALUE,
+    encode_htlc_ltc_swap_claim_witness, encode_htlc_ltc_swap_refund_witness,
+    encode_htlc_ltc_swap_v1_script, encode_ltc_swap_order_cancel_witness,
+    encode_ltc_swap_order_expire_sweep_witness,
+    encode_ltc_swap_order_fill_buy_witness, encode_ltc_swap_order_fill_sell_witness,
+    encode_ltc_swap_order_script, parse_htlc_ltc_swap_v1_script,
+    parse_ltc_swap_order_script,
+    HtlcLtcSwapV1Output, LtcSwapOrderOutput, HTLC_LTC_SWAP_V1_SCRIPT_LEN,
+    LTC_SWAP_ORDER_DIRECTION_BUY, LTC_SWAP_ORDER_DIRECTION_SELL,
+    LTC_SWAP_ORDER_MAX_SWEEP_FEE, LTC_SWAP_ORDER_MIN_LOCKED_VALUE,
+    MAX_HTLC_LTC_SWAP_CONFIRMATIONS, MIN_HTLC_LTC_SWAP_CONFIRMATIONS,
     encode_htlcv1_claim_witness, encode_htlcv1_refund_witness, encode_htlcv1_script,
     encode_swap_order_cancel_witness, encode_swap_order_expire_sweep_witness,
     encode_swap_order_fill_buy_witness, encode_swap_order_fill_sell_witness,
@@ -90,7 +111,15 @@ use irium_node_rs::btc_spv::{
     encode_btc_header_batch, BtcAnchor, BtcHeader, BtcHeaderEntry, BTC_HEADER_BYTES,
     MAX_BTC_HEADERS_PER_BATCH,
 };
-use irium_node_rs::wallet_store::{WalletKey, WalletManager};
+use irium_node_rs::ltc_spv::{
+    encode_ltc_header_batch, LtcAnchor, LtcHeader, LtcHeaderEntry, LTC_HEADER_BYTES,
+    MAX_LTC_HEADERS_PER_BATCH,
+};
+use irium_node_rs::doge_spv::{
+    encode_doge_header_batch, DogeAnchor, DogeHeader, DogeHeaderEntry, DOGE_HEADER_BYTES,
+    MAX_DOGE_HEADERS_PER_BATCH,
+};
+use irium_node_rs::wallet_store::{WalletKey, WalletManager, WalletMode};
 use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use k256::ecdsa::{Signature, SigningKey};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -5327,7 +5356,7 @@ async fn fund_agreement(
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain
             .calculate_fees(&tx)
-            .map_err(|_| bad("chain_fee_calculation_failed"))?
+            .map_err(|e| { eprintln!("[create_doge_swap] calc_fees_err={}", e); bad("chain_fee_calculation_failed") })?
     };
 
     let raw = tx.serialize();
@@ -6342,6 +6371,685 @@ async fn btc_header(
     }
 }
 
+// Phase E.1 — LTC SPV header relay RPC endpoints. Byte-level mirror of the
+// BTC SPV trio above; gated on `chain.params.ltc_spv` being `Some` and
+// `chain.height >= activation_height`. Sha256d display-order helpers
+// (`btc_hash_to_display`, `parse_btc_display_hash`) are reused as-is —
+// Litecoin block hashes are sha256d in the same byte order.
+
+#[derive(Debug, Deserialize)]
+struct SubmitLtcHeadersRequest {
+    headers_hex: String,
+    #[serde(default)]
+    broadcast: Option<bool>,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitLtcHeadersResponse {
+    txid: String,
+    accepted: bool,
+    headers_count: u32,
+    new_tip_hash: Option<String>,
+    new_tip_height: Option<u64>,
+    fee: u64,
+    raw_tx_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LtcRelayTipResponse {
+    active: bool,
+    anchor_hash: String,
+    anchor_height: u64,
+    anchor_bits: String,
+    anchor_time: u32,
+    tip_hash: String,
+    tip_height: u64,
+    tip_time: u32,
+    tip_total_work_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitDogeHeadersRequest {
+    headers_hex: String,
+    #[serde(default)]
+    broadcast: Option<bool>,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitDogeHeadersResponse {
+    txid: String,
+    accepted: bool,
+    headers_count: u32,
+    new_tip_hash: Option<String>,
+    new_tip_height: Option<u64>,
+    fee: u64,
+    raw_tx_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DogeRelayTipResponse {
+    active: bool,
+    anchor_hash: String,
+    anchor_height: u64,
+    anchor_bits: String,
+    anchor_time: u32,
+    tip_hash: String,
+    tip_height: u64,
+    tip_time: u32,
+    tip_total_work_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LtcHeaderQuery {
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    height: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct LtcHeaderResponse {
+    found: bool,
+    hash: Option<String>,
+    height: Option<u64>,
+    version: Option<i32>,
+    prev_hash: Option<String>,
+    merkle_root: Option<String>,
+    time: Option<u32>,
+    bits: Option<String>,
+    nonce: Option<u32>,
+    on_canonical_chain: Option<bool>,
+}
+
+async fn submit_ltc_headers(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SubmitLtcHeadersRequest>,
+) -> Result<Json<SubmitLtcHeadersResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[submit_ltc_headers] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .ltc_spv
+            .as_ref()
+            .map(|p| chain.height >= p.activation_height)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ltc_spv_relay_not_active".to_string(),
+            ));
+        }
+    }
+
+    let raw = hex::decode(req.headers_hex.trim())
+        .map_err(|_| bad("headers_hex_decode_failed"))?;
+    if raw.is_empty() || raw.len() % LTC_HEADER_BYTES != 0 {
+        return Err(bad("headers_hex_length_not_multiple_of_80"));
+    }
+    let header_count = raw.len() / LTC_HEADER_BYTES;
+    if header_count == 0 || header_count > MAX_LTC_HEADERS_PER_BATCH as usize {
+        return Err(bad("header_count_out_of_range"));
+    }
+    let mut parsed_headers: Vec<LtcHeader> = Vec::with_capacity(header_count);
+    for i in 0..header_count {
+        let chunk = &raw[i * LTC_HEADER_BYTES..(i + 1) * LTC_HEADER_BYTES];
+        let h = LtcHeader::deserialize(chunk).map_err(|_| bad("ltc_header_deserialize_failed"))?;
+        parsed_headers.push(h);
+    }
+
+    let batch_script = encode_ltc_header_batch(&parsed_headers)
+        .map_err(|_| bad("encode_ltc_header_batch_failed"))?;
+
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        for key in keys {
+            let bytes = hex::decode(&key.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            key_map.insert(arr, key);
+        }
+    }
+    if key_map.is_empty() {
+        return Err(bad("wallet_key_map_empty"));
+    }
+
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if key_map.contains_key(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+    if utxos.is_empty() {
+        return Err(bad("wallet_utxo_set_empty"));
+    }
+    utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
+
+    let mut fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    if fee_per_byte == 0 {
+        fee_per_byte = 1;
+    }
+
+    let mut selected: Vec<WalletUtxo> = Vec::new();
+    let mut total: u64 = 0;
+    let mut fee: u64 = 0;
+    for utxo in utxos.iter() {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
+            continue;
+        }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.output.value);
+        let base_size = estimate_tx_size(selected.len(), 2);
+        fee = base_size
+            .saturating_add(batch_script.len() as u64)
+            .saturating_mul(fee_per_byte);
+        if total >= fee {
+            break;
+        }
+    }
+    if total < fee {
+        return Err(bad("insufficient_spendable_funds_for_header_batch_fee"));
+    }
+
+    let change_pkh = selected
+        .first()
+        .map(|u| u.pkh)
+        .ok_or_else(|| bad("no_change_pkh_available"))?;
+    let mut change = total.saturating_sub(fee);
+
+    let inputs: Vec<TxInput> = selected
+        .iter()
+        .map(|u| TxInput {
+            prev_txid: u.outpoint.txid,
+            prev_index: u.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        })
+        .collect();
+
+    let outputs = vec![
+        TxOutput {
+            value: change,
+            script_pubkey: p2pkh_script(&change_pkh),
+        },
+        TxOutput {
+            value: 0,
+            script_pubkey: batch_script,
+        },
+    ];
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+
+    for _ in 0..2 {
+        sign_wallet_inputs(&mut tx, &selected, &key_map)
+            .map_err(|_| bad("sign_wallet_inputs_failed"))?;
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if change >= extra {
+                fee = needed_fee;
+                change = change.saturating_sub(extra);
+                tx.outputs[0].value = change;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_change"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("chain_fee_calculation_failed"))?
+    };
+
+    let raw_tx = tx.serialize();
+    let txid = tx.txid();
+    let txid_hex = hex::encode(txid);
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(true) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid) {
+            match mempool.add_transaction(tx.clone(), raw_tx.clone(), fee_checked) {
+                Ok(_) => accepted = true,
+                Err(e) => {
+                    eprintln!("[submit_ltc_headers] mempool_reject reason={}", e);
+                }
+            }
+        }
+    }
+
+    Ok(Json(SubmitLtcHeadersResponse {
+        txid: txid_hex,
+        accepted,
+        headers_count: header_count as u32,
+        new_tip_hash: None,
+        new_tip_height: None,
+        fee: fee_checked,
+        raw_tx_hex: hex::encode(raw_tx),
+    }))
+}
+
+async fn ltc_relay_tip(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+) -> Result<Json<LtcRelayTipResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers_map)?;
+    require_rpc_auth(&headers_map)?;
+
+    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let (active, anchor) = match chain.params.ltc_spv.as_ref() {
+        Some(p) => (chain.height >= p.activation_height, p.anchor),
+        None => (false, LtcAnchor::zero()),
+    };
+
+    let (tip_hash_display, tip_height, tip_time, tip_total_work_hex) = match chain.ltc_tip {
+        Some(h) => {
+            let entry = chain.ltc_headers.get(&h);
+            let time = entry.map(|e| e.header.time).unwrap_or(0);
+            let work_hex = entry
+                .map(|e| e.total_work.to_str_radix(16))
+                .unwrap_or_else(|| "0".to_string());
+            (
+                btc_hash_to_display(&h),
+                chain.ltc_tip_height,
+                time,
+                work_hex,
+            )
+        }
+        None => (
+            btc_hash_to_display(&anchor.hash),
+            anchor.height,
+            anchor.time,
+            "0".to_string(),
+        ),
+    };
+
+    Ok(Json(LtcRelayTipResponse {
+        active,
+        anchor_hash: btc_hash_to_display(&anchor.hash),
+        anchor_height: anchor.height,
+        anchor_bits: format!("0x{:08x}", anchor.bits),
+        anchor_time: anchor.time,
+        tip_hash: tip_hash_display,
+        tip_height,
+        tip_time,
+        tip_total_work_hex,
+    }))
+}
+
+async fn submit_doge_headers(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SubmitDogeHeadersRequest>,
+) -> Result<Json<SubmitDogeHeadersResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[submit_doge_headers] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .doge_spv
+            .as_ref()
+            .map(|p| chain.height >= p.activation_height)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "doge_spv_relay_not_active".to_string(),
+            ));
+        }
+    }
+
+    let raw = hex::decode(req.headers_hex.trim())
+        .map_err(|_| bad("headers_hex_decode_failed"))?;
+    if raw.is_empty() || raw.len() % DOGE_HEADER_BYTES != 0 {
+        return Err(bad("headers_hex_length_not_multiple_of_80"));
+    }
+    let header_count = raw.len() / DOGE_HEADER_BYTES;
+    if header_count == 0 || header_count > MAX_DOGE_HEADERS_PER_BATCH as usize {
+        return Err(bad("header_count_out_of_range"));
+    }
+    let mut parsed_headers: Vec<DogeHeader> = Vec::with_capacity(header_count);
+    for i in 0..header_count {
+        let chunk = &raw[i * DOGE_HEADER_BYTES..(i + 1) * DOGE_HEADER_BYTES];
+        let h = DogeHeader::deserialize(chunk).map_err(|_| bad("ltc_header_deserialize_failed"))?;
+        parsed_headers.push(h);
+    }
+
+    let batch_script = encode_doge_header_batch(&parsed_headers)
+        .map_err(|_| bad("encode_doge_header_batch_failed"))?;
+
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        for key in keys {
+            let bytes = hex::decode(&key.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            key_map.insert(arr, key);
+        }
+    }
+    if key_map.is_empty() {
+        return Err(bad("wallet_key_map_empty"));
+    }
+
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if key_map.contains_key(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+    if utxos.is_empty() {
+        return Err(bad("wallet_utxo_set_empty"));
+    }
+    utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
+
+    let mut fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    if fee_per_byte == 0 {
+        fee_per_byte = 1;
+    }
+
+    let mut selected: Vec<WalletUtxo> = Vec::new();
+    let mut total: u64 = 0;
+    let mut fee: u64 = 0;
+    for utxo in utxos.iter() {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
+            continue;
+        }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.output.value);
+        let base_size = estimate_tx_size(selected.len(), 2);
+        fee = base_size
+            .saturating_add(batch_script.len() as u64)
+            .saturating_mul(fee_per_byte);
+        if total >= fee {
+            break;
+        }
+    }
+    if total < fee {
+        return Err(bad("insufficient_spendable_funds_for_header_batch_fee"));
+    }
+
+    let change_pkh = selected
+        .first()
+        .map(|u| u.pkh)
+        .ok_or_else(|| bad("no_change_pkh_available"))?;
+    let mut change = total.saturating_sub(fee);
+
+    let inputs: Vec<TxInput> = selected
+        .iter()
+        .map(|u| TxInput {
+            prev_txid: u.outpoint.txid,
+            prev_index: u.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        })
+        .collect();
+
+    let outputs = vec![
+        TxOutput {
+            value: change,
+            script_pubkey: p2pkh_script(&change_pkh),
+        },
+        TxOutput {
+            value: 0,
+            script_pubkey: batch_script,
+        },
+    ];
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+
+    for _ in 0..2 {
+        sign_wallet_inputs(&mut tx, &selected, &key_map)
+            .map_err(|_| bad("sign_wallet_inputs_failed"))?;
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if change >= extra {
+                fee = needed_fee;
+                change = change.saturating_sub(extra);
+                tx.outputs[0].value = change;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_change"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("chain_fee_calculation_failed"))?
+    };
+
+    let raw_tx = tx.serialize();
+    let txid = tx.txid();
+    let txid_hex = hex::encode(txid);
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(true) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid) {
+            match mempool.add_transaction(tx.clone(), raw_tx.clone(), fee_checked) {
+                Ok(_) => accepted = true,
+                Err(e) => {
+                    eprintln!("[submit_doge_headers] mempool_reject reason={}", e);
+                }
+            }
+        }
+    }
+
+    Ok(Json(SubmitDogeHeadersResponse {
+        txid: txid_hex,
+        accepted,
+        headers_count: header_count as u32,
+        new_tip_hash: None,
+        new_tip_height: None,
+        fee: fee_checked,
+        raw_tx_hex: hex::encode(raw_tx),
+    }))
+}
+
+async fn doge_relay_tip(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+) -> Result<Json<DogeRelayTipResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers_map)?;
+    require_rpc_auth(&headers_map)?;
+
+    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let (active, anchor) = match chain.params.doge_spv.as_ref() {
+        Some(p) => (chain.height >= p.activation_height, p.anchor),
+        None => (false, DogeAnchor::zero()),
+    };
+
+    let (tip_hash_display, tip_height, tip_time, tip_total_work_hex) = match chain.doge_tip {
+        Some(h) => {
+            let entry = chain.doge_headers.get(&h);
+            let time = entry.map(|e| e.header.time).unwrap_or(0);
+            let work_hex = entry
+                .map(|e| e.total_work.to_str_radix(16))
+                .unwrap_or_else(|| "0".to_string());
+            (
+                btc_hash_to_display(&h),
+                chain.doge_tip_height,
+                time,
+                work_hex,
+            )
+        }
+        None => (
+            btc_hash_to_display(&anchor.hash),
+            anchor.height,
+            anchor.time,
+            "0".to_string(),
+        ),
+    };
+
+    Ok(Json(DogeRelayTipResponse {
+        active,
+        anchor_hash: btc_hash_to_display(&anchor.hash),
+        anchor_height: anchor.height,
+        anchor_bits: format!("0x{:08x}", anchor.bits),
+        anchor_time: anchor.time,
+        tip_hash: tip_hash_display,
+        tip_height,
+        tip_time,
+        tip_total_work_hex,
+    }))
+}
+
+async fn ltc_header(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    Query(q): Query<LtcHeaderQuery>,
+) -> Result<Json<LtcHeaderResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers_map)?;
+    require_rpc_auth(&headers_map)?;
+
+    if q.hash.is_none() && q.height.is_none() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if q.hash.is_some() && q.height.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+
+    let found: Option<([u8; 32], LtcHeaderEntry, bool)> = if let Some(hash_display) = &q.hash {
+        let natural = match parse_btc_display_hash(hash_display) {
+            Ok(h) => h,
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        };
+        chain.ltc_headers.get(&natural).map(|e| {
+            let canonical = chain
+                .ltc_heights
+                .get(&natural)
+                .copied()
+                .map(|h| h <= chain.ltc_tip_height)
+                .unwrap_or(false);
+            (natural, e.clone(), canonical)
+        })
+    } else if let Some(h) = q.height {
+        let mut hit: Option<[u8; 32]> = None;
+        for (hash, bh) in chain.ltc_heights.iter() {
+            if *bh == h {
+                hit = Some(*hash);
+                break;
+            }
+        }
+        hit.and_then(|hash| {
+            chain
+                .ltc_headers
+                .get(&hash)
+                .cloned()
+                .map(|e| (hash, e, true))
+        })
+    } else {
+        None
+    };
+
+    match found {
+        Some((hash, entry, canonical)) => Ok(Json(LtcHeaderResponse {
+            found: true,
+            hash: Some(btc_hash_to_display(&hash)),
+            height: Some(entry.height),
+            version: Some(entry.header.version),
+            prev_hash: Some(btc_hash_to_display(&entry.header.prev_hash)),
+            merkle_root: Some(btc_hash_to_display(&entry.header.merkle_root)),
+            time: Some(entry.header.time),
+            bits: Some(format!("0x{:08x}", entry.header.bits)),
+            nonce: Some(entry.header.nonce),
+            on_canonical_chain: Some(canonical),
+        })),
+        None => Ok(Json(LtcHeaderResponse {
+            found: false,
+            hash: None,
+            height: None,
+            version: None,
+            prev_hash: None,
+            merkle_root: None,
+            time: None,
+            bits: None,
+            nonce: None,
+            on_canonical_chain: None,
+        })),
+    }
+}
+
 // Phase 4 Part 2 — HtlcBtcSwapV1 RPC endpoints. Four endpoints behind the
 // `htlc_btc_swap_v1_activation_height` gate; claim path additionally
 // requires the `btc_spv` relay active so header proofs can resolve. All
@@ -6827,16 +7535,44 @@ async fn claim_btc_swap(
         .as_bytes()
         .to_vec();
 
-    let witness = encode_htlc_btc_swap_claim_witness(
-        &sig_bytes,
-        &pubkey,
-        &btc_block_hash,
-        &branch,
-        req.btc_merkle_index,
-        &btc_tx_raw,
-    )
-    .ok_or_else(|| bad("encode_claim_witness_failed"))?;
-    tx.inputs[0].script_sig = witness;
+    // 2-pass fee recalc: estimate_tx_size(1,1) returns 192 bytes, but the
+    // real claim witness (sig + pubkey + btc_block_hash + merkle branch +
+    // raw BTC tx) pushes the actual tx to ~810 bytes. Without this loop the
+    // computed fee is ~0.24 sat/B and mempool admission fails at
+    // min_fee_per_byte=100.0. Same pattern as submit_btc_headers.
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+        let witness = encode_htlc_btc_swap_claim_witness(
+            &sig_bytes,
+            &pubkey,
+            &btc_block_hash,
+            &branch,
+            req.btc_merkle_index,
+            &btc_tx_raw,
+        )
+        .ok_or_else(|| bad("encode_claim_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -6945,11 +7681,11 @@ async fn refund_btc_swap(
     dest_pkh.copy_from_slice(&dest);
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(bad("funding_value_le_fee"));
     }
-    let payout = funding_out.output.value - fee;
+    let mut payout = funding_out.output.value - fee;
 
     let mut tx = Transaction {
         version: 1,
@@ -6966,7 +7702,6 @@ async fn refund_btc_swap(
         locktime: 0,
     };
 
-    let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
     let priv_bytes =
         hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
@@ -6976,21 +7711,42 @@ async fn refund_btc_swap(
     sk_bytes.copy_from_slice(&priv_bytes);
     let signing_key = SigningKey::from_bytes((&sk_bytes).into())
         .map_err(|_| bad("signing_key_init_failed"))?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
 
-    let witness = encode_htlc_btc_swap_refund_witness(&sig_bytes, &pubkey)
-        .ok_or_else(|| bad("encode_refund_witness_failed"))?;
-    tx.inputs[0].script_sig = witness;
+    // 2-pass fee recalc: refund witness pushes tx above the
+    // estimate_tx_size(1,1) baseline. Same pattern as claim_btc_swap fix
+    // (1d9519f) and claim_ltc_swap fix (58ca801).
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_htlc_btc_swap_refund_witness(&sig_bytes, &pubkey)
+            .ok_or_else(|| bad("encode_refund_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -7097,6 +7853,1605 @@ async fn inspect_btc_swap(
         refund_address: Some(base58_p2pkh_from_hash(&swap.refund_pkh)),
         btc_recipient_pkh_hex: Some(hex::encode(swap.btc_recipient_pkh)),
         btc_amount_sats: Some(swap.btc_amount_sats),
+        confirmations_required: Some(swap.confirmations_required),
+        timeout_height: Some(swap.timeout_height),
+        funding_binding_hex: Some(hex::encode(swap.funding_binding)),
+        claimable_now: swap_active && spv_active,
+        refundable_now: tip_height >= swap.timeout_height,
+    }))
+}
+
+// Phase C — HtlcLtcSwapV1 RPC endpoints. Byte-level mirror of the BTC
+// swap RPCs above, gated on `htlc_ltc_swap_v1_activation_height` (and
+// additionally on `ltc_spv` for the claim path so LTC header proofs can
+// resolve). All four return SERVICE_UNAVAILABLE while the gate is None.
+
+#[derive(Debug, Deserialize)]
+struct CreateLtcSwapRequest {
+    irm_amount: String,
+    ltc_amount_sats: u64,
+    ltc_recipient_address: String,
+    recipient_address: String,
+    refund_address: String,
+    confirmations_required: u8,
+    timeout_height: u64,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+    #[serde(default)]
+    broadcast: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateLtcSwapResponse {
+    txid: String,
+    accepted: bool,
+    raw_tx_hex: String,
+    swap_vout: u32,
+    funding_binding_hex: String,
+    ltc_op_return_payload_hex: String,
+    expected_ltc_payment_address: String,
+    expected_ltc_amount_sats: u64,
+    fee: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimLtcSwapRequest {
+    funding_txid: String,
+    vout: u32,
+    destination_address: String,
+    ltc_block_hash: String,
+    ltc_tx_hex: String,
+    ltc_merkle_branch_hex: Vec<String>,
+    ltc_merkle_index: u32,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+    #[serde(default)]
+    broadcast: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefundLtcSwapRequest {
+    funding_txid: String,
+    vout: u32,
+    destination_address: String,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+    #[serde(default)]
+    broadcast: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct SpendLtcSwapResponse {
+    txid: String,
+    accepted: bool,
+    raw_tx_hex: String,
+    fee: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectLtcSwapQuery {
+    txid: String,
+    vout: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectLtcSwapResponse {
+    exists: bool,
+    funded: bool,
+    unspent: bool,
+    spent: bool,
+    recipient_address: Option<String>,
+    refund_address: Option<String>,
+    ltc_recipient_pkh_hex: Option<String>,
+    ltc_amount_sats: Option<u64>,
+    confirmations_required: Option<u8>,
+    timeout_height: Option<u64>,
+    funding_binding_hex: Option<String>,
+    claimable_now: bool,
+    refundable_now: bool,
+}
+
+/// Decode a Litecoin P2PKH address (base58check; mainnet prefix `0x30`,
+/// testnet prefix `0x6f`) into a 20-byte hash. v1 only supports P2PKH —
+/// bech32 (ltc1...) inputs are rejected because consensus only validates
+/// P2PKH at the LTC OP_RETURN claim path. Structurally identical to
+/// `decode_btc_p2pkh_address`, just different prefix byte.
+fn decode_ltc_p2pkh_address(addr: &str) -> Option<[u8; 20]> {
+    let data = bs58::decode(addr.trim()).into_vec().ok()?;
+    if data.len() != 25 {
+        return None;
+    }
+    let (body, checksum) = data.split_at(21);
+    let first = Sha256::digest(body);
+    let second = Sha256::digest(&first);
+    if &second[0..4] != checksum {
+        return None;
+    }
+    if body[0] != 0x30 && body[0] != 0x6f {
+        return None;
+    }
+    let mut pkh = [0u8; 20];
+    pkh.copy_from_slice(&body[1..]);
+    Some(pkh)
+}
+
+async fn create_ltc_swap(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<CreateLtcSwapRequest>,
+) -> Result<Json<CreateLtcSwapResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[create_ltc_swap] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .htlc_ltc_swap_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "htlc_ltc_swap_v1_not_active".to_string(),
+            ));
+        }
+    }
+
+    if req.confirmations_required < MIN_HTLC_LTC_SWAP_CONFIRMATIONS
+        || req.confirmations_required > MAX_HTLC_LTC_SWAP_CONFIRMATIONS
+    {
+        return Err(bad("confirmations_required_out_of_range"));
+    }
+
+    let amount = parse_irm(&req.irm_amount).map_err(|_| bad("irm_amount_parse_failed"))?;
+    if amount == 0 {
+        return Err(bad("irm_amount_zero"));
+    }
+    if req.ltc_amount_sats == 0 {
+        return Err(bad("ltc_amount_sats_zero"));
+    }
+
+    let recipient_vec = base58_p2pkh_to_hash(&req.recipient_address)
+        .ok_or_else(|| bad("recipient_address_decode_failed"))?;
+    let refund_vec = base58_p2pkh_to_hash(&req.refund_address)
+        .ok_or_else(|| bad("refund_address_decode_failed"))?;
+    if recipient_vec.len() != 20 || refund_vec.len() != 20 {
+        return Err(bad("iriumd_address_hash_len_invalid"));
+    }
+    let mut recipient_pkh = [0u8; 20];
+    recipient_pkh.copy_from_slice(&recipient_vec);
+    let mut refund_pkh = [0u8; 20];
+    refund_pkh.copy_from_slice(&refund_vec);
+
+    let ltc_recipient_pkh = decode_ltc_p2pkh_address(&req.ltc_recipient_address)
+        .ok_or_else(|| bad("ltc_recipient_address_must_be_p2pkh"))?;
+
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        for key in keys {
+            let bytes = hex::decode(&key.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            key_map.insert(arr, key);
+        }
+    }
+    if key_map.is_empty() {
+        return Err(bad("wallet_key_map_empty"));
+    }
+
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if key_map.contains_key(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+    if utxos.is_empty() {
+        return Err(bad("wallet_utxo_set_empty"));
+    }
+    utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
+
+    let mut fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    if fee_per_byte == 0 {
+        fee_per_byte = 1;
+    }
+
+    let mut selected: Vec<WalletUtxo> = Vec::new();
+    let mut total = 0u64;
+    let mut fee = 0u64;
+    for utxo in utxos.iter() {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
+            continue;
+        }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.output.value);
+        let n_outs = if total > amount { 2 } else { 1 };
+        fee = estimate_tx_size(selected.len(), n_outs).saturating_mul(fee_per_byte);
+        if total >= amount.saturating_add(fee) {
+            break;
+        }
+    }
+    if total < amount.saturating_add(fee) {
+        return Err(bad("insufficient_spendable_funds"));
+    }
+
+    let first_input = selected
+        .first()
+        .ok_or_else(|| bad("no_input_for_binding"))?;
+    let funding_binding =
+        compute_funding_binding(&first_input.outpoint.txid, first_input.outpoint.index);
+
+    let swap = HtlcLtcSwapV1Output {
+        confirmations_required: req.confirmations_required,
+        recipient_pkh,
+        refund_pkh,
+        ltc_recipient_pkh,
+        ltc_amount_sats: req.ltc_amount_sats,
+        timeout_height: req.timeout_height,
+        funding_binding,
+    };
+
+    let inputs: Vec<TxInput> = selected
+        .iter()
+        .map(|u| TxInput {
+            prev_txid: u.outpoint.txid,
+            prev_index: u.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        })
+        .collect();
+
+    let mut outputs = vec![TxOutput {
+        value: amount,
+        script_pubkey: encode_htlc_ltc_swap_v1_script(&swap),
+    }];
+    let mut change = total.saturating_sub(amount).saturating_sub(fee);
+    if change > 0 {
+        let change_pkh = selected
+            .first()
+            .map(|u| u.pkh)
+            .ok_or_else(|| bad("no_change_pkh"))?;
+        outputs.push(TxOutput {
+            value: change,
+            script_pubkey: p2pkh_script(&change_pkh),
+        });
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+
+    for _ in 0..2 {
+        sign_wallet_inputs(&mut tx, &selected, &key_map)
+            .map_err(|_| bad("sign_wallet_inputs_failed"))?;
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if change >= extra {
+                fee = needed_fee;
+                change = change.saturating_sub(extra);
+                if tx.outputs.len() > 1 {
+                    tx.outputs[1].value = change;
+                }
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_change"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("chain_fee_calculation_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_arr = tx.txid();
+    let txid_hex = hex::encode(txid_arr);
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_arr) {
+            match mempool.add_transaction(tx.clone(), raw.clone(), fee_checked) {
+                Ok(_) => accepted = true,
+                Err(e) => eprintln!("[create_ltc_swap] mempool_reject reason={}", e),
+            }
+        }
+    }
+
+    let mut op_return_payload = Vec::with_capacity(14);
+    op_return_payload.extend_from_slice(b"irmlsw");
+    op_return_payload.extend_from_slice(&funding_binding);
+
+    Ok(Json(CreateLtcSwapResponse {
+        txid: txid_hex,
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        swap_vout: 0,
+        funding_binding_hex: hex::encode(funding_binding),
+        ltc_op_return_payload_hex: hex::encode(op_return_payload),
+        expected_ltc_payment_address: req.ltc_recipient_address,
+        expected_ltc_amount_sats: req.ltc_amount_sats,
+        fee: fee_checked,
+    }))
+}
+
+async fn claim_ltc_swap(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<ClaimLtcSwapRequest>,
+) -> Result<Json<SpendLtcSwapResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[claim_ltc_swap] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let swap_active = chain
+            .params
+            .htlc_ltc_swap_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        let spv_active = chain
+            .params
+            .ltc_spv
+            .as_ref()
+            .map(|p| chain.height >= p.activation_height)
+            .unwrap_or(false);
+        if !swap_active || !spv_active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "htlc_ltc_swap_or_ltc_spv_not_active".to_string(),
+            ));
+        }
+    }
+
+    let txid_arr =
+        hex_to_32(req.funding_txid.trim()).map_err(|_| bad("funding_txid_hex_invalid"))?;
+    let key = OutPoint {
+        txid: txid_arr,
+        index: req.vout,
+    };
+
+    let funding_out = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| bad("funding_outpoint_unspent_or_unknown"))?
+    };
+
+    let swap = parse_htlc_ltc_swap_v1_script(&funding_out.output.script_pubkey)
+        .ok_or_else(|| bad("funding_output_not_htlc_ltc_swap_v1"))?;
+
+    let signer_pkh = swap.recipient_pkh;
+    let wallet_key = {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        let mut found: Option<WalletKey> = None;
+        for k in keys {
+            let b = hex::decode(&k.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if b.len() != 20 {
+                continue;
+            }
+            let mut pkh = [0u8; 20];
+            pkh.copy_from_slice(&b);
+            if pkh == signer_pkh {
+                found = Some(k);
+                break;
+            }
+        }
+        found.ok_or_else(|| bad("recipient_pkh_key_not_in_wallet"))?
+    };
+
+    let dest = base58_p2pkh_to_hash(&req.destination_address)
+        .ok_or_else(|| bad("destination_address_decode_failed"))?;
+    if dest.len() != 20 {
+        return Err(bad("destination_pkh_len_invalid"));
+    }
+    let mut dest_pkh = [0u8; 20];
+    dest_pkh.copy_from_slice(&dest);
+
+    let ltc_block_hash =
+        parse_btc_display_hash(&req.ltc_block_hash).map_err(|_| bad("ltc_block_hash_invalid"))?;
+    let ltc_tx_raw =
+        hex::decode(req.ltc_tx_hex.trim()).map_err(|_| bad("ltc_tx_hex_invalid"))?;
+    if ltc_tx_raw.is_empty() {
+        return Err(bad("ltc_tx_hex_empty"));
+    }
+    let mut branch: Vec<[u8; 32]> = Vec::with_capacity(req.ltc_merkle_branch_hex.len());
+    for s in &req.ltc_merkle_branch_hex {
+        let h = parse_btc_display_hash(s).map_err(|_| bad("merkle_branch_node_invalid"))?;
+        branch.push(h);
+    }
+
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    if funding_out.output.value <= fee {
+        return Err(bad("funding_value_le_fee"));
+    }
+    let mut payout = funding_out.output.value - fee;
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: txid_arr,
+            prev_index: req.vout,
+            script_sig: Vec::new(),
+            sequence: 0xffff_fffe,
+        }],
+        outputs: vec![TxOutput {
+            value: payout,
+            script_pubkey: p2pkh_script(&dest_pkh),
+        }],
+        locktime: 0,
+    };
+
+    let priv_bytes =
+        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    if priv_bytes.len() != 32 {
+        return Err(bad("privkey_len_invalid"));
+    }
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(&priv_bytes);
+    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
+        .map_err(|_| bad("signing_key_init_failed"))?;
+    let pubkey = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+
+    // 2-pass fee recalc: estimate_tx_size(1,1) returns 192 bytes, but the
+    // real claim witness (sig + pubkey + ltc_block_hash + merkle branch +
+    // raw LTC tx) pushes the actual tx well above that. Without this loop
+    // the computed fee falls below the 1.0 sat/B mempool floor and
+    // add_transaction rejects with "Fee per byte below minimum policy".
+    // Same pattern as claim_btc_swap fix in 1d9519f.
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+        let witness = encode_htlc_ltc_swap_claim_witness(
+            &sig_bytes,
+            &pubkey,
+            &ltc_block_hash,
+            &branch,
+            req.ltc_merkle_index,
+            &ltc_tx_raw,
+        )
+        .ok_or_else(|| bad("encode_claim_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("calculate_fees_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_out = tx.txid();
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_out) {
+            accepted = mempool
+                .add_transaction(tx, raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+    Ok(Json(SpendLtcSwapResponse {
+        txid: hex::encode(txid_out),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    }))
+}
+
+async fn refund_ltc_swap(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<RefundLtcSwapRequest>,
+) -> Result<Json<SpendLtcSwapResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[refund_ltc_swap] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .htlc_ltc_swap_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "htlc_ltc_swap_v1_not_active".to_string(),
+            ));
+        }
+    }
+
+    let txid_arr =
+        hex_to_32(req.funding_txid.trim()).map_err(|_| bad("funding_txid_hex_invalid"))?;
+    let key = OutPoint {
+        txid: txid_arr,
+        index: req.vout,
+    };
+
+    let (funding_out, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let utxo = chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| bad("funding_outpoint_unspent_or_unknown"))?;
+        (utxo, chain.tip_height())
+    };
+
+    let swap = parse_htlc_ltc_swap_v1_script(&funding_out.output.script_pubkey)
+        .ok_or_else(|| bad("funding_output_not_htlc_ltc_swap_v1"))?;
+    if tip_height < swap.timeout_height {
+        return Err(bad("timeout_not_reached"));
+    }
+
+    let signer_pkh = swap.refund_pkh;
+    let wallet_key = {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        let mut found: Option<WalletKey> = None;
+        for k in keys {
+            let b = hex::decode(&k.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if b.len() != 20 {
+                continue;
+            }
+            let mut pkh = [0u8; 20];
+            pkh.copy_from_slice(&b);
+            if pkh == signer_pkh {
+                found = Some(k);
+                break;
+            }
+        }
+        found.ok_or_else(|| bad("refund_pkh_key_not_in_wallet"))?
+    };
+
+    let dest = base58_p2pkh_to_hash(&req.destination_address)
+        .ok_or_else(|| bad("destination_address_decode_failed"))?;
+    if dest.len() != 20 {
+        return Err(bad("destination_pkh_len_invalid"));
+    }
+    let mut dest_pkh = [0u8; 20];
+    dest_pkh.copy_from_slice(&dest);
+
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    if funding_out.output.value <= fee {
+        return Err(bad("funding_value_le_fee"));
+    }
+    let mut payout = funding_out.output.value - fee;
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: txid_arr,
+            prev_index: req.vout,
+            script_sig: Vec::new(),
+            sequence: 0xffff_fffe,
+        }],
+        outputs: vec![TxOutput {
+            value: payout,
+            script_pubkey: p2pkh_script(&dest_pkh),
+        }],
+        locktime: 0,
+    };
+
+    let priv_bytes =
+        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    if priv_bytes.len() != 32 {
+        return Err(bad("privkey_len_invalid"));
+    }
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(&priv_bytes);
+    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
+        .map_err(|_| bad("signing_key_init_failed"))?;
+    let pubkey = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_htlc_ltc_swap_refund_witness(&sig_bytes, &pubkey)
+            .ok_or_else(|| bad("encode_refund_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("calculate_fees_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_out = tx.txid();
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_out) {
+            accepted = mempool
+                .add_transaction(tx, raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+    Ok(Json(SpendLtcSwapResponse {
+        txid: hex::encode(txid_out),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    }))
+}
+
+async fn inspect_ltc_swap(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    Query(q): Query<InspectLtcSwapQuery>,
+) -> Result<Json<InspectLtcSwapResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers_map)?;
+    require_rpc_auth(&headers_map)?;
+
+    let txid = hex_to_32(q.txid.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let key = OutPoint {
+        txid,
+        index: q.vout,
+    };
+
+    let (tip_height, maybe_utxo, swap_active, spv_active) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let utxo = chain.utxos.get(&key).cloned();
+        let swap_active = chain
+            .params
+            .htlc_ltc_swap_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        let spv_active = chain
+            .params
+            .ltc_spv
+            .as_ref()
+            .map(|p| chain.height >= p.activation_height)
+            .unwrap_or(false);
+        (chain.tip_height(), utxo, swap_active, spv_active)
+    };
+
+    let Some(utxo) = maybe_utxo else {
+        return Ok(Json(InspectLtcSwapResponse {
+            exists: false,
+            funded: false,
+            unspent: false,
+            spent: true,
+            recipient_address: None,
+            refund_address: None,
+            ltc_recipient_pkh_hex: None,
+            ltc_amount_sats: None,
+            confirmations_required: None,
+            timeout_height: None,
+            funding_binding_hex: None,
+            claimable_now: false,
+            refundable_now: false,
+        }));
+    };
+
+    let swap = match parse_htlc_ltc_swap_v1_script(&utxo.output.script_pubkey) {
+        Some(v) => v,
+        None => {
+            return Ok(Json(InspectLtcSwapResponse {
+                exists: false,
+                funded: false,
+                unspent: false,
+                spent: false,
+                recipient_address: None,
+                refund_address: None,
+                ltc_recipient_pkh_hex: None,
+                ltc_amount_sats: None,
+                confirmations_required: None,
+                timeout_height: None,
+                funding_binding_hex: None,
+                claimable_now: false,
+                refundable_now: false,
+            }))
+        }
+    };
+
+    Ok(Json(InspectLtcSwapResponse {
+        exists: true,
+        funded: true,
+        unspent: true,
+        spent: false,
+        recipient_address: Some(base58_p2pkh_from_hash(&swap.recipient_pkh)),
+        refund_address: Some(base58_p2pkh_from_hash(&swap.refund_pkh)),
+        ltc_recipient_pkh_hex: Some(hex::encode(swap.ltc_recipient_pkh)),
+        ltc_amount_sats: Some(swap.ltc_amount_sats),
+        confirmations_required: Some(swap.confirmations_required),
+        timeout_height: Some(swap.timeout_height),
+        funding_binding_hex: Some(hex::encode(swap.funding_binding)),
+        claimable_now: swap_active && spv_active,
+        refundable_now: tip_height >= swap.timeout_height,
+    }))
+}
+
+// Phase C — HtlcDogeSwapV1 RPC endpoints. Byte-level mirror of the BTC
+// swap RPCs above, gated on `htlc_doge_swap_v1_activation_height` (and
+// additionally on `doge_spv` for the claim path so DOGE header proofs can
+// resolve). All four return SERVICE_UNAVAILABLE while the gate is None.
+
+#[derive(Debug, Deserialize)]
+struct CreateDogeSwapRequest {
+    irm_amount: String,
+    doge_amount_sats: u64,
+    doge_recipient_address: String,
+    recipient_address: String,
+    refund_address: String,
+    confirmations_required: u8,
+    timeout_height: u64,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+    #[serde(default)]
+    broadcast: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateDogeSwapResponse {
+    txid: String,
+    accepted: bool,
+    raw_tx_hex: String,
+    swap_vout: u32,
+    funding_binding_hex: String,
+    doge_op_return_payload_hex: String,
+    expected_doge_payment_address: String,
+    expected_doge_amount_sats: u64,
+    fee: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimDogeSwapRequest {
+    funding_txid: String,
+    vout: u32,
+    destination_address: String,
+    doge_block_hash: String,
+    doge_tx_hex: String,
+    doge_merkle_branch_hex: Vec<String>,
+    doge_merkle_index: u32,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+    #[serde(default)]
+    broadcast: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefundDogeSwapRequest {
+    funding_txid: String,
+    vout: u32,
+    destination_address: String,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+    #[serde(default)]
+    broadcast: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct SpendDogeSwapResponse {
+    txid: String,
+    accepted: bool,
+    raw_tx_hex: String,
+    fee: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectDogeSwapQuery {
+    txid: String,
+    vout: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectDogeSwapResponse {
+    exists: bool,
+    funded: bool,
+    unspent: bool,
+    spent: bool,
+    recipient_address: Option<String>,
+    refund_address: Option<String>,
+    doge_recipient_pkh_hex: Option<String>,
+    doge_amount_sats: Option<u64>,
+    confirmations_required: Option<u8>,
+    timeout_height: Option<u64>,
+    funding_binding_hex: Option<String>,
+    claimable_now: bool,
+    refundable_now: bool,
+}
+
+/// Decode a Dogecoin P2PKH address (base58check; mainnet prefix `0x30`,
+/// testnet prefix `0x6f`) into a 20-byte hash. v1 only supports P2PKH —
+/// bech32 (ltc1...) inputs are rejected because consensus only validates
+/// P2PKH at the DOGE OP_RETURN claim path. Structurally identical to
+/// `decode_btc_p2pkh_address`, just different prefix byte.
+fn decode_doge_p2pkh_address(addr: &str) -> Option<[u8; 20]> {
+    let data = bs58::decode(addr.trim()).into_vec().ok()?;
+    if data.len() != 25 {
+        return None;
+    }
+    let (body, checksum) = data.split_at(21);
+    let first = Sha256::digest(body);
+    let second = Sha256::digest(&first);
+    if &second[0..4] != checksum {
+        return None;
+    }
+    if body[0] != 0x30 && body[0] != 0x6f {
+        return None;
+    }
+    let mut pkh = [0u8; 20];
+    pkh.copy_from_slice(&body[1..]);
+    Some(pkh)
+}
+
+async fn create_doge_swap(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<CreateDogeSwapRequest>,
+) -> Result<Json<CreateDogeSwapResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[create_doge_swap] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .htlc_doge_swap_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "htlc_doge_swap_v1_not_active".to_string(),
+            ));
+        }
+    }
+
+    if req.confirmations_required < MIN_HTLC_DOGE_SWAP_CONFIRMATIONS
+        || req.confirmations_required > MAX_HTLC_DOGE_SWAP_CONFIRMATIONS
+    {
+        return Err(bad("confirmations_required_out_of_range"));
+    }
+
+    let amount = parse_irm(&req.irm_amount).map_err(|_| bad("irm_amount_parse_failed"))?;
+    if amount == 0 {
+        return Err(bad("irm_amount_zero"));
+    }
+    if req.doge_amount_sats == 0 {
+        return Err(bad("doge_amount_sats_zero"));
+    }
+
+    let recipient_vec = base58_p2pkh_to_hash(&req.recipient_address)
+        .ok_or_else(|| bad("recipient_address_decode_failed"))?;
+    let refund_vec = base58_p2pkh_to_hash(&req.refund_address)
+        .ok_or_else(|| bad("refund_address_decode_failed"))?;
+    if recipient_vec.len() != 20 || refund_vec.len() != 20 {
+        return Err(bad("iriumd_address_hash_len_invalid"));
+    }
+    let mut recipient_pkh = [0u8; 20];
+    recipient_pkh.copy_from_slice(&recipient_vec);
+    let mut refund_pkh = [0u8; 20];
+    refund_pkh.copy_from_slice(&refund_vec);
+
+    let doge_recipient_pkh = decode_doge_p2pkh_address(&req.doge_recipient_address)
+        .ok_or_else(|| bad("doge_recipient_address_must_be_p2pkh"))?;
+
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        for key in keys {
+            let bytes = hex::decode(&key.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            key_map.insert(arr, key);
+        }
+    }
+    if key_map.is_empty() {
+        return Err(bad("wallet_key_map_empty"));
+    }
+
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if key_map.contains_key(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+    if utxos.is_empty() {
+        return Err(bad("wallet_utxo_set_empty"));
+    }
+    utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
+
+    let mut fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    if fee_per_byte == 0 {
+        fee_per_byte = 1;
+    }
+
+    let mut selected: Vec<WalletUtxo> = Vec::new();
+    let mut total = 0u64;
+    let mut fee = 0u64;
+    for utxo in utxos.iter() {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
+            continue;
+        }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.output.value);
+        let n_outs = if total > amount { 2 } else { 1 };
+        fee = estimate_tx_size(selected.len(), n_outs).saturating_mul(fee_per_byte);
+        if total >= amount.saturating_add(fee) {
+            break;
+        }
+    }
+    if total < amount.saturating_add(fee) {
+        return Err(bad("insufficient_spendable_funds"));
+    }
+
+    let first_input = selected
+        .first()
+        .ok_or_else(|| bad("no_input_for_binding"))?;
+    let funding_binding =
+        compute_funding_binding(&first_input.outpoint.txid, first_input.outpoint.index);
+
+    let swap = HtlcDogeSwapV1Output {
+        confirmations_required: req.confirmations_required,
+        recipient_pkh,
+        refund_pkh,
+        doge_recipient_pkh,
+        doge_amount_sats: req.doge_amount_sats,
+        timeout_height: req.timeout_height,
+        funding_binding,
+    };
+
+    let inputs: Vec<TxInput> = selected
+        .iter()
+        .map(|u| TxInput {
+            prev_txid: u.outpoint.txid,
+            prev_index: u.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        })
+        .collect();
+
+    let mut outputs = vec![TxOutput {
+        value: amount,
+        script_pubkey: encode_htlc_doge_swap_v1_script(&swap),
+    }];
+    let mut change = total.saturating_sub(amount).saturating_sub(fee);
+    if change > 0 {
+        let change_pkh = selected
+            .first()
+            .map(|u| u.pkh)
+            .ok_or_else(|| bad("no_change_pkh"))?;
+        outputs.push(TxOutput {
+            value: change,
+            script_pubkey: p2pkh_script(&change_pkh),
+        });
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+
+    for _ in 0..2 {
+        sign_wallet_inputs(&mut tx, &selected, &key_map)
+            .map_err(|_| bad("sign_wallet_inputs_failed"))?;
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if change >= extra {
+                fee = needed_fee;
+                change = change.saturating_sub(extra);
+                if tx.outputs.len() > 1 {
+                    tx.outputs[1].value = change;
+                }
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_change"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("chain_fee_calculation_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_arr = tx.txid();
+    let txid_hex = hex::encode(txid_arr);
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_arr) {
+            match mempool.add_transaction(tx.clone(), raw.clone(), fee_checked) {
+                Ok(_) => accepted = true,
+                Err(e) => eprintln!("[create_doge_swap] mempool_reject reason={}", e),
+            }
+        }
+    }
+
+    let mut op_return_payload = Vec::with_capacity(14);
+    op_return_payload.extend_from_slice(b"irmdsw");
+    op_return_payload.extend_from_slice(&funding_binding);
+
+    Ok(Json(CreateDogeSwapResponse {
+        txid: txid_hex,
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        swap_vout: 0,
+        funding_binding_hex: hex::encode(funding_binding),
+        doge_op_return_payload_hex: hex::encode(op_return_payload),
+        expected_doge_payment_address: req.doge_recipient_address,
+        expected_doge_amount_sats: req.doge_amount_sats,
+        fee: fee_checked,
+    }))
+}
+
+async fn claim_doge_swap(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<ClaimDogeSwapRequest>,
+) -> Result<Json<SpendDogeSwapResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[claim_doge_swap] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let swap_active = chain
+            .params
+            .htlc_doge_swap_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        let spv_active = chain
+            .params
+            .doge_spv
+            .as_ref()
+            .map(|p| chain.height >= p.activation_height)
+            .unwrap_or(false);
+        if !swap_active || !spv_active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "htlc_doge_swap_or_doge_spv_not_active".to_string(),
+            ));
+        }
+    }
+
+    let txid_arr =
+        hex_to_32(req.funding_txid.trim()).map_err(|_| bad("funding_txid_hex_invalid"))?;
+    let key = OutPoint {
+        txid: txid_arr,
+        index: req.vout,
+    };
+
+    let funding_out = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| bad("funding_outpoint_unspent_or_unknown"))?
+    };
+
+    let swap = parse_htlc_doge_swap_v1_script(&funding_out.output.script_pubkey)
+        .ok_or_else(|| bad("funding_output_not_htlc_doge_swap_v1"))?;
+
+    let signer_pkh = swap.recipient_pkh;
+    let wallet_key = {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        let mut found: Option<WalletKey> = None;
+        for k in keys {
+            let b = hex::decode(&k.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if b.len() != 20 {
+                continue;
+            }
+            let mut pkh = [0u8; 20];
+            pkh.copy_from_slice(&b);
+            if pkh == signer_pkh {
+                found = Some(k);
+                break;
+            }
+        }
+        found.ok_or_else(|| bad("recipient_pkh_key_not_in_wallet"))?
+    };
+
+    let dest = base58_p2pkh_to_hash(&req.destination_address)
+        .ok_or_else(|| bad("destination_address_decode_failed"))?;
+    if dest.len() != 20 {
+        return Err(bad("destination_pkh_len_invalid"));
+    }
+    let mut dest_pkh = [0u8; 20];
+    dest_pkh.copy_from_slice(&dest);
+
+    let doge_block_hash =
+        parse_btc_display_hash(&req.doge_block_hash).map_err(|_| bad("doge_block_hash_invalid"))?;
+    let doge_tx_raw =
+        hex::decode(req.doge_tx_hex.trim()).map_err(|_| bad("doge_tx_hex_invalid"))?;
+    if doge_tx_raw.is_empty() {
+        return Err(bad("doge_tx_hex_empty"));
+    }
+    let mut branch: Vec<[u8; 32]> = Vec::with_capacity(req.doge_merkle_branch_hex.len());
+    for s in &req.doge_merkle_branch_hex {
+        let h = parse_btc_display_hash(s).map_err(|_| bad("merkle_branch_node_invalid"))?;
+        branch.push(h);
+    }
+
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    if funding_out.output.value <= fee {
+        return Err(bad("funding_value_le_fee"));
+    }
+    let mut payout = funding_out.output.value - fee;
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: txid_arr,
+            prev_index: req.vout,
+            script_sig: Vec::new(),
+            sequence: 0xffff_fffe,
+        }],
+        outputs: vec![TxOutput {
+            value: payout,
+            script_pubkey: p2pkh_script(&dest_pkh),
+        }],
+        locktime: 0,
+    };
+
+    let priv_bytes =
+        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    if priv_bytes.len() != 32 {
+        return Err(bad("privkey_len_invalid"));
+    }
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(&priv_bytes);
+    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
+        .map_err(|_| bad("signing_key_init_failed"))?;
+    let pubkey = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_htlc_doge_swap_claim_witness(
+            &sig_bytes,
+            &pubkey,
+            &doge_block_hash,
+            &branch,
+            req.doge_merkle_index,
+            &doge_tx_raw,
+        )
+        .ok_or_else(|| bad("encode_claim_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("calculate_fees_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_out = tx.txid();
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_out) {
+            accepted = mempool
+                .add_transaction(tx, raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+    Ok(Json(SpendDogeSwapResponse {
+        txid: hex::encode(txid_out),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    }))
+}
+
+async fn refund_doge_swap(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<RefundDogeSwapRequest>,
+) -> Result<Json<SpendDogeSwapResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[refund_doge_swap] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .htlc_doge_swap_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "htlc_doge_swap_v1_not_active".to_string(),
+            ));
+        }
+    }
+
+    let txid_arr =
+        hex_to_32(req.funding_txid.trim()).map_err(|_| bad("funding_txid_hex_invalid"))?;
+    let key = OutPoint {
+        txid: txid_arr,
+        index: req.vout,
+    };
+
+    let (funding_out, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let utxo = chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| bad("funding_outpoint_unspent_or_unknown"))?;
+        (utxo, chain.tip_height())
+    };
+
+    let swap = parse_htlc_doge_swap_v1_script(&funding_out.output.script_pubkey)
+        .ok_or_else(|| bad("funding_output_not_htlc_doge_swap_v1"))?;
+    if tip_height < swap.timeout_height {
+        return Err(bad("timeout_not_reached"));
+    }
+
+    let signer_pkh = swap.refund_pkh;
+    let wallet_key = {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        let mut found: Option<WalletKey> = None;
+        for k in keys {
+            let b = hex::decode(&k.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if b.len() != 20 {
+                continue;
+            }
+            let mut pkh = [0u8; 20];
+            pkh.copy_from_slice(&b);
+            if pkh == signer_pkh {
+                found = Some(k);
+                break;
+            }
+        }
+        found.ok_or_else(|| bad("refund_pkh_key_not_in_wallet"))?
+    };
+
+    let dest = base58_p2pkh_to_hash(&req.destination_address)
+        .ok_or_else(|| bad("destination_address_decode_failed"))?;
+    if dest.len() != 20 {
+        return Err(bad("destination_pkh_len_invalid"));
+    }
+    let mut dest_pkh = [0u8; 20];
+    dest_pkh.copy_from_slice(&dest);
+
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    if funding_out.output.value <= fee {
+        return Err(bad("funding_value_le_fee"));
+    }
+    let mut payout = funding_out.output.value - fee;
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: txid_arr,
+            prev_index: req.vout,
+            script_sig: Vec::new(),
+            sequence: 0xffff_fffe,
+        }],
+        outputs: vec![TxOutput {
+            value: payout,
+            script_pubkey: p2pkh_script(&dest_pkh),
+        }],
+        locktime: 0,
+    };
+
+    let priv_bytes =
+        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    if priv_bytes.len() != 32 {
+        return Err(bad("privkey_len_invalid"));
+    }
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(&priv_bytes);
+    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
+        .map_err(|_| bad("signing_key_init_failed"))?;
+    let pubkey = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_htlc_doge_swap_refund_witness(&sig_bytes, &pubkey)
+            .ok_or_else(|| bad("encode_refund_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("calculate_fees_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_out = tx.txid();
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_out) {
+            accepted = mempool
+                .add_transaction(tx, raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+    Ok(Json(SpendDogeSwapResponse {
+        txid: hex::encode(txid_out),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    }))
+}
+
+async fn inspect_doge_swap(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    Query(q): Query<InspectDogeSwapQuery>,
+) -> Result<Json<InspectDogeSwapResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers_map)?;
+    require_rpc_auth(&headers_map)?;
+
+    let txid = hex_to_32(q.txid.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let key = OutPoint {
+        txid,
+        index: q.vout,
+    };
+
+    let (tip_height, maybe_utxo, swap_active, spv_active) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let utxo = chain.utxos.get(&key).cloned();
+        let swap_active = chain
+            .params
+            .htlc_doge_swap_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        let spv_active = chain
+            .params
+            .doge_spv
+            .as_ref()
+            .map(|p| chain.height >= p.activation_height)
+            .unwrap_or(false);
+        (chain.tip_height(), utxo, swap_active, spv_active)
+    };
+
+    let Some(utxo) = maybe_utxo else {
+        return Ok(Json(InspectDogeSwapResponse {
+            exists: false,
+            funded: false,
+            unspent: false,
+            spent: true,
+            recipient_address: None,
+            refund_address: None,
+            doge_recipient_pkh_hex: None,
+            doge_amount_sats: None,
+            confirmations_required: None,
+            timeout_height: None,
+            funding_binding_hex: None,
+            claimable_now: false,
+            refundable_now: false,
+        }));
+    };
+
+    let swap = match parse_htlc_doge_swap_v1_script(&utxo.output.script_pubkey) {
+        Some(v) => v,
+        None => {
+            return Ok(Json(InspectDogeSwapResponse {
+                exists: false,
+                funded: false,
+                unspent: false,
+                spent: false,
+                recipient_address: None,
+                refund_address: None,
+                doge_recipient_pkh_hex: None,
+                doge_amount_sats: None,
+                confirmations_required: None,
+                timeout_height: None,
+                funding_binding_hex: None,
+                claimable_now: false,
+                refundable_now: false,
+            }))
+        }
+    };
+
+    Ok(Json(InspectDogeSwapResponse {
+        exists: true,
+        funded: true,
+        unspent: true,
+        spent: false,
+        recipient_address: Some(base58_p2pkh_from_hash(&swap.recipient_pkh)),
+        refund_address: Some(base58_p2pkh_from_hash(&swap.refund_pkh)),
+        doge_recipient_pkh_hex: Some(hex::encode(swap.doge_recipient_pkh)),
+        doge_amount_sats: Some(swap.doge_amount_sats),
         confirmations_required: Some(swap.confirmations_required),
         timeout_height: Some(swap.timeout_height),
         funding_binding_hex: Some(hex::encode(swap.funding_binding)),
@@ -7808,11 +10163,11 @@ async fn cancel_swap_order(
     dest_pkh.copy_from_slice(&dest);
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(bad("funding_value_le_fee"));
     }
-    let payout = funding_out.output.value - fee;
+    let mut payout = funding_out.output.value - fee;
 
     let mut tx = Transaction {
         version: 1,
@@ -7830,7 +10185,6 @@ async fn cancel_swap_order(
     };
 
     let scriptcode = encode_swap_order_script(&order);
-    let digest = signature_digest(&tx, 0, &scriptcode);
     let priv_bytes =
         hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
@@ -7840,21 +10194,39 @@ async fn cancel_swap_order(
     sk_bytes.copy_from_slice(&priv_bytes);
     let signing_key = SigningKey::from_bytes((&sk_bytes).into())
         .map_err(|_| bad("signing_key_init_failed"))?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
 
-    let witness = encode_swap_order_cancel_witness(&sig_bytes, &pubkey)
-        .ok_or_else(|| bad("encode_cancel_witness_failed"))?;
-    tx.inputs[0].script_sig = witness;
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &scriptcode);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_swap_order_cancel_witness(&sig_bytes, &pubkey)
+            .ok_or_else(|| bad("encode_cancel_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -8127,23 +10499,19 @@ async fn fill_swap_order(
     let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
     order_sig_bytes.push(0x01);
 
-    let witness = match order.direction {
-        SWAP_ORDER_DIRECTION_SELL => encode_swap_order_fill_sell_witness(
-            &order_sig_bytes,
-            &pubkey,
-            &taker_iriumd_pkh,
-            timeout_height,
-        )
-        .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
-        SWAP_ORDER_DIRECTION_BUY => encode_swap_order_fill_buy_witness(
-            &order_sig_bytes,
-            &pubkey,
-            timeout_height,
-        )
-        .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
-        _ => return Err(bad("order_direction_unknown")),
-    };
-    tx.inputs[0].script_sig = witness;
+    // 2-pass fee recalc: estimate_tx_size(1,1) under-counts the order fill
+    // witness (sig + pubkey + taker_pkh + timeout) and any extra P2PKH
+    // wallet inputs. Without this loop a 1-input/1-output sell fill at
+    // fee_per_byte=1 produces ~0.66 sat/B and mempool admission fails at
+    // min_fee_per_byte=100.0. Same pattern as submit_btc_headers.
+    for _ in 0..2 {
+        let digest_order = signature_digest(&tx, 0, &scriptcode_order);
+        let order_sig: Signature = signing_key
+            .sign_prehash(&digest_order)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let order_sig = order_sig.normalize_s().unwrap_or(order_sig);
+        let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
+        order_sig_bytes.push(0x01);
 
     if !extra_inputs.is_empty() {
         let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
@@ -8240,10 +10608,7 @@ async fn sweep_expired_order(
     let minimum_payout = utxo_value.saturating_sub(SWAP_ORDER_MAX_SWEEP_FEE);
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
     let est_fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
-    // Output value sits between the consensus minimum (utxo - 1000) and
-    // utxo_value itself; chain.calculate_fees will accept any value in
-    // that band so long as the actual tx fee is non-negative.
-    let payout = if utxo_value >= est_fee.saturating_add(minimum_payout) {
+    let mut payout = if utxo_value >= est_fee.saturating_add(minimum_payout) {
         utxo_value - est_fee
     } else {
         minimum_payout
@@ -8252,7 +10617,7 @@ async fn sweep_expired_order(
         return Err(bad("payout_below_consensus_minimum"));
     }
 
-    let tx = Transaction {
+    let mut tx = Transaction {
         version: 1,
         inputs: vec![TxInput {
             prev_txid: txid_arr,
@@ -8266,6 +10631,22 @@ async fn sweep_expired_order(
         }],
         locktime: 0,
     };
+
+    // Fee recalc against the actual serialized size. The 1-byte
+    // expire-sweep witness is constant so a single pass suffices;
+    // we only need to absorb the delta between estimate_tx_size(1,1)
+    // and the real tx into the single payout output, subject to the
+    // consensus minimum_payout floor.
+    let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+    if needed_fee > est_fee {
+        let extra = needed_fee - est_fee;
+        if payout >= minimum_payout.saturating_add(extra) {
+            payout -= extra;
+            tx.outputs[0].value = payout;
+        } else {
+            return Err(bad("fee_recalculation_exceeded_payout_floor"));
+        }
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -8288,6 +10669,2387 @@ async fn sweep_expired_order(
         txid: hex::encode(txid_out),
         accepted,
         raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    }))
+}
+
+async fn sweep_ltc_expired_order(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SweepExpiredOrderRequest>,
+) -> Result<Json<SwapSpendResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[sweep_ltc_expired_order] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .ltc_swap_order_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ltc_swap_order_v1_not_active".to_string(),
+            ));
+        }
+    }
+
+    let txid_arr =
+        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let key = OutPoint {
+        txid: txid_arr,
+        index: req.order_vout,
+    };
+
+    let (funding_out, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let utxo = chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| bad("order_outpoint_unspent_or_unknown"))?;
+        (utxo, chain.tip_height())
+    };
+
+    let order = parse_ltc_swap_order_script(&funding_out.output.script_pubkey)
+        .ok_or_else(|| bad("funding_output_not_ltc_swap_order"))?;
+    if tip_height < order.expiry_height {
+        return Err(bad("expiry_height_not_reached"));
+    }
+
+    let utxo_value = funding_out.output.value;
+    let minimum_payout = utxo_value.saturating_sub(LTC_SWAP_ORDER_MAX_SWEEP_FEE);
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let est_fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut payout = if utxo_value >= est_fee.saturating_add(minimum_payout) {
+        utxo_value - est_fee
+    } else {
+        minimum_payout
+    };
+    if payout < minimum_payout {
+        return Err(bad("payout_below_consensus_minimum"));
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: txid_arr,
+            prev_index: req.order_vout,
+            script_sig: encode_ltc_swap_order_expire_sweep_witness(),
+            sequence: 0xffff_fffe,
+        }],
+        outputs: vec![TxOutput {
+            value: payout,
+            script_pubkey: p2pkh_script(&order.maker_iriumd_pkh),
+        }],
+        locktime: 0,
+    };
+
+    // Fee recalc against the actual serialized size. The 1-byte
+    // expire-sweep witness is constant so a single pass suffices.
+    let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+    if needed_fee > est_fee {
+        let extra = needed_fee - est_fee;
+        if payout >= minimum_payout.saturating_add(extra) {
+            payout -= extra;
+            tx.outputs[0].value = payout;
+        } else {
+            return Err(bad("fee_recalculation_exceeded_payout_floor"));
+        }
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("calculate_fees_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_out = tx.txid();
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_out) {
+            accepted = mempool
+                .add_transaction(tx.clone(), raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+    Ok(Json(SwapSpendResponse {
+        txid: hex::encode(txid_out),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    }))
+}
+
+// ---- Phase D — LtcSwapOrder RPC endpoints. Byte-level mirror of the
+// BTC SwapOrder RPCs above, gated on `ltc_swap_order_v1_activation_height`.
+// Sell-direction fills emit `HtlcLtcSwapV1` outputs (Phase C); buy-direction
+// fills emit `HTLCv1` outputs identical to the BTC SwapOrder buy-fill since
+// the IRM hashlock is chain-agnostic.
+
+#[derive(Debug, Deserialize)]
+struct PostLtcSwapOrderRequest {
+    direction: String,
+    irm_amount: String,
+    ltc_amount_sats: u64,
+    maker_iriumd_address: String,
+    maker_ltc_address: String,
+    confirmations_required: u8,
+    expiry_blocks_from_now: u64,
+    #[serde(default)]
+    expected_hash_hex: Option<String>,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+    #[serde(default)]
+    broadcast: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct PostLtcSwapOrderResponse {
+    txid: String,
+    accepted: bool,
+    raw_tx_hex: String,
+    order_outpoint: OutPointJson,
+    order_id_hex: String,
+    expiry_height: u64,
+    fee: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListLtcSwapOrdersQuery {
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    min_irm: Option<u64>,
+    #[serde(default)]
+    max_irm: Option<u64>,
+    #[serde(default)]
+    min_ltc: Option<u64>,
+    #[serde(default)]
+    max_ltc: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    sort: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LtcSwapOrderJson {
+    outpoint: OutPointJson,
+    order_id_hex: String,
+    direction: String,
+    irm_amount: u64,
+    ltc_amount_sats: u64,
+    implied_ltc_per_irm_sats: f64,
+    maker_iriumd_address: String,
+    maker_ltc_pkh_hex: String,
+    confirmations_required: u8,
+    expiry_height: u64,
+    locked_value: u64,
+    expected_hash_hex: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListLtcSwapOrdersResponse {
+    orders: Vec<LtcSwapOrderJson>,
+    total_open: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetLtcSwapOrderQuery {
+    txid: String,
+    vout: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct GetLtcSwapOrderResponse {
+    found: bool,
+    order: Option<LtcSwapOrderJson>,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelLtcSwapOrderRequest {
+    order_txid: String,
+    order_vout: u32,
+    destination_address: String,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+    #[serde(default)]
+    broadcast: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FillLtcSwapOrderRequest {
+    order_txid: String,
+    order_vout: u32,
+    taker_iriumd_address: String,
+    #[serde(default)]
+    taker_ltc_address: Option<String>,
+    timeout_blocks_from_now: u64,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+    #[serde(default)]
+    broadcast: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct FillLtcSwapOrderResponse {
+    txid: String,
+    accepted: bool,
+    raw_tx_hex: String,
+    new_outpoint: OutPointJson,
+    direction: String,
+    fee: u64,
+}
+
+fn compute_ltc_swap_order_id(o: &LtcSwapOrderOutput) -> [u8; 8] {
+    let mut hasher = Sha256::new();
+    hasher.update([o.direction, o.confirmations_required]);
+    hasher.update(o.irm_amount.to_le_bytes());
+    hasher.update(o.ltc_amount_sats.to_le_bytes());
+    hasher.update(o.maker_iriumd_pkh);
+    hasher.update(o.maker_ltc_pkh);
+    hasher.update(o.expiry_height.to_le_bytes());
+    if let Some(h) = &o.expected_hash {
+        hasher.update(h);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    out
+}
+
+fn ltc_swap_direction_label(direction: u8) -> &'static str {
+    match direction {
+        LTC_SWAP_ORDER_DIRECTION_SELL => "sell_irm",
+        LTC_SWAP_ORDER_DIRECTION_BUY => "buy_irm",
+        _ => "unknown",
+    }
+}
+
+fn parse_ltc_swap_direction(s: &str) -> Option<u8> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "sell_irm" | "sell" => Some(LTC_SWAP_ORDER_DIRECTION_SELL),
+        "buy_irm" | "buy" => Some(LTC_SWAP_ORDER_DIRECTION_BUY),
+        _ => None,
+    }
+}
+
+async fn sweep_doge_expired_order(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SweepExpiredOrderRequest>,
+) -> Result<Json<SwapSpendResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[sweep_doge_expired_order] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .doge_swap_order_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "doge_swap_order_v1_not_active".to_string(),
+            ));
+        }
+    }
+
+    let txid_arr =
+        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let key = OutPoint {
+        txid: txid_arr,
+        index: req.order_vout,
+    };
+
+    let (funding_out, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let utxo = chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| bad("order_outpoint_unspent_or_unknown"))?;
+        (utxo, chain.tip_height())
+    };
+
+    let order = parse_doge_swap_order_script(&funding_out.output.script_pubkey)
+        .ok_or_else(|| bad("funding_output_not_doge_swap_order"))?;
+    if tip_height < order.expiry_height {
+        return Err(bad("expiry_height_not_reached"));
+    }
+
+    let utxo_value = funding_out.output.value;
+    let minimum_payout = utxo_value.saturating_sub(DOGE_SWAP_ORDER_MAX_SWEEP_FEE);
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let est_fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut payout = if utxo_value >= est_fee.saturating_add(minimum_payout) {
+        utxo_value - est_fee
+    } else {
+        minimum_payout
+    };
+    if payout < minimum_payout {
+        return Err(bad("payout_below_consensus_minimum"));
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: txid_arr,
+            prev_index: req.order_vout,
+            script_sig: encode_doge_swap_order_expire_sweep_witness(),
+            sequence: 0xffff_fffe,
+        }],
+        outputs: vec![TxOutput {
+            value: payout,
+            script_pubkey: p2pkh_script(&order.maker_iriumd_pkh),
+        }],
+        locktime: 0,
+    };
+
+    // Fee recalc against the actual serialized size. The 1-byte
+    // expire-sweep witness is constant so a single pass suffices.
+    let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+    if needed_fee > est_fee {
+        let extra = needed_fee - est_fee;
+        if payout >= minimum_payout.saturating_add(extra) {
+            payout -= extra;
+            tx.outputs[0].value = payout;
+        } else {
+            return Err(bad("fee_recalculation_exceeded_payout_floor"));
+        }
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("calculate_fees_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_out = tx.txid();
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_out) {
+            accepted = mempool
+                .add_transaction(tx.clone(), raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+    Ok(Json(SwapSpendResponse {
+        txid: hex::encode(txid_out),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    }))
+}
+
+async fn post_ltc_swap_order(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<PostLtcSwapOrderRequest>,
+) -> Result<Json<PostLtcSwapOrderResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[post_ltc_swap_order] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    let tip_height_before = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .ltc_swap_order_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ltc_swap_order_v1_not_active".to_string(),
+            ));
+        }
+        chain.tip_height()
+    };
+
+    let direction =
+        parse_ltc_swap_direction(&req.direction).ok_or_else(|| bad("direction_invalid"))?;
+    let irm_amount = parse_irm(&req.irm_amount).map_err(|_| bad("irm_amount_parse_failed"))?;
+    if irm_amount == 0 {
+        return Err(bad("irm_amount_zero"));
+    }
+    if req.ltc_amount_sats == 0 {
+        return Err(bad("ltc_amount_sats_zero"));
+    }
+    if req.confirmations_required < MIN_HTLC_LTC_SWAP_CONFIRMATIONS
+        || req.confirmations_required > MAX_HTLC_LTC_SWAP_CONFIRMATIONS
+    {
+        return Err(bad("confirmations_required_out_of_range"));
+    }
+    if req.expiry_blocks_from_now == 0 {
+        return Err(bad("expiry_blocks_from_now_zero"));
+    }
+    let expiry_height = tip_height_before.saturating_add(req.expiry_blocks_from_now);
+
+    let maker_iriumd_vec = base58_p2pkh_to_hash(&req.maker_iriumd_address)
+        .ok_or_else(|| bad("maker_iriumd_address_decode_failed"))?;
+    if maker_iriumd_vec.len() != 20 {
+        return Err(bad("maker_iriumd_pkh_len_invalid"));
+    }
+    let mut maker_iriumd_pkh = [0u8; 20];
+    maker_iriumd_pkh.copy_from_slice(&maker_iriumd_vec);
+
+    let maker_ltc_pkh = decode_ltc_p2pkh_address(&req.maker_ltc_address)
+        .ok_or_else(|| bad("maker_ltc_address_must_be_p2pkh"))?;
+
+    let expected_hash = if direction == LTC_SWAP_ORDER_DIRECTION_BUY {
+        let h_hex = req
+            .expected_hash_hex
+            .as_deref()
+            .ok_or_else(|| bad("expected_hash_hex_required_for_buy_irm"))?;
+        let bytes = hex::decode(h_hex.trim()).map_err(|_| bad("expected_hash_hex_invalid"))?;
+        if bytes.len() != 32 {
+            return Err(bad("expected_hash_len_invalid"));
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&bytes);
+        Some(h)
+    } else {
+        None
+    };
+
+    let mut order = LtcSwapOrderOutput {
+        direction,
+        confirmations_required: req.confirmations_required,
+        irm_amount,
+        ltc_amount_sats: req.ltc_amount_sats,
+        maker_iriumd_pkh,
+        maker_ltc_pkh,
+        expiry_height,
+        order_id: [0u8; 8],
+        expected_hash,
+    };
+    order.order_id = compute_ltc_swap_order_id(&order);
+
+    let order_script = encode_ltc_swap_order_script(&order);
+    let order_value = if direction == LTC_SWAP_ORDER_DIRECTION_SELL {
+        irm_amount
+    } else {
+        LTC_SWAP_ORDER_MIN_LOCKED_VALUE
+    };
+
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        for key in keys {
+            let bytes = hex::decode(&key.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            key_map.insert(arr, key);
+        }
+    }
+    if key_map.is_empty() {
+        return Err(bad("wallet_key_map_empty"));
+    }
+
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if key_map.contains_key(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+    if utxos.is_empty() {
+        return Err(bad("wallet_utxo_set_empty"));
+    }
+    utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
+
+    let mut fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    if fee_per_byte == 0 {
+        fee_per_byte = 1;
+    }
+
+    let mut selected: Vec<WalletUtxo> = Vec::new();
+    let mut total = 0u64;
+    let mut fee = 0u64;
+    for utxo in utxos.iter() {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
+            continue;
+        }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.output.value);
+        let n_outs = if total > order_value { 2 } else { 1 };
+        fee = estimate_tx_size(selected.len(), n_outs)
+            .saturating_add(order_script.len() as u64)
+            .saturating_mul(fee_per_byte);
+        if total >= order_value.saturating_add(fee) {
+            break;
+        }
+    }
+    if total < order_value.saturating_add(fee) {
+        return Err(bad("insufficient_spendable_funds"));
+    }
+
+    let inputs: Vec<TxInput> = selected
+        .iter()
+        .map(|u| TxInput {
+            prev_txid: u.outpoint.txid,
+            prev_index: u.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        })
+        .collect();
+
+    let mut outputs = vec![TxOutput {
+        value: order_value,
+        script_pubkey: order_script,
+    }];
+    let mut change = total.saturating_sub(order_value).saturating_sub(fee);
+    if change > 0 {
+        let change_pkh = selected
+            .first()
+            .map(|u| u.pkh)
+            .ok_or_else(|| bad("no_change_pkh"))?;
+        outputs.push(TxOutput {
+            value: change,
+            script_pubkey: p2pkh_script(&change_pkh),
+        });
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+
+    for _ in 0..2 {
+        sign_wallet_inputs(&mut tx, &selected, &key_map)
+            .map_err(|_| bad("sign_wallet_inputs_failed"))?;
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if change >= extra {
+                fee = needed_fee;
+                change = change.saturating_sub(extra);
+                if tx.outputs.len() > 1 {
+                    tx.outputs[1].value = change;
+                }
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_change"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("chain_fee_calculation_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_arr = tx.txid();
+    let txid_hex = hex::encode(txid_arr);
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_arr) {
+            match mempool.add_transaction(tx.clone(), raw.clone(), fee_checked) {
+                Ok(_) => accepted = true,
+                Err(e) => eprintln!("[post_ltc_swap_order] mempool_reject reason={}", e),
+            }
+        }
+    }
+
+    Ok(Json(PostLtcSwapOrderResponse {
+        txid: txid_hex.clone(),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        order_outpoint: OutPointJson {
+            txid: txid_hex,
+            vout: 0,
+        },
+        order_id_hex: hex::encode(order.order_id),
+        expiry_height,
+        fee: fee_checked,
+    }))
+}
+
+async fn list_ltc_swap_orders(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    Query(q): Query<ListLtcSwapOrdersQuery>,
+) -> Result<Json<ListLtcSwapOrdersResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers_map)?;
+    require_rpc_auth(&headers_map)?;
+
+    let direction_filter = match q.direction.as_deref() {
+        None | Some("both") => None,
+        Some(s) => match parse_ltc_swap_direction(s) {
+            Some(d) => Some(d),
+            None => return Err(StatusCode::BAD_REQUEST),
+        },
+    };
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let offset = q.offset.unwrap_or(0);
+    let sort = q.sort.as_deref().unwrap_or("recent");
+
+    let mut all: Vec<LtcSwapOrderJson> = Vec::new();
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        for (outpoint, utxo) in chain.utxos.iter() {
+            let order = match parse_ltc_swap_order_script(&utxo.output.script_pubkey) {
+                Some(o) => o,
+                None => continue,
+            };
+            if let Some(d) = direction_filter {
+                if order.direction != d {
+                    continue;
+                }
+            }
+            if let Some(min) = q.min_irm {
+                if order.irm_amount < min {
+                    continue;
+                }
+            }
+            if let Some(max) = q.max_irm {
+                if order.irm_amount > max {
+                    continue;
+                }
+            }
+            if let Some(min) = q.min_ltc {
+                if order.ltc_amount_sats < min {
+                    continue;
+                }
+            }
+            if let Some(max) = q.max_ltc {
+                if order.ltc_amount_sats > max {
+                    continue;
+                }
+            }
+            let implied = if order.irm_amount > 0 {
+                order.ltc_amount_sats as f64 / order.irm_amount as f64
+            } else {
+                0.0
+            };
+            all.push(LtcSwapOrderJson {
+                outpoint: OutPointJson {
+                    txid: hex::encode(outpoint.txid),
+                    vout: outpoint.index,
+                },
+                order_id_hex: hex::encode(order.order_id),
+                direction: ltc_swap_direction_label(order.direction).to_string(),
+                irm_amount: order.irm_amount,
+                ltc_amount_sats: order.ltc_amount_sats,
+                implied_ltc_per_irm_sats: implied,
+                maker_iriumd_address: base58_p2pkh_from_hash(&order.maker_iriumd_pkh),
+                maker_ltc_pkh_hex: hex::encode(order.maker_ltc_pkh),
+                confirmations_required: order.confirmations_required,
+                expiry_height: order.expiry_height,
+                locked_value: utxo.output.value,
+                expected_hash_hex: order.expected_hash.map(hex::encode),
+            });
+        }
+    }
+
+    let total_open = all.len();
+    match sort {
+        "price_asc" => all.sort_by(|a, b| {
+            a.implied_ltc_per_irm_sats
+                .partial_cmp(&b.implied_ltc_per_irm_sats)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        "price_desc" => all.sort_by(|a, b| {
+            b.implied_ltc_per_irm_sats
+                .partial_cmp(&a.implied_ltc_per_irm_sats)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        _ => all.sort_by(|a, b| b.expiry_height.cmp(&a.expiry_height)),
+    }
+
+    let page: Vec<LtcSwapOrderJson> = all.into_iter().skip(offset).take(limit).collect();
+    Ok(Json(ListLtcSwapOrdersResponse {
+        orders: page,
+        total_open,
+    }))
+}
+
+async fn get_ltc_swap_order(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    Query(q): Query<GetLtcSwapOrderQuery>,
+) -> Result<Json<GetLtcSwapOrderResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers_map)?;
+    require_rpc_auth(&headers_map)?;
+
+    let txid = hex_to_32(q.txid.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let key = OutPoint {
+        txid,
+        index: q.vout,
+    };
+
+    let (tip_height, maybe_utxo) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        (chain.tip_height(), chain.utxos.get(&key).cloned())
+    };
+
+    let Some(utxo) = maybe_utxo else {
+        return Ok(Json(GetLtcSwapOrderResponse {
+            found: false,
+            order: None,
+            status: "closed".to_string(),
+        }));
+    };
+
+    let order = match parse_ltc_swap_order_script(&utxo.output.script_pubkey) {
+        Some(o) => o,
+        None => {
+            return Ok(Json(GetLtcSwapOrderResponse {
+                found: false,
+                order: None,
+                status: "not_a_ltc_swap_order".to_string(),
+            }));
+        }
+    };
+
+    let implied = if order.irm_amount > 0 {
+        order.ltc_amount_sats as f64 / order.irm_amount as f64
+    } else {
+        0.0
+    };
+    let status = if tip_height >= order.expiry_height {
+        "expired"
+    } else {
+        "open"
+    };
+    Ok(Json(GetLtcSwapOrderResponse {
+        found: true,
+        order: Some(LtcSwapOrderJson {
+            outpoint: OutPointJson {
+                txid: hex::encode(key.txid),
+                vout: key.index,
+            },
+            order_id_hex: hex::encode(order.order_id),
+            direction: ltc_swap_direction_label(order.direction).to_string(),
+            irm_amount: order.irm_amount,
+            ltc_amount_sats: order.ltc_amount_sats,
+            implied_ltc_per_irm_sats: implied,
+            maker_iriumd_address: base58_p2pkh_from_hash(&order.maker_iriumd_pkh),
+            maker_ltc_pkh_hex: hex::encode(order.maker_ltc_pkh),
+            confirmations_required: order.confirmations_required,
+            expiry_height: order.expiry_height,
+            locked_value: utxo.output.value,
+            expected_hash_hex: order.expected_hash.map(hex::encode),
+        }),
+        status: status.to_string(),
+    }))
+}
+
+async fn cancel_ltc_swap_order(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<CancelLtcSwapOrderRequest>,
+) -> Result<Json<SwapSpendResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[cancel_ltc_swap_order] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .ltc_swap_order_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ltc_swap_order_v1_not_active".to_string(),
+            ));
+        }
+    }
+
+    let txid_arr =
+        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let key = OutPoint {
+        txid: txid_arr,
+        index: req.order_vout,
+    };
+
+    let (funding_out, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let utxo = chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| bad("order_outpoint_unspent_or_unknown"))?;
+        (utxo, chain.tip_height())
+    };
+
+    let order = parse_ltc_swap_order_script(&funding_out.output.script_pubkey)
+        .ok_or_else(|| bad("funding_output_not_ltc_swap_order"))?;
+    if tip_height >= order.expiry_height {
+        return Err(bad("order_already_expired"));
+    }
+
+    let signer_pkh = order.maker_iriumd_pkh;
+    let wallet_key = {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        let mut found: Option<WalletKey> = None;
+        for k in keys {
+            let b = hex::decode(&k.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if b.len() != 20 {
+                continue;
+            }
+            let mut pkh = [0u8; 20];
+            pkh.copy_from_slice(&b);
+            if pkh == signer_pkh {
+                found = Some(k);
+                break;
+            }
+        }
+        found.ok_or_else(|| bad("maker_iriumd_pkh_key_not_in_wallet"))?
+    };
+
+    let dest = base58_p2pkh_to_hash(&req.destination_address)
+        .ok_or_else(|| bad("destination_address_decode_failed"))?;
+    if dest.len() != 20 {
+        return Err(bad("destination_pkh_len_invalid"));
+    }
+    let mut dest_pkh = [0u8; 20];
+    dest_pkh.copy_from_slice(&dest);
+
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    if funding_out.output.value <= fee {
+        return Err(bad("funding_value_le_fee"));
+    }
+    let mut payout = funding_out.output.value - fee;
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: txid_arr,
+            prev_index: req.order_vout,
+            script_sig: Vec::new(),
+            sequence: 0xffff_fffe,
+        }],
+        outputs: vec![TxOutput {
+            value: payout,
+            script_pubkey: p2pkh_script(&dest_pkh),
+        }],
+        locktime: 0,
+    };
+
+    let scriptcode = encode_ltc_swap_order_script(&order);
+    let priv_bytes =
+        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    if priv_bytes.len() != 32 {
+        return Err(bad("privkey_len_invalid"));
+    }
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(&priv_bytes);
+    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
+        .map_err(|_| bad("signing_key_init_failed"))?;
+    let pubkey = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &scriptcode);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_ltc_swap_order_cancel_witness(&sig_bytes, &pubkey)
+            .ok_or_else(|| bad("encode_cancel_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("calculate_fees_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_out = tx.txid();
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_out) {
+            accepted = mempool
+                .add_transaction(tx, raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+    Ok(Json(SwapSpendResponse {
+        txid: hex::encode(txid_out),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    }))
+}
+
+async fn fill_ltc_swap_order(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<FillLtcSwapOrderRequest>,
+) -> Result<Json<FillLtcSwapOrderResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[fill_ltc_swap_order] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .ltc_swap_order_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ltc_swap_order_v1_not_active".to_string(),
+            ));
+        }
+    }
+
+    let _ = req.taker_ltc_address;
+
+    let txid_arr =
+        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let key = OutPoint {
+        txid: txid_arr,
+        index: req.order_vout,
+    };
+
+    let (funding_out, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let utxo = chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| bad("order_outpoint_unspent_or_unknown"))?;
+        (utxo, chain.tip_height())
+    };
+
+    let order = parse_ltc_swap_order_script(&funding_out.output.script_pubkey)
+        .ok_or_else(|| bad("funding_output_not_ltc_swap_order"))?;
+    if tip_height > order.expiry_height {
+        return Err(bad("order_expired"));
+    }
+    if req.timeout_blocks_from_now == 0 {
+        return Err(bad("timeout_blocks_from_now_zero"));
+    }
+    let timeout_height = tip_height.saturating_add(req.timeout_blocks_from_now);
+
+    let taker_iriumd_vec = base58_p2pkh_to_hash(&req.taker_iriumd_address)
+        .ok_or_else(|| bad("taker_iriumd_address_decode_failed"))?;
+    if taker_iriumd_vec.len() != 20 {
+        return Err(bad("taker_iriumd_pkh_len_invalid"));
+    }
+    let mut taker_iriumd_pkh = [0u8; 20];
+    taker_iriumd_pkh.copy_from_slice(&taker_iriumd_vec);
+
+    let wallet_key = {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        let mut found: Option<WalletKey> = None;
+        for k in keys {
+            let b = hex::decode(&k.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if b.len() != 20 {
+                continue;
+            }
+            let mut pkh = [0u8; 20];
+            pkh.copy_from_slice(&b);
+            if pkh == taker_iriumd_pkh {
+                found = Some(k);
+                break;
+            }
+        }
+        found.ok_or_else(|| bad("taker_iriumd_pkh_key_not_in_wallet"))?
+    };
+
+    let priv_bytes =
+        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    if priv_bytes.len() != 32 {
+        return Err(bad("privkey_len_invalid"));
+    }
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(&priv_bytes);
+    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
+        .map_err(|_| bad("signing_key_init_failed"))?;
+    let pubkey = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+
+    let covenant_output = match order.direction {
+        LTC_SWAP_ORDER_DIRECTION_SELL => {
+            let funding_binding = compute_funding_binding(&txid_arr, req.order_vout);
+            let swap = HtlcLtcSwapV1Output {
+                confirmations_required: order.confirmations_required,
+                recipient_pkh: taker_iriumd_pkh,
+                refund_pkh: order.maker_iriumd_pkh,
+                ltc_recipient_pkh: order.maker_ltc_pkh,
+                ltc_amount_sats: order.ltc_amount_sats,
+                timeout_height,
+                funding_binding,
+            };
+            TxOutput {
+                value: order.irm_amount,
+                script_pubkey: encode_htlc_ltc_swap_v1_script(&swap),
+            }
+        }
+        LTC_SWAP_ORDER_DIRECTION_BUY => {
+            let expected_hash = order
+                .expected_hash
+                .ok_or_else(|| bad("buy_order_missing_expected_hash"))?;
+            let sha = Sha256::digest(&pubkey);
+            let rip = ripemd::Ripemd160::digest(&sha);
+            let mut taker_refund_pkh = [0u8; 20];
+            taker_refund_pkh.copy_from_slice(&rip);
+            let htlc = HtlcV1Output {
+                expected_hash,
+                recipient_pkh: order.maker_iriumd_pkh,
+                refund_pkh: taker_refund_pkh,
+                timeout_height,
+            };
+            TxOutput {
+                value: order.irm_amount,
+                script_pubkey: encode_htlcv1_script(&htlc),
+            }
+        }
+        _ => return Err(bad("order_direction_unknown")),
+    };
+
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    if order.direction == LTC_SWAP_ORDER_DIRECTION_SELL
+        && funding_out.output.value < order.irm_amount
+    {
+        return Err(bad("order_value_below_required_irm_amount"));
+    }
+
+    let mut inputs: Vec<TxInput> = vec![TxInput {
+        prev_txid: txid_arr,
+        prev_index: req.order_vout,
+        script_sig: Vec::new(),
+        sequence: 0xffff_fffe,
+    }];
+    let mut outputs = vec![covenant_output];
+
+    let mut extra_inputs: Vec<WalletUtxo> = Vec::new();
+    let mut extra_total = 0u64;
+    if order.direction == LTC_SWAP_ORDER_DIRECTION_BUY
+        || funding_out.output.value < order.irm_amount.saturating_add(fee)
+    {
+        let needed = order
+            .irm_amount
+            .saturating_add(fee)
+            .saturating_sub(funding_out.output.value);
+        let mut wallet_utxos = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            let mut collected = Vec::new();
+            for (out, ut) in chain.utxos.iter() {
+                if let Some(pkh) = p2pkh_hash_from_script(&ut.output.script_pubkey) {
+                    if pkh == taker_iriumd_pkh {
+                        collected.push(WalletUtxo {
+                            outpoint: out.clone(),
+                            output: ut.output.clone(),
+                            height: ut.height,
+                            is_coinbase: ut.is_coinbase,
+                            pkh,
+                        });
+                    }
+                }
+            }
+            collected
+        };
+        wallet_utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
+        for u in wallet_utxos.iter() {
+            if u.is_coinbase
+                && tip_height.saturating_sub(u.height) < coinbase_maturity()
+            {
+                continue;
+            }
+            extra_inputs.push(u.clone());
+            extra_total = extra_total.saturating_add(u.output.value);
+            inputs.push(TxInput {
+                prev_txid: u.outpoint.txid,
+                prev_index: u.outpoint.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            });
+            if extra_total >= needed {
+                break;
+            }
+        }
+        if extra_total < needed {
+            return Err(bad("insufficient_taker_funds_to_fill_order"));
+        }
+        let change = funding_out
+            .output
+            .value
+            .saturating_add(extra_total)
+            .saturating_sub(order.irm_amount)
+            .saturating_sub(fee);
+        if change > 0 {
+            outputs.push(TxOutput {
+                value: change,
+                script_pubkey: p2pkh_script(&taker_iriumd_pkh),
+            });
+        }
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+
+    let scriptcode_order = encode_ltc_swap_order_script(&order);
+
+    // 2-pass fee recalc: estimate_tx_size(1,1) under-counts the order
+    // fill witness (sig + pubkey + taker_pkh + timeout) and any extra
+    // P2PKH wallet inputs. Without this loop a 1-input/1-output sell
+    // fill at fee_per_byte=1 produces ~0.66 sat/B and mempool admission
+    // fails at min_fee_per_byte=100.0. Same pattern as fill_swap_order
+    // fix in 1d9519f.
+    for _ in 0..2 {
+        let digest_order = signature_digest(&tx, 0, &scriptcode_order);
+        let order_sig: Signature = signing_key
+            .sign_prehash(&digest_order)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let order_sig = order_sig.normalize_s().unwrap_or(order_sig);
+        let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
+        order_sig_bytes.push(0x01);
+
+        let witness = match order.direction {
+            LTC_SWAP_ORDER_DIRECTION_SELL => encode_ltc_swap_order_fill_sell_witness(
+                &order_sig_bytes,
+                &pubkey,
+                &taker_iriumd_pkh,
+                timeout_height,
+            )
+            .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
+            LTC_SWAP_ORDER_DIRECTION_BUY => encode_ltc_swap_order_fill_buy_witness(
+                &order_sig_bytes,
+                &pubkey,
+                timeout_height,
+            )
+            .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
+            _ => return Err(bad("order_direction_unknown")),
+        };
+        tx.inputs[0].script_sig = witness;
+
+        if !extra_inputs.is_empty() {
+            let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+            key_map.insert(taker_iriumd_pkh, wallet_key.clone());
+            sign_wallet_inputs(&mut tx, &extra_inputs, &key_map)
+                .map_err(|_| bad("sign_extra_inputs_failed"))?;
+        }
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            // Reduce change (always the last output when there is one) to
+            // absorb the shortfall. Covenant output 0 is fixed by spec; we
+            // cannot touch it. If no change exists or change can't cover
+            // the delta, reject \xe2\x80\x94 caller can retry with a higher
+            // fee_per_byte or pre-funded inputs.
+            if tx.outputs.len() > 1 {
+                let change_idx = tx.outputs.len() - 1;
+                if tx.outputs[change_idx].value > extra {
+                    fee = needed_fee;
+                    tx.outputs[change_idx].value -= extra;
+                    continue;
+                } else {
+                    return Err(bad("fee_recalculation_exceeded_change"));
+                }
+            } else {
+                return Err(bad("fee_recalculation_no_change_to_reduce"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("calculate_fees_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_out = tx.txid();
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_out) {
+            accepted = mempool
+                .add_transaction(tx, raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+
+    Ok(Json(FillLtcSwapOrderResponse {
+        txid: hex::encode(txid_out),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        new_outpoint: OutPointJson {
+            txid: hex::encode(txid_out),
+            vout: 0,
+        },
+        direction: ltc_swap_direction_label(order.direction).to_string(),
+        fee: fee_checked,
+    }))
+}
+
+// ---- Phase D — DogeSwapOrder RPC endpoints. Byte-level mirror of the
+// BTC SwapOrder RPCs above, gated on `doge_swap_order_v1_activation_height`.
+// Sell-direction fills emit `HtlcDogeSwapV1` outputs (Phase C); buy-direction
+// fills emit `HTLCv1` outputs identical to the BTC SwapOrder buy-fill since
+// the IRM hashlock is chain-agnostic.
+
+#[derive(Debug, Deserialize)]
+struct PostDogeSwapOrderRequest {
+    direction: String,
+    irm_amount: String,
+    doge_amount_sats: u64,
+    maker_iriumd_address: String,
+    maker_doge_address: String,
+    confirmations_required: u8,
+    expiry_blocks_from_now: u64,
+    #[serde(default)]
+    expected_hash_hex: Option<String>,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+    #[serde(default)]
+    broadcast: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct PostDogeSwapOrderResponse {
+    txid: String,
+    accepted: bool,
+    raw_tx_hex: String,
+    order_outpoint: OutPointJson,
+    order_id_hex: String,
+    expiry_height: u64,
+    fee: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListDogeSwapOrdersQuery {
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    min_irm: Option<u64>,
+    #[serde(default)]
+    max_irm: Option<u64>,
+    #[serde(default)]
+    min_ltc: Option<u64>,
+    #[serde(default)]
+    max_ltc: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    sort: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DogeSwapOrderJson {
+    outpoint: OutPointJson,
+    order_id_hex: String,
+    direction: String,
+    irm_amount: u64,
+    doge_amount_sats: u64,
+    implied_ltc_per_irm_sats: f64,
+    maker_iriumd_address: String,
+    maker_doge_pkh_hex: String,
+    confirmations_required: u8,
+    expiry_height: u64,
+    locked_value: u64,
+    expected_hash_hex: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListDogeSwapOrdersResponse {
+    orders: Vec<DogeSwapOrderJson>,
+    total_open: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetDogeSwapOrderQuery {
+    txid: String,
+    vout: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct GetDogeSwapOrderResponse {
+    found: bool,
+    order: Option<DogeSwapOrderJson>,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelDogeSwapOrderRequest {
+    order_txid: String,
+    order_vout: u32,
+    destination_address: String,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+    #[serde(default)]
+    broadcast: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FillDogeSwapOrderRequest {
+    order_txid: String,
+    order_vout: u32,
+    taker_iriumd_address: String,
+    #[serde(default)]
+    taker_ltc_address: Option<String>,
+    timeout_blocks_from_now: u64,
+    #[serde(default)]
+    fee_per_byte: Option<u64>,
+    #[serde(default)]
+    broadcast: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct FillDogeSwapOrderResponse {
+    txid: String,
+    accepted: bool,
+    raw_tx_hex: String,
+    new_outpoint: OutPointJson,
+    direction: String,
+    fee: u64,
+}
+
+fn compute_doge_swap_order_id(o: &DogeSwapOrderOutput) -> [u8; 8] {
+    let mut hasher = Sha256::new();
+    hasher.update([o.direction, o.confirmations_required]);
+    hasher.update(o.irm_amount.to_le_bytes());
+    hasher.update(o.doge_amount_sats.to_le_bytes());
+    hasher.update(o.maker_iriumd_pkh);
+    hasher.update(o.maker_doge_pkh);
+    hasher.update(o.expiry_height.to_le_bytes());
+    if let Some(h) = &o.expected_hash {
+        hasher.update(h);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    out
+}
+
+fn doge_swap_direction_label(direction: u8) -> &'static str {
+    match direction {
+        DOGE_SWAP_ORDER_DIRECTION_SELL => "sell_irm",
+        DOGE_SWAP_ORDER_DIRECTION_BUY => "buy_irm",
+        _ => "unknown",
+    }
+}
+
+fn parse_doge_swap_direction(s: &str) -> Option<u8> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "sell_irm" | "sell" => Some(DOGE_SWAP_ORDER_DIRECTION_SELL),
+        "buy_irm" | "buy" => Some(DOGE_SWAP_ORDER_DIRECTION_BUY),
+        _ => None,
+    }
+}
+
+async fn post_doge_swap_order(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<PostDogeSwapOrderRequest>,
+) -> Result<Json<PostDogeSwapOrderResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[post_doge_swap_order] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    let tip_height_before = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .doge_swap_order_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "doge_swap_order_v1_not_active".to_string(),
+            ));
+        }
+        chain.tip_height()
+    };
+
+    let direction =
+        parse_doge_swap_direction(&req.direction).ok_or_else(|| bad("direction_invalid"))?;
+    let irm_amount = parse_irm(&req.irm_amount).map_err(|_| bad("irm_amount_parse_failed"))?;
+    if irm_amount == 0 {
+        return Err(bad("irm_amount_zero"));
+    }
+    if req.doge_amount_sats == 0 {
+        return Err(bad("doge_amount_sats_zero"));
+    }
+    if req.confirmations_required < MIN_HTLC_DOGE_SWAP_CONFIRMATIONS
+        || req.confirmations_required > MAX_HTLC_DOGE_SWAP_CONFIRMATIONS
+    {
+        return Err(bad("confirmations_required_out_of_range"));
+    }
+    if req.expiry_blocks_from_now == 0 {
+        return Err(bad("expiry_blocks_from_now_zero"));
+    }
+    let expiry_height = tip_height_before.saturating_add(req.expiry_blocks_from_now);
+
+    let maker_iriumd_vec = base58_p2pkh_to_hash(&req.maker_iriumd_address)
+        .ok_or_else(|| bad("maker_iriumd_address_decode_failed"))?;
+    if maker_iriumd_vec.len() != 20 {
+        return Err(bad("maker_iriumd_pkh_len_invalid"));
+    }
+    let mut maker_iriumd_pkh = [0u8; 20];
+    maker_iriumd_pkh.copy_from_slice(&maker_iriumd_vec);
+
+    let maker_doge_pkh = decode_doge_p2pkh_address(&req.maker_doge_address)
+        .ok_or_else(|| bad("maker_doge_address_must_be_p2pkh"))?;
+
+    let expected_hash = if direction == DOGE_SWAP_ORDER_DIRECTION_BUY {
+        let h_hex = req
+            .expected_hash_hex
+            .as_deref()
+            .ok_or_else(|| bad("expected_hash_hex_required_for_buy_irm"))?;
+        let bytes = hex::decode(h_hex.trim()).map_err(|_| bad("expected_hash_hex_invalid"))?;
+        if bytes.len() != 32 {
+            return Err(bad("expected_hash_len_invalid"));
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&bytes);
+        Some(h)
+    } else {
+        None
+    };
+
+    let mut order = DogeSwapOrderOutput {
+        direction,
+        confirmations_required: req.confirmations_required,
+        irm_amount,
+        doge_amount_sats: req.doge_amount_sats,
+        maker_iriumd_pkh,
+        maker_doge_pkh,
+        expiry_height,
+        order_id: [0u8; 8],
+        expected_hash,
+    };
+    order.order_id = compute_doge_swap_order_id(&order);
+
+    let order_script = encode_doge_swap_order_script(&order);
+    let order_value = if direction == DOGE_SWAP_ORDER_DIRECTION_SELL {
+        irm_amount
+    } else {
+        DOGE_SWAP_ORDER_MIN_LOCKED_VALUE
+    };
+
+    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+    {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        for key in keys {
+            let bytes = hex::decode(&key.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            key_map.insert(arr, key);
+        }
+    }
+    if key_map.is_empty() {
+        return Err(bad("wallet_key_map_empty"));
+    }
+
+    let (mut utxos, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut collected = Vec::new();
+        for (outpoint, utxo) in chain.utxos.iter() {
+            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
+                if key_map.contains_key(&script_pkh) {
+                    collected.push(WalletUtxo {
+                        outpoint: outpoint.clone(),
+                        output: utxo.output.clone(),
+                        height: utxo.height,
+                        is_coinbase: utxo.is_coinbase,
+                        pkh: script_pkh,
+                    });
+                }
+            }
+        }
+        (collected, chain.tip_height())
+    };
+    if utxos.is_empty() {
+        return Err(bad("wallet_utxo_set_empty"));
+    }
+    utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
+
+    let mut fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    if fee_per_byte == 0 {
+        fee_per_byte = 1;
+    }
+
+    let mut selected: Vec<WalletUtxo> = Vec::new();
+    let mut total = 0u64;
+    let mut fee = 0u64;
+    for utxo in utxos.iter() {
+        let confirmations = tip_height.saturating_sub(utxo.height);
+        if utxo.is_coinbase && confirmations < coinbase_maturity() {
+            continue;
+        }
+        selected.push(utxo.clone());
+        total = total.saturating_add(utxo.output.value);
+        let n_outs = if total > order_value { 2 } else { 1 };
+        fee = estimate_tx_size(selected.len(), n_outs)
+            .saturating_add(order_script.len() as u64)
+            .saturating_mul(fee_per_byte);
+        if total >= order_value.saturating_add(fee) {
+            break;
+        }
+    }
+    if total < order_value.saturating_add(fee) {
+        return Err(bad("insufficient_spendable_funds"));
+    }
+
+    let inputs: Vec<TxInput> = selected
+        .iter()
+        .map(|u| TxInput {
+            prev_txid: u.outpoint.txid,
+            prev_index: u.outpoint.index,
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+        })
+        .collect();
+
+    let mut outputs = vec![TxOutput {
+        value: order_value,
+        script_pubkey: order_script,
+    }];
+    let mut change = total.saturating_sub(order_value).saturating_sub(fee);
+    if change > 0 {
+        let change_pkh = selected
+            .first()
+            .map(|u| u.pkh)
+            .ok_or_else(|| bad("no_change_pkh"))?;
+        outputs.push(TxOutput {
+            value: change,
+            script_pubkey: p2pkh_script(&change_pkh),
+        });
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+
+    for _ in 0..2 {
+        sign_wallet_inputs(&mut tx, &selected, &key_map)
+            .map_err(|_| bad("sign_wallet_inputs_failed"))?;
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if change >= extra {
+                fee = needed_fee;
+                change = change.saturating_sub(extra);
+                if tx.outputs.len() > 1 {
+                    tx.outputs[1].value = change;
+                }
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_change"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("chain_fee_calculation_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_arr = tx.txid();
+    let txid_hex = hex::encode(txid_arr);
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_arr) {
+            match mempool.add_transaction(tx.clone(), raw.clone(), fee_checked) {
+                Ok(_) => accepted = true,
+                Err(e) => eprintln!("[post_doge_swap_order] mempool_reject reason={}", e),
+            }
+        }
+    }
+
+    Ok(Json(PostDogeSwapOrderResponse {
+        txid: txid_hex.clone(),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        order_outpoint: OutPointJson {
+            txid: txid_hex,
+            vout: 0,
+        },
+        order_id_hex: hex::encode(order.order_id),
+        expiry_height,
+        fee: fee_checked,
+    }))
+}
+
+async fn list_doge_swap_orders(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    Query(q): Query<ListDogeSwapOrdersQuery>,
+) -> Result<Json<ListDogeSwapOrdersResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers_map)?;
+    require_rpc_auth(&headers_map)?;
+
+    let direction_filter = match q.direction.as_deref() {
+        None | Some("both") => None,
+        Some(s) => match parse_doge_swap_direction(s) {
+            Some(d) => Some(d),
+            None => return Err(StatusCode::BAD_REQUEST),
+        },
+    };
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let offset = q.offset.unwrap_or(0);
+    let sort = q.sort.as_deref().unwrap_or("recent");
+
+    let mut all: Vec<DogeSwapOrderJson> = Vec::new();
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        for (outpoint, utxo) in chain.utxos.iter() {
+            let order = match parse_doge_swap_order_script(&utxo.output.script_pubkey) {
+                Some(o) => o,
+                None => continue,
+            };
+            if let Some(d) = direction_filter {
+                if order.direction != d {
+                    continue;
+                }
+            }
+            if let Some(min) = q.min_irm {
+                if order.irm_amount < min {
+                    continue;
+                }
+            }
+            if let Some(max) = q.max_irm {
+                if order.irm_amount > max {
+                    continue;
+                }
+            }
+            if let Some(min) = q.min_ltc {
+                if order.doge_amount_sats < min {
+                    continue;
+                }
+            }
+            if let Some(max) = q.max_ltc {
+                if order.doge_amount_sats > max {
+                    continue;
+                }
+            }
+            let implied = if order.irm_amount > 0 {
+                order.doge_amount_sats as f64 / order.irm_amount as f64
+            } else {
+                0.0
+            };
+            all.push(DogeSwapOrderJson {
+                outpoint: OutPointJson {
+                    txid: hex::encode(outpoint.txid),
+                    vout: outpoint.index,
+                },
+                order_id_hex: hex::encode(order.order_id),
+                direction: doge_swap_direction_label(order.direction).to_string(),
+                irm_amount: order.irm_amount,
+                doge_amount_sats: order.doge_amount_sats,
+                implied_ltc_per_irm_sats: implied,
+                maker_iriumd_address: base58_p2pkh_from_hash(&order.maker_iriumd_pkh),
+                maker_doge_pkh_hex: hex::encode(order.maker_doge_pkh),
+                confirmations_required: order.confirmations_required,
+                expiry_height: order.expiry_height,
+                locked_value: utxo.output.value,
+                expected_hash_hex: order.expected_hash.map(hex::encode),
+            });
+        }
+    }
+
+    let total_open = all.len();
+    match sort {
+        "price_asc" => all.sort_by(|a, b| {
+            a.implied_ltc_per_irm_sats
+                .partial_cmp(&b.implied_ltc_per_irm_sats)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        "price_desc" => all.sort_by(|a, b| {
+            b.implied_ltc_per_irm_sats
+                .partial_cmp(&a.implied_ltc_per_irm_sats)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        _ => all.sort_by(|a, b| b.expiry_height.cmp(&a.expiry_height)),
+    }
+
+    let page: Vec<DogeSwapOrderJson> = all.into_iter().skip(offset).take(limit).collect();
+    Ok(Json(ListDogeSwapOrdersResponse {
+        orders: page,
+        total_open,
+    }))
+}
+
+async fn get_doge_swap_order(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    Query(q): Query<GetDogeSwapOrderQuery>,
+) -> Result<Json<GetDogeSwapOrderResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers_map)?;
+    require_rpc_auth(&headers_map)?;
+
+    let txid = hex_to_32(q.txid.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let key = OutPoint {
+        txid,
+        index: q.vout,
+    };
+
+    let (tip_height, maybe_utxo) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        (chain.tip_height(), chain.utxos.get(&key).cloned())
+    };
+
+    let Some(utxo) = maybe_utxo else {
+        return Ok(Json(GetDogeSwapOrderResponse {
+            found: false,
+            order: None,
+            status: "closed".to_string(),
+        }));
+    };
+
+    let order = match parse_doge_swap_order_script(&utxo.output.script_pubkey) {
+        Some(o) => o,
+        None => {
+            return Ok(Json(GetDogeSwapOrderResponse {
+                found: false,
+                order: None,
+                status: "not_a_doge_swap_order".to_string(),
+            }));
+        }
+    };
+
+    let implied = if order.irm_amount > 0 {
+        order.doge_amount_sats as f64 / order.irm_amount as f64
+    } else {
+        0.0
+    };
+    let status = if tip_height >= order.expiry_height {
+        "expired"
+    } else {
+        "open"
+    };
+    Ok(Json(GetDogeSwapOrderResponse {
+        found: true,
+        order: Some(DogeSwapOrderJson {
+            outpoint: OutPointJson {
+                txid: hex::encode(key.txid),
+                vout: key.index,
+            },
+            order_id_hex: hex::encode(order.order_id),
+            direction: doge_swap_direction_label(order.direction).to_string(),
+            irm_amount: order.irm_amount,
+            doge_amount_sats: order.doge_amount_sats,
+            implied_ltc_per_irm_sats: implied,
+            maker_iriumd_address: base58_p2pkh_from_hash(&order.maker_iriumd_pkh),
+            maker_doge_pkh_hex: hex::encode(order.maker_doge_pkh),
+            confirmations_required: order.confirmations_required,
+            expiry_height: order.expiry_height,
+            locked_value: utxo.output.value,
+            expected_hash_hex: order.expected_hash.map(hex::encode),
+        }),
+        status: status.to_string(),
+    }))
+}
+
+async fn cancel_doge_swap_order(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<CancelDogeSwapOrderRequest>,
+) -> Result<Json<SwapSpendResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[cancel_doge_swap_order] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .doge_swap_order_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "doge_swap_order_v1_not_active".to_string(),
+            ));
+        }
+    }
+
+    let txid_arr =
+        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let key = OutPoint {
+        txid: txid_arr,
+        index: req.order_vout,
+    };
+
+    let (funding_out, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let utxo = chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| bad("order_outpoint_unspent_or_unknown"))?;
+        (utxo, chain.tip_height())
+    };
+
+    let order = parse_doge_swap_order_script(&funding_out.output.script_pubkey)
+        .ok_or_else(|| bad("funding_output_not_doge_swap_order"))?;
+    if tip_height >= order.expiry_height {
+        return Err(bad("order_already_expired"));
+    }
+
+    let signer_pkh = order.maker_iriumd_pkh;
+    let wallet_key = {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        let mut found: Option<WalletKey> = None;
+        for k in keys {
+            let b = hex::decode(&k.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if b.len() != 20 {
+                continue;
+            }
+            let mut pkh = [0u8; 20];
+            pkh.copy_from_slice(&b);
+            if pkh == signer_pkh {
+                found = Some(k);
+                break;
+            }
+        }
+        found.ok_or_else(|| bad("maker_iriumd_pkh_key_not_in_wallet"))?
+    };
+
+    let dest = base58_p2pkh_to_hash(&req.destination_address)
+        .ok_or_else(|| bad("destination_address_decode_failed"))?;
+    if dest.len() != 20 {
+        return Err(bad("destination_pkh_len_invalid"));
+    }
+    let mut dest_pkh = [0u8; 20];
+    dest_pkh.copy_from_slice(&dest);
+
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    if funding_out.output.value <= fee {
+        return Err(bad("funding_value_le_fee"));
+    }
+    let mut payout = funding_out.output.value - fee;
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            prev_txid: txid_arr,
+            prev_index: req.order_vout,
+            script_sig: Vec::new(),
+            sequence: 0xffff_fffe,
+        }],
+        outputs: vec![TxOutput {
+            value: payout,
+            script_pubkey: p2pkh_script(&dest_pkh),
+        }],
+        locktime: 0,
+    };
+
+    let scriptcode = encode_doge_swap_order_script(&order);
+    let priv_bytes =
+        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    if priv_bytes.len() != 32 {
+        return Err(bad("privkey_len_invalid"));
+    }
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(&priv_bytes);
+    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
+        .map_err(|_| bad("signing_key_init_failed"))?;
+    let pubkey = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &scriptcode);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+
+        let witness = encode_doge_swap_order_cancel_witness(&sig_bytes, &pubkey)
+            .ok_or_else(|| bad("encode_cancel_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("calculate_fees_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_out = tx.txid();
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_out) {
+            accepted = mempool
+                .add_transaction(tx, raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+    Ok(Json(SwapSpendResponse {
+        txid: hex::encode(txid_out),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        fee: fee_checked,
+    }))
+}
+
+async fn fill_doge_swap_order(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<FillDogeSwapOrderRequest>,
+) -> Result<Json<FillDogeSwapOrderResponse>, (StatusCode, String)> {
+    let bad = |reason: &str| -> (StatusCode, String) {
+        eprintln!("[fill_doge_swap_order] reject reason={}", reason);
+        (StatusCode::BAD_REQUEST, reason.to_string())
+    };
+
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+
+    {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let active = chain
+            .params
+            .doge_swap_order_v1_activation_height
+            .map(|h| chain.height >= h)
+            .unwrap_or(false);
+        if !active {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "doge_swap_order_v1_not_active".to_string(),
+            ));
+        }
+    }
+
+    let _ = req.taker_ltc_address;
+
+    let txid_arr =
+        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let key = OutPoint {
+        txid: txid_arr,
+        index: req.order_vout,
+    };
+
+    let (funding_out, tip_height) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let utxo = chain
+            .utxos
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| bad("order_outpoint_unspent_or_unknown"))?;
+        (utxo, chain.tip_height())
+    };
+
+    let order = parse_doge_swap_order_script(&funding_out.output.script_pubkey)
+        .ok_or_else(|| bad("funding_output_not_doge_swap_order"))?;
+    if tip_height > order.expiry_height {
+        return Err(bad("order_expired"));
+    }
+    if req.timeout_blocks_from_now == 0 {
+        return Err(bad("timeout_blocks_from_now_zero"));
+    }
+    let timeout_height = tip_height.saturating_add(req.timeout_blocks_from_now);
+
+    let taker_iriumd_vec = base58_p2pkh_to_hash(&req.taker_iriumd_address)
+        .ok_or_else(|| bad("taker_iriumd_address_decode_failed"))?;
+    if taker_iriumd_vec.len() != 20 {
+        return Err(bad("taker_iriumd_pkh_len_invalid"));
+    }
+    let mut taker_iriumd_pkh = [0u8; 20];
+    taker_iriumd_pkh.copy_from_slice(&taker_iriumd_vec);
+
+    let wallet_key = {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
+        let mut found: Option<WalletKey> = None;
+        for k in keys {
+            let b = hex::decode(&k.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
+            if b.len() != 20 {
+                continue;
+            }
+            let mut pkh = [0u8; 20];
+            pkh.copy_from_slice(&b);
+            if pkh == taker_iriumd_pkh {
+                found = Some(k);
+                break;
+            }
+        }
+        found.ok_or_else(|| bad("taker_iriumd_pkh_key_not_in_wallet"))?
+    };
+
+    let priv_bytes =
+        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    if priv_bytes.len() != 32 {
+        return Err(bad("privkey_len_invalid"));
+    }
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(&priv_bytes);
+    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
+        .map_err(|_| bad("signing_key_init_failed"))?;
+    let pubkey = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+
+    let covenant_output = match order.direction {
+        DOGE_SWAP_ORDER_DIRECTION_SELL => {
+            let funding_binding = compute_funding_binding(&txid_arr, req.order_vout);
+            let swap = HtlcDogeSwapV1Output {
+                confirmations_required: order.confirmations_required,
+                recipient_pkh: taker_iriumd_pkh,
+                refund_pkh: order.maker_iriumd_pkh,
+                doge_recipient_pkh: order.maker_doge_pkh,
+                doge_amount_sats: order.doge_amount_sats,
+                timeout_height,
+                funding_binding,
+            };
+            TxOutput {
+                value: order.irm_amount,
+                script_pubkey: encode_htlc_doge_swap_v1_script(&swap),
+            }
+        }
+        DOGE_SWAP_ORDER_DIRECTION_BUY => {
+            let expected_hash = order
+                .expected_hash
+                .ok_or_else(|| bad("buy_order_missing_expected_hash"))?;
+            let sha = Sha256::digest(&pubkey);
+            let rip = ripemd::Ripemd160::digest(&sha);
+            let mut taker_refund_pkh = [0u8; 20];
+            taker_refund_pkh.copy_from_slice(&rip);
+            let htlc = HtlcV1Output {
+                expected_hash,
+                recipient_pkh: order.maker_iriumd_pkh,
+                refund_pkh: taker_refund_pkh,
+                timeout_height,
+            };
+            TxOutput {
+                value: order.irm_amount,
+                script_pubkey: encode_htlcv1_script(&htlc),
+            }
+        }
+        _ => return Err(bad("order_direction_unknown")),
+    };
+
+    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    if order.direction == DOGE_SWAP_ORDER_DIRECTION_SELL
+        && funding_out.output.value < order.irm_amount
+    {
+        return Err(bad("order_value_below_required_irm_amount"));
+    }
+
+    let mut inputs: Vec<TxInput> = vec![TxInput {
+        prev_txid: txid_arr,
+        prev_index: req.order_vout,
+        script_sig: Vec::new(),
+        sequence: 0xffff_fffe,
+    }];
+    let mut outputs = vec![covenant_output];
+
+    let mut extra_inputs: Vec<WalletUtxo> = Vec::new();
+    let mut extra_total = 0u64;
+    if order.direction == DOGE_SWAP_ORDER_DIRECTION_BUY
+        || funding_out.output.value < order.irm_amount.saturating_add(fee)
+    {
+        let needed = order
+            .irm_amount
+            .saturating_add(fee)
+            .saturating_sub(funding_out.output.value);
+        let mut wallet_utxos = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            let mut collected = Vec::new();
+            for (out, ut) in chain.utxos.iter() {
+                if let Some(pkh) = p2pkh_hash_from_script(&ut.output.script_pubkey) {
+                    if pkh == taker_iriumd_pkh {
+                        collected.push(WalletUtxo {
+                            outpoint: out.clone(),
+                            output: ut.output.clone(),
+                            height: ut.height,
+                            is_coinbase: ut.is_coinbase,
+                            pkh,
+                        });
+                    }
+                }
+            }
+            collected
+        };
+        wallet_utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
+        for u in wallet_utxos.iter() {
+            if u.is_coinbase
+                && tip_height.saturating_sub(u.height) < coinbase_maturity()
+            {
+                continue;
+            }
+            extra_inputs.push(u.clone());
+            extra_total = extra_total.saturating_add(u.output.value);
+            inputs.push(TxInput {
+                prev_txid: u.outpoint.txid,
+                prev_index: u.outpoint.index,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+            });
+            if extra_total >= needed {
+                break;
+            }
+        }
+        if extra_total < needed {
+            return Err(bad("insufficient_taker_funds_to_fill_order"));
+        }
+        let change = funding_out
+            .output
+            .value
+            .saturating_add(extra_total)
+            .saturating_sub(order.irm_amount)
+            .saturating_sub(fee);
+        if change > 0 {
+            outputs.push(TxOutput {
+                value: change,
+                script_pubkey: p2pkh_script(&taker_iriumd_pkh),
+            });
+        }
+    }
+
+    let mut tx = Transaction {
+        version: 1,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+
+    let scriptcode_order = encode_doge_swap_order_script(&order);
+
+    for _ in 0..2 {
+        let digest_order = signature_digest(&tx, 0, &scriptcode_order);
+        let order_sig: Signature = signing_key
+            .sign_prehash(&digest_order)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let order_sig = order_sig.normalize_s().unwrap_or(order_sig);
+        let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
+        order_sig_bytes.push(0x01);
+
+        let witness = match order.direction {
+            DOGE_SWAP_ORDER_DIRECTION_SELL => encode_doge_swap_order_fill_sell_witness(
+                &order_sig_bytes,
+                &pubkey,
+                &taker_iriumd_pkh,
+                timeout_height,
+            )
+            .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
+            DOGE_SWAP_ORDER_DIRECTION_BUY => encode_doge_swap_order_fill_buy_witness(
+                &order_sig_bytes,
+                &pubkey,
+                timeout_height,
+            )
+            .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
+            _ => return Err(bad("order_direction_unknown")),
+        };
+        tx.inputs[0].script_sig = witness;
+
+        if !extra_inputs.is_empty() {
+            let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+            key_map.insert(taker_iriumd_pkh, wallet_key.clone());
+            sign_wallet_inputs(&mut tx, &extra_inputs, &key_map)
+                .map_err(|_| bad("sign_extra_inputs_failed"))?;
+        }
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            // Covenant output 0 is pinned by the sell/buy fill rule; only
+            // change (last output) can absorb the shortfall.
+            if tx.outputs.len() > 1 {
+                let change_idx = tx.outputs.len() - 1;
+                if tx.outputs[change_idx].value > extra {
+                    fee = needed_fee;
+                    tx.outputs[change_idx].value -= extra;
+                    continue;
+                } else {
+                    return Err(bad("fee_recalculation_exceeded_change"));
+                }
+            } else {
+                return Err(bad("fee_recalculation_no_change_to_reduce"));
+            }
+        }
+        break;
+    }
+
+    let fee_checked = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .calculate_fees(&tx)
+            .map_err(|_| bad("calculate_fees_failed"))?
+    };
+    let raw = tx.serialize();
+    let txid_out = tx.txid();
+    let mut accepted = false;
+    if req.broadcast.unwrap_or(false) {
+        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if !mempool.contains(&txid_out) {
+            accepted = mempool
+                .add_transaction(tx, raw.clone(), fee_checked)
+                .is_ok();
+        }
+    }
+
+    Ok(Json(FillDogeSwapOrderResponse {
+        txid: hex::encode(txid_out),
+        accepted,
+        raw_tx_hex: hex::encode(raw),
+        new_outpoint: OutPointJson {
+            txid: hex::encode(txid_out),
+            vout: 0,
+        },
+        direction: doge_swap_direction_label(order.direction).to_string(),
         fee: fee_checked,
     }))
 }
@@ -8559,7 +13321,7 @@ async fn decode_htlc(
             recipient_address: None,
             refund_address: None,
         })),
-        OutputEncumbrance::MpsoV1(_) | OutputEncumbrance::HtlcBtcSwapV1(_) | OutputEncumbrance::SwapOrder(_) | OutputEncumbrance::Unknown => Ok(Json(DecodeHtlcResponse {
+        OutputEncumbrance::MpsoV1(_) | OutputEncumbrance::HtlcBtcSwapV1(_) | OutputEncumbrance::HtlcLtcSwapV1(_) | OutputEncumbrance::HtlcDogeSwapV1(_) | OutputEncumbrance::SwapOrder(_) | OutputEncumbrance::LtcSwapOrder(_) | OutputEncumbrance::DogeSwapOrder(_) | OutputEncumbrance::Unknown => Ok(Json(DecodeHtlcResponse {
             found: false,
             vout: Some(idx as u32),
             output_type: "unknown".to_string(),
@@ -9611,7 +14373,6 @@ async fn build_agreement_release(
 ) -> Result<Json<AgreementBuildSpendResponse>, (StatusCode, String)> {
     build_agreement_spend_internal(true, addr, state, headers, req).await
 }
-
 async fn build_agreement_refund(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -10821,8 +15582,16 @@ async fn main() {
             btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
             htlc_btc_swap_v1_activation_height:
                 irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
+            htlc_ltc_swap_v1_activation_height:
+                irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
+            htlc_doge_swap_v1_activation_height:
+                irium_node_rs::activation::resolved_htlc_doge_swap_v1_activation_height(network),
             swap_order_v1_activation_height:
                 irium_node_rs::activation::resolved_swap_order_v1_activation_height(network),
+            ltc_swap_order_v1_activation_height:
+                irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
+            doge_swap_order_v1_activation_height:
+                irium_node_rs::activation::resolved_doge_swap_order_v1_activation_height(network),
     };
     let mut state = ChainState::new(params);
     if load_persisted {
@@ -10837,7 +15606,7 @@ async fn main() {
             era.era_name, era.era_description
         );
     }
-    let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 1.0)));
+    let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 100.0, 10_000)));
     let limiter = Arc::new(Mutex::new(rate_limiter()));
     let wallet = Arc::new(Mutex::new(
         WalletManager::new(WalletManager::default_path()),
@@ -12796,15 +17565,40 @@ async fn explorer_stats(
         .route("/rpc/submitbtcheaders", post(submit_btc_headers))
         .route("/rpc/btcrelaytip", get(btc_relay_tip))
         .route("/rpc/btcheader", get(btc_header))
+        .route("/rpc/submitltcheaders", post(submit_ltc_headers))
+        .route("/rpc/submitdogeheaders", post(submit_doge_headers))
+        .route("/rpc/ltcrelaytip", get(ltc_relay_tip))
+        .route("/rpc/dogerelaytip", get(doge_relay_tip))
+        .route("/rpc/ltcheader", get(ltc_header))
         .route("/rpc/createbtcswap", post(create_btc_swap))
         .route("/rpc/claimbtcswap", post(claim_btc_swap))
         .route("/rpc/refundbtcswap", post(refund_btc_swap))
         .route("/rpc/inspectbtcswap", get(inspect_btc_swap))
+        .route("/rpc/createltcswap", post(create_ltc_swap))
+        .route("/rpc/claimltcswap", post(claim_ltc_swap))
+        .route("/rpc/postdogeswaporder", post(post_doge_swap_order))
+        .route("/rpc/listdogeswaporders", get(list_doge_swap_orders))
+        .route("/rpc/getdogeswaporder", get(get_doge_swap_order))
+        .route("/rpc/canceldogeswaporder", post(cancel_doge_swap_order))
+        .route("/rpc/filldogeswaporder", post(fill_doge_swap_order))
+        .route("/rpc/refundltcswap", post(refund_ltc_swap))
+        .route("/rpc/inspectltcswap", get(inspect_ltc_swap))
+        .route("/rpc/createdogeswap", post(create_doge_swap))
+        .route("/rpc/claimdogeswap", post(claim_doge_swap))
+        .route("/rpc/refunddogeswap", post(refund_doge_swap))
+        .route("/rpc/inspectdogeswap", get(inspect_doge_swap))
         .route("/rpc/postswaporder", post(post_swap_order))
         .route("/rpc/listswaporders", get(list_swap_orders))
         .route("/rpc/getswaporder", get(get_swap_order))
         .route("/rpc/cancelswaporder", post(cancel_swap_order))
         .route("/rpc/fillswaporder", post(fill_swap_order))
+        .route("/rpc/postltcswaporder", post(post_ltc_swap_order))
+        .route("/rpc/listltcswaporders", get(list_ltc_swap_orders))
+        .route("/rpc/getltcswaporder", get(get_ltc_swap_order))
+        .route("/rpc/cancelltcswaporder", post(cancel_ltc_swap_order))
+        .route("/rpc/fillltcswaporder", post(fill_ltc_swap_order))
+        .route("/rpc/sweepltcexpiredorder", post(sweep_ltc_expired_order))
+        .route("/rpc/sweepdogeexpiredorder", post(sweep_doge_expired_order))
         .route("/rpc/sweepexpiredorder", post(sweep_expired_order))
         .route("/wallet/create", post(wallet_create))
         .route("/wallet/unlock", post(wallet_unlock))
@@ -12989,12 +17783,16 @@ mod tests {
             auxpow_activation_height: None,
             btc_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            htlc_ltc_swap_v1_activation_height: None,
+            htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
+            doge_swap_order_v1_activation_height: None,
         };
         let chain = Arc::new(Mutex::new(ChainState::new(params)));
 
         let mempool_path = unique_path("irium_htlc_mempool", "json");
-        let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_path, 1024, 0.0)));
+        let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_path, 1024, 0.0, 0)));
 
         let wallet_path = unique_path("irium_htlc_wallet", "json");
         let wallet = Arc::new(Mutex::new(WalletManager::new(wallet_path)));
@@ -13906,7 +18704,11 @@ mod tests {
             auxpow_activation_height: None,
             btc_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            htlc_ltc_swap_v1_activation_height: None,
+            htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
+            doge_swap_order_v1_activation_height: None,
         };
         let chain = ChainState::new(params);
         let genesis_hash = hex::encode(chain.tip_hash());
@@ -20202,6 +25004,394 @@ mod tests {
         let (status, msg) = result.expect_err("should reject");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("resolver_not_recent_miner"), "got: {msg}");
+    }
+
+    /// Regression for the size-estimator bug fixed in claim_btc_swap and
+    /// fill_swap_order. Before the 2-pass recalc, those handlers computed
+    /// fee = estimate_tx_size(1, 1) * fee_per_byte = 192 sats at fpb=1,
+    /// but the actual serialized tx — with the heavy claim or fill
+    /// witness — is several times larger. The handler-produced tx was
+    /// then rejected by the production mempool (min_fee_per_byte=100.0).
+    /// This test asserts the property the fix delivers: a tx whose
+    /// declared fee equals serialize().len() * 1 IS admitted.
+    #[test]
+    fn mempool_admits_claim_shaped_tx_when_fee_matches_serialized_size() {
+        // Mimic a real claim_btc_swap output: one input carrying the
+        // ~720-byte claim witness, one P2PKH output. Concrete witness
+        // bytes don't need to be meaningful — only the size matters for
+        // mempool admission. (Consensus validation isn't exercised here;
+        // mempool admission is governed by raw fee/size ratio.)
+        let witness = vec![0u8; 720];
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0xa1u8; 32],
+                prev_index: 0,
+                script_sig: witness,
+                sequence: 0xffff_fffe,
+            }],
+            outputs: vec![TxOutput {
+                value: 100_000,
+                script_pubkey: p2pkh_script(&[0u8; 20]),
+            }],
+            locktime: 0,
+        };
+        let raw = tx.serialize();
+        let size = raw.len() as u64;
+
+        let path = unique_path("mempool_claim_admit", "json");
+        let mut mempool = MempoolManager::new(path.clone(), 100, 1.0, 0);
+
+        // Correct fee = size * 1 satisfies min_fee_per_byte=1.0.
+        let res = mempool.add_transaction(tx.clone(), raw.clone(), size);
+        assert!(
+            res.is_ok(),
+            "expected admission at correct fee={} for size={}: {:?}",
+            size,
+            size,
+            res
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression — confirms the bug shape. Before the 2-pass fix, the
+    /// handlers passed estimate_tx_size(1, 1) (= 192 sats at fpb=1) as
+    /// the fee for a tx whose real size is much larger. Mempool then
+    /// rejects the tx because fee/size < min_fee_per_byte. This test
+    /// makes that rejection explicit so a future regression that
+    /// reintroduces the estimator-only path will fail loudly.
+    #[test]
+    fn mempool_rejects_claim_shaped_tx_at_buggy_estimate_only_fee() {
+        let witness = vec![0u8; 720];
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0xa2u8; 32], // distinct so the prior test's
+                prev_index: 0,           // entry doesn't collide
+                script_sig: witness,
+                sequence: 0xffff_fffe,
+            }],
+            outputs: vec![TxOutput {
+                value: 100_000,
+                script_pubkey: p2pkh_script(&[0u8; 20]),
+            }],
+            locktime: 0,
+        };
+        let raw = tx.serialize();
+        let real_size = raw.len() as u64;
+
+        // The buggy fee the handlers used before the fix.
+        let buggy_fee = estimate_tx_size(1, 1);
+        assert!(
+            buggy_fee < real_size,
+            "test inputs are not representative: estimate {} should be \
+             much less than actual {}",
+            buggy_fee,
+            real_size
+        );
+
+        let path = unique_path("mempool_claim_reject", "json");
+        let mut mempool = MempoolManager::new(path.clone(), 100, 1.0, 0);
+
+        let res = mempool.add_transaction(tx.clone(), raw.clone(), buggy_fee);
+        assert!(
+            res.is_err(),
+            "expected rejection at buggy fee={} on size={} tx",
+            buggy_fee,
+            real_size
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ============================================================================
+    // Unified wallet RPC tests (Commit 1)
+    // ============================================================================
+
+    /// Construct a minimal AppState whose wallet manager points at a
+    /// caller-supplied path. Skips the full chain/mempool setup that
+    /// `create_test_state` does; these wallet tests only exercise the
+    /// wallet-side handlers.
+    fn make_wallet_app_state(wallet_path: PathBuf) -> AppState {
+        // Bare minimum chain (needed because AppState requires it).
+        let locked = load_locked_genesis().expect("genesis");
+        let block = block_from_locked(&locked).expect("block_from_locked");
+        let params = ChainParams {
+            genesis_block: block,
+            pow_limit: irium_node_rs::pow::Target { bits: 0x1d00_ffff },
+            htlcv1_activation_height: None,
+            mpsov1_activation_height: None,
+            lwma: irium_node_rs::chain::LwmaParams::new(
+                None,
+                irium_node_rs::pow::Target { bits: 0x1d00_ffff },
+            ),
+            lwma_v2: None,
+            auxpow_activation_height: None,
+            btc_spv: None,
+            ltc_spv: None,
+            doge_spv: None,
+            htlc_btc_swap_v1_activation_height: None,
+            htlc_ltc_swap_v1_activation_height: None,
+            htlc_doge_swap_v1_activation_height: None,
+            swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
+            doge_swap_order_v1_activation_height: None,
+        };
+        let chain = Arc::new(Mutex::new(ChainState::new(params)));
+        let mempool_path = unique_path("irium_wallet_test_mempool", "json");
+        let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_path, 256, 0.0, 0)));
+        let wallet = Arc::new(Mutex::new(WalletManager::new(wallet_path)));
+
+        AppState {
+            chain,
+            genesis_hash: "00".repeat(32),
+            mempool,
+            wallet,
+            anchors: None,
+            p2p: None,
+            limiter: Arc::new(Mutex::new(rate_limiter())),
+            status_height_cache: Arc::new(AtomicU64::new(0)),
+            status_peer_count_cache: Arc::new(AtomicUsize::new(0)),
+            status_sybil_cache: Arc::new(AtomicU8::new(0)),
+            status_persisted_height_cache: Arc::new(AtomicU64::new(0)),
+            status_persist_queue_cache: Arc::new(AtomicUsize::new(0)),
+            status_persisted_contiguous_cache: Arc::new(AtomicU64::new(0)),
+            status_persisted_max_on_disk_cache: Arc::new(AtomicU64::new(0)),
+            status_quarantine_count_cache: Arc::new(AtomicU64::new(0)),
+            status_persisted_window_tip_cache: Arc::new(AtomicU64::new(0)),
+            status_missing_persisted_in_window_cache: Arc::new(AtomicU64::new(0)),
+            status_missing_or_mismatch_in_window_cache: Arc::new(AtomicU64::new(0)),
+            status_expected_hash_coverage_in_window_cache: Arc::new(AtomicU64::new(0)),
+            status_expected_hash_window_span_cache: Arc::new(AtomicU64::new(0)),
+            status_best_header_hash_cache: Arc::new(Mutex::new(String::new())),
+            proof_store: Arc::new(Mutex::new(ProofStore::new(unique_path(
+                "irium_proofs_wallet",
+                "json",
+            )))),
+            policy_store: Arc::new(Mutex::new(PolicyStore::new(unique_path(
+                "irium_policies_wallet",
+                "json",
+            )))),
+            event_tx: tokio::sync::broadcast::channel::<std::sync::Arc<String>>(
+                WS_BROADCAST_CAPACITY,
+            )
+            .0,
+            proof_heights: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            disputes_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            resolvers_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Empty headers; with IRIUM_RPC_TOKEN unset (which
+    /// `ensure_rpc_token_env` enforces) the require_rpc_auth path
+    /// short-circuits to Ok and these tests don't need to fabricate
+    /// a Bearer token. Matches the convention used by the
+    /// dispute/proof RPC tests in this same file via
+    /// `create_test_state`.
+    fn auth_headers() -> HeaderMap {
+        HeaderMap::new()
+    }
+
+    fn ensure_rpc_token_env() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+    }
+
+    fn write_legacy_plaintext_at(path: &PathBuf) {
+        let plain_json = serde_json::json!({
+            "version": 1,
+            "seed_hex": null,
+            "bip32_seed": "01".repeat(64),
+            "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "next_index": 1,
+            "keys": [],
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&plain_json).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wallet_info_reports_none_when_no_file() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletinfo_none", "json");
+        let state = make_wallet_app_state(path.clone());
+        let resp = wallet_info(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+        )
+        .await
+        .expect("Ok");
+        let body = resp.0;
+        assert!(!body.exists);
+        assert_eq!(body.mode, WalletMode::None);
+        assert!(!body.is_unlocked);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn wallet_info_reports_plaintext_when_legacy_file_present() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletinfo_plain", "json");
+        write_legacy_plaintext_at(&path);
+        let state = make_wallet_app_state(path.clone());
+        let resp = wallet_info(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+        )
+        .await
+        .expect("Ok");
+        assert!(resp.0.exists);
+        assert_eq!(resp.0.mode, WalletMode::Plaintext);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn wallet_info_reports_encrypted_after_create() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletinfo_enc", "json");
+        let state = make_wallet_app_state(path.clone());
+        // Use create_with_seed directly on the wallet to set up state.
+        {
+            let mut w = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+            w.create_with_seed("p", None).expect("create");
+        }
+        let resp = wallet_info(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+        )
+        .await
+        .expect("Ok");
+        assert_eq!(resp.0.mode, WalletMode::Encrypted);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn wallet_unlock_returns_409_on_plaintext_file() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletunlock_plain", "json");
+        write_legacy_plaintext_at(&path);
+        let state = make_wallet_app_state(path.clone());
+        let result = wallet_unlock(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(WalletUnlockRequest {
+                passphrase: "irrelevant".to_string(),
+            }),
+        )
+        .await;
+        let status = result.err().expect("must error");
+        assert_eq!(status, StatusCode::CONFLICT);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn wallet_migrate_to_encrypted_succeeds_on_plaintext() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletmigrate_ok", "json");
+        write_legacy_plaintext_at(&path);
+        let state = make_wallet_app_state(path.clone());
+        let resp = wallet_migrate_to_encrypted(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            auth_headers(),
+            AxumJson(WalletMigrateRequest {
+                passphrase: "new-pass".to_string(),
+            }),
+        )
+        .await
+        .expect("Ok");
+        assert_eq!(resp.0.mode, WalletMode::Encrypted);
+        // wallet_info should now report encrypted+unlocked
+        let info = wallet_info(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            auth_headers(),
+        )
+        .await
+        .expect("Ok");
+        assert_eq!(info.0.mode, WalletMode::Encrypted);
+        assert!(info.0.is_unlocked);
+        let _ = std::fs::remove_file(&path);
+        // Cleanup the backup
+        let parent = path.parent().unwrap();
+        if let Ok(dir) = std::fs::read_dir(parent) {
+            for e in dir.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.contains(".plaintext.bak.") {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_migrate_to_encrypted_returns_409_on_already_encrypted() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletmigrate_conflict", "json");
+        let state = make_wallet_app_state(path.clone());
+        {
+            let mut w = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+            w.create_with_seed("first", None).expect("create");
+        }
+        let result = wallet_migrate_to_encrypted(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(WalletMigrateRequest {
+                passphrase: "second".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(result.err().unwrap(), StatusCode::CONFLICT);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn wallet_recover_from_seed_succeeds_when_no_wallet_exists() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletrecover_ok", "json");
+        let state = make_wallet_app_state(path.clone());
+        let resp = wallet_recover_from_seed(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(WalletRecoverRequest {
+                seed_hex: "ab".repeat(32),
+                passphrase: "p".to_string(),
+                allow_overwrite: false,
+            }),
+        )
+        .await
+        .expect("Ok");
+        assert!(!resp.0.address.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn wallet_recover_from_seed_returns_409_when_wallet_exists_without_overwrite() {
+        ensure_rpc_token_env();
+        let path = unique_path("walletrecover_conflict", "json");
+        let state = make_wallet_app_state(path.clone());
+        {
+            let mut w = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+            w.create_with_seed("first", None).expect("create");
+        }
+        let result = wallet_recover_from_seed(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(WalletRecoverRequest {
+                seed_hex: "cd".repeat(32),
+                passphrase: "second".to_string(),
+                allow_overwrite: false,
+            }),
+        )
+        .await;
+        assert_eq!(result.err().unwrap(), StatusCode::CONFLICT);
+        let _ = std::fs::remove_file(&path);
     }
 }
 

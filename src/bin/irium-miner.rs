@@ -709,7 +709,7 @@ fn load_mempool_entries(
         return mempool_entries_from_template(chain, template);
     }
     // First try the structured mempool manager.
-    let mgr = MempoolManager::new(mempool_file(), 1000, 1.0);
+    let mgr = MempoolManager::new(mempool_file(), 1000, 100.0, 10_000);
     let mut out = Vec::new();
     for entry in mgr.ordered_entries() {
         if let Err(e) = chain.validate_transaction(&entry.tx) {
@@ -3206,12 +3206,24 @@ fn main() {
         pow_limit,
         htlcv1_activation_height: htlc_activation,
         mpsov1_activation_height: resolved_mpsov1_activation_height(network),
+            htlc_doge_swap_v1_activation_height:
+                irium_node_rs::activation::resolved_htlc_doge_swap_v1_activation_height(network),
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
-            btc_spv: None,
-            htlc_btc_swap_v1_activation_height: None,
-            swap_order_v1_activation_height: None,
+            btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
+            ltc_spv: irium_node_rs::ltc_spv::resolve_ltc_spv_params(network),
+            doge_spv: irium_node_rs::doge_spv::resolve_doge_spv_params(network),
+            htlc_btc_swap_v1_activation_height:
+                irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
+            htlc_ltc_swap_v1_activation_height:
+                irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
+            swap_order_v1_activation_height:
+                irium_node_rs::activation::resolved_swap_order_v1_activation_height(network),
+            ltc_swap_order_v1_activation_height:
+                irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
+            doge_swap_order_v1_activation_height:
+                irium_node_rs::activation::resolved_doge_swap_order_v1_activation_height(network),
     };
 
     let mut state = ChainState::new(params.clone());

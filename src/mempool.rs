@@ -43,15 +43,32 @@ pub struct MempoolManager {
     path: PathBuf,
     max_entries: usize,
     min_fee_per_byte: f64,
+    /// Absolute per-tx fee floor in satoshis. Standard-priority txs
+    /// must pay at least this much in total fee in addition to
+    /// clearing `min_fee_per_byte`. `ZeroFeeAllowed` bypasses both
+    /// floors. `0` disables the floor (used in tests).
+    min_total_fee: u64,
+    /// Last admission time per source IP for `ZeroFeeAllowed` entries.
+    /// In-memory only by design — an iriumd restart re-opens the rate
+    /// window. The attacker model here is network spam, and a restart
+    /// is a costly operation an attacker cannot trigger remotely.
+    header_relay_last_seen: HashMap<IpAddr, SystemTime>,
 }
 
 impl MempoolManager {
-    pub fn new(path: PathBuf, max_entries: usize, min_fee_per_byte: f64) -> MempoolManager {
+    pub fn new(
+        path: PathBuf,
+        max_entries: usize,
+        min_fee_per_byte: f64,
+        min_total_fee: u64,
+    ) -> MempoolManager {
         let mut mgr = MempoolManager {
             entries: HashMap::new(),
             path,
             max_entries,
             min_fee_per_byte,
+            min_total_fee,
+            header_relay_last_seen: HashMap::new(),
         };
         mgr.load_from_disk();
         mgr
@@ -154,6 +171,11 @@ impl MempoolManager {
         if fee_per_byte < self.min_fee_per_byte {
             return Err("Fee per byte below minimum policy".to_string());
         }
+        // Absolute per-tx fee floor. Symmetric with the per-byte check
+        // above: Standard priority enforces, ZeroFeeAllowed bypasses.
+        if priority == MempoolPriority::Standard && fee < self.min_total_fee {
+            return Err("Fee below minimum total policy".to_string());
+        }
 
         let mut evicted = None;
         if self.entries.len() >= self.max_entries {
@@ -224,6 +246,10 @@ impl MempoolManager {
 
     pub fn min_fee_per_byte(&self) -> f64 {
         self.min_fee_per_byte
+    }
+
+    pub fn min_total_fee(&self) -> u64 {
+        self.min_total_fee
     }
 
     pub fn ordered_transactions(&self) -> Vec<Transaction> {
@@ -382,7 +408,7 @@ mod tests {
     #[test]
     fn adds_and_evicts_by_fee() {
         let path = tmp_path("evict");
-        let mut mgr = MempoolManager::new(path.clone(), 1, 0.0);
+        let mut mgr = MempoolManager::new(path.clone(), 1, 0.0, 0);
 
         let tx_low = dummy_tx(10);
         let raw_low = tx_low.serialize();
@@ -403,7 +429,7 @@ mod tests {
     #[test]
     fn records_relay_and_address() {
         let path = tmp_path("relay");
-        let mut mgr = MempoolManager::new(path.clone(), 10, 0.0);
+        let mut mgr = MempoolManager::new(path.clone(), 10, 0.0, 0);
         let tx = dummy_tx(5);
         let raw = tx.serialize();
         let txid = tx.txid();
@@ -414,6 +440,179 @@ mod tests {
         let entry = mgr.entries.get(&txid).unwrap();
         assert!(entry.relays.contains(&"peer1".to_string()));
         assert!(entry.relay_addresses.contains(&"aa".to_string()));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// ZeroFeeAllowed must be admitted with fee=0 even under the
+    /// production min_fee_per_byte=1.0 policy. This is the BTC-buyer
+    /// path's structural requirement.
+    #[test]
+    fn zero_fee_admitted_when_priority_is_zero_fee_allowed() {
+        let path = tmp_path("zfa_admit");
+        let mut mgr = MempoolManager::new(path.clone(), 10, 1.0, 0);
+        let tx = dummy_tx_tagged(0xaa, 100);
+        let raw = tx.serialize();
+
+        let res = mgr.add_transaction_with_priority(
+            tx.clone(),
+            raw,
+            0,
+            MempoolPriority::ZeroFeeAllowed,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))),
+        );
+        assert!(res.is_ok(), "zero-fee zfa should be admitted: {:?}", res);
+        assert_eq!(mgr.len(), 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn standard_still_rejected_below_min_fee() {
+        let path = tmp_path("std_min");
+        let mut mgr = MempoolManager::new(path.clone(), 10, 1.0, 0);
+        let tx = dummy_tx_tagged(0xbb, 100);
+        let raw = tx.serialize();
+        let res = mgr.add_transaction(tx.clone(), raw, 1);
+        assert!(res.is_err(), "underpaid standard tx must reject");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Capacity full of Standard txs. A new ZeroFeeAllowed cannot
+    /// displace any of them — the buyer-side exemption can never push
+    /// out a paying tx.
+    #[test]
+    fn zero_fee_cannot_evict_standard_when_full() {
+        let path = tmp_path("zfa_no_evict");
+        let mut mgr = MempoolManager::new(path.clone(), 1, 0.0, 0);
+
+        let std_tx = dummy_tx_tagged(0x10, 100);
+        let std_raw = std_tx.serialize();
+        mgr.add_transaction(std_tx.clone(), std_raw, 50).unwrap();
+        assert_eq!(mgr.len(), 1);
+
+        let zfa_tx = dummy_tx_tagged(0x11, 200);
+        let zfa_raw = zfa_tx.serialize();
+        let res = mgr.add_transaction_with_priority(
+            zfa_tx.clone(),
+            zfa_raw,
+            0,
+            MempoolPriority::ZeroFeeAllowed,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 6))),
+        );
+        assert!(res.is_err(), "zfa must not displace standard: {:?}", res);
+        assert!(mgr.contains(&std_tx.txid()));
+        assert!(!mgr.contains(&zfa_tx.txid()));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Capacity full of ZeroFeeAllowed txs. An incoming Standard tx of
+    /// ANY positive fee evicts the lowest-priority entry — that's how
+    /// the user-facing fee floor stays load-bearing.
+    #[test]
+    fn standard_evicts_zero_fee_regardless_of_fee() {
+        let path = tmp_path("std_evicts_zfa");
+        let mut mgr = MempoolManager::new(path.clone(), 1, 0.0, 0);
+
+        let zfa_tx = dummy_tx_tagged(0x20, 100);
+        let zfa_raw = zfa_tx.serialize();
+        mgr.add_transaction_with_priority(
+            zfa_tx.clone(),
+            zfa_raw,
+            0,
+            MempoolPriority::ZeroFeeAllowed,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+        )
+        .unwrap();
+
+        let std_tx = dummy_tx_tagged(0x21, 100);
+        let std_raw = std_tx.serialize();
+        let res = mgr.add_transaction(std_tx.clone(), std_raw, 50);
+        assert!(res.is_ok(), "standard must evict zfa: {:?}", res);
+        let outcome = res.unwrap();
+        assert_eq!(outcome.evicted, Some(zfa_tx.txid()));
+        assert!(mgr.contains(&std_tx.txid()));
+        assert!(!mgr.contains(&zfa_tx.txid()));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Two consecutive ZeroFeeAllowed admissions from the SAME non-loopback
+    /// IP within the 600s window: the second must be rate-limited.
+    /// A different IP succeeds; a loopback IP succeeds even back-to-back.
+    #[test]
+    fn rate_limit_per_ip_with_loopback_exempt() {
+        let path = tmp_path("rate_limit");
+        let mut mgr = MempoolManager::new(path.clone(), 100, 1.0, 0);
+
+        let peer_a = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+        let peer_b = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11));
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        // First admission from peer_a succeeds.
+        let tx1 = dummy_tx_tagged(0x30, 1);
+        let raw1 = tx1.serialize();
+        mgr.add_transaction_with_priority(
+            tx1.clone(),
+            raw1,
+            0,
+            MempoolPriority::ZeroFeeAllowed,
+            Some(peer_a),
+        )
+        .unwrap();
+
+        // Second admission from peer_a within window -> rate-limited.
+        let tx2 = dummy_tx_tagged(0x31, 1);
+        let raw2 = tx2.serialize();
+        let res2 = mgr.add_transaction_with_priority(
+            tx2.clone(),
+            raw2,
+            0,
+            MempoolPriority::ZeroFeeAllowed,
+            Some(peer_a),
+        );
+        assert!(res2.is_err(), "second zfa from same IP must be rate-limited");
+        assert!(res2
+            .as_ref()
+            .err()
+            .map(|e| e.contains("header_relay_rate_limit_per_ip"))
+            .unwrap_or(false));
+
+        // Different IP succeeds.
+        let tx3 = dummy_tx_tagged(0x32, 1);
+        let raw3 = tx3.serialize();
+        let res3 = mgr.add_transaction_with_priority(
+            tx3.clone(),
+            raw3,
+            0,
+            MempoolPriority::ZeroFeeAllowed,
+            Some(peer_b),
+        );
+        assert!(res3.is_ok(), "different IP must succeed: {:?}", res3);
+
+        // Loopback exempted from rate limit even back-to-back.
+        let tx4 = dummy_tx_tagged(0x40, 1);
+        let raw4 = tx4.serialize();
+        mgr.add_transaction_with_priority(
+            tx4.clone(),
+            raw4,
+            0,
+            MempoolPriority::ZeroFeeAllowed,
+            Some(loopback),
+        )
+        .unwrap();
+        let tx5 = dummy_tx_tagged(0x41, 1);
+        let raw5 = tx5.serialize();
+        let res5 = mgr.add_transaction_with_priority(
+            tx5.clone(),
+            raw5,
+            0,
+            MempoolPriority::ZeroFeeAllowed,
+            Some(loopback),
+        );
+        assert!(res5.is_ok(), "loopback must not be rate-limited: {:?}", res5);
 
         let _ = std::fs::remove_file(path);
     }

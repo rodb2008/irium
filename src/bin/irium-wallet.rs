@@ -69,7 +69,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const IRIUM_P2PKH_VERSION: u8 = 0x39;
 const IRIUM_MULTISIG_VERSION: u8 = 0x28;
-const DEFAULT_FEE_PER_BYTE: u64 = 1;
+const DEFAULT_FEE_PER_BYTE: u64 = 100;
 
 /// GROUP E: number of blocks to wait after a satisfying proof is observed
 /// before the auto-release watcher (`irium-wallet watch --auto-release`)
@@ -9530,7 +9530,7 @@ fn handle_attestor_register(args: &[String]) -> Result<(), String> {
         let est_fee = est.min_fee_per_byte.ceil() as u64;
         if est_fee > fee_per_byte { fee_per_byte = est_fee; }
     }
-    let fee = estimate_tx_size(1, 2).saturating_mul(fee_per_byte).max(500);
+    let fee = estimate_tx_size(1, 2).saturating_mul(fee_per_byte).max(10_000);
     let mut selected = Vec::new();
     let mut total = 0u64;
     for utxo in utxos.iter() {
@@ -9595,7 +9595,7 @@ fn handle_attestor_register(args: &[String]) -> Result<(), String> {
             script.extend_from_slice(&pub_bytes);
             tx.inputs[idx].script_sig = script;
         }
-        let actual_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte).max(500);
+        let actual_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte).max(10_000);
         tx.outputs[1].value = total.saturating_sub(actual_fee);
     }
     submit_tx(&client, base, &tx)?;
@@ -9690,7 +9690,7 @@ fn handle_attestor_withdraw_bond(args: &[String]) -> Result<(), String> {
         let est_fee = est.min_fee_per_byte.ceil() as u64;
         if est_fee > fee_per_byte { fee_per_byte = est_fee; }
     }
-    let fee = estimate_tx_size(1, 2).saturating_mul(fee_per_byte).max(500);
+    let fee = estimate_tx_size(1, 2).saturating_mul(fee_per_byte).max(10_000);
     let mut selected = Vec::new();
     let mut total = 0u64;
     for utxo in utxos.iter() {
@@ -9741,7 +9741,7 @@ fn handle_attestor_withdraw_bond(args: &[String]) -> Result<(), String> {
             script.extend_from_slice(&pub_bytes);
             tx.inputs[idx].script_sig = script;
         }
-        let actual_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte).max(500);
+        let actual_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte).max(10_000);
         tx.outputs[1].value = total.saturating_sub(actual_fee);
     }
     submit_tx(&client, base, &tx)?;
@@ -9882,7 +9882,7 @@ fn handle_attestor_slash(args: &[String]) -> Result<(), String> {
     let pending_spent = fetch_mempool_spent_by(&client, base, &slash_from);
     utxos.retain(|u| !pending_spent.contains(&(u.txid.clone(), u.index)));
     utxos.sort_by_key(|u| u.value);
-    let fee = estimate_tx_size(1, 2).saturating_mul(DEFAULT_FEE_PER_BYTE).max(500);
+    let fee = estimate_tx_size(1, 2).saturating_mul(DEFAULT_FEE_PER_BYTE).max(10_000);
     let mut selected = Vec::new();
     let mut total = 0u64;
     for utxo in utxos.iter() {
@@ -9930,7 +9930,7 @@ fn handle_attestor_slash(args: &[String]) -> Result<(), String> {
             script.extend_from_slice(&pub_bytes);
             tx.inputs[idx].script_sig = script;
         }
-        let actual_fee = (tx.serialize().len() as u64).saturating_mul(DEFAULT_FEE_PER_BYTE).max(500);
+        let actual_fee = (tx.serialize().len() as u64).saturating_mul(DEFAULT_FEE_PER_BYTE).max(10_000);
         tx.outputs[1].value = total.saturating_sub(actual_fee);
     }
     submit_tx(&client, base, &tx)?;

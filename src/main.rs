@@ -52,8 +52,13 @@ fn main() {
             .map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: crate::activation::resolved_auxpow_activation_height(network),
             btc_spv: None,
+            htlc_doge_swap_v1_activation_height: None,
+            ltc_spv: None,
+            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
+            ltc_swap_order_v1_activation_height: None,
+            doge_swap_order_v1_activation_height: None,
     };
 
     let state = ChainState::new(params);
