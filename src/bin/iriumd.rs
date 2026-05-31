@@ -44,7 +44,7 @@ use irium_node_rs::chain::{
 };
 use irium_node_rs::constants::{block_reward, coinbase_maturity, COINBASE_MATURITY};
 use irium_node_rs::genesis::load_locked_genesis;
-use irium_node_rs::mempool::{evict_invalid_mempool_entries, MempoolManager};
+use irium_node_rs::mempool::{evict_invalid_mempool_entries, MempoolManager, MempoolPriority};
 use irium_node_rs::network::SeedlistManager;
 use irium_node_rs::network_era::network_era;
 use irium_node_rs::p2p::P2PNode;
@@ -6208,7 +6208,17 @@ async fn submit_btc_headers(
     if req.broadcast.unwrap_or(true) {
         let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         if !mempool.contains(&txid) {
-            match mempool.add_transaction(tx.clone(), raw_tx.clone(), fee_checked) {
+            // BtcHeaderBatch carrier tx: ZeroFeeAllowed so a BTC-only
+            // buyer can extend the relay before their claim. peer_ip is
+            // the caller's RPC source; loopback bypasses the rate limit
+            // so the local operator and Tauri client are unthrottled.
+            match mempool.add_transaction_with_priority(
+                tx.clone(),
+                raw_tx.clone(),
+                fee_checked,
+                MempoolPriority::ZeroFeeAllowed,
+                Some(addr.ip()),
+            ) {
                 Ok(_) => accepted = true,
                 Err(e) => {
                     eprintln!("[submit_btc_headers] mempool_reject reason={}", e);
@@ -7278,8 +7288,17 @@ async fn claim_btc_swap(
     if req.broadcast.unwrap_or(false) {
         let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         if !mempool.contains(&txid_out) {
+            // HtlcBtcSwapV1 BTC-proof claim: ZeroFeeAllowed so a buyer
+            // with no IRM can receive the full swap value with zero
+            // network deduction.
             accepted = mempool
-                .add_transaction(tx, raw.clone(), fee_checked)
+                .add_transaction_with_priority(
+                    tx,
+                    raw.clone(),
+                    fee_checked,
+                    MempoolPriority::ZeroFeeAllowed,
+                    Some(addr.ip()),
+                )
                 .is_ok();
         }
     }
@@ -9386,8 +9405,23 @@ async fn fill_swap_order(
     if req.broadcast.unwrap_or(false) {
         let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         if !mempool.contains(&txid_out) {
+            // sell_irm fill is the BTC-buyer covenant tx: ZeroFeeAllowed
+            // so the taker (who has no IRM) can fill at zero fee. buy_irm
+            // fillers DO have IRM (they're providing the IRM side) so
+            // their fills remain Standard.
+            let priority = if order.direction == SWAP_ORDER_DIRECTION_SELL {
+                MempoolPriority::ZeroFeeAllowed
+            } else {
+                MempoolPriority::Standard
+            };
             accepted = mempool
-                .add_transaction(tx, raw.clone(), fee_checked)
+                .add_transaction_with_priority(
+                    tx,
+                    raw.clone(),
+                    fee_checked,
+                    priority,
+                    Some(addr.ip()),
+                )
                 .is_ok();
         }
     }

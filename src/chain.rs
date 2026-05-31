@@ -2816,6 +2816,66 @@ pub fn decode_compact_tx(raw: &[u8]) -> Transaction {
     }
 }
 
+/// Classify a tx for mempool admission. Returns
+/// [`MempoolPriority::ZeroFeeAllowed`] for the three buyer-side shapes:
+///   - any tx whose outputs include a `BtcHeaderBatch`, `LtcHeaderBatch`,
+///     or `DogeHeaderBatch` script tag,
+///   - any tx whose input 0 spends an `HtlcBtcSwapV1` UTXO with witness
+///     selector `0x01` (BTC-proof claim),
+///   - any tx whose input 0 spends a `SwapOrder` UTXO of sell_irm
+///     direction with witness selector `0x01` (sell-direction fill).
+///
+/// All other shapes return [`MempoolPriority::Standard`]. Used by the
+/// P2P ingress path so peer-relayed buyer-side txs receive the same
+/// exemption local handlers grant explicitly. RPC handlers that build
+/// these txs directly call `add_transaction_with_priority(..., ZFA, ..)`
+/// without going through this classifier.
+pub fn classify_tx_priority(
+    tx: &Transaction,
+    chain: &ChainState,
+) -> crate::mempool::MempoolPriority {
+    use crate::btc_spv::BTC_HEADER_BATCH_TAG;
+    use crate::doge_spv::DOGE_HEADER_BATCH_TAG;
+    use crate::ltc_spv::LTC_HEADER_BATCH_TAG;
+    use crate::mempool::MempoolPriority;
+
+    for o in &tx.outputs {
+        match o.script_pubkey.first().copied() {
+            Some(BTC_HEADER_BATCH_TAG)
+            | Some(LTC_HEADER_BATCH_TAG)
+            | Some(DOGE_HEADER_BATCH_TAG) => {
+                return MempoolPriority::ZeroFeeAllowed;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(input0) = tx.inputs.first() {
+        let outpoint = OutPoint {
+            txid: input0.prev_txid,
+            index: input0.prev_index,
+        };
+        if let Some(utxo) = chain.utxos.get(&outpoint) {
+            let script = &utxo.output.script_pubkey;
+            let first_witness_byte = input0.script_sig.first().copied();
+            if parse_htlc_btc_swap_v1_script(script).is_some()
+                && first_witness_byte == Some(0x01)
+            {
+                return MempoolPriority::ZeroFeeAllowed;
+            }
+            if let Some(order) = parse_swap_order_script(script) {
+                if order.direction == SWAP_ORDER_DIRECTION_SELL
+                    && first_witness_byte == Some(0x01)
+                {
+                    return MempoolPriority::ZeroFeeAllowed;
+                }
+            }
+        }
+    }
+
+    MempoolPriority::Standard
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
