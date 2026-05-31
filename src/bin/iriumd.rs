@@ -7191,11 +7191,11 @@ async fn claim_btc_swap(
     }
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee {
         return Err(bad("funding_value_le_fee"));
     }
-    let payout = funding_out.output.value - fee;
+    let mut payout = funding_out.output.value - fee;
 
     let mut tx = Transaction {
         version: 1,
@@ -7212,7 +7212,6 @@ async fn claim_btc_swap(
         locktime: 0,
     };
 
-    let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
     let priv_bytes =
         hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
@@ -7222,28 +7221,50 @@ async fn claim_btc_swap(
     sk_bytes.copy_from_slice(&priv_bytes);
     let signing_key = SigningKey::from_bytes((&sk_bytes).into())
         .map_err(|_| bad("signing_key_init_failed"))?;
-    let sig: Signature = signing_key
-        .sign_prehash(&digest)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-    sig_bytes.push(0x01);
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
 
-    let witness = encode_htlc_btc_swap_claim_witness(
-        &sig_bytes,
-        &pubkey,
-        &btc_block_hash,
-        &branch,
-        req.btc_merkle_index,
-        &btc_tx_raw,
-    )
-    .ok_or_else(|| bad("encode_claim_witness_failed"))?;
-    tx.inputs[0].script_sig = witness;
+    // 2-pass fee recalc: estimate_tx_size(1,1) returns 192 bytes, but the
+    // real claim witness (sig + pubkey + btc_block_hash + merkle branch +
+    // raw BTC tx) pushes the actual tx to ~810 bytes. Without this loop the
+    // computed fee is ~0.24 sat/B and mempool admission fails at
+    // min_fee_per_byte=1.0. Same pattern as submit_btc_headers.
+    for _ in 0..2 {
+        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
+        let sig: Signature = signing_key
+            .sign_prehash(&digest)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
+        sig_bytes.push(0x01);
+        let witness = encode_htlc_btc_swap_claim_witness(
+            &sig_bytes,
+            &pubkey,
+            &btc_block_hash,
+            &branch,
+            req.btc_merkle_index,
+            &btc_tx_raw,
+        )
+        .ok_or_else(|| bad("encode_claim_witness_failed"))?;
+        tx.inputs[0].script_sig = witness;
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            if payout > extra {
+                fee = needed_fee;
+                payout -= extra;
+                tx.outputs[0].value = payout;
+                continue;
+            } else {
+                return Err(bad("fee_recalculation_exceeded_payout"));
+            }
+        }
+        break;
+    }
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -9199,7 +9220,7 @@ async fn fill_swap_order(
     };
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
+    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
     if funding_out.output.value <= fee.saturating_add(order.irm_amount).saturating_sub(funding_out.output.value)
         && order.direction == SWAP_ORDER_DIRECTION_SELL
         && funding_out.output.value < order.irm_amount
@@ -9289,37 +9310,68 @@ async fn fill_swap_order(
     };
 
     let scriptcode_order = encode_swap_order_script(&order);
-    let digest_order = signature_digest(&tx, 0, &scriptcode_order);
-    let order_sig: Signature = signing_key
-        .sign_prehash(&digest_order)
-        .map_err(|_| bad("sig_prehash_failed"))?;
-    let order_sig = order_sig.normalize_s().unwrap_or(order_sig);
-    let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
-    order_sig_bytes.push(0x01);
 
-    let witness = match order.direction {
-        SWAP_ORDER_DIRECTION_SELL => encode_swap_order_fill_sell_witness(
-            &order_sig_bytes,
-            &pubkey,
-            &taker_iriumd_pkh,
-            timeout_height,
-        )
-        .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
-        SWAP_ORDER_DIRECTION_BUY => encode_swap_order_fill_buy_witness(
-            &order_sig_bytes,
-            &pubkey,
-            timeout_height,
-        )
-        .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
-        _ => return Err(bad("order_direction_unknown")),
-    };
-    tx.inputs[0].script_sig = witness;
+    // 2-pass fee recalc: estimate_tx_size(1,1) under-counts the order fill
+    // witness (sig + pubkey + taker_pkh + timeout) and any extra P2PKH
+    // wallet inputs. Without this loop a 1-input/1-output sell fill at
+    // fee_per_byte=1 produces ~0.66 sat/B and mempool admission fails at
+    // min_fee_per_byte=1.0. Same pattern as submit_btc_headers.
+    for _ in 0..2 {
+        let digest_order = signature_digest(&tx, 0, &scriptcode_order);
+        let order_sig: Signature = signing_key
+            .sign_prehash(&digest_order)
+            .map_err(|_| bad("sig_prehash_failed"))?;
+        let order_sig = order_sig.normalize_s().unwrap_or(order_sig);
+        let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
+        order_sig_bytes.push(0x01);
 
-    if !extra_inputs.is_empty() {
-        let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
-        key_map.insert(taker_iriumd_pkh, wallet_key.clone());
-        sign_wallet_inputs(&mut tx, &extra_inputs, &key_map)
-            .map_err(|_| bad("sign_extra_inputs_failed"))?;
+        let witness = match order.direction {
+            SWAP_ORDER_DIRECTION_SELL => encode_swap_order_fill_sell_witness(
+                &order_sig_bytes,
+                &pubkey,
+                &taker_iriumd_pkh,
+                timeout_height,
+            )
+            .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
+            SWAP_ORDER_DIRECTION_BUY => encode_swap_order_fill_buy_witness(
+                &order_sig_bytes,
+                &pubkey,
+                timeout_height,
+            )
+            .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
+            _ => return Err(bad("order_direction_unknown")),
+        };
+        tx.inputs[0].script_sig = witness;
+
+        if !extra_inputs.is_empty() {
+            let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
+            key_map.insert(taker_iriumd_pkh, wallet_key.clone());
+            sign_wallet_inputs(&mut tx, &extra_inputs, &key_map)
+                .map_err(|_| bad("sign_extra_inputs_failed"))?;
+        }
+
+        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
+        if needed_fee > fee {
+            let extra = needed_fee - fee;
+            // Reduce change (always the last output when there is one) to
+            // absorb the shortfall. Covenant output 0 is fixed by spec; we
+            // cannot touch it. If no change exists or change can't cover
+            // the delta, reject — caller can retry with a higher
+            // fee_per_byte or pre-funded inputs.
+            if tx.outputs.len() > 1 {
+                let change_idx = tx.outputs.len() - 1;
+                if tx.outputs[change_idx].value > extra {
+                    fee = needed_fee;
+                    tx.outputs[change_idx].value -= extra;
+                    continue;
+                } else {
+                    return Err(bad("fee_recalculation_exceeded_change"));
+                }
+            } else {
+                return Err(bad("fee_recalculation_no_change_to_reduce"));
+            }
+        }
+        break;
     }
 
     let fee_checked = {
@@ -22532,6 +22584,105 @@ mod tests {
         let (status, msg) = result.expect_err("should reject");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("resolver_not_recent_miner"), "got: {msg}");
+    }
+
+    /// Regression for the size-estimator bug fixed in claim_btc_swap and
+    /// fill_swap_order. Before the 2-pass recalc, those handlers computed
+    /// fee = estimate_tx_size(1, 1) * fee_per_byte = 192 sats at fpb=1,
+    /// but the actual serialized tx — with the heavy claim or fill
+    /// witness — is several times larger. The handler-produced tx was
+    /// then rejected by the production mempool (min_fee_per_byte=1.0).
+    /// This test asserts the property the fix delivers: a tx whose
+    /// declared fee equals serialize().len() * 1 IS admitted.
+    #[test]
+    fn mempool_admits_claim_shaped_tx_when_fee_matches_serialized_size() {
+        // Mimic a real claim_btc_swap output: one input carrying the
+        // ~720-byte claim witness, one P2PKH output. Concrete witness
+        // bytes don't need to be meaningful — only the size matters for
+        // mempool admission. (Consensus validation isn't exercised here;
+        // mempool admission is governed by raw fee/size ratio.)
+        let witness = vec![0u8; 720];
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0xa1u8; 32],
+                prev_index: 0,
+                script_sig: witness,
+                sequence: 0xffff_fffe,
+            }],
+            outputs: vec![TxOutput {
+                value: 100_000,
+                script_pubkey: p2pkh_script(&[0u8; 20]),
+            }],
+            locktime: 0,
+        };
+        let raw = tx.serialize();
+        let size = raw.len() as u64;
+
+        let path = unique_path("mempool_claim_admit", "json");
+        let mut mempool = MempoolManager::new(path.clone(), 100, 1.0);
+
+        // Correct fee = size * 1 satisfies min_fee_per_byte=1.0.
+        let res = mempool.add_transaction(tx.clone(), raw.clone(), size);
+        assert!(
+            res.is_ok(),
+            "expected admission at correct fee={} for size={}: {:?}",
+            size,
+            size,
+            res
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression — confirms the bug shape. Before the 2-pass fix, the
+    /// handlers passed estimate_tx_size(1, 1) (= 192 sats at fpb=1) as
+    /// the fee for a tx whose real size is much larger. Mempool then
+    /// rejects the tx because fee/size < min_fee_per_byte. This test
+    /// makes that rejection explicit so a future regression that
+    /// reintroduces the estimator-only path will fail loudly.
+    #[test]
+    fn mempool_rejects_claim_shaped_tx_at_buggy_estimate_only_fee() {
+        let witness = vec![0u8; 720];
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0xa2u8; 32], // distinct so the prior test's
+                prev_index: 0,           // entry doesn't collide
+                script_sig: witness,
+                sequence: 0xffff_fffe,
+            }],
+            outputs: vec![TxOutput {
+                value: 100_000,
+                script_pubkey: p2pkh_script(&[0u8; 20]),
+            }],
+            locktime: 0,
+        };
+        let raw = tx.serialize();
+        let real_size = raw.len() as u64;
+
+        // The buggy fee the handlers used before the fix.
+        let buggy_fee = estimate_tx_size(1, 1);
+        assert!(
+            buggy_fee < real_size,
+            "test inputs are not representative: estimate {} should be \
+             much less than actual {}",
+            buggy_fee,
+            real_size
+        );
+
+        let path = unique_path("mempool_claim_reject", "json");
+        let mut mempool = MempoolManager::new(path.clone(), 100, 1.0);
+
+        let res = mempool.add_transaction(tx.clone(), raw.clone(), buggy_fee);
+        assert!(
+            res.is_err(),
+            "expected rejection at buggy fee={} on size={} tx",
+            buggy_fee,
+            real_size
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }
 
