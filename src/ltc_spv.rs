@@ -521,7 +521,7 @@ fn expected_bits_for_v(
     }
     let first_height = height - params.window;
     if first_height < anchor.height {
-        return Err("expected_bits: retarget window reaches before anchor".to_string());
+        return Ok(parent_bits);
     }
     let first_time = find_ancestor_time_at_height_v(parent_hash, first_height, view, anchor)?;
     let mut actual_timespan = parent_time.saturating_sub(first_time);
