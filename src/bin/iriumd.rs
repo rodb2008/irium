@@ -7300,6 +7300,50 @@ fn decode_btc_p2pkh_address(addr: &str) -> Option<[u8; 20]> {
     Some(pkh)
 }
 
+/// Decode a bech32 P2WPKH BIP173 address into the 20-byte HASH160(pubkey).
+///
+/// Accepts only:
+///   - bech32 variant (not bech32m — bech32m is reserved for witness
+///     versions ≥ 1, i.e. Taproot; v1 is intentionally out of scope for the
+///     BTC swap claim path).
+///   - witness version 0.
+///   - a 20-byte program. The same opcode/length form with a 32-byte
+///     program encodes P2WSH; we reject it because consensus has no way
+///     to recover the inner script hash and match it against a swap's
+///     `btc_recipient_pkh` slot.
+///   - HRP listed in `expected_hrps`. Used to keep BTC and LTC decoders
+///     symmetric: BTC accepts "bc"/"tb"; LTC accepts "ltc"/"tltc".
+fn decode_p2wpkh_bech32_for_hrps(addr: &str, expected_hrps: &[&str]) -> Option<[u8; 20]> {
+    let (hrp, witver, program) = bech32::segwit::decode(addr.trim()).ok()?;
+    if witver.to_u8() != 0 {
+        return None;
+    }
+    let hrp_s = hrp.as_str();
+    if !expected_hrps.iter().any(|h| h.eq_ignore_ascii_case(hrp_s)) {
+        return None;
+    }
+    if program.len() != 20 {
+        return None;
+    }
+    let mut pkh = [0u8; 20];
+    pkh.copy_from_slice(&program);
+    Some(pkh)
+}
+
+/// Decode either a legacy P2PKH (base58check) or a bech32 P2WPKH BTC
+/// address into the 20-byte HASH160(pubkey).
+///
+/// Acceptance of bech32 forms here is RPC-layer ingress only — it lets
+/// users post / create swaps with their default modern-wallet address.
+/// Whether a bech32 BTC payment subsequently satisfies the claim path is
+/// gated by `ChainParams.btc_swap_bech32_payment_activation_height` at
+/// consensus time. The 20-byte hash returned is identical for both
+/// encodings (both encode HASH160(pubkey)), so the on-chain
+/// `btc_recipient_pkh` slot is form-agnostic.
+fn decode_btc_address(addr: &str) -> Option<[u8; 20]> {
+    decode_btc_p2pkh_address(addr).or_else(|| decode_p2wpkh_bech32_for_hrps(addr, &["bc", "tb"]))
+}
+
 async fn create_btc_swap(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -7356,8 +7400,8 @@ async fn create_btc_swap(
     let mut refund_pkh = [0u8; 20];
     refund_pkh.copy_from_slice(&refund_vec);
 
-    let btc_recipient_pkh = decode_btc_p2pkh_address(&req.btc_recipient_address)
-        .ok_or_else(|| bad("btc_recipient_address_must_be_p2pkh"))?;
+    let btc_recipient_pkh = decode_btc_address(&req.btc_recipient_address)
+        .ok_or_else(|| bad("btc_recipient_address_must_be_p2pkh_or_bech32_p2wpkh"))?;
 
     let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
     {
@@ -8113,6 +8157,16 @@ fn decode_ltc_p2pkh_address(addr: &str) -> Option<[u8; 20]> {
     Some(pkh)
 }
 
+/// Decode either a legacy P2PKH (base58check) or a bech32 P2WPKH LTC
+/// address into the 20-byte HASH160(pubkey). LTC bech32 acceptance has
+/// no separate consensus gate: the LTC swap claim arm itself ships
+/// disabled today (`htlc_ltc_swap_v1_active`), and the initial mainnet
+/// activation will land with bech32 acceptance on day one. Mirrors
+/// `decode_btc_address` but uses the "ltc"/"tltc" HRP set.
+fn decode_ltc_address(addr: &str) -> Option<[u8; 20]> {
+    decode_ltc_p2pkh_address(addr).or_else(|| decode_p2wpkh_bech32_for_hrps(addr, &["ltc", "tltc"]))
+}
+
 async fn create_ltc_swap(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -8169,8 +8223,8 @@ async fn create_ltc_swap(
     let mut refund_pkh = [0u8; 20];
     refund_pkh.copy_from_slice(&refund_vec);
 
-    let ltc_recipient_pkh = decode_ltc_p2pkh_address(&req.ltc_recipient_address)
-        .ok_or_else(|| bad("ltc_recipient_address_must_be_p2pkh"))?;
+    let ltc_recipient_pkh = decode_ltc_address(&req.ltc_recipient_address)
+        .ok_or_else(|| bad("ltc_recipient_address_must_be_p2pkh_or_bech32_p2wpkh"))?;
 
     let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
     {
@@ -9853,8 +9907,8 @@ async fn post_swap_order(
     let mut maker_iriumd_pkh = [0u8; 20];
     maker_iriumd_pkh.copy_from_slice(&maker_iriumd_vec);
 
-    let maker_btc_pkh = decode_btc_p2pkh_address(&req.maker_btc_address)
-        .ok_or_else(|| bad("maker_btc_address_must_be_p2pkh"))?;
+    let maker_btc_pkh = decode_btc_address(&req.maker_btc_address)
+        .ok_or_else(|| bad("maker_btc_address_must_be_p2pkh_or_bech32_p2wpkh"))?;
 
     let expected_hash = if direction == SWAP_ORDER_DIRECTION_BUY {
         let h_hex = req
@@ -11314,8 +11368,8 @@ async fn post_ltc_swap_order(
     let mut maker_iriumd_pkh = [0u8; 20];
     maker_iriumd_pkh.copy_from_slice(&maker_iriumd_vec);
 
-    let maker_ltc_pkh = decode_ltc_p2pkh_address(&req.maker_ltc_address)
-        .ok_or_else(|| bad("maker_ltc_address_must_be_p2pkh"))?;
+    let maker_ltc_pkh = decode_ltc_address(&req.maker_ltc_address)
+        .ok_or_else(|| bad("maker_ltc_address_must_be_p2pkh_or_bech32_p2wpkh"))?;
 
     let expected_hash = if direction == LTC_SWAP_ORDER_DIRECTION_BUY {
         let h_hex = req
@@ -15772,6 +15826,8 @@ async fn main() {
             doge_spv: irium_node_rs::doge_spv::resolve_doge_spv_params(network),
             htlc_btc_swap_v1_activation_height:
                 irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
+            btc_swap_bech32_payment_activation_height:
+                irium_node_rs::activation::resolved_btc_swap_bech32_payment_activation_height(network),
             htlc_ltc_swap_v1_activation_height:
                 irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
             htlc_doge_swap_v1_activation_height:
@@ -17978,6 +18034,7 @@ mod tests {
             ltc_spv: None,
             doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
@@ -18901,6 +18958,7 @@ mod tests {
             ltc_spv: None,
             doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
@@ -25329,6 +25387,7 @@ mod tests {
             ltc_spv: None,
             doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,

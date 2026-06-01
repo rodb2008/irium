@@ -3222,6 +3222,8 @@ fn main() {
             doge_spv: irium_node_rs::doge_spv::resolve_doge_spv_params(network),
             htlc_btc_swap_v1_activation_height:
                 irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
+            btc_swap_bech32_payment_activation_height:
+                irium_node_rs::activation::resolved_btc_swap_bech32_payment_activation_height(network),
             htlc_ltc_swap_v1_activation_height:
                 irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
             swap_order_v1_activation_height:

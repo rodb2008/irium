@@ -246,6 +246,30 @@ pub const MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = Some(23_850)
 /// fill covenant would otherwise reject every spend.
 pub const MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = Some(23_850);
 
+/// Mainnet activation height for accepting bech32 P2WPKH BTC payments in
+/// HtlcBtcSwapV1 claim proofs (in addition to the always-accepted legacy
+/// P2PKH form).
+///
+/// `None` keeps the rule at "P2PKH only" — modern bech32 wallets cannot
+/// satisfy the BTC payment leg even when they pay to the correct 20-byte
+/// pkh, because the consensus check looks only for the 25-byte P2PKH
+/// script shape. Setting this to `Some(<height>)` broadens acceptance: a
+/// claim whose referenced BTC tx pays the swap.btc_recipient_pkh via the
+/// 22-byte P2WPKH form (`OP_0 <0x14> <20-byte pkh>`) ALSO satisfies the
+/// payment check from `<height>` onwards.
+///
+/// This is a consensus-rule relaxation — old nodes will reject claims new
+/// nodes accept, so activation requires a coordinated upgrade window per
+/// the workflow in docs/htlcv1_activation_commit_workflow.md.
+///
+/// LTC piggybacks on `htlc_ltc_swap_v1_activation_height`: when LTC swap
+/// goes live on mainnet, bech32 LTC P2WPKH payments are accepted from
+/// the same block. No separate LTC constant.
+///
+/// DOGE never activated SegWit; the DOGE claim arm remains P2PKH-only
+/// regardless of this constant.
+pub const MAINNET_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT: Option<u64> = None;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkKind {
     Mainnet,
@@ -471,6 +495,25 @@ pub fn resolved_swap_order_v1_activation_height(network: NetworkKind) -> Option<
     match network {
         NetworkKind::Mainnet => MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT,
         NetworkKind::Testnet | NetworkKind::Devnet => runtime_swap_order_v1_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the BTC-swap bech32-payment activation
+/// height. Read from `IRIUM_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT`.
+/// Ignored on mainnet, which uses
+/// `MAINNET_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT`.
+#[allow(dead_code)] // wired through ChainParams once the bech32-payment relaxation is consumed
+pub fn runtime_btc_swap_bech32_payment_env_override() -> Option<u64> {
+    env::var("IRIUM_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+#[allow(dead_code)] // wired through ChainParams once the bech32-payment relaxation is consumed
+pub fn resolved_btc_swap_bech32_payment_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_btc_swap_bech32_payment_env_override(),
     }
 }
 
@@ -969,6 +1012,40 @@ mod tests {
             Some(333)
         );
         std::env::remove_var("IRIUM_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn mainnet_btc_swap_bech32_payment_is_none_pending_governance() {
+        assert!(
+            MAINNET_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT.is_none(),
+            "bech32 P2WPKH BTC payment acceptance must stay disabled on mainnet until governance flips this constant"
+        );
+        assert!(resolved_btc_swap_bech32_payment_activation_height(NetworkKind::Mainnet).is_none());
+    }
+
+    #[test]
+    fn mainnet_ignores_btc_swap_bech32_payment_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT", "12345");
+        let resolved = resolved_btc_swap_bech32_payment_activation_height(NetworkKind::Mainnet);
+        std::env::remove_var("IRIUM_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT");
+        assert_eq!(resolved, MAINNET_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn non_mainnet_uses_btc_swap_bech32_payment_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT", "55");
+        assert_eq!(
+            resolved_btc_swap_bech32_payment_activation_height(NetworkKind::Devnet),
+            Some(55)
+        );
+        assert_eq!(
+            resolved_btc_swap_bech32_payment_activation_height(NetworkKind::Testnet),
+            Some(55)
+        );
+        std::env::remove_var("IRIUM_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT");
     }
 
 }
