@@ -5863,35 +5863,52 @@ async fn wallet_send(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumJson(req): AxumJson<WalletSendRequest>,
-) -> Result<Json<WalletSendResponse>, StatusCode> {
-    check_rate_with_auth(&state, &addr, &headers)?;
-    require_rpc_auth(&headers)?;
+) -> Result<Json<WalletSendResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // Helpers — surface a typed error body that the desktop wallet's
+    // wallet_send command can decode into a friendly user-facing message.
+    // The empty-body returns from the previous shape are what made the
+    // GUI's "HTTP 400 Bad Request" indistinguishable between "wallet
+    // locked", "insufficient funds", and "invalid address" — see issue
+    // report and the v1.0.74-era src-tauri wallet_send change for the
+    // call-site decode logic.
+    let bad = |reason: &str| -> (StatusCode, Json<serde_json::Value>) {
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": reason })))
+    };
+    let denied = |reason: &str| -> (StatusCode, Json<serde_json::Value>) {
+        (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": reason })))
+    };
+    let auth_err = |s: StatusCode| -> (StatusCode, Json<serde_json::Value>) {
+        (s, Json(serde_json::json!({})))
+    };
 
-    let amount = parse_irm(&req.amount).map_err(|_| StatusCode::BAD_REQUEST)?;
+    check_rate_with_auth(&state, &addr, &headers).map_err(auth_err)?;
+    require_rpc_auth(&headers).map_err(auth_err)?;
+
+    let amount = parse_irm(&req.amount).map_err(|_| bad("invalid_amount"))?;
     if amount == 0 {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("invalid_amount"));
     }
 
     let (keys, change_address) = {
         let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-        let keys = wallet.keys().map_err(|_| StatusCode::BAD_REQUEST)?;
+        let keys = wallet.keys().map_err(|_| bad("wallet_locked"))?;
         let change = if let Some(ref from) = req.from_address {
             from.clone()
         } else {
             wallet
                 .current_address()
-                .map_err(|_| StatusCode::BAD_REQUEST)?
+                .map_err(|_| bad("wallet_locked"))?
         };
         (keys, change)
     };
 
     if keys.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("wallet_locked"));
     }
 
     let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
     for key in keys {
-        let bytes = hex::decode(&key.pkh).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let bytes = hex::decode(&key.pkh).map_err(|_| bad("internal_keymap_error"))?;
         if bytes.len() != 20 {
             continue;
         }
@@ -5901,19 +5918,19 @@ async fn wallet_send(
     }
 
     if key_map.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("wallet_locked"));
     }
 
     let mut allowed: HashSet<[u8; 20]> = HashSet::new();
     if let Some(ref from_addr) = req.from_address {
-        let pkh = base58_p2pkh_to_hash(from_addr).ok_or(StatusCode::BAD_REQUEST)?;
+        let pkh = base58_p2pkh_to_hash(from_addr).ok_or_else(|| bad("invalid_address"))?;
         if pkh.len() != 20 {
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(bad("invalid_address"));
         }
         let mut arr = [0u8; 20];
         arr.copy_from_slice(&pkh);
         if !key_map.contains_key(&arr) {
-            return Err(StatusCode::FORBIDDEN);
+            return Err(denied("from_address_not_in_wallet"));
         }
         allowed.insert(arr);
     } else {
@@ -5922,14 +5939,14 @@ async fn wallet_send(
         }
     }
 
-    let change_vec = base58_p2pkh_to_hash(&change_address).ok_or(StatusCode::BAD_REQUEST)?;
+    let change_vec = base58_p2pkh_to_hash(&change_address).ok_or_else(|| bad("invalid_address"))?;
     if change_vec.len() != 20 {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("invalid_address"));
     }
     let mut change_pkh = [0u8; 20];
     change_pkh.copy_from_slice(&change_vec);
     if !key_map.contains_key(&change_pkh) {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(denied("change_address_not_in_wallet"));
     }
 
     let (mut utxos, tip_height) = {
@@ -5952,7 +5969,7 @@ async fn wallet_send(
     };
 
     if utxos.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("no_utxos"));
     }
 
     let coin_select = req.coin_select.as_deref().unwrap_or("largest");
@@ -6002,12 +6019,12 @@ async fn wallet_send(
     }
 
     if total < amount.saturating_add(fee) {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("insufficient_funds"));
     }
 
-    let to_vec = base58_p2pkh_to_hash(&req.to_address).ok_or(StatusCode::BAD_REQUEST)?;
+    let to_vec = base58_p2pkh_to_hash(&req.to_address).ok_or_else(|| bad("invalid_address"))?;
     if to_vec.len() != 20 {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("invalid_address"));
     }
     let mut to_pkh = [0u8; 20];
     to_pkh.copy_from_slice(&to_vec);
@@ -6045,7 +6062,7 @@ async fn wallet_send(
     };
 
     for _ in 0..2 {
-        sign_wallet_inputs(&mut tx, &selected, &key_map)?;
+        sign_wallet_inputs(&mut tx, &selected, &key_map).map_err(auth_err)?;
         let size = tx.serialize().len() as u64;
         let needed_fee = size.saturating_mul(fee_per_byte);
         if needed_fee > fee {
@@ -6063,7 +6080,7 @@ async fn wallet_send(
                 }
                 continue;
             } else {
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(bad("insufficient_funds"));
             }
         }
         break;
@@ -6073,7 +6090,7 @@ async fn wallet_send(
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain
             .calculate_fees(&tx)
-            .map_err(|_| StatusCode::BAD_REQUEST)?
+            .map_err(|_| bad("fee_calc_failed"))?
     };
 
     let raw = tx.serialize();
