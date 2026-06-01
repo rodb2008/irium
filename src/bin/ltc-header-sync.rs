@@ -235,10 +235,17 @@ fn submit_headers(
     headers_hex: &str,
 ) -> Result<SubmitResp, String> {
     let url = format!("{rpc_url}/rpc/submitltcheaders");
+    // Read fee_per_byte from env with a default of 100 sat/byte to stay at
+    // or above the current mainnet mempool floor. Hardcoded `1` predated
+    // the floor bump in v1.9.42 and caused every submission to be rejected.
+    let fee_per_byte: u64 = env::var("LTC_HEADER_SYNC_FEE_PER_BYTE")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(100);
     let body = json!({
         "headers_hex": headers_hex,
         "broadcast": true,
-        "fee_per_byte": 1
+        "fee_per_byte": fee_per_byte
     });
     let resp = client
         .post(&url)
