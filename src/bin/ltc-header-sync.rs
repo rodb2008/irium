@@ -114,7 +114,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            log_line("ERROR", &format!("{e}"));
+            log_line("ERROR", &e.to_string());
             ExitCode::FAILURE
         }
     }

@@ -532,7 +532,7 @@ async fn proof_create(
     let payload_bytes = settlement_proof_payload_bytes(&proof)
         .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, "payload_error", &e))?;
     let payload_digest = Sha256::digest(&payload_bytes);
-    let payload_hash_hex = hex::encode(&payload_digest);
+    let payload_hash_hex = hex::encode(payload_digest);
     let sig: Signature = signing_key.sign_prehash(&payload_digest).map_err(|e| {
         json_err(
             StatusCode::INTERNAL_SERVER_ERROR,

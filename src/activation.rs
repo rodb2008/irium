@@ -241,7 +241,7 @@ pub const MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = None;
 /// Phase C ships disabled. Activation should not precede
 /// `MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT`, otherwise no proof would
 /// resolve.
-
+///
 /// Mainnet HtlcBtcSwapV1 activation height (Phase 2).
 ///
 /// `None` keeps the BTC-proof claim path disabled on mainnet. When set to

@@ -1,3 +1,6 @@
+#![allow(warnings)]
+#![allow(clippy::all)]
+
 use reqwest::blocking::Client;
 use reqwest::Certificate;
 use reqwest::StatusCode;

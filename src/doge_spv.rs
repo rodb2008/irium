@@ -66,8 +66,9 @@ use crate::scrypt_pow::meets_target_ltc;
 pub use crate::activation::{
     MAINNET_DOGE_ANCHOR_BITS, MAINNET_DOGE_ANCHOR_HASH_DISPLAY, MAINNET_DOGE_ANCHOR_HEIGHT,
     MAINNET_DOGE_ANCHOR_PREV_TIME, MAINNET_DOGE_ANCHOR_TIME,
-    MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT,
 };
+#[cfg(test)]
+use crate::activation::MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT;
 
 /// Output script tag reserved for a Dogecoin header batch. Consensus
 /// dispatch is wired in a later phase once governance assigns an
@@ -1309,8 +1310,7 @@ mod tests {
             bits: 0,
             nonce: 0,
         };
-        let oversize: Vec<DogeHeader> = std::iter::repeat(dummy)
-            .take(MAX_DOGE_HEADERS_PER_BATCH as usize + 1)
+        let oversize: Vec<DogeHeader> = std::iter::repeat_n(dummy, MAX_DOGE_HEADERS_PER_BATCH as usize + 1)
             .collect();
         let mut headers_db = HashMap::new();
         let mut heights_db = HashMap::new();

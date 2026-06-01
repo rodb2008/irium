@@ -219,7 +219,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             fs::write(
                 &anchors_path,
                 serde_json::to_string_pretty(&serde_json::Value::Object(
-                    full_map.into_iter().map(|(k, v)| (k, v)).collect(),
+                    full_map.into_iter().collect(),
                 ))?,
             )?;
 

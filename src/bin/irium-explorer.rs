@@ -3866,8 +3866,8 @@ mod tests {
         let wrapped = settlement_surface("agreementstatus", json!({"agreement_hash": "aa"})).0;
         assert_eq!(wrapped["surface"], "phase1_settlement");
         assert_eq!(wrapped["rpc"], "agreementstatus");
-        assert!(wrapped["htlc_enforced"].as_array().unwrap().len() > 0);
-        assert!(wrapped["metadata_indexed"].as_array().unwrap().len() > 0);
+        assert!(!wrapped["htlc_enforced"].as_array().unwrap().is_empty());
+        assert!(!wrapped["metadata_indexed"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

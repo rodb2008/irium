@@ -2777,7 +2777,7 @@ pub fn extract_agreement_funding_leg_refs_from_tx(
                 body.push(0x00);
                 body.extend_from_slice(&htlc.recipient_pkh);
                 let first = sha2::Sha256::digest(&body);
-                let second = sha2::Sha256::digest(&first);
+                let second = sha2::Sha256::digest(first);
                 body.extend_from_slice(&second[0..4]);
                 body
             })
@@ -2787,7 +2787,7 @@ pub fn extract_agreement_funding_leg_refs_from_tx(
                 body.push(0x00);
                 body.extend_from_slice(&htlc.refund_pkh);
                 let first = sha2::Sha256::digest(&body);
-                let second = sha2::Sha256::digest(&first);
+                let second = sha2::Sha256::digest(first);
                 body.extend_from_slice(&second[0..4]);
                 body
             })
@@ -4946,7 +4946,7 @@ fn evaluate_holdback(
     // Proof-condition release takes priority over deadline release.
     if let Some(ref req_id) = holdback.release_requirement_id {
         let req_met = scope_reqs.iter().any(|req| {
-            req.requirement_id == *req_id && req_satisfied_threshold(*req, proofs, satisfied)
+            req.requirement_id == *req_id && req_satisfied_threshold(req, proofs, satisfied)
         });
         if req_met {
             return HoldbackEvaluationResult {
@@ -8938,7 +8938,7 @@ mod tests {
 
         // Only att-a: base NOT satisfied (threshold 2 unmet) → holdback Pending.
         let proof_a = make_threshold_proof(&hash, "att-a", &sk_a, "prf-a");
-        let r1 = evaluate_policy(&agreement, &policy, &[proof_a.clone()], 0).unwrap();
+        let r1 = evaluate_policy(&agreement, &policy, std::slice::from_ref(&proof_a), 0).unwrap();
         assert_eq!(r1.outcome, PolicyOutcome::Unsatisfied);
         // holdback is None when base is Unsatisfied: evaluate_holdback is only
         // called on the Satisfied path. Pending state is represented as None.
@@ -9083,7 +9083,7 @@ mod tests {
         let sk = sample_signing_key();
         let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let policy = make_test_policy(&hash, &pk, "att");
         let proof = make_test_proof(&hash, "att", &sk);
@@ -9140,7 +9140,7 @@ mod tests {
         let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
         let agreement = sample_agreement();
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let policy = make_test_policy(&hash, &pk, "att");
         let mut proof = make_test_proof(&hash, "att", &sk);
@@ -9261,7 +9261,7 @@ mod tests {
         let sk = sample_signing_key();
         let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let policy = make_test_policy(&hash, &pk, "att");
         let mut proof = make_test_proof(&hash, "att", &sk);
@@ -9289,7 +9289,7 @@ mod tests {
         let sk = sample_signing_key();
         let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let policy = make_test_policy(&hash, &pk, "att");
         let mut proof = make_test_proof(&hash, "att", &sk);
@@ -9641,7 +9641,7 @@ mod tests {
         let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
         let agreement = sample_agreement();
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let policy = preorder_deposit_template(
             "pol-eval-pre",
@@ -9688,7 +9688,7 @@ mod tests {
     fn preorder_evaluates_timeout_when_deadline_passed_no_proof() {
         let agreement = sample_agreement();
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let policy = preorder_deposit_template(
             "pol-eval-timeout",
@@ -9717,7 +9717,7 @@ mod tests {
         let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
         let agreement = sample_agreement();
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let policy = contractor_milestone_template(
             "pol-c-eval",
@@ -9785,7 +9785,7 @@ mod tests {
         let pk2 = hex::encode(sk2.verifying_key().to_encoded_point(false).as_bytes());
         let agreement = sample_agreement();
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let policy = basic_otc_escrow_template(
             "pol-otc-thr",
@@ -9834,7 +9834,7 @@ mod tests {
         let p1 = make_p("prf-1", "arb-1", pk1.clone(), &sk1);
         let p2 = make_p("prf-2", "arb-2", pk2.clone(), &sk2);
         assert_eq!(
-            evaluate_policy(&agreement, &policy, &[p1.clone()], 0)
+            evaluate_policy(&agreement, &policy, std::slice::from_ref(&p1), 0)
                 .unwrap()
                 .outcome,
             PolicyOutcome::Unsatisfied
@@ -9869,7 +9869,7 @@ mod tests {
         let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
         let agreement = sample_agreement();
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let legacy = make_test_policy(&hash, &pk, "att");
         let template = basic_otc_escrow_template(
@@ -10171,7 +10171,7 @@ mod tests {
         let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
         let agreement = sample_agreement();
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let policy = contractor_milestone_template(
             "pol-scope-01",
@@ -10223,7 +10223,7 @@ mod tests {
         let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
         let agreement = sample_agreement();
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let policy = contractor_milestone_template(
             "pol-scope-02",
@@ -10273,7 +10273,7 @@ mod tests {
         let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
         let agreement = sample_agreement();
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let policy = contractor_milestone_template(
             "pol-scope-03",
@@ -10348,7 +10348,7 @@ mod tests {
         let pk = hex::encode(sk.verifying_key().to_encoded_point(false).as_bytes());
         let agreement = sample_agreement();
         let hash = hex::encode(Sha256::digest(
-            &agreement_canonical_bytes(&agreement).unwrap(),
+            agreement_canonical_bytes(&agreement).unwrap(),
         ));
         let policy = contractor_milestone_template(
             "pol-scope-04",

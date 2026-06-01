@@ -4,7 +4,6 @@ use std::env;
 
 use crate::anchors::AnchorManager;
 use chrono::Utc;
-use hex;
 use num_bigint::BigUint;
 use num_traits::Zero;
 
@@ -29,8 +28,7 @@ use crate::doge_spv::{
     MAX_DOGE_HEADER_BATCH_BYTES,
 };
 use crate::constants::{
-    block_reward, block_target_interval, coinbase_maturity, BLOCK_TARGET_INTERVAL_V1,
-    COINBASE_MATURITY, DIFFICULTY_RETARGET_INTERVAL, LWMA_MAX_TARGET_DOWN_FACTOR,
+    block_reward, block_target_interval, coinbase_maturity, BLOCK_TARGET_INTERVAL_V1, DIFFICULTY_RETARGET_INTERVAL, LWMA_MAX_TARGET_DOWN_FACTOR,
     LWMA_MAX_TARGET_UP_FACTOR, LWMA_MIN_DIFFICULTY_FLOOR, LWMA_SOLVETIME_CLAMP_FACTOR,
     LWMA_V2_MAX_TARGET_DOWN_FACTOR, LWMA_V2_MAX_TARGET_UP_FACTOR, LWMA_V2_SOLVETIME_CLAMP_FACTOR,
     LWMA_V2_WINDOW, LWMA_WINDOW, MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
@@ -667,7 +665,7 @@ impl ChainState {
             .expect("chain should have at least genesis when querying target");
 
         // Pre-activation consensus path. Historical blocks must remain unchanged.
-        if height < DIFFICULTY_RETARGET_INTERVAL || height % DIFFICULTY_RETARGET_INTERVAL != 0 {
+        if height < DIFFICULTY_RETARGET_INTERVAL || !height.is_multiple_of(DIFFICULTY_RETARGET_INTERVAL) {
             return last_block.header.target();
         }
 
@@ -1063,7 +1061,6 @@ impl ChainState {
     }
 
     /// Add a header to the header tree if it extends a known header and compute cumulative work.
-
     pub fn add_header(&mut self, header: BlockHeader) -> Result<u64, String> {
         // Look up the parent first so we know `height` before computing the
         // height-aware hash. Pre-Fix-2a the hash was computed before height,
@@ -1133,11 +1130,10 @@ impl ChainState {
     pub fn best_header_if_better(&self) -> Option<HeaderWork> {
         let mut best: Option<HeaderWork> = None;
         for hw in self.headers.values() {
-            if hw.work > self.total_work {
-                if best.as_ref().map(|b| &b.work < &hw.work).unwrap_or(true) {
+            if hw.work > self.total_work
+                && best.as_ref().map(|b| b.work < hw.work).unwrap_or(true) {
                     best = Some(hw.clone());
                 }
-            }
         }
         best
     }
@@ -1211,7 +1207,7 @@ impl ChainState {
         }
 
         // Timestamp validation
-        let current_time = Utc::now().timestamp() as i64;
+        let current_time = Utc::now().timestamp();
         if (block.header.time as i64) > current_time + MAX_FUTURE_BLOCK_TIME {
             return Err("Block timestamp too far in future".to_string());
         }
@@ -3524,7 +3520,7 @@ mod tests {
             return chain.params.genesis_block.header.target();
         }
         let last_block = chain.chain.last().expect("last block");
-        if height < DIFFICULTY_RETARGET_INTERVAL || height % DIFFICULTY_RETARGET_INTERVAL != 0 {
+        if height < DIFFICULTY_RETARGET_INTERVAL || !height.is_multiple_of(DIFFICULTY_RETARGET_INTERVAL) {
             return last_block.header.target();
         }
         let interval = DIFFICULTY_RETARGET_INTERVAL as usize;

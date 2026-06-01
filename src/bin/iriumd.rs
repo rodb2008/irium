@@ -1,3 +1,46 @@
+// Crate-level lint allows: see src/lib.rs for the rationale. The
+// iriumd binary inherits its own allow list because the lib-level
+// attributes don't apply to bin targets.
+#![allow(clippy::all)]
+#![allow(unused_must_use)]
+#![allow(clippy::manual_clamp)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::manual_is_multiple_of)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_unwrap_or_default)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::empty_line_after_doc_comments)]
+#![allow(clippy::empty_line_after_outer_attr)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::doc_overindented_list_items)]
+#![allow(clippy::len_without_is_empty)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::manual_range_contains)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::single_char_add_str)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::len_zero)]
+#![allow(clippy::redundant_clone)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::useless_vec)]
+#![allow(clippy::single_match)]
+#![allow(clippy::format_in_format_args)]
+#![allow(clippy::let_and_return)]
+#![allow(clippy::question_mark)]
+#![allow(clippy::redundant_closure)]
+#![allow(clippy::collapsible_else_if)]
+#![allow(clippy::collapsible_match)]
+#![allow(clippy::manual_strip)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::single_char_pattern)]
+#![allow(clippy::useless_conversion)]
+#![allow(dead_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -20,7 +63,6 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Utc;
-use hex;
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -28,7 +70,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower_http::cors::{Any, CorsLayer};
 
-use bs58;
 use get_if_addrs::get_if_addrs;
 use subtle::ConstantTimeEq;
 use irium_node_rs::activation::{
@@ -42,7 +83,7 @@ use irium_node_rs::block::{Block, BlockHeader};
 use irium_node_rs::chain::{
     block_from_locked, ChainParams, ChainState, HeaderWork, LwmaParams, OutPoint,
 };
-use irium_node_rs::constants::{block_reward, coinbase_maturity, COINBASE_MATURITY};
+use irium_node_rs::constants::{block_reward, coinbase_maturity};
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::{evict_invalid_mempool_entries, MempoolManager, MempoolPriority};
 use irium_node_rs::network::SeedlistManager;
@@ -78,7 +119,7 @@ use irium_node_rs::tx::{
     encode_htlc_btc_swap_refund_witness, encode_htlc_btc_swap_v1_script,
     encode_htlc_doge_swap_claim_witness, encode_htlc_doge_swap_refund_witness,
     encode_htlc_doge_swap_v1_script, parse_htlc_doge_swap_v1_script,
-    HtlcDogeSwapV1Output, HTLC_DOGE_SWAP_V1_SCRIPT_LEN,
+    HtlcDogeSwapV1Output,
     MAX_HTLC_DOGE_SWAP_CONFIRMATIONS, MIN_HTLC_DOGE_SWAP_CONFIRMATIONS,
     encode_doge_swap_order_cancel_witness,
     encode_doge_swap_order_expire_sweep_witness,
@@ -93,7 +134,7 @@ use irium_node_rs::tx::{
     encode_ltc_swap_order_fill_buy_witness, encode_ltc_swap_order_fill_sell_witness,
     encode_ltc_swap_order_script, parse_htlc_ltc_swap_v1_script,
     parse_ltc_swap_order_script,
-    HtlcLtcSwapV1Output, LtcSwapOrderOutput, HTLC_LTC_SWAP_V1_SCRIPT_LEN,
+    HtlcLtcSwapV1Output, LtcSwapOrderOutput,
     LTC_SWAP_ORDER_DIRECTION_BUY, LTC_SWAP_ORDER_DIRECTION_SELL,
     LTC_SWAP_ORDER_MAX_SWEEP_FEE, LTC_SWAP_ORDER_MIN_LOCKED_VALUE,
     MAX_HTLC_LTC_SWAP_CONFIRMATIONS, MIN_HTLC_LTC_SWAP_CONFIRMATIONS,
@@ -116,7 +157,7 @@ use irium_node_rs::ltc_spv::{
     MAX_LTC_HEADERS_PER_BATCH,
 };
 use irium_node_rs::doge_spv::{
-    encode_doge_header_batch, DogeAnchor, DogeHeader, DogeHeaderEntry, DOGE_HEADER_BYTES,
+    encode_doge_header_batch, DogeAnchor, DogeHeader, DOGE_HEADER_BYTES,
     MAX_DOGE_HEADERS_PER_BATCH,
 };
 use irium_node_rs::wallet_store::{WalletKey, WalletManager, WalletMode};
@@ -310,7 +351,7 @@ async fn ws_handle_socket(mut socket: WebSocket, state: AppState, is_public_conn
                 match event_result {
                     Ok(json_arc) => {
                         if has_subscribed && !subscribed.is_empty() {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&*json_arc) {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_arc) {
                                 let et = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                 if !ws_event_matches(et, &subscribed) {
                                     continue;
@@ -328,7 +369,7 @@ async fn ws_handle_socket(mut socket: WebSocket, state: AppState, is_public_conn
                                 }
                             }
                         } else if is_public_conn {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&*json_arc) {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_arc) {
                                 let et = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                 if !ws_is_public_event(et) {
                                     continue;
@@ -362,11 +403,10 @@ async fn ws_handler(
     let token_required = std::env::var("IRIUM_RPC_TOKEN")
         .map(|t| !t.trim().is_empty())
         .unwrap_or(false);
-    if token_required && !ws_public {
-        if require_rpc_auth(&headers).is_err() {
+    if token_required && !ws_public
+        && require_rpc_auth(&headers).is_err() {
             return (StatusCode::UNAUTHORIZED, "Bearer token required").into_response();
         }
-    }
     let is_public_conn = ws_public && require_rpc_auth(&headers).is_err();
     ws.on_upgrade(move |socket| ws_handle_socket(socket, state, is_public_conn))
 }
@@ -394,7 +434,7 @@ async fn sse_handler(
                 match rx.recv().await {
                     Ok(json_arc) => {
                         if is_pub {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&*json_arc) {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_arc) {
                                 let et = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                 if !ws_is_public_event(et) {
                                     continue;
@@ -2124,7 +2164,7 @@ fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
     }
     let (body, checksum) = data.split_at(data.len() - 4);
     let first = Sha256::digest(body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     if &second[0..4] != checksum {
         return None;
     }
@@ -2143,7 +2183,7 @@ fn base58_p2pkh_from_hash(pkh: &[u8; 20]) -> String {
     body.push(IRIUM_P2PKH_VERSION);
     body.extend_from_slice(pkh);
     let first = Sha256::digest(&body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     let checksum = &second[0..4];
     let mut full = body;
     full.extend_from_slice(checksum);
@@ -7361,7 +7401,7 @@ fn decode_btc_p2pkh_address(addr: &str) -> Option<[u8; 20]> {
     }
     let (body, checksum) = data.split_at(21);
     let first = Sha256::digest(body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     if &second[0..4] != checksum {
         return None;
     }
@@ -8218,7 +8258,7 @@ fn decode_ltc_p2pkh_address(addr: &str) -> Option<[u8; 20]> {
     }
     let (body, checksum) = data.split_at(21);
     let first = Sha256::digest(body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     if &second[0..4] != checksum {
         return None;
     }
@@ -9030,7 +9070,7 @@ fn decode_doge_p2pkh_address(addr: &str) -> Option<[u8; 20]> {
     }
     let (body, checksum) = data.split_at(21);
     let first = Sha256::digest(body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     if &second[0..4] != checksum {
         return None;
     }
@@ -10648,7 +10688,7 @@ async fn fill_swap_order(
                 .expected_hash
                 .ok_or_else(|| bad("buy_order_missing_expected_hash"))?;
             let sha = Sha256::digest(&pubkey);
-            let rip = ripemd::Ripemd160::digest(&sha);
+            let rip = ripemd::Ripemd160::digest(sha);
             let mut taker_refund_pkh = [0u8; 20];
             taker_refund_pkh.copy_from_slice(&rip);
             let htlc = HtlcV1Output {
@@ -12102,7 +12142,7 @@ async fn fill_ltc_swap_order(
                 .expected_hash
                 .ok_or_else(|| bad("buy_order_missing_expected_hash"))?;
             let sha = Sha256::digest(&pubkey);
-            let rip = ripemd::Ripemd160::digest(&sha);
+            let rip = ripemd::Ripemd160::digest(sha);
             let mut taker_refund_pkh = [0u8; 20];
             taker_refund_pkh.copy_from_slice(&rip);
             let htlc = HtlcV1Output {
@@ -13178,7 +13218,7 @@ async fn fill_doge_swap_order(
                 .expected_hash
                 .ok_or_else(|| bad("buy_order_missing_expected_hash"))?;
             let sha = Sha256::digest(&pubkey);
-            let rip = ripemd::Ripemd160::digest(&sha);
+            let rip = ripemd::Ripemd160::digest(sha);
             let mut taker_refund_pkh = [0u8; 20];
             taker_refund_pkh.copy_from_slice(&rip);
             let htlc = HtlcV1Output {
@@ -13902,7 +13942,7 @@ async fn list_policies_rpc(
             .list_all()
             .into_iter()
             .filter_map(|p| {
-                let expired = p.expires_at_height.map_or(false, |h| tip_height >= h);
+                let expired = p.expires_at_height.is_some_and(|h| tip_height >= h);
                 if active_only && expired {
                     return None;
                 }
@@ -14348,7 +14388,7 @@ async fn get_policy_rpc(
     let policy = store.get(&req.agreement_hash).cloned();
     let found = policy.is_some();
     let expires_at_height = policy.as_ref().and_then(|p| p.expires_at_height);
-    let expired = expires_at_height.map_or(false, |h| tip_height >= h);
+    let expired = expires_at_height.is_some_and(|h| tip_height >= h);
     Ok(Json(GetPolicyResponse {
         agreement_hash: req.agreement_hash,
         found,
@@ -16334,7 +16374,7 @@ async fn main() {
     let default_seed_port: u16 = std::env::var("IRIUM_P2P_BIND").ok()
         .or_else(|| node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.clone()))
         .as_deref()
-        .and_then(|b| b.split(':').last())
+        .and_then(|b| b.split(':').next_back())
         .and_then(|p| p.parse().ok())
         .unwrap_or(0);
 
@@ -16520,7 +16560,7 @@ async fn main() {
                             println!("{}", line);
                         }
                         if let Err(e) = node_c.connect_and_handshake(addr, height, &agent_c).await {
-                            let msg = format!("{}", e);
+                            let msg = e.to_string();
                             if !msg.contains("dial backoff") && !msg.contains("dial in progress") {
                                 if let Some(suppressed) = dial_seed_log_allowed(1, addr.ip()) {
                                     let mut line = format!(
@@ -16628,10 +16668,10 @@ async fn main() {
                     node_clone.peer_count(),
                 )
                 .await
-                .unwrap_or_else(|_| peers.len());
+                .unwrap_or(peers.len());
                 maintenance_ticks = maintenance_ticks.wrapping_add(1);
                 // Emergency reconnect when 0 peers; also routine reconnect every 30s.
-                if current_peer_count == 0 || maintenance_ticks % 6 == 0 {
+                if current_peer_count == 0 || maintenance_ticks.is_multiple_of(6) {
                     let maintenance_node = node_clone.clone();
                     tokio::spawn(async move {
                         let _ = tokio::time::timeout(
@@ -16775,7 +16815,7 @@ async fn main() {
                 // `best_peer == local` (cap bug, handshake bug, network partition that
                 // dissolves with the rest of the chain ahead, etc.) would silently strand
                 // the node at its current tip until manual intervention.
-                let periodic_probe = hb_ticks > 0 && hb_ticks % 12 == 0;
+                let periodic_probe = hb_ticks > 0 && hb_ticks.is_multiple_of(12);
                 if need_sync_burst || periodic_probe {
                     let min_gap = if need_sync_burst {
                         std::time::Duration::from_secs(10)
@@ -16796,7 +16836,7 @@ async fn main() {
                 }
 
                 // Periodic sync status line to diagnose stalls quickly.
-                if hb_ticks % 6 == 0 {
+                if hb_ticks.is_multiple_of(6) {
                     let ahead = sync_target_height.saturating_sub(local_height);
                     eprintln!(
                         "[{}] [🔁 sync] status local={} best_header={} best_peer={} ahead={} peers={} inflight(getheaders)={} inflight(getblocks)={} handshake_failures={}",
@@ -16812,7 +16852,7 @@ async fn main() {
                     );
                 }
 
-                if hb_ticks % 12 == 0 {
+                if hb_ticks.is_multiple_of(12) {
                     let prev = last_peer_summary.unwrap_or(peer_dbg);
                     let delta_attempts = peer_dbg
                         .outbound_dial_attempts_total
@@ -17455,7 +17495,7 @@ async fn main() {
                     if status == "open" {
                         if let Some(th) = timeout_height {
                             if tip_height >= th {
-                                if let Some(mut new_val) = serde_json::from_str::<serde_json::Value>(&data).ok() {
+                                if let Ok(mut new_val) = serde_json::from_str::<serde_json::Value>(&data) {
                                     if let Some(obj) = new_val.as_object_mut() {
                                         obj.insert("status".to_string(), serde_json::json!("expired"));
                                     }
@@ -17487,7 +17527,7 @@ async fn main() {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
                                         .to_string();
-                                    if let Some(mut new_val) = serde_json::from_str::<serde_json::Value>(&data).ok() {
+                                    if let Ok(mut new_val) = serde_json::from_str::<serde_json::Value>(&data) {
                                         if let Some(obj) = new_val.as_object_mut() {
                                             obj.insert("status".to_string(), serde_json::json!("open"));
                                             obj.remove("agreement_id");
@@ -24768,7 +24808,7 @@ mod tests {
             .as_bytes()
             .to_vec();
         let sha = Sha256::digest(&pk);
-        let rip = ripemd::Ripemd160::digest(&sha);
+        let rip = ripemd::Ripemd160::digest(sha);
         let mut pkh = [0u8; 20];
         pkh.copy_from_slice(&rip);
         base58_p2pkh_from_hash(&pkh)
@@ -26593,7 +26633,7 @@ fn verify_envelope_signature(
     let mut sha = Sha256::new();
     sha.update(&pubkey_bytes);
     let sha_out = sha.finalize();
-    let rip = ripemd::Ripemd160::digest(&sha_out);
+    let rip = ripemd::Ripemd160::digest(sha_out);
     let mut pkh = [0u8; 20];
     pkh.copy_from_slice(&rip);
     let derived_address = base58_p2pkh_from_hash(&pkh);
@@ -27761,15 +27801,14 @@ async fn reresolve_agreement(
     ];
     let mut pair_valid = false;
     for (a, b) in pairs {
-        if sa_addr == a && sb_addr == b {
-            if verify_envelope_signature(&req.nomination.party_a_signature, &digest, &a).is_ok()
+        if sa_addr == a && sb_addr == b
+            && verify_envelope_signature(&req.nomination.party_a_signature, &digest, &a).is_ok()
                 && verify_envelope_signature(&req.nomination.party_b_signature, &digest, &b)
                     .is_ok()
             {
                 pair_valid = true;
                 break;
             }
-        }
     }
     if !pair_valid {
         return Err(bad("co_signatures_invalid"));

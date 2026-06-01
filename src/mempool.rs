@@ -425,7 +425,7 @@ impl MempoolManager {
     }
 
     pub fn txids_hex(&self) -> Vec<String> {
-        self.entries.keys().map(|h| hex::encode(h)).collect()
+        self.entries.keys().map(hex::encode).collect()
     }
 
     pub fn raw_tx(&self, txid: &[u8; 32]) -> Option<Vec<u8>> {

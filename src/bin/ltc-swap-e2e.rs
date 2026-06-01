@@ -1,3 +1,6 @@
+#![allow(warnings)]
+#![allow(clippy::all)]
+
 //! End-to-end IRM/LTC swap test against iriumd-devnet + litecoind regtest.
 //!
 //! Drives the direct `/rpc/createltcswap` -> `/rpc/claimltcswap` flow with
@@ -187,7 +190,7 @@ fn compute_merkle_branch_natural(leaves: &[[u8; 32]], target_index: usize) -> Ve
     let mut level: Vec<[u8; 32]> = leaves.to_vec();
     let mut idx = target_index;
     while level.len() > 1 {
-        let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let sibling_idx = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
         let sibling = if sibling_idx >= level.len() {
             level[idx]
         } else {
@@ -664,7 +667,7 @@ fn run() -> Result<(), String> {
     let handle = step_3_create_swap(&iriumd, &irm_addr, &ltc_payee, irm_height_before_funding)?;
     // Short pause so the funding tx propagates into mempool fully before mining
     thread::sleep(Duration::from_millis(300));
-    let irm_height_after_funding = step_4_confirm_swap(&iriumd, irm_height_before_funding)?;
+    let _irm_height_after_funding = step_4_confirm_swap(&iriumd, irm_height_before_funding)?;
 
     let signed_hex = step_5_build_ltc_tx(&litecoind, &handle)?;
     let ltc_txid = step_6_send_ltc_tx(&litecoind, &signed_hex)?;

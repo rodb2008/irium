@@ -50,7 +50,7 @@ pub fn verify_merkle_proof(
 ) -> bool {
     let mut current = *txid;
     for sibling in proof.drain(..) {
-        let (left, right) = if index % 2 == 0 {
+        let (left, right) = if index.is_multiple_of(2) {
             (current, sibling)
         } else {
             (sibling, current)
@@ -133,11 +133,10 @@ pub fn nipopow_compare_counts(a: &[usize], b: &[usize], m: usize) -> std::cmp::O
     for mu in (0..=max).rev() {
         let ac = a.get(mu).copied().unwrap_or(0);
         let bc = b.get(mu).copied().unwrap_or(0);
-        if ac >= m || bc >= m {
-            if ac != bc {
+        if (ac >= m || bc >= m)
+            && ac != bc {
                 return ac.cmp(&bc);
             }
-        }
     }
     std::cmp::Ordering::Equal
 }
