@@ -178,6 +178,18 @@ pub struct ChainParams {
     /// resolve, but consensus does not refuse a misordered configuration
     /// — it just means no claim will ever succeed.
     pub htlc_btc_swap_v1_activation_height: Option<u64>,
+    /// Activation height for accepting bech32 P2WPKH BTC payments in
+    /// HtlcBtcSwapV1 claim proofs (in addition to the always-accepted
+    /// legacy P2PKH form). `None` keeps the rule at "P2PKH only"; setting
+    /// to `Some(<height>)` broadens acceptance from `<height>` onwards.
+    /// This is a consensus-rule relaxation — old nodes will reject claims
+    /// new nodes accept, so activation requires a coordinated upgrade
+    /// window per the workflow in
+    /// docs/htlcv1_activation_commit_workflow.md. LTC piggybacks on
+    /// `htlc_ltc_swap_v1_activation_height` and needs no separate gate;
+    /// DOGE never activated SegWit so its claim arm remains P2PKH-only
+    /// regardless of this constant.
+    pub btc_swap_bech32_payment_activation_height: Option<u64>,
     /// HtlcLtcSwapV1 activation height (Phase C). `None` keeps the
     /// LTC-proof claim path disabled. Same precondition relationship to
     /// `ltc_spv.activation_height` as the BTC pair above.
@@ -485,6 +497,13 @@ impl ChainState {
     fn htlc_btc_swap_v1_active_at(&self, height: u64) -> bool {
         self.params
             .htlc_btc_swap_v1_activation_height
+            .map(|h| height >= h)
+            .unwrap_or(false)
+    }
+
+    fn btc_swap_bech32_payment_active_at(&self, height: u64) -> bool {
+        self.params
+            .btc_swap_bech32_payment_activation_height
             .map(|h| height >= h)
             .unwrap_or(false)
     }
@@ -1725,6 +1744,7 @@ impl ChainState {
                 self.htlcv1_active_at(height),
                 self.mpsov1_active_at(height),
                 self.htlc_btc_swap_v1_active_at(height),
+                self.btc_swap_bech32_payment_active_at(height),
                 self.htlc_ltc_swap_v1_active_at(height),
                 self.htlc_doge_swap_v1_active_at(height),
                 self.swap_order_v1_active_at(height),
@@ -2126,6 +2146,7 @@ fn verify_transaction_signature(
     htlcv1_active: bool,
     mpsov1_active: bool,
     htlc_btc_swap_v1_active: bool,
+    btc_swap_bech32_payment_active: bool,
     htlc_ltc_swap_v1_active: bool,
     htlc_doge_swap_v1_active: bool,
     swap_order_v1_active: bool,
@@ -2379,6 +2400,22 @@ fn verify_transaction_signature(
                                     pays = true;
                                 }
                             }
+                            BtcOutputScript::P2wpkh(pkh) => {
+                                // Native-SegWit P2WPKH payment. Both forms
+                                // encode HASH160(pubkey), so the same
+                                // `btc_recipient_pkh` comparison applies —
+                                // only the on-chain script shape differs.
+                                // Acceptance is gated by the bech32 payment
+                                // relaxation; pre-activation this branch
+                                // never sets `pays`, preserving the strict
+                                // P2PKH-only rule.
+                                if btc_swap_bech32_payment_active
+                                    && *pkh == swap.btc_recipient_pkh
+                                    && o.value >= swap.btc_amount_sats
+                                {
+                                    pays = true;
+                                }
+                            }
                             BtcOutputScript::OpReturn(data) => {
                                 if data == &expected_payload {
                                     if op_return_vout.is_some() {
@@ -2496,6 +2533,20 @@ fn verify_transaction_signature(
                     for o in &outs {
                         match &o.script {
                             BtcOutputScript::P2pkh(pkh) => {
+                                if *pkh == swap.ltc_recipient_pkh
+                                    && o.value >= swap.ltc_amount_sats
+                                {
+                                    pays = true;
+                                }
+                            }
+                            BtcOutputScript::P2wpkh(pkh) => {
+                                // LTC native-SegWit P2WPKH payment. No
+                                // separate gate: the LTC swap claim path
+                                // itself ships disabled today
+                                // (`htlc_ltc_swap_v1_active` already
+                                // returned at function entry), and its
+                                // initial mainnet activation will land
+                                // with bech32 acceptance on day one.
                                 if *pkh == swap.ltc_recipient_pkh
                                     && o.value >= swap.ltc_amount_sats
                                 {
@@ -2624,6 +2675,14 @@ fn verify_transaction_signature(
                                 {
                                     pays = true;
                                 }
+                            }
+                            BtcOutputScript::P2wpkh(_) => {
+                                // Dogecoin never activated SegWit on
+                                // mainnet; native-SegWit outputs do not
+                                // appear in live DOGE txs. This arm
+                                // exists only to keep `BtcOutputScript`
+                                // exhaustive after the BTC swap bech32
+                                // relaxation extended the enum.
                             }
                             BtcOutputScript::OpReturn(data) => {
                                 if data == &expected_payload {
@@ -3302,6 +3361,7 @@ mod tests {
             ltc_spv: None,
             doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
@@ -3385,6 +3445,7 @@ mod tests {
             ltc_spv: None,
             doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
@@ -4099,6 +4160,7 @@ mod tests {
             ltc_spv: None,
             doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
@@ -4356,6 +4418,7 @@ mod tests {
             ltc_spv: None,
             doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
+            btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,

@@ -12,6 +12,11 @@ sha2 = "0.10"
 hmac = "0.12"
 ripemd = "0.1"
 bs58 = "0.4"
+# Bech32 BIP173 decoder used by HtlcBtcSwapV1 / HtlcLtcSwapV1 to accept
+# native-SegWit P2WPKH addresses (bc1q.../ltc1q...) in addition to legacy
+# P2PKH. Consensus rule relaxation gated by
+# btc_swap_bech32_payment_activation_height in ChainParams.
+bech32 = "0.11"
 num-bigint = "0.4"
 num-traits = "0.2"
 chrono = { version = "0.4", features = ["clock"] }
