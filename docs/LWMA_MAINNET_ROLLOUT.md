@@ -13,7 +13,12 @@ This change introduces a height-gated consensus upgrade for difficulty adjustmen
 ## Exact Formula
 
 Let:
-- `T = BLOCK_TARGET_INTERVAL`
+- `T = block_target_interval(target_height)` — height-aware: returns
+  `BLOCK_TARGET_INTERVAL_V1` (600 s) below the block-time V2 fork height,
+  `BLOCK_TARGET_INTERVAL_V2` (120 s) at or above it. Historical LWMA
+  output below the fork is bit-for-bit unchanged because the V1 branch
+  reproduces the original constant value. See
+  `docs/block_time_v2_activation.md` for the V2 fork details.
 - `N = LWMA_WINDOW`
 - `solvetime_i = clamp(time_i - time_{i-1}, 1, 6*T)`
 - `weight_i = i` for `i = 1..N`

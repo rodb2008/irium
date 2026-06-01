@@ -20,6 +20,31 @@ pub const MAINNET_LWMA_ACTIVATION_HEIGHT: Option<u64> = Some(16_462);
 /// Historical consensus before this height is unaffected.
 pub const MAINNET_LWMA_V2_ACTIVATION_HEIGHT: Option<u64> = Some(19_740);
 
+/// Mainnet block-time V2 activation height (T 600s → 120s + halving rescale).
+///
+/// `None` keeps the chain on the V1 protocol target T=600s and the V1
+/// halving interval 210_000. When set to `Some(<height>)`, two coupled
+/// changes take effect at that height:
+///   1. The LWMA expected-time / solvetime clamp drops to T=120s
+///      (`BLOCK_TARGET_INTERVAL_V2`).
+///   2. The halving interval rescales from 210_000 to 1_050_000
+///      (`HALVING_INTERVAL_V2 = 5 × V1`) to preserve a roughly four-year
+///      halving calendar at the new T.
+///
+/// The two-leg coupling is intentional: changing T without rescaling
+/// HALVING_INTERVAL would compress the emission curve 5×; rescaling
+/// without changing T is meaningless. Both flip atomically at this
+/// height.
+///
+/// Ships disabled. Mainnet activation requires a dedicated commit per
+/// docs/htlcv1_activation_commit_workflow.md. Pre-fork chain history is
+/// bit-for-bit unchanged: the `block_target_interval(height)` and
+/// `halving_count(height)` accessors in `constants.rs` return V1 values
+/// for every `height < activation`, and the cumulative `halving_count`
+/// formula is continuous across the fork boundary
+/// (`halving_count(F) == halving_count(F+1)`).
+pub const MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT: Option<u64> = None;
+
 /// Mainnet AuxPoW merged-mining activation height.
 ///
 /// At this height the chain begins accepting blocks that carry a Namecoin
@@ -342,6 +367,27 @@ pub fn resolved_auxpow_activation_height(network: NetworkKind) -> Option<u64> {
     match network {
         NetworkKind::Mainnet => MAINNET_AUXPOW_ACTIVATION_HEIGHT,
         NetworkKind::Testnet | NetworkKind::Devnet => runtime_auxpow_env_override(),
+    }
+}
+
+/// Devnet/testnet override for the block-time V2 activation height.
+/// Read from `IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT`. Ignored on mainnet,
+/// which uses `MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT`.
+pub fn runtime_block_time_v2_env_override() -> Option<u64> {
+    env::var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// Resolves the block-time V2 activation height for the running network.
+/// Read by `constants.rs::block_target_interval(height)` and
+/// `constants.rs::halving_count(height)` so the V1→V2 switch is
+/// network-aware without threading ChainParams through every caller of
+/// `block_reward(height)`.
+pub fn resolved_block_time_v2_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT,
+        NetworkKind::Testnet | NetworkKind::Devnet => runtime_block_time_v2_env_override(),
     }
 }
 
@@ -674,6 +720,40 @@ mod tests {
             Some(1000)
         );
         std::env::remove_var("IRIUM_AUXPOW_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn mainnet_block_time_v2_height_is_none_pending_governance() {
+        assert!(
+            MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT.is_none(),
+            "Block-time V2 must stay disabled on mainnet until governance flips this constant"
+        );
+        assert!(resolved_block_time_v2_activation_height(NetworkKind::Mainnet).is_none());
+    }
+
+    #[test]
+    fn mainnet_ignores_block_time_v2_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT", "12345");
+        let resolved = resolved_block_time_v2_activation_height(NetworkKind::Mainnet);
+        std::env::remove_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT");
+        assert_eq!(resolved, MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn non_mainnet_uses_block_time_v2_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT", "75");
+        assert_eq!(
+            resolved_block_time_v2_activation_height(NetworkKind::Devnet),
+            Some(75)
+        );
+        assert_eq!(
+            resolved_block_time_v2_activation_height(NetworkKind::Testnet),
+            Some(75)
+        );
+        std::env::remove_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT");
     }
 
     #[test]

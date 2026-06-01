@@ -1,8 +1,29 @@
 #![allow(dead_code)]
 // Consensus and economic constants for Irium mainnet (Rust mirror of constants.py)
 
+use crate::activation::{network_kind_from_env, resolved_block_time_v2_activation_height};
+
 pub const MAX_MONEY: u64 = 100_000_000 * 100_000_000; // 1e8 * 1e8 sat-equivalent
-pub const BLOCK_TARGET_INTERVAL: u64 = 600; // seconds
+
+/// Pre-V2 protocol block-time target (seconds).
+///
+/// Used unconditionally for every height below the block-time V2 activation
+/// height. Legacy difficulty retargets (pre-LWMA codepath) and historical
+/// LWMA windows reference this value directly: at the V2 activation height
+/// the LWMA expected-time/clamp arithmetic switches to
+/// `BLOCK_TARGET_INTERVAL_V2`, but anything below the fork height continues
+/// to compute against this constant, so historical consensus is unaffected.
+pub const BLOCK_TARGET_INTERVAL_V1: u64 = 600;
+
+/// Post-V2 protocol block-time target (seconds).
+///
+/// Takes effect at heights at or above `MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT`
+/// (mainnet) or the matching devnet env override. Coupled with
+/// `HALVING_INTERVAL_V2`: when the block time shrinks 5×, the halving
+/// interval expands 5× so the emission calendar stays roughly four years
+/// per halving.
+pub const BLOCK_TARGET_INTERVAL_V2: u64 = 120;
+
 pub const DIFFICULTY_RETARGET_INTERVAL: u64 = 2016; // blocks
 pub const MAX_FUTURE_BLOCK_TIME: i64 = 7200; // 2 hours
 pub const COINBASE_MATURITY: u64 = 100; // blocks
@@ -14,18 +35,86 @@ pub const LWMA_MIN_DIFFICULTY_FLOOR: u64 = 1; // 1 disables any stricter post-ac
 
 #[allow(dead_code)]
 const INITIAL_SUBSIDY: u64 = 50 * 100_000_000; // 50 IRM in sat-equivalent
-#[allow(dead_code)]
-const HALVING_INTERVAL: u64 = 210_000; // blocks
+
+/// Pre-V2 halving interval (blocks).
+///
+/// Bitcoin-style 210_000-block epochs. At the original T=600s design, this
+/// yields a ~four-year halving calendar. Used for every halving epoch whose
+/// boundary falls at or below the block-time V2 activation height.
+pub const HALVING_INTERVAL_V1: u64 = 210_000;
+
+/// Post-V2 halving interval (blocks).
+///
+/// Set to 5 × V1 so that at T=120s the calendar between halvings stays at
+/// roughly four years (1_050_000 × 120s ≈ 9.6 months per halving in nominal
+/// terms — actual cadence depends on observed block time, but the protocol
+/// target matches the original four-year intent at the new T).
+///
+/// The cumulative `halving_count(height)` formula stitches V1 and V2 epochs
+/// together so the per-block reward curve is continuous across the fork
+/// boundary: the halving count at `fork_height` equals the count at
+/// `fork_height + 1`.
+pub const HALVING_INTERVAL_V2: u64 = 1_050_000;
+
+/// Returns the block-time V2 activation height for the running network
+/// (env-derived on devnet/testnet, code-constant on mainnet). Returns
+/// `None` when V2 is disabled, in which case `block_target_interval` and
+/// `halving_count` fall through to the V1-only formulas.
+fn resolved_block_time_v2_fork_height() -> Option<u64> {
+    resolved_block_time_v2_activation_height(network_kind_from_env())
+}
+
+/// Returns the protocol block-time target (seconds) effective at `height`.
+///
+/// Below the V2 fork height (or whenever V2 is disabled): returns
+/// `BLOCK_TARGET_INTERVAL_V1` (600). At/above the V2 fork height: returns
+/// `BLOCK_TARGET_INTERVAL_V2` (120). LWMA consensus reads this at every
+/// expected-time / solvetime-clamp computation so the same chain.rs code
+/// path serves both eras without forking the LWMA implementation.
+pub fn block_target_interval(height: u64) -> u64 {
+    match resolved_block_time_v2_fork_height() {
+        Some(fork) if height >= fork => BLOCK_TARGET_INTERVAL_V2,
+        _ => BLOCK_TARGET_INTERVAL_V1,
+    }
+}
+
+/// Returns the number of halvings that have occurred by `height`.
+///
+/// Cumulative across the V2 fork boundary: pre-fork halvings are counted
+/// against `HALVING_INTERVAL_V1`, post-fork blocks add halvings against
+/// `HALVING_INTERVAL_V2`. The split ensures the reward curve is continuous
+/// at the boundary — `halving_count(F) == halving_count(F+1)`.
+///
+/// The `(height - fork - 1) / V2` form on the post-fork branch matches the
+/// V1 convention `(height - 1) / V1`, where the k-th halving occurs at
+/// height `k * V1 + 1` (subsidy stays at the previous level THROUGH
+/// `k * V1`, then halves at `k * V1 + 1`). Without the `- 1`, the first
+/// post-fork halving would land one block early relative to the V1
+/// analogue.
+pub fn halving_count(height: u64) -> u64 {
+    if height == 0 {
+        return 0;
+    }
+    match resolved_block_time_v2_fork_height() {
+        Some(fork) if height > fork => {
+            let pre = if fork == 0 {
+                0
+            } else {
+                (fork - 1) / HALVING_INTERVAL_V1
+            };
+            let post = (height - fork - 1) / HALVING_INTERVAL_V2;
+            pre + post
+        }
+        _ => (height - 1) / HALVING_INTERVAL_V1,
+    }
+}
 
 #[allow(dead_code)]
 pub fn block_reward(height: u64) -> u64 {
     if height == 0 {
         return 0;
     }
-    if HALVING_INTERVAL == 0 {
-        return INITIAL_SUBSIDY;
-    }
-    let halvings = (height - 1) / HALVING_INTERVAL;
+    let halvings = halving_count(height);
     if halvings >= 64 {
         return 0;
     }
@@ -74,5 +163,177 @@ pub fn coinbase_maturity() -> u64 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(5),
         _ => COINBASE_MATURITY,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// With V2 disabled (env unset on non-mainnet, `None` on mainnet),
+    /// `block_target_interval` must return V1=600 for every height —
+    /// matching the original `BLOCK_TARGET_INTERVAL: u64 = 600` semantics
+    /// byte-for-byte.
+    #[test]
+    fn block_target_interval_returns_v1_when_v2_disabled() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK"); // mainnet default
+        assert_eq!(block_target_interval(0), BLOCK_TARGET_INTERVAL_V1);
+        assert_eq!(block_target_interval(1), BLOCK_TARGET_INTERVAL_V1);
+        assert_eq!(block_target_interval(24_059), BLOCK_TARGET_INTERVAL_V1);
+        assert_eq!(block_target_interval(1_000_000), BLOCK_TARGET_INTERVAL_V1);
+    }
+
+    /// With V2 enabled at a devnet fork height, `block_target_interval`
+    /// returns V1 below the fork and V2 at-or-above, with the boundary
+    /// landing on the fork height itself.
+    #[test]
+    fn block_target_interval_is_v1_pre_fork_v2_post_fork() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Use "testnet", not "devnet": the chain.rs LWMA/legacy retarget
+        // functions short-circuit to pow_limit when IRIUM_NETWORK is
+        // devnet|regtest, which would corrupt parallel-running chain tests
+        // that don't expect that shortcut.
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT", "100");
+
+        assert_eq!(block_target_interval(0), BLOCK_TARGET_INTERVAL_V1);
+        assert_eq!(block_target_interval(99), BLOCK_TARGET_INTERVAL_V1);
+        assert_eq!(block_target_interval(100), BLOCK_TARGET_INTERVAL_V2);
+        assert_eq!(block_target_interval(101), BLOCK_TARGET_INTERVAL_V2);
+        assert_eq!(block_target_interval(10_000), BLOCK_TARGET_INTERVAL_V2);
+
+        std::env::remove_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    /// `halving_count(F) == halving_count(F+1)` — the post-V2 branch must
+    /// pick up exactly where the pre-V2 branch left off, so the reward
+    /// curve stays continuous through the fork.
+    #[test]
+    fn halving_count_is_continuous_across_fork() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Use "testnet", not "devnet": the chain.rs LWMA/legacy retarget
+        // functions short-circuit to pow_limit when IRIUM_NETWORK is
+        // devnet|regtest, which would corrupt parallel-running chain tests
+        // that don't expect that shortcut.
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+
+        for fork in [1u64, 100, 30_000, 210_000, 210_001, 250_000, 419_999, 420_000] {
+            std::env::set_var(
+                "IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT",
+                fork.to_string(),
+            );
+            assert_eq!(
+                halving_count(fork),
+                halving_count(fork + 1),
+                "halving_count must be continuous across fork at height {fork}"
+            );
+        }
+
+        std::env::remove_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    /// `block_reward(F) == block_reward(F+1)` follows directly from
+    /// `halving_count` continuity; pin it as its own regression so a
+    /// future refactor of `block_reward` can't silently re-introduce a
+    /// discontinuity.
+    #[test]
+    fn block_reward_is_continuous_across_fork() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Use "testnet", not "devnet": the chain.rs LWMA/legacy retarget
+        // functions short-circuit to pow_limit when IRIUM_NETWORK is
+        // devnet|regtest, which would corrupt parallel-running chain tests
+        // that don't expect that shortcut.
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+
+        for fork in [1u64, 100, 30_000, 210_000, 210_001, 250_000] {
+            std::env::set_var(
+                "IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT",
+                fork.to_string(),
+            );
+            assert_eq!(
+                block_reward(fork),
+                block_reward(fork + 1),
+                "block_reward must be continuous across fork at height {fork}"
+            );
+        }
+
+        std::env::remove_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    /// With the V2 fork at a small height and the reward last halved at
+    /// pre-fork height H1, the next halving must occur exactly
+    /// `HALVING_INTERVAL_V2` blocks past the fork (not at the V1 cadence).
+    #[test]
+    fn block_reward_post_fork_halves_after_v2_interval_blocks() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Use "testnet", not "devnet": the chain.rs LWMA/legacy retarget
+        // functions short-circuit to pow_limit when IRIUM_NETWORK is
+        // devnet|regtest, which would corrupt parallel-running chain tests
+        // that don't expect that shortcut.
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let fork = 30_000u64;
+        std::env::set_var(
+            "IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT",
+            fork.to_string(),
+        );
+
+        // No halvings yet at the fork (we are well before V1's first
+        // halving at 210_000, and V2 hasn't accrued any blocks yet).
+        assert_eq!(block_reward(fork), INITIAL_SUBSIDY);
+        assert_eq!(block_reward(fork + 1), INITIAL_SUBSIDY);
+
+        // First post-fork halving lands HALVING_INTERVAL_V2 blocks past
+        // the fork.
+        let first_post_halving = fork + HALVING_INTERVAL_V2;
+        assert_eq!(block_reward(first_post_halving), INITIAL_SUBSIDY);
+        assert_eq!(block_reward(first_post_halving + 1), INITIAL_SUBSIDY >> 1);
+
+        // Second post-fork halving another HALVING_INTERVAL_V2 blocks on.
+        let second_post_halving = fork + 2 * HALVING_INTERVAL_V2;
+        assert_eq!(block_reward(second_post_halving + 1), INITIAL_SUBSIDY >> 2);
+
+        std::env::remove_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    /// Regression: with the V2 fork disabled (mainnet ships this way),
+    /// `block_reward` must reproduce the classic curve exactly at the
+    /// pre-change halving epoch boundaries.
+    #[test]
+    fn block_reward_when_fork_is_none_is_classic_curve() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+
+        assert_eq!(block_reward(0), 0);
+        assert_eq!(block_reward(1), INITIAL_SUBSIDY);
+        assert_eq!(block_reward(HALVING_INTERVAL_V1), INITIAL_SUBSIDY);
+        assert_eq!(block_reward(HALVING_INTERVAL_V1 + 1), INITIAL_SUBSIDY >> 1);
+        assert_eq!(block_reward(2 * HALVING_INTERVAL_V1), INITIAL_SUBSIDY >> 1);
+        assert_eq!(block_reward(2 * HALVING_INTERVAL_V1 + 1), INITIAL_SUBSIDY >> 2);
+        assert_eq!(block_reward(3 * HALVING_INTERVAL_V1 + 1), INITIAL_SUBSIDY >> 3);
     }
 }

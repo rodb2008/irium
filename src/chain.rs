@@ -29,10 +29,11 @@ use crate::doge_spv::{
     MAX_DOGE_HEADER_BATCH_BYTES,
 };
 use crate::constants::{
-    block_reward, coinbase_maturity, BLOCK_TARGET_INTERVAL, COINBASE_MATURITY, DIFFICULTY_RETARGET_INTERVAL,
-    LWMA_MAX_TARGET_DOWN_FACTOR, LWMA_MAX_TARGET_UP_FACTOR, LWMA_MIN_DIFFICULTY_FLOOR,
-    LWMA_SOLVETIME_CLAMP_FACTOR, LWMA_V2_MAX_TARGET_DOWN_FACTOR, LWMA_V2_MAX_TARGET_UP_FACTOR,
-    LWMA_V2_SOLVETIME_CLAMP_FACTOR, LWMA_V2_WINDOW, LWMA_WINDOW, MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
+    block_reward, block_target_interval, coinbase_maturity, BLOCK_TARGET_INTERVAL_V1,
+    COINBASE_MATURITY, DIFFICULTY_RETARGET_INTERVAL, LWMA_MAX_TARGET_DOWN_FACTOR,
+    LWMA_MAX_TARGET_UP_FACTOR, LWMA_MIN_DIFFICULTY_FLOOR, LWMA_SOLVETIME_CLAMP_FACTOR,
+    LWMA_V2_MAX_TARGET_DOWN_FACTOR, LWMA_V2_MAX_TARGET_UP_FACTOR, LWMA_V2_SOLVETIME_CLAMP_FACTOR,
+    LWMA_V2_WINDOW, LWMA_WINDOW, MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
 };
 use crate::genesis::LockedGenesis;
 use crate::pow::{meets_target, min_difficulty_target, sha256d, Target};
@@ -97,12 +98,20 @@ fn block_store_window() -> u64 {
 }
 
 /// Chain parameters for the Irium mainnet.
+///
+/// `solvetime_clamp_factor` replaces the previously-precomputed
+/// `max_solvetime: u64` field. The clamp ceiling is now derived at use time
+/// as `solvetime_clamp_factor × block_target_interval(target_height)`, so
+/// the LWMA window correctly scales when the height crosses the block-time
+/// V2 fork boundary. The two constructors continue to take
+/// `(activation_height, pow_limit)` so every existing `ChainParams { ... }`
+/// site compiles unchanged.
 #[derive(Debug, Clone, Copy)]
 pub struct LwmaParams {
     pub activation_height: Option<u64>,
     pub window: u64,
     pub min_solvetime: u64,
-    pub max_solvetime: u64,
+    pub solvetime_clamp_factor: u64,
     pub max_target_up_factor: u64,
     pub max_target_down_factor: u64,
     pub max_target: Target,
@@ -114,7 +123,7 @@ impl LwmaParams {
             activation_height,
             window: LWMA_WINDOW,
             min_solvetime: 1,
-            max_solvetime: BLOCK_TARGET_INTERVAL.saturating_mul(LWMA_SOLVETIME_CLAMP_FACTOR),
+            solvetime_clamp_factor: LWMA_SOLVETIME_CLAMP_FACTOR,
             max_target_up_factor: LWMA_MAX_TARGET_UP_FACTOR,
             max_target_down_factor: LWMA_MAX_TARGET_DOWN_FACTOR,
             max_target: min_difficulty_target(pow_limit, LWMA_MIN_DIFFICULTY_FLOOR),
@@ -129,11 +138,22 @@ impl LwmaParams {
             activation_height,
             window: LWMA_V2_WINDOW,
             min_solvetime: 1,
-            max_solvetime: BLOCK_TARGET_INTERVAL.saturating_mul(LWMA_V2_SOLVETIME_CLAMP_FACTOR),
+            solvetime_clamp_factor: LWMA_V2_SOLVETIME_CLAMP_FACTOR,
             max_target_up_factor: LWMA_V2_MAX_TARGET_UP_FACTOR,
             max_target_down_factor: LWMA_V2_MAX_TARGET_DOWN_FACTOR,
             max_target: min_difficulty_target(pow_limit, LWMA_MIN_DIFFICULTY_FLOOR),
         }
+    }
+
+    /// LWMA solvetime ceiling at `target_height`. Multiplies the per-version
+    /// clamp factor by `block_target_interval(target_height)` so the ceiling
+    /// is V1=6×600=3600s (v1) / V1=10×600=6000s (v2) pre-fork and
+    /// V2=6×120=720s / V2=10×120=1200s post-fork. Per-block step clamps
+    /// (max_target_up_factor / max_target_down_factor) are NOT scaled — they
+    /// are ratio clamps, not time clamps.
+    pub fn max_solvetime_at(&self, target_height: u64) -> u64 {
+        self.solvetime_clamp_factor
+            .saturating_mul(block_target_interval(target_height))
     }
 }
 
@@ -372,11 +392,6 @@ impl ChainState {
         state
     }
 
-    #[allow(dead_code)]
-    pub fn expected_time(&self, height: u64) -> u64 {
-        height * BLOCK_TARGET_INTERVAL
-    }
-
     pub fn tip_height(&self) -> u64 {
         self.height.saturating_sub(1)
     }
@@ -525,9 +540,13 @@ impl ChainState {
         }
     }
 
-    /// Convenience wrapper: compute LWMA target using v1 parameters.
-    fn lwma_target_for_height(&self) -> Target {
-        self.lwma_target_for_height_with(&self.params.lwma)
+    /// Convenience wrapper: compute LWMA target using v1 parameters at
+    /// `target_height`. Threads `target_height` into the underlying
+    /// implementation so the LWMA expected-time / solvetime clamp uses the
+    /// height-aware `block_target_interval(target_height)` for blocks that
+    /// land at or past the block-time V2 fork.
+    fn lwma_target_for_height(&self, target_height: u64) -> Target {
+        self.lwma_target_for_height_with(&self.params.lwma, target_height)
     }
 
     fn lwma_active_at(&self, height: u64) -> bool {
@@ -661,7 +680,14 @@ impl ChainState {
         let prev_block = &self.chain[prev_index];
 
         let actual_time = (last_block.header.time as i64) - (prev_block.header.time as i64);
-        let mut expected_time = (DIFFICULTY_RETARGET_INTERVAL * BLOCK_TARGET_INTERVAL) as i64;
+        // Legacy 2016-block retarget. On live mainnet this codepath is dead
+        // (LWMA activated at h=16_462, so legacy retarget heights 2016/4032
+        // never reach this branch in practice — pre-LWMA blocks took the
+        // `height < INTERVAL || height % INTERVAL != 0` early return above).
+        // Pre-LWMA heights are all far below any future block-time V2 fork,
+        // so we hardcode `BLOCK_TARGET_INTERVAL_V1` here for clarity and to
+        // freeze the historical formula.
+        let mut expected_time = (DIFFICULTY_RETARGET_INTERVAL * BLOCK_TARGET_INTERVAL_V1) as i64;
         if expected_time <= 0 {
             expected_time = 1;
         }
@@ -700,7 +726,7 @@ impl ChainState {
     ///
     /// All arithmetic is integer-only and deterministic. Compact bits encoding
     /// is used only at the boundaries.
-    fn lwma_target_for_height_with(&self, params: &LwmaParams) -> Target {
+    fn lwma_target_for_height_with(&self, params: &LwmaParams, target_height: u64) -> Target {
         // Devnet/regtest fast-mining override: return a near-maximum target so
         // commodity CPU mining finds blocks effectively instantly. Skip for
         // height 0 - the genesis block keeps its locked bits; otherwise
@@ -723,6 +749,14 @@ impl ChainState {
             return last_block.header.target();
         }
 
+        // Height-aware protocol target. Pre-V2-fork heights resolve to
+        // BLOCK_TARGET_INTERVAL_V1=600; at/past the fork they resolve to
+        // BLOCK_TARGET_INTERVAL_V2=120. Both the solvetime clamp ceiling
+        // and the LWMA expected-time scale from the same value, keeping
+        // the algorithm self-consistent across the fork boundary.
+        let target_t = block_target_interval(target_height);
+        let max_solvetime = params.max_solvetime_at(target_height);
+
         let start = self.chain.len() - sample_count;
         let mut weighted_solvetimes = 0u128;
         let mut weight_total = 0u128;
@@ -736,7 +770,7 @@ impl ChainState {
                 .time
                 .saturating_sub(previous.header.time)
                 .max(params.min_solvetime as u32) as u64;
-            let solvetime = raw_solvetime.min(params.max_solvetime);
+            let solvetime = raw_solvetime.min(max_solvetime);
             let weight = (offset as u128) + 1;
             weighted_solvetimes += weight * u128::from(solvetime);
             weight_total += weight;
@@ -749,7 +783,7 @@ impl ChainState {
         }
 
         let observed = BigUint::from(weighted_solvetimes.max(1));
-        let expected = BigUint::from((BLOCK_TARGET_INTERVAL as u128) * weight_total);
+        let expected = BigUint::from((target_t as u128) * weight_total);
         let mut next_target = avg_target * observed;
         next_target /= expected;
         if next_target.is_zero() {
@@ -798,15 +832,17 @@ impl ChainState {
             return legacy_target;
         }
 
-        // Use LWMA v2 params if active; otherwise fall back to v1.
+        // Use LWMA v2 params if active; otherwise fall back to v1. Both
+        // arms thread `height` through so the LWMA expected-time and
+        // solvetime clamp see the height-aware protocol target.
         let (lwma_target, version) = if self.lwma_v2_active_at(height) {
             let v2 = self
                 .params
                 .lwma_v2
                 .expect("lwma_v2 must be Some when v2 is active");
-            (self.lwma_target_for_height_with(&v2), 2u8)
+            (self.lwma_target_for_height_with(&v2, height), 2u8)
         } else {
-            (self.lwma_target_for_height(), 1u8)
+            (self.lwma_target_for_height(height), 1u8)
         };
 
         if Self::lwma_trace_enabled() {
@@ -3497,7 +3533,10 @@ mod tests {
         }
         let prev_block = &chain.chain[chain.chain.len() - interval];
         let actual_time = (last_block.header.time as i64) - (prev_block.header.time as i64);
-        let mut expected_time = (DIFFICULTY_RETARGET_INTERVAL * BLOCK_TARGET_INTERVAL) as i64;
+        // Test mirror of the production legacy retarget. Same V1-hardcoded
+        // rationale: legacy retarget heights are all pre-LWMA and thus
+        // well below any future block-time V2 fork.
+        let mut expected_time = (DIFFICULTY_RETARGET_INTERVAL * BLOCK_TARGET_INTERVAL_V1) as i64;
         if expected_time <= 0 {
             expected_time = 1;
         }
@@ -3881,7 +3920,7 @@ mod tests {
         let mut chain = difficulty_chain(Some(30_000), 0x207fffff);
         let mut time = chain.chain[0].header.time;
         for _ in 1..DIFFICULTY_RETARGET_INTERVAL {
-            time += (BLOCK_TARGET_INTERVAL * 2) as u32;
+            time += (BLOCK_TARGET_INTERVAL_V1 * 2) as u32;
             push_synthetic_block(&mut chain, time, 0x207fffff);
         }
 
@@ -3899,7 +3938,7 @@ mod tests {
         let mut time = chain.chain[0].header.time;
         for i in 1..activation {
             time += if i < 60 {
-                BLOCK_TARGET_INTERVAL as u32
+                BLOCK_TARGET_INTERVAL_V1 as u32
             } else {
                 60
             };
@@ -3912,7 +3951,7 @@ mod tests {
         );
         assert_eq!(
             chain.target_for_height(activation),
-            chain.lwma_target_for_height()
+            chain.lwma_target_for_height(activation)
         );
     }
 
@@ -3993,9 +4032,9 @@ mod tests {
         let mut time_a = clamped.chain[0].header.time;
         for i in 1..activation {
             time_a += if i == activation - 1 {
-                (BLOCK_TARGET_INTERVAL * 6) as u32
+                (BLOCK_TARGET_INTERVAL_V1 * 6) as u32
             } else {
-                BLOCK_TARGET_INTERVAL as u32
+                BLOCK_TARGET_INTERVAL_V1 as u32
             };
             push_synthetic_block(&mut clamped, time_a, 0x207fffff);
         }
@@ -4006,7 +4045,7 @@ mod tests {
             time_b += if i == activation - 1 {
                 200_000
             } else {
-                BLOCK_TARGET_INTERVAL as u32
+                BLOCK_TARGET_INTERVAL_V1 as u32
             };
             push_synthetic_block(&mut spiked, time_b, 0x207fffff);
         }
@@ -4026,7 +4065,7 @@ mod tests {
             time_a += if i == activation - 1 {
                 1
             } else {
-                BLOCK_TARGET_INTERVAL as u32
+                BLOCK_TARGET_INTERVAL_V1 as u32
             };
             push_synthetic_block(&mut monotonic, time_a, 0x207fffff);
         }
@@ -4037,7 +4076,7 @@ mod tests {
             if i == activation - 1 {
                 time_b = time_b.saturating_sub(500);
             } else {
-                time_b += BLOCK_TARGET_INTERVAL as u32;
+                time_b += BLOCK_TARGET_INTERVAL_V1 as u32;
             }
             push_synthetic_block(&mut non_monotonic, time_b, 0x207fffff);
         }
@@ -4395,6 +4434,152 @@ mod tests {
         assert!(
             t_19741.to_target() >= lo && t_19741.to_target() <= hi,
             "target at 19741 must not jump more than 4x from prior block:              19739={} 19741={}", t_19739.bits, t_19741.bits
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Block-time V2 fork tests (T 600 -> 120, halving rescale 210k -> 1.05M)
+    //
+    // The protocol target T is height-aware via
+    // constants::block_target_interval(height). All other LwmaParams fields
+    // (window, clamp factors, step factors, max_target) are unchanged across
+    // the fork — only the solvetime clamp ceiling and the LWMA expected-time
+    // scale with T. These tests exercise the boundary inside the LWMA
+    // codepath that handles both eras with a single implementation.
+    // -----------------------------------------------------------------------
+
+    use std::sync::{Mutex as StdMutex, OnceLock, PoisonError};
+
+    fn block_time_v2_env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    /// `IRIUM_NETWORK=testnet` is used here (not "devnet") because
+    /// `legacy_target_for_height` and `lwma_target_for_height_with` both
+    /// short-circuit to `pow_limit` when `IRIUM_NETWORK == devnet | regtest`
+    /// for fast CPU mining on dev networks. That shortcut would mask the
+    /// LWMA boundary math these tests are trying to exercise. Testnet keeps
+    /// the env-overridable activation height resolver without triggering
+    /// the fast-mining shortcut.
+    fn set_block_time_v2_fork(fork: u64) {
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var(
+            "IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT",
+            fork.to_string(),
+        );
+    }
+
+    fn clear_block_time_v2_fork() {
+        std::env::remove_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn block_time_v2_clamp_uses_v1_below_fork_v2_above() {
+        // Construct LwmaParams once (no env active during construction; the
+        // solvetime ceiling is computed at use time, not at construction
+        // time). Then set the env and confirm `max_solvetime_at` picks V1
+        // below the fork and V2 at/above it.
+        let _guard = block_time_v2_env_lock()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        clear_block_time_v2_fork();
+
+        let pow_limit = Target { bits: 0x207fffff };
+        let v1_params = LwmaParams::new(Some(10), pow_limit);
+        let v2_params = LwmaParams::new_v2(Some(10), pow_limit);
+
+        set_block_time_v2_fork(100);
+
+        // V1 below fork: clamp = LWMA_SOLVETIME_CLAMP_FACTOR (6) * 600 = 3600s.
+        assert_eq!(v1_params.max_solvetime_at(99), 6 * 600);
+        // V1 at/above fork: 6 * 120 = 720s.
+        assert_eq!(v1_params.max_solvetime_at(100), 6 * 120);
+        assert_eq!(v1_params.max_solvetime_at(101), 6 * 120);
+
+        // V2 below fork: clamp = LWMA_V2_SOLVETIME_CLAMP_FACTOR (10) * 600 = 6000s.
+        assert_eq!(v2_params.max_solvetime_at(99), 10 * 600);
+        // V2 at/above fork: 10 * 120 = 1200s.
+        assert_eq!(v2_params.max_solvetime_at(100), 10 * 120);
+
+        clear_block_time_v2_fork();
+    }
+
+    #[test]
+    fn block_time_v2_lwma_target_changes_at_fork_boundary() {
+        // Build a chain with LWMA active early and produce a synthetic
+        // window of equal-interval blocks. With the V2 fork enabled at
+        // height H, computing target_for_height(H-1) and target_for_height(H)
+        // should reflect different protocol targets T inside the LWMA
+        // expected-time formula. The two results must differ when the
+        // observed solvetime is far from both T_V1 and T_V2 (i.e. the LWMA
+        // is not yet at equilibrium for either era).
+        let _guard = block_time_v2_env_lock()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        clear_block_time_v2_fork();
+
+        let activation = 10u64;
+        let fork = 100u64;
+        let mut chain = difficulty_chain(Some(activation), 0x207fffff);
+        let bits = synthetic_working_bits(&chain);
+
+        // 300s solvetimes — between V1 (600) and V2 (120). Pre-fork this
+        // is below-target (LWMA hardens); post-fork it is above-target
+        // (LWMA eases). So the post-fork target must be GREATER than the
+        // pre-fork target for the same observed history.
+        let mut time = chain.chain[0].header.time;
+        for _ in 1..fork {
+            time += 300;
+            push_synthetic_block(&mut chain, time, bits);
+        }
+
+        set_block_time_v2_fork(fork);
+        let t_at_fork = chain.target_for_height(fork).to_target();
+        clear_block_time_v2_fork();
+        let t_at_fork_v1 = chain.target_for_height(fork).to_target();
+
+        assert!(
+            t_at_fork > t_at_fork_v1,
+            "post-fork LWMA must yield a LARGER target (easier difficulty) than pre-fork for the same 300s observed history: pre={} post={}",
+            t_at_fork_v1, t_at_fork
+        );
+    }
+
+    #[test]
+    fn block_time_v2_disabled_preserves_pre_change_behavior() {
+        // Regression: with the V2 fork height left at None (mainnet ships
+        // this way), every LWMA target computation must be byte-identical
+        // to the pre-change implementation. We assert this indirectly by
+        // computing two equivalent chains and verifying their targets
+        // match — one with the env explicitly cleared, one with the env
+        // set to a height above any height we query.
+        let _guard = block_time_v2_env_lock()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
+        let activation = 10u64;
+        let mut chain_a = difficulty_chain(Some(activation), 0x207fffff);
+        let mut chain_b = difficulty_chain(Some(activation), 0x207fffff);
+        let bits = synthetic_working_bits(&chain_a);
+        let mut time = chain_a.chain[0].header.time;
+        for _ in 1..50 {
+            time += 600;
+            push_synthetic_block(&mut chain_a, time, bits);
+            push_synthetic_block(&mut chain_b, time, bits);
+        }
+
+        clear_block_time_v2_fork();
+        let t_a = chain_a.target_for_height(50);
+
+        set_block_time_v2_fork(10_000); // far above the heights we query
+        let t_b = chain_b.target_for_height(50);
+        clear_block_time_v2_fork();
+
+        assert_eq!(
+            t_a.bits, t_b.bits,
+            "V2 fork above queried heights must produce the same target as V2 disabled"
         );
     }
 
