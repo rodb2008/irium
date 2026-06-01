@@ -6137,8 +6137,20 @@ async fn wallet_send(
     let txid = tx.txid();
     let hex_txid = hex::encode(txid);
 
+    let raw_for_broadcast = raw.clone();
     let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
     if mempool.contains(&txid) {
+        // Duplicate of a tx already in our local mempool. Drop the lock,
+        // re-broadcast in case peers missed the first round, and tell the
+        // caller we didn't admit a new entry. Mirrors submit_tx.
+        drop(mempool);
+        if let Some(p2p) = state.p2p.clone() {
+            tokio::spawn(async move {
+                if let Err(e) = p2p.broadcast_tx(&raw_for_broadcast).await {
+                    eprintln!("wallet_send: rebroadcast_tx failed: {}", e);
+                }
+            });
+        }
         return Ok(Json(WalletSendResponse {
             txid: hex_txid,
             accepted: false,
@@ -6148,17 +6160,33 @@ async fn wallet_send(
         }));
     }
 
-    let accepted = match mempool.add_transaction(tx, raw, fee_checked) {
-        Ok(_) => true,
-        Err(e) => {
-            eprintln!("Failed to add tx to mempool: {}", e);
-            false
-        }
-    };
+    if let Err(e) = mempool.add_transaction(tx, raw, fee_checked) {
+        // Pre-fix this branch silently set `accepted: false` and returned
+        // 200 OK with a real-looking txid, so the desktop wallet reported
+        // "success" for txs the local mempool had actually rejected. Now
+        // we propagate the rejection so the GUI can show the actual
+        // reason (fee floor, dust, input conflict, etc.).
+        eprintln!("wallet_send: mempool reject reason={}", e);
+        return Err(bad(&format!("mempool_reject:{e}")));
+    }
+    drop(mempool);
+
+    // Broadcast the freshly admitted tx to peers so mining nodes actually
+    // see it. Mirrors submit_tx — pre-fix this call was missing, so wallet
+    // sends sat in the local iriumd's mempool forever, never reaching the
+    // mainnet nodes, and the GUI showed "success" but the tx never
+    // confirmed.
+    if let Some(p2p) = state.p2p.clone() {
+        tokio::spawn(async move {
+            if let Err(e) = p2p.broadcast_tx(&raw_for_broadcast).await {
+                eprintln!("wallet_send: broadcast_tx failed: {}", e);
+            }
+        });
+    }
 
     Ok(Json(WalletSendResponse {
         txid: hex_txid,
-        accepted,
+        accepted: true,
         fee: fee_checked,
         total_input: total,
         change,
