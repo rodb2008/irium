@@ -571,6 +571,23 @@ impl WalletManager {
         Ok(seed)
     }
 
+    /// Return the BIP39 mnemonic phrase stored in the unlocked wallet. Mirrors
+    /// `export_seed` — the wallet must be unlocked and must have a mnemonic
+    /// (WIF-imported or raw-seed-imported wallets carry no mnemonic and will
+    /// surface "no mnemonic stored in wallet"). The mnemonic is preserved
+    /// across encrypt/decrypt cycles via the WalletPlain.mnemonic field.
+    pub fn export_mnemonic(&mut self) -> Result<String, String> {
+        self.ensure_unlocked()?;
+        let mnemonic = self
+            .state
+            .unlocked
+            .as_ref()
+            .and_then(|w| w.mnemonic.clone())
+            .ok_or_else(|| "no mnemonic stored in wallet".to_string())?;
+        self.touch();
+        Ok(mnemonic)
+    }
+
     pub fn import_seed(&mut self, seed_hex: &str, force: bool) -> Result<WalletKey, String> {
         self.ensure_unlocked()?;
         let passphrase = self

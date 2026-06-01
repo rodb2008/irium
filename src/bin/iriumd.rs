@@ -1413,6 +1413,11 @@ struct WalletSeedResponse {
 }
 
 #[derive(Serialize)]
+struct WalletMnemonicResponse {
+    mnemonic: String,
+}
+
+#[derive(Serialize)]
 struct WalletImportSeedResponse {
     address: String,
 }
@@ -5814,6 +5819,25 @@ async fn wallet_export_seed(
     let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
     let seed_hex = wallet.export_seed().map_err(|_| StatusCode::BAD_REQUEST)?;
     Ok(Json(WalletSeedResponse { seed_hex }))
+}
+
+/// GET /wallet/export_mnemonic — returns the BIP39 mnemonic stored in the
+/// unlocked wallet. Mirrors `wallet_export_seed`: requires the wallet to be
+/// unlocked, returns 400 if locked OR if the wallet has no mnemonic (WIF-
+/// imported or raw-seed-imported wallets). Used by the desktop wallet's
+/// Reveal Recovery Phrase flow on encrypted wallets, which can't reach the
+/// plaintext mnemonic field via the CLI's file-direct path.
+async fn wallet_export_mnemonic(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WalletMnemonicResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let mnemonic = wallet.export_mnemonic().map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(WalletMnemonicResponse { mnemonic }))
 }
 
 async fn wallet_import_seed(
@@ -17858,6 +17882,7 @@ async fn explorer_stats(
         .route("/wallet/export_wif", get(wallet_export_wif))
         .route("/wallet/import_wif", post(wallet_import_wif))
         .route("/wallet/export_seed", get(wallet_export_seed))
+        .route("/wallet/export_mnemonic", get(wallet_export_mnemonic))
         .route("/wallet/import_seed", post(wallet_import_seed))
         .route("/wallet/send", post(wallet_send))
         .route("/explorer/agreements", get(explorer_agreements))
