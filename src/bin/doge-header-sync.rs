@@ -1,5 +1,14 @@
 //! DOGE header sync — periodic relay top-up.
 //!
+//! DEPRECATED in v1.9.48: header sync is now an internal iriumd
+//! background tokio task (see `src/header_sync/` and the
+//! `maybe_spawn_doge_header_sync` / `run_doge_header_sync_cycle`
+//! helpers in `src/bin/iriumd.rs`). New deployments rely on the
+//! integrated runner; this standalone binary is retained as a fallback
+//! and for one-shot manual top-ups during devnet testing. It will be
+//! removed in a later release once all production deployments have
+//! migrated.
+//!
 //! One-shot binary intended to run under a systemd timer every 10 minutes
 //! once activated, OR invoked directly during devnet end-to-end testing.
 //! Reads the current iriumd DOGE SPV relay tip, fetches new Dogecoin

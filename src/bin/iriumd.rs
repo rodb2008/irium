@@ -6206,20 +6206,21 @@ fn parse_btc_display_hash(s: &str) -> Result<[u8; 32], String> {
     Ok(natural)
 }
 
-async fn submit_btc_headers(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<SubmitBtcHeadersRequest>,
-) -> Result<Json<SubmitBtcHeadersResponse>, (StatusCode, String)> {
+/// Core implementation of `/rpc/submitbtcheaders` shared between the HTTP
+/// handler and the in-process header-sync background task. Skips auth +
+/// rate-limit checks; callers must apply those themselves at the transport
+/// boundary. `peer_ip` is propagated to the mempool's per-IP rate
+/// accounting; the background task should pass `None`, the HTTP handler
+/// passes the caller's source IP.
+async fn submit_btc_headers_core(
+    state: &AppState,
+    req: SubmitBtcHeadersRequest,
+    peer_ip: Option<IpAddr>,
+) -> Result<SubmitBtcHeadersResponse, (StatusCode, String)> {
     let bad = |reason: &str| -> (StatusCode, String) {
         eprintln!("[submit_btc_headers] reject reason={}", reason);
         (StatusCode::BAD_REQUEST, reason.to_string())
     };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
 
     {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -6392,14 +6393,15 @@ async fn submit_btc_headers(
         if !mempool.contains(&txid) {
             // BtcHeaderBatch carrier tx: ZeroFeeAllowed so a BTC-only
             // buyer can extend the relay before their claim. peer_ip is
-            // the caller's RPC source; loopback bypasses the rate limit
-            // so the local operator and Tauri client are unthrottled.
+            // None for the in-process background task and Some(addr.ip())
+            // for HTTP callers; loopback bypasses the rate limit so the
+            // local operator and Tauri client are unthrottled.
             match mempool.add_transaction_with_priority(
                 tx.clone(),
                 raw_tx.clone(),
                 fee_checked,
                 MempoolPriority::ZeroFeeAllowed,
-                Some(addr.ip()),
+                peer_ip,
             ) {
                 Ok(_) => accepted = true,
                 Err(e) => {
@@ -6409,7 +6411,7 @@ async fn submit_btc_headers(
         }
     }
 
-    Ok(Json(SubmitBtcHeadersResponse {
+    Ok(SubmitBtcHeadersResponse {
         txid: txid_hex,
         accepted,
         headers_count: header_count as u32,
@@ -6417,7 +6419,21 @@ async fn submit_btc_headers(
         new_tip_height: None,
         fee: fee_checked,
         raw_tx_hex: hex::encode(raw_tx),
-    }))
+    })
+}
+
+async fn submit_btc_headers(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SubmitBtcHeadersRequest>,
+) -> Result<Json<SubmitBtcHeadersResponse>, (StatusCode, String)> {
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    submit_btc_headers_core(&state, req, Some(addr.ip()))
+        .await
+        .map(Json)
 }
 
 async fn btc_relay_tip(
@@ -6642,20 +6658,16 @@ struct LtcHeaderResponse {
     on_canonical_chain: Option<bool>,
 }
 
-async fn submit_ltc_headers(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<SubmitLtcHeadersRequest>,
-) -> Result<Json<SubmitLtcHeadersResponse>, (StatusCode, String)> {
+/// Core implementation of `/rpc/submitltcheaders` — see `submit_btc_headers_core`
+/// for the design rationale (auth + rate limit live at the transport layer).
+async fn submit_ltc_headers_core(
+    state: &AppState,
+    req: SubmitLtcHeadersRequest,
+) -> Result<SubmitLtcHeadersResponse, (StatusCode, String)> {
     let bad = |reason: &str| -> (StatusCode, String) {
         eprintln!("[submit_ltc_headers] reject reason={}", reason);
         (StatusCode::BAD_REQUEST, reason.to_string())
     };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
 
     {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -6835,7 +6847,7 @@ async fn submit_ltc_headers(
         }
     }
 
-    Ok(Json(SubmitLtcHeadersResponse {
+    Ok(SubmitLtcHeadersResponse {
         txid: txid_hex,
         accepted,
         headers_count: header_count as u32,
@@ -6843,7 +6855,19 @@ async fn submit_ltc_headers(
         new_tip_height: None,
         fee: fee_checked,
         raw_tx_hex: hex::encode(raw_tx),
-    }))
+    })
+}
+
+async fn submit_ltc_headers(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SubmitLtcHeadersRequest>,
+) -> Result<Json<SubmitLtcHeadersResponse>, (StatusCode, String)> {
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    submit_ltc_headers_core(&state, req).await.map(Json)
 }
 
 async fn ltc_relay_tip(
@@ -6895,20 +6919,16 @@ async fn ltc_relay_tip(
     }))
 }
 
-async fn submit_doge_headers(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<SubmitDogeHeadersRequest>,
-) -> Result<Json<SubmitDogeHeadersResponse>, (StatusCode, String)> {
+/// Core implementation of `/rpc/submitdogeheaders` — see `submit_btc_headers_core`
+/// for the design rationale (auth + rate limit live at the transport layer).
+async fn submit_doge_headers_core(
+    state: &AppState,
+    req: SubmitDogeHeadersRequest,
+) -> Result<SubmitDogeHeadersResponse, (StatusCode, String)> {
     let bad = |reason: &str| -> (StatusCode, String) {
         eprintln!("[submit_doge_headers] reject reason={}", reason);
         (StatusCode::BAD_REQUEST, reason.to_string())
     };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
 
     {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -7088,7 +7108,7 @@ async fn submit_doge_headers(
         }
     }
 
-    Ok(Json(SubmitDogeHeadersResponse {
+    Ok(SubmitDogeHeadersResponse {
         txid: txid_hex,
         accepted,
         headers_count: header_count as u32,
@@ -7096,7 +7116,19 @@ async fn submit_doge_headers(
         new_tip_height: None,
         fee: fee_checked,
         raw_tx_hex: hex::encode(raw_tx),
-    }))
+    })
+}
+
+async fn submit_doge_headers(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SubmitDogeHeadersRequest>,
+) -> Result<Json<SubmitDogeHeadersResponse>, (StatusCode, String)> {
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    submit_doge_headers_core(&state, req).await.map(Json)
 }
 
 async fn doge_relay_tip(
@@ -15715,6 +15747,311 @@ async fn mempool_spent_by(
     }))
 }
 
+// =====================================================================
+// In-process header sync background tasks (replacing the standalone
+// `src/bin/{btc,ltc,doge}-header-sync.rs` binaries + their systemd
+// timers). One tokio task per chain, spawned from main() once the
+// corresponding `resolved_*_spv_relay_activation_height(network)`
+// returns `Some(_)`. Each task loops forever:
+//   1. Read relay tip + activation gate directly from ChainState
+//      (in-process, no HTTP, no auth).
+//   2. Fetch external-chain tip via the async helpers in
+//      `irium_node_rs::header_sync::{btc,ltc,doge}`.
+//   3. Compute target = net_tip - SAFETY_LAG; bail if up to date.
+//   4. Fetch the [relay_tip+1 ..= target] header range (max 144).
+//   5. Call the corresponding `submit_*_headers_core` directly.
+//   6. Sleep CYCLE_PERIOD_SECS (600 s) and repeat. First cycle runs
+//      immediately at startup — no initial 600 s wait.
+// =====================================================================
+
+use irium_node_rs::header_sync;
+
+fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
+    let act_height = match irium_node_rs::activation::resolved_btc_spv_relay_activation_height(network) {
+        Some(h) => h,
+        None => {
+            eprintln!(
+                "[header-sync/btc] activation gate is None on {:?}; not spawning",
+                network
+            );
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .user_agent("iriumd-btc-header-sync/1.0")
+            .timeout(std::time::Duration::from_secs(
+                header_sync::common::HTTP_TIMEOUT_SECS,
+            ))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[header-sync/btc] failed to build http client: {e}; thread exiting");
+                return;
+            }
+        };
+        loop {
+            match run_btc_header_sync_cycle(&state, &client, act_height).await {
+                Ok(outcome) => {
+                    eprintln!("[header-sync/btc] cycle ok: {outcome}");
+                }
+                Err(e) => {
+                    eprintln!("[header-sync/btc] cycle error: {e}");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                header_sync::common::CYCLE_PERIOD_SECS,
+            ))
+            .await;
+        }
+    });
+}
+
+fn maybe_spawn_ltc_header_sync(state: AppState, network: NetworkKind) {
+    let act_height = match irium_node_rs::activation::resolved_ltc_spv_relay_activation_height(network) {
+        Some(h) => h,
+        None => {
+            eprintln!(
+                "[header-sync/ltc] activation gate is None on {:?}; not spawning",
+                network
+            );
+            return;
+        }
+    };
+    let source = match header_sync::common::Source::from_env("IRIUM_LTC_HEADER_SYNC_SOURCE") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[header-sync/ltc] source detection failed: {e}; thread exiting");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .user_agent("iriumd-ltc-header-sync/1.0")
+            .timeout(std::time::Duration::from_secs(
+                header_sync::common::HTTP_TIMEOUT_SECS,
+            ))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[header-sync/ltc] failed to build http client: {e}; thread exiting");
+                return;
+            }
+        };
+        loop {
+            match run_ltc_header_sync_cycle(&state, &client, act_height, source).await {
+                Ok(outcome) => {
+                    eprintln!("[header-sync/ltc] cycle ok: {outcome}");
+                }
+                Err(e) => {
+                    eprintln!("[header-sync/ltc] cycle error: {e}");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                header_sync::common::CYCLE_PERIOD_SECS,
+            ))
+            .await;
+        }
+    });
+}
+
+fn maybe_spawn_doge_header_sync(state: AppState, network: NetworkKind) {
+    let act_height = match irium_node_rs::activation::resolved_doge_spv_relay_activation_height(network) {
+        Some(h) => h,
+        None => {
+            eprintln!(
+                "[header-sync/doge] activation gate is None on {:?}; not spawning",
+                network
+            );
+            return;
+        }
+    };
+    let source = match header_sync::common::Source::from_env("IRIUM_DOGE_HEADER_SYNC_SOURCE") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[header-sync/doge] source detection failed: {e}; thread exiting");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .user_agent("iriumd-doge-header-sync/1.0")
+            .timeout(std::time::Duration::from_secs(
+                header_sync::common::HTTP_TIMEOUT_SECS,
+            ))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[header-sync/doge] failed to build http client: {e}; thread exiting");
+                return;
+            }
+        };
+        loop {
+            match run_doge_header_sync_cycle(&state, &client, act_height, source).await {
+                Ok(outcome) => {
+                    eprintln!("[header-sync/doge] cycle ok: {outcome}");
+                }
+                Err(e) => {
+                    eprintln!("[header-sync/doge] cycle error: {e}");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                header_sync::common::CYCLE_PERIOD_SECS,
+            ))
+            .await;
+        }
+    });
+}
+
+async fn run_btc_header_sync_cycle(
+    state: &AppState,
+    client: &reqwest::Client,
+    act_height: u64,
+) -> Result<String, String> {
+    let (relay_tip, gate_open) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let open = chain.height >= act_height;
+        (chain.btc_tip_height, open)
+    };
+    if !gate_open {
+        return Ok("gate_closed".to_string());
+    }
+    let btc_net_tip = header_sync::btc::fetch_btc_net_tip(client).await?;
+    if btc_net_tip <= header_sync::common::SAFETY_LAG {
+        return Err(format!(
+            "btc network tip {btc_net_tip} <= safety lag {}; refusing to submit",
+            header_sync::common::SAFETY_LAG
+        ));
+    }
+    let target = btc_net_tip - header_sync::common::SAFETY_LAG;
+    if relay_tip >= target {
+        return Ok(format!(
+            "up_to_date relay_tip={relay_tip} btc_net={btc_net_tip} target={target}"
+        ));
+    }
+    let start = relay_tip + 1;
+    let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
+    let headers_hex = header_sync::btc::fetch_btc_headers(client, start, end).await?;
+    let fee = header_sync::common::env_u64("BTC_HEADER_SYNC_FEE_PER_BYTE", 100);
+    let req = SubmitBtcHeadersRequest {
+        headers_hex,
+        broadcast: Some(true),
+        fee_per_byte: Some(fee),
+    };
+    let resp = submit_btc_headers_core(state, req, None)
+        .await
+        .map_err(|(sc, msg)| format!("submit failed: status={sc} reason={msg}"))?;
+    Ok(format!(
+        "submitted count={} txid={} accepted={}",
+        resp.headers_count, resp.txid, resp.accepted
+    ))
+}
+
+async fn run_ltc_header_sync_cycle(
+    state: &AppState,
+    client: &reqwest::Client,
+    act_height: u64,
+    source: header_sync::common::Source,
+) -> Result<String, String> {
+    let (relay_tip, gate_open) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let open = chain.height >= act_height;
+        (chain.ltc_tip_height, open)
+    };
+    if !gate_open {
+        return Ok("gate_closed".to_string());
+    }
+    let ltc_net_tip = header_sync::ltc::fetch_ltc_net_tip(client, source).await?;
+    if source == header_sync::common::Source::Mainnet
+        && ltc_net_tip <= header_sync::common::SAFETY_LAG
+    {
+        return Err(format!(
+            "ltc network tip {ltc_net_tip} <= safety lag {}; refusing to submit",
+            header_sync::common::SAFETY_LAG
+        ));
+    }
+    let target = match source {
+        header_sync::common::Source::Mainnet => ltc_net_tip - header_sync::common::SAFETY_LAG,
+        header_sync::common::Source::Regtest => ltc_net_tip,
+    };
+    if relay_tip >= target {
+        return Ok(format!(
+            "up_to_date relay_tip={relay_tip} ltc_net={ltc_net_tip} target={target} source={source:?}"
+        ));
+    }
+    let start = relay_tip + 1;
+    let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
+    let headers_hex =
+        header_sync::ltc::fetch_ltc_headers(client, source, start, end).await?;
+    let fee = header_sync::common::env_u64("LTC_HEADER_SYNC_FEE_PER_BYTE", 100);
+    let req = SubmitLtcHeadersRequest {
+        headers_hex,
+        broadcast: Some(true),
+        fee_per_byte: Some(fee),
+    };
+    let resp = submit_ltc_headers_core(state, req)
+        .await
+        .map_err(|(sc, msg)| format!("submit failed: status={sc} reason={msg}"))?;
+    Ok(format!(
+        "submitted count={} txid={} accepted={} source={source:?}",
+        resp.headers_count, resp.txid, resp.accepted
+    ))
+}
+
+async fn run_doge_header_sync_cycle(
+    state: &AppState,
+    client: &reqwest::Client,
+    act_height: u64,
+    source: header_sync::common::Source,
+) -> Result<String, String> {
+    let (relay_tip, gate_open) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let open = chain.height >= act_height;
+        (chain.doge_tip_height, open)
+    };
+    if !gate_open {
+        return Ok("gate_closed".to_string());
+    }
+    let doge_net_tip = header_sync::doge::fetch_doge_net_tip(client, source).await?;
+    if source == header_sync::common::Source::Mainnet
+        && doge_net_tip <= header_sync::common::SAFETY_LAG
+    {
+        return Err(format!(
+            "doge network tip {doge_net_tip} <= safety lag {}; refusing to submit",
+            header_sync::common::SAFETY_LAG
+        ));
+    }
+    let target = match source {
+        header_sync::common::Source::Mainnet => doge_net_tip - header_sync::common::SAFETY_LAG,
+        header_sync::common::Source::Regtest => doge_net_tip,
+    };
+    if relay_tip >= target {
+        return Ok(format!(
+            "up_to_date relay_tip={relay_tip} doge_net={doge_net_tip} target={target} source={source:?}"
+        ));
+    }
+    let start = relay_tip + 1;
+    let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
+    let headers_hex =
+        header_sync::doge::fetch_doge_headers(client, source, start, end).await?;
+    let fee = header_sync::common::env_u64("DOGE_HEADER_SYNC_FEE_PER_BYTE", 100);
+    let req = SubmitDogeHeadersRequest {
+        headers_hex,
+        broadcast: Some(true),
+        fee_per_byte: Some(fee),
+    };
+    let resp = submit_doge_headers_core(state, req)
+        .await
+        .map_err(|(sc, msg)| format!("submit failed: status={sc} reason={msg}"))?;
+    Ok(format!(
+        "submitted count={} txid={} accepted={} source={source:?}",
+        resp.headers_count, resp.txid, resp.accepted
+    ))
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
     // Install ring as the default rustls crypto provider before any TLS code runs.
@@ -16802,6 +17139,15 @@ async fn main() {
         disputes_index: Arc::new(Mutex::new(load_all_disputes_at_startup())),
         resolvers_index: Arc::new(Mutex::new(load_all_resolvers_at_startup())),
     };
+
+    // Spawn the in-process header-sync background tasks. Each one no-ops
+    // (and logs once) when the corresponding `resolved_*_spv_relay_activation_height`
+    // is `None` on the running network — so devnet / dev nodes pay nothing
+    // for chains they haven't enabled. Replaces the standalone
+    // src/bin/{btc,ltc,doge}-header-sync.rs binaries + systemd timers.
+    maybe_spawn_btc_header_sync(app_state.clone(), network);
+    maybe_spawn_ltc_header_sync(app_state.clone(), network);
+    maybe_spawn_doge_header_sync(app_state.clone(), network);
 
     // Background task: emit block.new events when chain height advances.
     {

@@ -9,6 +9,7 @@ pub mod chain;
 pub mod constants;
 pub mod doge_spv;
 pub mod genesis;
+pub mod header_sync;
 pub mod ltc_spv;
 pub mod mempool;
 pub mod network;
