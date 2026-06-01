@@ -36,14 +36,13 @@ pub const MAINNET_LWMA_V2_ACTIVATION_HEIGHT: Option<u64> = Some(19_740);
 /// without changing T is meaningless. Both flip atomically at this
 /// height.
 ///
-/// Ships disabled. Mainnet activation requires a dedicated commit per
-/// docs/htlcv1_activation_commit_workflow.md. Pre-fork chain history is
+/// Activated on mainnet at height 24_250. Pre-fork chain history is
 /// bit-for-bit unchanged: the `block_target_interval(height)` and
 /// `halving_count(height)` accessors in `constants.rs` return V1 values
-/// for every `height < activation`, and the cumulative `halving_count`
+/// for every `height < 24_250`, and the cumulative `halving_count`
 /// formula is continuous across the fork boundary
-/// (`halving_count(F) == halving_count(F+1)`).
-pub const MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT: Option<u64> = None;
+/// (`halving_count(24_250) == halving_count(24_251)`).
+pub const MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT: Option<u64> = Some(24_250);
 
 /// Mainnet AuxPoW merged-mining activation height.
 ///
@@ -723,12 +722,16 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_block_time_v2_height_is_none_pending_governance() {
-        assert!(
-            MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT.is_none(),
-            "Block-time V2 must stay disabled on mainnet until governance flips this constant"
+    fn mainnet_block_time_v2_activation_height_is_24250() {
+        assert_eq!(
+            MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT,
+            Some(24_250),
+            "Block-time V2 mainnet activation height must be 24250"
         );
-        assert!(resolved_block_time_v2_activation_height(NetworkKind::Mainnet).is_none());
+        assert_eq!(
+            resolved_block_time_v2_activation_height(NetworkKind::Mainnet),
+            Some(24_250)
+        );
     }
 
     #[test]
@@ -738,7 +741,11 @@ mod tests {
         let resolved = resolved_block_time_v2_activation_height(NetworkKind::Mainnet);
         std::env::remove_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT");
         assert_eq!(resolved, MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT);
-        assert!(resolved.is_none());
+        assert_eq!(
+            resolved,
+            Some(24_250),
+            "mainnet block-time-V2 height must be the code-defined 24250, not the env override 12345"
+        );
     }
 
     #[test]

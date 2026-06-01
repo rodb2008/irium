@@ -176,12 +176,13 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    /// With V2 disabled (env unset on non-mainnet, `None` on mainnet),
-    /// `block_target_interval` must return V1=600 for every height —
-    /// matching the original `BLOCK_TARGET_INTERVAL: u64 = 600` semantics
-    /// byte-for-byte.
+    /// Pins the live mainnet block-time-V2 fork boundary. With no env
+    /// overrides set, `block_target_interval` follows
+    /// `MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT = Some(24_250)`: V1 for
+    /// every height below 24_250, V2 for every height at-or-above. The
+    /// transition is sharp at the activation height.
     #[test]
-    fn block_target_interval_returns_v1_when_v2_disabled() {
+    fn block_target_interval_uses_mainnet_v2_fork_at_24250() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -189,8 +190,10 @@ mod tests {
         std::env::remove_var("IRIUM_NETWORK"); // mainnet default
         assert_eq!(block_target_interval(0), BLOCK_TARGET_INTERVAL_V1);
         assert_eq!(block_target_interval(1), BLOCK_TARGET_INTERVAL_V1);
-        assert_eq!(block_target_interval(24_059), BLOCK_TARGET_INTERVAL_V1);
-        assert_eq!(block_target_interval(1_000_000), BLOCK_TARGET_INTERVAL_V1);
+        assert_eq!(block_target_interval(24_249), BLOCK_TARGET_INTERVAL_V1);
+        assert_eq!(block_target_interval(24_250), BLOCK_TARGET_INTERVAL_V2);
+        assert_eq!(block_target_interval(24_251), BLOCK_TARGET_INTERVAL_V2);
+        assert_eq!(block_target_interval(1_000_000), BLOCK_TARGET_INTERVAL_V2);
     }
 
     /// With V2 enabled at a devnet fork height, `block_target_interval`
@@ -317,23 +320,47 @@ mod tests {
         std::env::remove_var("IRIUM_NETWORK");
     }
 
-    /// Regression: with the V2 fork disabled (mainnet ships this way),
-    /// `block_reward` must reproduce the classic curve exactly at the
-    /// pre-change halving epoch boundaries.
+    /// Pins the live mainnet `block_reward` curve given
+    /// `MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT = Some(24_250)`. Pre-fork
+    /// heights follow the classic `(h-1) / HALVING_INTERVAL_V1` rule;
+    /// post-fork heights use the cumulative formula with halvings
+    /// landing every `HALVING_INTERVAL_V2 = 1_050_000` blocks past the
+    /// fork. The k-th post-fork halving sits at
+    /// `24_250 + k * 1_050_000 + 1`.
     #[test]
-    fn block_reward_when_fork_is_none_is_classic_curve() {
+    fn block_reward_mainnet_post_fork_curve() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_NETWORK");
 
+        // Pre-fork: classic V1 curve up to the activation height.
+        // At fork=24_250 the V1 cumulative count is (24_250-1)/210_000 = 0,
+        // so no halvings have occurred yet by the fork.
         assert_eq!(block_reward(0), 0);
         assert_eq!(block_reward(1), INITIAL_SUBSIDY);
-        assert_eq!(block_reward(HALVING_INTERVAL_V1), INITIAL_SUBSIDY);
-        assert_eq!(block_reward(HALVING_INTERVAL_V1 + 1), INITIAL_SUBSIDY >> 1);
-        assert_eq!(block_reward(2 * HALVING_INTERVAL_V1), INITIAL_SUBSIDY >> 1);
-        assert_eq!(block_reward(2 * HALVING_INTERVAL_V1 + 1), INITIAL_SUBSIDY >> 2);
-        assert_eq!(block_reward(3 * HALVING_INTERVAL_V1 + 1), INITIAL_SUBSIDY >> 3);
+        assert_eq!(block_reward(24_249), INITIAL_SUBSIDY);
+        assert_eq!(block_reward(24_250), INITIAL_SUBSIDY);
+
+        // Post-fork branch picks up the count. h=24_251 is the first
+        // post-fork height; cumulative halvings = 0 + 0 = 0.
+        assert_eq!(block_reward(24_251), INITIAL_SUBSIDY);
+
+        // V1's would-be halving at h = 210_001 no longer applies after
+        // the fork — under the cumulative formula, we're still on the
+        // initial subsidy until the first V2-cadence halving.
+        assert_eq!(block_reward(210_001), INITIAL_SUBSIDY);
+
+        // First post-fork halving: 24_250 + 1_050_000 + 1 = 1_074_251.
+        assert_eq!(block_reward(1_074_250), INITIAL_SUBSIDY);
+        assert_eq!(block_reward(1_074_251), INITIAL_SUBSIDY >> 1);
+
+        // Second post-fork halving: 24_250 + 2*1_050_000 + 1 = 2_124_251.
+        assert_eq!(block_reward(2_124_250), INITIAL_SUBSIDY >> 1);
+        assert_eq!(block_reward(2_124_251), INITIAL_SUBSIDY >> 2);
+
+        // Third post-fork halving: 24_250 + 3*1_050_000 + 1 = 3_174_251.
+        assert_eq!(block_reward(3_174_251), INITIAL_SUBSIDY >> 3);
     }
 }
