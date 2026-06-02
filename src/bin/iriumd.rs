@@ -511,6 +511,12 @@ struct StatusResponse {
     gap_healer_last_progress_ts: u64,
     gap_healer_last_filled_height: Option<u64>,
     gap_healer_pending_count: u64,
+    /// Current minimum fee rate in satoshis per serialised byte. Equal to
+    /// `ceil(mempool.min_fee_per_byte())`, floored at 1 - matches the
+    /// default `wallet_send` uses when no `fee_per_byte` override or
+    /// `fee_mode` is supplied. Wallets can read this directly without a
+    /// second call to `/rpc/fee_estimate`.
+    fee_rate_sat_per_byte: u64,
 }
 
 #[derive(Serialize)]
@@ -3615,6 +3621,12 @@ async fn status(
     let gap_healer_last_filled_height = storage::gap_healer_last_filled_height();
     let gap_healer_pending_count = storage::gap_healer_pending_count();
 
+    let fee_rate_sat_per_byte = {
+        let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        let raw = mempool.min_fee_per_byte().ceil() as u64;
+        if raw == 0 { 1 } else { raw }
+    };
+
     Ok(Json(StatusResponse {
         height,
         genesis_hash: state.genesis_hash.clone(),
@@ -3642,6 +3654,7 @@ async fn status(
         gap_healer_last_progress_ts,
         gap_healer_last_filled_height,
         gap_healer_pending_count,
+        fee_rate_sat_per_byte,
     }))
 }
 
