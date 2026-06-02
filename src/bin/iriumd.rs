@@ -1726,6 +1726,109 @@ fn load_runtime_seeds() -> Vec<String> {
         .unwrap_or_default()
 }
 
+// ---- Item 3 (Phase 1 DNS-free bootstrap): peers.custom.json --------------
+//
+// Operator-curated seed list, kept separate from seedlist.runtime (which is
+// the auto-discovered peer cache that gets rewritten every 10 minutes from
+// gossip). peers.custom.json is the file a hand-edit will survive: anything
+// added via `--add-seed <ip:port>` or appended directly with an editor stays
+// authoritative across restarts. Format is a plain JSON array of "ip:port"
+// strings to make it both human-editable and easy to share between operators.
+
+/// Path to the operator-curated seed list. Precedence:
+/// `IRIUM_DATA_DIR/peers.custom.json` (when the env var is set) →
+/// `$HOME/.irium/peers.custom.json` otherwise.
+fn custom_seeds_path() -> std::path::PathBuf {
+    let data_dir = if let Ok(path) = std::env::var("IRIUM_DATA_DIR") {
+        std::path::PathBuf::from(path)
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        std::path::PathBuf::from(home).join(".irium")
+    };
+    data_dir.join("peers.custom.json")
+}
+
+/// Read operator-curated seeds from `peers.custom.json` (JSON array of
+/// `"ip:port"` strings). Returns an empty Vec when the file is absent,
+/// unreadable, or contains invalid JSON — an unparseable file is never fatal
+/// so a corrupted edit will not block node startup. A warning is logged on
+/// parse failure so the operator notices.
+fn load_custom_seeds() -> Vec<String> {
+    let path = custom_seeds_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    match serde_json::from_str::<Vec<String>>(&raw) {
+        Ok(list) => list
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Err(e) => {
+            eprintln!(
+                "[warn] peers.custom.json at {} is not a valid JSON array of \"ip:port\" strings: {}; ignoring",
+                path.display(),
+                e
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Append operator-supplied seed addresses to `peers.custom.json`. Loads the
+/// existing list, merges with deduplication, and writes back atomically
+/// (tmp file + rename) so a crash mid-write cannot corrupt the file. Silent
+/// no-op when `new_seeds` is empty; any I/O failure is logged but never
+/// propagated — `--add-seed` is best-effort persistence.
+fn append_custom_seeds(new_seeds: &[String]) {
+    if new_seeds.is_empty() {
+        return;
+    }
+    let path = custom_seeds_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut existing = load_custom_seeds();
+    let mut added = 0usize;
+    for seed in new_seeds {
+        let trimmed = seed.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !existing.iter().any(|s| s == &trimmed) {
+            existing.push(trimmed);
+            added += 1;
+        }
+    }
+    if added == 0 {
+        return;
+    }
+    let json = match serde_json::to_string_pretty(&existing) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[warn] failed to serialize peers.custom.json: {}", e);
+            return;
+        }
+    };
+    let tmp_path = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp_path, json) {
+        eprintln!(
+            "[warn] failed to write peers.custom.json tmp file at {}: {}",
+            tmp_path.display(),
+            e
+        );
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        eprintln!(
+            "[warn] failed to commit peers.custom.json (rename failed): {}",
+            e
+        );
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
 fn load_persisted_startup_seeds(
     peers: &[irium_node_rs::network::PeerRecord],
     default_seed_port: u16,
@@ -16591,19 +16694,20 @@ async fn main() {
             .map(|w| w[1].clone())
             .collect()
     };
+    // Item 3 Option B: persist --add-seed args to peers.custom.json (NOT to
+    // seedlist.runtime). This keeps the operator-curated list distinct from
+    // the auto-discovered peer cache so a hand-edit survives across the
+    // periodic seedlist.runtime rewrites that p2p does every 10 min.
     if !add_seed_args.is_empty() {
-        let runtime_path = storage::bootstrap_dir().join("seedlist.runtime");
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&runtime_path) {
-            use std::io::Write;
-            for addr in &add_seed_args {
-                let _ = writeln!(file, "{}", addr);
-            }
-        }
+        append_custom_seeds(&add_seed_args);
     }
     let mut manual_seeds = load_manual_seeds(node_cfg.as_ref());
-    for addr in &add_seed_args {
-        if !manual_seeds.iter().any(|s| s == addr) {
-            manual_seeds.push(addr.clone());
+    // Load operator-curated seeds (peers.custom.json from previous runs plus
+    // anything we just appended above) into the manual-seed pool so they get
+    // dialed on every start.
+    for addr in load_custom_seeds() {
+        if !manual_seeds.iter().any(|s| s == &addr) {
+            manual_seeds.push(addr);
         }
     }
     // Phase 3: cold-start blockchain peer scan
