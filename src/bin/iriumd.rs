@@ -476,6 +476,13 @@ struct BestHeaderTipResponse {
     hash: String,
 }
 
+/// The only currency the IRIUM settlement layer recognises. Consensus
+/// enforces this via the `network_marker == "IRIUM"` check in
+/// `AgreementObject::validate()`; this constant gives the HTTP surface
+/// a single source of truth and lets wallet clients gate their UI on
+/// `currency == "IRM"` without parsing the agreement JSON.
+const SETTLEMENT_CURRENCY: &str = "IRM";
+
 #[derive(Serialize)]
 struct StatusResponse {
     height: u64,
@@ -1003,6 +1010,8 @@ struct AgreementHashResponse {
 struct AgreementInspectResponse {
     agreement_hash: String,
     summary: AgreementSummary,
+    /// Always "IRM". The settlement layer is currency-locked at consensus.
+    currency: &'static str,
 }
 
 #[derive(Serialize)]
@@ -4675,6 +4684,7 @@ async fn create_agreement(
     Ok(Json(AgreementInspectResponse {
         agreement_hash: summary.agreement_hash.clone(),
         summary,
+        currency: SETTLEMENT_CURRENCY,
     }))
 }
 
