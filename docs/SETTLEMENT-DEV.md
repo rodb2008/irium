@@ -641,6 +641,40 @@ Each milestone is funded independently via `POST /rpc/fundagreement` with `miles
 
 ---
 
+## Fees in Settlement Transactions
+
+Every transaction iriumd's wallet builds on behalf of a settlement
+agreement - funding, release, refund, dispute anchors - pays the same
+network fee as any other on-chain tx. The fee formula and request
+shape are documented in [API.md](API.md#fees).
+
+### Settlement-specific cost components
+
+| Component | Defined where | Optional? | Comment |
+|---|---|---|---|
+| Funding-tx network fee | Wallet builder (`agreement-fund`) | Required | Standard `size_bytes * fee_per_byte`. The HTLC funding tx is typically 1 input + 2 outputs (HTLC + change), ~218 bytes. |
+| Release-tx / refund-tx network fee | Wallet builder (`agreement-release` / `agreement-refund` / `agreement-dispute-resolve`) | Required | The wallet's two-pass signing loop recomputes fee against the actual signed size, so the response's `fee` field is the on-chain value. |
+| Resolver fee | `primary_resolver_fee` / `fallback_resolver_fee` on the `AgreementObject` | Optional | Sats, must be `> 0`; combined sum must be `< total_amount`. Paid to the resolver address on the winning branch only (release or refund). Wallet builds the output split when constructing the spend tx. |
+| Attestor bond | `irium-wallet attestor-register --bond N` | Optional but recommended | Public on-chain stake announced via `bond1:<pkh>:<atoms>` OP_RETURN. Slashable on contradictory proofs. See the **Attestor Bonding** section below for the full lifecycle. |
+
+### Currency
+
+Every amount in a settlement agreement is denominated in **IRM** (satoshis at
+the wire level). The protocol does not support any other currency. Consensus
+enforces this via the `network_marker == "IRIUM"` check in
+`AgreementObject::validate()`; the `POST /rpc/inspectagreement` response
+surfaces the binding as a `currency: "IRM"` field so wallets can gate UI on
+it without parsing the agreement JSON.
+
+### Reading the live fee rate
+
+For a single source of truth on what `fee_per_byte` to pass to any wallet
+RPC, read `fee_rate_sat_per_byte` from `GET /status`. It is the same value
+`wallet_send` and the agreement builders use as their default when no
+`fee_per_byte` override or `fee_mode` is supplied.
+
+---
+
 ## Attestor Bonding
 
 Attestors can register an on-chain economic bond to signal accountability. Agreements
