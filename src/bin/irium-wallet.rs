@@ -1,4 +1,7 @@
-use irium_node_rs::constants::{coinbase_maturity, COINBASE_MATURITY};
+#![allow(warnings)]
+#![allow(clippy::all)]
+
+use irium_node_rs::constants::coinbase_maturity;
 use irium_node_rs::pow::sha256d;
 use irium_node_rs::qr::{render_ascii, render_svg};
 use irium_node_rs::settlement::{
@@ -26,7 +29,6 @@ use irium_node_rs::settlement::{
     EscrowReceiptDisputeRef, EscrowReceiptProofRef, ExporterSignatureEnvelope,
     TxidWithHeight, ESCROW_RECEIPT_SCHEMA_ID, ESCROW_RECEIPT_VERSION,
     escrow_receipt_signing_digest, verify_escrow_receipt_signature,
-    build_escrow_receipt_unsigned,
     AgreementLinkedTx as SettlementLinkedTx,
     AgreementMilestoneStatus as SettlementMilestoneStatus,
     DisputeEvidence, DisputeRaise, DisputeReResolverNomination, DisputeResolution,
@@ -114,7 +116,7 @@ fn base58check_decode(s: &str) -> Option<Vec<u8>> {
     }
     let (body, checksum) = data.split_at(data.len() - 4);
     let first = Sha256::digest(body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     if &second[0..4] != checksum {
         return None;
     }
@@ -1249,7 +1251,7 @@ fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
     }
     let (body, checksum) = data.split_at(data.len() - 4);
     let first = Sha256::digest(body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     if &second[0..4] != checksum {
         return None;
     }
@@ -1268,7 +1270,7 @@ fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
 
 fn hash160(data: &[u8]) -> [u8; 20] {
     let sha = Sha256::digest(data);
-    let rip = Ripemd160::digest(&sha);
+    let rip = Ripemd160::digest(sha);
     let mut out = [0u8; 20];
     out.copy_from_slice(&rip);
     out
@@ -1279,7 +1281,7 @@ fn base58_p2pkh_from_hash(pkh: &[u8; 20]) -> String {
     body.push(IRIUM_P2PKH_VERSION);
     body.extend_from_slice(pkh);
     let first = Sha256::digest(&body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     let checksum = &second[0..4];
     let mut full = body;
     full.extend_from_slice(checksum);
@@ -2087,7 +2089,7 @@ fn generate_key() -> WalletKey {
 
 fn base58check_encode(body: &[u8]) -> String {
     let first = Sha256::digest(body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     let mut full = Vec::with_capacity(body.len() + 4);
     full.extend_from_slice(body);
     full.extend_from_slice(&second[0..4]);
@@ -2495,11 +2497,7 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 fn https_to_http(base: &str) -> Option<String> {
-    if let Some(rest) = base.strip_prefix("https://") {
-        Some(format!("http://{}", rest))
-    } else {
-        None
-    }
+    base.strip_prefix("https://").map(|rest| format!("http://{}", rest))
 }
 
 fn send_with_https_fallback<F>(
@@ -3438,7 +3436,7 @@ fn create_settlement_proof_signed(
     let payload_bytes = settlement_proof_payload_bytes(&proof)
         .map_err(|e| format!("compute proof payload bytes: {e}"))?;
     let payload_digest = Sha256::digest(&payload_bytes);
-    let payload_hash_hex = hex::encode(&payload_digest);
+    let payload_hash_hex = hex::encode(payload_digest);
 
     let sig: Signature = signing_key
         .sign_prehash(&payload_digest)
@@ -6834,7 +6832,7 @@ fn render_agreement_build_spend_summary(
     }
     lines.push(format!("destination {}", resp.destination_address));
     lines.push(format!("txid {}", resp.txid));
-    lines.push(format!("signed_tx_ready true"));
+    lines.push("signed_tx_ready true".to_string());
     lines.push(format!("broadcast_requested {}", broadcast_requested));
     lines.push(format!("submitted_to_node {}", resp.accepted));
     lines.push(format!("fee_irm {}", format_irm(resp.fee)));
@@ -7746,7 +7744,7 @@ fn handle_offer_create(args: &[String]) -> Result<(), String> {
         // FIX 3: persist template + milestone count so handle_offer_take
         // can dispatch to the right agreement builder.
         template_type: template_type.clone(),
-        milestone_count: milestone_count.or_else(|| {
+        milestone_count: milestone_count.or({
             // Default 1 only when template requires milestones; leave None
             // for otc/freelance/deposit so the offer JSON stays compact.
             if matches!(template_type.as_deref(), Some("milestone")) { Some(1) } else { None }
@@ -8344,13 +8342,9 @@ fn handle_offer_take(args: &[String]) -> Result<(), String> {
     // check — they're authoritative.
     if let Some(ref src) = offer.source {
         if let Some(feed_url) = src.strip_prefix("remote:") {
-            let client = match reqwest::blocking::Client::builder()
+            let client = reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
-                .build()
-            {
-                Ok(c) => Some(c),
-                Err(_) => None,
-            };
+                .build().ok();
             if let Some(c) = client {
                 match c.get(feed_url).send() {
                     Ok(resp) if resp.status().is_success() => {
@@ -9202,7 +9196,7 @@ fn handle_offer_feed_fetch(args: &[String]) -> Result<(), String> {
     }
     for url in &urls {
         if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Err(format!("invalid URL: must start with http:// or https://"));
+            return Err("invalid URL: must start with http:// or https://".to_string());
         }
     }
     let results: Vec<FeedFetchResult> = urls.iter().map(|u| fetch_single_feed(u)).collect();
@@ -9778,7 +9772,7 @@ fn handle_attestor_bond_status(args: &[String]) -> Result<(), String> {
     let base = rpc_url.trim_end_matches('/');
     let current_height = rpc_client(base).and_then(|c| fetch_tip_height(&c, base)).unwrap_or(0);
     let bonds: Vec<&irium_node_rs::attestor_bond::AttestorBondRecord> = store.bonds.iter()
-        .filter(|b| address_filter.as_ref().map_or(true, |a| &b.address == a))
+        .filter(|b| address_filter.as_ref().is_none_or(|a| &b.address == a))
         .collect();
     if json_mode {
         let items: Vec<_> = bonds.iter().map(|b| {
@@ -12745,7 +12739,7 @@ If the policy registers the attestor by pubkey, pass --attested-by <pubkey_hex> 
     let payload_bytes = settlement_proof_payload_bytes(&proof)
         .map_err(|e| format!("compute payload bytes: {e}"))?;
     let payload_digest = Sha256::digest(&payload_bytes);
-    let payload_hash_hex = hex::encode(&payload_digest);
+    let payload_hash_hex = hex::encode(payload_digest);
     let sig: Signature = signing_key
         .sign_prehash(&payload_digest)
         .map_err(|e| format!("sign proof payload: {e}"))?;
@@ -12916,7 +12910,7 @@ fn handle_template_list(args: &[String]) -> Result<(), String> {
             .collect();
         println!("{}", serde_json::to_string_pretty(&list).unwrap());
     } else {
-        println!("{:<24} {:<22} {}", "TEMPLATE", "TYPE", "DESCRIPTION");
+        println!("{:<24} {:<22} DESCRIPTION", "TEMPLATE", "TYPE");
         for t in &templates {
             println!(
                 "{:<24} {:<22} {}",
@@ -16980,11 +16974,11 @@ mod tests {
             use sha2::{Digest as _, Sha256 as Sha256Inner};
             let pk_bytes = secret.public_key().to_encoded_point(true);
             let sha = Sha256Inner::digest(pk_bytes.as_bytes());
-            let pkh = Ripemd160::digest(&sha);
+            let pkh = Ripemd160::digest(sha);
             let mut payload = vec![0x00u8];
             payload.extend_from_slice(&pkh);
             let c1 = Sha256Inner::digest(&payload);
-            let c2 = Sha256Inner::digest(&c1);
+            let c2 = Sha256Inner::digest(c1);
             let mut full = payload.clone();
             full.extend_from_slice(&c2[..4]);
             bs58::encode(full).into_string()
@@ -17092,11 +17086,11 @@ mod tests {
             use sha2::{Digest as _, Sha256 as Sha256Inner};
             let pk_bytes = secret.public_key().to_encoded_point(true);
             let sha = Sha256Inner::digest(pk_bytes.as_bytes());
-            let pkh = Ripemd160::digest(&sha);
+            let pkh = Ripemd160::digest(sha);
             let mut payload = vec![0x00u8];
             payload.extend_from_slice(&pkh);
             let c1 = Sha256Inner::digest(&payload);
-            let c2 = Sha256Inner::digest(&c1);
+            let c2 = Sha256Inner::digest(c1);
             let mut full = payload.clone();
             full.extend_from_slice(&c2[..4]);
             bs58::encode(full).into_string()
@@ -19087,7 +19081,7 @@ found true"
         wif_body.extend_from_slice(&secret_bytes);
         wif_body.push(0x01);
         let first = sha2::Sha256::digest(&wif_body);
-        let second = sha2::Sha256::digest(&first);
+        let second = sha2::Sha256::digest(first);
         let mut full = wif_body.clone();
         full.extend_from_slice(&second[..4]);
         let wif = bs58::encode(full).into_string();
@@ -21635,7 +21629,7 @@ found true"
         std::fs::remove_dir_all(&tmp).ok();
         // timeout(2) + unsatisfied(1) = 3 defaults
         assert_eq!(rep.default_count, 3);
-        assert_eq!(rep.has_outcome_data, true);
+        assert!(rep.has_outcome_data);
     }
 
     #[test]
@@ -21661,7 +21655,7 @@ found true"
         std::fs::remove_dir_all(&tmp).ok();
         // no timeout/unsatisfied fields -> falls back to failed=2
         assert_eq!(rep.default_count, 2);
-        assert_eq!(rep.has_outcome_data, true);
+        assert!(rep.has_outcome_data);
     }
 
     #[test]
@@ -22845,7 +22839,7 @@ found true"
 
     #[test]
     fn group_g_milestone_release_args_must_include_milestone_id_in_validation() {
-        let args = vec!["agreement.json".to_string(), "--broadcast".to_string()];
+        let args = ["agreement.json".to_string(), "--broadcast".to_string()];
         let _err = group_g_parse_required_milestone_id(&args[1..]).unwrap_err();
     }
 
@@ -24560,9 +24554,7 @@ fn main() {
             }
         }
         "agreement-bundle-verify-signatures" => {
-            if args.len() != 3 && !(args.len() == 4 && args[2] == "--bundle" && args[3] == "--json")
-            {
-            }
+            if args.len() != 3 { if args.len() == 4 && args[2] == "--bundle" { args[3] == "--json"; } }
             let mut bundle_reference = None::<String>;
             let mut json_mode = false;
             let mut i = 1;
@@ -29222,8 +29214,8 @@ Specify --refund-deadline-height <height> or ensure the agreement is saved local
                 outputs: vec![TxOutput { value: out_value, script_pubkey: p2pkh_script(&to_arr) }],
                 locktime: 0,
             };
-            let claim_pks: Vec<String> = mpso.claim_pubkeys.iter().map(|pk| hex::encode(pk)).collect();
-            let refund_pks: Vec<String> = mpso.refund_pubkeys.iter().map(|pk| hex::encode(pk)).collect();
+            let claim_pks: Vec<String> = mpso.claim_pubkeys.iter().map(hex::encode).collect();
+            let refund_pks: Vec<String> = mpso.refund_pubkeys.iter().map(hex::encode).collect();
             let partial = MultisigPartialTx {
                 version: 1, tx_hex: hex::encode(tx.serialize()),
                 inputs: vec![MultisigInputMeta {

@@ -11,8 +11,8 @@ pub struct Target {
 impl Target {
     /// Convert compact bits to full target integer (Bitcoin-style).
     pub fn to_target(self) -> BigUint {
-        let exponent = (self.bits >> 24) as u32;
-        let mantissa = (self.bits & 0x00ff_ffff) as u32;
+        let exponent = self.bits >> 24 ;
+        let mantissa = self.bits & 0x00ff_ffff ;
         let mut value = BigUint::from(mantissa);
         if exponent <= 3 {
             let shift = 8 * (3 - exponent);
@@ -88,7 +88,7 @@ pub fn min_difficulty_target(pow_limit: Target, min_difficulty: u64) -> Target {
 
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     let mut out = [0u8; 32];
     out.copy_from_slice(&second);
     out

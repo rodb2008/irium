@@ -387,6 +387,12 @@ pub struct PeerDirectory {
     suppressed_learned_rate_limited: usize,
 }
 
+impl Default for PeerDirectory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PeerDirectory {
     pub fn new() -> PeerDirectory {
         let db_path = storage::state_dir().join("peers.json");
@@ -851,7 +857,7 @@ impl PeerDirectory {
         let mut seeds = self.seed_manager.load_static_entries();
 
         for rec in self.records.values() {
-            if rec.dialable == false {
+            if !rec.dialable {
                 continue;
             }
             let idle_hours = (now - rec.last_seen) / 3600.0;

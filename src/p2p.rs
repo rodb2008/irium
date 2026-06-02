@@ -322,7 +322,7 @@ fn sync_perf_record(decode: u128, precheck: u128, connect: u128, persist: u128) 
     g.precheck_ms = g.precheck_ms.saturating_add(precheck);
     g.connect_ms = g.connect_ms.saturating_add(connect);
     g.persist_ms = g.persist_ms.saturating_add(persist);
-    if g.blocks % 100 == 0 {
+    if g.blocks.is_multiple_of(100) {
         let elapsed = g.start.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
         let bps = if elapsed > 0.0 {
             g.blocks as f64 / elapsed
@@ -1434,7 +1434,7 @@ fn best_checkpoint(chain: &Option<Arc<StdMutex<ChainState>>>) -> (Option<u64>, O
     }
 
     // Fallback to genesis.
-    match guard.chain.get(0) {
+    match guard.chain.first() {
         Some(b) => (Some(0), Some(hex::encode(b.header.hash_for_height(0)))),
         None => (None, None),
     }
@@ -1534,6 +1534,7 @@ fn verify_peer_checkpoint(
 }
 
 #[derive(Debug)]
+#[derive(Default)]
 struct PeerSyncState {
     height: Option<u64>,
     tip: Option<[u8; 32]>,
@@ -1568,33 +1569,6 @@ struct PeerSyncState {
     last_applied_height: u64,
 }
 
-impl Default for PeerSyncState {
-    fn default() -> Self {
-        Self {
-            height: None,
-            tip: None,
-            node_id: None,
-            supports_uptime: false,
-            last_uptime_challenge: None,
-            last_uptime_sent: None,
-            last_headers_request: None,
-            last_headers_received: None,
-            last_headers_start: None,
-            headers_inflight: false,
-            headers_processing: false,
-            unsolicited_headers: 0,
-            last_unsolicited_log: None,
-            last_headers_batch_log: None,
-            last_bad_headers: None,
-            last_best_header_height: 0,
-            last_best_header_hash: [0u8; 32],
-            last_best_header_progress: None,
-            headers_recovery_exp: 0,
-            last_locator_recovery: None,
-            last_applied_height: 0,
-        }
-    }
-}
 
 #[derive(Clone)]
 struct OrphanHeaderEntry {
@@ -1969,8 +1943,8 @@ async fn maybe_request_sync(
             state.headers_inflight = true;
         }
     }
-    if peer_height > local_height || tip_mismatch {
-        if sync_block_request_allowed_for(
+    if (peer_height > local_height || tip_mismatch)
+        && sync_block_request_allowed_for(
             block_requests,
             addr.ip(),
             local_height,
@@ -1988,7 +1962,6 @@ async fn maybe_request_sync(
                 let _ = send_message(writer, msg, addr).await;
             }
         }
-    }
 }
 
 async fn maybe_request_headers_fallback(
@@ -2331,7 +2304,7 @@ fn handshake_fail_threshold() -> u32 {
 }
 
 fn should_log_handshake_failure(count: u32) -> bool {
-    count % handshake_fail_threshold() == 0
+    count.is_multiple_of(handshake_fail_threshold())
 }
 
 async fn record_handshake_failure(
@@ -4222,7 +4195,7 @@ impl P2PNode {
             checkpoint_hash,
             relay_address: self.relay_address.clone(),
             node_id: Some(hex::encode(&self.node_id)),
-            tip_hash: Some(hex::encode(&P2PNode::tip_hash(&self.chain))),
+            tip_hash: Some(hex::encode(P2PNode::tip_hash(&self.chain))),
             capabilities: local_capabilities(),
             marketplace_feed: self.marketplace_feed.clone(),
             external_endpoint: self.external_endpoint.clone(),
@@ -4334,7 +4307,7 @@ impl P2PNode {
                         checkpoint_hash,
                         relay_address: ping_relay.clone(),
                         node_id: Some(hex::encode(&ping_node_id)),
-                        tip_hash: Some(hex::encode(&P2PNode::tip_hash(&ping_chain))),
+                        tip_hash: Some(hex::encode(P2PNode::tip_hash(&ping_chain))),
                         capabilities: local_capabilities(),
                         marketplace_feed: ping_marketplace_feed.clone(),
                         external_endpoint: ping_external_endpoint.clone(),
@@ -6739,7 +6712,7 @@ async fn handle_incoming_with_sybil(
                     checkpoint_hash,
                     relay_address: ping_relay.clone(),
                     node_id: Some(hex::encode(&ping_node_id)),
-                    tip_hash: Some(hex::encode(&P2PNode::tip_hash(&ping_chain))),
+                    tip_hash: Some(hex::encode(P2PNode::tip_hash(&ping_chain))),
                     capabilities: local_capabilities(),
                     marketplace_feed: ping_marketplace_feed.clone(),
                     external_endpoint: ping_external_endpoint.clone(),
@@ -6832,7 +6805,7 @@ async fn handle_incoming_with_sybil(
         checkpoint_hash,
         relay_address: relay_address.clone(),
         node_id: Some(hex::encode(&node_id)),
-        tip_hash: Some(hex::encode(&P2PNode::tip_hash(&chain))),
+        tip_hash: Some(hex::encode(P2PNode::tip_hash(&chain))),
         capabilities: local_capabilities(),
         marketplace_feed: marketplace_feed_url.clone(),
         external_endpoint: external_endpoint.clone(),
@@ -7044,7 +7017,7 @@ async fn handle_incoming_with_sybil(
                         checkpoint_hash,
                         relay_address: relay_address.clone(),
                         node_id: Some(hex::encode(&node_id)),
-                        tip_hash: Some(hex::encode(&P2PNode::tip_hash(&chain))),
+                        tip_hash: Some(hex::encode(P2PNode::tip_hash(&chain))),
                         capabilities: local_capabilities(),
                         marketplace_feed: marketplace_feed_url.clone(),
                         external_endpoint: external_endpoint.clone(),

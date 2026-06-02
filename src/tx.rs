@@ -582,13 +582,13 @@ pub fn parse_mpso_script(script: &[u8]) -> Option<MpsoV1Output> {
     let claim_m = script[5];
     let refund_n = script[6];
     let refund_m = script[7];
-    if claim_n < 1 || claim_n > 8 {
+    if !(1..=8).contains(&claim_n) {
         return None;
     }
     if claim_m < 1 || claim_m > claim_n {
         return None;
     }
-    if refund_n < 1 || refund_n > 8 {
+    if !(1..=8).contains(&refund_n) {
         return None;
     }
     if refund_m < 1 || refund_m > refund_n {
@@ -1476,6 +1476,7 @@ pub fn parse_htlc_doge_swap_witness(script_sig: &[u8]) -> Option<HtlcDogeSwapWit
 
     // ---- HtlcDogeSwapV1 tests (Phase C) ----
 
+    #[allow(dead_code)]
     fn sample_doge_swap() -> HtlcDogeSwapV1Output {
         HtlcDogeSwapV1Output {
             confirmations_required: 6,

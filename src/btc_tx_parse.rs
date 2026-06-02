@@ -117,7 +117,7 @@ fn parse_output_script(script: &[u8]) -> BtcOutputScript {
     }
     if script.len() >= 2 && script[0] == 0x6a {
         let push = script[1];
-        if push >= 1 && push <= 75 && (push as usize) + 2 == script.len() {
+        if (1..=75).contains(&push) && (push as usize) + 2 == script.len() {
             return BtcOutputScript::OpReturn(script[2..].to_vec());
         }
     }
@@ -301,7 +301,7 @@ mod tests {
     }
 
     fn op_return_script_bytes(payload: &[u8]) -> Vec<u8> {
-        assert!(payload.len() >= 1 && payload.len() <= 75);
+        assert!(!payload.is_empty() && payload.len() <= 75);
         let mut s = Vec::with_capacity(2 + payload.len());
         s.push(0x6a);
         s.push(payload.len() as u8);

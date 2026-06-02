@@ -146,6 +146,12 @@ pub struct ReputationManager {
     reputations: HashMap<String, PeerReputation>,
 }
 
+impl Default for ReputationManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReputationManager {
     pub fn banned_count(&self) -> usize {
         self.reputations.values().filter(|r| r.is_banned()).count()

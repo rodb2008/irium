@@ -262,7 +262,7 @@ fn main() -> Result<(), String> {
             let header = BlockHeader {
                 version: jb.header.version,
                 prev_hash,
-                merkle_root: merkle_root,
+                merkle_root,
                 time: jb.header.time,
                 bits: header_bits,
                 nonce: jb.header.nonce,

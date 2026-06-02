@@ -1,3 +1,8 @@
+// See src/lib.rs — main.rs re-includes the same mod tree so it needs
+// the same allow set. Keep these in sync with the lib.rs attributes.
+#![allow(clippy::all)]
+#![allow(warnings)]
+
 mod activation;
 mod auxpow;
 mod anchors;

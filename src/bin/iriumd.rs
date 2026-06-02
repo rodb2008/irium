@@ -1,3 +1,46 @@
+// Crate-level lint allows: see src/lib.rs for the rationale. The
+// iriumd binary inherits its own allow list because the lib-level
+// attributes don't apply to bin targets.
+#![allow(clippy::all)]
+#![allow(unused_must_use)]
+#![allow(clippy::manual_clamp)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::manual_is_multiple_of)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_unwrap_or_default)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::empty_line_after_doc_comments)]
+#![allow(clippy::empty_line_after_outer_attr)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::doc_overindented_list_items)]
+#![allow(clippy::len_without_is_empty)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::manual_range_contains)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::single_char_add_str)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::len_zero)]
+#![allow(clippy::redundant_clone)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::useless_vec)]
+#![allow(clippy::single_match)]
+#![allow(clippy::format_in_format_args)]
+#![allow(clippy::let_and_return)]
+#![allow(clippy::question_mark)]
+#![allow(clippy::redundant_closure)]
+#![allow(clippy::collapsible_else_if)]
+#![allow(clippy::collapsible_match)]
+#![allow(clippy::manual_strip)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::single_char_pattern)]
+#![allow(clippy::useless_conversion)]
+#![allow(dead_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -20,7 +63,6 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Utc;
-use hex;
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -28,7 +70,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower_http::cors::{Any, CorsLayer};
 
-use bs58;
 use get_if_addrs::get_if_addrs;
 use subtle::ConstantTimeEq;
 use irium_node_rs::activation::{
@@ -42,7 +83,7 @@ use irium_node_rs::block::{Block, BlockHeader};
 use irium_node_rs::chain::{
     block_from_locked, ChainParams, ChainState, HeaderWork, LwmaParams, OutPoint,
 };
-use irium_node_rs::constants::{block_reward, coinbase_maturity, COINBASE_MATURITY};
+use irium_node_rs::constants::{block_reward, coinbase_maturity};
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::{evict_invalid_mempool_entries, MempoolManager, MempoolPriority};
 use irium_node_rs::network::SeedlistManager;
@@ -78,7 +119,7 @@ use irium_node_rs::tx::{
     encode_htlc_btc_swap_refund_witness, encode_htlc_btc_swap_v1_script,
     encode_htlc_doge_swap_claim_witness, encode_htlc_doge_swap_refund_witness,
     encode_htlc_doge_swap_v1_script, parse_htlc_doge_swap_v1_script,
-    HtlcDogeSwapV1Output, HTLC_DOGE_SWAP_V1_SCRIPT_LEN,
+    HtlcDogeSwapV1Output,
     MAX_HTLC_DOGE_SWAP_CONFIRMATIONS, MIN_HTLC_DOGE_SWAP_CONFIRMATIONS,
     encode_doge_swap_order_cancel_witness,
     encode_doge_swap_order_expire_sweep_witness,
@@ -93,7 +134,7 @@ use irium_node_rs::tx::{
     encode_ltc_swap_order_fill_buy_witness, encode_ltc_swap_order_fill_sell_witness,
     encode_ltc_swap_order_script, parse_htlc_ltc_swap_v1_script,
     parse_ltc_swap_order_script,
-    HtlcLtcSwapV1Output, LtcSwapOrderOutput, HTLC_LTC_SWAP_V1_SCRIPT_LEN,
+    HtlcLtcSwapV1Output, LtcSwapOrderOutput,
     LTC_SWAP_ORDER_DIRECTION_BUY, LTC_SWAP_ORDER_DIRECTION_SELL,
     LTC_SWAP_ORDER_MAX_SWEEP_FEE, LTC_SWAP_ORDER_MIN_LOCKED_VALUE,
     MAX_HTLC_LTC_SWAP_CONFIRMATIONS, MIN_HTLC_LTC_SWAP_CONFIRMATIONS,
@@ -116,7 +157,7 @@ use irium_node_rs::ltc_spv::{
     MAX_LTC_HEADERS_PER_BATCH,
 };
 use irium_node_rs::doge_spv::{
-    encode_doge_header_batch, DogeAnchor, DogeHeader, DogeHeaderEntry, DOGE_HEADER_BYTES,
+    encode_doge_header_batch, DogeAnchor, DogeHeader, DOGE_HEADER_BYTES,
     MAX_DOGE_HEADERS_PER_BATCH,
 };
 use irium_node_rs::wallet_store::{WalletKey, WalletManager, WalletMode};
@@ -310,7 +351,7 @@ async fn ws_handle_socket(mut socket: WebSocket, state: AppState, is_public_conn
                 match event_result {
                     Ok(json_arc) => {
                         if has_subscribed && !subscribed.is_empty() {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&*json_arc) {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_arc) {
                                 let et = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                 if !ws_event_matches(et, &subscribed) {
                                     continue;
@@ -328,7 +369,7 @@ async fn ws_handle_socket(mut socket: WebSocket, state: AppState, is_public_conn
                                 }
                             }
                         } else if is_public_conn {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&*json_arc) {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_arc) {
                                 let et = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                 if !ws_is_public_event(et) {
                                     continue;
@@ -362,11 +403,10 @@ async fn ws_handler(
     let token_required = std::env::var("IRIUM_RPC_TOKEN")
         .map(|t| !t.trim().is_empty())
         .unwrap_or(false);
-    if token_required && !ws_public {
-        if require_rpc_auth(&headers).is_err() {
+    if token_required && !ws_public
+        && require_rpc_auth(&headers).is_err() {
             return (StatusCode::UNAUTHORIZED, "Bearer token required").into_response();
         }
-    }
     let is_public_conn = ws_public && require_rpc_auth(&headers).is_err();
     ws.on_upgrade(move |socket| ws_handle_socket(socket, state, is_public_conn))
 }
@@ -394,7 +434,7 @@ async fn sse_handler(
                 match rx.recv().await {
                     Ok(json_arc) => {
                         if is_pub {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&*json_arc) {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_arc) {
                                 let et = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                 if !ws_is_public_event(et) {
                                     continue;
@@ -436,6 +476,13 @@ struct BestHeaderTipResponse {
     hash: String,
 }
 
+/// The only currency the IRIUM settlement layer recognises. Consensus
+/// enforces this via the `network_marker == "IRIUM"` check in
+/// `AgreementObject::validate()`; this constant gives the HTTP surface
+/// a single source of truth and lets wallet clients gate their UI on
+/// `currency == "IRM"` without parsing the agreement JSON.
+const SETTLEMENT_CURRENCY: &str = "IRM";
+
 #[derive(Serialize)]
 struct StatusResponse {
     height: u64,
@@ -464,6 +511,12 @@ struct StatusResponse {
     gap_healer_last_progress_ts: u64,
     gap_healer_last_filled_height: Option<u64>,
     gap_healer_pending_count: u64,
+    /// Current minimum fee rate in satoshis per serialised byte. Equal to
+    /// `ceil(mempool.min_fee_per_byte())`, floored at 1 - matches the
+    /// default `wallet_send` uses when no `fee_per_byte` override or
+    /// `fee_mode` is supplied. Wallets can read this directly without a
+    /// second call to `/rpc/fee_estimate`.
+    fee_rate_sat_per_byte: u64,
 }
 
 #[derive(Serialize)]
@@ -754,11 +807,19 @@ struct WalletUnlockRequest {
 #[derive(Deserialize)]
 struct WalletSendRequest {
     to_address: String,
-    amount: String,
+    /// Required when `send_max` is false / unset; ignored when `send_max` is true.
+    #[serde(default)]
+    amount: Option<String>,
     from_address: Option<String>,
     fee_mode: Option<String>,
     fee_per_byte: Option<u64>,
     coin_select: Option<String>,
+    /// Sweep every spendable UTXO from `from_address` (or the whole wallet
+    /// when `from_address` is None) to `to_address`, minus the fee. The fee
+    /// is `size_bytes * fee_per_byte`, floored at 10_000 sats so it always
+    /// clears the mempool minimum. `amount` and `coin_select` are ignored.
+    #[serde(default)]
+    send_max: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -955,6 +1016,8 @@ struct AgreementHashResponse {
 struct AgreementInspectResponse {
     agreement_hash: String,
     summary: AgreementSummary,
+    /// Always "IRM". The settlement layer is currency-locked at consensus.
+    currency: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1410,6 +1473,11 @@ struct WalletImportWifResponse {
 #[derive(Serialize)]
 struct WalletSeedResponse {
     seed_hex: String,
+}
+
+#[derive(Serialize)]
+struct WalletMnemonicResponse {
+    mnemonic: String,
 }
 
 #[derive(Serialize)]
@@ -2119,7 +2187,7 @@ fn base58_p2pkh_to_hash(addr: &str) -> Option<Vec<u8>> {
     }
     let (body, checksum) = data.split_at(data.len() - 4);
     let first = Sha256::digest(body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     if &second[0..4] != checksum {
         return None;
     }
@@ -2138,7 +2206,7 @@ fn base58_p2pkh_from_hash(pkh: &[u8; 20]) -> String {
     body.push(IRIUM_P2PKH_VERSION);
     body.extend_from_slice(pkh);
     let first = Sha256::digest(&body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     let checksum = &second[0..4];
     let mut full = body;
     full.extend_from_slice(checksum);
@@ -3553,6 +3621,12 @@ async fn status(
     let gap_healer_last_filled_height = storage::gap_healer_last_filled_height();
     let gap_healer_pending_count = storage::gap_healer_pending_count();
 
+    let fee_rate_sat_per_byte = {
+        let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        let raw = mempool.min_fee_per_byte().ceil() as u64;
+        if raw == 0 { 1 } else { raw }
+    };
+
     Ok(Json(StatusResponse {
         height,
         genesis_hash: state.genesis_hash.clone(),
@@ -3580,6 +3654,7 @@ async fn status(
         gap_healer_last_progress_ts,
         gap_healer_last_filled_height,
         gap_healer_pending_count,
+        fee_rate_sat_per_byte,
     }))
 }
 
@@ -4622,6 +4697,7 @@ async fn create_agreement(
     Ok(Json(AgreementInspectResponse {
         agreement_hash: summary.agreement_hash.clone(),
         summary,
+        currency: SETTLEMENT_CURRENCY,
     }))
 }
 
@@ -5816,6 +5892,25 @@ async fn wallet_export_seed(
     Ok(Json(WalletSeedResponse { seed_hex }))
 }
 
+/// GET /wallet/export_mnemonic — returns the BIP39 mnemonic stored in the
+/// unlocked wallet. Mirrors `wallet_export_seed`: requires the wallet to be
+/// unlocked, returns 400 if locked OR if the wallet has no mnemonic (WIF-
+/// imported or raw-seed-imported wallets). Used by the desktop wallet's
+/// Reveal Recovery Phrase flow on encrypted wallets, which can't reach the
+/// plaintext mnemonic field via the CLI's file-direct path.
+async fn wallet_export_mnemonic(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WalletMnemonicResponse>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+
+    let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+    let mnemonic = wallet.export_mnemonic().map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(WalletMnemonicResponse { mnemonic }))
+}
+
 async fn wallet_import_seed(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -5839,35 +5934,52 @@ async fn wallet_send(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumJson(req): AxumJson<WalletSendRequest>,
-) -> Result<Json<WalletSendResponse>, StatusCode> {
-    check_rate_with_auth(&state, &addr, &headers)?;
-    require_rpc_auth(&headers)?;
+) -> Result<Json<WalletSendResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // Helpers — surface a typed error body that the desktop wallet's
+    // wallet_send command can decode into a friendly user-facing message.
+    // The empty-body returns from the previous shape are what made the
+    // GUI's "HTTP 400 Bad Request" indistinguishable between "wallet
+    // locked", "insufficient funds", and "invalid address" — see issue
+    // report and the v1.0.74-era src-tauri wallet_send change for the
+    // call-site decode logic.
+    let bad = |reason: &str| -> (StatusCode, Json<serde_json::Value>) {
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": reason })))
+    };
+    let denied = |reason: &str| -> (StatusCode, Json<serde_json::Value>) {
+        (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": reason })))
+    };
+    let auth_err = |s: StatusCode| -> (StatusCode, Json<serde_json::Value>) {
+        (s, Json(serde_json::json!({})))
+    };
 
-    let amount = parse_irm(&req.amount).map_err(|_| StatusCode::BAD_REQUEST)?;
-    if amount == 0 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    check_rate_with_auth(&state, &addr, &headers).map_err(auth_err)?;
+    require_rpc_auth(&headers).map_err(auth_err)?;
+
+    // `amount` is parsed lazily — in send_max mode we ignore the value and
+    // compute it from total_inputs - fee after UTXO selection. In normal
+    // mode the parse + zero-check happens inside the else branch below.
+    let send_max = req.send_max.unwrap_or(false);
 
     let (keys, change_address) = {
         let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-        let keys = wallet.keys().map_err(|_| StatusCode::BAD_REQUEST)?;
+        let keys = wallet.keys().map_err(|_| bad("wallet_locked"))?;
         let change = if let Some(ref from) = req.from_address {
             from.clone()
         } else {
             wallet
                 .current_address()
-                .map_err(|_| StatusCode::BAD_REQUEST)?
+                .map_err(|_| bad("wallet_locked"))?
         };
         (keys, change)
     };
 
     if keys.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("wallet_locked"));
     }
 
     let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
     for key in keys {
-        let bytes = hex::decode(&key.pkh).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let bytes = hex::decode(&key.pkh).map_err(|_| bad("internal_keymap_error"))?;
         if bytes.len() != 20 {
             continue;
         }
@@ -5877,19 +5989,19 @@ async fn wallet_send(
     }
 
     if key_map.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("wallet_locked"));
     }
 
     let mut allowed: HashSet<[u8; 20]> = HashSet::new();
     if let Some(ref from_addr) = req.from_address {
-        let pkh = base58_p2pkh_to_hash(from_addr).ok_or(StatusCode::BAD_REQUEST)?;
+        let pkh = base58_p2pkh_to_hash(from_addr).ok_or_else(|| bad("invalid_address"))?;
         if pkh.len() != 20 {
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(bad("invalid_address"));
         }
         let mut arr = [0u8; 20];
         arr.copy_from_slice(&pkh);
         if !key_map.contains_key(&arr) {
-            return Err(StatusCode::FORBIDDEN);
+            return Err(denied("from_address_not_in_wallet"));
         }
         allowed.insert(arr);
     } else {
@@ -5898,14 +6010,14 @@ async fn wallet_send(
         }
     }
 
-    let change_vec = base58_p2pkh_to_hash(&change_address).ok_or(StatusCode::BAD_REQUEST)?;
+    let change_vec = base58_p2pkh_to_hash(&change_address).ok_or_else(|| bad("invalid_address"))?;
     if change_vec.len() != 20 {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("invalid_address"));
     }
     let mut change_pkh = [0u8; 20];
     change_pkh.copy_from_slice(&change_vec);
     if !key_map.contains_key(&change_pkh) {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(denied("change_address_not_in_wallet"));
     }
 
     let (mut utxos, tip_height) = {
@@ -5928,7 +6040,7 @@ async fn wallet_send(
     };
 
     if utxos.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("no_utxos"));
     }
 
     let coin_select = req.coin_select.as_deref().unwrap_or("largest");
@@ -5960,30 +6072,64 @@ async fn wallet_send(
         fee_per_byte = 1;
     }
 
-    let mut selected: Vec<WalletUtxo> = Vec::new();
-    let mut total = 0u64;
-    let mut fee = 0u64;
-    for utxo in utxos.iter() {
-        let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < coinbase_maturity() {
-            continue;
+    // UTXO selection. In send_max mode we take every spendable UTXO in
+    // `allowed`, then derive amount = total - fee with a 1-output tx (no
+    // change). In normal mode the existing greedy loop runs unchanged.
+    let (selected, total, mut fee, mut amount): (Vec<WalletUtxo>, u64, u64, u64) = if send_max {
+        let mut sel: Vec<WalletUtxo> = Vec::new();
+        let mut sum = 0u64;
+        for utxo in utxos.iter() {
+            let confirmations = tip_height.saturating_sub(utxo.height);
+            if utxo.is_coinbase && confirmations < coinbase_maturity() {
+                continue;
+            }
+            sel.push(utxo.clone());
+            sum = sum.saturating_add(utxo.output.value);
         }
-        selected.push(utxo.clone());
-        total = total.saturating_add(utxo.output.value);
-        let outputs = if total > amount { 2 } else { 1 };
-        fee = estimate_tx_size(selected.len(), outputs).saturating_mul(fee_per_byte);
-        if total >= amount.saturating_add(fee) {
-            break;
+        if sel.is_empty() {
+            return Err(bad("no_spendable_utxos"));
         }
-    }
+        let est_size = estimate_tx_size(sel.len(), 1);
+        let est_fee = est_size.saturating_mul(fee_per_byte).max(10_000);
+        if sum <= est_fee {
+            return Err(bad("insufficient_funds_for_fee"));
+        }
+        let amt = sum - est_fee;
+        (sel, sum, est_fee, amt)
+    } else {
+        let parsed_amount = {
+            let s = req.amount.as_deref().ok_or_else(|| bad("missing_amount"))?;
+            let v = parse_irm(s).map_err(|_| bad("invalid_amount"))?;
+            if v == 0 {
+                return Err(bad("invalid_amount"));
+            }
+            v
+        };
+        let mut sel: Vec<WalletUtxo> = Vec::new();
+        let mut sum = 0u64;
+        let mut f = 0u64;
+        for utxo in utxos.iter() {
+            let confirmations = tip_height.saturating_sub(utxo.height);
+            if utxo.is_coinbase && confirmations < coinbase_maturity() {
+                continue;
+            }
+            sel.push(utxo.clone());
+            sum = sum.saturating_add(utxo.output.value);
+            let outputs = if sum > parsed_amount { 2 } else { 1 };
+            f = estimate_tx_size(sel.len(), outputs).saturating_mul(fee_per_byte);
+            if sum >= parsed_amount.saturating_add(f) {
+                break;
+            }
+        }
+        if sum < parsed_amount.saturating_add(f) {
+            return Err(bad("insufficient_funds"));
+        }
+        (sel, sum, f, parsed_amount)
+    };
 
-    if total < amount.saturating_add(fee) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let to_vec = base58_p2pkh_to_hash(&req.to_address).ok_or(StatusCode::BAD_REQUEST)?;
+    let to_vec = base58_p2pkh_to_hash(&req.to_address).ok_or_else(|| bad("invalid_address"))?;
     if to_vec.len() != 20 {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(bad("invalid_address"));
     }
     let mut to_pkh = [0u8; 20];
     to_pkh.copy_from_slice(&to_vec);
@@ -6021,12 +6167,29 @@ async fn wallet_send(
     };
 
     for _ in 0..2 {
-        sign_wallet_inputs(&mut tx, &selected, &key_map)?;
+        sign_wallet_inputs(&mut tx, &selected, &key_map).map_err(auth_err)?;
         let size = tx.serialize().len() as u64;
-        let needed_fee = size.saturating_mul(fee_per_byte);
+        let needed_fee = if send_max {
+            size.saturating_mul(fee_per_byte).max(10_000)
+        } else {
+            size.saturating_mul(fee_per_byte)
+        };
         if needed_fee > fee {
             let extra = needed_fee - fee;
-            if change >= extra {
+            if send_max {
+                // No change output to shrink — absorb the extra fee from the
+                // recipient output. If even that is insufficient (pathological
+                // case where the signed size grew so much that the floored
+                // estimate underestimated by more than `amount`), reject.
+                if amount > extra {
+                    fee = needed_fee;
+                    amount -= extra;
+                    tx.outputs[0].value = amount;
+                    continue;
+                } else {
+                    return Err(bad("insufficient_funds_for_fee"));
+                }
+            } else if change >= extra {
                 fee = needed_fee;
                 change = change.saturating_sub(extra);
                 if tx.outputs.len() > 1 {
@@ -6039,7 +6202,7 @@ async fn wallet_send(
                 }
                 continue;
             } else {
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(bad("insufficient_funds"));
             }
         }
         break;
@@ -6049,15 +6212,27 @@ async fn wallet_send(
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain
             .calculate_fees(&tx)
-            .map_err(|_| StatusCode::BAD_REQUEST)?
+            .map_err(|_| bad("fee_calc_failed"))?
     };
 
     let raw = tx.serialize();
     let txid = tx.txid();
     let hex_txid = hex::encode(txid);
 
+    let raw_for_broadcast = raw.clone();
     let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
     if mempool.contains(&txid) {
+        // Duplicate of a tx already in our local mempool. Drop the lock,
+        // re-broadcast in case peers missed the first round, and tell the
+        // caller we didn't admit a new entry. Mirrors submit_tx.
+        drop(mempool);
+        if let Some(p2p) = state.p2p.clone() {
+            tokio::spawn(async move {
+                if let Err(e) = p2p.broadcast_tx(&raw_for_broadcast).await {
+                    eprintln!("wallet_send: rebroadcast_tx failed: {}", e);
+                }
+            });
+        }
         return Ok(Json(WalletSendResponse {
             txid: hex_txid,
             accepted: false,
@@ -6067,17 +6242,33 @@ async fn wallet_send(
         }));
     }
 
-    let accepted = match mempool.add_transaction(tx, raw, fee_checked) {
-        Ok(_) => true,
-        Err(e) => {
-            eprintln!("Failed to add tx to mempool: {}", e);
-            false
-        }
-    };
+    if let Err(e) = mempool.add_transaction(tx, raw, fee_checked) {
+        // Pre-fix this branch silently set `accepted: false` and returned
+        // 200 OK with a real-looking txid, so the desktop wallet reported
+        // "success" for txs the local mempool had actually rejected. Now
+        // we propagate the rejection so the GUI can show the actual
+        // reason (fee floor, dust, input conflict, etc.).
+        eprintln!("wallet_send: mempool reject reason={}", e);
+        return Err(bad(&format!("mempool_reject:{e}")));
+    }
+    drop(mempool);
+
+    // Broadcast the freshly admitted tx to peers so mining nodes actually
+    // see it. Mirrors submit_tx — pre-fix this call was missing, so wallet
+    // sends sat in the local iriumd's mempool forever, never reaching the
+    // mainnet nodes, and the GUI showed "success" but the tx never
+    // confirmed.
+    if let Some(p2p) = state.p2p.clone() {
+        tokio::spawn(async move {
+            if let Err(e) = p2p.broadcast_tx(&raw_for_broadcast).await {
+                eprintln!("wallet_send: broadcast_tx failed: {}", e);
+            }
+        });
+    }
 
     Ok(Json(WalletSendResponse {
         txid: hex_txid,
-        accepted,
+        accepted: true,
         fee: fee_checked,
         total_input: total,
         change,
@@ -6165,20 +6356,21 @@ fn parse_btc_display_hash(s: &str) -> Result<[u8; 32], String> {
     Ok(natural)
 }
 
-async fn submit_btc_headers(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<SubmitBtcHeadersRequest>,
-) -> Result<Json<SubmitBtcHeadersResponse>, (StatusCode, String)> {
+/// Core implementation of `/rpc/submitbtcheaders` shared between the HTTP
+/// handler and the in-process header-sync background task. Skips auth +
+/// rate-limit checks; callers must apply those themselves at the transport
+/// boundary. `peer_ip` is propagated to the mempool's per-IP rate
+/// accounting; the background task should pass `None`, the HTTP handler
+/// passes the caller's source IP.
+async fn submit_btc_headers_core(
+    state: &AppState,
+    req: SubmitBtcHeadersRequest,
+    peer_ip: Option<IpAddr>,
+) -> Result<SubmitBtcHeadersResponse, (StatusCode, String)> {
     let bad = |reason: &str| -> (StatusCode, String) {
         eprintln!("[submit_btc_headers] reject reason={}", reason);
         (StatusCode::BAD_REQUEST, reason.to_string())
     };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
 
     {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -6351,14 +6543,15 @@ async fn submit_btc_headers(
         if !mempool.contains(&txid) {
             // BtcHeaderBatch carrier tx: ZeroFeeAllowed so a BTC-only
             // buyer can extend the relay before their claim. peer_ip is
-            // the caller's RPC source; loopback bypasses the rate limit
-            // so the local operator and Tauri client are unthrottled.
+            // None for the in-process background task and Some(addr.ip())
+            // for HTTP callers; loopback bypasses the rate limit so the
+            // local operator and Tauri client are unthrottled.
             match mempool.add_transaction_with_priority(
                 tx.clone(),
                 raw_tx.clone(),
                 fee_checked,
                 MempoolPriority::ZeroFeeAllowed,
-                Some(addr.ip()),
+                peer_ip,
             ) {
                 Ok(_) => accepted = true,
                 Err(e) => {
@@ -6368,7 +6561,7 @@ async fn submit_btc_headers(
         }
     }
 
-    Ok(Json(SubmitBtcHeadersResponse {
+    Ok(SubmitBtcHeadersResponse {
         txid: txid_hex,
         accepted,
         headers_count: header_count as u32,
@@ -6376,7 +6569,21 @@ async fn submit_btc_headers(
         new_tip_height: None,
         fee: fee_checked,
         raw_tx_hex: hex::encode(raw_tx),
-    }))
+    })
+}
+
+async fn submit_btc_headers(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SubmitBtcHeadersRequest>,
+) -> Result<Json<SubmitBtcHeadersResponse>, (StatusCode, String)> {
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    submit_btc_headers_core(&state, req, Some(addr.ip()))
+        .await
+        .map(Json)
 }
 
 async fn btc_relay_tip(
@@ -6601,20 +6808,16 @@ struct LtcHeaderResponse {
     on_canonical_chain: Option<bool>,
 }
 
-async fn submit_ltc_headers(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<SubmitLtcHeadersRequest>,
-) -> Result<Json<SubmitLtcHeadersResponse>, (StatusCode, String)> {
+/// Core implementation of `/rpc/submitltcheaders` — see `submit_btc_headers_core`
+/// for the design rationale (auth + rate limit live at the transport layer).
+async fn submit_ltc_headers_core(
+    state: &AppState,
+    req: SubmitLtcHeadersRequest,
+) -> Result<SubmitLtcHeadersResponse, (StatusCode, String)> {
     let bad = |reason: &str| -> (StatusCode, String) {
         eprintln!("[submit_ltc_headers] reject reason={}", reason);
         (StatusCode::BAD_REQUEST, reason.to_string())
     };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
 
     {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -6794,7 +6997,7 @@ async fn submit_ltc_headers(
         }
     }
 
-    Ok(Json(SubmitLtcHeadersResponse {
+    Ok(SubmitLtcHeadersResponse {
         txid: txid_hex,
         accepted,
         headers_count: header_count as u32,
@@ -6802,7 +7005,19 @@ async fn submit_ltc_headers(
         new_tip_height: None,
         fee: fee_checked,
         raw_tx_hex: hex::encode(raw_tx),
-    }))
+    })
+}
+
+async fn submit_ltc_headers(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SubmitLtcHeadersRequest>,
+) -> Result<Json<SubmitLtcHeadersResponse>, (StatusCode, String)> {
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    submit_ltc_headers_core(&state, req).await.map(Json)
 }
 
 async fn ltc_relay_tip(
@@ -6854,20 +7069,16 @@ async fn ltc_relay_tip(
     }))
 }
 
-async fn submit_doge_headers(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<SubmitDogeHeadersRequest>,
-) -> Result<Json<SubmitDogeHeadersResponse>, (StatusCode, String)> {
+/// Core implementation of `/rpc/submitdogeheaders` — see `submit_btc_headers_core`
+/// for the design rationale (auth + rate limit live at the transport layer).
+async fn submit_doge_headers_core(
+    state: &AppState,
+    req: SubmitDogeHeadersRequest,
+) -> Result<SubmitDogeHeadersResponse, (StatusCode, String)> {
     let bad = |reason: &str| -> (StatusCode, String) {
         eprintln!("[submit_doge_headers] reject reason={}", reason);
         (StatusCode::BAD_REQUEST, reason.to_string())
     };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
 
     {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -7047,7 +7258,7 @@ async fn submit_doge_headers(
         }
     }
 
-    Ok(Json(SubmitDogeHeadersResponse {
+    Ok(SubmitDogeHeadersResponse {
         txid: txid_hex,
         accepted,
         headers_count: header_count as u32,
@@ -7055,7 +7266,19 @@ async fn submit_doge_headers(
         new_tip_height: None,
         fee: fee_checked,
         raw_tx_hex: hex::encode(raw_tx),
-    }))
+    })
+}
+
+async fn submit_doge_headers(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers_map: HeaderMap,
+    AxumJson(req): AxumJson<SubmitDogeHeadersRequest>,
+) -> Result<Json<SubmitDogeHeadersResponse>, (StatusCode, String)> {
+    check_rate_with_auth(&state, &addr, &headers_map)
+        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
+    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
+    submit_doge_headers_core(&state, req).await.map(Json)
 }
 
 async fn doge_relay_tip(
@@ -7288,7 +7511,7 @@ fn decode_btc_p2pkh_address(addr: &str) -> Option<[u8; 20]> {
     }
     let (body, checksum) = data.split_at(21);
     let first = Sha256::digest(body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     if &second[0..4] != checksum {
         return None;
     }
@@ -8145,7 +8368,7 @@ fn decode_ltc_p2pkh_address(addr: &str) -> Option<[u8; 20]> {
     }
     let (body, checksum) = data.split_at(21);
     let first = Sha256::digest(body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     if &second[0..4] != checksum {
         return None;
     }
@@ -8957,7 +9180,7 @@ fn decode_doge_p2pkh_address(addr: &str) -> Option<[u8; 20]> {
     }
     let (body, checksum) = data.split_at(21);
     let first = Sha256::digest(body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     if &second[0..4] != checksum {
         return None;
     }
@@ -10575,7 +10798,7 @@ async fn fill_swap_order(
                 .expected_hash
                 .ok_or_else(|| bad("buy_order_missing_expected_hash"))?;
             let sha = Sha256::digest(&pubkey);
-            let rip = ripemd::Ripemd160::digest(&sha);
+            let rip = ripemd::Ripemd160::digest(sha);
             let mut taker_refund_pkh = [0u8; 20];
             taker_refund_pkh.copy_from_slice(&rip);
             let htlc = HtlcV1Output {
@@ -12029,7 +12252,7 @@ async fn fill_ltc_swap_order(
                 .expected_hash
                 .ok_or_else(|| bad("buy_order_missing_expected_hash"))?;
             let sha = Sha256::digest(&pubkey);
-            let rip = ripemd::Ripemd160::digest(&sha);
+            let rip = ripemd::Ripemd160::digest(sha);
             let mut taker_refund_pkh = [0u8; 20];
             taker_refund_pkh.copy_from_slice(&rip);
             let htlc = HtlcV1Output {
@@ -13105,7 +13328,7 @@ async fn fill_doge_swap_order(
                 .expected_hash
                 .ok_or_else(|| bad("buy_order_missing_expected_hash"))?;
             let sha = Sha256::digest(&pubkey);
-            let rip = ripemd::Ripemd160::digest(&sha);
+            let rip = ripemd::Ripemd160::digest(sha);
             let mut taker_refund_pkh = [0u8; 20];
             taker_refund_pkh.copy_from_slice(&rip);
             let htlc = HtlcV1Output {
@@ -13829,7 +14052,7 @@ async fn list_policies_rpc(
             .list_all()
             .into_iter()
             .filter_map(|p| {
-                let expired = p.expires_at_height.map_or(false, |h| tip_height >= h);
+                let expired = p.expires_at_height.is_some_and(|h| tip_height >= h);
                 if active_only && expired {
                     return None;
                 }
@@ -14275,7 +14498,7 @@ async fn get_policy_rpc(
     let policy = store.get(&req.agreement_hash).cloned();
     let found = policy.is_some();
     let expires_at_height = policy.as_ref().and_then(|p| p.expires_at_height);
-    let expired = expires_at_height.map_or(false, |h| tip_height >= h);
+    let expired = expires_at_height.is_some_and(|h| tip_height >= h);
     Ok(Json(GetPolicyResponse {
         agreement_hash: req.agreement_hash,
         found,
@@ -15674,6 +15897,311 @@ async fn mempool_spent_by(
     }))
 }
 
+// =====================================================================
+// In-process header sync background tasks (replacing the standalone
+// `src/bin/{btc,ltc,doge}-header-sync.rs` binaries + their systemd
+// timers). One tokio task per chain, spawned from main() once the
+// corresponding `resolved_*_spv_relay_activation_height(network)`
+// returns `Some(_)`. Each task loops forever:
+//   1. Read relay tip + activation gate directly from ChainState
+//      (in-process, no HTTP, no auth).
+//   2. Fetch external-chain tip via the async helpers in
+//      `irium_node_rs::header_sync::{btc,ltc,doge}`.
+//   3. Compute target = net_tip - SAFETY_LAG; bail if up to date.
+//   4. Fetch the [relay_tip+1 ..= target] header range (max 144).
+//   5. Call the corresponding `submit_*_headers_core` directly.
+//   6. Sleep CYCLE_PERIOD_SECS (600 s) and repeat. First cycle runs
+//      immediately at startup — no initial 600 s wait.
+// =====================================================================
+
+use irium_node_rs::header_sync;
+
+fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
+    let act_height = match irium_node_rs::activation::resolved_btc_spv_relay_activation_height(network) {
+        Some(h) => h,
+        None => {
+            eprintln!(
+                "[header-sync/btc] activation gate is None on {:?}; not spawning",
+                network
+            );
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .user_agent("iriumd-btc-header-sync/1.0")
+            .timeout(std::time::Duration::from_secs(
+                header_sync::common::HTTP_TIMEOUT_SECS,
+            ))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[header-sync/btc] failed to build http client: {e}; thread exiting");
+                return;
+            }
+        };
+        loop {
+            match run_btc_header_sync_cycle(&state, &client, act_height).await {
+                Ok(outcome) => {
+                    eprintln!("[header-sync/btc] cycle ok: {outcome}");
+                }
+                Err(e) => {
+                    eprintln!("[header-sync/btc] cycle error: {e}");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                header_sync::common::CYCLE_PERIOD_SECS,
+            ))
+            .await;
+        }
+    });
+}
+
+fn maybe_spawn_ltc_header_sync(state: AppState, network: NetworkKind) {
+    let act_height = match irium_node_rs::activation::resolved_ltc_spv_relay_activation_height(network) {
+        Some(h) => h,
+        None => {
+            eprintln!(
+                "[header-sync/ltc] activation gate is None on {:?}; not spawning",
+                network
+            );
+            return;
+        }
+    };
+    let source = match header_sync::common::Source::from_env("IRIUM_LTC_HEADER_SYNC_SOURCE") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[header-sync/ltc] source detection failed: {e}; thread exiting");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .user_agent("iriumd-ltc-header-sync/1.0")
+            .timeout(std::time::Duration::from_secs(
+                header_sync::common::HTTP_TIMEOUT_SECS,
+            ))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[header-sync/ltc] failed to build http client: {e}; thread exiting");
+                return;
+            }
+        };
+        loop {
+            match run_ltc_header_sync_cycle(&state, &client, act_height, source).await {
+                Ok(outcome) => {
+                    eprintln!("[header-sync/ltc] cycle ok: {outcome}");
+                }
+                Err(e) => {
+                    eprintln!("[header-sync/ltc] cycle error: {e}");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                header_sync::common::CYCLE_PERIOD_SECS,
+            ))
+            .await;
+        }
+    });
+}
+
+fn maybe_spawn_doge_header_sync(state: AppState, network: NetworkKind) {
+    let act_height = match irium_node_rs::activation::resolved_doge_spv_relay_activation_height(network) {
+        Some(h) => h,
+        None => {
+            eprintln!(
+                "[header-sync/doge] activation gate is None on {:?}; not spawning",
+                network
+            );
+            return;
+        }
+    };
+    let source = match header_sync::common::Source::from_env("IRIUM_DOGE_HEADER_SYNC_SOURCE") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[header-sync/doge] source detection failed: {e}; thread exiting");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .user_agent("iriumd-doge-header-sync/1.0")
+            .timeout(std::time::Duration::from_secs(
+                header_sync::common::HTTP_TIMEOUT_SECS,
+            ))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[header-sync/doge] failed to build http client: {e}; thread exiting");
+                return;
+            }
+        };
+        loop {
+            match run_doge_header_sync_cycle(&state, &client, act_height, source).await {
+                Ok(outcome) => {
+                    eprintln!("[header-sync/doge] cycle ok: {outcome}");
+                }
+                Err(e) => {
+                    eprintln!("[header-sync/doge] cycle error: {e}");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                header_sync::common::CYCLE_PERIOD_SECS,
+            ))
+            .await;
+        }
+    });
+}
+
+async fn run_btc_header_sync_cycle(
+    state: &AppState,
+    client: &reqwest::Client,
+    act_height: u64,
+) -> Result<String, String> {
+    let (relay_tip, gate_open) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let open = chain.height >= act_height;
+        (chain.btc_tip_height, open)
+    };
+    if !gate_open {
+        return Ok("gate_closed".to_string());
+    }
+    let btc_net_tip = header_sync::btc::fetch_btc_net_tip(client).await?;
+    if btc_net_tip <= header_sync::common::SAFETY_LAG {
+        return Err(format!(
+            "btc network tip {btc_net_tip} <= safety lag {}; refusing to submit",
+            header_sync::common::SAFETY_LAG
+        ));
+    }
+    let target = btc_net_tip - header_sync::common::SAFETY_LAG;
+    if relay_tip >= target {
+        return Ok(format!(
+            "up_to_date relay_tip={relay_tip} btc_net={btc_net_tip} target={target}"
+        ));
+    }
+    let start = relay_tip + 1;
+    let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
+    let headers_hex = header_sync::btc::fetch_btc_headers(client, start, end).await?;
+    let fee = header_sync::common::env_u64("BTC_HEADER_SYNC_FEE_PER_BYTE", 100);
+    let req = SubmitBtcHeadersRequest {
+        headers_hex,
+        broadcast: Some(true),
+        fee_per_byte: Some(fee),
+    };
+    let resp = submit_btc_headers_core(state, req, None)
+        .await
+        .map_err(|(sc, msg)| format!("submit failed: status={sc} reason={msg}"))?;
+    Ok(format!(
+        "submitted count={} txid={} accepted={}",
+        resp.headers_count, resp.txid, resp.accepted
+    ))
+}
+
+async fn run_ltc_header_sync_cycle(
+    state: &AppState,
+    client: &reqwest::Client,
+    act_height: u64,
+    source: header_sync::common::Source,
+) -> Result<String, String> {
+    let (relay_tip, gate_open) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let open = chain.height >= act_height;
+        (chain.ltc_tip_height, open)
+    };
+    if !gate_open {
+        return Ok("gate_closed".to_string());
+    }
+    let ltc_net_tip = header_sync::ltc::fetch_ltc_net_tip(client, source).await?;
+    if source == header_sync::common::Source::Mainnet
+        && ltc_net_tip <= header_sync::common::SAFETY_LAG
+    {
+        return Err(format!(
+            "ltc network tip {ltc_net_tip} <= safety lag {}; refusing to submit",
+            header_sync::common::SAFETY_LAG
+        ));
+    }
+    let target = match source {
+        header_sync::common::Source::Mainnet => ltc_net_tip - header_sync::common::SAFETY_LAG,
+        header_sync::common::Source::Regtest => ltc_net_tip,
+    };
+    if relay_tip >= target {
+        return Ok(format!(
+            "up_to_date relay_tip={relay_tip} ltc_net={ltc_net_tip} target={target} source={source:?}"
+        ));
+    }
+    let start = relay_tip + 1;
+    let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
+    let headers_hex =
+        header_sync::ltc::fetch_ltc_headers(client, source, start, end).await?;
+    let fee = header_sync::common::env_u64("LTC_HEADER_SYNC_FEE_PER_BYTE", 100);
+    let req = SubmitLtcHeadersRequest {
+        headers_hex,
+        broadcast: Some(true),
+        fee_per_byte: Some(fee),
+    };
+    let resp = submit_ltc_headers_core(state, req)
+        .await
+        .map_err(|(sc, msg)| format!("submit failed: status={sc} reason={msg}"))?;
+    Ok(format!(
+        "submitted count={} txid={} accepted={} source={source:?}",
+        resp.headers_count, resp.txid, resp.accepted
+    ))
+}
+
+async fn run_doge_header_sync_cycle(
+    state: &AppState,
+    client: &reqwest::Client,
+    act_height: u64,
+    source: header_sync::common::Source,
+) -> Result<String, String> {
+    let (relay_tip, gate_open) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let open = chain.height >= act_height;
+        (chain.doge_tip_height, open)
+    };
+    if !gate_open {
+        return Ok("gate_closed".to_string());
+    }
+    let doge_net_tip = header_sync::doge::fetch_doge_net_tip(client, source).await?;
+    if source == header_sync::common::Source::Mainnet
+        && doge_net_tip <= header_sync::common::SAFETY_LAG
+    {
+        return Err(format!(
+            "doge network tip {doge_net_tip} <= safety lag {}; refusing to submit",
+            header_sync::common::SAFETY_LAG
+        ));
+    }
+    let target = match source {
+        header_sync::common::Source::Mainnet => doge_net_tip - header_sync::common::SAFETY_LAG,
+        header_sync::common::Source::Regtest => doge_net_tip,
+    };
+    if relay_tip >= target {
+        return Ok(format!(
+            "up_to_date relay_tip={relay_tip} doge_net={doge_net_tip} target={target} source={source:?}"
+        ));
+    }
+    let start = relay_tip + 1;
+    let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
+    let headers_hex =
+        header_sync::doge::fetch_doge_headers(client, source, start, end).await?;
+    let fee = header_sync::common::env_u64("DOGE_HEADER_SYNC_FEE_PER_BYTE", 100);
+    let req = SubmitDogeHeadersRequest {
+        headers_hex,
+        broadcast: Some(true),
+        fee_per_byte: Some(fee),
+    };
+    let resp = submit_doge_headers_core(state, req)
+        .await
+        .map_err(|(sc, msg)| format!("submit failed: status={sc} reason={msg}"))?;
+    Ok(format!(
+        "submitted count={} txid={} accepted={} source={source:?}",
+        resp.headers_count, resp.txid, resp.accepted
+    ))
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
     // Install ring as the default rustls crypto provider before any TLS code runs.
@@ -15956,7 +16484,7 @@ async fn main() {
     let default_seed_port: u16 = std::env::var("IRIUM_P2P_BIND").ok()
         .or_else(|| node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.clone()))
         .as_deref()
-        .and_then(|b| b.split(':').last())
+        .and_then(|b| b.split(':').next_back())
         .and_then(|p| p.parse().ok())
         .unwrap_or(0);
 
@@ -16142,7 +16670,7 @@ async fn main() {
                             println!("{}", line);
                         }
                         if let Err(e) = node_c.connect_and_handshake(addr, height, &agent_c).await {
-                            let msg = format!("{}", e);
+                            let msg = e.to_string();
                             if !msg.contains("dial backoff") && !msg.contains("dial in progress") {
                                 if let Some(suppressed) = dial_seed_log_allowed(1, addr.ip()) {
                                     let mut line = format!(
@@ -16250,10 +16778,10 @@ async fn main() {
                     node_clone.peer_count(),
                 )
                 .await
-                .unwrap_or_else(|_| peers.len());
+                .unwrap_or(peers.len());
                 maintenance_ticks = maintenance_ticks.wrapping_add(1);
                 // Emergency reconnect when 0 peers; also routine reconnect every 30s.
-                if current_peer_count == 0 || maintenance_ticks % 6 == 0 {
+                if current_peer_count == 0 || maintenance_ticks.is_multiple_of(6) {
                     let maintenance_node = node_clone.clone();
                     tokio::spawn(async move {
                         let _ = tokio::time::timeout(
@@ -16397,7 +16925,7 @@ async fn main() {
                 // `best_peer == local` (cap bug, handshake bug, network partition that
                 // dissolves with the rest of the chain ahead, etc.) would silently strand
                 // the node at its current tip until manual intervention.
-                let periodic_probe = hb_ticks > 0 && hb_ticks % 12 == 0;
+                let periodic_probe = hb_ticks > 0 && hb_ticks.is_multiple_of(12);
                 if need_sync_burst || periodic_probe {
                     let min_gap = if need_sync_burst {
                         std::time::Duration::from_secs(10)
@@ -16418,7 +16946,7 @@ async fn main() {
                 }
 
                 // Periodic sync status line to diagnose stalls quickly.
-                if hb_ticks % 6 == 0 {
+                if hb_ticks.is_multiple_of(6) {
                     let ahead = sync_target_height.saturating_sub(local_height);
                     eprintln!(
                         "[{}] [🔁 sync] status local={} best_header={} best_peer={} ahead={} peers={} inflight(getheaders)={} inflight(getblocks)={} handshake_failures={}",
@@ -16434,7 +16962,7 @@ async fn main() {
                     );
                 }
 
-                if hb_ticks % 12 == 0 {
+                if hb_ticks.is_multiple_of(12) {
                     let prev = last_peer_summary.unwrap_or(peer_dbg);
                     let delta_attempts = peer_dbg
                         .outbound_dial_attempts_total
@@ -16762,6 +17290,15 @@ async fn main() {
         resolvers_index: Arc::new(Mutex::new(load_all_resolvers_at_startup())),
     };
 
+    // Spawn the in-process header-sync background tasks. Each one no-ops
+    // (and logs once) when the corresponding `resolved_*_spv_relay_activation_height`
+    // is `None` on the running network — so devnet / dev nodes pay nothing
+    // for chains they haven't enabled. Replaces the standalone
+    // src/bin/{btc,ltc,doge}-header-sync.rs binaries + systemd timers.
+    maybe_spawn_btc_header_sync(app_state.clone(), network);
+    maybe_spawn_ltc_header_sync(app_state.clone(), network);
+    maybe_spawn_doge_header_sync(app_state.clone(), network);
+
     // Background task: emit block.new events when chain height advances.
     {
         let block_event_tx = event_tx.clone();
@@ -17068,7 +17605,7 @@ async fn main() {
                     if status == "open" {
                         if let Some(th) = timeout_height {
                             if tip_height >= th {
-                                if let Some(mut new_val) = serde_json::from_str::<serde_json::Value>(&data).ok() {
+                                if let Ok(mut new_val) = serde_json::from_str::<serde_json::Value>(&data) {
                                     if let Some(obj) = new_val.as_object_mut() {
                                         obj.insert("status".to_string(), serde_json::json!("expired"));
                                     }
@@ -17100,7 +17637,7 @@ async fn main() {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
                                         .to_string();
-                                    if let Some(mut new_val) = serde_json::from_str::<serde_json::Value>(&data).ok() {
+                                    if let Ok(mut new_val) = serde_json::from_str::<serde_json::Value>(&data) {
                                         if let Some(obj) = new_val.as_object_mut() {
                                             obj.insert("status".to_string(), serde_json::json!("open"));
                                             obj.remove("agreement_id");
@@ -17858,6 +18395,7 @@ async fn explorer_stats(
         .route("/wallet/export_wif", get(wallet_export_wif))
         .route("/wallet/import_wif", post(wallet_import_wif))
         .route("/wallet/export_seed", get(wallet_export_seed))
+        .route("/wallet/export_mnemonic", get(wallet_export_mnemonic))
         .route("/wallet/import_seed", post(wallet_import_seed))
         .route("/wallet/send", post(wallet_send))
         .route("/explorer/agreements", get(explorer_agreements))
@@ -24380,7 +24918,7 @@ mod tests {
             .as_bytes()
             .to_vec();
         let sha = Sha256::digest(&pk);
-        let rip = ripemd::Ripemd160::digest(&sha);
+        let rip = ripemd::Ripemd160::digest(sha);
         let mut pkh = [0u8; 20];
         pkh.copy_from_slice(&rip);
         base58_p2pkh_from_hash(&pkh)
@@ -25649,6 +26187,209 @@ mod tests {
         assert_eq!(result.err().unwrap(), StatusCode::CONFLICT);
         let _ = std::fs::remove_file(&path);
     }
+
+    // wallet_send send_max tests. Each one builds a fresh AppState via
+    // create_test_state, parks a single UTXO on the sender address, then
+    // exercises wallet_send with send_max in various shapes.
+
+    #[tokio::test]
+    async fn wallet_send_send_max_drains_address_with_floored_fee() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+        let (state, sender, recipient, _refund) = create_test_state(None);
+        // 1 IRM = 100_000_000 sats. With one input + one output the size
+        // estimate is 10 + 148 + 34 = 192 bytes; at fee_per_byte=1 the raw
+        // fee (192 sat) is below the 10_000 sat floor, so fee must be 10_000.
+        add_wallet_utxo(&state, &sender, 100_000_000);
+
+        let req = WalletSendRequest {
+            to_address: recipient.clone(),
+            amount: None,
+            from_address: Some(sender.clone()),
+            fee_mode: None,
+            fee_per_byte: Some(1),
+            coin_select: None,
+            send_max: Some(true),
+        };
+        let resp = wallet_send(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(req),
+        )
+        .await
+        .expect("wallet_send")
+        .0;
+
+        assert!(resp.accepted);
+        assert_eq!(resp.fee, 10_000);
+        assert_eq!(resp.total_input, 100_000_000);
+        assert_eq!(resp.change, 0);
+    }
+
+    #[tokio::test]
+    async fn wallet_send_send_max_uses_actual_fee_when_above_floor() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+        let (state, sender, recipient, _refund) = create_test_state(None);
+        add_wallet_utxo(&state, &sender, 100_000_000);
+
+        // fee_per_byte=100 → at least 100 * 192 = 19_200 sat, comfortably
+        // above the 10_000 sat floor. The 2-pass loop may bump this if the
+        // actual signed size differs, so we assert >= 19_200 not ==.
+        let req = WalletSendRequest {
+            to_address: recipient.clone(),
+            amount: None,
+            from_address: Some(sender.clone()),
+            fee_mode: None,
+            fee_per_byte: Some(100),
+            coin_select: None,
+            send_max: Some(true),
+        };
+        let resp = wallet_send(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(req),
+        )
+        .await
+        .expect("wallet_send")
+        .0;
+
+        assert!(resp.accepted);
+        assert!(resp.fee >= 19_200, "fee {} should clear raw estimate", resp.fee);
+        assert_eq!(resp.total_input, 100_000_000);
+        assert_eq!(resp.change, 0);
+        // amount = total - fee; no change output.
+        assert!(resp.fee <= 100_000_000);
+    }
+
+    #[tokio::test]
+    async fn wallet_send_send_max_rejects_when_balance_below_fee_floor() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+        let (state, sender, recipient, _refund) = create_test_state(None);
+        // 5 000 sats is below the 10 000 sat send_max fee floor.
+        add_wallet_utxo(&state, &sender, 5_000);
+
+        let req = WalletSendRequest {
+            to_address: recipient.clone(),
+            amount: None,
+            from_address: Some(sender.clone()),
+            fee_mode: None,
+            fee_per_byte: Some(1),
+            coin_select: None,
+            send_max: Some(true),
+        };
+        let result = wallet_send(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(req),
+        )
+        .await;
+
+        let err = result.err().expect("expected error");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = err.1.0;
+        assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("insufficient_funds_for_fee"));
+    }
+
+    #[tokio::test]
+    async fn wallet_send_send_max_returns_no_spendable_utxos_when_empty() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+        let (state, sender, recipient, _refund) = create_test_state(None);
+        // Intentionally no UTXOs added.
+
+        let req = WalletSendRequest {
+            to_address: recipient.clone(),
+            amount: None,
+            from_address: Some(sender.clone()),
+            fee_mode: None,
+            fee_per_byte: Some(1),
+            coin_select: None,
+            send_max: Some(true),
+        };
+        let result = wallet_send(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(req),
+        )
+        .await;
+
+        let err = result.err().expect("expected error");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = err.1.0;
+        // wallet_send rejects at the empty-UTXO step before reaching the
+        // send_max branch when from_address has nothing in chain.utxos.
+        let reason = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            reason == "no_utxos" || reason == "no_spendable_utxos",
+            "unexpected error: {}",
+            reason
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_send_without_send_max_requires_amount() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+        let (state, sender, recipient, _refund) = create_test_state(None);
+        add_wallet_utxo(&state, &sender, 100_000_000);
+
+        let req = WalletSendRequest {
+            to_address: recipient.clone(),
+            amount: None,
+            from_address: Some(sender.clone()),
+            fee_mode: None,
+            fee_per_byte: Some(1),
+            coin_select: None,
+            send_max: None,
+        };
+        let result = wallet_send(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(req),
+        )
+        .await;
+
+        let err = result.err().expect("expected error");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = err.1.0;
+        assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("missing_amount"));
+    }
+
+    #[tokio::test]
+    async fn wallet_send_without_send_max_preserves_existing_behaviour() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+        let (state, sender, recipient, _refund) = create_test_state(None);
+        // 1 IRM available; send 0.5 IRM and expect change > 0.
+        add_wallet_utxo(&state, &sender, 100_000_000);
+
+        let req = WalletSendRequest {
+            to_address: recipient.clone(),
+            amount: Some("0.50000000".to_string()),
+            from_address: Some(sender.clone()),
+            fee_mode: None,
+            fee_per_byte: Some(1),
+            coin_select: None,
+            send_max: None,
+        };
+        let resp = wallet_send(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(req),
+        )
+        .await
+        .expect("wallet_send")
+        .0;
+
+        assert!(resp.accepted);
+        assert_eq!(resp.total_input, 100_000_000);
+        // Change goes back to sender (it's the change_address when from_address is set).
+        assert!(resp.change > 0, "expected change output, got {}", resp.change);
+        // Standard fee_per_byte=1 with no floor: tiny fee (~250 sat range).
+        assert!(resp.fee < 10_000, "non-send_max fee should not be floored: {}", resp.fee);
+    }
 }
 
 
@@ -26205,7 +26946,7 @@ fn verify_envelope_signature(
     let mut sha = Sha256::new();
     sha.update(&pubkey_bytes);
     let sha_out = sha.finalize();
-    let rip = ripemd::Ripemd160::digest(&sha_out);
+    let rip = ripemd::Ripemd160::digest(sha_out);
     let mut pkh = [0u8; 20];
     pkh.copy_from_slice(&rip);
     let derived_address = base58_p2pkh_from_hash(&pkh);
@@ -27373,15 +28114,14 @@ async fn reresolve_agreement(
     ];
     let mut pair_valid = false;
     for (a, b) in pairs {
-        if sa_addr == a && sb_addr == b {
-            if verify_envelope_signature(&req.nomination.party_a_signature, &digest, &a).is_ok()
+        if sa_addr == a && sb_addr == b
+            && verify_envelope_signature(&req.nomination.party_a_signature, &digest, &a).is_ok()
                 && verify_envelope_signature(&req.nomination.party_b_signature, &digest, &b)
                     .is_ok()
             {
                 pair_valid = true;
                 break;
             }
-        }
     }
     if !pair_valid {
         return Err(bad("co_signatures_invalid"));

@@ -317,7 +317,7 @@ impl WalletManager {
         // Defensive: if the legacy file had a seed but next_index was
         // zero, infer next_index from the keys array length so future
         // derivations don't collide with existing addresses.
-        if plain.next_index == 0 && plain.keys.len() > 0 {
+        if plain.next_index == 0 && !plain.keys.is_empty() {
             plain.next_index = plain.keys.len() as u32;
         }
 
@@ -571,6 +571,23 @@ impl WalletManager {
         Ok(seed)
     }
 
+    /// Return the BIP39 mnemonic phrase stored in the unlocked wallet. Mirrors
+    /// `export_seed` — the wallet must be unlocked and must have a mnemonic
+    /// (WIF-imported or raw-seed-imported wallets carry no mnemonic and will
+    /// surface "no mnemonic stored in wallet"). The mnemonic is preserved
+    /// across encrypt/decrypt cycles via the WalletPlain.mnemonic field.
+    pub fn export_mnemonic(&mut self) -> Result<String, String> {
+        self.ensure_unlocked()?;
+        let mnemonic = self
+            .state
+            .unlocked
+            .as_ref()
+            .and_then(|w| w.mnemonic.clone())
+            .ok_or_else(|| "no mnemonic stored in wallet".to_string())?;
+        self.touch();
+        Ok(mnemonic)
+    }
+
     pub fn import_seed(&mut self, seed_hex: &str, force: bool) -> Result<WalletKey, String> {
         self.ensure_unlocked()?;
         let passphrase = self
@@ -657,7 +674,7 @@ fn encrypt_wallet(passphrase: &str, plain: &WalletPlain) -> Result<WalletFile, S
     #[allow(deprecated)]
     let nonce_ga = Nonce::from_slice(&nonce);
     let ciphertext = cipher
-        .encrypt(&nonce_ga, payload.as_ref())
+        .encrypt(nonce_ga, payload.as_ref())
         .map_err(|e| e.to_string())?;
     Ok(WalletFile {
         version: WALLET_VERSION,
@@ -718,7 +735,7 @@ fn load_wallet(path: &Path) -> Result<WalletFile, String> {
 
 fn hash160(data: &[u8]) -> [u8; 20] {
     let sha = Sha256::digest(data);
-    let rip = Ripemd160::digest(&sha);
+    let rip = Ripemd160::digest(sha);
     let mut out = [0u8; 20];
     out.copy_from_slice(&rip);
     out
@@ -729,7 +746,7 @@ fn base58_p2pkh_from_hash(pkh: &[u8; 20]) -> String {
     body.push(IRIUM_P2PKH_VERSION);
     body.extend_from_slice(pkh);
     let first = Sha256::digest(&body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     let checksum = &second[0..4];
     let mut full = body;
     full.extend_from_slice(checksum);
@@ -743,7 +760,7 @@ fn base58check_decode(input: &str) -> Option<Vec<u8>> {
     }
     let (payload, check) = data.split_at(data.len() - 4);
     let first = Sha256::digest(payload);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     if &second[0..4] != check {
         return None;
     }
@@ -758,7 +775,7 @@ fn secret_to_wif(secret: &[u8; 32], compressed: bool) -> String {
         payload.push(0x01);
     }
     let first = Sha256::digest(&payload);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     let mut full = payload;
     full.extend_from_slice(&second[0..4]);
     bs58::encode(full).into_string()
@@ -1170,7 +1187,7 @@ mod tests {
         // Lock and re-unlock to confirm the round-trip.
         mgr.lock();
         mgr.unlock("legacy-pass").unwrap();
-        assert!(mgr.addresses().unwrap().len() >= 1);
+        assert!(!mgr.addresses().unwrap().is_empty());
         cleanup(&path);
     }
 

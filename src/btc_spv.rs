@@ -22,7 +22,9 @@ use crate::activation::{
     resolved_btc_spv_relay_activation_height, NetworkKind, MAINNET_BTC_ANCHOR_BITS,
     MAINNET_BTC_ANCHOR_HASH, MAINNET_BTC_ANCHOR_HEIGHT, MAINNET_BTC_ANCHOR_TIME,
 };
-use crate::pow::{meets_target, meets_target_btc, sha256d, Target};
+#[cfg(test)]
+use crate::pow::meets_target;
+use crate::pow::{meets_target_btc, sha256d, Target};
 
 /// Output script tag for a Bitcoin header batch.
 pub const BTC_HEADER_BATCH_TAG: u8 = 0xc4;
@@ -404,7 +406,7 @@ fn expected_bits_for_v(
             .ok_or_else(|| "expected_bits: parent unknown".to_string())?;
         (e.header.bits, e.header.time)
     };
-    if height % BTC_RETARGET_INTERVAL != 0 {
+    if !height.is_multiple_of(BTC_RETARGET_INTERVAL) {
         return Ok(parent_bits);
     }
     let first_height = height - BTC_RETARGET_INTERVAL;

@@ -716,6 +716,64 @@ curl -X POST http://localhost:38300/rpc/submit_tx \
 
 ---
 
+## Fees
+
+All `iriumd` wallet endpoints compute the tx fee as:
+
+```
+fee = size_bytes * fee_per_byte
+```
+
+`size_bytes` is the serialised length of the signed transaction (10-byte
+header + ~148 bytes per input + ~34 bytes per output). The node uses a
+two-pass signing loop so the recorded fee equals the actual fee paid to
+the miner.
+
+### `fee_per_byte` resolution
+
+In order of precedence:
+
+1. **Request field `fee_per_byte: u64`** - explicit override.
+2. **Request field `fee_mode: "low" | "normal" | "high"`** - multiplies
+   the mempool minimum by `1x` / `2x` / `4x`.
+3. **Mempool minimum** - `ceil(mempool.min_fee_per_byte())`, floored
+   at 1.
+
+The currently-active mempool minimum is also surfaced as
+`fee_rate_sat_per_byte` on every `GET /status` response so wallets can
+poll a single endpoint for chain tip + fee rate together.
+
+### Fee floor for `send_max`
+
+`POST /wallet/send` with `send_max: true` overrides the user-supplied
+`amount` and sends every spendable UTXO from `from_address` (or the
+whole wallet when `from_address` is omitted) minus the network fee.
+In this mode the fee is computed as:
+
+```
+fee = max(size_bytes * fee_per_byte, 10 000 sats)
+```
+
+The 10 000 sat floor guarantees the resulting transaction clears the
+mempool minimum on every IRIUM node, even for tiny inputs. If the
+total selected balance is at or below this fee, the call returns
+`400 Bad Request` with body `{"error":"insufficient_funds_for_fee"}`.
+
+### Where the fee goes
+
+| Fee component | Set by | Paid to | On-chain enforcement |
+|---|---|---|---|
+| Transaction fee | Sender (`fee_per_byte` / `fee_mode` / floor for send_max) | Block miner | Mempool minimum + consensus tx-fee check |
+| Resolver fee | Agreement author (`primary_resolver_fee` / `fallback_resolver_fee` on the `AgreementObject`) | Resolver address (winner branch only) | Wallet builds the spend-tx output split; chain enforces tx integrity. See `SETTLEMENT-DEV.md` for the dispute system. |
+| Attestor bond | Attestor (`irium-wallet attestor-register --bond N`) | Locked in the attestor's own wallet; slashable on contradictory proofs | OP_RETURN `bond1:<pkh>:<atoms>` anchors the declaration; `slash1:` anchors any slash. Cooldown >= 1 000 blocks before `bond1w:` withdrawal. |
+
+The settlement currency is hard-coded to `"IRM"`. The
+`POST /rpc/inspectagreement` response surfaces this as a
+`currency` field; consensus enforces it via the
+`network_marker == "IRIUM"` check in `AgreementObject::validate()`.
+
+---
+
 ## Marketplace
 
 ### `GET /offers/feed`

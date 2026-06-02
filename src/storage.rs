@@ -348,7 +348,7 @@ fn base58_p2pkh_from_hash(pkh: &[u8; 20]) -> String {
     body.push(IRIUM_P2PKH_VERSION);
     body.extend_from_slice(pkh);
     let first = Sha256::digest(&body);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     let checksum = &second[0..4];
     let mut full = body;
     full.extend_from_slice(checksum);

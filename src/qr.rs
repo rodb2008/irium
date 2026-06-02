@@ -29,7 +29,7 @@ pub fn render_ascii(data: &str) -> Result<String, String> {
                 out.push_str("  ");
             }
         }
-        out.push_str("\n");
+        out.push('\n');
     }
     Ok(out)
 }

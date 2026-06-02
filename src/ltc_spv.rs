@@ -47,8 +47,10 @@ use crate::scrypt_pow::meets_target_ltc;
 // declared there and reused across the codebase).
 pub use crate::activation::{
     MAINNET_LTC_ANCHOR_BITS, MAINNET_LTC_ANCHOR_HASH_DISPLAY, MAINNET_LTC_ANCHOR_HEIGHT,
-    MAINNET_LTC_ANCHOR_TIME, MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT,
+    MAINNET_LTC_ANCHOR_TIME,
 };
+#[cfg(test)]
+use crate::activation::MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT;
 
 /// Output script tag reserved for a Litecoin header batch. Consensus
 /// dispatch is wired in a later phase once governance assigns an
@@ -516,7 +518,7 @@ fn expected_bits_for_v(
             .ok_or_else(|| "expected_bits: parent unknown".to_string())?;
         (e.header.bits, e.header.time)
     };
-    if height % params.window != 0 {
+    if !height.is_multiple_of(params.window) {
         return Ok(parent_bits);
     }
     let first_height = height - params.window;
@@ -1078,7 +1080,7 @@ mod tests {
             nonce: 0,
         };
         let oversize: Vec<LtcHeader> =
-            std::iter::repeat(dummy).take(MAX_LTC_HEADERS_PER_BATCH as usize + 1).collect();
+            std::iter::repeat_n(dummy, MAX_LTC_HEADERS_PER_BATCH as usize + 1).collect();
         let mut headers_db = HashMap::new();
         let mut heights_db = HashMap::new();
         let mut tip = None;
