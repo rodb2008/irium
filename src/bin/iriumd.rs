@@ -794,11 +794,19 @@ struct WalletUnlockRequest {
 #[derive(Deserialize)]
 struct WalletSendRequest {
     to_address: String,
-    amount: String,
+    /// Required when `send_max` is false / unset; ignored when `send_max` is true.
+    #[serde(default)]
+    amount: Option<String>,
     from_address: Option<String>,
     fee_mode: Option<String>,
     fee_per_byte: Option<u64>,
     coin_select: Option<String>,
+    /// Sweep every spendable UTXO from `from_address` (or the whole wallet
+    /// when `from_address` is None) to `to_address`, minus the fee. The fee
+    /// is `size_bytes * fee_per_byte`, floored at 10_000 sats so it always
+    /// clears the mempool minimum. `amount` and `coin_select` are ignored.
+    #[serde(default)]
+    send_max: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -5924,10 +5932,10 @@ async fn wallet_send(
     check_rate_with_auth(&state, &addr, &headers).map_err(auth_err)?;
     require_rpc_auth(&headers).map_err(auth_err)?;
 
-    let amount = parse_irm(&req.amount).map_err(|_| bad("invalid_amount"))?;
-    if amount == 0 {
-        return Err(bad("invalid_amount"));
-    }
+    // `amount` is parsed lazily — in send_max mode we ignore the value and
+    // compute it from total_inputs - fee after UTXO selection. In normal
+    // mode the parse + zero-check happens inside the else branch below.
+    let send_max = req.send_max.unwrap_or(false);
 
     let (keys, change_address) = {
         let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
@@ -6041,26 +6049,60 @@ async fn wallet_send(
         fee_per_byte = 1;
     }
 
-    let mut selected: Vec<WalletUtxo> = Vec::new();
-    let mut total = 0u64;
-    let mut fee = 0u64;
-    for utxo in utxos.iter() {
-        let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < coinbase_maturity() {
-            continue;
+    // UTXO selection. In send_max mode we take every spendable UTXO in
+    // `allowed`, then derive amount = total - fee with a 1-output tx (no
+    // change). In normal mode the existing greedy loop runs unchanged.
+    let (selected, total, mut fee, mut amount): (Vec<WalletUtxo>, u64, u64, u64) = if send_max {
+        let mut sel: Vec<WalletUtxo> = Vec::new();
+        let mut sum = 0u64;
+        for utxo in utxos.iter() {
+            let confirmations = tip_height.saturating_sub(utxo.height);
+            if utxo.is_coinbase && confirmations < coinbase_maturity() {
+                continue;
+            }
+            sel.push(utxo.clone());
+            sum = sum.saturating_add(utxo.output.value);
         }
-        selected.push(utxo.clone());
-        total = total.saturating_add(utxo.output.value);
-        let outputs = if total > amount { 2 } else { 1 };
-        fee = estimate_tx_size(selected.len(), outputs).saturating_mul(fee_per_byte);
-        if total >= amount.saturating_add(fee) {
-            break;
+        if sel.is_empty() {
+            return Err(bad("no_spendable_utxos"));
         }
-    }
-
-    if total < amount.saturating_add(fee) {
-        return Err(bad("insufficient_funds"));
-    }
+        let est_size = estimate_tx_size(sel.len(), 1);
+        let est_fee = est_size.saturating_mul(fee_per_byte).max(10_000);
+        if sum <= est_fee {
+            return Err(bad("insufficient_funds_for_fee"));
+        }
+        let amt = sum - est_fee;
+        (sel, sum, est_fee, amt)
+    } else {
+        let parsed_amount = {
+            let s = req.amount.as_deref().ok_or_else(|| bad("missing_amount"))?;
+            let v = parse_irm(s).map_err(|_| bad("invalid_amount"))?;
+            if v == 0 {
+                return Err(bad("invalid_amount"));
+            }
+            v
+        };
+        let mut sel: Vec<WalletUtxo> = Vec::new();
+        let mut sum = 0u64;
+        let mut f = 0u64;
+        for utxo in utxos.iter() {
+            let confirmations = tip_height.saturating_sub(utxo.height);
+            if utxo.is_coinbase && confirmations < coinbase_maturity() {
+                continue;
+            }
+            sel.push(utxo.clone());
+            sum = sum.saturating_add(utxo.output.value);
+            let outputs = if sum > parsed_amount { 2 } else { 1 };
+            f = estimate_tx_size(sel.len(), outputs).saturating_mul(fee_per_byte);
+            if sum >= parsed_amount.saturating_add(f) {
+                break;
+            }
+        }
+        if sum < parsed_amount.saturating_add(f) {
+            return Err(bad("insufficient_funds"));
+        }
+        (sel, sum, f, parsed_amount)
+    };
 
     let to_vec = base58_p2pkh_to_hash(&req.to_address).ok_or_else(|| bad("invalid_address"))?;
     if to_vec.len() != 20 {
@@ -6104,10 +6146,27 @@ async fn wallet_send(
     for _ in 0..2 {
         sign_wallet_inputs(&mut tx, &selected, &key_map).map_err(auth_err)?;
         let size = tx.serialize().len() as u64;
-        let needed_fee = size.saturating_mul(fee_per_byte);
+        let needed_fee = if send_max {
+            size.saturating_mul(fee_per_byte).max(10_000)
+        } else {
+            size.saturating_mul(fee_per_byte)
+        };
         if needed_fee > fee {
             let extra = needed_fee - fee;
-            if change >= extra {
+            if send_max {
+                // No change output to shrink — absorb the extra fee from the
+                // recipient output. If even that is insufficient (pathological
+                // case where the signed size grew so much that the floored
+                // estimate underestimated by more than `amount`), reject.
+                if amount > extra {
+                    fee = needed_fee;
+                    amount -= extra;
+                    tx.outputs[0].value = amount;
+                    continue;
+                } else {
+                    return Err(bad("insufficient_funds_for_fee"));
+                }
+            } else if change >= extra {
                 fee = needed_fee;
                 change = change.saturating_sub(extra);
                 if tx.outputs.len() > 1 {
@@ -26104,6 +26163,209 @@ mod tests {
         .await;
         assert_eq!(result.err().unwrap(), StatusCode::CONFLICT);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // wallet_send send_max tests. Each one builds a fresh AppState via
+    // create_test_state, parks a single UTXO on the sender address, then
+    // exercises wallet_send with send_max in various shapes.
+
+    #[tokio::test]
+    async fn wallet_send_send_max_drains_address_with_floored_fee() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+        let (state, sender, recipient, _refund) = create_test_state(None);
+        // 1 IRM = 100_000_000 sats. With one input + one output the size
+        // estimate is 10 + 148 + 34 = 192 bytes; at fee_per_byte=1 the raw
+        // fee (192 sat) is below the 10_000 sat floor, so fee must be 10_000.
+        add_wallet_utxo(&state, &sender, 100_000_000);
+
+        let req = WalletSendRequest {
+            to_address: recipient.clone(),
+            amount: None,
+            from_address: Some(sender.clone()),
+            fee_mode: None,
+            fee_per_byte: Some(1),
+            coin_select: None,
+            send_max: Some(true),
+        };
+        let resp = wallet_send(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(req),
+        )
+        .await
+        .expect("wallet_send")
+        .0;
+
+        assert!(resp.accepted);
+        assert_eq!(resp.fee, 10_000);
+        assert_eq!(resp.total_input, 100_000_000);
+        assert_eq!(resp.change, 0);
+    }
+
+    #[tokio::test]
+    async fn wallet_send_send_max_uses_actual_fee_when_above_floor() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+        let (state, sender, recipient, _refund) = create_test_state(None);
+        add_wallet_utxo(&state, &sender, 100_000_000);
+
+        // fee_per_byte=100 → at least 100 * 192 = 19_200 sat, comfortably
+        // above the 10_000 sat floor. The 2-pass loop may bump this if the
+        // actual signed size differs, so we assert >= 19_200 not ==.
+        let req = WalletSendRequest {
+            to_address: recipient.clone(),
+            amount: None,
+            from_address: Some(sender.clone()),
+            fee_mode: None,
+            fee_per_byte: Some(100),
+            coin_select: None,
+            send_max: Some(true),
+        };
+        let resp = wallet_send(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(req),
+        )
+        .await
+        .expect("wallet_send")
+        .0;
+
+        assert!(resp.accepted);
+        assert!(resp.fee >= 19_200, "fee {} should clear raw estimate", resp.fee);
+        assert_eq!(resp.total_input, 100_000_000);
+        assert_eq!(resp.change, 0);
+        // amount = total - fee; no change output.
+        assert!(resp.fee <= 100_000_000);
+    }
+
+    #[tokio::test]
+    async fn wallet_send_send_max_rejects_when_balance_below_fee_floor() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+        let (state, sender, recipient, _refund) = create_test_state(None);
+        // 5 000 sats is below the 10 000 sat send_max fee floor.
+        add_wallet_utxo(&state, &sender, 5_000);
+
+        let req = WalletSendRequest {
+            to_address: recipient.clone(),
+            amount: None,
+            from_address: Some(sender.clone()),
+            fee_mode: None,
+            fee_per_byte: Some(1),
+            coin_select: None,
+            send_max: Some(true),
+        };
+        let result = wallet_send(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(req),
+        )
+        .await;
+
+        let err = result.err().expect("expected error");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = err.1.0;
+        assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("insufficient_funds_for_fee"));
+    }
+
+    #[tokio::test]
+    async fn wallet_send_send_max_returns_no_spendable_utxos_when_empty() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+        let (state, sender, recipient, _refund) = create_test_state(None);
+        // Intentionally no UTXOs added.
+
+        let req = WalletSendRequest {
+            to_address: recipient.clone(),
+            amount: None,
+            from_address: Some(sender.clone()),
+            fee_mode: None,
+            fee_per_byte: Some(1),
+            coin_select: None,
+            send_max: Some(true),
+        };
+        let result = wallet_send(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(req),
+        )
+        .await;
+
+        let err = result.err().expect("expected error");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = err.1.0;
+        // wallet_send rejects at the empty-UTXO step before reaching the
+        // send_max branch when from_address has nothing in chain.utxos.
+        let reason = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            reason == "no_utxos" || reason == "no_spendable_utxos",
+            "unexpected error: {}",
+            reason
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_send_without_send_max_requires_amount() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+        let (state, sender, recipient, _refund) = create_test_state(None);
+        add_wallet_utxo(&state, &sender, 100_000_000);
+
+        let req = WalletSendRequest {
+            to_address: recipient.clone(),
+            amount: None,
+            from_address: Some(sender.clone()),
+            fee_mode: None,
+            fee_per_byte: Some(1),
+            coin_select: None,
+            send_max: None,
+        };
+        let result = wallet_send(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(req),
+        )
+        .await;
+
+        let err = result.err().expect("expected error");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = err.1.0;
+        assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("missing_amount"));
+    }
+
+    #[tokio::test]
+    async fn wallet_send_without_send_max_preserves_existing_behaviour() {
+        std::env::remove_var("IRIUM_RPC_TOKEN");
+        let (state, sender, recipient, _refund) = create_test_state(None);
+        // 1 IRM available; send 0.5 IRM and expect change > 0.
+        add_wallet_utxo(&state, &sender, 100_000_000);
+
+        let req = WalletSendRequest {
+            to_address: recipient.clone(),
+            amount: Some("0.50000000".to_string()),
+            from_address: Some(sender.clone()),
+            fee_mode: None,
+            fee_per_byte: Some(1),
+            coin_select: None,
+            send_max: None,
+        };
+        let resp = wallet_send(
+            ConnectInfo(test_socket()),
+            State(state),
+            HeaderMap::new(),
+            AxumJson(req),
+        )
+        .await
+        .expect("wallet_send")
+        .0;
+
+        assert!(resp.accepted);
+        assert_eq!(resp.total_input, 100_000_000);
+        // Change goes back to sender (it's the change_address when from_address is set).
+        assert!(resp.change > 0, "expected change output, got {}", resp.change);
+        // Standard fee_per_byte=1 with no floor: tiny fee (~250 sat range).
+        assert!(resp.fee < 10_000, "non-send_max fee should not be floored: {}", resp.fee);
     }
 }
 
