@@ -15949,6 +15949,22 @@ fn spawn_mempool_rebroadcast(state: AppState) {
     });
 }
 
+/// Module-scope helper used by both `spawn_offer_rebroadcast` and the in-main
+/// offer handlers. Resolves the local offers feed directory in this precedence:
+/// `IRIUM_OFFERS_DIR` env var > `IRIUM_DATA_DIR/offers` > `$HOME/.irium/offers`.
+fn offers_feed_dir() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("IRIUM_OFFERS_DIR") {
+        return std::path::PathBuf::from(path);
+    }
+    let data_dir = if let Ok(path) = std::env::var("IRIUM_DATA_DIR") {
+        std::path::PathBuf::from(path)
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        std::path::PathBuf::from(home).join(".irium")
+    };
+    data_dir.join("offers")
+}
+
 /// Periodic background task: re-broadcasts all locally-stored open offers to
 /// currently-connected peers every 120 seconds. Unlike the session-scoped
 /// offer watcher (which suppresses re-announcement after the first broadcast),
@@ -15965,20 +15981,7 @@ fn spawn_offer_rebroadcast(state: AppState) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-            // Inlined copy of `offers_feed_dir()` — that helper is a local
-            // fn inside `async fn main()` so it isn't visible from this
-            // module-scope task. Keep both in sync.
-            let dir: std::path::PathBuf = if let Ok(path) = std::env::var("IRIUM_OFFERS_DIR") {
-                std::path::PathBuf::from(path)
-            } else {
-                let data_dir = if let Ok(path) = std::env::var("IRIUM_DATA_DIR") {
-                    std::path::PathBuf::from(path)
-                } else {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-                    std::path::PathBuf::from(home).join(".irium")
-                };
-                data_dir.join("offers")
-            };
+            let dir = offers_feed_dir();
             let entries = match std::fs::read_dir(&dir) {
                 Ok(e) => e,
                 Err(_) => continue,
@@ -17946,19 +17949,6 @@ fn process_received_offer_take(payload_json: &str, event_tx: &EventTx) -> Result
         "via": "p2p",
     }));
     Ok(())
-}
-
-fn offers_feed_dir() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("IRIUM_OFFERS_DIR") {
-        return std::path::PathBuf::from(path);
-    }
-    let data_dir = if let Ok(path) = std::env::var("IRIUM_DATA_DIR") {
-        std::path::PathBuf::from(path)
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        std::path::PathBuf::from(home).join(".irium")
-    };
-    data_dir.join("offers")
 }
 
 fn offers_feed_limit() -> usize {
