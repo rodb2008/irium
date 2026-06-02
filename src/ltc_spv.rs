@@ -898,10 +898,11 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_activation_is_none_pending_governance() {
-        assert!(
-            MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT.is_none(),
-            "LTC SPV must stay disabled on mainnet until governance flips this constant"
+    fn mainnet_activation_set_to_25000() {
+        assert_eq!(
+            MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT,
+            Some(25_000),
+            "LTC SPV mainnet activation height is set to 25_000"
         );
     }
 
