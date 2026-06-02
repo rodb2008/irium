@@ -15916,6 +15916,98 @@ async fn mempool_spent_by(
 
 use irium_node_rs::header_sync;
 
+/// Periodic background task: re-broadcasts every unconfirmed transaction in
+/// the local mempool to all currently-connected peers every 60 seconds.
+/// Fixes the case where a tx was created while no peers were connected; the
+/// next tick will catch it once peers reconnect. Best-effort: errors are
+/// logged but do not abort the loop.
+fn spawn_mempool_rebroadcast(state: AppState) {
+    let p2p = match state.p2p.clone() {
+        Some(n) => n,
+        None => {
+            eprintln!("[mempool-rebroadcast] P2P is disabled; not spawning");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let raw_txs: Vec<Vec<u8>> = {
+                let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+                mempool.iter_entries().map(|(_, entry)| entry.raw.clone()).collect()
+            };
+            if raw_txs.is_empty() {
+                continue;
+            }
+            eprintln!("[mempool-rebroadcast] rebroadcasting {} mempool tx(s)", raw_txs.len());
+            for raw in &raw_txs {
+                if let Err(e) = p2p.broadcast_tx(raw).await {
+                    eprintln!("[mempool-rebroadcast] broadcast_tx error: {e}");
+                }
+            }
+        }
+    });
+}
+
+/// Periodic background task: re-broadcasts all locally-stored open offers to
+/// currently-connected peers every 120 seconds. Unlike the session-scoped
+/// offer watcher (which suppresses re-announcement after the first broadcast),
+/// this timer re-announces unconditionally, covering peers that joined after
+/// initial creation.
+fn spawn_offer_rebroadcast(state: AppState) {
+    let p2p = match state.p2p.clone() {
+        Some(n) => n,
+        None => {
+            eprintln!("[offer-rebroadcast] P2P is disabled; not spawning");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            // Inlined copy of `offers_feed_dir()` — that helper is a local
+            // fn inside `async fn main()` so it isn't visible from this
+            // module-scope task. Keep both in sync.
+            let dir: std::path::PathBuf = if let Ok(path) = std::env::var("IRIUM_OFFERS_DIR") {
+                std::path::PathBuf::from(path)
+            } else {
+                let data_dir = if let Ok(path) = std::env::var("IRIUM_DATA_DIR") {
+                    std::path::PathBuf::from(path)
+                } else {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+                    std::path::PathBuf::from(home).join(".irium")
+                };
+                data_dir.join("offers")
+            };
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let mut to_broadcast: Vec<String> = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.extension().map(|e| e == "json").unwrap_or(false) { continue; }
+                let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !filename.starts_with("offer-") || !filename.ends_with(".json") { continue; }
+                let data = match std::fs::read_to_string(&path) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let status = serde_json::from_str::<serde_json::Value>(&data)
+                    .ok()
+                    .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s.to_string()));
+                if status.as_deref() != Some("open") { continue; }
+                to_broadcast.push(data);
+            }
+            if to_broadcast.is_empty() { continue; }
+            eprintln!("[offer-rebroadcast] rebroadcasting {} open offer(s)", to_broadcast.len());
+            for json in &to_broadcast {
+                p2p.broadcast_offer(json).await;
+            }
+        }
+    });
+}
+
 fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
     let act_height = match irium_node_rs::activation::resolved_btc_spv_relay_activation_height(network) {
         Some(h) => h,
@@ -17298,6 +17390,8 @@ async fn main() {
     maybe_spawn_btc_header_sync(app_state.clone(), network);
     maybe_spawn_ltc_header_sync(app_state.clone(), network);
     maybe_spawn_doge_header_sync(app_state.clone(), network);
+    spawn_mempool_rebroadcast(app_state.clone());
+    spawn_offer_rebroadcast(app_state.clone());
 
     // Background task: emit block.new events when chain height advances.
     {
