@@ -38,12 +38,12 @@ SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.
 
 | Parameter | Value |
 |-----------|-------|
-| Current node version | `v1.9.32` (latest tag; v1.9.28 introduced settlement Groups C-H, FIX #128 P2P reputation hygiene, and FIX 2a hard-fork code; v1.9.29-v1.9.32 added GPU-miner and pool-Stratum fixes) |
-| Desktop app version | [`v1.0.42`](https://github.com/iriumlabs/irium-core/releases/latest) (bundles the latest v1.9.x sidecar binaries) |
+| Current node version | `v1.9.49` (latest tag; v1.9.28 introduced settlement Groups C-H, FIX #128 P2P reputation hygiene, and FIX 2a hard-fork code; v1.9.29-v1.9.32 added GPU-miner and pool-Stratum fixes; later releases added BTC atomic swap activation, LWMA v2 rollout, V2 block-time fork, and the periodic mempool/offer rebroadcast timers) |
+| Desktop app version | [`v1.0.77`](https://github.com/iriumlabs/irium-core/releases/latest) (bundles the latest v1.9.x sidecar binaries) |
 | Consensus algorithm | SHA-256d proof of work |
-| Block target interval | 600 s (10 min) |
-| Difficulty adjustment | LWMA (60-block window; LWMA v2 — 30-block window — wired but inactive until rolled forward) |
-| Block reward | 50 IRM during the Early Miner Era; halves every 210,000 blocks |
+| Block target interval | 120 s (2 min) — V2 block time, active since block 24,250 (V1 600 s target before the fork) |
+| Difficulty adjustment | LWMA v2 (30-block window) — active since block 19,740 |
+| Block reward | 50 IRM during the Early Miner Era; halves every 1,050,000 blocks |
 | AuxPoW merged mining | Activates at block 26,500 (still pending; current tip ≈ 22,500) |
 | Fix 2a hard fork (Bitcoin-standard header serialization) | Activates at block 23,500 — **all nodes must upgrade to v1.9.28 before this height** |
 | Total supply cap | 100,000,000 IRM (96.5M mineable + 3.5M genesis CLTV vest) |
@@ -53,6 +53,8 @@ SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.
 | `/status` lightweight port | 8080 (loopback only by default) |
 | Official pool — CPU/GPU | `stratum+tcp://pool.iriumlabs.org:3335` |
 | Official pool — ASIC | `stratum+tcp://pool.iriumlabs.org:3333` |
+| Official pool — firewall bypass | `stratum+tcp://pool.iriumlabs.org:443` (sslh-multiplexed; for environments blocking high ports) |
+| Official pool — solo | `stratum+tcp://pool.iriumlabs.org:3336` (full 50 IRM coinbase payout directly to the block finder; 0% pool fee) |
 | Public pool stats proxy | `http://pool.iriumlabs.org:3337/stats` |
 
 ---
@@ -81,6 +83,8 @@ SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.
 | BIP32/BIP39 key derivation | Live |
 | Multisig (2-of-2, 2-of-3) | Live |
 | Confidential agreements | Live |
+| BTC atomic swaps (SPV-verified, no custodian) | Live since block 23,850 |
+| LTC / DOGE atomic swaps | Coming soon |
 | Desktop / web / mobile wallet | Desktop wallet (`irium-core`) shipping; web / mobile in development |
 
 ---
@@ -91,7 +95,7 @@ SHA-256d consensus. No premine. No admin keys. 100,000,000 IRM total supply (96.
 
 Download the latest installer for Windows, macOS, or Linux from
 [https://github.com/iriumlabs/irium-core/releases/latest](https://github.com/iriumlabs/irium-core/releases/latest).
-The app bundles the v1.9.28 sidecars, runs the node + wallet + miner in one
+The app bundles the v1.9.49 sidecars, runs the node + wallet + miner in one
 window, and ships pool client + marketplace + settlement Hub.
 
 The CLI options below are for power users, server operators, and developers.

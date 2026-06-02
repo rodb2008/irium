@@ -523,7 +523,7 @@ preference to integrated Intel iGPUs.
 | Flag | Description |
 |------|-------------|
 | `--wallet <addr>` | Mining/payout address (same as `IRIUM_MINER_ADDRESS`) |
-| `--pool <url>` | Stratum URL (e.g. `stratum+tcp://pool.iriumlabs.org:3335`). When set, the miner runs in pool mode and ignores `--rpc`. |
+| `--pool <url>` | Stratum URL (e.g. `stratum+tcp://pool.iriumlabs.org:3335` for CPU/GPU, `:3333` for ASIC, `:443` for firewall bypass, `:3336` for solo with 0% pool fee). When set, the miner runs in pool mode and ignores `--rpc`. |
 | `--rpc <url>` | Solo-mode node RPC URL (default `http://127.0.0.1:38300`) |
 | `--platform <n\|name>` | OpenCL platform index, or vendor substring (`nvidia`, `amd`, `intel`). Default: auto, prefers NVIDIA / AMD. |
 | `--device <n>` | Device index within the selected platform (default `0`) |

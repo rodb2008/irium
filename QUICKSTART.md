@@ -55,7 +55,7 @@ shown.
 
 The chain activates Bitcoin-standard block-header serialization at **block
 23,500** (Fix 2a). **You must be on iriumd v1.9.28 or newer (latest tag is
-v1.9.32; the latest Irium Core desktop app bundles it) before this block
+v1.9.49; the latest Irium Core desktop app bundles it) before this block
 is mined.** Older versions will fork off from the canonical chain. Check
 the current tip against the activation height with
 `curl http://127.0.0.1:38300/status | jq '.height'`; if your `height` is
@@ -231,6 +231,7 @@ Pool mining splits the reward across many miners so you get small payments regul
 | CPU or GPU | `stratum+tcp://pool.iriumlabs.org:3335` |
 | ASIC | `stratum+tcp://pool.iriumlabs.org:3333` |
 | Behind ISP that blocks 3333/3335 (notably China) | `stratum+tcp://pool.iriumlabs.org:443` — same Stratum protocol on the HTTPS port to bypass filtering |
+| Solo (full 50 IRM coinbase to block finder, 0% pool fee) | `stratum+tcp://pool.iriumlabs.org:3336` |
 
 For the bundled GPU miner:
 
@@ -305,7 +306,7 @@ irium-wallet offer-create \
   --price-note "Software licence — delivered as download link"
 ```
 
-Replace `<YOUR_ADDRESS>` with one of your addresses from Step 3. The `--timeout` is the block height deadline (current height plus blocks to wait; ~10 minutes per block).
+Replace `<YOUR_ADDRESS>` with one of your addresses from Step 3. The `--timeout` is the block height deadline (current height plus blocks to wait; ~2 minutes per block at the V2 block-time target, active since block 24,250).
 
 **What you will see:**
 
