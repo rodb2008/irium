@@ -16082,12 +16082,20 @@ fn spawn_offer_rebroadcast(state: AppState) {
         }
     };
     tokio::spawn(async move {
+        // Initial warmup so the first re-broadcast lands AFTER outbound
+        // peer dial has had a chance to complete on freshly-started NAT
+        // nodes. Without this the first rebroadcast happens 120 s in,
+        // which used to be the only catch when the 5 s offer-watcher
+        // wasted its single shot against zero peers at T=5 s.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
             let dir = offers_feed_dir();
             let entries = match std::fs::read_dir(&dir) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                    continue;
+                }
             };
             let mut to_broadcast: Vec<String> = Vec::new();
             for entry in entries.flatten() {
@@ -16105,11 +16113,13 @@ fn spawn_offer_rebroadcast(state: AppState) {
                 if status.as_deref() != Some("open") { continue; }
                 to_broadcast.push(data);
             }
-            if to_broadcast.is_empty() { continue; }
-            eprintln!("[offer-rebroadcast] rebroadcasting {} open offer(s)", to_broadcast.len());
-            for json in &to_broadcast {
-                p2p.broadcast_offer(json).await;
+            if !to_broadcast.is_empty() {
+                eprintln!("[offer-rebroadcast] rebroadcasting {} open offer(s)", to_broadcast.len());
+                for json in &to_broadcast {
+                    p2p.broadcast_offer(json).await;
+                }
             }
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         }
     });
 }
@@ -17889,10 +17899,21 @@ async fn main() {
                 // loop. Mark each as announced only after broadcast_offer
                 // returns so a panic/early-return doesn't leave us in a
                 // half-announced state that would skip retry next tick.
+                //
+                // Startup-race fix: also gate `announced` on peers > 0. On
+                // freshly-started NAT iriumd, peer dial takes 10-30 s; the
+                // 5 s watcher used to fire against zero peers, mark the
+                // offer announced for the session, and leave us waiting
+                // for the 120 s rebroadcast loop. Retrying every 5 s until
+                // at least one peer is up costs essentially nothing and
+                // closes that gap entirely.
                 if let Some(ref p2p) = watcher_p2p {
+                    let peer_count = p2p.peers_snapshot().await.len();
                     for (id, json) in to_broadcast {
                         p2p.broadcast_offer(&json).await;
-                        broadcast_announced.insert(id);
+                        if peer_count > 0 {
+                            broadcast_announced.insert(id);
+                        }
                     }
                 }
             }
