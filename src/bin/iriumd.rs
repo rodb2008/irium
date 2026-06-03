@@ -15608,6 +15608,54 @@ async fn get_block_template(
             true
         });
     }
+    // Consensus enforces at-most-one of each header-batch carrier per block
+    // (chain.rs: 'block contains more than one {Btc,Ltc,Doge}HeaderBatch
+    // output'). The mempool can hold many in transit when peers re-gossip
+    // stale carriers after an iriumd restart, so the template builder must
+    // filter — otherwise the pool stuffs all of them into a block and
+    // submit_block rejects, stalling production network-wide. Keep the
+    // highest-fee carrier of each chain (ordered_entries is fee-per-byte
+    // desc) and drop the rest.
+    {
+        let mut btc_seen = false;
+        let mut ltc_seen = false;
+        let mut doge_seen = false;
+        mempool_entries.retain(|e| {
+            let mut has_btc = false;
+            let mut has_ltc = false;
+            let mut has_doge = false;
+            for out in &e.tx.outputs {
+                if parse_btc_header_batch(&out.script_pubkey).is_ok() {
+                    has_btc = true;
+                }
+                if parse_ltc_header_batch(&out.script_pubkey).is_ok() {
+                    has_ltc = true;
+                }
+                if parse_doge_header_batch(&out.script_pubkey).is_ok() {
+                    has_doge = true;
+                }
+            }
+            if has_btc && btc_seen {
+                return false;
+            }
+            if has_ltc && ltc_seen {
+                return false;
+            }
+            if has_doge && doge_seen {
+                return false;
+            }
+            if has_btc {
+                btc_seen = true;
+            }
+            if has_ltc {
+                ltc_seen = true;
+            }
+            if has_doge {
+                doge_seen = true;
+            }
+            true
+        });
+    }
     let mempool_count = mempool_entries.len();
     let mut total_fees = 0u64;
     let txs = mempool_entries
