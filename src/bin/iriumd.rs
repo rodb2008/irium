@@ -15739,16 +15739,22 @@ async fn get_block_template(
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             if let Some(c) = btc_cached {
+                // v1.9.63: freshness is age-only. Removed the strict
+                // expected_relay_tip_height == chain.btc_tip_height
+                // check that was wedging injection after the first
+                // post-activation block (cycle stored relay_tip=X,
+                // apply moved chain to X+144, all subsequent template
+                // requests saw mismatch and skipped until next cycle
+                // 10min later). apply_btc_header_batch is robust:
+                // entirely-known headers no-op via v1.9.52 idempotency;
+                // partially-applied or disconnected fail-fast for that
+                // single block, the cycle re-fetches on the next tick.
                 let fresh = c
                     .built_at
                     .elapsed()
                     .map(|d| d.as_secs() <= COINBASE_BATCH_CACHE_TTL_SECS)
                     .unwrap_or(false);
-                let live = {
-                    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-                    chain.btc_tip_height
-                };
-                if fresh && live == c.expected_relay_tip_height {
+                if fresh {
                     if let Ok(raw) = hex::decode(c.headers_hex.trim()) {
                         if !raw.is_empty() && raw.len() % BTC_HEADER_BYTES == 0 {
                             let mut headers: Vec<BtcHeader> = Vec::new();
@@ -15774,14 +15780,86 @@ async fn get_block_template(
                     }
                 }
             }
-            // LTC + DOGE injection DISABLED (v1.9.62 hotfix).
-            // Cold-start cycle fetches headers from height 1 which don't
-            // connect to the mainnet anchors (LTC ~2.5M / DOGE ~6.2M).
-            // Every pool block with these carriers fails
-            // apply_*_header_batch and is rejected, stalling production.
-            // Re-enable in v1.9.63 once the cycle uses
-            // max(relay_tip, anchor.height) + 1 as start so the first
-            // cached headers chain from the anchor.
+            // LTC — v1.9.63: re-enabled after the cycle started flooring
+            // start at max(relay_tip, anchor.height) + 1 (see
+            // run_ltc_header_sync_cycle); cached LTC headers now connect
+            // from the mainnet anchor on cold start. Freshness check is
+            // age-only (same relaxation as BTC above).
+            let ltc_cached = state
+                .ltc_template_headers_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(c) = ltc_cached {
+                let fresh = c
+                    .built_at
+                    .elapsed()
+                    .map(|d| d.as_secs() <= COINBASE_BATCH_CACHE_TTL_SECS)
+                    .unwrap_or(false);
+                if fresh {
+                    if let Ok(raw) = hex::decode(c.headers_hex.trim()) {
+                        if !raw.is_empty() && raw.len() % LTC_HEADER_BYTES == 0 {
+                            let mut headers: Vec<LtcHeader> = Vec::new();
+                            let mut ok = true;
+                            for chunk in raw.chunks(LTC_HEADER_BYTES) {
+                                match LtcHeader::deserialize(chunk) {
+                                    Ok(h) => headers.push(h),
+                                    Err(_) => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if ok {
+                                if let Ok(script) = encode_ltc_header_batch(&headers) {
+                                    out.push(CoinbaseExtraOutput {
+                                        value: 0,
+                                        script_pubkey_hex: hex::encode(script),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // DOGE — v1.9.63: same shape and re-enable rationale as LTC.
+            let doge_cached = state
+                .doge_template_headers_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(c) = doge_cached {
+                let fresh = c
+                    .built_at
+                    .elapsed()
+                    .map(|d| d.as_secs() <= COINBASE_BATCH_CACHE_TTL_SECS)
+                    .unwrap_or(false);
+                if fresh {
+                    if let Ok(raw) = hex::decode(c.headers_hex.trim()) {
+                        if !raw.is_empty() && raw.len() % DOGE_HEADER_BYTES == 0 {
+                            let mut headers: Vec<DogeHeader> = Vec::new();
+                            let mut ok = true;
+                            for chunk in raw.chunks(DOGE_HEADER_BYTES) {
+                                match DogeHeader::deserialize(chunk) {
+                                    Ok(h) => headers.push(h),
+                                    Err(_) => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if ok {
+                                if let Ok(script) = encode_doge_header_batch(&headers) {
+                                    out.push(CoinbaseExtraOutput {
+                                        value: 0,
+                                        script_pubkey_hex: hex::encode(script),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             out
         } else {
             Vec::new()
@@ -17171,7 +17249,23 @@ async fn run_btc_header_sync_cycle(
             "up_to_date relay_tip={relay_tip} btc_net={btc_net_tip} target={target}"
         ));
     }
-    let start = relay_tip + 1;
+    // FIX 2 (v1.9.63): floor at anchor.height on cold start. ChainState
+    // initialises btc_tip_height to 0 even when btc_spv is configured;
+    // fetching from height 1 would produce headers that do not connect
+    // to the anchor (LTC/DOGE hit this hard at v1.9.62 activation; apply
+    // BTC the same protection for consistency even though v1.9.55
+    // bootstrap usually beats the cycle to it).
+    let anchor_height = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .params
+            .btc_spv
+            .as_ref()
+            .map(|p| p.anchor.height)
+            .unwrap_or(0)
+    };
+    let effective_relay_tip = std::cmp::max(relay_tip, anchor_height);
+    let start = effective_relay_tip + 1;
     let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
     let headers_hex = header_sync::btc::fetch_btc_headers(client, start, end).await?;
     let live_relay_tip = {
@@ -17234,7 +17328,18 @@ async fn run_ltc_header_sync_cycle(
             "up_to_date relay_tip={relay_tip} ltc_net={ltc_net_tip} target={target} source={source:?}"
         ));
     }
-    let start = relay_tip + 1;
+    // FIX 2 (v1.9.63): floor at anchor.height on cold start.
+    let anchor_height = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .params
+            .ltc_spv
+            .as_ref()
+            .map(|p| p.anchor.height)
+            .unwrap_or(0)
+    };
+    let effective_relay_tip = std::cmp::max(relay_tip, anchor_height);
+    let start = effective_relay_tip + 1;
     let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
     let headers_hex =
         header_sync::ltc::fetch_ltc_headers(client, source, start, end).await?;
@@ -17298,7 +17403,18 @@ async fn run_doge_header_sync_cycle(
             "up_to_date relay_tip={relay_tip} doge_net={doge_net_tip} target={target} source={source:?}"
         ));
     }
-    let start = relay_tip + 1;
+    // FIX 2 (v1.9.63): floor at anchor.height on cold start.
+    let anchor_height = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain
+            .params
+            .doge_spv
+            .as_ref()
+            .map(|p| p.anchor.height)
+            .unwrap_or(0)
+    };
+    let effective_relay_tip = std::cmp::max(relay_tip, anchor_height);
+    let start = effective_relay_tip + 1;
     let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
     let headers_hex =
         header_sync::doge::fetch_doge_headers(client, source, start, end).await?;
