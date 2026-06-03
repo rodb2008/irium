@@ -16746,6 +16746,86 @@ async fn maybe_bootstrap_btc_headers(
     Ok(())
 }
 
+/// Result of an auto-unlock attempt; lets the caller log a precise reason
+/// without inspecting wallet state again. Pure data — no side effects.
+#[derive(Debug, PartialEq, Eq)]
+enum AutoUnlockOutcome {
+    /// IRIUM_WALLET_PASSWORD env var was unset or empty. No-op.
+    NoPassword,
+    /// Wallet on disk is None (no wallet yet) or Plaintext (legacy; no
+    /// passphrase to apply). No-op.
+    SkippedNotEncrypted,
+    /// Wallet was already unlocked when called (e.g. a manual unlock RPC
+    /// landed first). No-op.
+    AlreadyUnlocked,
+    /// Successfully decrypted with the supplied passphrase.
+    Unlocked,
+    /// Decrypt failed (wrong passphrase, file corruption, etc.).
+    UnlockFailed(String),
+}
+
+/// Pure auto-unlock logic — extracted from `maybe_auto_unlock_wallet` so unit
+/// tests don't have to build a full AppState. Takes the wallet manager
+/// directly and the password option (`None` ⇒ env var unset, `Some("")` ⇒ env
+/// var set to empty string; both treated as no-op).
+fn auto_unlock_wallet_with_password(
+    wallet: &mut WalletManager,
+    password: Option<&str>,
+) -> AutoUnlockOutcome {
+    let pw = match password {
+        Some(p) if !p.is_empty() => p,
+        _ => return AutoUnlockOutcome::NoPassword,
+    };
+    if !matches!(wallet.mode(), WalletMode::Encrypted) {
+        return AutoUnlockOutcome::SkippedNotEncrypted;
+    }
+    if wallet.is_unlocked() {
+        return AutoUnlockOutcome::AlreadyUnlocked;
+    }
+    match wallet.unlock(pw) {
+        Ok(()) => AutoUnlockOutcome::Unlocked,
+        Err(e) => AutoUnlockOutcome::UnlockFailed(e),
+    }
+}
+
+/// Read IRIUM_WALLET_PASSWORD and auto-unlock the wallet if encrypted. Called
+/// once during `main()` BEFORE the BTC/LTC/DOGE header-sync tasks are spawned,
+/// so the in-process `submit_*_headers_core` calls those tasks make can read
+/// `wallet.keys()` without `wallet_keys_unavailable` errors.
+///
+/// Threat model: env var is set via systemd `Environment=` directive on
+/// operator-controlled VPS only; same surface as IRIUM_RPC_TOKEN. Desktop
+/// users on Windows never set this — their flow is unchanged.
+///
+/// On wrong passphrase / decrypt error: logs a warning and returns. Header
+/// sync stays broken until /wallet/unlock is called manually, which is the
+/// pre-v1.9.56 behavior. No retry loop here — passphrase doesn't change at
+/// runtime, so retrying on the same value is pointless.
+fn maybe_auto_unlock_wallet(state: &AppState) {
+    let pw_env = env::var("IRIUM_WALLET_PASSWORD").ok();
+    let outcome = {
+        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
+        auto_unlock_wallet_with_password(&mut *wallet, pw_env.as_deref())
+    };
+    match outcome {
+        AutoUnlockOutcome::NoPassword | AutoUnlockOutcome::SkippedNotEncrypted => {
+            // Silent no-op: this is the default path for desktop / fresh installs.
+        }
+        AutoUnlockOutcome::AlreadyUnlocked => {
+            eprintln!("[wallet-auto-unlock] wallet already unlocked; no action taken");
+        }
+        AutoUnlockOutcome::Unlocked => {
+            eprintln!("[wallet-auto-unlock] unlocked from IRIUM_WALLET_PASSWORD");
+        }
+        AutoUnlockOutcome::UnlockFailed(e) => {
+            eprintln!(
+                "[wallet-auto-unlock] failed: {} (header-sync will report wallet_keys_unavailable until /wallet/unlock is called manually)",
+                e
+            );
+        }
+    }
+}
+
 fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
     let act_height = match irium_node_rs::activation::resolved_btc_spv_relay_activation_height(network) {
         Some(h) => h,
@@ -18143,6 +18223,13 @@ async fn main() {
             }
         });
     }
+
+    // v1.9.56: auto-unlock encrypted wallet from IRIUM_WALLET_PASSWORD env var
+    // BEFORE spawning header-sync loops. Header-sync calls submit_*_headers_core
+    // in-process and that path needs wallet.keys(), which fails when the wallet
+    // is locked. Sync (not spawned) so header-sync sees an unlocked wallet on
+    // its very first cycle. No-op if env var is unset.
+    maybe_auto_unlock_wallet(&app_state);
 
     maybe_spawn_btc_header_sync(app_state.clone(), network);
     maybe_spawn_ltc_header_sync(app_state.clone(), network);
@@ -26928,6 +27015,87 @@ mod tests {
         let status = result.err().expect("must error");
         assert_eq!(status, StatusCode::CONFLICT);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_unlock_helper_unlocks_encrypted_wallet_when_password_provided() {
+        // Encrypted wallet + matching passphrase => Unlocked + wallet now unlocked.
+        let path = unique_path("autounlock_ok", "json");
+        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path.clone());
+        mgr.create_with_seed("correct-horse-battery-staple", None)
+            .expect("create");
+        // create_with_seed leaves the wallet unlocked in memory. Drop and reopen
+        // to simulate a fresh process where the wallet starts locked.
+        drop(mgr);
+        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path.clone());
+        assert!(!mgr.is_unlocked(), "fresh reopen should be locked");
+        let outcome = auto_unlock_wallet_with_password(
+            &mut mgr,
+            Some("correct-horse-battery-staple"),
+        );
+        assert_eq!(outcome, AutoUnlockOutcome::Unlocked);
+        assert!(mgr.is_unlocked(), "wallet should be unlocked after helper");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_unlock_helper_is_noop_when_password_absent() {
+        // Encrypted wallet but password is None => NoPassword, wallet stays locked.
+        let path = unique_path("autounlock_nopw", "json");
+        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path.clone());
+        mgr.create_with_seed("any-pass", None).expect("create");
+        drop(mgr);
+        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path.clone());
+        let outcome = auto_unlock_wallet_with_password(&mut mgr, None);
+        assert_eq!(outcome, AutoUnlockOutcome::NoPassword);
+        assert!(!mgr.is_unlocked(), "wallet must remain locked");
+
+        // Empty-string password is also a no-op.
+        let outcome_empty = auto_unlock_wallet_with_password(&mut mgr, Some(""));
+        assert_eq!(outcome_empty, AutoUnlockOutcome::NoPassword);
+        assert!(!mgr.is_unlocked(), "wallet must remain locked on empty pw");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_unlock_helper_logs_failure_and_keeps_wallet_locked_on_wrong_pw() {
+        // Encrypted wallet + wrong passphrase => UnlockFailed(_), wallet stays locked.
+        let path = unique_path("autounlock_wrongpw", "json");
+        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path.clone());
+        mgr.create_with_seed("the-real-password", None).expect("create");
+        drop(mgr);
+        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path.clone());
+        let outcome = auto_unlock_wallet_with_password(
+            &mut mgr,
+            Some("definitely-not-the-real-password"),
+        );
+        assert!(
+            matches!(outcome, AutoUnlockOutcome::UnlockFailed(_)),
+            "expected UnlockFailed, got {:?}",
+            outcome
+        );
+        assert!(
+            !mgr.is_unlocked(),
+            "wallet must stay locked after wrong passphrase"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_unlock_helper_skips_when_wallet_missing_or_plaintext() {
+        // 1. No wallet file at all => SkippedNotEncrypted.
+        let path_missing = unique_path("autounlock_missing", "json");
+        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path_missing.clone());
+        let outcome = auto_unlock_wallet_with_password(&mut mgr, Some("anything"));
+        assert_eq!(outcome, AutoUnlockOutcome::SkippedNotEncrypted);
+
+        // 2. Plaintext wallet on disk => SkippedNotEncrypted.
+        let path_plain = unique_path("autounlock_plain", "json");
+        write_legacy_plaintext_at(&path_plain);
+        let mut mgr2 = irium_node_rs::wallet_store::WalletManager::new(path_plain.clone());
+        let outcome2 = auto_unlock_wallet_with_password(&mut mgr2, Some("anything"));
+        assert_eq!(outcome2, AutoUnlockOutcome::SkippedNotEncrypted);
+        let _ = std::fs::remove_file(&path_plain);
     }
 
     #[tokio::test]
