@@ -479,6 +479,47 @@ pub fn apply_btc_header_batch(
         (parent.height, parent.total_work.clone())
     };
 
+    // Idempotency: when the wrapping BtcHeaderBatch tx that was already
+    // applied via /rpc/submitbtcheaders is later mined into an iriumd
+    // block, apply_btc_header_batch runs again against the same headers.
+    // The "already known in chain state" check below would reject the
+    // block and stall chain production (issue #59). If every header in
+    // this batch is already committed at the expected height AND matches
+    // the stored entry byte-for-byte, treat the call as a no-op success
+    // instead. Fork attempts (different header data at the same heights)
+    // still fall through to the normal validation path below, which will
+    // fail fast on the first mismatching header.
+    {
+        let mut all_known_and_matching = true;
+        let mut probe_prev_hash = first.prev_hash;
+        let mut probe_prev_height = start_prev_height;
+        for header in headers.iter() {
+            if header.prev_hash != probe_prev_hash {
+                all_known_and_matching = false;
+                break;
+            }
+            let expected_height = probe_prev_height + 1;
+            let hash = header.block_hash();
+            let Some(entry) = btc_headers.get(&hash) else {
+                all_known_and_matching = false;
+                break;
+            };
+            if entry.height != expected_height || entry.header != *header {
+                all_known_and_matching = false;
+                break;
+            }
+            probe_prev_hash = hash;
+            probe_prev_height = expected_height;
+        }
+        if all_known_and_matching {
+            return Ok(BtcRelayUpdate {
+                tip_before: *btc_tip,
+                tip_height_before: *btc_tip_height,
+                headers_added: Vec::new(),
+            });
+        }
+    }
+
     let mut prev_hash = first.prev_hash;
     let mut prev_height = start_prev_height;
     let mut prev_work = start_prev_work;
@@ -1003,6 +1044,88 @@ mod tests {
     }
 
     #[test]
+    fn replaying_identical_batch_is_noop_success() {
+        // Issue #59: when /rpc/submitbtcheaders has already applied a batch
+        // to chain state and the wrapping mempool tx is later mined into an
+        // iriumd block, apply_btc_header_batch must accept the duplicate
+        // apply as a no-op rather than rejecting with "already known in
+        // chain state". Otherwise every miner block built on a template
+        // that includes the tx gets rejected and the chain stalls.
+        let (anchor, anchor_header) = fresh_anchor();
+        let h1 = mine_btc_header(anchor.hash, anchor_header.time + 600, anchor.bits);
+        let h2 = mine_btc_header(h1.block_hash(), anchor_header.time + 1200, anchor.bits);
+        let mut headers_db: HashMap<[u8; 32], BtcHeaderEntry> = HashMap::new();
+        let mut heights_db: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut tip: Option<[u8; 32]> = None;
+        let mut tip_height: u64 = 0;
+
+        // First apply: extends chain. Both hashes appear in headers_added.
+        let first = apply_btc_header_batch(
+            vec![h1.clone(), h2.clone()],
+            anchor_header.time + 1200,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+        )
+        .expect("first apply");
+        assert_eq!(first.headers_added.len(), 2);
+        assert_eq!(tip, Some(h2.block_hash()));
+        assert_eq!(tip_height, anchor.height + 2);
+
+        // Snapshot state for post-no-op comparison.
+        let headers_before = headers_db.len();
+        let heights_before = heights_db.len();
+        let tip_snapshot = tip;
+        let tip_height_snapshot = tip_height;
+
+        // Second apply with the SAME batch: must succeed as a no-op.
+        let second = apply_btc_header_batch(
+            vec![h1.clone(), h2.clone()],
+            anchor_header.time + 1200,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+        )
+        .expect("idempotent re-apply must succeed");
+        assert!(
+            second.headers_added.is_empty(),
+            "idempotent re-apply should add no headers"
+        );
+        assert_eq!(second.tip_before, tip_snapshot);
+        assert_eq!(second.tip_height_before, tip_height_snapshot);
+        assert_eq!(headers_db.len(), headers_before, "no headers added");
+        assert_eq!(heights_db.len(), heights_before, "no heights added");
+        assert_eq!(tip, tip_snapshot, "tip unchanged");
+        assert_eq!(tip_height, tip_height_snapshot, "tip_height unchanged");
+
+        // Sanity: a batch where one header is tampered (same prev_hash and
+        // same height, different nonce -> different hash) must NOT be
+        // silently treated as idempotent. It falls through to the existing
+        // validation path which rejects h1 with "already known in chain
+        // state". This proves the idempotency check requires byte-equal
+        // headers, not just height/prev_hash linkage.
+        let mut h2_tampered = h2.clone();
+        h2_tampered.nonce = h2.nonce.wrapping_add(1);
+        let mismatch = apply_btc_header_batch(
+            vec![h1.clone(), h2_tampered],
+            anchor_header.time + 1200,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+        );
+        assert!(
+            mismatch.is_err(),
+            "modified header in re-applied batch must not be idempotent"
+        );
+    }
+
+    #[test]
     fn apply_rejects_bad_linkage() {
         let (anchor, anchor_header) = fresh_anchor();
         let h1 = mine_btc_header(anchor.hash, anchor_header.time + 600, anchor.bits);
@@ -1174,7 +1297,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_rejects_already_known_header() {
+    fn apply_treats_already_known_header_as_noop() {
+        // Issue #59: re-applying a single-header batch whose header is
+        // already committed at the expected height MUST be a no-op
+        // success, not a rejection. The previous behavior (rejecting with
+        // "already known in chain state") caused mainnet to stall when the
+        // BtcHeaderBatch mempool tx was mined into a block.
         let (anchor, anchor_header) = fresh_anchor();
         let h1 = mine_btc_header(anchor.hash, anchor_header.time + 600, anchor.bits);
         let mut headers_db = HashMap::new();
@@ -1191,7 +1319,7 @@ mod tests {
             &anchor,
         )
         .expect("first apply");
-        let res = apply_btc_header_batch(
+        let update = apply_btc_header_batch(
             vec![h1],
             anchor_header.time + 1200,
             &mut headers_db,
@@ -1199,8 +1327,12 @@ mod tests {
             &mut tip,
             &mut tip_height,
             &anchor,
+        )
+        .expect("second apply must be idempotent (issue #59)");
+        assert!(
+            update.headers_added.is_empty(),
+            "idempotent re-apply should add no headers"
         );
-        assert!(res.is_err(), "second apply with same header must fail");
     }
 
     #[test]
