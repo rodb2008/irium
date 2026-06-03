@@ -18128,12 +18128,20 @@ async fn main() {
     // src/bin/{btc,ltc,doge}-header-sync.rs binaries + systemd timers.
     // v1.9.54: pre-seed BTC headers from mempool.space on fresh installs so
     // Irium blocks that carry a BtcHeaderBatch tx whose first header references
-    // a BTC block past the anchor can be applied. Runs BEFORE
-    // maybe_spawn_btc_header_sync so there is no concurrent btc_headers writer
-    // during bootstrap. On HTTP / validation error the call is best-effort and
-    // iriumd continues to start (btc-header-sync.timer can fill the gap).
-    if let Err(e) = maybe_bootstrap_btc_headers(app_state.clone(), network).await {
-        eprintln!("[btc-bootstrap] bootstrap returned error (continuing startup): {}", e);
+    // a BTC block past the anchor can be applied. Runs as a tokio::spawn task
+    // so iriumd's HTTP server and P2P stack come up immediately — fetching
+    // 70k+ headers can take 15+ minutes against historical mempool.space data
+    // and there is no reason to block RPC during that time. Blocks that arrive
+    // before bootstrap completes and reference an un-fetched BTC header will
+    // fail validation and be re-requested from peers; the v1.9.52 idempotency
+    // fix makes the eventual re-application a no-op.
+    {
+        let s = app_state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = maybe_bootstrap_btc_headers(s, network).await {
+                eprintln!("[btc-bootstrap] returned error: {}", e);
+            }
+        });
     }
 
     maybe_spawn_btc_header_sync(app_state.clone(), network);
