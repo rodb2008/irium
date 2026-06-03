@@ -208,6 +208,14 @@ struct AppState {
     disputes_index: Arc<Mutex<std::collections::HashMap<String, DisputeState>>>,
     /// Resolver registration index keyed by resolver_address (Stage 3.2).
     resolvers_index: Arc<Mutex<std::collections::HashMap<String, ResolverRegistrationRecord>>>,
+    /// v1.9.61: latest BTC header batch cached for direct block-template
+    /// injection. Populated by run_btc_header_sync_cycle; consumed by
+    /// build_template_btc_batch inside getblocktemplate.
+    btc_template_headers_cache: Arc<Mutex<Option<CachedHeaderBatchForTemplate>>>,
+    /// v1.9.61: same as above for LTC.
+    ltc_template_headers_cache: Arc<Mutex<Option<CachedHeaderBatchForTemplate>>>,
+    /// v1.9.61: same as above for DOGE.
+    doge_template_headers_cache: Arc<Mutex<Option<CachedHeaderBatchForTemplate>>>,
 }
 
 const DISPUTE_RESOLVER_RESPONSE_WINDOW: u64 = 288; // blocks
@@ -1493,6 +1501,26 @@ struct WalletUtxo {
     height: u64,
     is_coinbase: bool,
     pkh: [u8; 20],
+}
+
+/// v1.9.61: cached header-batch fetched by the in-process sync cycle, to
+/// be built into a signed carrier tx by getblocktemplate. Only the headers
+/// (slow to fetch from mempool.space) are cached; the carrier tx is signed
+/// fresh per template request so it always uses the wallet's current UTXO
+/// set and never collides with an in-flight user-initiated wallet spend.
+#[derive(Clone)]
+struct CachedHeaderBatchForTemplate {
+    /// Hex-encoded concatenation of 80-byte BTC headers (or 80-byte LTC,
+    /// or DOGE header — same shape per chain). Passed verbatim to the
+    /// chain's submit_*_headers_core.
+    headers_hex: String,
+    /// Chain's *_tip_height at the moment the headers were fetched. The
+    /// helpers refuse to use the cache once the on-chain tip has advanced
+    /// past this value — the carrier would extend from the wrong base.
+    expected_relay_tip_height: u64,
+    /// Wall-clock timestamp at fetch. Cache entries older than 15 minutes
+    /// are treated as stale and ignored, forcing the cycle to refresh.
+    built_at: std::time::SystemTime,
 }
 
 #[derive(Serialize)]
@@ -15509,6 +15537,144 @@ async fn inspect_htlc(
     }))
 }
 
+/// v1.9.61: maximum age of a cached header batch before it is treated as
+/// stale. The cycle runs every 600s and refreshes the cache; allow some
+/// slack for cycle delays / mempool.space slow responses while still
+/// guaranteeing we never inject headers we fetched many minutes ago.
+const TEMPLATE_BATCH_CACHE_TTL_SECS: u64 = 900;
+
+/// v1.9.61: build a fresh signed BTC header-batch carrier tx for the
+/// block template, using cached headers from the in-process sync cycle.
+/// Returns None on any failure (no cache, stale cache, wallet locked,
+/// no spendable UTXOs, BTC SPV gate closed, fee policy mismatch, etc.) —
+/// the template is then shipped without a carrier and block production
+/// proceeds unaffected. The BTC relay tip simply advances later, when
+/// the next block carrying a batch is mined.
+async fn build_template_btc_batch(state: &AppState) -> Option<TemplateTx> {
+    // v1.9.61 wallet-spend safety: this helper signs a tx with the
+    // operator wallet. Desktop nodes (no IRIUM_WALLET_PASSWORD) must
+    // never reach the signing path — return None up front.
+    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
+        return None;
+    }
+    let cached = {
+        let guard = state
+            .btc_template_headers_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.clone()?
+    };
+    if cached
+        .built_at
+        .elapsed()
+        .map(|d| d.as_secs() > TEMPLATE_BATCH_CACHE_TTL_SECS)
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    let live_relay_tip = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.btc_tip_height
+    };
+    if live_relay_tip != cached.expected_relay_tip_height {
+        return None;
+    }
+    let fee = header_sync::common::env_u64("BTC_HEADER_SYNC_FEE_PER_BYTE", 100);
+    let req = SubmitBtcHeadersRequest {
+        headers_hex: cached.headers_hex,
+        broadcast: Some(false),
+        fee_per_byte: Some(fee),
+    };
+    let resp = submit_btc_headers_core(state, req, None).await.ok()?;
+    Some(TemplateTx {
+        hex: resp.raw_tx_hex,
+        fee: resp.fee,
+        relay_addresses: Vec::new(),
+    })
+}
+
+/// v1.9.61: LTC analogue of build_template_btc_batch.
+async fn build_template_ltc_batch(state: &AppState) -> Option<TemplateTx> {
+    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
+        return None;
+    }
+    let cached = {
+        let guard = state
+            .ltc_template_headers_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.clone()?
+    };
+    if cached
+        .built_at
+        .elapsed()
+        .map(|d| d.as_secs() > TEMPLATE_BATCH_CACHE_TTL_SECS)
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    let live_relay_tip = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.ltc_tip_height
+    };
+    if live_relay_tip != cached.expected_relay_tip_height {
+        return None;
+    }
+    let fee = header_sync::common::env_u64("LTC_HEADER_SYNC_FEE_PER_BYTE", 100);
+    let req = SubmitLtcHeadersRequest {
+        headers_hex: cached.headers_hex,
+        broadcast: Some(false),
+        fee_per_byte: Some(fee),
+    };
+    let resp = submit_ltc_headers_core(state, req).await.ok()?;
+    Some(TemplateTx {
+        hex: resp.raw_tx_hex,
+        fee: resp.fee,
+        relay_addresses: Vec::new(),
+    })
+}
+
+/// v1.9.61: DOGE analogue of build_template_btc_batch.
+async fn build_template_doge_batch(state: &AppState) -> Option<TemplateTx> {
+    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
+        return None;
+    }
+    let cached = {
+        let guard = state
+            .doge_template_headers_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.clone()?
+    };
+    if cached
+        .built_at
+        .elapsed()
+        .map(|d| d.as_secs() > TEMPLATE_BATCH_CACHE_TTL_SECS)
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    let live_relay_tip = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.doge_tip_height
+    };
+    if live_relay_tip != cached.expected_relay_tip_height {
+        return None;
+    }
+    let fee = header_sync::common::env_u64("DOGE_HEADER_SYNC_FEE_PER_BYTE", 100);
+    let req = SubmitDogeHeadersRequest {
+        headers_hex: cached.headers_hex,
+        broadcast: Some(false),
+        fee_per_byte: Some(fee),
+    };
+    let resp = submit_doge_headers_core(state, req).await.ok()?;
+    Some(TemplateTx {
+        hex: resp.raw_tx_hex,
+        fee: resp.fee,
+        relay_addresses: Vec::new(),
+    })
+}
+
 async fn get_block_template(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -15656,9 +15822,39 @@ async fn get_block_template(
             true
         });
     }
+    // v1.9.61: if the mempool didn't supply a carrier for a given chain,
+    // try to inject one built fresh from the cycle's cached headers.
+    // Each build silently fails (returns None) if anything is wrong
+    // (wallet locked, no UTXOs, gate closed, stale cache, etc.) so block
+    // production never blocks on header relay.
+    let already_has_btc_batch = mempool_entries
+        .iter()
+        .any(|e| e.tx.outputs.iter().any(|o| parse_btc_header_batch(&o.script_pubkey).is_ok()));
+    let already_has_ltc_batch = mempool_entries
+        .iter()
+        .any(|e| e.tx.outputs.iter().any(|o| parse_ltc_header_batch(&o.script_pubkey).is_ok()));
+    let already_has_doge_batch = mempool_entries
+        .iter()
+        .any(|e| e.tx.outputs.iter().any(|o| parse_doge_header_batch(&o.script_pubkey).is_ok()));
+    let injected_btc = if already_has_btc_batch {
+        None
+    } else {
+        build_template_btc_batch(&state).await
+    };
+    let injected_ltc = if already_has_ltc_batch {
+        None
+    } else {
+        build_template_ltc_batch(&state).await
+    };
+    let injected_doge = if already_has_doge_batch {
+        None
+    } else {
+        build_template_doge_batch(&state).await
+    };
+
     let mempool_count = mempool_entries.len();
     let mut total_fees = 0u64;
-    let txs = mempool_entries
+    let mut txs: Vec<TemplateTx> = mempool_entries
         .into_iter()
         .map(|entry| {
             total_fees = total_fees.saturating_add(entry.fee);
@@ -15669,6 +15865,10 @@ async fn get_block_template(
             }
         })
         .collect();
+    for inj in [injected_btc, injected_ltc, injected_doge].into_iter().flatten() {
+        total_fees = total_fees.saturating_add(inj.fee);
+        txs.push(inj);
+    }
 
     let coinbase_value = block_reward(height).saturating_add(total_fees);
 
@@ -16947,6 +17147,18 @@ where
 }
 
 fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
+    // v1.9.61 wallet-spend safety: header relay funds carrier txs from
+    // the operator wallet. Desktop wallet users never consented to that.
+    // Gate the entire cycle behind IRIUM_WALLET_PASSWORD so only operator
+    // nodes (which set the env var via systemd drop-in) ever spawn the
+    // relay loop. Desktop nodes still receive header data via P2P from
+    // operator nodes; they simply do not originate carrier txs.
+    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
+        eprintln!(
+            "[header-sync/btc] IRIUM_WALLET_PASSWORD not set — skipping header relay (operator-only)"
+        );
+        return;
+    }
     let act_height = match irium_node_rs::activation::resolved_btc_spv_relay_activation_height(network) {
         Some(h) => h,
         None => {
@@ -16996,6 +17208,12 @@ fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
 }
 
 fn maybe_spawn_ltc_header_sync(state: AppState, network: NetworkKind) {
+    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
+        eprintln!(
+            "[header-sync/ltc] IRIUM_WALLET_PASSWORD not set — skipping header relay (operator-only)"
+        );
+        return;
+    }
     let act_height = match irium_node_rs::activation::resolved_ltc_spv_relay_activation_height(network) {
         Some(h) => h,
         None => {
@@ -17048,6 +17266,12 @@ fn maybe_spawn_ltc_header_sync(state: AppState, network: NetworkKind) {
 }
 
 fn maybe_spawn_doge_header_sync(state: AppState, network: NetworkKind) {
+    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
+        eprintln!(
+            "[header-sync/doge] IRIUM_WALLET_PASSWORD not set — skipping header relay (operator-only)"
+        );
+        return;
+    }
     let act_height = match irium_node_rs::activation::resolved_doge_spv_relay_activation_height(network) {
         Some(h) => h,
         None => {
@@ -17104,6 +17328,14 @@ async fn run_btc_header_sync_cycle(
     client: &reqwest::Client,
     act_height: u64,
 ) -> Result<String, String> {
+    // v1.9.61 wallet-spend safety (defense-in-depth): even if some
+    // future code path invokes the cycle directly without going
+    // through maybe_spawn_btc_header_sync, refuse to fetch when
+    // IRIUM_WALLET_PASSWORD is unset. Desktop wallets must never be
+    // touched by header relay.
+    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
+        return Ok("disabled: IRIUM_WALLET_PASSWORD not set".to_string());
+    }
     let (relay_tip, gate_open) = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let open = chain.height >= act_height;
@@ -17112,31 +17344,23 @@ async fn run_btc_header_sync_cycle(
     if !gate_open {
         return Ok("gate_closed".to_string());
     }
-    // Primary/fallback guard: if any unconfirmed BtcHeaderBatch tx is
-    // already sitting in the mempool, do not submit another. submit_btc_headers_core
-    // is deterministic: same wallet UTXO set + same headers => same txid.
-    // The mempool dedup-rejects the second copy, but the bigger problem is
-    // that under heavy peer gossip the carrier tx hangs around long enough
-    // for block templates to include duplicate copies, which fail
-    // consensus and stall block production. Wait for the previous batch
-    // to confirm before submitting a new one.
-    if mempool_has_pending_header_batch(state, |s| parse_btc_header_batch(s).is_ok()) {
-        return Ok("skipped: BtcHeaderBatch already pending in mempool".to_string());
-    }
+    // v1.9.61: this cycle has NO mempool side effects. It only fetches
+    // headers from mempool.space and caches them. getblocktemplate builds
+    // a fresh signed carrier per template request using current wallet
+    // UTXOs, and the carrier rides into a mined block directly without
+    // ever entering the mempool. The previous mempool guard (v1.9.57)
+    // is therefore not relevant here anymore and is removed; the v1.9.58
+    // template carrier cap and v1.9.59 admission dedup still protect
+    // against peer-submitted carriers (e.g. via /rpc/submitbtcheaders).
     let btc_net_tip = header_sync::btc::fetch_btc_net_tip(client).await?;
     if btc_net_tip <= header_sync::common::SAFETY_LAG {
         return Err(format!(
-            "btc network tip {btc_net_tip} <= safety lag {}; refusing to submit",
+            "btc network tip {btc_net_tip} <= safety lag {}; refusing to fetch",
             header_sync::common::SAFETY_LAG
         ));
     }
     let target = btc_net_tip - header_sync::common::SAFETY_LAG;
     if relay_tip >= target {
-        // Up to date and primary is doing its job — let the fallback timer
-        // know by refreshing the staleness marker even though we didn't
-        // submit (otherwise a node that catches up and stays caught up
-        // would let the marker age out and the timer would fire a useless
-        // fetch every 10 minutes).
         header_sync_touch_last_file("btc");
         return Ok(format!(
             "up_to_date relay_tip={relay_tip} btc_net={btc_net_tip} target={target}"
@@ -17145,14 +17369,6 @@ async fn run_btc_header_sync_cycle(
     let start = relay_tip + 1;
     let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
     let headers_hex = header_sync::btc::fetch_btc_headers(client, start, end).await?;
-    // FIX 1 (v1.9.60): re-read chain state immediately before submit. The
-    // mempool.space fetch above takes 5-30 seconds; in that window, another
-    // node's carrier can be mined into an Irium block, advancing our
-    // btc_tip_height past `end`. Submitting a now-stale range would create
-    // a redundant carrier that other nodes will reject as a duplicate
-    // (v1.9.59 mempool dedup), but skipping here saves the wallet fee and
-    // the gossip bandwidth. Touch the last-sync file so the fallback
-    // timer also stands down.
     let live_relay_tip = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain.btc_tip_height
@@ -17163,21 +17379,20 @@ async fn run_btc_header_sync_cycle(
             "stand_down: chain advanced from {relay_tip} to {live_relay_tip} during fetch (planned end {end})"
         ));
     }
-    let fee = header_sync::common::env_u64("BTC_HEADER_SYNC_FEE_PER_BYTE", 100);
-    let req = SubmitBtcHeadersRequest {
-        headers_hex,
-        broadcast: Some(true),
-        fee_per_byte: Some(fee),
-    };
-    let resp = submit_btc_headers_core(state, req, None)
-        .await
-        .map_err(|(sc, msg)| format!("submit failed: status={sc} reason={msg}"))?;
-    if resp.accepted {
-        header_sync_touch_last_file("btc");
+    {
+        let mut cache = state
+            .btc_template_headers_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache = Some(CachedHeaderBatchForTemplate {
+            headers_hex,
+            expected_relay_tip_height: live_relay_tip,
+            built_at: std::time::SystemTime::now(),
+        });
     }
+    header_sync_touch_last_file("btc");
     Ok(format!(
-        "submitted count={} txid={} accepted={}",
-        resp.headers_count, resp.txid, resp.accepted
+        "cached_headers start={start} end={end} relay_tip={live_relay_tip}"
     ))
 }
 
@@ -17187,6 +17402,9 @@ async fn run_ltc_header_sync_cycle(
     act_height: u64,
     source: header_sync::common::Source,
 ) -> Result<String, String> {
+    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
+        return Ok("disabled: IRIUM_WALLET_PASSWORD not set".to_string());
+    }
     let (relay_tip, gate_open) = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let open = chain.height >= act_height;
@@ -17208,9 +17426,6 @@ async fn run_ltc_header_sync_cycle(
         header_sync::common::Source::Mainnet => ltc_net_tip - header_sync::common::SAFETY_LAG,
         header_sync::common::Source::Regtest => ltc_net_tip,
     };
-    if mempool_has_pending_header_batch(state, |s| parse_ltc_header_batch(s).is_ok()) {
-        return Ok("skipped: LtcHeaderBatch already pending in mempool".to_string());
-    }
     if relay_tip >= target {
         header_sync_touch_last_file("ltc");
         return Ok(format!(
@@ -17231,21 +17446,20 @@ async fn run_ltc_header_sync_cycle(
             "stand_down: chain advanced from {relay_tip} to {live_relay_tip} during fetch (planned end {end})"
         ));
     }
-    let fee = header_sync::common::env_u64("LTC_HEADER_SYNC_FEE_PER_BYTE", 100);
-    let req = SubmitLtcHeadersRequest {
-        headers_hex,
-        broadcast: Some(true),
-        fee_per_byte: Some(fee),
-    };
-    let resp = submit_ltc_headers_core(state, req)
-        .await
-        .map_err(|(sc, msg)| format!("submit failed: status={sc} reason={msg}"))?;
-    if resp.accepted {
-        header_sync_touch_last_file("ltc");
+    {
+        let mut cache = state
+            .ltc_template_headers_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache = Some(CachedHeaderBatchForTemplate {
+            headers_hex,
+            expected_relay_tip_height: live_relay_tip,
+            built_at: std::time::SystemTime::now(),
+        });
     }
+    header_sync_touch_last_file("ltc");
     Ok(format!(
-        "submitted count={} txid={} accepted={} source={source:?}",
-        resp.headers_count, resp.txid, resp.accepted
+        "cached_headers start={start} end={end} relay_tip={live_relay_tip} source={source:?}"
     ))
 }
 
@@ -17255,6 +17469,9 @@ async fn run_doge_header_sync_cycle(
     act_height: u64,
     source: header_sync::common::Source,
 ) -> Result<String, String> {
+    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
+        return Ok("disabled: IRIUM_WALLET_PASSWORD not set".to_string());
+    }
     let (relay_tip, gate_open) = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let open = chain.height >= act_height;
@@ -17276,9 +17493,6 @@ async fn run_doge_header_sync_cycle(
         header_sync::common::Source::Mainnet => doge_net_tip - header_sync::common::SAFETY_LAG,
         header_sync::common::Source::Regtest => doge_net_tip,
     };
-    if mempool_has_pending_header_batch(state, |s| parse_doge_header_batch(s).is_ok()) {
-        return Ok("skipped: DogeHeaderBatch already pending in mempool".to_string());
-    }
     if relay_tip >= target {
         header_sync_touch_last_file("doge");
         return Ok(format!(
@@ -17299,21 +17513,20 @@ async fn run_doge_header_sync_cycle(
             "stand_down: chain advanced from {relay_tip} to {live_relay_tip} during fetch (planned end {end})"
         ));
     }
-    let fee = header_sync::common::env_u64("DOGE_HEADER_SYNC_FEE_PER_BYTE", 100);
-    let req = SubmitDogeHeadersRequest {
-        headers_hex,
-        broadcast: Some(true),
-        fee_per_byte: Some(fee),
-    };
-    let resp = submit_doge_headers_core(state, req)
-        .await
-        .map_err(|(sc, msg)| format!("submit failed: status={sc} reason={msg}"))?;
-    if resp.accepted {
-        header_sync_touch_last_file("doge");
+    {
+        let mut cache = state
+            .doge_template_headers_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache = Some(CachedHeaderBatchForTemplate {
+            headers_hex,
+            expected_relay_tip_height: live_relay_tip,
+            built_at: std::time::SystemTime::now(),
+        });
     }
+    header_sync_touch_last_file("doge");
     Ok(format!(
-        "submitted count={} txid={} accepted={} source={source:?}",
-        resp.headers_count, resp.txid, resp.accepted
+        "cached_headers start={start} end={end} relay_tip={live_relay_tip} source={source:?}"
     ))
 }
 
@@ -18404,6 +18617,9 @@ async fn main() {
         proof_heights: Arc::new(Mutex::new(std::collections::HashMap::new())),
         disputes_index: Arc::new(Mutex::new(load_all_disputes_at_startup())),
         resolvers_index: Arc::new(Mutex::new(load_all_resolvers_at_startup())),
+        btc_template_headers_cache: Arc::new(Mutex::new(None)),
+        ltc_template_headers_cache: Arc::new(Mutex::new(None)),
+        doge_template_headers_cache: Arc::new(Mutex::new(None)),
     };
 
     // Spawn the in-process header-sync background tasks. Each one no-ops
@@ -19776,6 +19992,9 @@ mod tests {
             proof_heights: Arc::new(Mutex::new(std::collections::HashMap::new())),
             disputes_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
             resolvers_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            btc_template_headers_cache: Arc::new(Mutex::new(None)),
+            ltc_template_headers_cache: Arc::new(Mutex::new(None)),
+            doge_template_headers_cache: Arc::new(Mutex::new(None)),
         };
 
         (state, sender, recipient, refund)
@@ -27115,6 +27334,9 @@ mod tests {
             proof_heights: Arc::new(Mutex::new(std::collections::HashMap::new())),
             disputes_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
             resolvers_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            btc_template_headers_cache: Arc::new(Mutex::new(None)),
+            ltc_template_headers_cache: Arc::new(Mutex::new(None)),
+            doge_template_headers_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -27282,6 +27504,97 @@ mod tests {
         assert!(
             !mgr.is_unlocked(),
             "wallet must stay locked after wrong passphrase"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn build_template_btc_batch_returns_none_when_cache_empty() {
+        // Default AppState has no cached headers => helper returns None and
+        // the template ships without a carrier.
+        let path = unique_path("template_btc_empty", "json");
+        let state = make_wallet_app_state(path.clone());
+        let result = build_template_btc_batch(&state).await;
+        assert!(
+            result.is_none(),
+            "expected None when cache is empty, got Some(fee={:?})",
+            result.map(|t| t.fee)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn build_template_btc_batch_returns_none_when_cache_tip_mismatches_chain() {
+        // Cache populated but expected_relay_tip_height (999_999) does not
+        // match the chain's btc_tip_height (0 in the test state). Helper
+        // refuses to use the stale cache.
+        let path = unique_path("template_btc_mismatch", "json");
+        let state = make_wallet_app_state(path.clone());
+        {
+            let mut guard = state
+                .btc_template_headers_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = Some(CachedHeaderBatchForTemplate {
+                headers_hex: "00".repeat(80),
+                expected_relay_tip_height: 999_999,
+                built_at: std::time::SystemTime::now(),
+            });
+        }
+        let result = build_template_btc_batch(&state).await;
+        assert!(result.is_none(), "expected None when cache tip != chain tip");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn build_template_btc_batch_returns_none_when_cache_too_old() {
+        // Cache age > TEMPLATE_BATCH_CACHE_TTL_SECS (15 minutes) => discarded.
+        let path = unique_path("template_btc_stale", "json");
+        let state = make_wallet_app_state(path.clone());
+        {
+            let mut guard = state
+                .btc_template_headers_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = Some(CachedHeaderBatchForTemplate {
+                headers_hex: "00".repeat(80),
+                expected_relay_tip_height: 0,
+                built_at: std::time::SystemTime::now()
+                    .checked_sub(std::time::Duration::from_secs(
+                        TEMPLATE_BATCH_CACHE_TTL_SECS + 60,
+                    ))
+                    .expect("system time minus 16min must be representable"),
+            });
+        }
+        let result = build_template_btc_batch(&state).await;
+        assert!(result.is_none(), "expected None when cache is past TTL");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn build_template_btc_batch_returns_none_when_submit_core_fails() {
+        // Cache fresh and matches the chain tip, but the chain's btc_spv
+        // params are None (test state has no SPV activation), so
+        // submit_btc_headers_core returns btc_spv_relay_not_active. The
+        // helper must surface that as a silent None — never block
+        // template generation when relay isn't applicable.
+        let path = unique_path("template_btc_nogate", "json");
+        let state = make_wallet_app_state(path.clone());
+        {
+            let mut guard = state
+                .btc_template_headers_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = Some(CachedHeaderBatchForTemplate {
+                headers_hex: "00".repeat(80),
+                expected_relay_tip_height: 0,
+                built_at: std::time::SystemTime::now(),
+            });
+        }
+        let result = build_template_btc_batch(&state).await;
+        assert!(
+            result.is_none(),
+            "expected None when submit_btc_headers_core returns an error"
         );
         let _ = std::fs::remove_file(&path);
     }
