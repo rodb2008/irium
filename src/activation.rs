@@ -231,6 +231,16 @@ pub const MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = Some(24_800
 /// consensus-wiring commit.
 pub const MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 
+/// Mainnet coinbase header-batch activation (v1.9.62 issue #60).
+///
+/// At this height and above, blocks may carry BTC/LTC/DOGE header batches
+/// directly in the coinbase tx as zero-value outputs. Before this height,
+/// coinbase batch outputs are rejected (pre-v1.9.62 behavior). The same
+/// one-per-chain-per-block cap as the regular-tx path is enforced; a block
+/// cannot have both a coinbase batch and a regular-tx batch for the same
+/// chain. Eliminates the wallet-funded carrier-tx cost entirely.
+pub const MAINNET_COINBASE_HEADER_BATCH_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
+
 /// Mainnet HtlcDogeSwapV1 activation height (Phase C).
 ///
 /// `None` keeps the DOGE-proof claim path disabled on mainnet. When set
@@ -576,6 +586,19 @@ pub fn runtime_mpsov1_env_override() -> Option<u64> {
 }
 
 #[allow(dead_code)] // public resolver for MPSOv1 activation height; used by wallet and block validators once MPSOv1 ships
+pub fn resolved_coinbase_header_batch_activation_height(network: NetworkKind) -> Option<u64> {
+    match network {
+        NetworkKind::Mainnet => MAINNET_COINBASE_HEADER_BATCH_ACTIVATION_HEIGHT,
+        NetworkKind::Devnet | NetworkKind::Testnet => env::var(
+            "IRIUM_COINBASE_HEADER_BATCH_ACTIVATION_HEIGHT",
+        )
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Some)
+        .unwrap_or(None),
+    }
+}
+
 pub fn resolved_mpsov1_activation_height(network: NetworkKind) -> Option<u64> {
     match network {
         NetworkKind::Mainnet => MAINNET_MPSOV1_ACTIVATION_HEIGHT,

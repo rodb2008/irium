@@ -3235,6 +3235,8 @@ fn main() {
                 irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
             doge_swap_order_v1_activation_height:
                 irium_node_rs::activation::resolved_doge_swap_order_v1_activation_height(network),
+            coinbase_header_batch_activation_height:
+                irium_node_rs::activation::resolved_coinbase_header_batch_activation_height(network),
     };
 
     let mut state = ChainState::new(params.clone());

@@ -8584,6 +8584,7 @@ mod tests {
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
             doge_swap_order_v1_activation_height: None,
+            coinbase_header_batch_activation_height: None,
         };
         let mut chain = ChainState::new(params);
 
@@ -8651,6 +8652,7 @@ mod tests {
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
             doge_swap_order_v1_activation_height: None,
+            coinbase_header_batch_activation_height: None,
         };
         let chain = ChainState::new(params);
 
@@ -8703,6 +8705,7 @@ mod tests {
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
             doge_swap_order_v1_activation_height: None,
+            coinbase_header_batch_activation_height: None,
         };
         let chain = ChainState::new(params);
 

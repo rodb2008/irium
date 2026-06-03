@@ -1530,6 +1530,16 @@ struct TemplateTx {
     relay_addresses: Vec<String>,
 }
 
+/// v1.9.62 issue #60: zero-cost coinbase header relay. Each entry is appended
+/// by the stratum as an additional output on the coinbase tx after the miner
+/// reward output. `value` is always 0 for batch carriers; the script is the
+/// batch payload as produced by encode_btc_header_batch / ltc / doge.
+#[derive(Serialize)]
+struct CoinbaseExtraOutput {
+    value: u64,
+    script_pubkey_hex: String,
+}
+
 #[derive(Serialize)]
 struct BlockTemplateResponse {
     height: u64,
@@ -1541,6 +1551,11 @@ struct BlockTemplateResponse {
     total_fees: u64,
     coinbase_value: u64,
     mempool_count: usize,
+    /// v1.9.62 issue #60: zero-value outputs the stratum must append to the
+    /// coinbase. Empty pre-activation; one entry per chain (BTC/LTC/DOGE)
+    /// post-activation when the cycle has cached fresh headers.
+    #[serde(default)]
+    coinbase_extra_outputs: Vec<CoinbaseExtraOutput>,
 }
 
 #[derive(Deserialize)]
@@ -15700,6 +15715,155 @@ async fn get_block_template(
 
     let coinbase_value = block_reward(height).saturating_add(total_fees);
 
+    // v1.9.62 issue #60: build coinbase extra outputs from the cycle's
+    // cached headers if the coinbase batch activation height has been
+    // reached. Zero-cost: no wallet access, no UTXOs, no signing — just
+    // pure header data the stratum appends to the coinbase as
+    // additional value=0 outputs.
+    let coinbase_extra_outputs = {
+        let coinbase_batch_active = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain
+                .params
+                .coinbase_header_batch_activation_height
+                .map(|h| height >= h)
+                .unwrap_or(false)
+        };
+        if coinbase_batch_active {
+            const COINBASE_BATCH_CACHE_TTL_SECS: u64 = 900;
+            let mut out: Vec<CoinbaseExtraOutput> = Vec::new();
+            // BTC
+            let btc_cached = state
+                .btc_template_headers_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(c) = btc_cached {
+                let fresh = c
+                    .built_at
+                    .elapsed()
+                    .map(|d| d.as_secs() <= COINBASE_BATCH_CACHE_TTL_SECS)
+                    .unwrap_or(false);
+                let live = {
+                    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+                    chain.btc_tip_height
+                };
+                if fresh && live == c.expected_relay_tip_height {
+                    if let Ok(raw) = hex::decode(c.headers_hex.trim()) {
+                        if !raw.is_empty() && raw.len() % BTC_HEADER_BYTES == 0 {
+                            let mut headers: Vec<BtcHeader> = Vec::new();
+                            let mut ok = true;
+                            for chunk in raw.chunks(BTC_HEADER_BYTES) {
+                                match BtcHeader::deserialize(chunk) {
+                                    Ok(h) => headers.push(h),
+                                    Err(_) => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if ok {
+                                if let Ok(script) = encode_btc_header_batch(&headers) {
+                                    out.push(CoinbaseExtraOutput {
+                                        value: 0,
+                                        script_pubkey_hex: hex::encode(script),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // LTC
+            let ltc_cached = state
+                .ltc_template_headers_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(c) = ltc_cached {
+                let fresh = c
+                    .built_at
+                    .elapsed()
+                    .map(|d| d.as_secs() <= COINBASE_BATCH_CACHE_TTL_SECS)
+                    .unwrap_or(false);
+                let live = {
+                    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+                    chain.ltc_tip_height
+                };
+                if fresh && live == c.expected_relay_tip_height {
+                    if let Ok(raw) = hex::decode(c.headers_hex.trim()) {
+                        if !raw.is_empty() && raw.len() % LTC_HEADER_BYTES == 0 {
+                            let mut headers: Vec<LtcHeader> = Vec::new();
+                            let mut ok = true;
+                            for chunk in raw.chunks(LTC_HEADER_BYTES) {
+                                match LtcHeader::deserialize(chunk) {
+                                    Ok(h) => headers.push(h),
+                                    Err(_) => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if ok {
+                                if let Ok(script) = encode_ltc_header_batch(&headers) {
+                                    out.push(CoinbaseExtraOutput {
+                                        value: 0,
+                                        script_pubkey_hex: hex::encode(script),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // DOGE
+            let doge_cached = state
+                .doge_template_headers_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(c) = doge_cached {
+                let fresh = c
+                    .built_at
+                    .elapsed()
+                    .map(|d| d.as_secs() <= COINBASE_BATCH_CACHE_TTL_SECS)
+                    .unwrap_or(false);
+                let live = {
+                    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+                    chain.doge_tip_height
+                };
+                if fresh && live == c.expected_relay_tip_height {
+                    if let Ok(raw) = hex::decode(c.headers_hex.trim()) {
+                        if !raw.is_empty() && raw.len() % DOGE_HEADER_BYTES == 0 {
+                            let mut headers: Vec<DogeHeader> = Vec::new();
+                            let mut ok = true;
+                            for chunk in raw.chunks(DOGE_HEADER_BYTES) {
+                                match DogeHeader::deserialize(chunk) {
+                                    Ok(h) => headers.push(h),
+                                    Err(_) => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if ok {
+                                if let Ok(script) = encode_doge_header_batch(&headers) {
+                                    out.push(CoinbaseExtraOutput {
+                                        value: 0,
+                                        script_pubkey_hex: hex::encode(script),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        } else {
+            Vec::new()
+        }
+    };
+
     Ok(Json(BlockTemplateResponse {
         height,
         prev_hash,
@@ -15710,6 +15874,7 @@ async fn get_block_template(
         total_fees,
         coinbase_value,
         mempool_count,
+        coinbase_extra_outputs,
     }))
 }
 
@@ -17404,6 +17569,8 @@ async fn main() {
                 irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
             doge_swap_order_v1_activation_height:
                 irium_node_rs::activation::resolved_doge_swap_order_v1_activation_height(network),
+            coinbase_header_batch_activation_height:
+                irium_node_rs::activation::resolved_coinbase_header_batch_activation_height(network),
     };
     let mut state = ChainState::new(params);
     if load_persisted {
@@ -19638,6 +19805,7 @@ mod tests {
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
             doge_swap_order_v1_activation_height: None,
+            coinbase_header_batch_activation_height: None,
         };
         let chain = Arc::new(Mutex::new(ChainState::new(params)));
 
@@ -20565,6 +20733,7 @@ mod tests {
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
             doge_swap_order_v1_activation_height: None,
+            coinbase_header_batch_activation_height: None,
         };
         let chain = ChainState::new(params);
         let genesis_hash = hex::encode(chain.tip_hash());
@@ -26994,6 +27163,7 @@ mod tests {
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
             doge_swap_order_v1_activation_height: None,
+            coinbase_header_batch_activation_height: None,
         };
         let chain = Arc::new(Mutex::new(ChainState::new(params)));
         let mempool_path = unique_path("irium_wallet_test_mempool", "json");

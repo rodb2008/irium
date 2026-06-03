@@ -72,6 +72,7 @@ fn main() {
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
             doge_swap_order_v1_activation_height: None,
+            coinbase_header_batch_activation_height: None,
     };
 
     let state = ChainState::new(params);

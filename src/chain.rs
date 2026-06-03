@@ -225,6 +225,12 @@ pub struct ChainParams {
     /// to fail the output's structural check.
     pub ltc_swap_order_v1_activation_height: Option<u64>,
     pub doge_swap_order_v1_activation_height: Option<u64>,
+    /// v1.9.62 issue #60: when set, blocks at or above this height may carry
+    /// BTC/LTC/DOGE header batches in the coinbase as zero-value outputs.
+    /// Pre-activation blocks still reject coinbase batch outputs (the
+    /// historical rule). `None` keeps the rule strict on this network.
+
+    pub coinbase_header_batch_activation_height: Option<u64>,
 }
 
 /// Reference to a specific transaction output.
@@ -413,6 +419,16 @@ impl ChainState {
             .btc_spv
             .as_ref()
             .map(|p| height >= p.activation_height)
+            .unwrap_or(false)
+    }
+
+    /// v1.9.62 issue #60: true iff coinbase header-batch outputs are
+    /// allowed at the given block height. Pre-activation blocks continue
+    /// to reject any BTC/LTC/DOGE batch output in the coinbase.
+    fn coinbase_header_batch_active_at(&self, height: u64) -> bool {
+        self.params
+            .coinbase_header_batch_activation_height
+            .map(|h| height >= h)
             .unwrap_or(false)
     }
 
@@ -1392,15 +1408,136 @@ impl ChainState {
         }
 
         let mut coinbase_total: u64 = 0;
+        // v1.9.62 issue #60: coinbase batch acceptance — when the
+        // coinbase_header_batch activation height has been crossed, BTC/
+        // LTC/DOGE header-batch scripts are accepted as zero-value
+        // coinbase outputs and applied via apply_*_header_batch, instead
+        // of unconditionally rejected. The one-per-chain-per-block cap
+        // still applies; a block cannot carry both a coinbase batch and
+        // a regular-tx batch for the same chain.
+        let coinbase_batch_active = self.coinbase_header_batch_active_at(height);
+        let mut coinbase_btc_batch_count = 0u32;
+        let mut coinbase_ltc_batch_count = 0u32;
+        let mut coinbase_doge_batch_count = 0u32;
         for output in &coinbase.outputs {
-            if output.script_pubkey.first().copied() == Some(BTC_HEADER_BATCH_TAG) {
-                return Err("BtcHeaderBatch output not allowed in coinbase".to_string());
+            let tag = output.script_pubkey.first().copied();
+            if tag == Some(BTC_HEADER_BATCH_TAG) {
+                if !coinbase_batch_active {
+                    return Err("BtcHeaderBatch output not allowed in coinbase".to_string());
+                }
+                if !self.btc_spv_relay_active_at(height) {
+                    return Err(
+                        "coinbase BtcHeaderBatch before SPV relay activation".to_string(),
+                    );
+                }
+                if output.value != 0 {
+                    return Err("coinbase BtcHeaderBatch output must have value=0".to_string());
+                }
+                coinbase_btc_batch_count += 1;
+                if coinbase_btc_batch_count > 1 {
+                    return Err(
+                        "coinbase contains more than one BtcHeaderBatch output".to_string(),
+                    );
+                }
+                if btc_relay_update.is_some() {
+                    return Err(
+                        "block contains both coinbase and regular-tx BtcHeaderBatch".to_string(),
+                    );
+                }
+                let headers = parse_btc_header_batch(&output.script_pubkey)
+                    .map_err(|e| format!("coinbase BtcHeaderBatch parse failed: {}", e))?;
+                let anchor = self.btc_anchor();
+                let update = apply_btc_header_batch(
+                    headers,
+                    block.header.time,
+                    &mut self.btc_headers,
+                    &mut self.btc_heights,
+                    &mut self.btc_tip,
+                    &mut self.btc_tip_height,
+                    &anchor,
+                )?;
+                btc_relay_update = Some(update);
+                continue;
             }
-            if output.script_pubkey.first().copied() == Some(LTC_HEADER_BATCH_TAG) {
-                return Err("LtcHeaderBatch output not allowed in coinbase".to_string());
+            if tag == Some(LTC_HEADER_BATCH_TAG) {
+                if !coinbase_batch_active {
+                    return Err("LtcHeaderBatch output not allowed in coinbase".to_string());
+                }
+                if !self.ltc_spv_relay_active_at(height) {
+                    return Err(
+                        "coinbase LtcHeaderBatch before SPV relay activation".to_string(),
+                    );
+                }
+                if output.value != 0 {
+                    return Err("coinbase LtcHeaderBatch output must have value=0".to_string());
+                }
+                coinbase_ltc_batch_count += 1;
+                if coinbase_ltc_batch_count > 1 {
+                    return Err(
+                        "coinbase contains more than one LtcHeaderBatch output".to_string(),
+                    );
+                }
+                if ltc_relay_update.is_some() {
+                    return Err(
+                        "block contains both coinbase and regular-tx LtcHeaderBatch".to_string(),
+                    );
+                }
+                let headers = parse_ltc_header_batch(&output.script_pubkey)
+                    .map_err(|e| format!("coinbase LtcHeaderBatch parse failed: {}", e))?;
+                let anchor = self.ltc_anchor();
+                let retarget = self.ltc_retarget_params();
+                let update = apply_ltc_header_batch(
+                    headers,
+                    block.header.time,
+                    &mut self.ltc_headers,
+                    &mut self.ltc_heights,
+                    &mut self.ltc_tip,
+                    &mut self.ltc_tip_height,
+                    &anchor,
+                    &retarget,
+                )?;
+                ltc_relay_update = Some(update);
+                continue;
             }
-            if output.script_pubkey.first().copied() == Some(DOGE_HEADER_BATCH_TAG) {
-                return Err("DogeHeaderBatch output not allowed in coinbase".to_string());
+            if tag == Some(DOGE_HEADER_BATCH_TAG) {
+                if !coinbase_batch_active {
+                    return Err("DogeHeaderBatch output not allowed in coinbase".to_string());
+                }
+                if !self.doge_spv_relay_active_at(height) {
+                    return Err(
+                        "coinbase DogeHeaderBatch before SPV relay activation".to_string(),
+                    );
+                }
+                if output.value != 0 {
+                    return Err("coinbase DogeHeaderBatch output must have value=0".to_string());
+                }
+                coinbase_doge_batch_count += 1;
+                if coinbase_doge_batch_count > 1 {
+                    return Err(
+                        "coinbase contains more than one DogeHeaderBatch output".to_string(),
+                    );
+                }
+                if doge_relay_update.is_some() {
+                    return Err(
+                        "block contains both coinbase and regular-tx DogeHeaderBatch".to_string(),
+                    );
+                }
+                let headers = parse_doge_header_batch(&output.script_pubkey)
+                    .map_err(|e| format!("coinbase DogeHeaderBatch parse failed: {}", e))?;
+                let anchor = self.doge_anchor();
+                let retarget = self.doge_retarget_params();
+                let update = apply_doge_header_batch(
+                    headers,
+                    block.header.time,
+                    &mut self.doge_headers,
+                    &mut self.doge_heights,
+                    &mut self.doge_tip,
+                    &mut self.doge_tip_height,
+                    &anchor,
+                    &retarget,
+                )?;
+                doge_relay_update = Some(update);
+                continue;
             }
             validate_output(
                 output,
@@ -3399,6 +3536,7 @@ mod tests {
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
             doge_swap_order_v1_activation_height: None,
+            coinbase_header_batch_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -3483,6 +3621,7 @@ mod tests {
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
             doge_swap_order_v1_activation_height: None,
+            coinbase_header_batch_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -4201,6 +4340,7 @@ mod tests {
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
             doge_swap_order_v1_activation_height: None,
+            coinbase_header_batch_activation_height: None,
         };
         ChainState::new(params)
     }
@@ -4605,6 +4745,7 @@ mod tests {
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
             doge_swap_order_v1_activation_height: None,
+            coinbase_header_batch_activation_height: None,
         };
         ChainState::new(params)
     }
