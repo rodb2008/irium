@@ -2,7 +2,7 @@
 
 **Technical Whitepaper — Version 2.2 (post-Groups-C-H)**
 
-**Network Status:** Live on Mainnet — Block ~22,500 (May 2026) · node `v1.9.28` released (current); desktop app [Irium Core v1.0.42](https://github.com/iriumlabs/irium-core/releases/latest) bundles the v1.9.28 sidecars
+**Network Status:** Live on Mainnet (launched January 5, 2026) · node `v1.9.49` released (current); desktop app [Irium Core v1.0.77](https://github.com/iriumlabs/irium-core/releases/latest) bundles the latest v1.9.x sidecars. V2 block-time fork (120 s target) active since block 24,250; LWMA v2 active since block 19,740; BTC atomic swaps (SPV-verified, no custodian) live since block 23,850 (LTC/DOGE coming soon).
 
 **Snapshot (block ~22,500):** ~18 connected peers per VPS node · circulating supply ~1.12M IRM · max supply 100,000,000 IRM (96.5M mineable + 3.5M genesis CLTV vest) · genesis hash `0000000028f25d…` · network era *Early Miner Era* · official-pool live (`pool.iriumlabs.org:3333` ASIC, `:3335` CPU/GPU, `:443` ISP-block fallback, `:3337` public stats proxy, `https://pool.iriumlabs.org/stats` HTML stats page)
 
@@ -107,8 +107,8 @@ primitive. Buyers and sellers can create cryptographically binding agreements, f
 them with IRM, submit proof of delivery or service completion, and release funds —
 all without trusting any intermediary, custodian, or smart contract platform.
 
-The base chain uses SHA-256d proof of work with the LWMA difficulty algorithm, 10-minute
-block targets, and AuxPoW merged mining. The settlement layer implements deterministic
+The base chain uses SHA-256d proof of work with the LWMA v2 difficulty algorithm, 2-minute
+block targets (V2, active since block 24,250), and AuxPoW merged mining. The settlement layer implements deterministic
 spend-path evaluation: release requires verified proof, refund requires timeout,
 and every outcome is determined by on-chain observable data. A proof automation engine
 handles three categories of real-world evidence (software delivery, service completion,
@@ -166,7 +166,7 @@ Irium consists of five distinct protocol layers. Each layer is separable in conc
 but they interact to form the complete system.
 
 **Base chain layer.** The foundation is a SHA-256d proof-of-work blockchain with
-10-minute block targets and the LWMA difficulty adjustment algorithm. This layer
+2-minute block targets (V2, active since block 24,250) and the LWMA v2 difficulty adjustment algorithm. This layer
 handles block production, transaction ordering, and IRM token issuance. It is
 intentionally similar to Bitcoin's base layer to allow easy integration with
 existing mining infrastructure and tooling.
@@ -207,9 +207,9 @@ objective metrics before entering an agreement.
 | Max Supply | 100,000,000 IRM |
 | Genesis Vesting | 3,500,000 IRM (3.5%) |
 | Mineable Supply | 96,500,000 IRM (96.5%) |
-| Block Time | 600 seconds (10 minutes) |
+| Block Time | 120 seconds (2 minutes), V2 target active since block 24,250 (V1 was 600 s) |
 | Initial Reward | 50 IRM |
-| Halving Interval | 210,000 blocks (~4 years) |
+| Halving Interval | 1,050,000 blocks (~4 years at the 2-min V2 target) |
 | Difficulty Retarget | 2,016-block retarget until height 16,462, then LWMA v2 |
 | Coinbase Maturity | 100 blocks |
 | Min Fee Rate | 1 sat/byte (~250 sat for a typical transaction) |
@@ -322,13 +322,14 @@ paths: release via secret preimage, or refund via block height timeout.
 
 ### Block Rewards
 
-Block rewards follow a Bitcoin-identical halving schedule. The initial block reward
-is 50 IRM per block. Rewards halve every 210,000 blocks. The block reward at any
-height is computed as (`src/constants.rs`):
+Block rewards follow a Bitcoin-style halving schedule scaled to Irium's parameters.
+The initial block reward is 50 IRM per block. Rewards halve every 1,050,000 blocks
+(~4 years at the V2 2-minute target). The block reward at any height is computed
+as (`src/constants.rs`):
 
 ```rust
 pub const INITIAL_SUBSIDY: u64 = 50 * 100_000_000;  // 50 IRM
-pub const HALVING_INTERVAL: u64 = 210_000;
+pub const HALVING_INTERVAL: u64 = 1_050_000;
 
 pub fn block_reward(height: u64) -> u64 {
     let halvings = (height - 1) / HALVING_INTERVAL;
@@ -343,16 +344,18 @@ Halving schedule:
 
 | Era | Block range | Reward per block | Era total |
 |---|---|---|---|
-| 1 | 1 – 210,000 | 50 IRM | 10,500,000 IRM |
-| 2 | 210,001 – 420,000 | 25 IRM | 5,250,000 IRM |
-| 3 | 420,001 – 630,000 | 12.5 IRM | 2,625,000 IRM |
-| 4 | 630,001 – 840,000 | 6.25 IRM | 1,312,500 IRM |
+| 1 | 1 – 1,050,000 | 50 IRM | 52,500,000 IRM |
+| 2 | 1,050,001 – 2,100,000 | 25 IRM | 26,250,000 IRM |
+| 3 | 2,100,001 – 3,150,000 | 12.5 IRM | 13,125,000 IRM |
+| 4 | 3,150,001 – 4,200,000 | 6.25 IRM | 6,562,500 IRM |
+| 5 | 4,200,001 – 5,250,000 | 3.125 IRM | 3,281,250 IRM |
+| 6 | 5,250,001 – 6,300,000 | 1.5625 IRM | 1,640,625 IRM |
 | ... | ... | ... | ... |
-| All eras | 1 – ~13,440,000 | Converging | ~21,000,000 IRM |
+| All eras (bounded by cap) | Converging | Halving every 1,050,000 blocks | 96,500,000 IRM total mining emission |
 
-The sum of all block rewards across all 64 possible halving eras converges to
-approximately 21,000,000 IRM — identical to Bitcoin's supply curve applied to
-Irium's parameters.
+The sum of all block rewards across all halving eras converges to 96,500,000 IRM,
+bounded by the `MAX_MONEY = 100,000,000 IRM` consensus cap (which leaves
+3,500,000 IRM headroom for the genesis CLTV vesting allocation described below).
 
 ### Genesis Vesting Allocation
 
@@ -1298,6 +1301,8 @@ Stratum configuration:
 |---------|----------|--------------------------|-------------|
 | ASIC / strict | `stratum+tcp://pool.iriumlabs.org:3333` | 16 (vardiff 1–2048) | your `Q…` payout address |
 | CPU / GPU / legacy | `stratum+tcp://pool.iriumlabs.org:3335` | 1 (vardiff 1–1024) | your `Q…` payout address |
+| Firewall bypass (sslh-multiplexed) | `stratum+tcp://pool.iriumlabs.org:443` | Same as ASIC | your `Q…` payout address |
+| Solo (full 50 IRM coinbase to block finder, 0% pool fee) | `stratum+tcp://pool.iriumlabs.org:3336` | 10000 (vardiff capped) | your `Q…` payout address |
 
 The pool runs the `irium-stratum` daemon from this repository
 (`pool/irium-stratum/`) split into two systemd units (`irium-stratum.service`
@@ -1498,8 +1503,10 @@ a verifiable track record rather than a self-reported one.
 All of this operates on a SHA-256d proof-of-work foundation that allows Irium to
 leverage the existing Bitcoin mining ecosystem — initially through standalone mining,
 and from block 26,347 onward through AuxPoW merged mining. The economic model
-follows Bitcoin's halving schedule: 50 IRM per block, halving every 210,000 blocks,
-converging to approximately 21 million IRM from block rewards total.
+scales Bitcoin's halving curve to Irium's parameters: 50 IRM per block, halving every
+1,050,000 blocks (~4 years at the V2 2-minute target), converging to 96.5M IRM from
+block rewards plus 3.5M IRM from the genesis CLTV vesting allocation — a fixed
+100,000,000 IRM total supply enforced by the `MAX_MONEY` consensus cap.
 
 Irium is designed to be a durable layer for commercial trust on the internet —
 censorship-resistant, deterministic, and verifiable without requiring any party
