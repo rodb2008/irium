@@ -15796,7 +15796,15 @@ async fn get_block_template(
                     .elapsed()
                     .map(|d| d.as_secs() <= COINBASE_BATCH_CACHE_TTL_SECS)
                     .unwrap_or(false);
-                if fresh {
+                // v1.9.64: LTC needs strict tip match because apply_ltc_header_batch
+                // lacks the v1.9.52-style idempotency that BTC has — re-applying
+                // an already-known batch hard-rejects with "header X already known
+                // in chain state" and the whole block fails.
+                let live = {
+                    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+                    chain.ltc_tip_height
+                };
+                if fresh && live == c.expected_relay_tip_height {
                     if let Ok(raw) = hex::decode(c.headers_hex.trim()) {
                         if !raw.is_empty() && raw.len() % LTC_HEADER_BYTES == 0 {
                             let mut headers: Vec<LtcHeader> = Vec::new();
@@ -15834,7 +15842,14 @@ async fn get_block_template(
                     .elapsed()
                     .map(|d| d.as_secs() <= COINBASE_BATCH_CACHE_TTL_SECS)
                     .unwrap_or(false);
-                if fresh {
+                // v1.9.64: DOGE needs strict tip match for the same reason
+                // as LTC — apply_doge_header_batch lacks v1.9.52-style
+                // idempotency, so re-injecting a known batch hard-rejects.
+                let live = {
+                    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+                    chain.doge_tip_height
+                };
+                if fresh && live == c.expected_relay_tip_height {
                     if let Ok(raw) = hex::decode(c.headers_hex.trim()) {
                         if !raw.is_empty() && raw.len() % DOGE_HEADER_BYTES == 0 {
                             let mut headers: Vec<DogeHeader> = Vec::new();
