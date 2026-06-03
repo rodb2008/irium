@@ -15537,144 +15537,6 @@ async fn inspect_htlc(
     }))
 }
 
-/// v1.9.61: maximum age of a cached header batch before it is treated as
-/// stale. The cycle runs every 600s and refreshes the cache; allow some
-/// slack for cycle delays / mempool.space slow responses while still
-/// guaranteeing we never inject headers we fetched many minutes ago.
-const TEMPLATE_BATCH_CACHE_TTL_SECS: u64 = 900;
-
-/// v1.9.61: build a fresh signed BTC header-batch carrier tx for the
-/// block template, using cached headers from the in-process sync cycle.
-/// Returns None on any failure (no cache, stale cache, wallet locked,
-/// no spendable UTXOs, BTC SPV gate closed, fee policy mismatch, etc.) —
-/// the template is then shipped without a carrier and block production
-/// proceeds unaffected. The BTC relay tip simply advances later, when
-/// the next block carrying a batch is mined.
-async fn build_template_btc_batch(state: &AppState) -> Option<TemplateTx> {
-    // v1.9.61 wallet-spend safety: this helper signs a tx with the
-    // operator wallet. Desktop nodes (no IRIUM_WALLET_PASSWORD) must
-    // never reach the signing path — return None up front.
-    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
-        return None;
-    }
-    let cached = {
-        let guard = state
-            .btc_template_headers_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.clone()?
-    };
-    if cached
-        .built_at
-        .elapsed()
-        .map(|d| d.as_secs() > TEMPLATE_BATCH_CACHE_TTL_SECS)
-        .unwrap_or(true)
-    {
-        return None;
-    }
-    let live_relay_tip = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain.btc_tip_height
-    };
-    if live_relay_tip != cached.expected_relay_tip_height {
-        return None;
-    }
-    let fee = header_sync::common::env_u64("BTC_HEADER_SYNC_FEE_PER_BYTE", 100);
-    let req = SubmitBtcHeadersRequest {
-        headers_hex: cached.headers_hex,
-        broadcast: Some(false),
-        fee_per_byte: Some(fee),
-    };
-    let resp = submit_btc_headers_core(state, req, None).await.ok()?;
-    Some(TemplateTx {
-        hex: resp.raw_tx_hex,
-        fee: resp.fee,
-        relay_addresses: Vec::new(),
-    })
-}
-
-/// v1.9.61: LTC analogue of build_template_btc_batch.
-async fn build_template_ltc_batch(state: &AppState) -> Option<TemplateTx> {
-    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
-        return None;
-    }
-    let cached = {
-        let guard = state
-            .ltc_template_headers_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.clone()?
-    };
-    if cached
-        .built_at
-        .elapsed()
-        .map(|d| d.as_secs() > TEMPLATE_BATCH_CACHE_TTL_SECS)
-        .unwrap_or(true)
-    {
-        return None;
-    }
-    let live_relay_tip = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain.ltc_tip_height
-    };
-    if live_relay_tip != cached.expected_relay_tip_height {
-        return None;
-    }
-    let fee = header_sync::common::env_u64("LTC_HEADER_SYNC_FEE_PER_BYTE", 100);
-    let req = SubmitLtcHeadersRequest {
-        headers_hex: cached.headers_hex,
-        broadcast: Some(false),
-        fee_per_byte: Some(fee),
-    };
-    let resp = submit_ltc_headers_core(state, req).await.ok()?;
-    Some(TemplateTx {
-        hex: resp.raw_tx_hex,
-        fee: resp.fee,
-        relay_addresses: Vec::new(),
-    })
-}
-
-/// v1.9.61: DOGE analogue of build_template_btc_batch.
-async fn build_template_doge_batch(state: &AppState) -> Option<TemplateTx> {
-    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
-        return None;
-    }
-    let cached = {
-        let guard = state
-            .doge_template_headers_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.clone()?
-    };
-    if cached
-        .built_at
-        .elapsed()
-        .map(|d| d.as_secs() > TEMPLATE_BATCH_CACHE_TTL_SECS)
-        .unwrap_or(true)
-    {
-        return None;
-    }
-    let live_relay_tip = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain.doge_tip_height
-    };
-    if live_relay_tip != cached.expected_relay_tip_height {
-        return None;
-    }
-    let fee = header_sync::common::env_u64("DOGE_HEADER_SYNC_FEE_PER_BYTE", 100);
-    let req = SubmitDogeHeadersRequest {
-        headers_hex: cached.headers_hex,
-        broadcast: Some(false),
-        fee_per_byte: Some(fee),
-    };
-    let resp = submit_doge_headers_core(state, req).await.ok()?;
-    Some(TemplateTx {
-        hex: resp.raw_tx_hex,
-        fee: resp.fee,
-        relay_addresses: Vec::new(),
-    })
-}
-
 async fn get_block_template(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -15822,39 +15684,9 @@ async fn get_block_template(
             true
         });
     }
-    // v1.9.61: if the mempool didn't supply a carrier for a given chain,
-    // try to inject one built fresh from the cycle's cached headers.
-    // Each build silently fails (returns None) if anything is wrong
-    // (wallet locked, no UTXOs, gate closed, stale cache, etc.) so block
-    // production never blocks on header relay.
-    let already_has_btc_batch = mempool_entries
-        .iter()
-        .any(|e| e.tx.outputs.iter().any(|o| parse_btc_header_batch(&o.script_pubkey).is_ok()));
-    let already_has_ltc_batch = mempool_entries
-        .iter()
-        .any(|e| e.tx.outputs.iter().any(|o| parse_ltc_header_batch(&o.script_pubkey).is_ok()));
-    let already_has_doge_batch = mempool_entries
-        .iter()
-        .any(|e| e.tx.outputs.iter().any(|o| parse_doge_header_batch(&o.script_pubkey).is_ok()));
-    let injected_btc = if already_has_btc_batch {
-        None
-    } else {
-        build_template_btc_batch(&state).await
-    };
-    let injected_ltc = if already_has_ltc_batch {
-        None
-    } else {
-        build_template_ltc_batch(&state).await
-    };
-    let injected_doge = if already_has_doge_batch {
-        None
-    } else {
-        build_template_doge_batch(&state).await
-    };
-
     let mempool_count = mempool_entries.len();
     let mut total_fees = 0u64;
-    let mut txs: Vec<TemplateTx> = mempool_entries
+    let txs = mempool_entries
         .into_iter()
         .map(|entry| {
             total_fees = total_fees.saturating_add(entry.fee);
@@ -15865,10 +15697,6 @@ async fn get_block_template(
             }
         })
         .collect();
-    for inj in [injected_btc, injected_ltc, injected_doge].into_iter().flatten() {
-        total_fees = total_fees.saturating_add(inj.fee);
-        txs.push(inj);
-    }
 
     let coinbase_value = block_reward(height).saturating_add(total_fees);
 
@@ -16994,86 +16822,6 @@ async fn maybe_bootstrap_btc_headers(
     Ok(())
 }
 
-/// Result of an auto-unlock attempt; lets the caller log a precise reason
-/// without inspecting wallet state again. Pure data — no side effects.
-#[derive(Debug, PartialEq, Eq)]
-enum AutoUnlockOutcome {
-    /// IRIUM_WALLET_PASSWORD env var was unset or empty. No-op.
-    NoPassword,
-    /// Wallet on disk is None (no wallet yet) or Plaintext (legacy; no
-    /// passphrase to apply). No-op.
-    SkippedNotEncrypted,
-    /// Wallet was already unlocked when called (e.g. a manual unlock RPC
-    /// landed first). No-op.
-    AlreadyUnlocked,
-    /// Successfully decrypted with the supplied passphrase.
-    Unlocked,
-    /// Decrypt failed (wrong passphrase, file corruption, etc.).
-    UnlockFailed(String),
-}
-
-/// Pure auto-unlock logic — extracted from `maybe_auto_unlock_wallet` so unit
-/// tests don't have to build a full AppState. Takes the wallet manager
-/// directly and the password option (`None` ⇒ env var unset, `Some("")` ⇒ env
-/// var set to empty string; both treated as no-op).
-fn auto_unlock_wallet_with_password(
-    wallet: &mut WalletManager,
-    password: Option<&str>,
-) -> AutoUnlockOutcome {
-    let pw = match password {
-        Some(p) if !p.is_empty() => p,
-        _ => return AutoUnlockOutcome::NoPassword,
-    };
-    if !matches!(wallet.mode(), WalletMode::Encrypted) {
-        return AutoUnlockOutcome::SkippedNotEncrypted;
-    }
-    if wallet.is_unlocked() {
-        return AutoUnlockOutcome::AlreadyUnlocked;
-    }
-    match wallet.unlock(pw) {
-        Ok(()) => AutoUnlockOutcome::Unlocked,
-        Err(e) => AutoUnlockOutcome::UnlockFailed(e),
-    }
-}
-
-/// Read IRIUM_WALLET_PASSWORD and auto-unlock the wallet if encrypted. Called
-/// once during `main()` BEFORE the BTC/LTC/DOGE header-sync tasks are spawned,
-/// so the in-process `submit_*_headers_core` calls those tasks make can read
-/// `wallet.keys()` without `wallet_keys_unavailable` errors.
-///
-/// Threat model: env var is set via systemd `Environment=` directive on
-/// operator-controlled VPS only; same surface as IRIUM_RPC_TOKEN. Desktop
-/// users on Windows never set this — their flow is unchanged.
-///
-/// On wrong passphrase / decrypt error: logs a warning and returns. Header
-/// sync stays broken until /wallet/unlock is called manually, which is the
-/// pre-v1.9.56 behavior. No retry loop here — passphrase doesn't change at
-/// runtime, so retrying on the same value is pointless.
-fn maybe_auto_unlock_wallet(state: &AppState) {
-    let pw_env = env::var("IRIUM_WALLET_PASSWORD").ok();
-    let outcome = {
-        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-        auto_unlock_wallet_with_password(&mut *wallet, pw_env.as_deref())
-    };
-    match outcome {
-        AutoUnlockOutcome::NoPassword | AutoUnlockOutcome::SkippedNotEncrypted => {
-            // Silent no-op: this is the default path for desktop / fresh installs.
-        }
-        AutoUnlockOutcome::AlreadyUnlocked => {
-            eprintln!("[wallet-auto-unlock] wallet already unlocked; no action taken");
-        }
-        AutoUnlockOutcome::Unlocked => {
-            eprintln!("[wallet-auto-unlock] unlocked from IRIUM_WALLET_PASSWORD");
-        }
-        AutoUnlockOutcome::UnlockFailed(e) => {
-            eprintln!(
-                "[wallet-auto-unlock] failed: {} (header-sync will report wallet_keys_unavailable until /wallet/unlock is called manually)",
-                e
-            );
-        }
-    }
-}
-
 /// Resolve `<IRIUM_DATA_DIR>/{label}_header_sync_last.txt` (or
 /// `$HOME/.irium/...` if the env var is unset). The wrapper script
 /// /usr/local/bin/btc-header-sync-wrapper reads this file's unix
@@ -17147,18 +16895,6 @@ where
 }
 
 fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
-    // v1.9.61 wallet-spend safety: header relay funds carrier txs from
-    // the operator wallet. Desktop wallet users never consented to that.
-    // Gate the entire cycle behind IRIUM_WALLET_PASSWORD so only operator
-    // nodes (which set the env var via systemd drop-in) ever spawn the
-    // relay loop. Desktop nodes still receive header data via P2P from
-    // operator nodes; they simply do not originate carrier txs.
-    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
-        eprintln!(
-            "[header-sync/btc] IRIUM_WALLET_PASSWORD not set — skipping header relay (operator-only)"
-        );
-        return;
-    }
     let act_height = match irium_node_rs::activation::resolved_btc_spv_relay_activation_height(network) {
         Some(h) => h,
         None => {
@@ -17208,12 +16944,6 @@ fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
 }
 
 fn maybe_spawn_ltc_header_sync(state: AppState, network: NetworkKind) {
-    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
-        eprintln!(
-            "[header-sync/ltc] IRIUM_WALLET_PASSWORD not set — skipping header relay (operator-only)"
-        );
-        return;
-    }
     let act_height = match irium_node_rs::activation::resolved_ltc_spv_relay_activation_height(network) {
         Some(h) => h,
         None => {
@@ -17266,12 +16996,6 @@ fn maybe_spawn_ltc_header_sync(state: AppState, network: NetworkKind) {
 }
 
 fn maybe_spawn_doge_header_sync(state: AppState, network: NetworkKind) {
-    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
-        eprintln!(
-            "[header-sync/doge] IRIUM_WALLET_PASSWORD not set — skipping header relay (operator-only)"
-        );
-        return;
-    }
     let act_height = match irium_node_rs::activation::resolved_doge_spv_relay_activation_height(network) {
         Some(h) => h,
         None => {
@@ -17328,14 +17052,6 @@ async fn run_btc_header_sync_cycle(
     client: &reqwest::Client,
     act_height: u64,
 ) -> Result<String, String> {
-    // v1.9.61 wallet-spend safety (defense-in-depth): even if some
-    // future code path invokes the cycle directly without going
-    // through maybe_spawn_btc_header_sync, refuse to fetch when
-    // IRIUM_WALLET_PASSWORD is unset. Desktop wallets must never be
-    // touched by header relay.
-    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
-        return Ok("disabled: IRIUM_WALLET_PASSWORD not set".to_string());
-    }
     let (relay_tip, gate_open) = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let open = chain.height >= act_height;
@@ -17402,9 +17118,6 @@ async fn run_ltc_header_sync_cycle(
     act_height: u64,
     source: header_sync::common::Source,
 ) -> Result<String, String> {
-    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
-        return Ok("disabled: IRIUM_WALLET_PASSWORD not set".to_string());
-    }
     let (relay_tip, gate_open) = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let open = chain.height >= act_height;
@@ -17469,9 +17182,6 @@ async fn run_doge_header_sync_cycle(
     act_height: u64,
     source: header_sync::common::Source,
 ) -> Result<String, String> {
-    if env::var("IRIUM_WALLET_PASSWORD").is_err() {
-        return Ok("disabled: IRIUM_WALLET_PASSWORD not set".to_string());
-    }
     let (relay_tip, gate_open) = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let open = chain.height >= act_height;
@@ -18644,13 +18354,6 @@ async fn main() {
             }
         });
     }
-
-    // v1.9.56: auto-unlock encrypted wallet from IRIUM_WALLET_PASSWORD env var
-    // BEFORE spawning header-sync loops. Header-sync calls submit_*_headers_core
-    // in-process and that path needs wallet.keys(), which fails when the wallet
-    // is locked. Sync (not spawned) so header-sync sees an unlocked wallet on
-    // its very first cycle. No-op if env var is unset.
-    maybe_auto_unlock_wallet(&app_state);
 
     maybe_spawn_btc_header_sync(app_state.clone(), network);
     maybe_spawn_ltc_header_sync(app_state.clone(), network);
@@ -27442,178 +27145,6 @@ mod tests {
         let status = result.err().expect("must error");
         assert_eq!(status, StatusCode::CONFLICT);
         let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn auto_unlock_helper_unlocks_encrypted_wallet_when_password_provided() {
-        // Encrypted wallet + matching passphrase => Unlocked + wallet now unlocked.
-        let path = unique_path("autounlock_ok", "json");
-        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path.clone());
-        mgr.create_with_seed("correct-horse-battery-staple", None)
-            .expect("create");
-        // create_with_seed leaves the wallet unlocked in memory. Drop and reopen
-        // to simulate a fresh process where the wallet starts locked.
-        drop(mgr);
-        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path.clone());
-        assert!(!mgr.is_unlocked(), "fresh reopen should be locked");
-        let outcome = auto_unlock_wallet_with_password(
-            &mut mgr,
-            Some("correct-horse-battery-staple"),
-        );
-        assert_eq!(outcome, AutoUnlockOutcome::Unlocked);
-        assert!(mgr.is_unlocked(), "wallet should be unlocked after helper");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn auto_unlock_helper_is_noop_when_password_absent() {
-        // Encrypted wallet but password is None => NoPassword, wallet stays locked.
-        let path = unique_path("autounlock_nopw", "json");
-        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path.clone());
-        mgr.create_with_seed("any-pass", None).expect("create");
-        drop(mgr);
-        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path.clone());
-        let outcome = auto_unlock_wallet_with_password(&mut mgr, None);
-        assert_eq!(outcome, AutoUnlockOutcome::NoPassword);
-        assert!(!mgr.is_unlocked(), "wallet must remain locked");
-
-        // Empty-string password is also a no-op.
-        let outcome_empty = auto_unlock_wallet_with_password(&mut mgr, Some(""));
-        assert_eq!(outcome_empty, AutoUnlockOutcome::NoPassword);
-        assert!(!mgr.is_unlocked(), "wallet must remain locked on empty pw");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn auto_unlock_helper_logs_failure_and_keeps_wallet_locked_on_wrong_pw() {
-        // Encrypted wallet + wrong passphrase => UnlockFailed(_), wallet stays locked.
-        let path = unique_path("autounlock_wrongpw", "json");
-        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path.clone());
-        mgr.create_with_seed("the-real-password", None).expect("create");
-        drop(mgr);
-        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path.clone());
-        let outcome = auto_unlock_wallet_with_password(
-            &mut mgr,
-            Some("definitely-not-the-real-password"),
-        );
-        assert!(
-            matches!(outcome, AutoUnlockOutcome::UnlockFailed(_)),
-            "expected UnlockFailed, got {:?}",
-            outcome
-        );
-        assert!(
-            !mgr.is_unlocked(),
-            "wallet must stay locked after wrong passphrase"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn build_template_btc_batch_returns_none_when_cache_empty() {
-        // Default AppState has no cached headers => helper returns None and
-        // the template ships without a carrier.
-        let path = unique_path("template_btc_empty", "json");
-        let state = make_wallet_app_state(path.clone());
-        let result = build_template_btc_batch(&state).await;
-        assert!(
-            result.is_none(),
-            "expected None when cache is empty, got Some(fee={:?})",
-            result.map(|t| t.fee)
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn build_template_btc_batch_returns_none_when_cache_tip_mismatches_chain() {
-        // Cache populated but expected_relay_tip_height (999_999) does not
-        // match the chain's btc_tip_height (0 in the test state). Helper
-        // refuses to use the stale cache.
-        let path = unique_path("template_btc_mismatch", "json");
-        let state = make_wallet_app_state(path.clone());
-        {
-            let mut guard = state
-                .btc_template_headers_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *guard = Some(CachedHeaderBatchForTemplate {
-                headers_hex: "00".repeat(80),
-                expected_relay_tip_height: 999_999,
-                built_at: std::time::SystemTime::now(),
-            });
-        }
-        let result = build_template_btc_batch(&state).await;
-        assert!(result.is_none(), "expected None when cache tip != chain tip");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn build_template_btc_batch_returns_none_when_cache_too_old() {
-        // Cache age > TEMPLATE_BATCH_CACHE_TTL_SECS (15 minutes) => discarded.
-        let path = unique_path("template_btc_stale", "json");
-        let state = make_wallet_app_state(path.clone());
-        {
-            let mut guard = state
-                .btc_template_headers_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *guard = Some(CachedHeaderBatchForTemplate {
-                headers_hex: "00".repeat(80),
-                expected_relay_tip_height: 0,
-                built_at: std::time::SystemTime::now()
-                    .checked_sub(std::time::Duration::from_secs(
-                        TEMPLATE_BATCH_CACHE_TTL_SECS + 60,
-                    ))
-                    .expect("system time minus 16min must be representable"),
-            });
-        }
-        let result = build_template_btc_batch(&state).await;
-        assert!(result.is_none(), "expected None when cache is past TTL");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn build_template_btc_batch_returns_none_when_submit_core_fails() {
-        // Cache fresh and matches the chain tip, but the chain's btc_spv
-        // params are None (test state has no SPV activation), so
-        // submit_btc_headers_core returns btc_spv_relay_not_active. The
-        // helper must surface that as a silent None — never block
-        // template generation when relay isn't applicable.
-        let path = unique_path("template_btc_nogate", "json");
-        let state = make_wallet_app_state(path.clone());
-        {
-            let mut guard = state
-                .btc_template_headers_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *guard = Some(CachedHeaderBatchForTemplate {
-                headers_hex: "00".repeat(80),
-                expected_relay_tip_height: 0,
-                built_at: std::time::SystemTime::now(),
-            });
-        }
-        let result = build_template_btc_batch(&state).await;
-        assert!(
-            result.is_none(),
-            "expected None when submit_btc_headers_core returns an error"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn auto_unlock_helper_skips_when_wallet_missing_or_plaintext() {
-        // 1. No wallet file at all => SkippedNotEncrypted.
-        let path_missing = unique_path("autounlock_missing", "json");
-        let mut mgr = irium_node_rs::wallet_store::WalletManager::new(path_missing.clone());
-        let outcome = auto_unlock_wallet_with_password(&mut mgr, Some("anything"));
-        assert_eq!(outcome, AutoUnlockOutcome::SkippedNotEncrypted);
-
-        // 2. Plaintext wallet on disk => SkippedNotEncrypted.
-        let path_plain = unique_path("autounlock_plain", "json");
-        write_legacy_plaintext_at(&path_plain);
-        let mut mgr2 = irium_node_rs::wallet_store::WalletManager::new(path_plain.clone());
-        let outcome2 = auto_unlock_wallet_with_password(&mut mgr2, Some("anything"));
-        assert_eq!(outcome2, AutoUnlockOutcome::SkippedNotEncrypted);
-        let _ = std::fs::remove_file(&path_plain);
     }
 
     #[tokio::test]

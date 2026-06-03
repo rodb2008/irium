@@ -898,11 +898,11 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_activation_set_to_25000() {
+    fn mainnet_activation_set_to_24800() {
         assert_eq!(
             MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT,
-            Some(25_000),
-            "LTC SPV mainnet activation height is set to 25_000"
+            Some(24_800),
+            "LTC SPV mainnet activation height is set to 24_800"
         );
     }
 

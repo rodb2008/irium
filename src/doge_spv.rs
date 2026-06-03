@@ -880,7 +880,7 @@ mod tests {
         let anchor_header = mine_doge_header([0u8; 32], 1_700_000_000, bits);
         let anchor = DogeAnchor {
             hash: anchor_header.block_hash(),
-            height: 6_225_000,
+            height: 6_224_800,
             bits,
             time: anchor_header.time,
             prev_time: anchor_header.time - 60,
@@ -981,11 +981,11 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_activation_set_to_25000() {
+    fn mainnet_activation_set_to_24800() {
         assert_eq!(
             MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT,
-            Some(25_000),
-            "DOGE SPV mainnet activation height is set to 25_000"
+            Some(24_800),
+            "DOGE SPV mainnet activation height is set to 24_800"
         );
     }
 
