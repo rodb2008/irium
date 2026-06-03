@@ -149,17 +149,17 @@ use irium_node_rs::tx::{
     SWAP_ORDER_MIN_LOCKED_VALUE,
 };
 use irium_node_rs::btc_spv::{
-    apply_btc_header_batch, encode_btc_header_batch, resolve_btc_spv_params, BtcAnchor,
-    BtcHeader, BtcHeaderEntry, BTC_HEADER_BYTES,
+    apply_btc_header_batch, encode_btc_header_batch, parse_btc_header_batch,
+    resolve_btc_spv_params, BtcAnchor, BtcHeader, BtcHeaderEntry, BTC_HEADER_BYTES,
     MAX_BTC_HEADERS_PER_BATCH,
 };
 use irium_node_rs::ltc_spv::{
-    encode_ltc_header_batch, LtcAnchor, LtcHeader, LtcHeaderEntry, LTC_HEADER_BYTES,
-    MAX_LTC_HEADERS_PER_BATCH,
+    encode_ltc_header_batch, parse_ltc_header_batch, LtcAnchor, LtcHeader, LtcHeaderEntry,
+    LTC_HEADER_BYTES, MAX_LTC_HEADERS_PER_BATCH,
 };
 use irium_node_rs::doge_spv::{
-    encode_doge_header_batch, DogeAnchor, DogeHeader, DOGE_HEADER_BYTES,
-    MAX_DOGE_HEADERS_PER_BATCH,
+    encode_doge_header_batch, parse_doge_header_batch, DogeAnchor, DogeHeader,
+    DOGE_HEADER_BYTES, MAX_DOGE_HEADERS_PER_BATCH,
 };
 use irium_node_rs::wallet_store::{WalletKey, WalletManager, WalletMode};
 use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
@@ -16826,6 +16826,63 @@ fn maybe_auto_unlock_wallet(state: &AppState) {
     }
 }
 
+/// Resolve `<IRIUM_DATA_DIR>/{label}_header_sync_last.txt` (or
+/// `$HOME/.irium/...` if the env var is unset). The wrapper script
+/// /usr/local/bin/btc-header-sync-wrapper reads this file's unix
+/// timestamp and exits 0 (skipping the fallback fetch) if it is less
+/// than 600s old. So updating the file with the current time is how the
+/// internal cycle tells the external timer "primary is healthy — stand
+/// down."
+fn header_sync_last_file_path(label: &str) -> std::path::PathBuf {
+    let data_dir = env::var("IRIUM_DATA_DIR").unwrap_or_else(|_| {
+        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        format!("{}/.irium", home)
+    });
+    std::path::Path::new(&data_dir).join(format!("{}_header_sync_last.txt", label))
+}
+
+/// Write current unix seconds into <data_dir>/{label}_header_sync_last.txt.
+/// Best-effort: write errors are logged but not propagated — the worst
+/// case is the fallback timer runs a redundant fetch, which is fine.
+fn header_sync_touch_last_file(label: &str) {
+    let path = header_sync_last_file_path(label);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Err(e) = std::fs::write(&path, format!("{}\n", now)) {
+        eprintln!(
+            "[header-sync/{}] failed to write {}: {} (fallback timer will run unnecessarily)",
+            label,
+            path.display(),
+            e
+        );
+    }
+}
+
+/// True iff the mempool contains a tx whose outputs include a script
+/// that the supplied parser recognises (i.e. a pending unconfirmed
+/// BtcHeaderBatch / LtcHeaderBatch / DogeHeaderBatch carrier tx). When
+/// true, the cycle skips submitting another batch: with the same
+/// wallet inputs and same headers, the resulting tx is byte-identical
+/// to the pending one, which the mempool rejects as a duplicate and
+/// block-template builders can then race the two against each other —
+/// the v1.9.55 → v1.9.56 production stall was a textbook example.
+fn mempool_has_pending_header_batch<F>(state: &AppState, output_is_batch: F) -> bool
+where
+    F: Fn(&[u8]) -> bool,
+{
+    let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+    let found = mempool.iter_entries().any(|(_txid, entry)| {
+        entry
+            .tx
+            .outputs
+            .iter()
+            .any(|out| output_is_batch(&out.script_pubkey))
+    });
+    found
+}
+
 fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
     let act_height = match irium_node_rs::activation::resolved_btc_spv_relay_activation_height(network) {
         Some(h) => h,
@@ -16979,6 +17036,17 @@ async fn run_btc_header_sync_cycle(
     if !gate_open {
         return Ok("gate_closed".to_string());
     }
+    // Primary/fallback guard: if any unconfirmed BtcHeaderBatch tx is
+    // already sitting in the mempool, do not submit another. submit_btc_headers_core
+    // is deterministic: same wallet UTXO set + same headers => same txid.
+    // The mempool dedup-rejects the second copy, but the bigger problem is
+    // that under heavy peer gossip the carrier tx hangs around long enough
+    // for block templates to include duplicate copies, which fail
+    // consensus and stall block production. Wait for the previous batch
+    // to confirm before submitting a new one.
+    if mempool_has_pending_header_batch(state, |s| parse_btc_header_batch(s).is_ok()) {
+        return Ok("skipped: BtcHeaderBatch already pending in mempool".to_string());
+    }
     let btc_net_tip = header_sync::btc::fetch_btc_net_tip(client).await?;
     if btc_net_tip <= header_sync::common::SAFETY_LAG {
         return Err(format!(
@@ -16988,6 +17056,12 @@ async fn run_btc_header_sync_cycle(
     }
     let target = btc_net_tip - header_sync::common::SAFETY_LAG;
     if relay_tip >= target {
+        // Up to date and primary is doing its job — let the fallback timer
+        // know by refreshing the staleness marker even though we didn't
+        // submit (otherwise a node that catches up and stays caught up
+        // would let the marker age out and the timer would fire a useless
+        // fetch every 10 minutes).
+        header_sync_touch_last_file("btc");
         return Ok(format!(
             "up_to_date relay_tip={relay_tip} btc_net={btc_net_tip} target={target}"
         ));
@@ -17004,6 +17078,9 @@ async fn run_btc_header_sync_cycle(
     let resp = submit_btc_headers_core(state, req, None)
         .await
         .map_err(|(sc, msg)| format!("submit failed: status={sc} reason={msg}"))?;
+    if resp.accepted {
+        header_sync_touch_last_file("btc");
+    }
     Ok(format!(
         "submitted count={} txid={} accepted={}",
         resp.headers_count, resp.txid, resp.accepted
@@ -17037,7 +17114,11 @@ async fn run_ltc_header_sync_cycle(
         header_sync::common::Source::Mainnet => ltc_net_tip - header_sync::common::SAFETY_LAG,
         header_sync::common::Source::Regtest => ltc_net_tip,
     };
+    if mempool_has_pending_header_batch(state, |s| parse_ltc_header_batch(s).is_ok()) {
+        return Ok("skipped: LtcHeaderBatch already pending in mempool".to_string());
+    }
     if relay_tip >= target {
+        header_sync_touch_last_file("ltc");
         return Ok(format!(
             "up_to_date relay_tip={relay_tip} ltc_net={ltc_net_tip} target={target} source={source:?}"
         ));
@@ -17055,6 +17136,9 @@ async fn run_ltc_header_sync_cycle(
     let resp = submit_ltc_headers_core(state, req)
         .await
         .map_err(|(sc, msg)| format!("submit failed: status={sc} reason={msg}"))?;
+    if resp.accepted {
+        header_sync_touch_last_file("ltc");
+    }
     Ok(format!(
         "submitted count={} txid={} accepted={} source={source:?}",
         resp.headers_count, resp.txid, resp.accepted
@@ -17088,7 +17172,11 @@ async fn run_doge_header_sync_cycle(
         header_sync::common::Source::Mainnet => doge_net_tip - header_sync::common::SAFETY_LAG,
         header_sync::common::Source::Regtest => doge_net_tip,
     };
+    if mempool_has_pending_header_batch(state, |s| parse_doge_header_batch(s).is_ok()) {
+        return Ok("skipped: DogeHeaderBatch already pending in mempool".to_string());
+    }
     if relay_tip >= target {
+        header_sync_touch_last_file("doge");
         return Ok(format!(
             "up_to_date relay_tip={relay_tip} doge_net={doge_net_tip} target={target} source={source:?}"
         ));
@@ -17106,6 +17194,9 @@ async fn run_doge_header_sync_cycle(
     let resp = submit_doge_headers_core(state, req)
         .await
         .map_err(|(sc, msg)| format!("submit failed: status={sc} reason={msg}"))?;
+    if resp.accepted {
+        header_sync_touch_last_file("doge");
+    }
     Ok(format!(
         "submitted count={} txid={} accepted={} source={source:?}",
         resp.headers_count, resp.txid, resp.accepted
