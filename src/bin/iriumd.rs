@@ -149,7 +149,8 @@ use irium_node_rs::tx::{
     SWAP_ORDER_MIN_LOCKED_VALUE,
 };
 use irium_node_rs::btc_spv::{
-    encode_btc_header_batch, BtcAnchor, BtcHeader, BtcHeaderEntry, BTC_HEADER_BYTES,
+    apply_btc_header_batch, encode_btc_header_batch, resolve_btc_spv_params, BtcAnchor,
+    BtcHeader, BtcHeaderEntry, BTC_HEADER_BYTES,
     MAX_BTC_HEADERS_PER_BATCH,
 };
 use irium_node_rs::ltc_spv::{
@@ -16430,6 +16431,321 @@ fn spawn_offer_rebroadcast(state: AppState) {
     });
 }
 
+/// HTTP shape returned by mempool.space `/api/v1/blocks/{height}` for each
+/// block in the descending 15-item page. Only the fields we need are
+/// declared; the rest are ignored by serde.
+#[derive(serde::Deserialize)]
+struct MempoolSpaceBlock {
+    id: String,
+    height: u64,
+    version: i32,
+    timestamp: u32,
+    bits: u32,
+    nonce: u32,
+    merkle_root: String,
+    previousblockhash: Option<String>,
+}
+
+fn reconstruct_btc_header_from_mempool_space(b: &MempoolSpaceBlock) -> Result<BtcHeader, String> {
+    let prev = b.previousblockhash.as_deref().unwrap_or("");
+    let prev_bytes = hex::decode(prev)
+        .map_err(|e| format!("prev_hash hex decode at h={}: {}", b.height, e))?;
+    if prev_bytes.len() != 32 {
+        return Err(format!("prev_hash len {} != 32 at h={}", prev_bytes.len(), b.height));
+    }
+    let mut prev_hash = [0u8; 32];
+    prev_hash.copy_from_slice(&prev_bytes);
+    // mempool.space returns display-order hex; convert to natural order for
+    // the BtcHeader struct, which is the on-wire byte order used by sha256d.
+    prev_hash.reverse();
+
+    let merkle = hex::decode(&b.merkle_root)
+        .map_err(|e| format!("merkle hex decode at h={}: {}", b.height, e))?;
+    if merkle.len() != 32 {
+        return Err(format!("merkle len {} != 32 at h={}", merkle.len(), b.height));
+    }
+    let mut merkle_root = [0u8; 32];
+    merkle_root.copy_from_slice(&merkle);
+    merkle_root.reverse();
+
+    Ok(BtcHeader {
+        version: b.version,
+        prev_hash,
+        merkle_root,
+        time: b.timestamp,
+        bits: b.bits,
+        nonce: b.nonce,
+    })
+}
+
+/// Fetch BTC headers covering `start..=end` (inclusive heights) from
+/// mempool.space's `/api/v1/blocks/{height}` endpoint, which returns 15
+/// blocks at a time descending from the given height. We page downward
+/// until the requested range is fully covered, then return the headers in
+/// ascending height order (the order apply_btc_header_batch expects).
+async fn fetch_btc_headers_from_mempool_space(
+    client: &reqwest::Client,
+    start: u64,
+    end: u64,
+) -> Result<Vec<BtcHeader>, String> {
+    use std::collections::BTreeMap;
+    if start > end {
+        return Err(format!("fetch range start={} > end={}", start, end));
+    }
+    let mut by_height: BTreeMap<u64, BtcHeader> = BTreeMap::new();
+    let mut fetch_from = end;
+    let max_pages = ((end - start) / 15) + 4;
+    let mut page = 0u64;
+    loop {
+        if page > max_pages {
+            return Err(format!(
+                "exceeded max pages ({}) fetching {}..{}",
+                max_pages, start, end
+            ));
+        }
+        page += 1;
+        let url = format!("https://mempool.space/api/v1/blocks/{}", fetch_from);
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("http error {}: {}", url, e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("http {} from {}", status, url));
+        }
+        let blocks: Vec<MempoolSpaceBlock> = resp
+            .json()
+            .await
+            .map_err(|e| format!("json parse {}: {}", url, e))?;
+        if blocks.is_empty() {
+            return Err(format!("empty blocks array from {}", url));
+        }
+        let mut min_h = u64::MAX;
+        for b in blocks.iter() {
+            if b.height >= start && b.height <= end {
+                let h = reconstruct_btc_header_from_mempool_space(b)?;
+                by_height.insert(b.height, h);
+            }
+            if b.height < min_h {
+                min_h = b.height;
+            }
+        }
+        if (by_height.len() as u64) >= (end - start + 1) {
+            break;
+        }
+        if min_h == 0 || min_h <= start {
+            break;
+        }
+        fetch_from = min_h - 1;
+        // Be nice to mempool.space — small pause between paginated calls.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+    let got = by_height.len() as u64;
+    let want = end - start + 1;
+    if got < want {
+        return Err(format!(
+            "got {} headers, wanted {} for {}..{}",
+            got, want, start, end
+        ));
+    }
+    Ok(by_height.into_values().collect())
+}
+
+/// On fresh mainnet nodes (or any time the local BTC header chain is far
+/// behind the network), fetch BTC headers from mempool.space and validate
+/// them via the existing apply_btc_header_batch path. Runs synchronously
+/// in main() BEFORE maybe_spawn_btc_header_sync and BEFORE the HTTP server
+/// accepts connections, so there is no concurrent writer on
+/// chain.btc_headers during bootstrap.
+///
+/// Without this step, fresh installs cannot apply Irium blocks containing
+/// BtcHeaderBatch transactions whose first header references a BTC block
+/// that is not the hardcoded anchor — every block from h=24,477 onward
+/// fails validation with "first header does not connect to known chain".
+///
+/// Idempotent: on subsequent restarts where btc_tip_height is already past
+/// the target, the function is a no-op (it computes start_height from
+/// existing btc_tip_height + 1, sees it is at or past the target, and
+/// returns). When iriumd's chain state is re-derived from blocks (and so
+/// btc_headers is rebuilt from scratch), this bootstrap runs again — the
+/// v1.9.52 apply_btc_header_batch idempotency fix means subsequent block
+/// replays that re-apply the same headers are no-ops, not rejections.
+///
+/// On any HTTP / parse / validation error the function logs a warning and
+/// returns Ok(()) — iriumd still starts, and btc-header-sync.timer or a
+/// subsequent restart can complete the bootstrap later.
+async fn maybe_bootstrap_btc_headers(
+    state: AppState,
+    network: NetworkKind,
+) -> Result<(), String> {
+    if !matches!(network, NetworkKind::Mainnet) {
+        return Ok(());
+    }
+    if env::var("IRIUM_SKIP_BTC_BOOTSTRAP").ok().as_deref() == Some("1") {
+        eprintln!("[btc-bootstrap] skipped via IRIUM_SKIP_BTC_BOOTSTRAP=1");
+        return Ok(());
+    }
+
+    // Resolve the anchor directly from the network constants rather than
+    // going through ChainState::btc_anchor (private). Mirrors the value
+    // chain.rs threads into apply_btc_header_batch at block apply time.
+    let anchor = match resolve_btc_spv_params(network) {
+        Some(p) => p.anchor,
+        None => {
+            eprintln!("[btc-bootstrap] btc_spv params unresolved on {:?} — skipping", network);
+            return Ok(());
+        }
+    };
+    if anchor.is_zero() {
+        eprintln!("[btc-bootstrap] anchor not configured on mainnet — skipping");
+        return Ok(());
+    }
+    let existing_tip = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.btc_tip_height
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("iriumd-btc-bootstrap/1.9.54")
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[btc-bootstrap] http client build failed: {} — skipping", e);
+            return Ok(());
+        }
+    };
+
+    let tip_url = "https://mempool.space/api/blocks/tip/height";
+    let btc_tip: u64 = match client.get(tip_url).send().await {
+        Ok(resp) => match resp.text().await {
+            Ok(s) => match s.trim().parse() {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!(
+                        "[btc-bootstrap] could not parse tip {:?}: {} — skipping",
+                        s, e
+                    );
+                    return Ok(());
+                }
+            },
+            Err(e) => {
+                eprintln!("[btc-bootstrap] tip body read failed: {} — skipping", e);
+                return Ok(());
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "[btc-bootstrap] could not reach mempool.space ({}): {} — skipping; btc-header-sync.timer can fill the gap later",
+                tip_url, e
+            );
+            return Ok(());
+        }
+    };
+
+    // 12-block safety margin against mempool.space serving a header that
+    // ends up reorged out of the canonical chain by the time we apply it.
+    let target_height = btc_tip.saturating_sub(12);
+    let start_height = if existing_tip == 0 {
+        anchor.height + 1
+    } else {
+        existing_tip + 1
+    };
+    if start_height > target_height {
+        eprintln!(
+            "[btc-bootstrap] already at h={} (target {}), nothing to bootstrap",
+            existing_tip, target_height
+        );
+        return Ok(());
+    }
+
+    eprintln!(
+        "[btc-bootstrap] mainnet bootstrap from {} to {} ({} headers) — mempool.space",
+        start_height,
+        target_height,
+        target_height - start_height + 1,
+    );
+
+    let chunk_size: u64 = 2016;
+    let mut h = start_height;
+    while h <= target_height {
+        let chunk_end = (h + chunk_size - 1).min(target_height);
+        eprintln!(
+            "[btc-bootstrap] fetching headers {}..{}",
+            h, chunk_end
+        );
+        let headers =
+            match fetch_btc_headers_from_mempool_space(&client, h, chunk_end).await {
+                Ok(hs) => hs,
+                Err(e) => {
+                    eprintln!(
+                        "[btc-bootstrap] fetch {}..{} failed: {} — aborting bootstrap",
+                        h, chunk_end, e
+                    );
+                    return Ok(());
+                }
+            };
+
+        // Apply via the existing validator. iriumd_block_time is used only
+        // for the "header.time > iriumd_block_time + 2h" future-time guard;
+        // we are populating historical headers so use the current wall
+        // clock as the upper bound.
+        let iriumd_block_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(u32::MAX - 7200);
+
+        let apply_result = {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            // Splitting borrows on fields of a MutexGuard requires going
+            // through an explicit `&mut *chain` reborrow first; otherwise
+            // the compiler tracks each .field access as a fresh borrow of
+            // the whole guard and rejects multiple mutable accesses.
+            let cs = &mut *chain;
+            apply_btc_header_batch(
+                headers,
+                iriumd_block_time,
+                &mut cs.btc_headers,
+                &mut cs.btc_heights,
+                &mut cs.btc_tip,
+                &mut cs.btc_tip_height,
+                &anchor,
+            )
+        };
+
+        match apply_result {
+            Ok(update) => {
+                eprintln!(
+                    "[btc-bootstrap] applied {} headers ({}..{}); btc_tip_height={}",
+                    update.headers_added.len(),
+                    h,
+                    chunk_end,
+                    chunk_end
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[btc-bootstrap] apply {}..{} failed: {} — aborting bootstrap",
+                    h, chunk_end, e
+                );
+                return Ok(());
+            }
+        }
+
+        h = chunk_end + 1;
+        // Small pause so the rate guard on mempool.space stays happy.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    eprintln!(
+        "[btc-bootstrap] complete. btc_tip_height now at {}",
+        target_height
+    );
+    Ok(())
+}
+
 fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
     let act_height = match irium_node_rs::activation::resolved_btc_spv_relay_activation_height(network) {
         Some(h) => h,
@@ -17810,6 +18126,16 @@ async fn main() {
     // is `None` on the running network — so devnet / dev nodes pay nothing
     // for chains they haven't enabled. Replaces the standalone
     // src/bin/{btc,ltc,doge}-header-sync.rs binaries + systemd timers.
+    // v1.9.54: pre-seed BTC headers from mempool.space on fresh installs so
+    // Irium blocks that carry a BtcHeaderBatch tx whose first header references
+    // a BTC block past the anchor can be applied. Runs BEFORE
+    // maybe_spawn_btc_header_sync so there is no concurrent btc_headers writer
+    // during bootstrap. On HTTP / validation error the call is best-effort and
+    // iriumd continues to start (btc-header-sync.timer can fill the gap).
+    if let Err(e) = maybe_bootstrap_btc_headers(app_state.clone(), network).await {
+        eprintln!("[btc-bootstrap] bootstrap returned error (continuing startup): {}", e);
+    }
+
     maybe_spawn_btc_header_sync(app_state.clone(), network);
     maybe_spawn_ltc_header_sync(app_state.clone(), network);
     maybe_spawn_doge_header_sync(app_state.clone(), network);
