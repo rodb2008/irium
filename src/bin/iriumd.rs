@@ -15774,90 +15774,14 @@ async fn get_block_template(
                     }
                 }
             }
-            // LTC
-            let ltc_cached = state
-                .ltc_template_headers_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            if let Some(c) = ltc_cached {
-                let fresh = c
-                    .built_at
-                    .elapsed()
-                    .map(|d| d.as_secs() <= COINBASE_BATCH_CACHE_TTL_SECS)
-                    .unwrap_or(false);
-                let live = {
-                    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-                    chain.ltc_tip_height
-                };
-                if fresh && live == c.expected_relay_tip_height {
-                    if let Ok(raw) = hex::decode(c.headers_hex.trim()) {
-                        if !raw.is_empty() && raw.len() % LTC_HEADER_BYTES == 0 {
-                            let mut headers: Vec<LtcHeader> = Vec::new();
-                            let mut ok = true;
-                            for chunk in raw.chunks(LTC_HEADER_BYTES) {
-                                match LtcHeader::deserialize(chunk) {
-                                    Ok(h) => headers.push(h),
-                                    Err(_) => {
-                                        ok = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if ok {
-                                if let Ok(script) = encode_ltc_header_batch(&headers) {
-                                    out.push(CoinbaseExtraOutput {
-                                        value: 0,
-                                        script_pubkey_hex: hex::encode(script),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // DOGE
-            let doge_cached = state
-                .doge_template_headers_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            if let Some(c) = doge_cached {
-                let fresh = c
-                    .built_at
-                    .elapsed()
-                    .map(|d| d.as_secs() <= COINBASE_BATCH_CACHE_TTL_SECS)
-                    .unwrap_or(false);
-                let live = {
-                    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-                    chain.doge_tip_height
-                };
-                if fresh && live == c.expected_relay_tip_height {
-                    if let Ok(raw) = hex::decode(c.headers_hex.trim()) {
-                        if !raw.is_empty() && raw.len() % DOGE_HEADER_BYTES == 0 {
-                            let mut headers: Vec<DogeHeader> = Vec::new();
-                            let mut ok = true;
-                            for chunk in raw.chunks(DOGE_HEADER_BYTES) {
-                                match DogeHeader::deserialize(chunk) {
-                                    Ok(h) => headers.push(h),
-                                    Err(_) => {
-                                        ok = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if ok {
-                                if let Ok(script) = encode_doge_header_batch(&headers) {
-                                    out.push(CoinbaseExtraOutput {
-                                        value: 0,
-                                        script_pubkey_hex: hex::encode(script),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // LTC + DOGE injection DISABLED (v1.9.62 hotfix).
+            // Cold-start cycle fetches headers from height 1 which don't
+            // connect to the mainnet anchors (LTC ~2.5M / DOGE ~6.2M).
+            // Every pool block with these carriers fails
+            // apply_*_header_batch and is rejected, stalling production.
+            // Re-enable in v1.9.63 once the cycle uses
+            // max(relay_tip, anchor.height) + 1 as start so the first
+            // cached headers chain from the anchor.
             out
         } else {
             Vec::new()
