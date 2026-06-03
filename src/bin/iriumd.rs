@@ -8099,6 +8099,23 @@ async fn claim_btc_swap(
                 .is_ok();
         }
     }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/claim_btc_swap] error: {e}");
+                }
+            });
+        }
+    }
     Ok(Json(SpendBtcSwapResponse {
         txid: hex::encode(txid_out),
         accepted,
@@ -8271,6 +8288,23 @@ async fn refund_btc_swap(
             accepted = mempool
                 .add_transaction(tx, raw.clone(), fee_checked)
                 .is_ok();
+        }
+    }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/refund_btc_swap] error: {e}");
+                }
+            });
         }
     }
     Ok(Json(SpendBtcSwapResponse {
@@ -8914,6 +8948,23 @@ async fn claim_ltc_swap(
                 .is_ok();
         }
     }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/claim_ltc_swap] error: {e}");
+                }
+            });
+        }
+    }
     Ok(Json(SpendLtcSwapResponse {
         txid: hex::encode(txid_out),
         accepted,
@@ -9083,6 +9134,23 @@ async fn refund_ltc_swap(
             accepted = mempool
                 .add_transaction(tx, raw.clone(), fee_checked)
                 .is_ok();
+        }
+    }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/refund_ltc_swap] error: {e}");
+                }
+            });
         }
     }
     Ok(Json(SpendLtcSwapResponse {
@@ -9711,6 +9779,23 @@ async fn claim_doge_swap(
                 .is_ok();
         }
     }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/claim_doge_swap] error: {e}");
+                }
+            });
+        }
+    }
     Ok(Json(SpendDogeSwapResponse {
         txid: hex::encode(txid_out),
         accepted,
@@ -9880,6 +9965,23 @@ async fn refund_doge_swap(
             accepted = mempool
                 .add_transaction(tx, raw.clone(), fee_checked)
                 .is_ok();
+        }
+    }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/refund_doge_swap] error: {e}");
+                }
+            });
         }
     }
     Ok(Json(SpendDogeSwapResponse {
@@ -10413,6 +10515,23 @@ async fn post_swap_order(
         }
     }
 
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/post_swap_order] error: {e}");
+                }
+            });
+        }
+    }
+
     Ok(Json(PostSwapOrderResponse {
         txid: txid_hex.clone(),
         accepted,
@@ -10763,6 +10882,23 @@ async fn cancel_swap_order(
                 .is_ok();
         }
     }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/cancel_swap_order] error: {e}");
+                }
+            });
+        }
+    }
     Ok(Json(SwapSpendResponse {
         txid: hex::encode(txid_out),
         accepted,
@@ -11106,6 +11242,23 @@ async fn fill_swap_order(
         }
     }
 
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/fill_swap_order] error: {e}");
+                }
+            });
+        }
+    }
+
     Ok(Json(FillSwapOrderResponse {
         txid: hex::encode(txid_out),
         accepted,
@@ -11233,6 +11386,23 @@ async fn sweep_expired_order(
                 .is_ok();
         }
     }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/sweep_expired_order] error: {e}");
+                }
+            });
+        }
+    }
     Ok(Json(SwapSpendResponse {
         txid: hex::encode(txid_out),
         accepted,
@@ -11350,6 +11520,23 @@ async fn sweep_ltc_expired_order(
             accepted = mempool
                 .add_transaction(tx.clone(), raw.clone(), fee_checked)
                 .is_ok();
+        }
+    }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/sweep_ltc_expired_order] error: {e}");
+                }
+            });
         }
     }
     Ok(Json(SwapSpendResponse {
@@ -11628,6 +11815,23 @@ async fn sweep_doge_expired_order(
                 .is_ok();
         }
     }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/sweep_doge_expired_order] error: {e}");
+                }
+            });
+        }
+    }
     Ok(Json(SwapSpendResponse {
         txid: hex::encode(txid_out),
         accepted,
@@ -11871,6 +12075,23 @@ async fn post_ltc_swap_order(
                 Ok(_) => accepted = true,
                 Err(e) => eprintln!("[post_ltc_swap_order] mempool_reject reason={}", e),
             }
+        }
+    }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/post_ltc_swap_order] error: {e}");
+                }
+            });
         }
     }
 
@@ -12224,6 +12445,23 @@ async fn cancel_ltc_swap_order(
                 .is_ok();
         }
     }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/cancel_ltc_swap_order] error: {e}");
+                }
+            });
+        }
+    }
     Ok(Json(SwapSpendResponse {
         txid: hex::encode(txid_out),
         accepted,
@@ -12539,6 +12777,23 @@ async fn fill_ltc_swap_order(
             accepted = mempool
                 .add_transaction(tx, raw.clone(), fee_checked)
                 .is_ok();
+        }
+    }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/fill_ltc_swap_order] error: {e}");
+                }
+            });
         }
     }
 
@@ -12950,6 +13205,23 @@ async fn post_doge_swap_order(
         }
     }
 
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/post_doge_swap_order] error: {e}");
+                }
+            });
+        }
+    }
+
     Ok(Json(PostDogeSwapOrderResponse {
         txid: txid_hex.clone(),
         accepted,
@@ -13300,6 +13572,23 @@ async fn cancel_doge_swap_order(
                 .is_ok();
         }
     }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/cancel_doge_swap_order] error: {e}");
+                }
+            });
+        }
+    }
     Ok(Json(SwapSpendResponse {
         txid: hex::encode(txid_out),
         accepted,
@@ -13606,6 +13895,23 @@ async fn fill_doge_swap_order(
             accepted = mempool
                 .add_transaction(tx, raw.clone(), fee_checked)
                 .is_ok();
+        }
+    }
+
+    // Gap A (NAT broadcast): admitting to local mempool alone relies on
+    // the 60s rebroadcast timer to reach peers, which delays order/fill
+    // visibility up to a minute on NAT-bound nodes. Push the tx to all
+    // currently-connected peers immediately so they see it the moment we
+    // accept it. Best-effort; the rebroadcast timer still covers failures.
+    if accepted {
+        if let Some(ref p2p) = state.p2p {
+            let p = p2p.clone();
+            let r = raw.clone();
+            tokio::spawn(async move {
+                if let Err(e) = p.broadcast_tx(&r).await {
+                    eprintln!("[swap-broadcast/fill_doge_swap_order] error: {e}");
+                }
+            });
         }
     }
 
