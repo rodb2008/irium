@@ -16908,6 +16908,21 @@ fn header_sync_touch_last_file(label: &str) {
     }
 }
 
+/// Random 0-30s startup delay (v1.9.60) so simultaneous deploys across
+/// the network don't have every node firing its very first header-sync
+/// cycle within the same wall-clock second. Seeds purely off the current
+/// nanosecond, so no `rand` crate dependency is needed and each node
+/// gets a distinct value naturally. After the jitter, the steady-state
+/// 600s loop period takes over and individual schedule drift keeps
+/// nodes desynchronised on its own.
+fn header_sync_startup_jitter_secs() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    nanos % 31
+}
+
 /// True iff the mempool contains a tx whose outputs include a script
 /// that the supplied parser recognises (i.e. a pending unconfirmed
 /// BtcHeaderBatch / LtcHeaderBatch / DogeHeaderBatch carrier tx). When
@@ -16956,6 +16971,13 @@ fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
                 return;
             }
         };
+        // FIX 2 (v1.9.60): random 0-30s startup jitter so simultaneous
+        // network-wide restarts don't have every node firing cycle 0 at
+        // the same wall-clock second. After this, the 600s loop period
+        // drift keeps nodes naturally desynchronised.
+        let jitter = header_sync_startup_jitter_secs();
+        eprintln!("[header-sync/btc] startup jitter {jitter}s");
+        tokio::time::sleep(std::time::Duration::from_secs(jitter)).await;
         loop {
             match run_btc_header_sync_cycle(&state, &client, act_height).await {
                 Ok(outcome) => {
@@ -17005,6 +17027,9 @@ fn maybe_spawn_ltc_header_sync(state: AppState, network: NetworkKind) {
                 return;
             }
         };
+        let jitter = header_sync_startup_jitter_secs();
+        eprintln!("[header-sync/ltc] startup jitter {jitter}s");
+        tokio::time::sleep(std::time::Duration::from_secs(jitter)).await;
         loop {
             match run_ltc_header_sync_cycle(&state, &client, act_height, source).await {
                 Ok(outcome) => {
@@ -17054,6 +17079,9 @@ fn maybe_spawn_doge_header_sync(state: AppState, network: NetworkKind) {
                 return;
             }
         };
+        let jitter = header_sync_startup_jitter_secs();
+        eprintln!("[header-sync/doge] startup jitter {jitter}s");
+        tokio::time::sleep(std::time::Duration::from_secs(jitter)).await;
         loop {
             match run_doge_header_sync_cycle(&state, &client, act_height, source).await {
                 Ok(outcome) => {
@@ -17117,6 +17145,24 @@ async fn run_btc_header_sync_cycle(
     let start = relay_tip + 1;
     let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
     let headers_hex = header_sync::btc::fetch_btc_headers(client, start, end).await?;
+    // FIX 1 (v1.9.60): re-read chain state immediately before submit. The
+    // mempool.space fetch above takes 5-30 seconds; in that window, another
+    // node's carrier can be mined into an Irium block, advancing our
+    // btc_tip_height past `end`. Submitting a now-stale range would create
+    // a redundant carrier that other nodes will reject as a duplicate
+    // (v1.9.59 mempool dedup), but skipping here saves the wallet fee and
+    // the gossip bandwidth. Touch the last-sync file so the fallback
+    // timer also stands down.
+    let live_relay_tip = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.btc_tip_height
+    };
+    if live_relay_tip >= end {
+        header_sync_touch_last_file("btc");
+        return Ok(format!(
+            "stand_down: chain advanced from {relay_tip} to {live_relay_tip} during fetch (planned end {end})"
+        ));
+    }
     let fee = header_sync::common::env_u64("BTC_HEADER_SYNC_FEE_PER_BYTE", 100);
     let req = SubmitBtcHeadersRequest {
         headers_hex,
@@ -17175,6 +17221,16 @@ async fn run_ltc_header_sync_cycle(
     let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
     let headers_hex =
         header_sync::ltc::fetch_ltc_headers(client, source, start, end).await?;
+    let live_relay_tip = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.ltc_tip_height
+    };
+    if live_relay_tip >= end {
+        header_sync_touch_last_file("ltc");
+        return Ok(format!(
+            "stand_down: chain advanced from {relay_tip} to {live_relay_tip} during fetch (planned end {end})"
+        ));
+    }
     let fee = header_sync::common::env_u64("LTC_HEADER_SYNC_FEE_PER_BYTE", 100);
     let req = SubmitLtcHeadersRequest {
         headers_hex,
@@ -17233,6 +17289,16 @@ async fn run_doge_header_sync_cycle(
     let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
     let headers_hex =
         header_sync::doge::fetch_doge_headers(client, source, start, end).await?;
+    let live_relay_tip = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.doge_tip_height
+    };
+    if live_relay_tip >= end {
+        header_sync_touch_last_file("doge");
+        return Ok(format!(
+            "stand_down: chain advanced from {relay_tip} to {live_relay_tip} during fetch (planned end {end})"
+        ));
+    }
     let fee = header_sync::common::env_u64("DOGE_HEADER_SYNC_FEE_PER_BYTE", 100);
     let req = SubmitDogeHeadersRequest {
         headers_hex,
