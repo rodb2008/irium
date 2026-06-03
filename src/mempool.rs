@@ -6,7 +6,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::btc_spv::parse_btc_header_batch;
 use crate::chain::ChainState;
+use crate::doge_spv::parse_doge_header_batch;
+use crate::ltc_spv::parse_ltc_header_batch;
 use crate::tx::{decode_full_tx, Transaction};
 
 /// Per-IP minimum interval between successive `ZeroFeeAllowed` admissions.
@@ -247,6 +250,61 @@ impl MempoolManager {
         let txid = tx.txid();
         if self.entries.contains_key(&txid) {
             return Err("Transaction already in mempool".to_string());
+        }
+
+        // Per-chain header-batch dedup. Consensus caps each
+        // {Btc,Ltc,Doge}HeaderBatch carrier at one per block (chain.rs).
+        // The mempool can hold many in transit when peers re-gossip
+        // stale carriers after an iriumd restart — each cycle of the
+        // wallet-funded carrier-tx builder uses different UTXOs, so
+        // multiple distinct txids can carry the same chain's batch and
+        // the existing same-txid dedup above does not catch them.
+        // Reject incoming carriers when a same-chain carrier is
+        // already pending. The existing carrier confirms (or ages
+        // out) before the next one is accepted, mirroring the
+        // consensus cap one level earlier in the pipeline.
+        let new_has_btc = tx
+            .outputs
+            .iter()
+            .any(|o| parse_btc_header_batch(&o.script_pubkey).is_ok());
+        let new_has_ltc = tx
+            .outputs
+            .iter()
+            .any(|o| parse_ltc_header_batch(&o.script_pubkey).is_ok());
+        let new_has_doge = tx
+            .outputs
+            .iter()
+            .any(|o| parse_doge_header_batch(&o.script_pubkey).is_ok());
+        if new_has_btc || new_has_ltc || new_has_doge {
+            for entry in self.entries.values() {
+                if new_has_btc
+                    && entry
+                        .tx
+                        .outputs
+                        .iter()
+                        .any(|o| parse_btc_header_batch(&o.script_pubkey).is_ok())
+                {
+                    return Err("duplicate_btc_header_batch_pending".to_string());
+                }
+                if new_has_ltc
+                    && entry
+                        .tx
+                        .outputs
+                        .iter()
+                        .any(|o| parse_ltc_header_batch(&o.script_pubkey).is_ok())
+                {
+                    return Err("duplicate_ltc_header_batch_pending".to_string());
+                }
+                if new_has_doge
+                    && entry
+                        .tx
+                        .outputs
+                        .iter()
+                        .any(|o| parse_doge_header_batch(&o.script_pubkey).is_ok())
+                {
+                    return Err("duplicate_doge_header_batch_pending".to_string());
+                }
+            }
         }
 
         if priority == MempoolPriority::ZeroFeeAllowed {
