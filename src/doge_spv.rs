@@ -981,11 +981,11 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_activation_set_to_25200() {
+    fn mainnet_activation_set_to_25000() {
         assert_eq!(
             MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT,
-            Some(25_200),
-            "DOGE SPV mainnet activation height is set to 25_200"
+            Some(25_000),
+            "DOGE SPV mainnet activation height is set to 25_000"
         );
     }
 
