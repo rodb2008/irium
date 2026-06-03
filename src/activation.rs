@@ -53,7 +53,7 @@ pub const MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT: Option<u64> = Some(24_250);
 /// Height 26500 is approximately 6 weeks after height 20299 (when this
 /// constant was set), giving all known node operators time to upgrade
 /// before the first AuxPoW block can appear.
-pub const MAINNET_AUXPOW_ACTIVATION_HEIGHT: Option<u64> = Some(25_000);
+pub const MAINNET_AUXPOW_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 
 /// Mainnet Bitcoin SPV header relay activation height (Phase 1).
 ///
@@ -98,7 +98,7 @@ pub const MAINNET_BTC_ANCHOR_TIME: u32 = 1_737_337_343;
 ///
 /// Phase B ships disabled. Activation requires a dedicated commit per the
 /// same workflow as Phase 1.
-pub const MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = Some(25_000);
+pub const MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 
 /// Mainnet anchor for the LTC SPV header relay.
 ///
@@ -135,7 +135,7 @@ pub const MAINNET_LTC_ANCHOR_TIME: u32 = 1_778_676_649;
 /// PoW lives on a parent Litecoin header rather than the DOGE header
 /// itself. Without A2, the relay would only accept solo-mined DOGE
 /// blocks — none in practice.
-pub const MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = Some(25_000);
+pub const MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 
 /// Mainnet anchor for the DOGE SPV header relay.
 ///
@@ -153,7 +153,7 @@ pub const MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = Some(25_000);
 /// These constants take effect only after governance flips
 /// `MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT` to `Some(<height>)`.
 #[allow(dead_code)] // wired through ChainParams once Phase B callers come online
-pub const MAINNET_DOGE_ANCHOR_HEIGHT: u64 = 6_225_000;
+pub const MAINNET_DOGE_ANCHOR_HEIGHT: u64 = 6_224_800;
 #[allow(dead_code)]
 pub const MAINNET_DOGE_ANCHOR_HASH_DISPLAY: [u8; 32] = [
     0x26, 0x55, 0xf8, 0x96, 0xbd, 0xf6, 0xdd, 0x40,
@@ -178,7 +178,7 @@ pub const MAINNET_DOGE_ANCHOR_PREV_TIME: u32 = 1_779_953_888;
 /// Phase C ships disabled. Activation should not precede
 /// `MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT`, otherwise no proof would
 /// resolve.
-pub const MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = Some(25_000);
+pub const MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 
 /// Mainnet LtcSwapOrder activation height (Phase D).
 ///
@@ -191,7 +191,7 @@ pub const MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = Some(25_000)
 /// outputs (Phase C), so this should not be activated before
 /// `MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT` — the fill covenant
 /// would otherwise reject every spend.
-pub const MAINNET_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = Some(25_000);
+pub const MAINNET_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 
 /// Mainnet HtlcDogeSwapV1 activation height (DOGE Phase C).
 ///
@@ -212,7 +212,7 @@ pub const MAINNET_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = Some(25_000
 /// consensus arm, and the createdogeswap / claimdogeswap /
 /// refunddogeswap / inspectdogeswap RPC handlers ship in the heavier
 /// Phase C consensus-wiring commit.
-pub const MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = Some(25_000);
+pub const MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 
 /// Mainnet DogeSwapOrder activation height (DOGE Phase D foundation).
 ///
@@ -229,7 +229,7 @@ pub const MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = Some(25_000
 /// Foundation-only: tag 0xcb is reserved but the output type,
 /// witness paths, and RPC handlers ship in the Phase D
 /// consensus-wiring commit.
-pub const MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = Some(25_000);
+pub const MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 
 /// Mainnet HtlcDogeSwapV1 activation height (Phase C).
 ///
@@ -685,15 +685,15 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_auxpow_activation_height_is_25000() {
+    fn mainnet_auxpow_activation_height_is_24800() {
         assert_eq!(
             MAINNET_AUXPOW_ACTIVATION_HEIGHT,
-            Some(25_000),
-            "AuxPoW mainnet activation height must be 25000"
+            Some(24_800),
+            "AuxPoW mainnet activation height must be 24800"
         );
         assert_eq!(
             resolved_auxpow_activation_height(NetworkKind::Mainnet),
-            Some(25_000)
+            Some(24_800)
         );
     }
 
@@ -875,15 +875,15 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_ltc_spv_height_activated_at_25000() {
+    fn mainnet_ltc_spv_height_activated_at_24800() {
         assert_eq!(
             MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT,
-            Some(25_000),
-            "LTC SPV mainnet activation height is set to 25_000"
+            Some(24_800),
+            "LTC SPV mainnet activation height is set to 24_800"
         );
         assert_eq!(
             resolved_ltc_spv_relay_activation_height(NetworkKind::Mainnet),
-            Some(25_000),
+            Some(24_800),
         );
     }
 
@@ -894,7 +894,7 @@ mod tests {
         let resolved = resolved_ltc_spv_relay_activation_height(NetworkKind::Mainnet);
         std::env::remove_var("IRIUM_LTC_SPV_RELAY_ACTIVATION_HEIGHT");
         assert_eq!(resolved, MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT);
-        assert_eq!(resolved, Some(25_000));
+        assert_eq!(resolved, Some(24_800));
     }
 
     #[test]
@@ -924,15 +924,15 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_doge_spv_height_activated_at_25000() {
+    fn mainnet_doge_spv_height_activated_at_24800() {
         assert_eq!(
             MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT,
-            Some(25_000),
-            "DOGE SPV mainnet activation height is set to 25_000"
+            Some(24_800),
+            "DOGE SPV mainnet activation height is set to 24_800"
         );
         assert_eq!(
             resolved_doge_spv_relay_activation_height(NetworkKind::Mainnet),
-            Some(25_000),
+            Some(24_800),
         );
     }
 
@@ -943,7 +943,7 @@ mod tests {
         let resolved = resolved_doge_spv_relay_activation_height(NetworkKind::Mainnet);
         std::env::remove_var("IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT");
         assert_eq!(resolved, MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT);
-        assert_eq!(resolved, Some(25_000));
+        assert_eq!(resolved, Some(24_800));
     }
 
     #[test]
@@ -965,7 +965,7 @@ mod tests {
     fn mainnet_doge_anchor_constants_have_expected_values() {
         // Display-order hash (from blockchair.com / Dogecoin Core RPC).
         // Reversed to natural order in `DogeAnchor::mainnet()`.
-        assert_eq!(MAINNET_DOGE_ANCHOR_HEIGHT, 6_225_000);
+        assert_eq!(MAINNET_DOGE_ANCHOR_HEIGHT, 6_224_800);
         assert_eq!(MAINNET_DOGE_ANCHOR_BITS, 0x1a00_97af);
         assert_eq!(MAINNET_DOGE_ANCHOR_TIME, 1_779_953_962);
         assert_eq!(MAINNET_DOGE_ANCHOR_PREV_TIME, 1_779_953_888);
@@ -974,15 +974,15 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_htlc_ltc_swap_v1_height_activated_at_25000() {
+    fn mainnet_htlc_ltc_swap_v1_height_activated_at_24800() {
         assert_eq!(
             MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT,
-            Some(25_000),
-            "HtlcLtcSwapV1 mainnet activation height is set to 25_000"
+            Some(24_800),
+            "HtlcLtcSwapV1 mainnet activation height is set to 24_800"
         );
         assert_eq!(
             resolved_htlc_ltc_swap_v1_activation_height(NetworkKind::Mainnet),
-            Some(25_000),
+            Some(24_800),
         );
     }
 
@@ -993,7 +993,7 @@ mod tests {
         let resolved = resolved_htlc_ltc_swap_v1_activation_height(NetworkKind::Mainnet);
         std::env::remove_var("IRIUM_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT");
         assert_eq!(resolved, MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT);
-        assert_eq!(resolved, Some(25_000));
+        assert_eq!(resolved, Some(24_800));
     }
 
     #[test]
@@ -1012,15 +1012,15 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_ltc_swap_order_v1_height_activated_at_25000() {
+    fn mainnet_ltc_swap_order_v1_height_activated_at_24800() {
         assert_eq!(
             MAINNET_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT,
-            Some(25_000),
-            "LtcSwapOrder mainnet activation height is set to 25_000"
+            Some(24_800),
+            "LtcSwapOrder mainnet activation height is set to 24_800"
         );
         assert_eq!(
             resolved_ltc_swap_order_v1_activation_height(NetworkKind::Mainnet),
-            Some(25_000),
+            Some(24_800),
         );
     }
 
@@ -1031,7 +1031,7 @@ mod tests {
         let resolved = resolved_ltc_swap_order_v1_activation_height(NetworkKind::Mainnet);
         std::env::remove_var("IRIUM_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
         assert_eq!(resolved, MAINNET_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT);
-        assert_eq!(resolved, Some(25_000));
+        assert_eq!(resolved, Some(24_800));
     }
 
     #[test]
@@ -1050,15 +1050,15 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_htlc_doge_swap_v1_height_activated_at_25000() {
+    fn mainnet_htlc_doge_swap_v1_height_activated_at_24800() {
         assert_eq!(
             MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT,
-            Some(25_000),
-            "HtlcDogeSwapV1 mainnet activation height is set to 25_000"
+            Some(24_800),
+            "HtlcDogeSwapV1 mainnet activation height is set to 24_800"
         );
         assert_eq!(
             resolved_htlc_doge_swap_v1_activation_height(NetworkKind::Mainnet),
-            Some(25_000),
+            Some(24_800),
         );
     }
 
@@ -1069,7 +1069,7 @@ mod tests {
         let resolved = resolved_htlc_doge_swap_v1_activation_height(NetworkKind::Mainnet);
         std::env::remove_var("IRIUM_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT");
         assert_eq!(resolved, MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT);
-        assert_eq!(resolved, Some(25_000));
+        assert_eq!(resolved, Some(24_800));
     }
 
     #[test]
@@ -1088,15 +1088,15 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_doge_swap_order_v1_height_activated_at_25000() {
+    fn mainnet_doge_swap_order_v1_height_activated_at_24800() {
         assert_eq!(
             MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT,
-            Some(25_000),
-            "DogeSwapOrder mainnet activation height is set to 25_000"
+            Some(24_800),
+            "DogeSwapOrder mainnet activation height is set to 24_800"
         );
         assert_eq!(
             resolved_doge_swap_order_v1_activation_height(NetworkKind::Mainnet),
-            Some(25_000),
+            Some(24_800),
         );
     }
 
@@ -1107,7 +1107,7 @@ mod tests {
         let resolved = resolved_doge_swap_order_v1_activation_height(NetworkKind::Mainnet);
         std::env::remove_var("IRIUM_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
         assert_eq!(resolved, MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT);
-        assert_eq!(resolved, Some(25_000));
+        assert_eq!(resolved, Some(24_800));
     }
 
     #[test]
