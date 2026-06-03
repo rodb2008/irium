@@ -63,8 +63,15 @@ fn encode_bip34_height(height: u64) -> Vec<u8> {
     out
 }
 
-pub fn build_coinbase_tx(height: u64, reward: u64, pkh: &[u8; 20], extranonce: &[u8], bip34_height: bool) -> Vec<u8> {
-    let mut tx = Vec::with_capacity(200);
+pub fn build_coinbase_tx(
+    height: u64,
+    reward: u64,
+    pkh: &[u8; 20],
+    extranonce: &[u8],
+    bip34_height: bool,
+    extras: &[(u64, Vec<u8>)],
+) -> Vec<u8> {
+    let mut tx = Vec::with_capacity(200 + extras.iter().map(|(_, s)| s.len() + 16).sum::<usize>());
     tx.extend_from_slice(&1u32.to_le_bytes());
     put_varint(1, &mut tx);
     // Fix F: iriumd's tx format prefixes prev_txid with a 1-byte length (=32),
@@ -86,22 +93,37 @@ pub fn build_coinbase_tx(height: u64, reward: u64, pkh: &[u8; 20], extranonce: &
     tx.extend_from_slice(&script_sig);
 
     tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
-    put_varint(1, &mut tx);
+    // v1.9.62 issue #60: extras are zero-value BTC/LTC/DOGE header-batch
+    // outputs that ride in the coinbase post-activation. They cost nothing
+    // (coinbase has no inputs) and chain.rs accepts them at value=0 with a
+    // one-per-chain cap.
+    put_varint(1 + extras.len(), &mut tx);
     tx.extend_from_slice(&reward.to_le_bytes());
 
     let spk = p2pkh_script(pkh);
     put_varint(spk.len(), &mut tx);
     tx.extend_from_slice(&spk);
+    for (value, script) in extras {
+        tx.extend_from_slice(&value.to_le_bytes());
+        put_varint(script.len(), &mut tx);
+        tx.extend_from_slice(script);
+    }
     tx.extend_from_slice(&0u32.to_le_bytes());
     tx
 }
 
-pub fn coinbase_prefix_suffix(height: u64, reward: u64, pkh: &[u8; 20], bip34_height: bool) -> (Vec<u8>, Vec<u8>) {
+pub fn coinbase_prefix_suffix(
+    height: u64,
+    reward: u64,
+    pkh: &[u8; 20],
+    bip34_height: bool,
+    extras: &[(u64, Vec<u8>)],
+) -> (Vec<u8>, Vec<u8>) {
     // Use a unique non-zero marker so we only split at the extranonce location,
     // not at zero-filled fields like prevout hash/index in coinbase tx.
     // Marker length must match total extranonce payload length (4+4=8 bytes).
     let marker: [u8; 8] = [0xfa, 0xce, 0xb0, 0x0c, 0x1c, 0xab, 0xad, 0x1d];
-    let full = build_coinbase_tx(height, reward, pkh, &marker, bip34_height);
+    let full = build_coinbase_tx(height, reward, pkh, &marker, bip34_height, extras);
     let pos = full
         .windows(marker.len())
         .position(|w| w == marker)

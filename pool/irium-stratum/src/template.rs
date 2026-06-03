@@ -9,6 +9,15 @@ pub struct TemplateTx {
     pub hex: String,
 }
 
+/// v1.9.62 issue #60: zero-value coinbase output the stratum appends post
+/// activation height. value is always 0; script is the encoded
+/// BtcHeaderBatch / LtcHeaderBatch / DogeHeaderBatch payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoinbaseExtraOutput {
+    pub value: u64,
+    pub script_pubkey_hex: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GetBlockTemplate {
     pub height: u64,
@@ -19,6 +28,11 @@ pub struct GetBlockTemplate {
     #[serde(default)]
     pub txs: Vec<TemplateTx>,
     pub coinbase_value: u64,
+    /// v1.9.62 issue #60. `#[serde(default)]` so an iriumd that doesn't
+    /// emit the field (e.g. pre-v1.9.62 or running with the cache empty)
+    /// still produces a valid template.
+    #[serde(default)]
+    pub coinbase_extra_outputs: Vec<CoinbaseExtraOutput>,
 }
 
 #[derive(Clone)]

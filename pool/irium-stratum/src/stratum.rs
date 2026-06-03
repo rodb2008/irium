@@ -192,6 +192,10 @@ struct Job {
     tx_hex: Vec<String>,
     branches: Vec<[u8; 32]>,
     template_target_hex: String,
+    /// v1.9.62 issue #60: zero-value header-batch outputs to append to the
+    /// coinbase tx. Empty when the chain is pre-coinbase-activation or the
+    /// iriumd sync cycle has no fresh cached headers.
+    coinbase_extras: Vec<(u64, Vec<u8>)>,
 }
 
 #[derive(Clone)]
@@ -1262,7 +1266,7 @@ fn build_canonical_job_snapshot(job: &Job, session: &SessionState, config: &Stra
     let (coinbase_prefix, coinbase_suffix, prev_hash_internal, branches, auxpow_mode, irium_header80, irium_coinbase_hex) =
         if auxpow_active {
             // AuxPoW: build fixed Irium coinbase, compute Irium block hash, build parent coinbase
-            let irium_coinbase = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &[], session.coinbase_bip34);
+            let irium_coinbase = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &[], session.coinbase_bip34, &job.coinbase_extras);
             let irium_coinbase_hash = sha256d(&irium_coinbase);
             let irium_merkle_root = merkle_root_from_coinbase(irium_coinbase_hash, &job.branches);
             let irium_h80 = build_irium_auxpow_header(job.prev_hash, irium_merkle_root, ntime, job.bits);
@@ -1272,7 +1276,7 @@ fn build_canonical_job_snapshot(job: &Job, session: &SessionState, config: &Stra
             );
             (pp, ps, [0u8; 32], vec![], true, Some(irium_h80), Some(hex::encode(&irium_coinbase)))
         } else {
-            let (cp, cs) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34);
+            let (cp, cs) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34, &job.coinbase_extras);
             (cp, cs, job.prev_hash, job.branches.clone(), false, None, None)
         };
 
@@ -1571,6 +1575,11 @@ fn to_job(seq: u64, tpl: &GetBlockTemplate) -> Result<Job> {
     let tx_hex: Vec<String> = tpl.txs.iter().map(|t| t.hex.clone()).collect();
     let branches = build_merkle_branches(&tx_hex)?;
 
+    let coinbase_extras: Vec<(u64, Vec<u8>)> = tpl
+        .coinbase_extra_outputs
+        .iter()
+        .filter_map(|e| hex::decode(e.script_pubkey_hex.trim()).ok().map(|b| (e.value, b)))
+        .collect();
     Ok(Job {
         job_id: format!("{seq:016x}"),
         height: tpl.height,
@@ -1582,6 +1591,7 @@ fn to_job(seq: u64, tpl: &GetBlockTemplate) -> Result<Job> {
         tx_hex,
         branches,
         template_target_hex: tpl.target.clone(),
+        coinbase_extras,
     })
 }
 
@@ -2840,7 +2850,7 @@ async fn handle_submit_legacy_rewardable(
     let mut en = session.extranonce1.clone();
     en.extend_from_slice(&extra2);
 
-    let cb = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &en, config.coinbase_bip34);
+    let cb = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &en, config.coinbase_bip34, &job.coinbase_extras);
     let cb_hash = sha256d(&cb);
 
     fn fold_merkle(root0: [u8; 32], branches: &[[u8; 32]], rev_branch: bool, rev_each_round: bool) -> [u8; 32] {
@@ -3421,7 +3431,7 @@ async fn send_notify(
             )
         }
     } else {
-        let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34);
+        let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34, &job.coinbase_extras);
         (prev_hex_for_height(&job.prev_hash, job.height), hex::encode(&cb1), hex::encode(&cb2), job.branches.iter().map(hex::encode).collect())
     };
 
@@ -3622,6 +3632,7 @@ mod tests {
             tx_hex: vec![],
             branches: vec![],
             template_target_hex: biguint_to_32hex(&target_from_bits(0x1d00ffff)),
+            coinbase_extras: vec![],
         }
     }
 
@@ -3637,6 +3648,7 @@ mod tests {
             tx_hex: vec![],
             branches: vec![],
             template_target_hex: biguint_to_32hex(&target_from_bits(0x207fffff)),
+            coinbase_extras: vec![],
         }
     }
 
