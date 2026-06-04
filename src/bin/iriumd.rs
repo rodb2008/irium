@@ -17518,6 +17518,12 @@ async fn run_doge_header_sync_cycle(
         let raw_headers = irium_node_rs::doge_p2p::fetch_headers(tip_hash)
             .await
             .map_err(|e| format!("p2p fetch: {e}"))?;
+        // v1.9.69: cap DOGE batch to 144 headers (~11.5 KB encoded) so
+        // the coinbase OP_RETURN does not bloat past what miners and
+        // submitblock validators tolerate. Without this cap a 2000-header
+        // peer response produced a 160 KB coinbase output and stalled
+        // local mining (workers disconnected on receiving the job).
+        let raw_headers: Vec<[u8; 80]> = raw_headers.into_iter().take(144).collect();
         if raw_headers.is_empty() {
             header_sync_touch_last_file("doge");
             return Ok("p2p_up_to_date".to_string());
