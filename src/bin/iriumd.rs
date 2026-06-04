@@ -17242,6 +17242,50 @@ async fn run_btc_header_sync_cycle(
     if !gate_open {
         return Ok("gate_closed".to_string());
     }
+    // v1.9.67 Issue #60 phase 2: native BTC P2P. No mempool.space HTTP.
+    let tip_hash = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.btc_tip.unwrap_or_else(|| {
+            chain
+                .params
+                .btc_spv
+                .as_ref()
+                .map(|p| p.anchor.hash)
+                .unwrap_or([0u8; 32])
+        })
+    };
+    let raw_headers = irium_node_rs::btc_p2p::fetch_headers(tip_hash)
+        .await
+        .map_err(|e| format!("p2p fetch: {e}"))?;
+    if raw_headers.is_empty() {
+        header_sync_touch_last_file("btc");
+        return Ok("p2p_up_to_date".to_string());
+    }
+    let count = raw_headers.len();
+    let headers_hex: String = raw_headers.iter().map(hex::encode).collect();
+    let live_relay_tip = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.btc_tip_height
+    };
+    {
+        let mut cache = state
+            .btc_template_headers_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache = Some(CachedHeaderBatchForTemplate {
+            headers_hex,
+            expected_relay_tip_height: live_relay_tip,
+            built_at: std::time::SystemTime::now(),
+        });
+    }
+    header_sync_touch_last_file("btc");
+    return Ok(format!(
+        "p2p_cached_headers count={count} relay_tip={live_relay_tip}"
+    ));
+
+    // ----- dead post-v1.9.67 code below; kept inside `#[allow]` block ----
+    #[allow(unreachable_code, unused_variables, unused_assignments)]
+    {
     // v1.9.61: this cycle has NO mempool side effects. It only fetches
     // headers from mempool.space and caches them. getblocktemplate builds
     // a fresh signed carrier per template request using current wallet
@@ -17308,6 +17352,7 @@ async fn run_btc_header_sync_cycle(
     Ok(format!(
         "cached_headers start={start} end={end} relay_tip={live_relay_tip}"
     ))
+    } // closes #[allow] block
 }
 
 async fn run_ltc_header_sync_cycle(
@@ -17316,7 +17361,7 @@ async fn run_ltc_header_sync_cycle(
     act_height: u64,
     source: header_sync::common::Source,
 ) -> Result<String, String> {
-    let (relay_tip, gate_open) = {
+    let (_relay_tip, gate_open) = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let open = chain.height >= act_height;
         (chain.ltc_tip_height, open)
@@ -17324,6 +17369,56 @@ async fn run_ltc_header_sync_cycle(
     if !gate_open {
         return Ok("gate_closed".to_string());
     }
+    // v1.9.67 Issue #60 phase 3: native LTC P2P for mainnet. Regtest
+    // (iriumd-devnet) still goes through the existing litecoind RPC
+    // path for integration test rigs.
+    if source == header_sync::common::Source::Mainnet {
+        let tip_hash = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.ltc_tip.unwrap_or_else(|| {
+                chain
+                    .params
+                    .ltc_spv
+                    .as_ref()
+                    .map(|p| p.anchor.hash)
+                    .unwrap_or([0u8; 32])
+            })
+        };
+        let raw_headers = irium_node_rs::ltc_p2p::fetch_headers(tip_hash)
+            .await
+            .map_err(|e| format!("p2p fetch: {e}"))?;
+        if raw_headers.is_empty() {
+            header_sync_touch_last_file("ltc");
+            return Ok("p2p_up_to_date".to_string());
+        }
+        let count = raw_headers.len();
+        let headers_hex: String = raw_headers.iter().map(hex::encode).collect();
+        let live_relay_tip = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.ltc_tip_height
+        };
+        {
+            let mut cache = state
+                .ltc_template_headers_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *cache = Some(CachedHeaderBatchForTemplate {
+                headers_hex,
+                expected_relay_tip_height: live_relay_tip,
+                built_at: std::time::SystemTime::now(),
+            });
+        }
+        header_sync_touch_last_file("ltc");
+        return Ok(format!(
+            "p2p_cached_headers count={count} relay_tip={live_relay_tip}"
+        ));
+    }
+
+    // Regtest path (unchanged from pre-v1.9.67): litecoind JSON-RPC.
+    let relay_tip = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.ltc_tip_height
+    };
     let ltc_net_tip = header_sync::ltc::fetch_ltc_net_tip(client, source).await?;
     if source == header_sync::common::Source::Mainnet
         && ltc_net_tip <= header_sync::common::SAFETY_LAG
