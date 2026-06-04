@@ -1047,6 +1047,14 @@ impl ChainState {
             return Ok(());
         }
 
+        // Observability: capture old-tip hash and counts before mutating
+        // chain state. Emitted as a single [reorg] log line on success
+        // below so operators can finally see how often the chain reorgs
+        // and at what depth — successful reorgs were previously silent.
+        let old_tip_hash = self.tip_hash();
+        let disconnected_count = current_tip_height - ancestor_height;
+        let connected_count = new_branch.len() as u64;
+
         let mut disconnected: Vec<Block> = Vec::new();
         while self.tip_height() > ancestor_height {
             disconnected.push(self.disconnect_tip_block()?);
@@ -1065,6 +1073,15 @@ impl ChainState {
             }
             connected_new.push(block.clone());
         }
+
+        eprintln!(
+            "[reorg] old tip: {} new tip: {} height: {} disconnected: {} blocks",
+            hex::encode(old_tip_hash),
+            hex::encode(new_tip),
+            ancestor_height + connected_count,
+            disconnected_count,
+        );
+        let _ = connected_count;
         Ok(())
     }
 
