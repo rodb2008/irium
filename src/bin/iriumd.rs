@@ -17399,26 +17399,66 @@ async fn run_doge_header_sync_cycle(
     if !gate_open {
         return Ok("gate_closed".to_string());
     }
-    let doge_net_tip = header_sync::doge::fetch_doge_net_tip(client, source).await?;
-    if source == header_sync::common::Source::Mainnet
-        && doge_net_tip <= header_sync::common::SAFETY_LAG
-    {
-        return Err(format!(
-            "doge network tip {doge_net_tip} <= safety lag {}; refusing to submit",
-            header_sync::common::SAFETY_LAG
+    // v1.9.66 Issue #60 phase 1: mainnet uses native P2P (no HTTP
+    // block-explorer APIs anymore). Regtest still goes through the
+    // local dogecoind RPC path because that is how the integration
+    // test rigs operate — the P2P client only knows how to dial
+    // mainnet seeds.
+    if source == header_sync::common::Source::Mainnet {
+        // Locator: the natural-byte-order block hash of our current
+        // DOGE relay tip if we have one, otherwise the anchor hash.
+        // The peer walks our locator and replies with up to 2000
+        // headers chained from the first hash it also knows.
+        let tip_hash = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.doge_tip.unwrap_or_else(|| {
+                chain
+                    .params
+                    .doge_spv
+                    .as_ref()
+                    .map(|p| p.anchor.hash)
+                    .unwrap_or([0u8; 32])
+            })
+        };
+        let raw_headers = irium_node_rs::doge_p2p::fetch_headers(tip_hash)
+            .await
+            .map_err(|e| format!("p2p fetch: {e}"))?;
+        if raw_headers.is_empty() {
+            header_sync_touch_last_file("doge");
+            return Ok("p2p_up_to_date".to_string());
+        }
+        let count = raw_headers.len();
+        let headers_hex: String = raw_headers.iter().map(hex::encode).collect();
+        let live_relay_tip = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.doge_tip_height
+        };
+        {
+            let mut cache = state
+                .doge_template_headers_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *cache = Some(CachedHeaderBatchForTemplate {
+                headers_hex,
+                expected_relay_tip_height: live_relay_tip,
+                built_at: std::time::SystemTime::now(),
+            });
+        }
+        header_sync_touch_last_file("doge");
+        return Ok(format!(
+            "p2p_cached_headers count={count} relay_tip={live_relay_tip}"
         ));
     }
-    let target = match source {
-        header_sync::common::Source::Mainnet => doge_net_tip - header_sync::common::SAFETY_LAG,
-        header_sync::common::Source::Regtest => doge_net_tip,
-    };
+
+    // Regtest path (unchanged from pre-v1.9.66): dogecoind JSON-RPC.
+    let doge_net_tip = header_sync::doge::fetch_doge_net_tip(client, source).await?;
+    let target = doge_net_tip;
     if relay_tip >= target {
         header_sync_touch_last_file("doge");
         return Ok(format!(
             "up_to_date relay_tip={relay_tip} doge_net={doge_net_tip} target={target} source={source:?}"
         ));
     }
-    // FIX 2 (v1.9.63): floor at anchor.height on cold start.
     let anchor_height = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain
