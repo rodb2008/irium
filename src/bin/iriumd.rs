@@ -17257,6 +17257,10 @@ async fn run_btc_header_sync_cycle(
     let raw_headers = irium_node_rs::btc_p2p::fetch_headers(tip_hash)
         .await
         .map_err(|e| format!("p2p fetch: {e}"))?;
+    // v1.9.70: cap BTC batch to 144 headers (~11.5 KB encoded) for the
+    // same reason as the v1.9.69 DOGE cap — a 2000-header P2P response
+    // produces a 160 KB coinbase OP_RETURN that stalls local mining.
+    let raw_headers: Vec<[u8; 80]> = raw_headers.into_iter().take(144).collect();
     if raw_headers.is_empty() {
         header_sync_touch_last_file("btc");
         return Ok("p2p_up_to_date".to_string());
@@ -17387,6 +17391,8 @@ async fn run_ltc_header_sync_cycle(
         let raw_headers = irium_node_rs::ltc_p2p::fetch_headers(tip_hash)
             .await
             .map_err(|e| format!("p2p fetch: {e}"))?;
+        // v1.9.70: cap LTC batch to 144 headers — see BTC comment above.
+        let raw_headers: Vec<[u8; 80]> = raw_headers.into_iter().take(144).collect();
         if raw_headers.is_empty() {
             header_sync_touch_last_file("ltc");
             return Ok("p2p_up_to_date".to_string());
