@@ -21119,15 +21119,17 @@ found true"
     }
 
     #[test]
-    fn offer_feed_max_bytes_default_is_one_mb() {
+    fn offer_feed_max_bytes_default_and_env_override() {
+        // Combined: process-wide env var state means these two checks
+        // race when run in parallel — CI saw default_is_one_mb assert
+        // 512000 because env_override's set_var landed between
+        // default's remove_var and its function call.
         env::remove_var("IRIUM_OFFER_FEED_MAX_BYTES");
         assert_eq!(offer_feed_max_bytes(), 1_048_576);
-    }
 
-    #[test]
-    fn offer_feed_max_bytes_env_override() {
         env::set_var("IRIUM_OFFER_FEED_MAX_BYTES", "512000");
         assert_eq!(offer_feed_max_bytes(), 512_000);
+
         env::remove_var("IRIUM_OFFER_FEED_MAX_BYTES");
     }
 
