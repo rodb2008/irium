@@ -1575,11 +1575,20 @@ fn to_job(seq: u64, tpl: &GetBlockTemplate) -> Result<Job> {
     let tx_hex: Vec<String> = tpl.txs.iter().map(|t| t.hex.clone()).collect();
     let branches = build_merkle_branches(&tx_hex)?;
 
-    let coinbase_extras: Vec<(u64, Vec<u8>)> = tpl
-        .coinbase_extra_outputs
-        .iter()
-        .filter_map(|e| hex::decode(e.script_pubkey_hex.trim()).ok().map(|b| (e.value, b)))
-        .collect();
+    // STRATUM_CARRIERS=off — emergency switch for small-buffer firmware
+    // (NerdQAxe++ / Bitaxe / ESP-Miner) that cannot parse oversized notify
+    // bodies. When set, this drops the BTC/LTC/DOGE header-batch carrier
+    // outputs that ride in the coinbase. The pool still mines blocks
+    // normally; only the header-relay throughput from this port is paused.
+    let coinbase_extras: Vec<(u64, Vec<u8>)> =
+        if std::env::var("STRATUM_CARRIERS").as_deref() == Ok("off") {
+            Vec::new()
+        } else {
+            tpl.coinbase_extra_outputs
+                .iter()
+                .filter_map(|e| hex::decode(e.script_pubkey_hex.trim()).ok().map(|b| (e.value, b)))
+                .collect()
+        };
     Ok(Job {
         job_id: format!("{seq:016x}"),
         height: tpl.height,
