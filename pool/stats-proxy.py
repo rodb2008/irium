@@ -99,6 +99,24 @@ _pool_blocks_by_address = {}
 _pool_blocks_last_height = 0
 _pool_blocks_tick = 0
 
+# Per-address block heights for session-scoped blocks_found calculation.
+# Maps address -> sorted list of block heights found at that address since
+# proxy started. More granular than _pool_blocks_by_address (which only
+# stores a count) so we can count blocks after a specific session-start height.
+_pool_blocks_heights = {}  # {address: [h1, h2, ...]}
+
+# Per-worker session tracking for session-scoped blocks_found.
+# Maps "profile:worker" -> {"start_height": int, "first_seen_ts": float}
+# Reset when a worker reconnects after an absence > SESSION_GAP_SECS.
+SESSION_GAP_SECS = 600  # 10 min gap = new session
+_worker_sessions = {}
+
+# Aggregate per-profile hashrate cache computed from sum of per-worker
+# vardiff-corrected hashrates. Updated by background_sampler every tick.
+# Keyed by profile name. None until first full sample cycle completes.
+_profile_hashrate_sum = {"asic": None, "cpu_gpu": None, "solo": None, "port443": None}
+_profile_hashrate_lock = threading.Lock()
+
 
 def fetch(url):
     try:
@@ -329,6 +347,33 @@ def _is_stale_session(m):
     )
 
 
+def _count_unique_miner_addresses(source_metrics):
+    """v1.9.65 active_miners: unique miner addresses currently active.
+    'Active' = accepted > 0 AND last share within 600s. Excludes
+    long-stale workers (workers that mined hours ago but stopped) so
+    the metric reflects who is mining RIGHT NOW, not since-startup.
+    The address is the worker prefix before the first '.', matching
+    the /miners endpoint convention.
+    """
+    import time as _time
+    miners_data = source_metrics.get("miners", {}) or {}
+    now = _time.time()
+    addrs = set()
+    for worker, mstats in miners_data.items():
+        accepted = int(mstats.get("accepted", 0) or 0)
+        if accepted <= 0:
+            continue
+        last_share_at = int(mstats.get("last_share_at", 0) or 0)
+        if last_share_at <= 0:
+            # Never submitted a share -> not active.
+            continue
+        if now - last_share_at > 600:
+            # Stale (>10min since last share) -> not active.
+            continue
+        addrs.add(worker.split(".", 1)[0])
+    return len(addrs)
+
+
 def _filter_stale_duplicates(miners):
     """Drop stale rows whose (base_address, profile) tuple has a peer
     with a more-recent last_share_ago_seconds. Grouping by the tuple
@@ -486,12 +531,32 @@ def _refresh_pool_blocks():
             addr = b.get("miner_address") or ""
             if addr:
                 _pool_blocks_by_address[addr] = _pool_blocks_by_address.get(addr, 0) + 1
+                if addr not in _pool_blocks_heights:
+                    _pool_blocks_heights[addr] = []
+                import bisect
+                bisect.insort(_pool_blocks_heights[addr], h)
                 updated = True
             if h > last:
                 last = h
         _pool_blocks_last_height = last
     if updated:
         _save_pool_blocks()
+
+
+def _get_pool_blocks_session(address, since_height):
+    """Count blocks found by address at or above since_height.
+    Returns None on cold start (no data), 0 if address found no blocks
+    since that height.
+    """
+    with _pool_blocks_lock:
+        if not _pool_blocks_by_address:
+            return None
+        heights = _pool_blocks_heights.get(address, [])
+    if not heights:
+        return 0
+    import bisect
+    idx = bisect.bisect_left(heights, since_height)
+    return len(heights) - idx
 
 
 def _get_pool_blocks_count(address):
@@ -540,6 +605,18 @@ class Handler(BaseHTTPRequestHandler):
         asic_tcp = asic.get("active_tcp_sessions", 0)
         cpu_tcp = cpu.get("active_tcp_sessions", 0)
         solo_tcp = solo.get("active_tcp_sessions", 0)
+        # Override aggregate hashrate with per-worker vardiff-corrected sum.
+        with _profile_hashrate_lock:
+            asic_hr_override = _profile_hashrate_sum["asic"]
+            cpu_hr_override = _profile_hashrate_sum["cpu_gpu"]
+            solo_hr_override = _profile_hashrate_sum["solo"]
+        if asic_hr_override is not None:
+            asic_est["hashrate_estimate_hps"] = asic_hr_override
+            asic_est["hashrate_confidence"] = "high"
+        if cpu_hr_override is not None:
+            cpu_est["hashrate_estimate_hps"] = cpu_hr_override
+        if solo_hr_override is not None:
+            solo_est["hashrate_estimate_hps"] = solo_hr_override
         data = {
             "pool": "Irium Official Pool",
             "url": "pool.iriumlabs.org",
@@ -547,7 +624,7 @@ class Handler(BaseHTTPRequestHandler):
             "cpu_gpu_port": 3335,
             "solo_port": 3336,
             "asic": {
-                "active_miners": asic_tcp,
+                "active_miners": _count_unique_miner_addresses(asic),
                 "tcp_sessions": asic_tcp,
                 "accepted_shares": asic.get("accepted_shares", 0),
                 "rejected_shares": asic.get("rejected_shares", 0),
@@ -556,7 +633,7 @@ class Handler(BaseHTTPRequestHandler):
                 **asic_est,
             },
             "cpu_gpu": {
-                "active_miners": cpu_tcp,
+                "active_miners": _count_unique_miner_addresses(cpu),
                 "tcp_sessions": cpu_tcp,
                 "accepted_shares": cpu.get("accepted_shares", 0),
                 "rejected_shares": cpu.get("rejected_shares", 0),
@@ -565,7 +642,7 @@ class Handler(BaseHTTPRequestHandler):
                 **cpu_est,
             },
             "solo": {
-                "active_miners": solo_tcp,
+                "active_miners": _count_unique_miner_addresses(solo),
                 "tcp_sessions": solo_tcp,
                 "accepted_shares": solo.get("accepted_shares", 0),
                 "rejected_shares": solo.get("rejected_shares", 0),
@@ -573,7 +650,11 @@ class Handler(BaseHTTPRequestHandler):
                 "integrity": solo.get("pool_integrity", "unknown"),
                 **solo_est,
             },
-            "total_miners": asic_tcp + cpu_tcp + solo_tcp,
+            "total_miners": (
+                _count_unique_miner_addresses(asic)
+                + _count_unique_miner_addresses(cpu)
+                + _count_unique_miner_addresses(solo)
+            ),
             "total_blocks_found": asic.get("submit_accepted", 0) + cpu.get("submit_accepted", 0) + solo.get("submit_accepted", 0),
             "blocks_found_today": _blocks_found_today(
                 asic.get("submit_accepted", 0) + cpu.get("submit_accepted", 0) + solo.get("submit_accepted", 0)
@@ -676,6 +757,10 @@ class Handler(BaseHTTPRequestHandler):
                     "hashrate_15m": hashrate_15m,
                     "last_share_ago_seconds": last_share_ago,
                     "blocks_found": _get_pool_blocks_count(worker.split(".", 1)[0]),
+                    "blocks_found_session": (lambda: (
+                        lambda addr, key: _get_pool_blocks_session(addr,
+                            _worker_sessions.get(key, {}).get("start_height", 0))
+                    )(worker.split(".", 1)[0], f"{profile}:{worker}"))(),
                     "pending_shares": pending_shares,
                     "estimated_payout_irm": estimated_payout_irm,
                 })
@@ -715,11 +800,10 @@ class Handler(BaseHTTPRequestHandler):
         solo = fetch(SOLO_METRICS)
         solo_est = record_and_estimate("solo", solo)
         tcp = solo.get("active_tcp_sessions", 0)
-        # Effective active miners: only count once at least one share has
-        # been accepted, same convention the /stats endpoint uses for the
-        # ASIC and CPU/GPU profiles. Suppresses noise from port scanners.
+        # v1.9.65: count unique addresses with shares, not TCP sessions.
+        # accepted_shares = pool-wide count (kept for the JSON below).
         accepted = solo.get("accepted_shares", 0)
-        effective_miners = tcp if accepted > 0 else 0
+        effective_miners = _count_unique_miner_addresses(solo)
         data = {
             "pool": "Irium Solo Pool",
             "url": "pool.iriumlabs.org",
@@ -859,6 +943,52 @@ def background_sampler():
                 _refresh_pool_blocks()
         except Exception as e:
             print(f"[stats-proxy] background sampler error: {e}", flush=True)
+        # Update per-worker session tracking and aggregate hashrate sum.
+        # Do this after all profile samples so per-miner data is fresh.
+        hr_sums = {"asic": 0.0, "cpu_gpu": 0.0, "solo": 0.0, "port443": 0.0}
+        hr_counts = {"asic": 0, "cpu_gpu": 0, "solo": 0, "port443": 0}
+        now_ts = time.time()
+        with _pool_blocks_lock:
+            cur_height = _pool_blocks_last_height
+        for pname, cfg in DEFAULTS.items():
+            metrics = fetch(cfg["metrics"])
+            miners_data = metrics.get("miners", {}) or {}
+            diff_base = DEFAULTS[pname]["diff"]
+            for worker, mstats in miners_data.items():
+                key = f"{pname}:{worker}"
+                accepted = int(mstats.get("accepted", 0) or 0)
+                last_share_at = int(mstats.get("last_share_at", 0) or 0)
+                # Session detection: new worker or reconnect after gap.
+                sess = _worker_sessions.get(key)
+                if sess is None:
+                    # First time we see this worker - start session now.
+                    _worker_sessions[key] = {
+                        "start_height": cur_height,
+                        "first_seen_ts": now_ts,
+                    }
+                elif last_share_at > 0:
+                    last_seen = sess.get("last_seen_ts", now_ts)
+                    if (now_ts - last_seen) > SESSION_GAP_SECS:
+                        # Worker was absent, reconnected - new session.
+                        _worker_sessions[key] = {
+                            "start_height": cur_height,
+                            "first_seen_ts": now_ts,
+                        }
+                if key in _worker_sessions:
+                    _worker_sessions[key]["last_seen_ts"] = now_ts
+                # Per-worker vardiff-corrected hashrate contribution.
+                live_diff = mstats.get("current_diff")
+                effective_diff = float(live_diff) if live_diff else diff_base
+                hr, _ = estimate_miner_hashrate(key, accepted, effective_diff)
+                if hr is not None:
+                    hr_sums[pname] += hr
+                    hr_counts[pname] += 1
+        with _profile_hashrate_lock:
+            for pname in DEFAULTS:
+                if hr_counts[pname] > 0:
+                    _profile_hashrate_sum[pname] = hr_sums[pname]
+                # If no workers contributed a hashrate, leave the cached
+                # value as-is so a single missed tick doesn't zero the display.
         time.sleep(30)
 
 
