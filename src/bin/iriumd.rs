@@ -16133,7 +16133,17 @@ fn decode_compact_tx(raw: &[u8]) -> Result<Transaction, String> {
     let mut outputs = Vec::with_capacity(output_count);
     for _ in 0..output_count {
         let value = read_u64(raw, &mut offset)?;
-        let script_len = read_u8(raw, &mut offset)? as usize;
+        // v1.9.73: read script_len as varint to match TxOutput::serialize
+        // (which switched to varint to support outputs > 252 bytes such as
+        // BtcHeaderBatch / LtcHeaderBatch / DogeHeaderBatch / large MPSO
+        // covenants). Previously this single-byte read produced a garbage
+        // tx for any output whose script_pubkey was > 252 bytes — the
+        // recomputed txid then differed from the original, the merkle
+        // tree differed, and parse_persisted_block_file rejected the
+        // file with "block merkle root mismatch" on every startup.
+        // chain.rs:3337 (the permissive decoder) already does this read.
+        let script_len = irium_node_rs::tx::read_varint_at(raw, &mut offset)
+            .ok_or_else(|| "varint EOF".to_string())? as usize;
         let script_pubkey = read_bytes(raw, &mut offset, script_len)?;
         outputs.push(TxOutput {
             value,
