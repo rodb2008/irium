@@ -3,6 +3,7 @@ use std::sync::{
     mpsc::{sync_channel, SyncSender, TrySendError},
     Mutex, OnceLock,
 };
+use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{
@@ -600,16 +601,28 @@ fn read_block_json_string(height: u64) -> std::io::Result<Option<String>> {
 
 fn write_block_json_string(height: u64, json: &str) -> std::io::Result<()> {
     let path = block_json_path_for_height(height)?;
-    // Atomic write: stage the new contents in a `.tmp` sibling, then rename
-    // to the canonical name. fs::rename is atomic on every supported OS, so
-    // readers (including iriumd's startup persisted-block scan) see either
-    // the old file or the fully-written new file — never a half-written
-    // truncated one. Without this, a kill mid-`fs::write` left `block_N.json`
-    // existing but missing fields, triggering the "missing header" quarantine
-    // that returned 404 for that height forever afterwards.
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json)?;
-    fs::rename(&tmp, &path)
+    // v1.9.71 atomic write with explicit fsync. The previous bare
+    // `fs::write` + `fs::rename` pair was atomic with respect to
+    // readers (rename swaps in one step) but not durable across SIGKILL +
+    // host crash: the kernel may keep the .tmp data and the renamed
+    // dirent in page cache, so the canonical path can resolve to an
+    // inode whose data blocks were never flushed. That surfaced as
+    // zero-byte / truncated block_N.json files on the next boot, which
+    // iriumd quarantined into orphaned_<ts>/ with a merkle-root
+    // mismatch (Issue #61).
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 fn rename_block_json_to(height: u64, dest: &Path) -> std::io::Result<()> {
