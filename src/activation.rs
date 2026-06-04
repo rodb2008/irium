@@ -139,13 +139,13 @@ pub const MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 
 /// Mainnet anchor for the DOGE SPV header relay.
 ///
-/// Dogecoin mainnet block 6,225,000, picked ~3,374 confirmations deep
+/// Dogecoin mainnet block 6,224,800, picked ~3,374 confirmations deep
 /// (about 56 hours of finality buffer past the 720-confirmation
 /// minimum). Hash stored here in DISPLAY order for readability;
 /// reversed to natural byte order in `DogeAnchor::mainnet()` so it
 /// lines up with `prev_hash` chain-linkage fields.
 ///
-/// `PREV_TIME` is the timestamp of block 6,224,999 — needed because
+/// `PREV_TIME` is the timestamp of block 6,224,799 — needed because
 /// Digishield's per-block retarget reads the grandparent's timestamp,
 /// and for the first relayed header the grandparent IS the block one
 /// step below the anchor.
@@ -156,17 +156,17 @@ pub const MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 pub const MAINNET_DOGE_ANCHOR_HEIGHT: u64 = 6_224_800;
 #[allow(dead_code)]
 pub const MAINNET_DOGE_ANCHOR_HASH_DISPLAY: [u8; 32] = [
-    0x26, 0x55, 0xf8, 0x96, 0xbd, 0xf6, 0xdd, 0x40,
-    0xb9, 0x3e, 0xa4, 0xbb, 0x5d, 0xc4, 0x68, 0xcb,
-    0x3d, 0x2d, 0xb2, 0x5b, 0x60, 0x1e, 0x06, 0xe4,
-    0xcb, 0x18, 0x41, 0x8a, 0x0c, 0xb9, 0x1f, 0xb4,
+    0x5e, 0x03, 0x13, 0xd5, 0x88, 0x7e, 0xc7, 0xae,
+    0x67, 0xaa, 0xb7, 0xe2, 0xbe, 0x52, 0x62, 0xb2,
+    0x65, 0x34, 0x36, 0x37, 0xb5, 0xed, 0x92, 0x02,
+    0x81, 0x1b, 0x7e, 0x31, 0x87, 0xf1, 0xc4, 0xc1,
 ];
 #[allow(dead_code)]
-pub const MAINNET_DOGE_ANCHOR_BITS: u32 = 0x1a00_97af;
+pub const MAINNET_DOGE_ANCHOR_BITS: u32 = 0x196a_2b5d;
 #[allow(dead_code)]
-pub const MAINNET_DOGE_ANCHOR_TIME: u32 = 1_779_953_962;
+pub const MAINNET_DOGE_ANCHOR_TIME: u32 = 1_779_940_888;
 #[allow(dead_code)]
-pub const MAINNET_DOGE_ANCHOR_PREV_TIME: u32 = 1_779_953_888;
+pub const MAINNET_DOGE_ANCHOR_PREV_TIME: u32 = 1_779_940_838;
 
 /// Mainnet HtlcLtcSwapV1 activation height (Phase C).
 ///
@@ -989,11 +989,11 @@ mod tests {
         // Display-order hash (from blockchair.com / Dogecoin Core RPC).
         // Reversed to natural order in `DogeAnchor::mainnet()`.
         assert_eq!(MAINNET_DOGE_ANCHOR_HEIGHT, 6_224_800);
-        assert_eq!(MAINNET_DOGE_ANCHOR_BITS, 0x1a00_97af);
-        assert_eq!(MAINNET_DOGE_ANCHOR_TIME, 1_779_953_962);
-        assert_eq!(MAINNET_DOGE_ANCHOR_PREV_TIME, 1_779_953_888);
-        assert_eq!(MAINNET_DOGE_ANCHOR_HASH_DISPLAY[0], 0x26);
-        assert_eq!(MAINNET_DOGE_ANCHOR_HASH_DISPLAY[31], 0xb4);
+        assert_eq!(MAINNET_DOGE_ANCHOR_BITS, 0x196a_2b5d);
+        assert_eq!(MAINNET_DOGE_ANCHOR_TIME, 1_779_940_888);
+        assert_eq!(MAINNET_DOGE_ANCHOR_PREV_TIME, 1_779_940_838);
+        assert_eq!(MAINNET_DOGE_ANCHOR_HASH_DISPLAY[0], 0x5e);
+        assert_eq!(MAINNET_DOGE_ANCHOR_HASH_DISPLAY[31], 0xc1);
     }
 
     #[test]
