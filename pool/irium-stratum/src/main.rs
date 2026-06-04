@@ -142,10 +142,15 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(5);
+    // Default reduced from 3600s (1h) to 300s (5min): the rate-limit-then-ban
+    // loop is meant to slow down obviously-bad reconnect spam, not punish
+    // legitimate workers for transient flakiness. 5min is enough to defang
+    // a runaway reconnect loop while letting genuine miners recover quickly.
+    // Operators can still override via IRIUM_STRATUM_BAN_DURATION_SECS env var.
     let ban_duration_secs = env::var("IRIUM_STRATUM_BAN_DURATION_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(3600);
+        .unwrap_or(300);
 
     if default_diff_raw < 1.0 {
         warn!(
