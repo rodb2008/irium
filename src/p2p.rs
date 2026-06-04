@@ -34,6 +34,27 @@ use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+// Global 60s throttle for "unsolicited headers ignored" log emission.
+// The per-peer last_unsolicited_log field below already throttles each
+// peer to ~once/30s, but with many connected peers the aggregate rate
+// is still ~10 lines/minute. Real value is in the RATE not per-event
+// detail — collapse to one log line per minute globally.
+static LAST_UNSOLICITED_LOG_GLOBAL: AtomicU64 = AtomicU64::new(0);
+
+fn should_emit_unsolicited_headers_log() -> bool {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_UNSOLICITED_LOG_GLOBAL.load(Ordering::Relaxed);
+    if now_secs.saturating_sub(last) >= 60 {
+        LAST_UNSOLICITED_LOG_GLOBAL.store(now_secs, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 /// Minimal P2P node skeleton: accepts incoming connections and can
 /// broadcast raw block bytes to all connected peers.
 const DEFAULT_MAX_PEERS: usize = 100;
@@ -5145,14 +5166,16 @@ impl P2PNode {
                                             .unwrap_or(true);
                                         if should_log {
                                             state.last_unsolicited_log = Some(now);
-                                            P2PNode::log_event(
-                                                "warn",
-                                                "sync",
-                                                format!(
-                                                    "P2P {}: unsolicited headers ignored",
-                                                    addr
-                                                ),
-                                            );
+                                            if should_emit_unsolicited_headers_log() {
+                                                P2PNode::log_event(
+                                                    "warn",
+                                                    "sync",
+                                                    format!(
+                                                        "P2P {}: unsolicited headers ignored",
+                                                        addr
+                                                    ),
+                                                );
+                                            }
                                         }
                                         continue;
                                     }
@@ -7470,11 +7493,13 @@ async fn handle_incoming_with_sybil(
                                     .unwrap_or(true);
                                 if should_log {
                                     state.last_unsolicited_log = Some(now);
-                                    P2PNode::log_event(
-                                        "warn",
-                                        "sync",
-                                        format!("P2P {}: unsolicited headers ignored", addr),
-                                    );
+                                    if should_emit_unsolicited_headers_log() {
+                                        P2PNode::log_event(
+                                            "warn",
+                                            "sync",
+                                            format!("P2P {}: unsolicited headers ignored", addr),
+                                        );
+                                    }
                                 }
                                 continue;
                             }
