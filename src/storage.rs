@@ -480,12 +480,39 @@ pub fn ensure_runtime_dirs() -> std::io::Result<(PathBuf, PathBuf)> {
     // from a previous run that was killed mid-write. Trying to use them
     // would only fail validation (or partially write again), so deleting
     // them up front keeps startup fast and avoids confusing log spam.
+    //
+    // v1.9.72: also prune `orphaned_<ts>/` subdirs older than 7 days.
+    // iriumd quarantines invalid-merkle blocks into these on cold-load.
+    // Combined with the iriumd.rs guard that stops collect_block_files_from_dir
+    // from recursing into these subdirs, this caps total disk usage:
+    // recent crashes leave a forensic window operators can inspect within
+    // a week; older debris is auto-cleaned so the dir count stays bounded.
+    const ORPHANED_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
     if let Ok(rd) = fs::read_dir(&blocks) {
+        let now = SystemTime::now();
         for entry in rd.flatten() {
             let p = entry.path();
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if name.starts_with("block_") && name.ends_with(".json.tmp") {
                 let _ = fs::remove_file(&p);
+                continue;
+            }
+            if name.starts_with("orphaned_") {
+                let is_dir = entry
+                    .file_type()
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or(false);
+                if !is_dir {
+                    continue;
+                }
+                let mtime = match entry.metadata().and_then(|m| m.modified()) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let age = now.duration_since(mtime).unwrap_or_default().as_secs();
+                if age > ORPHANED_RETENTION_SECS {
+                    let _ = fs::remove_dir_all(&p);
+                }
             }
         }
     }

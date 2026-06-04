@@ -2663,6 +2663,23 @@ fn collect_block_files_from_dir(dir: &std::path::Path, out: &mut Vec<std::path::
         for entry in read_dir.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                // v1.9.72: skip orphaned_<ts>/ subdirs at scan time so
+                // already-quarantined blocks aren't re-loaded → re-validated
+                // → re-quarantined into yet another fresh orphaned_<ts2>/
+                // on every startup. Without this gate the orphan directory
+                // count grows monotonically every restart, even though the
+                // chain on disk is healthy and the v1.9.71 atomic-write fix
+                // prevents new partial writes. The orphaned files remain on
+                // disk for forensic inspection; storage::ensure_runtime_dirs
+                // auto-prunes orphaned_* dirs older than 7 days.
+                let name_starts_orphaned = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.starts_with("orphaned_"))
+                    .unwrap_or(false);
+                if name_starts_orphaned {
+                    continue;
+                }
                 stack.push(path);
                 continue;
             }
