@@ -19195,6 +19195,17 @@ async fn main() {
                         storage::persist_queue_len()
                     );
                 }
+                // Issue #66 — installing a custom SIGTERM handler via
+                // tokio::signal::unix::signal suppresses the kernel's
+                // default exit-on-SIGTERM behavior. Without an explicit
+                // exit here, the runtime stays alive via the 30+ spawned
+                // background tasks (offer drainers, dispute drainers,
+                // gossip, header sync, ...) and systemd SIGKILLs after
+                // TimeoutStopSec, losing in-memory state accumulated
+                // between drain completion and SIGKILL. Matches the
+                // /rpc/stop and Windows ctrl_c handlers (which already
+                // exit explicitly).
+                std::process::exit(0);
             });
         }
 

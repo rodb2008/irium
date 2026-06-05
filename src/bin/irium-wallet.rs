@@ -1160,6 +1160,15 @@ struct LocalStoreAgreementItem {
     agreement_hash: String,
     path: String,
     referenced_by_receipt_count: usize,
+    /// Block-height refund deadline from the on-disk
+    /// `AgreementObject.deadlines.refund_deadline`. None when the
+    /// agreement template doesn't set a refund timeout. Surfaces to
+    /// API/CLI consumers without requiring per-agreement file reads on
+    /// the consumer side. (Issue #67 / canonical deadline field for the
+    /// agreement-local-store-list response. Pairs with the Tauri
+    /// layer's existing per-entry status fetch.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deadline: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3874,6 +3883,9 @@ fn build_agreement_local_store_listing(
             agreement_hash,
             path: path.clone(),
             referenced_by_receipt_count: refs.get(&path).map(|v| v.len()).unwrap_or(0),
+            // Issue #67: copy the on-disk refund deadline through so
+            // API/CLI consumers don't have to parse each agreement file.
+            deadline: item.agreement.deadlines.refund_deadline,
         });
     }
 
