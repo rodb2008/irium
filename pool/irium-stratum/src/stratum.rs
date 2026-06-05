@@ -412,6 +412,13 @@ struct SessionState {
     /// closed so the miner can reconnect and potentially get a clean
     /// job assignment.
     consecutive_variant_none: u64,
+    /// User-agent string captured from mining.subscribe params[0]. Used
+    /// by is_small_buffer_firmware() to decide whether coinbase carrier
+    /// outputs should be stripped from this session's mining.notify body.
+    /// None when subscribe omitted params[0] or sent a non-string value;
+    /// treated as "large-buffer" by default so unknown firmware keeps the
+    /// existing carrier-relay behavior.
+    user_agent: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -1266,7 +1273,7 @@ fn build_canonical_job_snapshot(job: &Job, session: &SessionState, config: &Stra
     let (coinbase_prefix, coinbase_suffix, prev_hash_internal, branches, auxpow_mode, irium_header80, irium_coinbase_hex) =
         if auxpow_active {
             // AuxPoW: build fixed Irium coinbase, compute Irium block hash, build parent coinbase
-            let irium_coinbase = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &[], session.coinbase_bip34, &job.coinbase_extras);
+            let irium_coinbase = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &[], session.coinbase_bip34, session_coinbase_extras(job, session));
             let irium_coinbase_hash = sha256d(&irium_coinbase);
             let irium_merkle_root = merkle_root_from_coinbase(irium_coinbase_hash, &job.branches);
             let irium_h80 = build_irium_auxpow_header(job.prev_hash, irium_merkle_root, ntime, job.bits);
@@ -1276,7 +1283,7 @@ fn build_canonical_job_snapshot(job: &Job, session: &SessionState, config: &Stra
             );
             (pp, ps, [0u8; 32], vec![], true, Some(irium_h80), Some(hex::encode(&irium_coinbase)))
         } else {
-            let (cp, cs) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34, &job.coinbase_extras);
+            let (cp, cs) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34, session_coinbase_extras(job, session));
             (cp, cs, job.prev_hash, job.branches.clone(), false, None, None)
         };
 
@@ -1568,6 +1575,43 @@ async fn template_loop(
     }
 }
 
+/// Returns true for ASIC firmware known to have small JSON buffers
+/// (4-8 KB). With BTC/LTC/DOGE header-relay carrier outputs in the
+/// coinbase, mining.notify bodies hit ~10 KB; small-buffer firmware
+/// silently overflows its parser and RSTs the TCP connection.
+/// Detection is purely string-match on the mining.subscribe user-agent
+/// (params[0]). Unknown firmware defaults to "large-buffer" -> carriers
+/// included, the backward-compat path.
+fn is_small_buffer_firmware(user_agent: &str) -> bool {
+    let ua = user_agent.to_ascii_lowercase();
+    ua.contains("nerdqaxe")
+        || ua.contains("bitaxe")
+        || ua.contains("esp-miner")
+        || ua.contains("bm1370")
+}
+
+/// Per-session view of coinbase carrier extras. Returns an empty slice
+/// for small-buffer firmware so its mining.notify body stays under the
+/// parser limit; returns the full job-level extras for everyone else.
+/// The pool-wide STRATUM_CARRIERS=off env override applies at to_job
+/// time and produces an already-empty job.coinbase_extras, so the
+/// emergency kill-switch still wins regardless of user-agent.
+fn session_coinbase_extras<'a>(
+    job: &'a Job,
+    session: &SessionState,
+) -> &'a [(u64, Vec<u8>)] {
+    if session
+        .user_agent
+        .as_deref()
+        .map(is_small_buffer_firmware)
+        .unwrap_or(false)
+    {
+        &[]
+    } else {
+        &job.coinbase_extras
+    }
+}
+
 fn to_job(seq: u64, tpl: &GetBlockTemplate) -> Result<Job> {
     let prev_hash = parse_hex32(&tpl.prev_hash)?;
     let bits = parse_u32_hex(&tpl.bits)?;
@@ -1643,6 +1687,7 @@ async fn handle_conn(
         adapter_kind: select_adapter_kind(&config),
         wants_extranonce_updates: false,
         consecutive_variant_none: 0,
+        user_agent: None,
     };
 
     let (rd, mut wr) = stream.into_split();
@@ -1749,6 +1794,28 @@ async fn handle_message(
             write_json(wr, &resp).await?;
         }
         "mining.subscribe" => {
+            // v1.9.77: capture firmware identifier from params[0] so
+            // session_coinbase_extras() can suppress header-relay carriers
+            // for small-buffer firmware (NerdQAxe / Bitaxe / ESP-Miner /
+            // BM1370). Non-string / missing params[0] stays None -> treated
+            // as large-buffer (carriers on).
+            session.user_agent = params
+                .first()
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            if let Some(ua) = session.user_agent.as_deref() {
+                if is_small_buffer_firmware(ua) {
+                    info!(
+                        "[subscribe] conn={} user_agent={:?} small_buffer=true carriers=off-for-session",
+                        conn_id, ua
+                    );
+                } else {
+                    debug!(
+                        "[subscribe] conn={} user_agent={:?} small_buffer=false",
+                        conn_id, ua
+                    );
+                }
+            }
             // Stratum v1: result[2] is extranonce2_size (the number of bytes
             // the miner must append to extranonce1 in mining.submit). Internally
             // the snapshot hardcodes 4 (see build_canonical_job_snapshot line ~963);
@@ -2859,7 +2926,7 @@ async fn handle_submit_legacy_rewardable(
     let mut en = session.extranonce1.clone();
     en.extend_from_slice(&extra2);
 
-    let cb = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &en, config.coinbase_bip34, &job.coinbase_extras);
+    let cb = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &en, config.coinbase_bip34, session_coinbase_extras(&job, session));
     let cb_hash = sha256d(&cb);
 
     fn fold_merkle(root0: [u8; 32], branches: &[[u8; 32]], rev_branch: bool, rev_each_round: bool) -> [u8; 32] {
@@ -3440,7 +3507,7 @@ async fn send_notify(
             )
         }
     } else {
-        let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34, &job.coinbase_extras);
+        let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34, session_coinbase_extras(job, session));
         (prev_hex_for_height(&job.prev_hash, job.height), hex::encode(&cb1), hex::encode(&cb2), job.branches.iter().map(hex::encode).collect())
     };
 
@@ -3626,6 +3693,7 @@ mod tests {
             adapter_kind: mode,
             wants_extranonce_updates: false,
             consecutive_variant_none: 0,
+            user_agent: None,
         }
     }
 
