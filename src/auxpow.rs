@@ -89,18 +89,26 @@ where
     }
 
     if chain_count == 1 {
-        if committed_root != aux_hash {
+        // AuxPoW spec: coinbase stores the merkle root as a little-endian
+        // uint256 (display / reversed byte order). Bitcoin Core's
+        // ComputeAuxpowRootHash reverses the computed value before compare.
+        let mut aux_hash_committed = aux_hash;
+        aux_hash_committed.reverse();
+        if committed_root != aux_hash_committed {
             return Err("coinbase commitment does not match aux block hash".to_string());
         }
     } else {
         if ap.blockchain_branch_index >= chain_count {
             return Err("blockchain branch index exceeds chain count".to_string());
         }
-        let computed_root = compute_merkle_root(
+        let mut computed_root = compute_merkle_root(
             &aux_hash,
             &ap.blockchain_branch,
             ap.blockchain_branch_index,
         );
+        // AuxPoW spec: see comment above. Reverse computed_root to match
+        // the little-endian uint256 stored in the coinbase commitment.
+        computed_root.reverse();
         if computed_root != committed_root {
             return Err("blockchain Merkle branch does not match commitment root".to_string());
         }
@@ -176,12 +184,17 @@ pub fn compute_merkle_root(leaf: &[u8; 32], branch: &[[u8; 32]], index: u32) -> 
 
 /// Build a 44-byte merged-mining commitment for embedding in a Bitcoin coinbase.
 ///
-/// `aux_hash` is sha256d(block_header.serialize()) — natural order, not reversed.
+/// `aux_hash` is sha256d(block_header.serialize()) — natural order. This
+/// function reverses it to little-endian (display) order before embedding,
+/// matching the AuxPoW spec convention used by Bitcoin Core and DOGE Core
+/// (the committed merkle root is stored as a little-endian uint256).
 #[allow(dead_code)] // merged-mining commitment builder; used by mining infrastructure when merge mining is enabled
 pub fn build_commitment(aux_hash: &[u8; 32], chain_count: u32, nonce: u32) -> [u8; 44] {
     let mut out = [0u8; 44];
     out[..4].copy_from_slice(&AUXPOW_COMMIT_MAGIC);
-    out[4..36].copy_from_slice(aux_hash);
+    let mut aux_hash_rev = *aux_hash;
+    aux_hash_rev.reverse();
+    out[4..36].copy_from_slice(&aux_hash_rev);
     out[36..40].copy_from_slice(&chain_count.to_le_bytes());
     out[40..44].copy_from_slice(&nonce.to_le_bytes());
     out
