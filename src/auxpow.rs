@@ -27,7 +27,50 @@ pub struct AuxPoW {
 ///
 /// `aux_header_bytes` must be the serialized 80-byte Irium block header
 /// (`BlockHeader::serialize()`).
+///
+/// PR-2 of issue #68 refactored this function into a thin wrapper around
+/// `validate_with_parent_hash` so that other chains (DOGE) with a
+/// non-sha256d parent PoW (Scrypt) can reuse the merge-mining merkle
+/// and commitment validation logic without duplication. Behavior is
+/// identical to the pre-refactor implementation: parent PoW is sha256d
+/// (Bitcoin/IRIUM family) and checked against `target`.
 pub fn validate(ap: &AuxPoW, aux_header_bytes: &[u8], target: Target) -> Result<(), String> {
+    validate_with_parent_hash(ap, aux_header_bytes, target, |header| {
+        // sha256d returns natural order; meets_target expects display
+        // (big-endian) order.
+        let mut parent_hash_display = sha256d(header);
+        parent_hash_display.reverse();
+        meets_target(&parent_hash_display, target)
+    })
+}
+
+/// Validate an AuxPoW proof with a caller-supplied parent-PoW predicate.
+///
+/// This is the parent-hash-function-agnostic core of AuxPoW validation.
+/// The closure `parent_pow` is invoked with the 80-byte parent block
+/// header and must return whether that parent's PoW meets the chain's
+/// difficulty target.
+///
+/// Use cases:
+///   * IRIUM's own merge-mining (parent uses sha256d) — the existing
+///     `validate()` wraps this with the sha256d + meets_target check.
+///   * DOGE SPV AuxPoW (parent is LTC using Scrypt) — callers pass a
+///     closure that runs Scrypt on the parent header and checks it
+///     against the DOGE target. This is the post-371,337 DOGE SPV
+///     validator path; lands in a later PR.
+///
+/// `target` is preserved in the signature for diagnostic error context
+/// and forward API symmetry; the closure is the authoritative PoW check.
+/// (Issue #68 PR-2)
+pub fn validate_with_parent_hash<F>(
+    ap: &AuxPoW,
+    aux_header_bytes: &[u8],
+    target: Target,
+    parent_pow: F,
+) -> Result<(), String>
+where
+    F: Fn(&[u8; 80]) -> bool,
+{
     if aux_header_bytes.len() != 80 {
         return Err("aux block header must be exactly 80 bytes".to_string());
     }
@@ -73,11 +116,11 @@ pub fn validate(ap: &AuxPoW, aux_header_bytes: &[u8], target: Target) -> Result<
         return Err("coinbase Merkle branch does not match parent block merkle root".to_string());
     }
 
-    // sha256d returns natural order; meets_target expects display (big-endian) order.
-    let mut parent_hash_display = sha256d(&ap.parent_header);
-    parent_hash_display.reverse();
-    if !meets_target(&parent_hash_display, target) {
-        return Err("parent block hash does not meet Irium target".to_string());
+    if !parent_pow(&ap.parent_header) {
+        return Err(format!(
+            "parent block hash does not meet target (bits=0x{:08x})",
+            target.bits,
+        ));
     }
 
     Ok(())
@@ -459,5 +502,113 @@ mod tests {
             parent_header: [0u8; 80],
         };
         assert!(validate(&ap, &[0u8; 80], Target { bits: 0x207fffff }).is_err());
+    }
+
+    /// PR-2 of issue #68: validate the IRIUM merge-mine path end-to-end
+    /// through the refactored `validate()` (which now wraps
+    /// `validate_with_parent_hash` with the sha256d closure). Constructs
+    /// a synthetic but structurally valid AuxPoW and asserts Ok. Anything
+    /// breaking here would indicate a behavior regression from the
+    /// pre-refactor `validate()`. Pairs with the existing
+    /// `validate_rejects_*` tests covering negative paths.
+    ///
+    /// Note: 0x207fffff (max compact target) only accepts ~50% of random
+    /// hashes (top byte ≤ 0x7f after byte reversal), so we brute-force
+    /// the parent_header nonce to find one whose sha256d meets the
+    /// target. Practice mirrors what a real miner does — a few
+    /// iterations on average — but with an upper bound for safety.
+    #[test]
+    fn validate_passes_for_synthetic_valid_irium_auxpow() {
+        let target = Target { bits: 0x207fffff };
+        let aux_header = [0u8; 80];
+        let aux_hash = sha256d(&aux_header);
+        // Coinbase = just the 44-byte merge-mining commitment. With
+        // chain_count=1, the validator skips the blockchain_branch
+        // merkle check (commitment hash == aux_hash directly).
+        let coinbase_txn = build_commitment(&aux_hash, 1, 0).to_vec();
+        let coinbase_txid = sha256d(&coinbase_txn);
+        // Empty coinbase_branch → coinbase_txid IS the parent's merkle
+        // root (coinbase is the only transaction in the parent block).
+        let mut parent_header = [0u8; 80];
+        parent_header[36..68].copy_from_slice(&coinbase_txid);
+
+        // Brute-force the parent_header nonce until its sha256d (reversed
+        // to display order) meets the target. ~50% acceptance rate per
+        // attempt, so we expect this to terminate quickly.
+        let mut found = false;
+        for nonce in 0u32..10_000 {
+            parent_header[76..80].copy_from_slice(&nonce.to_le_bytes());
+            let mut h = sha256d(&parent_header);
+            h.reverse();
+            if meets_target(&h, target) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "could not find a valid parent_header nonce in 10_000 tries");
+
+        let ap = AuxPoW {
+            coinbase_txn,
+            parent_hash: sha256d(&parent_header),
+            coinbase_branch: vec![],
+            coinbase_branch_index: 0,
+            blockchain_branch: vec![],
+            blockchain_branch_index: 0,
+            parent_header,
+        };
+        let result = validate(&ap, &aux_header, target);
+        assert!(
+            result.is_ok(),
+            "refactored validate() rejected a synthetic valid IRIUM AuxPoW: {:?}",
+            result,
+        );
+    }
+
+    /// PR-2 of issue #68: confirm `validate_with_parent_hash` honors the
+    /// caller-supplied parent-PoW closure. Same synthetic AuxPoW as the
+    /// positive test above; here we force the closure to reject and
+    /// assert the function returns the expected parent-pow error — this
+    /// proves the closure is actually on the validation path (and not
+    /// silently bypassed).
+    #[test]
+    fn validate_with_parent_hash_closure_is_authoritative() {
+        let aux_header = [0u8; 80];
+        let aux_hash = sha256d(&aux_header);
+        let coinbase_txn = build_commitment(&aux_hash, 1, 0).to_vec();
+        let coinbase_txid = sha256d(&coinbase_txn);
+        let mut parent_header = [0u8; 80];
+        parent_header[36..68].copy_from_slice(&coinbase_txid);
+        let ap = AuxPoW {
+            coinbase_txn,
+            parent_hash: sha256d(&parent_header),
+            coinbase_branch: vec![],
+            coinbase_branch_index: 0,
+            blockchain_branch: vec![],
+            blockchain_branch_index: 0,
+            parent_header,
+        };
+
+        // Closure returns true → Ok
+        let ok = validate_with_parent_hash(
+            &ap, &aux_header, Target { bits: 0x207fffff }, |_| true,
+        );
+        assert!(ok.is_ok(), "closure-true path rejected: {:?}", ok);
+
+        // Closure returns false → Err on parent PoW with bits in message
+        let err = validate_with_parent_hash(
+            &ap, &aux_header, Target { bits: 0x207fffff }, |_| false,
+        );
+        assert!(err.is_err(), "closure-false path accepted");
+        let msg = err.unwrap_err();
+        assert!(
+            msg.contains("does not meet target"),
+            "expected parent-pow error, got: {}",
+            msg,
+        );
+        assert!(
+            msg.contains("207fffff"),
+            "expected bits in error context, got: {}",
+            msg,
+        );
     }
 }
