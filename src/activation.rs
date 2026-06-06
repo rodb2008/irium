@@ -168,6 +168,25 @@ pub const MAINNET_DOGE_ANCHOR_TIME: u32 = 1_779_940_888;
 #[allow(dead_code)]
 pub const MAINNET_DOGE_ANCHOR_PREV_TIME: u32 = 1_779_940_838;
 
+/// Mainnet DOGE merge-mining (AuxPoW) activation height.
+///
+/// At DOGE mainnet block 371,337 (2014-09-11), the Dogecoin chain
+/// switched from standalone Scrypt PoW to AuxPoW merge-mined with
+/// Litecoin. From this height onward, the DOGE block header's
+/// nonce/bits do not produce a valid standalone Scrypt PoW; instead
+/// the parent LTC block's Scrypt PoW serves as the DOGE block's PoW
+/// via the AuxPoW data carried after the 80-byte header.
+///
+/// iriumd's DOGE SPV uses this constant to choose between the
+/// pre-AuxPoW standalone-Scrypt validator path and the AuxPoW
+/// validator path. Devnet/testnet override via
+/// `IRIUM_DOGE_AUXPOW_HEIGHT`.
+///
+/// Issue #68 PR-1: constant + helper only. Validator wiring lands
+/// in later PRs.
+#[allow(dead_code)] // wired into doge_spv apply_doge_header_batch in later PRs
+pub const MAINNET_DOGE_AUXPOW_ACTIVATION_HEIGHT: u64 = 371_337;
+
 /// Mainnet HtlcLtcSwapV1 activation height (Phase C).
 ///
 /// `None` keeps the LTC-proof claim path disabled on mainnet. When set
@@ -377,6 +396,27 @@ pub fn resolved_auxpow_activation_height(network: NetworkKind) -> Option<u64> {
         NetworkKind::Mainnet => MAINNET_AUXPOW_ACTIVATION_HEIGHT,
         NetworkKind::Testnet | NetworkKind::Devnet => runtime_auxpow_env_override(),
     }
+}
+
+/// DOGE AuxPoW activation height with devnet/testnet env override.
+///
+/// On mainnet, returns `MAINNET_DOGE_AUXPOW_ACTIVATION_HEIGHT`
+/// (371,337 — the historical Dogecoin merge-mining boundary). On
+/// devnet/testnet, `IRIUM_DOGE_AUXPOW_HEIGHT` overrides the boundary
+/// for testing.
+///
+/// Unlike `resolved_auxpow_activation_height`, this returns a
+/// concrete `u64` (not `Option<u64>`) because the DOGE merge-mining
+/// transition is a fixed historical chain event — there is no
+/// "AuxPoW never activates" state for the DOGE chain.
+///
+/// Issue #68 PR-1.
+#[allow(dead_code)] // wired into doge_spv apply_doge_header_batch in later PRs
+pub fn doge_auxpow_activation_height() -> u64 {
+    env::var("IRIUM_DOGE_AUXPOW_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(MAINNET_DOGE_AUXPOW_ACTIVATION_HEIGHT)
 }
 
 /// Devnet/testnet override for the block-time V2 activation height.

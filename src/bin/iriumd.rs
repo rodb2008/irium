@@ -158,7 +158,8 @@ use irium_node_rs::ltc_spv::{
     LTC_HEADER_BYTES, MAX_LTC_HEADERS_PER_BATCH,
 };
 use irium_node_rs::doge_spv::{
-    encode_doge_header_batch, parse_doge_header_batch, DogeAnchor, DogeHeader,
+    encode_doge_header_batch, encode_doge_header_batch_with_auxpow,
+    parse_doge_header_batch, DogeAnchor, DogeHeader, ParsedDogeHeader,
     DOGE_HEADER_BYTES, MAX_DOGE_HEADERS_PER_BATCH,
 };
 use irium_node_rs::wallet_store::{WalletKey, WalletManager, WalletMode};
@@ -216,6 +217,12 @@ struct AppState {
     ltc_template_headers_cache: Arc<Mutex<Option<CachedHeaderBatchForTemplate>>>,
     /// v1.9.61: same as above for DOGE.
     doge_template_headers_cache: Arc<Mutex<Option<CachedHeaderBatchForTemplate>>>,
+    /// PR-6 of issue #68: parallel cache holding per-header iriumd-format
+    /// AuxPoW bytes (hex-encoded). Same length as the headers vec implied
+    /// by doge_template_headers_cache.headers_hex.len() / 80. Some(None)
+    /// for pre-371,337 / no-AuxPoW-bit headers; Some(Some(hex)) when the
+    /// peer returned AuxPoW data. Cleared whenever the headers cache is.
+    doge_template_auxpow_cache: Arc<Mutex<Option<Vec<Option<String>>>>>,
 }
 
 const DISPUTE_RESOLVER_RESPONSE_WINDOW: u64 = 288; // blocks
@@ -15881,7 +15888,32 @@ async fn get_block_template(
                                 }
                             }
                             if ok {
-                                if let Ok(script) = encode_doge_header_batch(&headers) {
+                                // PR-6 of issue #68: zip with parallel
+                                // AuxPoW cache and emit v0x02 batches so
+                                // post-371,337 headers carry the AuxPoW
+                                // data their PR-5 validator requires.
+                                let auxpow_cache = state
+                                    .doge_template_auxpow_cache
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone();
+                                let items: Vec<ParsedDogeHeader> = match auxpow_cache {
+                                    Some(ap_vec) if ap_vec.len() == headers.len() => headers
+                                        .into_iter()
+                                        .zip(ap_vec.into_iter())
+                                        .map(|(h, ap_hex_opt)| ParsedDogeHeader {
+                                            header: h,
+                                            auxpow: ap_hex_opt
+                                                .as_ref()
+                                                .and_then(|s| hex::decode(s).ok()),
+                                        })
+                                        .collect(),
+                                    _ => headers
+                                        .into_iter()
+                                        .map(|h| ParsedDogeHeader { header: h, auxpow: None })
+                                        .collect(),
+                                };
+                                if let Ok(script) = encode_doge_header_batch_with_auxpow(&items) {
                                     out.push(CoinbaseExtraOutput {
                                         value: 0,
                                         script_pubkey_hex: hex::encode(script),
@@ -17548,21 +17580,26 @@ async fn run_doge_header_sync_cycle(
                     .unwrap_or([0u8; 32])
             })
         };
-        let raw_headers = irium_node_rs::doge_p2p::fetch_headers(tip_hash)
-            .await
-            .map_err(|e| format!("p2p fetch: {e}"))?;
-        // v1.9.69: cap DOGE batch to 144 headers (~11.5 KB encoded) so
-        // the coinbase OP_RETURN does not bloat past what miners and
-        // submitblock validators tolerate. Without this cap a 2000-header
-        // peer response produced a 160 KB coinbase output and stalled
-        // local mining (workers disconnected on receiving the job).
-        let raw_headers: Vec<[u8; 80]> = raw_headers.into_iter().take(144).collect();
-        if raw_headers.is_empty() {
+        // PR-6 of issue #68: fetch headers AND per-header AuxPoW bytes
+        // (iriumd-format) so the mining template can emit v0x02 batches
+        // that pass PR-5's apply_doge_header_batch_with_auxpow validator.
+        let raw_items =
+            irium_node_rs::doge_p2p::fetch_doge_headers_with_auxpow(tip_hash)
+                .await
+                .map_err(|e| format!("p2p fetch: {e}"))?;
+        // v1.9.69: cap DOGE batch to 144 headers (same rationale — coinbase
+        // OP_RETURN must stay within what miners + submitblock tolerate).
+        let raw_items: Vec<([u8; 80], Option<Vec<u8>>)> =
+            raw_items.into_iter().take(144).collect();
+        if raw_items.is_empty() {
             header_sync_touch_last_file("doge");
             return Ok("p2p_up_to_date".to_string());
         }
-        let count = raw_headers.len();
-        let headers_hex: String = raw_headers.iter().map(hex::encode).collect();
+        let count = raw_items.len();
+        let headers_hex: String = raw_items.iter().map(|(h, _)| hex::encode(h)).collect();
+        let auxpow_hex_vec: Vec<Option<String>> =
+            raw_items.iter().map(|(_, ap)| ap.as_ref().map(hex::encode)).collect();
+        let auxpow_count = auxpow_hex_vec.iter().filter(|x| x.is_some()).count();
         let live_relay_tip = {
             let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
             chain.doge_tip_height
@@ -17578,9 +17615,16 @@ async fn run_doge_header_sync_cycle(
                 built_at: std::time::SystemTime::now(),
             });
         }
+        {
+            let mut ap_cache = state
+                .doge_template_auxpow_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *ap_cache = Some(auxpow_hex_vec);
+        }
         header_sync_touch_last_file("doge");
         return Ok(format!(
-            "p2p_cached_headers count={count} relay_tip={live_relay_tip}"
+            "p2p_cached_headers count={count} with_auxpow={auxpow_count} relay_tip={live_relay_tip}"
         ));
     }
 
@@ -18726,6 +18770,7 @@ async fn main() {
         btc_template_headers_cache: Arc::new(Mutex::new(None)),
         ltc_template_headers_cache: Arc::new(Mutex::new(None)),
         doge_template_headers_cache: Arc::new(Mutex::new(None)),
+        doge_template_auxpow_cache: Arc::new(Mutex::new(None)),
     };
 
     // Spawn the in-process header-sync background tasks. Each one no-ops
@@ -20106,6 +20151,7 @@ mod tests {
             btc_template_headers_cache: Arc::new(Mutex::new(None)),
             ltc_template_headers_cache: Arc::new(Mutex::new(None)),
             doge_template_headers_cache: Arc::new(Mutex::new(None)),
+        doge_template_auxpow_cache: Arc::new(Mutex::new(None)),
         };
 
         (state, sender, recipient, refund)
@@ -27450,6 +27496,7 @@ mod tests {
             btc_template_headers_cache: Arc::new(Mutex::new(None)),
             ltc_template_headers_cache: Arc::new(Mutex::new(None)),
             doge_template_headers_cache: Arc::new(Mutex::new(None)),
+        doge_template_auxpow_cache: Arc::new(Mutex::new(None)),
         }
     }
 

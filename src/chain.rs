@@ -23,7 +23,8 @@ use crate::ltc_spv::{
     MAX_LTC_HEADER_BATCH_BYTES,
 };
 use crate::doge_spv::{
-    apply_doge_header_batch, parse_doge_header_batch, undo_doge_relay_update, DigishieldParams,
+    apply_doge_header_batch, apply_doge_header_batch_with_auxpow, parse_doge_header_batch,
+    parse_doge_header_batch_with_auxpow, undo_doge_relay_update, DigishieldParams,
     DogeAnchor, DogeHeaderEntry, DogeRelayUpdate, DogeSpvParams, DOGE_HEADER_BATCH_TAG,
     MAX_DOGE_HEADER_BATCH_BYTES,
 };
@@ -1403,12 +1404,12 @@ impl ChainState {
                             "block contains more than one DogeHeaderBatch output".to_string(),
                         );
                     }
-                    let headers = parse_doge_header_batch(&output.script_pubkey)
+                    let parsed_items = parse_doge_header_batch_with_auxpow(&output.script_pubkey)
                         .map_err(|e| format!("DogeHeaderBatch apply parse failed: {}", e))?;
                     let anchor = self.doge_anchor();
                     let retarget = self.doge_retarget_params();
-                    let update = apply_doge_header_batch(
-                        headers,
+                    let update = apply_doge_header_batch_with_auxpow(
+                        parsed_items,
                         block.header.time,
                         &mut self.doge_headers,
                         &mut self.doge_heights,
@@ -1539,12 +1540,12 @@ impl ChainState {
                         "block contains both coinbase and regular-tx DogeHeaderBatch".to_string(),
                     );
                 }
-                let headers = parse_doge_header_batch(&output.script_pubkey)
+                let parsed_items = parse_doge_header_batch_with_auxpow(&output.script_pubkey)
                     .map_err(|e| format!("coinbase DogeHeaderBatch parse failed: {}", e))?;
                 let anchor = self.doge_anchor();
                 let retarget = self.doge_retarget_params();
-                let update = apply_doge_header_batch(
-                    headers,
+                let update = apply_doge_header_batch_with_auxpow(
+                    parsed_items,
                     block.header.time,
                     &mut self.doge_headers,
                     &mut self.doge_heights,
@@ -2073,7 +2074,7 @@ fn validate_output(
         if output.script_pubkey.len() > MAX_DOGE_HEADER_BATCH_BYTES {
             return Err("DogeHeaderBatch script_pubkey too large".to_string());
         }
-        parse_doge_header_batch(&output.script_pubkey)
+        parse_doge_header_batch_with_auxpow(&output.script_pubkey)
             .map_err(|e| format!("Malformed DogeHeaderBatch: {}", e))?;
         return Ok(());
     }

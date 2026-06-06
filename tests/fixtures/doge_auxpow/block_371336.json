@@ -1,0 +1,13 @@
+{
+  "height": 371336,
+  "hash": "46a8b109fb016fa41abd17a19186ca78d39c60c020c71fcd2690320d47036f0d",
+  "previousblockhash": "8ad58fc406423207bdd82bed27c0c9a22f8241e3d3e8595191decb55a50b20c7",
+  "version": 6422530,
+  "version_hex": "0x00620002",
+  "merkleroot": "a0503bb44fd98e79239cc8f7b896a81b9a5fb1deb74e165173d7a530db34d877",
+  "time": 1410464569,
+  "bits": "1b2fdf75",
+  "nonce": 3401887720,
+  "has_auxpow": false,
+  "note": "Last pre-AuxPoW DOGE block. Standalone Scrypt PoW. AuxPoW bit 0x100 NOT set in version."
+}

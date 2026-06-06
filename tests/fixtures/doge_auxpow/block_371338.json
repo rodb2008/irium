@@ -1,0 +1,18 @@
+{
+  "height": 371338,
+  "hash": "6fb5ae70a65902381bcaa63a38cadf36e8c0a9b4cbffa85bc545c1be08cd0721",
+  "previousblockhash": "60323982f9c5ff1b5a954eac9dc1269352835f47c2c5222691d80f0d50dcf053",
+  "version": 6422786,
+  "version_hex": "0x00620102",
+  "time": 1410464609,
+  "bits": "1b30d490",
+  "nonce": 0,
+  "has_auxpow": true,
+  "auxpow": {
+    "parent_header_hex": "02000000d2ec7dfeb7e8f43fe77aba3368df95ac2088034420402730ee0492a208421708f6d32f6e7eb2941bcdcd47740f7c67a7b1930014b771a18809a86898a506250f60fb11548b54021be017686d",
+    "parent_prev_hash": "d2ec7dfeb7e8f43fe77aba3368df95ac2088034420402730ee0492a208421708",
+    "parent_time": 1410464582,
+    "parent_bits": "1b02548b"
+  },
+  "note": "Second AuxPoW DOGE block. Different LTC parent than 371337 (different merkle_root/nonce). Same LTC prev_hash confirms sibling LTC blocks. Validator must NOT cache parent across DOGE blocks."
+}

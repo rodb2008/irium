@@ -1,0 +1,35 @@
+{
+  "height": 371337,
+  "hash": "60323982f9c5ff1b5a954eac9dc1269352835f47c2c5222691d80f0d50dcf053",
+  "previousblockhash": "46a8b109fb016fa41abd17a19186ca78d39c60c020c71fcd2690320d47036f0d",
+  "version": 6422786,
+  "version_hex": "0x00620102",
+  "merkleroot": "ee27b8fb782a5bfb99c975f0d4686440b9af9e16846603e5f2830e0b6fbf158a",
+  "time": 1410464577,
+  "bits": "1b364184",
+  "nonce": 0,
+  "has_auxpow": true,
+  "auxpow": {
+    "coinbase_tx_hex": "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff380345bf09fabe6d6d980ba42120410de0554d42a5b5ee58167bcd86bf7591f429005f24da45fb51cf0800000000000000cdb1f1ff0e000000ffffffff01800c0c2a010000001976a914aa3750aa18b8a0f3f0590731e1fab934856680cf88ac00000000",
+    "parent_header_hex": "02000000d2ec7dfeb7e8f43fe77aba3368df95ac2088034420402730ee0492a2084217083411b3fc91033bfdeea339bc11b9efc986e161c703e07a9045338c165673f09940fb11548b54021b58cc9ae5",
+    "coinbase_branch": [
+      "cd3947cd5a0c26fde01b05a3aa3d7a38717be6ae11d27239365024db36a679a9",
+      "48f9e8fef3411944e27f49ec804462c9e124dca0954c71c8560e8a9dd218a452",
+      "d11293660392e7c51f69477a6130237c72ecee2d0c1d3dc815841734c370331a"
+    ],
+    "coinbase_branch_index": 0,
+    "chain_branch": [
+      "b541c848bc001d07d2bdf8643abab61d2c6ae50d5b2495815339a4b30703a46f",
+      "78d6abe48cee514cf3496f4042039acb7e27616dcfc5de926ff0d6c7e5987be7",
+      "a0469413ce64d67c43902d54ee3a380eff12ded22ca11cbd3842e15d48298103"
+    ],
+    "chain_branch_index": 0,
+    "parent_version": 2,
+    "parent_prev_hash": "d2ec7dfeb7e8f43fe77aba3368df95ac2088034420402730ee0492a208421708",
+    "parent_merkle_root": "3411b3fc91033bfdeea339bc11b9efc986e161c703e07a9045338c165673f099",
+    "parent_time": 1410464576,
+    "parent_bits": "1b02548b",
+    "parent_nonce": 3852368984
+  },
+  "note": "First AuxPoW DOGE block. AuxPoW bit 0x100 set. LTC parent does Scrypt PoW. Chain count=8 in coinbase commitment."
+}

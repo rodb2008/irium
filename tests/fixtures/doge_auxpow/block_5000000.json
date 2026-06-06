@@ -1,0 +1,17 @@
+{
+  "height": 5000000,
+  "hash": "5ae6eadfe5fd98fa7f388b671c4863db4b62e46eecc054465a276d419500e469",
+  "version": 6422788,
+  "version_hex": "0x00620104",
+  "time": 1702188235,
+  "bits": "1a010be6",
+  "nonce": 0,
+  "has_auxpow": true,
+  "auxpow": {
+    "parent_header_hex": "00000020bfe9ea9267ca035645d478c0873acd7c7eb739441fc0dc29612698880c3f315f7646e8126d5c42c5447987a441ffa3ac2548bbd3077af749cf8e65a22b880b58c75475651696001a56d90b1e",
+    "parent_version_hex": "0x20000000",
+    "coinbase_branch_count": 9,
+    "chain_branch_count": 6
+  },
+  "note": "Modern-era AuxPoW (2023-12-10). BIP9 parent version 0x20000000. Higher difficulty (0x1a010be6 vs 0x1b36 at genesis-AuxPoW). Longer merkle branches. Validator must not hardcode parent version or branch count."
+}

@@ -78,6 +78,27 @@ use crate::activation::MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT;
 /// `0xc7` (HtlcLtcSwapV1), and `0xc8` (LtcSwapOrder).
 pub const DOGE_HEADER_BATCH_TAG: u8 = 0xc9;
 pub const DOGE_HEADER_BATCH_VERSION: u8 = 0x01;
+/// PR-4 of issue #68: v0x02 batches carry optional per-header AuxPoW
+/// bytes. The chain consensus path (`parse_doge_header_batch`) still
+/// rejects v0x02 via its "unknown version" check — activation in
+/// iriumd blocks is gated by a future chain.rs PR. The format is
+/// available today via `parse_doge_header_batch_with_auxpow` for
+/// tooling and the post-activation chain code that will land later.
+pub const DOGE_HEADER_BATCH_VERSION_V2: u8 = 0x02;
+/// Per-header AuxPoW byte cap. Real AuxPoW is ~300-500 bytes (parent
+/// header 80 + coinbase ~200 + 2 merkle branches of ~9 hashes × 32
+/// bytes). 10 KB is well above any historical or projected value;
+/// the cap exists to prevent memory-exhaustion via malicious batches.
+pub const MAX_DOGE_AUXPOW_BYTES: usize = 10_000;
+/// Upper bound on the v0x02 batch payload size, derived from the
+/// 144-headers-per-batch cap × (80 header + 1 flag + 3 varint + 10 KB
+/// auxpow). ~1.5 MB worst case. iriumd MAX_BLOCK_SIZE is 4 MB (per
+/// `src/protocol.rs:9`), so a v0x02 batch fits comfortably inside a
+/// single block. Typical real-world batches are ~70 KB (~500 B
+/// AuxPoW × 144 headers).
+pub const MAX_DOGE_HEADER_BATCH_V2_BYTES: usize =
+    4 + (DOGE_HEADER_BYTES + 1 + 3 + MAX_DOGE_AUXPOW_BYTES)
+        * (MAX_DOGE_HEADERS_PER_BATCH as usize);
 pub const DOGE_HEADER_BYTES: usize = 80;
 
 /// Regtest proof-of-work limit (`bnProofOfWorkLimit` in dogecoind/regtest).
@@ -230,6 +251,29 @@ impl DogeHeader {
     pub fn meets_pow(&self) -> bool {
         meets_target_ltc(&self.serialize(), Target { bits: self.bits })
     }
+
+    /// PR-5 of issue #68: validate this header's AuxPoW via the LTC
+    /// parent's Scrypt PoW and the merge-mining merkle proofs.
+    ///
+    /// Returns true iff `auxpow::validate_with_parent_hash` accepts
+    /// the AuxPoW with the LTC Scrypt parent-PoW closure against this
+    /// DOGE block's target (derived from `self.bits`).
+    ///
+    /// Used by `apply_doge_header_batch_with_auxpow` for headers at
+    /// DOGE height ≥ 371,337 with the AuxPoW bit (0x100) set in the
+    /// version field. Pre-AuxPoW headers and headers without the bit
+    /// continue to use `meets_pow` (standalone Scrypt).
+    pub fn meets_pow_auxpow(&self, auxpow: &crate::auxpow::AuxPoW) -> bool {
+        let aux_header = self.serialize();
+        let target = Target { bits: self.bits };
+        crate::auxpow::validate_with_parent_hash(
+            auxpow,
+            &aux_header,
+            target,
+            |parent_header| meets_target_ltc(parent_header, target),
+        )
+        .is_ok()
+    }
 }
 
 /// One stored Dogecoin header plus its derived chain metadata.
@@ -238,6 +282,19 @@ pub struct DogeHeaderEntry {
     pub header: DogeHeader,
     pub height: u64,
     pub total_work: BigUint,
+}
+
+/// PR-4 of issue #68: a DOGE header paired with optional raw AuxPoW
+/// bytes. Returned by `parse_doge_header_batch_with_auxpow` when
+/// parsing v0x02 batches. The bytes are deliberately not deserialized
+/// at parse time — the AuxPoW validator (later PR) consumes them via
+/// `auxpow::deserialize`. Using `Option<Vec<u8>>` instead of an empty
+/// `Vec` makes the "no auxpow attached" case explicit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // wired into doge mining / post-activation chain code in later PRs
+pub struct ParsedDogeHeader {
+    pub header: DogeHeader,
+    pub auxpow: Option<Vec<u8>>,
 }
 
 /// The first Dogecoin header known to this iriumd relay. No header
@@ -416,6 +473,244 @@ pub fn encode_doge_header_batch(headers: &[DogeHeader]) -> Result<Vec<u8>, Strin
         out.extend_from_slice(&h.serialize());
     }
     Ok(out)
+}
+
+// ====================================================================
+// PR-4 of issue #68 — v0x02 wire format with optional per-header AuxPoW
+// ====================================================================
+//
+// Per-batch:
+//   [1 byte: tag = 0xc9]
+//   [1 byte: version = 0x02]
+//   [2 bytes LE: count]
+//   [per-header payload * count]
+//
+// Per-header payload:
+//   [80 bytes: DOGE header]
+//   [1 byte: has_auxpow flag (0x00 or 0x01)]
+//   If has_auxpow == 0x01:
+//     [varint: auxpow_len]
+//     [auxpow_len bytes: serialized AuxPoW (see auxpow::serialize)]
+//
+// The legacy v0x01 parser (`parse_doge_header_batch`) is the
+// consensus path used by chain.rs/mempool.rs. It rejects v0x02 via
+// its existing "unknown version" check — activation in iriumd blocks
+// lands in a future PR. The new
+// `parse_doge_header_batch_with_auxpow` is format-tolerant (accepts
+// both v0x01 and v0x02) and is for tooling + post-activation chain
+// code. The new `encode_doge_header_batch_with_auxpow` emits v0x02.
+
+/// Parse a `DogeHeaderBatch` script accepting both v0x01 and v0x02.
+/// Preserves any per-header AuxPoW bytes (None for v0x01 entries).
+///
+/// **NOT** called from the chain consensus path — see
+/// `parse_doge_header_batch` for that. This function is the
+/// format-tolerant variant for tooling and the post-activation chain
+/// code that will land in a later PR.
+#[allow(dead_code)] // wired into doge mining / post-activation chain code in later PRs
+pub fn parse_doge_header_batch_with_auxpow(
+    script: &[u8],
+) -> Result<Vec<ParsedDogeHeader>, String> {
+    if script.len() < 4 {
+        return Err("doge header batch: script too short".to_string());
+    }
+    if script[0] != DOGE_HEADER_BATCH_TAG {
+        return Err("doge header batch: wrong tag".to_string());
+    }
+    let version = script[1];
+    let count = u16::from_le_bytes([script[2], script[3]]) as usize;
+    if count == 0 || count > MAX_DOGE_HEADERS_PER_BATCH as usize {
+        return Err(format!("doge header batch: count {} out of range", count));
+    }
+    match version {
+        DOGE_HEADER_BATCH_VERSION => {
+            // v0x01: fixed 80 bytes per header, no auxpow.
+            let expected = 4 + DOGE_HEADER_BYTES * count;
+            if script.len() != expected {
+                return Err(format!(
+                    "doge header batch v1: wrong size (got {}, expected {})",
+                    script.len(),
+                    expected
+                ));
+            }
+            let mut out = Vec::with_capacity(count);
+            for i in 0..count {
+                let start = 4 + i * DOGE_HEADER_BYTES;
+                let h = DogeHeader::deserialize(&script[start..start + DOGE_HEADER_BYTES])?;
+                out.push(ParsedDogeHeader { header: h, auxpow: None });
+            }
+            Ok(out)
+        }
+        DOGE_HEADER_BATCH_VERSION_V2 => {
+            // v0x02: variable size per header (80 + flag + optional
+            // varint + auxpow bytes).
+            if script.len() > MAX_DOGE_HEADER_BATCH_V2_BYTES {
+                return Err(format!(
+                    "doge header batch v2: total size {} exceeds cap {}",
+                    script.len(),
+                    MAX_DOGE_HEADER_BATCH_V2_BYTES
+                ));
+            }
+            let mut out = Vec::with_capacity(count);
+            let mut off = 4usize;
+            for i in 0..count {
+                if off + DOGE_HEADER_BYTES + 1 > script.len() {
+                    return Err(format!(
+                        "doge header batch v2: truncated at header {}",
+                        i
+                    ));
+                }
+                let h = DogeHeader::deserialize(&script[off..off + DOGE_HEADER_BYTES])?;
+                off += DOGE_HEADER_BYTES;
+                let flag = script[off];
+                off += 1;
+                let auxpow = match flag {
+                    0x00 => None,
+                    0x01 => {
+                        let auxpow_len = read_varint_doge(script, &mut off)?;
+                        if auxpow_len > MAX_DOGE_AUXPOW_BYTES {
+                            return Err(format!(
+                                "doge header batch v2 header {}: auxpow_len {} exceeds cap {}",
+                                i, auxpow_len, MAX_DOGE_AUXPOW_BYTES
+                            ));
+                        }
+                        if off + auxpow_len > script.len() {
+                            return Err(format!(
+                                "doge header batch v2 header {}: auxpow truncated",
+                                i
+                            ));
+                        }
+                        let bytes = script[off..off + auxpow_len].to_vec();
+                        off += auxpow_len;
+                        Some(bytes)
+                    }
+                    other => {
+                        return Err(format!(
+                            "doge header batch v2 header {}: invalid has_auxpow flag 0x{:02x}",
+                            i, other
+                        ));
+                    }
+                };
+                out.push(ParsedDogeHeader { header: h, auxpow });
+            }
+            if off != script.len() {
+                return Err(format!(
+                    "doge header batch v2: trailing {} bytes after last header",
+                    script.len() - off
+                ));
+            }
+            Ok(out)
+        }
+        v => Err(format!("doge header batch: unknown version 0x{:02x}", v)),
+    }
+}
+
+/// Encode a v0x02 `DogeHeaderBatch` script with optional per-header
+/// AuxPoW bytes. Used by future tooling / mining code (gated by
+/// activation in a later PR). Pre-activation callers should continue
+/// using `encode_doge_header_batch` (v0x01).
+pub fn encode_doge_header_batch_with_auxpow(
+    items: &[ParsedDogeHeader],
+) -> Result<Vec<u8>, String> {
+    if items.is_empty() {
+        return Err("doge header batch v2: empty".to_string());
+    }
+    if items.len() > MAX_DOGE_HEADERS_PER_BATCH as usize {
+        return Err(format!(
+            "doge header batch v2: {} headers exceeds max {}",
+            items.len(),
+            MAX_DOGE_HEADERS_PER_BATCH
+        ));
+    }
+    let count = items.len() as u16;
+    let mut out = Vec::with_capacity(4 + (DOGE_HEADER_BYTES + 1) * items.len());
+    out.push(DOGE_HEADER_BATCH_TAG);
+    out.push(DOGE_HEADER_BATCH_VERSION_V2);
+    out.extend_from_slice(&count.to_le_bytes());
+    for item in items {
+        out.extend_from_slice(&item.header.serialize());
+        match &item.auxpow {
+            None => out.push(0x00),
+            Some(bytes) => {
+                if bytes.len() > MAX_DOGE_AUXPOW_BYTES {
+                    return Err(format!(
+                        "doge header batch v2: auxpow {} bytes exceeds cap {}",
+                        bytes.len(),
+                        MAX_DOGE_AUXPOW_BYTES
+                    ));
+                }
+                out.push(0x01);
+                write_varint_doge(&mut out, bytes.len());
+                out.extend_from_slice(bytes);
+            }
+        }
+    }
+    if out.len() > MAX_DOGE_HEADER_BATCH_V2_BYTES {
+        return Err(format!(
+            "doge header batch v2: total {} bytes exceeds cap {}",
+            out.len(),
+            MAX_DOGE_HEADER_BATCH_V2_BYTES
+        ));
+    }
+    Ok(out)
+}
+
+/// Private varint reader for v0x02 batch parsing. Bitcoin CompactSize
+/// (1, 3, 5, or 9 bytes). Kept private to doge_spv.rs to avoid
+/// surfacing a duplicate of auxpow::read_varint as a pub API.
+fn read_varint_doge(data: &[u8], off: &mut usize) -> Result<usize, String> {
+    if *off >= data.len() {
+        return Err("varint: EOF".to_string());
+    }
+    let first = data[*off];
+    *off += 1;
+    match first {
+        0xff => {
+            if *off + 8 > data.len() {
+                return Err("varint: EOF (8b)".to_string());
+            }
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&data[*off..*off + 8]);
+            *off += 8;
+            Ok(u64::from_le_bytes(b) as usize)
+        }
+        0xfe => {
+            if *off + 4 > data.len() {
+                return Err("varint: EOF (4b)".to_string());
+            }
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&data[*off..*off + 4]);
+            *off += 4;
+            Ok(u32::from_le_bytes(b) as usize)
+        }
+        0xfd => {
+            if *off + 2 > data.len() {
+                return Err("varint: EOF (2b)".to_string());
+            }
+            let mut b = [0u8; 2];
+            b.copy_from_slice(&data[*off..*off + 2]);
+            *off += 2;
+            Ok(u16::from_le_bytes(b) as usize)
+        }
+        n => Ok(n as usize),
+    }
+}
+
+/// Private varint writer for v0x02 batch serialization. Mirror of
+/// `read_varint_doge`.
+fn write_varint_doge(out: &mut Vec<u8>, n: usize) {
+    if n < 0xfd {
+        out.push(n as u8);
+    } else if n <= 0xffff {
+        out.push(0xfd);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if n <= 0xffff_ffff {
+        out.push(0xfe);
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+    } else {
+        out.push(0xff);
+        out.extend_from_slice(&(n as u64).to_le_bytes());
+    }
 }
 
 pub fn parse_doge_header_batch(script: &[u8]) -> Result<Vec<DogeHeader>, String> {
@@ -663,8 +958,28 @@ fn expected_bits_for_v(
 /// cumulative work strictly exceeds the prior tip's cumulative work.
 /// Lower-work batches are still recorded so they can become canonical
 /// later if extended.
-pub fn apply_doge_header_batch(
-    headers: Vec<DogeHeader>,
+/// PR-5 of issue #68: apply a batch of DOGE headers, each optionally
+/// carrying AuxPoW data. Post-371,337 DOGE headers with the AuxPoW
+/// version bit (0x100) set must carry AuxPoW bytes and are validated
+/// via the parent LTC Scrypt PoW + merge-mining merkle proofs. All
+/// other headers (pre-activation or post-activation without the bit)
+/// fall back to standalone Scrypt (`meets_pow`) — some pools continue
+/// emitting legacy-style headers after the boundary; DOGE Core accepts
+/// these the same way.
+///
+/// The DOGE AuxPoW activation height (371,337) comes from
+/// `crate::activation::doge_auxpow_activation_height()`, which honors
+/// the `IRIUM_DOGE_AUXPOW_HEIGHT` env override on devnet/testnet
+/// (mainnet is fixed).
+///
+/// NOTE: this function does NOT use the parallel PoW pre-check from
+/// the legacy `apply_doge_header_batch` because per-header validator
+/// dispatch depends on the DOGE height assigned during sequential
+/// chain linkage. A later optimization can split into two passes
+/// (linkage first to assign heights, then par_iter for PoW) if the
+/// performance regression matters.
+pub fn apply_doge_header_batch_with_auxpow(
+    items: Vec<ParsedDogeHeader>,
     iriumd_block_time: u32,
     doge_headers: &mut HashMap<[u8; 32], DogeHeaderEntry>,
     doge_heights: &mut HashMap<[u8; 32], u64>,
@@ -673,13 +988,13 @@ pub fn apply_doge_header_batch(
     anchor: &DogeAnchor,
     retarget: &DigishieldParams,
 ) -> Result<DogeRelayUpdate, String> {
-    if headers.is_empty() {
+    if items.is_empty() {
         return Err("apply_doge_header_batch: empty batch".to_string());
     }
-    if headers.len() > MAX_DOGE_HEADERS_PER_BATCH as usize {
+    if items.len() > MAX_DOGE_HEADERS_PER_BATCH as usize {
         return Err(format!(
             "apply_doge_header_batch: {} headers exceeds max {}",
-            headers.len(),
+            items.len(),
             MAX_DOGE_HEADERS_PER_BATCH
         ));
     }
@@ -687,25 +1002,7 @@ pub fn apply_doge_header_batch(
         return Err("apply_doge_header_batch: anchor not configured".to_string());
     }
 
-    // Parallel PoW pre-check. scrypt costs ~10 ms / header; running them
-    // sequentially for a full batch is >1 s wall-clock. par_iter fans
-    // the work across the rayon thread pool. We collect indices of any
-    // failures and report the lowest one, matching the sequential
-    // caller contract on the BTC and LTC sides.
-    let mut pow_failures: Vec<usize> = headers
-        .par_iter()
-        .enumerate()
-        .filter_map(|(i, h)| if h.meets_pow() { None } else { Some(i) })
-        .collect();
-    if !pow_failures.is_empty() {
-        pow_failures.sort_unstable();
-        return Err(format!(
-            "apply_doge_header_batch: header {} fails PoW",
-            pow_failures[0]
-        ));
-    }
-
-    let first = &headers[0];
+    let first = &items[0].header;
     let (start_prev_height, start_prev_work) = if first.prev_hash == anchor.hash {
         (anchor.height, work_for_bits(anchor.bits))
     } else {
@@ -715,12 +1012,14 @@ pub fn apply_doge_header_batch(
         (parent.height, parent.total_work.clone())
     };
 
+    let auxpow_activation = crate::activation::doge_auxpow_activation_height();
     let mut prev_hash = first.prev_hash;
     let mut prev_height = start_prev_height;
     let mut prev_work = start_prev_work;
-    let mut staged: Vec<([u8; 32], DogeHeaderEntry)> = Vec::with_capacity(headers.len());
+    let mut staged: Vec<([u8; 32], DogeHeaderEntry)> = Vec::with_capacity(items.len());
 
-    for (i, header) in headers.iter().enumerate() {
+    for (i, parsed) in items.iter().enumerate() {
+        let header = &parsed.header;
         if header.prev_hash != prev_hash {
             return Err(format!(
                 "apply_doge_header_batch: header {} does not link to previous",
@@ -728,8 +1027,45 @@ pub fn apply_doge_header_batch(
             ));
         }
         let height = prev_height + 1;
-        let hash = header.block_hash();
 
+        // PR-5: per-header PoW dispatch by DOGE height + AuxPoW bit.
+        let auxpow_active_at_this_height = height >= auxpow_activation;
+        let has_auxpow_bit =
+            (header.version as u32) & crate::auxpow::AUXPOW_VERSION_BIT != 0;
+        let pow_ok = if auxpow_active_at_this_height && has_auxpow_bit {
+            let bytes = parsed.auxpow.as_ref().ok_or_else(|| {
+                format!(
+                    "apply_doge_header_batch: header {} at DOGE height {} has AuxPoW bit set but no AuxPoW data attached",
+                    i, height
+                )
+            })?;
+            let mut off = 0;
+            let auxpow = crate::auxpow::deserialize(bytes, &mut off).map_err(|e| {
+                format!(
+                    "apply_doge_header_batch: header {} auxpow parse: {}",
+                    i, e
+                )
+            })?;
+            if off != bytes.len() {
+                return Err(format!(
+                    "apply_doge_header_batch: header {} auxpow has {} trailing bytes",
+                    i,
+                    bytes.len() - off
+                ));
+            }
+            header.meets_pow_auxpow(&auxpow)
+        } else {
+            // Pre-activation OR post-activation without AuxPoW bit.
+            header.meets_pow()
+        };
+        if !pow_ok {
+            return Err(format!(
+                "apply_doge_header_batch: header {} fails PoW",
+                i
+            ));
+        }
+
+        let hash = header.block_hash();
         if doge_headers.contains_key(&hash) {
             return Err(format!(
                 "apply_doge_header_batch: header {} already known in chain state",
@@ -761,7 +1097,6 @@ pub fn apply_doge_header_batch(
                 i, expected_bits, header.bits
             ));
         }
-
         if header.time <= mtp {
             return Err(format!(
                 "apply_doge_header_batch: header {} time {} not above MTP {}",
@@ -821,6 +1156,41 @@ pub fn apply_doge_header_batch(
         tip_height_before,
         headers_added,
     })
+}
+
+/// PR-5 of issue #68: legacy entry point for tests / callers that
+/// don't construct `ParsedDogeHeader` themselves. Wraps each `DogeHeader`
+/// as `ParsedDogeHeader { header, auxpow: None }` and delegates to
+/// `apply_doge_header_batch_with_auxpow`. Behavior is identical to the
+/// pre-PR-5 implementation for pre-371,337 DOGE headers (standalone
+/// Scrypt). Post-371,337 headers with the AuxPoW bit set would fail
+/// the "has AuxPoW bit set but no AuxPoW data attached" error here —
+/// callers wanting AuxPoW validation must use the new function
+/// directly.
+pub fn apply_doge_header_batch(
+    headers: Vec<DogeHeader>,
+    iriumd_block_time: u32,
+    doge_headers: &mut HashMap<[u8; 32], DogeHeaderEntry>,
+    doge_heights: &mut HashMap<[u8; 32], u64>,
+    doge_tip: &mut Option<[u8; 32]>,
+    doge_tip_height: &mut u64,
+    anchor: &DogeAnchor,
+    retarget: &DigishieldParams,
+) -> Result<DogeRelayUpdate, String> {
+    let items: Vec<ParsedDogeHeader> = headers
+        .into_iter()
+        .map(|h| ParsedDogeHeader { header: h, auxpow: None })
+        .collect();
+    apply_doge_header_batch_with_auxpow(
+        items,
+        iriumd_block_time,
+        doge_headers,
+        doge_heights,
+        doge_tip,
+        doge_tip_height,
+        anchor,
+        retarget,
+    )
 }
 
 /// Reverse a previously-applied `DogeRelayUpdate`. Removes inserted
@@ -1328,5 +1698,365 @@ mod tests {
             &DigishieldParams::DOGECOIN,
         );
         assert!(res.is_err());
+    }
+
+    // ====================================================================
+    // PR-4 of issue #68 — v0x02 wire format tests
+    // ====================================================================
+    // Real-mainnet-fixture-based test deferred to PR-5 (where the AuxPoW
+    // validator wiring lands); these 6 tests cover the format-level
+    // round-trip + rejection paths synthetically.
+
+    #[test]
+    fn pr4_parse_v01_still_works_after_dispatcher_added() {
+        // Regression: existing v0x01 batches must still parse via the
+        // chain-consensus path (parse_doge_header_batch, v0x01-only).
+        let h1 = DogeHeader {
+            version: 1, prev_hash: [0u8; 32], merkle_root: [1u8; 32],
+            time: 100, bits: 0x1d00ffff, nonce: 0,
+        };
+        let batch = encode_doge_header_batch(&[h1.clone()]).unwrap();
+        let parsed = parse_doge_header_batch(&batch).unwrap();
+        assert_eq!(parsed, vec![h1]);
+    }
+
+    #[test]
+    fn pr4_parse_v01_via_with_auxpow_returns_none_per_header() {
+        // v0x01 batches parsed through the v0x02-capable function yield
+        // None for the auxpow field on every header.
+        let h = DogeHeader {
+            version: 1, prev_hash: [0u8; 32], merkle_root: [2u8; 32],
+            time: 200, bits: 0x1d00ffff, nonce: 0,
+        };
+        let batch = encode_doge_header_batch(&[h.clone()]).unwrap();
+        let parsed = parse_doge_header_batch_with_auxpow(&batch).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].header, h);
+        assert_eq!(parsed[0].auxpow, None);
+    }
+
+    #[test]
+    fn pr4_parse_v02_rejected_by_consensus_path() {
+        // SAFETY: parse_doge_header_batch (used by chain.rs) must
+        // reject v0x02 batches. Without an activation gate in chain.rs,
+        // accepting them would let a malicious miner pre-activate
+        // AuxPoW behavior. Issue #68 PR-4 keeps this gate.
+        let h = DogeHeader {
+            version: 1, prev_hash: [0u8; 32], merkle_root: [3u8; 32],
+            time: 300, bits: 0x1d00ffff, nonce: 0,
+        };
+        let batch = encode_doge_header_batch_with_auxpow(&[
+            ParsedDogeHeader { header: h, auxpow: None },
+        ]).unwrap();
+        assert_eq!(batch[1], DOGE_HEADER_BATCH_VERSION_V2);
+        let err = parse_doge_header_batch(&batch).unwrap_err();
+        assert!(
+            err.contains("unknown version"),
+            "expected 'unknown version' rejection, got: {}", err,
+        );
+    }
+
+    #[test]
+    fn pr4_parse_v02_round_trip_no_auxpow() {
+        // Encode v0x02 with all headers flagged has_auxpow=0; verify
+        // round-trip via the v0x02-capable parser.
+        let h1 = DogeHeader {
+            version: 1, prev_hash: [0u8; 32], merkle_root: [4u8; 32],
+            time: 400, bits: 0x1d00ffff, nonce: 0,
+        };
+        let h2 = DogeHeader {
+            version: 1, prev_hash: h1.block_hash(), merkle_root: [5u8; 32],
+            time: 410, bits: 0x1d00ffff, nonce: 0,
+        };
+        let items = vec![
+            ParsedDogeHeader { header: h1, auxpow: None },
+            ParsedDogeHeader { header: h2, auxpow: None },
+        ];
+        let bytes = encode_doge_header_batch_with_auxpow(&items).unwrap();
+        let parsed = parse_doge_header_batch_with_auxpow(&bytes).unwrap();
+        assert_eq!(parsed, items);
+    }
+
+    #[test]
+    fn pr4_parse_v02_round_trip_with_auxpow() {
+        // Round-trip a v0x02 batch where headers carry synthetic
+        // (non-empty) auxpow bytes. Verifies the varint length encoding
+        // and reading works for typical sizes.
+        let h = DogeHeader {
+            version: 0x00620102_u32 as i32, prev_hash: [0u8; 32],
+            merkle_root: [6u8; 32], time: 500, bits: 0x1d00ffff, nonce: 0,
+        };
+        let auxpow_bytes: Vec<u8> = (0..512u16).map(|i| (i & 0xff) as u8).collect();
+        let items = vec![
+            ParsedDogeHeader { header: h.clone(), auxpow: Some(auxpow_bytes.clone()) },
+        ];
+        let bytes = encode_doge_header_batch_with_auxpow(&items).unwrap();
+        assert_eq!(bytes[1], DOGE_HEADER_BATCH_VERSION_V2);
+        let parsed = parse_doge_header_batch_with_auxpow(&bytes).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].header, h);
+        assert_eq!(parsed[0].auxpow.as_deref(), Some(auxpow_bytes.as_slice()));
+    }
+
+    #[test]
+    fn pr4_parse_v02_rejects_unknown_flag() {
+        // The has_auxpow flag byte must be 0x00 or 0x01. Anything else
+        // is rejected, preventing malformed batches from sneaking past.
+        let mut batch = Vec::new();
+        batch.push(DOGE_HEADER_BATCH_TAG);
+        batch.push(DOGE_HEADER_BATCH_VERSION_V2);
+        batch.extend_from_slice(&1u16.to_le_bytes());
+        batch.extend_from_slice(&[0u8; DOGE_HEADER_BYTES]);
+        batch.push(0x42); // invalid flag
+        let err = parse_doge_header_batch_with_auxpow(&batch).unwrap_err();
+        assert!(
+            err.contains("invalid has_auxpow flag"),
+            "expected 'invalid has_auxpow flag' error, got: {}", err,
+        );
+    }
+
+    #[test]
+    fn pr4_parse_v02_rejects_oversized_auxpow() {
+        // auxpow_len > MAX_DOGE_AUXPOW_BYTES must be rejected at the
+        // length-prefix step BEFORE allocating / consuming the bytes.
+        // Defense against memory-exhaustion attacks via malformed
+        // batches.
+        let mut batch = Vec::new();
+        batch.push(DOGE_HEADER_BATCH_TAG);
+        batch.push(DOGE_HEADER_BATCH_VERSION_V2);
+        batch.extend_from_slice(&1u16.to_le_bytes());
+        batch.extend_from_slice(&[0u8; DOGE_HEADER_BYTES]);
+        batch.push(0x01); // has_auxpow
+        // 4-byte varint header (0xfe) + a length larger than the cap
+        batch.push(0xfe);
+        batch.extend_from_slice(&(MAX_DOGE_AUXPOW_BYTES as u32 + 1).to_le_bytes());
+        let err = parse_doge_header_batch_with_auxpow(&batch).unwrap_err();
+        assert!(
+            err.contains("exceeds cap"),
+            "expected 'exceeds cap' error, got: {}", err,
+        );
+    }
+
+    // ====================================================================
+    // PR-5 of issue #68 — AuxPoW validator wiring tests
+    // ====================================================================
+
+    /// Pre-activation DOGE headers (DOGE height < 371,337) in a v0x02
+    /// batch with `auxpow: None` must use the standalone Scrypt path
+    /// via the legacy wrapper. This is the most common path for
+    /// historical batches.
+    #[test]
+    fn pr5_apply_pre_activation_path_uses_standalone_scrypt() {
+        // Use the legacy wrapper, which delegates to
+        // apply_doge_header_batch_with_auxpow with auxpow: None for
+        // every header. Any header that doesn't pass standalone Scrypt
+        // (which is true for synthetic headers) should produce the
+        // "fails PoW" error — proving the standalone-Scrypt path is
+        // exercised even via the new function.
+        let (anchor, anchor_header) = fresh_anchor();
+        let synthetic = DogeHeader {
+            version: 1, // No AuxPoW bit
+            prev_hash: anchor.hash,
+            merkle_root: [0u8; 32],
+            time: anchor_header.time + 60,
+            bits: anchor.bits,
+            nonce: 0,
+        };
+        let mut headers_db = HashMap::new();
+        let mut heights_db = HashMap::new();
+        let mut tip = None;
+        let mut tip_height = 0;
+        let res = apply_doge_header_batch(
+            vec![synthetic],
+            anchor_header.time + 120,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &DigishieldParams::DOGECOIN,
+        );
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("fails PoW") || err.contains("bits mismatch") || err.contains("MTP"),
+            "expected standalone-Scrypt path error, got: {}", err,
+        );
+    }
+
+    /// Post-activation DOGE header with the AuxPoW bit set but no
+    /// AuxPoW data attached must error with the specific "has AuxPoW
+    /// bit set but no AuxPoW data" message. This proves the
+    /// per-header dispatch is reading version & 0x100 correctly.
+    #[test]
+    fn pr5_apply_post_activation_auxpow_bit_requires_auxpow_data() {
+        // Set up an anchor at DOGE height 371_336 so the next header
+        // is at 371_337 (the AuxPoW activation boundary).
+        let anchor = DogeAnchor {
+            hash: [0xaau8; 32],
+            height: 371_336,
+            bits: 0x1d00ffff,
+            time: 1_410_464_500,
+            prev_time: 1_410_464_440,
+        };
+        let header_at_371_337 = DogeHeader {
+            // 0x100 bit set → AuxPoW required at this height
+            version: 0x00010102_i32,
+            prev_hash: anchor.hash,
+            merkle_root: [0u8; 32],
+            time: anchor.time + 60,
+            bits: anchor.bits,
+            nonce: 0,
+        };
+        let items = vec![ParsedDogeHeader {
+            header: header_at_371_337,
+            auxpow: None, // missing the required AuxPoW data
+        }];
+        let mut headers_db = HashMap::new();
+        let mut heights_db = HashMap::new();
+        let mut tip = None;
+        let mut tip_height = 0;
+        let res = apply_doge_header_batch_with_auxpow(
+            items,
+            anchor.time + 120,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &DigishieldParams::DOGECOIN,
+        );
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("has AuxPoW bit set but no AuxPoW data attached"),
+            "expected missing-auxpow error, got: {}", err,
+        );
+    }
+
+    /// Post-activation DOGE header WITHOUT the AuxPoW bit set should
+    /// still attempt standalone Scrypt (per DOGE Core's behavior —
+    /// pools may emit either type after the boundary). The expected
+    /// failure here is from standalone Scrypt failing on the synthetic
+    /// header, NOT from AuxPoW being mandatory.
+    #[test]
+    fn pr5_apply_post_activation_no_auxpow_bit_uses_standalone_scrypt() {
+        let anchor = DogeAnchor {
+            hash: [0xbbu8; 32],
+            height: 371_336,
+            bits: 0x1d00ffff,
+            time: 1_410_464_500,
+            prev_time: 1_410_464_440,
+        };
+        let header_at_371_337 = DogeHeader {
+            // AuxPoW bit NOT set → standalone Scrypt path
+            version: 0x00010002_i32,
+            prev_hash: anchor.hash,
+            merkle_root: [0u8; 32],
+            time: anchor.time + 60,
+            bits: anchor.bits,
+            nonce: 0,
+        };
+        let items = vec![ParsedDogeHeader {
+            header: header_at_371_337,
+            auxpow: None,
+        }];
+        let mut headers_db = HashMap::new();
+        let mut heights_db = HashMap::new();
+        let mut tip = None;
+        let mut tip_height = 0;
+        let res = apply_doge_header_batch_with_auxpow(
+            items,
+            anchor.time + 120,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &DigishieldParams::DOGECOIN,
+        );
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("fails PoW") || err.contains("bits mismatch") || err.contains("MTP"),
+            "expected standalone-Scrypt path error, got: {}", err,
+        );
+        assert!(
+            !err.contains("has AuxPoW bit set"),
+            "should NOT trigger missing-auxpow error when bit is clear, got: {}", err,
+        );
+    }
+
+    /// Real mainnet DOGE block 371,337 AuxPoW validation. If this
+    /// breaks, the AuxPoW validator no longer correctly handles the
+    /// historic merge-mining transition data — a consensus-breaking
+    /// regression. Fixture source:
+    /// tests/fixtures/doge_auxpow/block_371337.json (PR-3).
+    ///
+    /// Byte-order note: blockchair's JSON returns merkle branch hashes
+    /// as 32-byte hex strings. PR-5 first attempt uses NATURAL byte
+    /// order (no reversal). If validation fails, try the reversed
+    /// orientation — Bitcoin RPC outputs are sometimes display-order.
+    #[test]
+    fn pr5_validate_block_371337_real_mainnet_auxpow() {
+        // Helper: hex → [u8; 32], optionally byte-reversed (for the
+        // prev_hash and merkle_root fields which are display-order in
+        // explorers but on-wire little-endian).
+        fn h32(s: &str, reverse: bool) -> [u8; 32] {
+            let mut v = hex::decode(s).unwrap();
+            if reverse {
+                v.reverse();
+            }
+            v.try_into().unwrap()
+        }
+
+        let coinbase_txn = hex::decode("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff380345bf09fabe6d6d980ba42120410de0554d42a5b5ee58167bcd86bf7591f429005f24da45fb51cf0800000000000000cdb1f1ff0e000000ffffffff01800c0c2a010000001976a914aa3750aa18b8a0f3f0590731e1fab934856680cf88ac00000000").unwrap();
+        let mut parent_header = [0u8; 80];
+        parent_header.copy_from_slice(&hex::decode("02000000d2ec7dfeb7e8f43fe77aba3368df95ac2088034420402730ee0492a2084217083411b3fc91033bfdeea339bc11b9efc986e161c703e07a9045338c165673f09940fb11548b54021b58cc9ae5").unwrap());
+
+        // Use natural byte order for branches (no reversal). If this
+        // fails empirically, flip to true.
+        let branch_reverse = true;
+        let coinbase_branch = vec![
+            h32("cd3947cd5a0c26fde01b05a3aa3d7a38717be6ae11d27239365024db36a679a9", branch_reverse),
+            h32("48f9e8fef3411944e27f49ec804462c9e124dca0954c71c8560e8a9dd218a452", branch_reverse),
+            h32("d11293660392e7c51f69477a6130237c72ecee2d0c1d3dc815841734c370331a", branch_reverse),
+        ];
+        let blockchain_branch = vec![
+            h32("b541c848bc001d07d2bdf8643abab61d2c6ae50d5b2495815339a4b30703a46f", branch_reverse),
+            h32("78d6abe48cee514cf3496f4042039acb7e27616dcfc5de926ff0d6c7e5987be7", branch_reverse),
+            h32("a0469413ce64d67c43902d54ee3a380eff12ded22ca11cbd3842e15d48298103", branch_reverse),
+        ];
+
+        let auxpow = crate::auxpow::AuxPoW {
+            coinbase_txn,
+            parent_hash: crate::pow::sha256d(&parent_header),
+            coinbase_branch,
+            coinbase_branch_index: 0,
+            blockchain_branch,
+            blockchain_branch_index: 0,
+            parent_header,
+        };
+
+        // DOGE block 371,337 header. version 0x00620102 has the AuxPoW
+        // bit (0x100). prev_hash and merkle_root are display-order in
+        // explorers; reverse to get on-wire little-endian bytes.
+        let doge_header = DogeHeader {
+            version: 0x00620102_i32,
+            prev_hash: h32(
+                "46a8b109fb016fa41abd17a19186ca78d39c60c020c71fcd2690320d47036f0d",
+                true,
+            ),
+            merkle_root: h32(
+                "ee27b8fb782a5bfb99c975f0d4686440b9af9e16846603e5f2830e0b6fbf158a",
+                true,
+            ),
+            time: 1_410_464_577,
+            bits: 0x1b364184,
+            nonce: 0,
+        };
+
+                let result = doge_header.meets_pow_auxpow(&auxpow);
+        assert!(
+            result,
+            "Real mainnet DOGE block 371,337 AuxPoW validation FAILED              after the PR-2 byte-order fix. If this fires, either the fix              regressed or the fixture data is wrong.",
+        );
     }
 }
