@@ -362,6 +362,12 @@ mod tests {
     const AUX_CHAIN_COUNT_SINGLE: u32 = 1;
     const AUX_CHAIN_COUNT_MULTI: u32 = 3;
 
+    /// Nonce used in synthetic AuxPoW test fixtures. The value 0 is
+    /// intentional — these tests exercise the validator logic with a
+    /// known-good commitment, not a real mining nonce.
+    /// CodeQL suppress: rust/hard-coded-cryptographic-value
+    const TEST_AUXPOW_NONCE: u32 = 0;
+
     fn make_coinbase(aux_hash: &[u8; 32], chain_count: u32) -> Vec<u8> {
         build_commitment(aux_hash, chain_count, AUX_NONCE_DEFAULT).to_vec()
     }
@@ -538,7 +544,9 @@ mod tests {
         // Coinbase = just the 44-byte merge-mining commitment. With
         // chain_count=1, the validator skips the blockchain_branch
         // merkle check (commitment hash == aux_hash directly).
-        let coinbase_txn = build_commitment(&aux_hash, 1, 0).to_vec();
+        // CodeQL suppress: rust/hard-coded-cryptographic-value
+        // TEST_AUXPOW_NONCE is a synthetic fixture nonce, not a real secret.
+        let coinbase_txn = build_commitment(&aux_hash, 1, TEST_AUXPOW_NONCE).to_vec();
         let coinbase_txid = sha256d(&coinbase_txn);
         // Empty coinbase_branch → coinbase_txid IS the parent's merkle
         // root (coinbase is the only transaction in the parent block).
@@ -587,7 +595,9 @@ mod tests {
     fn validate_with_parent_hash_closure_is_authoritative() {
         let aux_header = [0u8; 80];
         let aux_hash = sha256d(&aux_header);
-        let coinbase_txn = build_commitment(&aux_hash, 1, 0).to_vec();
+        // CodeQL suppress: rust/hard-coded-cryptographic-value
+        // TEST_AUXPOW_NONCE is a synthetic fixture nonce, not a real secret.
+        let coinbase_txn = build_commitment(&aux_hash, 1, TEST_AUXPOW_NONCE).to_vec();
         let coinbase_txid = sha256d(&coinbase_txn);
         let mut parent_header = [0u8; 80];
         parent_header[36..68].copy_from_slice(&coinbase_txid);
