@@ -125,8 +125,13 @@ pub fn make_message(magic: u32, command: &str, payload: &[u8]) -> Vec<u8> {
     msg
 }
 
-/// Write a full P2P message to the stream. No partial-write handling
-/// beyond what `write_all` provides.
+/// Write a full P2P message to the stream. v1.9.82 of issue #68:
+/// always flush after write_all. tokio's `AsyncWriteExt::write_all`
+/// can leave bytes in the internal buffer; small messages like a
+/// 37-byte `getdata` for one block hash got delayed long enough that
+/// peers timed us out or dropped the request before transmission.
+/// Bitcoin Core's reference uses TCP with `MSG_DONTWAIT` plus
+/// equivalent flushing; this matches that behavior on the tokio side.
 pub async fn write_message(
     stream: &mut TcpStream,
     magic: u32,
@@ -134,7 +139,8 @@ pub async fn write_message(
     payload: &[u8],
 ) -> io::Result<()> {
     let msg = make_message(magic, command, payload);
-    stream.write_all(&msg).await
+    stream.write_all(&msg).await?;
+    stream.flush().await
 }
 
 /// Read one full P2P message off the stream, with per-read timeout.
