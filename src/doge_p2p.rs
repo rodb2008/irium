@@ -17,8 +17,8 @@ use tokio::time::timeout;
 
 use crate::p2p_wire::{
     build_getdata_payload, build_getheaders_payload, build_version_payload,
-    parse_block_prefix_for_auxpow, parse_headers_payload, read_message, sha256d,
-    write_message, MSG_BLOCK,
+    parse_block_prefix_for_auxpow, parse_headers_payload, read_message,
+    read_varint_slice, sha256d, write_message, MSG_BLOCK,
 };
 
 use std::collections::HashMap;
@@ -134,11 +134,11 @@ async fn discover_peers() -> Result<Vec<SocketAddr>, String> {
     Ok(out)
 }
 
-/// PR-6 of issue #68: max INV entries per `getdata` message. Bursting
-/// 144 invs in one shot disconnects some peer implementations; 50 is
-/// safely below typical caps and round-trips fast enough that the
-/// cycle's 600s budget is comfortable.
-const INV_BATCH: usize = 50;
+/// v1.9.81: temporarily reduced to 1 for isolation diagnostics —
+/// if a single-inv getdata still times out, the issue is not batch
+/// size. Will be restored to a higher value (10–50) once the failure
+/// mode is identified. PR-6 of issue #68.
+const INV_BATCH: usize = 1;
 
 /// PR-6 of issue #68: max messages drained while waiting for block
 /// responses to a single getdata batch. Covers the requested blocks
@@ -180,6 +180,32 @@ async fn try_peer_with_auxpow(
         match msg.command.as_str() {
             "version" => {
                 got_their_version = true;
+                // v1.9.81 diagnostic: log peer's services + user_agent.
+                if msg.payload.len() >= 12 {
+                    let services = u64::from_le_bytes(
+                        msg.payload[4..12].try_into().unwrap(),
+                    );
+                    // version body: i32 ver(4) + u64 services(8) + i64 ts(8) +
+                    // recv_addr(26) + from_addr(26) + nonce(8) = offset 80
+                    let mut ua = String::new();
+                    if msg.payload.len() > 80 {
+                        if let Ok((ualen, used)) =
+                            read_varint_slice(&msg.payload[80..])
+                        {
+                            let start = 80 + used;
+                            let end = start + (ualen as usize);
+                            if end <= msg.payload.len() {
+                                ua = String::from_utf8_lossy(
+                                    &msg.payload[start..end],
+                                )
+                                .into_owned();
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[doge-p2p] peer {peer} version services=0x{services:016x} user_agent={ua:?}"
+                    );
+                }
                 // Echo verack back.
                 write_message(&mut stream, DOGE_MAGIC, "verack", &[])
                     .await
@@ -242,6 +268,16 @@ async fn try_peer_with_auxpow(
     let headers = headers
         .ok_or_else(|| "no headers received after MAX_POST_GETHEADERS_MESSAGES".to_string())?;
 
+    // v1.9.81 diagnostic: log how many headers and how many need AuxPoW.
+    let auxpow_bit_count = headers.iter().filter(|h| {
+        let v = i32::from_le_bytes(h[..4].try_into().unwrap());
+        (v as u32) & 0x100 != 0
+    }).count();
+    eprintln!(
+        "[doge-p2p] peer {peer} returned {} headers, {} with AuxPoW bit",
+        headers.len(), auxpow_bit_count
+    );
+
     // Build the result vec. Slots for non-AuxPoW headers are filled
     // immediately; slots for AuxPoW-bit headers wait for a matching
     // block message.
@@ -267,18 +303,36 @@ async fn try_peer_with_auxpow(
         let chunk: Vec<[u8; 32]> = all_hashes.drain(..all_hashes.len().min(INV_BATCH)).collect();
         let invs: Vec<(u32, [u8; 32])> = chunk.iter().map(|h| (MSG_BLOCK, *h)).collect();
         let payload = build_getdata_payload(&invs);
+        eprintln!(
+            "[doge-p2p] peer {peer} sending getdata for {} blocks (batch)",
+            chunk.len()
+        );
         write_message(&mut stream, DOGE_MAGIC, "getdata", &payload)
             .await
             .map_err(|e| format!("send getdata: {e}"))?;
 
         let mut received_in_batch = 0usize;
-        for _ in 0..MAX_BLOCK_RESPONSE_MESSAGES {
+        for response_idx in 0..MAX_BLOCK_RESPONSE_MESSAGES {
             if received_in_batch >= chunk.len() {
                 break;
             }
+            // v1.9.81 diagnostic: log before each read so we can see
+            // exactly which response number times out.
+            eprintln!(
+                "[doge-p2p] peer {peer} waiting for block {}/{} (msg #{response_idx})",
+                received_in_batch + 1,
+                chunk.len()
+            );
             let msg = read_message(&mut stream, DOGE_MAGIC)
                 .await
-                .map_err(|e| format!("post-getdata read: {e}"))?;
+                .map_err(|e| {
+                    let err = format!("post-getdata read: {e}");
+                    eprintln!(
+                        "[doge-p2p] peer {peer} read error after {received_in_batch}/{} blocks: {err}",
+                        chunk.len()
+                    );
+                    err
+                })?;
             match msg.command.as_str() {
                 "block" => {
                     let (block_header, auxpow_bytes) =
