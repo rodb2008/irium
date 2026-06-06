@@ -157,6 +157,15 @@ async fn try_peer_with_auxpow(
         .await
         .map_err(|_| "connect timeout".to_string())?
         .map_err(|e| format!("connect error: {e}"))?;
+    // v1.9.82 of issue #68: disable Nagle so the 37-byte `getdata`
+    // payload ships immediately. With Nagle on, a small write sits in
+    // the kernel send buffer waiting for more data or the next ACK
+    // (up to 200ms delayed-ACK on Linux). DOGE peers were silently
+    // timing us out before our getdata even left the socket. Bitcoin
+    // Core sets TCP_NODELAY on all P2P sockets; we match that.
+    stream
+        .set_nodelay(true)
+        .map_err(|e| format!("set_nodelay: {e}"))?;
 
     // Handshake — send our VERSION first.
     let vp = build_version_payload(0, DOGE_PORT);
