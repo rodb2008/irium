@@ -510,3 +510,298 @@ async fn mainnet_fetch_block_header(
         "exhausted {PER_HEADER_RETRIES} attempts; last error: {last_err}"
     ))
 }
+
+// ====================================================================
+// Issue #68 Option B (v1.9.83): AuxPoW data fetch via blockchair HTTP.
+//
+// PR-6's P2P `getdata MSG_BLOCK` path didn't work against real DOGE
+// peers (peers ack our getdata then timeout instead of sending the
+// block — verified-correct via a Python probe). We pivot to HTTP for
+// AuxPoW data only; the header stream stays on P2P matching BTC/LTC.
+// ====================================================================
+
+/// Politeness sleep between consecutive blockchair HTTP requests in
+/// the AuxPoW fetch loop. Blockchair's free tier rate-limits aggressive
+/// burst requests; 1s spacing keeps us comfortably below the threshold.
+pub const DOGE_AUXPOW_POLITE_SLEEP_MS: u64 = 1000;
+
+/// Pure JSON parser for blockchair's `dogecoin/raw/block/<height>`
+/// response. Returns `Ok(None)` if the block has no AuxPoW bit,
+/// `Ok(Some(bytes))` with iriumd-format AuxPoW bytes (compatible with
+/// `auxpow::deserialize`) when AuxPoW data is present. Pure function,
+/// no I/O — testable with a hard-coded JSON literal.
+fn parse_blockchair_auxpow_json(
+    json: &Value,
+    height: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let height_str = height.to_string();
+    let entry = json
+        .get("data")
+        .and_then(|d| d.get(&height_str))
+        .ok_or_else(|| format!("blockchair response missing data.{height_str}"))?;
+    let decoded = entry
+        .get("decoded_raw_block")
+        .ok_or_else(|| "blockchair entry missing decoded_raw_block".to_string())?;
+    let version = decoded
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "decoded_raw_block.version missing or not u64".to_string())?
+        as u32;
+
+    if version & 0x100 == 0 {
+        return Ok(None);
+    }
+
+    let ap_json = decoded
+        .get("auxpow")
+        .ok_or_else(|| "AuxPoW bit set but auxpow field missing".to_string())?;
+
+    // auxpow.tx is a nested dict with "hex" field (full coinbase tx).
+    let tx_hex = ap_json
+        .get("tx")
+        .and_then(|t| t.get("hex"))
+        .and_then(|h| h.as_str())
+        .ok_or_else(|| "auxpow.tx.hex missing or not str".to_string())?;
+    let coinbase_txn =
+        hex::decode(tx_hex).map_err(|e| format!("auxpow.tx.hex decode: {e}"))?;
+
+    // auxpow.parentblock is the parent header hex (must be 80 bytes).
+    let parent_hex = ap_json
+        .get("parentblock")
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| "auxpow.parentblock missing or not str".to_string())?;
+    let parent_bytes = hex::decode(parent_hex)
+        .map_err(|e| format!("auxpow.parentblock decode: {e}"))?;
+    if parent_bytes.len() != 80 {
+        return Err(format!(
+            "auxpow.parentblock wrong length {} (expected 80)",
+            parent_bytes.len()
+        ));
+    }
+    let mut parent_header = [0u8; 80];
+    parent_header.copy_from_slice(&parent_bytes);
+    let parent_hash = crate::pow::sha256d(&parent_header);
+
+    let coinbase_index = ap_json
+        .get("index")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "auxpow.index missing or not u64".to_string())? as u32;
+    let chain_index = ap_json
+        .get("chainindex")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "auxpow.chainindex missing or not u64".to_string())? as u32;
+
+    let coinbase_branch = parse_branch_array(
+        ap_json
+            .get("merklebranch")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "auxpow.merklebranch missing or not array".to_string())?,
+        "merklebranch",
+    )?;
+    let blockchain_branch = parse_branch_array(
+        ap_json
+            .get("chainmerklebranch")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "auxpow.chainmerklebranch missing or not array".to_string())?,
+        "chainmerklebranch",
+    )?;
+
+    let ap = crate::auxpow::AuxPoW {
+        coinbase_txn,
+        parent_hash,
+        coinbase_branch,
+        coinbase_branch_index: coinbase_index,
+        blockchain_branch,
+        blockchain_branch_index: chain_index,
+        parent_header,
+    };
+
+    Ok(Some(crate::auxpow::serialize(&ap)))
+}
+
+fn parse_branch_array(arr: &[Value], label: &str) -> Result<Vec<[u8; 32]>, String> {
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let hex_str = v
+            .as_str()
+            .ok_or_else(|| format!("{label} entry not str"))?;
+        let mut bytes = hex::decode(hex_str)
+            .map_err(|e| format!("{label} hex decode: {e}"))?;
+        if bytes.len() != 32 {
+            return Err(format!(
+                "{label} entry wrong length {} (expected 32)",
+                bytes.len()
+            ));
+        }
+        // Blockchair returns hashes in display order (big-endian
+        // uint256); reverse to natural-byte-order to match how
+        // compute_merkle_root inside auxpow::validate expects them.
+        bytes.reverse();
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&bytes);
+        out.push(h);
+    }
+    Ok(out)
+}
+
+/// Fetch the AuxPoW data for one DOGE block by height via blockchair's
+/// HTTP API. Returns `Ok(None)` for blocks without the AuxPoW bit
+/// (pre-371,337 or no-bit pools post-activation) and `Ok(Some(bytes))`
+/// otherwise — `bytes` is the iriumd-format AuxPoW serialization,
+/// directly compatible with `auxpow::deserialize` and PR-5's
+/// `apply_doge_header_batch_with_auxpow` validator.
+pub async fn fetch_doge_block_auxpow(
+    client: &Client,
+    height: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let url = format!("https://api.blockchair.com/dogecoin/raw/block/{height}");
+    let mut last_err = String::new();
+    for attempt in 0..PER_HEADER_RETRIES {
+        let result: Result<Option<Vec<u8>>, String> = async {
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("blockchair request: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("blockchair HTTP {status}"));
+            }
+            let json: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("blockchair json parse: {e}"))?;
+            parse_blockchair_auxpow_json(&json, height)
+        }
+        .await;
+        match result {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last_err = e;
+                if attempt + 1 < PER_HEADER_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(RETRY_SLEEP_MS)).await;
+                }
+            }
+        }
+    }
+    Err(format!(
+        "blockchair auxpow h={height} exhausted {PER_HEADER_RETRIES} attempts; last error: {last_err}"
+    ))
+}
+
+#[cfg(test)]
+mod option_b_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_blockchair_returns_none_when_auxpow_bit_clear() {
+        let response = json!({
+            "data": {
+                "100": {
+                    "decoded_raw_block": {
+                        "version": 0x20000000u64,
+                    }
+                }
+            }
+        });
+        let r = parse_blockchair_auxpow_json(&response, 100).expect("parse");
+        assert!(r.is_none(), "no AuxPoW bit -> None");
+    }
+
+    #[test]
+    fn parse_blockchair_errors_on_missing_height_entry() {
+        let response = json!({ "data": {} });
+        let err = parse_blockchair_auxpow_json(&response, 100).unwrap_err();
+        assert!(err.contains("missing data.100"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_blockchair_errors_when_auxpow_bit_set_but_no_auxpow_field() {
+        let response = json!({
+            "data": {
+                "100": {
+                    "decoded_raw_block": {
+                        "version": 0x00010102u64,
+                    }
+                }
+            }
+        });
+        let err = parse_blockchair_auxpow_json(&response, 100).unwrap_err();
+        assert!(err.contains("auxpow field missing"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_blockchair_assembles_minimal_auxpow_round_trip() {
+        // Minimal AuxPoW: empty branches, 60-byte coinbase, 80-byte
+        // parent_header. The assembled iriumd-format bytes must
+        // round-trip through auxpow::deserialize without error.
+        let tx_hex = "010000000100000000000000000000000000000000000000000000000000000000000000000000000000ffffffff0100000000000000000000000000";
+        let parent_hex = "00".repeat(80);
+        let response = json!({
+            "data": {
+                "200": {
+                    "decoded_raw_block": {
+                        "version": 0x00010102u64,
+                        "auxpow": {
+                            "tx": { "hex": tx_hex },
+                            "index": 0u64,
+                            "chainindex": 0u64,
+                            "merklebranch": [],
+                            "chainmerklebranch": [],
+                            "parentblock": parent_hex,
+                        }
+                    }
+                }
+            }
+        });
+        let bytes = parse_blockchair_auxpow_json(&response, 200)
+            .expect("parse")
+            .expect("Some bytes for AuxPoW-bit header");
+        let mut off = 0usize;
+        let parsed = crate::auxpow::deserialize(&bytes, &mut off)
+            .expect("iriumd auxpow deserialize round-trip");
+        assert_eq!(off, bytes.len(), "deserialize consumed all bytes");
+        assert_eq!(parsed.coinbase_branch.len(), 0);
+        assert_eq!(parsed.blockchain_branch.len(), 0);
+        assert_eq!(parsed.coinbase_branch_index, 0);
+        assert_eq!(parsed.blockchain_branch_index, 0);
+        assert_eq!(parsed.parent_header.len(), 80);
+    }
+
+    #[test]
+    fn parse_blockchair_branch_array_reverses_display_to_natural() {
+        // Single 32-byte branch in display order. The assembled bytes
+        // should contain the REVERSED hash (natural / wire order).
+        let display = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut natural = hex::decode(display).unwrap();
+        natural.reverse();
+        let tx_hex = "010000000100000000000000000000000000000000000000000000000000000000000000000000000000ffffffff0100000000000000000000000000";
+        let parent_hex = "00".repeat(80);
+        let response = json!({
+            "data": {
+                "200": {
+                    "decoded_raw_block": {
+                        "version": 0x00010102u64,
+                        "auxpow": {
+                            "tx": { "hex": tx_hex },
+                            "index": 0u64,
+                            "chainindex": 0u64,
+                            "merklebranch": [display],
+                            "chainmerklebranch": [],
+                            "parentblock": parent_hex,
+                        }
+                    }
+                }
+            }
+        });
+        let bytes = parse_blockchair_auxpow_json(&response, 200)
+            .expect("parse")
+            .expect("Some bytes");
+        let mut off = 0usize;
+        let parsed = crate::auxpow::deserialize(&bytes, &mut off)
+            .expect("deserialize");
+        assert_eq!(parsed.coinbase_branch.len(), 1);
+        assert_eq!(&parsed.coinbase_branch[0][..], &natural[..]);
+    }
+}

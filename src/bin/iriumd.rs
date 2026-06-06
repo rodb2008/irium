@@ -17580,25 +17580,64 @@ async fn run_doge_header_sync_cycle(
                     .unwrap_or([0u8; 32])
             })
         };
-        // PR-6 of issue #68: fetch headers AND per-header AuxPoW bytes
-        // (iriumd-format) so the mining template can emit v0x02 batches
-        // that pass PR-5's apply_doge_header_batch_with_auxpow validator.
-        let raw_items =
-            irium_node_rs::doge_p2p::fetch_doge_headers_with_auxpow(tip_hash)
-                .await
-                .map_err(|e| format!("p2p fetch: {e}"))?;
-        // v1.9.69: cap DOGE batch to 144 headers (same rationale — coinbase
-        // OP_RETURN must stay within what miners + submitblock tolerate).
-        let raw_items: Vec<([u8; 80], Option<Vec<u8>>)> =
-            raw_items.into_iter().take(144).collect();
-        if raw_items.is_empty() {
+        // Issue #68 Option B (v1.9.83): headers come via P2P (mirrors
+        // BTC/LTC), AuxPoW data comes via HTTP from blockchair. PR-6's
+        // P2P getdata path didn't work against real DOGE peers.
+        let raw_headers = irium_node_rs::doge_p2p::fetch_headers(tip_hash)
+            .await
+            .map_err(|e| format!("p2p fetch: {e}"))?;
+        // v1.9.83: tightened DOGE batch from 144 to 20 to stay under
+        // blockchair's free-tier HTTP quota (~1500 req/day). At ~43%
+        // AuxPoW-bit headers post-371,337, this is ~9 HTTP calls per
+        // cycle × 144 cycles/day = ~1,300 req/day with headroom for
+        // retries.
+        let raw_headers: Vec<[u8; 80]> = raw_headers.into_iter().take(20).collect();
+        if raw_headers.is_empty() {
             header_sync_touch_last_file("doge");
             return Ok("p2p_up_to_date".to_string());
         }
-        let count = raw_items.len();
-        let headers_hex: String = raw_items.iter().map(|(h, _)| hex::encode(h)).collect();
-        let auxpow_hex_vec: Vec<Option<String>> =
-            raw_items.iter().map(|(_, ap)| ap.as_ref().map(hex::encode)).collect();
+
+        // Compute the DOGE height of the first header in this batch.
+        // If we have no relay tip yet, headers chain from the anchor;
+        // otherwise from current chain.doge_tip_height + 1.
+        let starting_height = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            let anchor_h = chain
+                .params
+                .doge_spv
+                .as_ref()
+                .map(|p| p.anchor.height)
+                .unwrap_or(0);
+            if chain.doge_tip.is_none() {
+                anchor_h + 1
+            } else {
+                chain.doge_tip_height + 1
+            }
+        };
+
+        // For each AuxPoW-bit header, fetch AuxPoW via blockchair HTTP.
+        // Fail-fast on any HTTP error so we never populate caches with
+        // partial data (would cause mid-batch apply rejection).
+        let mut auxpow_hex_vec: Vec<Option<String>> = Vec::with_capacity(raw_headers.len());
+        for (i, header) in raw_headers.iter().enumerate() {
+            let version = i32::from_le_bytes(header[..4].try_into().unwrap());
+            if (version as u32) & 0x100 != 0 {
+                let h = starting_height + i as u64;
+                let bytes = header_sync::doge::fetch_doge_block_auxpow(client, h)
+                    .await
+                    .map_err(|e| format!("auxpow http fetch h={h}: {e}"))?;
+                auxpow_hex_vec.push(bytes.map(hex::encode));
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    header_sync::doge::DOGE_AUXPOW_POLITE_SLEEP_MS,
+                ))
+                .await;
+            } else {
+                auxpow_hex_vec.push(None);
+            }
+        }
+
+        let count = raw_headers.len();
+        let headers_hex: String = raw_headers.iter().map(hex::encode).collect();
         let auxpow_count = auxpow_hex_vec.iter().filter(|x| x.is_some()).count();
         let live_relay_tip = {
             let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -17624,7 +17663,7 @@ async fn run_doge_header_sync_cycle(
         }
         header_sync_touch_last_file("doge");
         return Ok(format!(
-            "p2p_cached_headers count={count} with_auxpow={auxpow_count} relay_tip={live_relay_tip}"
+            "p2p_headers+http_auxpow count={count} with_auxpow={auxpow_count} relay_tip={live_relay_tip} starting_h={starting_height}"
         ));
     }
 
