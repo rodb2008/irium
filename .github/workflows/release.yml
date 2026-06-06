@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*'
@@ -8,6 +9,9 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CARGO_TERM_COLOR: always
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_TIMEOUT: "120"
 
 jobs:
   build:
@@ -212,6 +216,7 @@ jobs:
 
   release:
     name: Publish release
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     needs: build
     runs-on: ubuntu-latest
     permissions:
