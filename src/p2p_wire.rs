@@ -483,10 +483,63 @@ pub fn build_getheaders_payload(locator: &[[u8; 32]], hash_stop: [u8; 32]) -> Ve
     p
 }
 
+/// Skip a DOGE-style on-wire AuxPoW that follows an 80-byte header.
+/// Wire layout (per parse_block_prefix_for_auxpow above):
+///   coinbase_txn       raw CTransaction (no length prefix)
+///   parent_hash        32 bytes
+///   coinbase_branch    varint count + count*32 + 4-byte LE index
+///   blockchain_branch  varint count + count*32 + 4-byte LE index
+///   parent_header      80 bytes
+///
+/// Stay in sync with the AuxPoW walk inside parse_block_prefix_for_auxpow.
+fn skip_inline_auxpow(payload: &[u8], off: &mut usize) -> Result<(), String> {
+    skip_one_tx(payload, off).map_err(|e| format!("coinbase tx: {e}"))?;
+    if *off + 32 > payload.len() {
+        return Err("truncated parent_hash".to_string());
+    }
+    *off += 32;
+    let (cb_count, used) = read_varint_slice(&payload[*off..])
+        .map_err(|e| format!("coinbase_branch count: {e}"))?;
+    *off += used;
+    let cb_bytes = (cb_count as usize)
+        .checked_mul(32)
+        .and_then(|n| n.checked_add(4))
+        .ok_or_else(|| "coinbase_branch size overflow".to_string())?;
+    if *off + cb_bytes > payload.len() {
+        return Err("truncated coinbase_branch".to_string());
+    }
+    *off += cb_bytes;
+    let (bc_count, used) = read_varint_slice(&payload[*off..])
+        .map_err(|e| format!("blockchain_branch count: {e}"))?;
+    *off += used;
+    let bc_bytes = (bc_count as usize)
+        .checked_mul(32)
+        .and_then(|n| n.checked_add(4))
+        .ok_or_else(|| "blockchain_branch size overflow".to_string())?;
+    if *off + bc_bytes > payload.len() {
+        return Err("truncated blockchain_branch".to_string());
+    }
+    *off += bc_bytes;
+    if *off + 80 > payload.len() {
+        return Err("truncated parent_header".to_string());
+    }
+    *off += 80;
+    Ok(())
+}
+
 /// Parse a headers payload into raw 80-byte headers. The wire format
 /// for each entry is the 80-byte header followed by a varint tx_count
 /// that is always 0 in a getheaders response — we read and discard it.
-pub fn parse_headers_payload(payload: &[u8]) -> Result<Vec<[u8; 80]>, String> {
+///
+/// `has_inline_auxpow`: DOGE post-371_337 embeds on-wire AuxPoW data
+/// between the 80-byte header and the tx_count varint whenever version
+/// bit `AUXPOW_VERSION_BIT (0x100)` is set. BTC/LTC do not, and bit
+/// 0x100 overlaps BIP9 deployment bit 8 historically used on BTC, so
+/// callers must opt in per chain.
+pub fn parse_headers_payload(
+    payload: &[u8],
+    has_inline_auxpow: bool,
+) -> Result<Vec<[u8; 80]>, String> {
     let (count, used) = read_varint_slice(payload)?;
     let mut cur = used;
     let mut out: Vec<[u8; 80]> = Vec::with_capacity(count as usize);
@@ -498,8 +551,15 @@ pub fn parse_headers_payload(payload: &[u8]) -> Result<Vec<[u8; 80]>, String> {
         }
         let mut h = [0u8; 80];
         h.copy_from_slice(&payload[cur..cur + 80]);
-        out.push(h);
         cur += 80;
+        if has_inline_auxpow {
+            let version = i32::from_le_bytes(h[..4].try_into().unwrap());
+            if (version as u32) & crate::auxpow::AUXPOW_VERSION_BIT != 0 {
+                skip_inline_auxpow(payload, &mut cur)
+                    .map_err(|e| format!("headers: entry {i}/{count} auxpow skip: {e}"))?;
+            }
+        }
+        out.push(h);
         let (_tx_count, used) = read_varint_slice(&payload[cur..])?;
         cur += used;
     }
@@ -594,7 +654,7 @@ mod tests {
         payload.extend_from_slice(&h2);
         put_varint(0, &mut payload);
 
-        let parsed = parse_headers_payload(&payload).expect("parse");
+        let parsed = parse_headers_payload(&payload, false).expect("parse");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0], h1);
         assert_eq!(parsed[1], h2);
@@ -608,8 +668,105 @@ mod tests {
         payload.extend_from_slice(&[0xaau8; 80]);
         put_varint(0, &mut payload);
         // Now the 2nd entry's bytes are missing.
-        let result = parse_headers_payload(&payload);
+        let result = parse_headers_payload(&payload, false);
         assert!(result.is_err(), "expected truncation error");
+    }
+
+    #[test]
+    fn parse_headers_payload_doge_auxpow_skip_round_trip() {
+        // Mirror of pr6_parse_block_prefix_with_auxpow_bit_roundtrips_iriumd_format
+        // but in a HEADERS payload context: 2 entries, both with AuxPoW bit set.
+        // Confirms parse_headers_payload skips the on-wire AuxPoW bytes
+        // between consecutive headers when has_inline_auxpow=true.
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1u32.to_le_bytes());
+        tx.push(1);
+        tx.extend_from_slice(&[0u8; 36]);
+        tx.push(0);
+        tx.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        tx.push(1);
+        tx.extend_from_slice(&[0u8; 8]);
+        tx.push(0);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(tx.len(), 60);
+
+        let build_wire_auxpow = |parent_hash: &[u8; 32], parent_header: &[u8; 80]| -> Vec<u8> {
+            let mut ap = Vec::new();
+            ap.extend_from_slice(&tx);
+            ap.extend_from_slice(parent_hash);
+            ap.push(0);
+            ap.extend_from_slice(&0u32.to_le_bytes());
+            ap.push(0);
+            ap.extend_from_slice(&0u32.to_le_bytes());
+            ap.extend_from_slice(parent_header);
+            ap
+        };
+
+        let mut h1 = [0u8; 80];
+        h1[..4].copy_from_slice(&0x00010102u32.to_le_bytes());
+        h1[4..36].fill(0x11);
+        let mut h2 = [0u8; 80];
+        h2[..4].copy_from_slice(&0x00010102u32.to_le_bytes());
+        h2[4..36].fill(0x22);
+
+        let parent_hash_1 = [0xAAu8; 32];
+        let parent_header_1 = [0xBBu8; 80];
+        let parent_hash_2 = [0xCCu8; 32];
+        let parent_header_2 = [0xDDu8; 80];
+
+        let mut payload = Vec::new();
+        put_varint(2, &mut payload);
+        payload.extend_from_slice(&h1);
+        payload.extend_from_slice(&build_wire_auxpow(&parent_hash_1, &parent_header_1));
+        payload.push(0);
+        payload.extend_from_slice(&h2);
+        payload.extend_from_slice(&build_wire_auxpow(&parent_hash_2, &parent_header_2));
+        payload.push(0);
+
+        let parsed = parse_headers_payload(&payload, true).expect("parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], h1);
+        assert_eq!(parsed[1], h2);
+    }
+
+    #[test]
+    fn parse_headers_payload_doge_mixed_auxpow_bit() {
+        // header[0] with AuxPoW bit, header[1] without. Confirms skip
+        // is per-header (gated on version bit), not whole-batch.
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1u32.to_le_bytes());
+        tx.push(1);
+        tx.extend_from_slice(&[0u8; 36]);
+        tx.push(0);
+        tx.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        tx.push(1);
+        tx.extend_from_slice(&[0u8; 8]);
+        tx.push(0);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut h_aux = [0u8; 80];
+        h_aux[..4].copy_from_slice(&0x00010102u32.to_le_bytes());
+        let mut h_no_aux = [0u8; 80];
+        h_no_aux[..4].copy_from_slice(&0x20000000u32.to_le_bytes());
+
+        let mut payload = Vec::new();
+        put_varint(2, &mut payload);
+        payload.extend_from_slice(&h_aux);
+        payload.extend_from_slice(&tx);
+        payload.extend_from_slice(&[0xAAu8; 32]);
+        payload.push(0);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&[0xBBu8; 80]);
+        payload.push(0);
+        payload.extend_from_slice(&h_no_aux);
+        payload.push(0);
+
+        let parsed = parse_headers_payload(&payload, true).expect("parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], h_aux);
+        assert_eq!(parsed[1], h_no_aux);
     }
 
     #[test]
