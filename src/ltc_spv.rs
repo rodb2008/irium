@@ -761,6 +761,21 @@ pub fn apply_ltc_header_batch(
     let tip_before = *ltc_tip;
     let tip_height_before = *ltc_tip_height;
 
+    // v1.9.86 issue #72: after the post-activation partial idempotency
+    // skip pass, staged may be empty when every header in the batch
+    // was already known at its expected position (the full-overlap
+    // case). BTC handles this via the v1.9.52 pre-loop check that
+    // returns Ok early; LTC has no equivalent pre-loop check, so the
+    // empty-staged case reaches here and must be returned as a no-op
+    // success rather than panicking on staged.last().unwrap().
+    if staged.is_empty() {
+        return Ok(LtcRelayUpdate {
+            tip_before,
+            tip_height_before,
+            headers_added: Vec::new(),
+        });
+    }
+
     let final_hash = staged.last().unwrap().0;
     let final_height = staged.last().unwrap().1.height;
     let final_work = staged.last().unwrap().1.total_work.clone();
@@ -1043,6 +1058,157 @@ mod tests {
         assert_eq!(tip_height, anchor.height + 1);
         assert!(headers_db.contains_key(&h1.block_hash()));
         assert_eq!(*heights_db.get(&h1.block_hash()).unwrap(), anchor.height + 1);
+    }
+
+    #[test]
+    fn apply_ltc_header_batch_full_overlap_noop() {
+        // v1.9.86 issue #72: post-activation full-batch idempotency for
+        // LTC. Mirror of the BTC test. Pre-v1.9.86 LTC had no
+        // idempotency path; full-batch re-apply hard-rejected at
+        // header 0 already known.
+        let (anchor, anchor_header) = fresh_anchor();
+        let mut headers = Vec::with_capacity(5);
+        let mut prev = anchor.hash;
+        let mut t = anchor_header.time;
+        for _ in 0..5 {
+            t += 150;
+            let h = mine_ltc_header(prev, t, anchor.bits);
+            prev = h.block_hash();
+            headers.push(h);
+        }
+        let mut headers_db: HashMap<[u8; 32], LtcHeaderEntry> = HashMap::new();
+        let mut heights_db: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut tip: Option<[u8; 32]> = None;
+        let mut tip_height: u64 = 0;
+
+        apply_ltc_header_batch(
+            headers.clone(),
+            u32::MAX,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &RetargetParams::LITECOIN,
+        )
+        .expect("first apply seeds all 5 headers");
+        let tip_snapshot = tip;
+        let tip_height_snapshot = tip_height;
+        let db_len_snapshot = headers_db.len();
+
+        let update = apply_ltc_header_batch(
+            headers.clone(),
+            u32::MAX,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &RetargetParams::LITECOIN,
+        )
+        .expect("full-overlap re-apply must succeed post-activation");
+        assert!(update.headers_added.is_empty());
+        assert_eq!(tip, tip_snapshot);
+        assert_eq!(tip_height, tip_height_snapshot);
+        assert_eq!(headers_db.len(), db_len_snapshot);
+    }
+
+    #[test]
+    fn apply_ltc_header_batch_mid_batch_fork_rejects() {
+        // v1.9.86 issue #72: mid-batch height mismatch must reject.
+        let (anchor, anchor_header) = fresh_anchor();
+        let h1 = mine_ltc_header(anchor.hash, anchor_header.time + 150, anchor.bits);
+        let h2 = mine_ltc_header(h1.block_hash(), anchor_header.time + 300, anchor.bits);
+        let h3 = mine_ltc_header(h2.block_hash(), anchor_header.time + 450, anchor.bits);
+        let mut headers_db: HashMap<[u8; 32], LtcHeaderEntry> = HashMap::new();
+        let mut heights_db: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut tip: Option<[u8; 32]> = None;
+        let mut tip_height: u64 = 0;
+
+        apply_ltc_header_batch(
+            vec![h1.clone(), h2.clone()],
+            u32::MAX,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &RetargetParams::LITECOIN,
+        )
+        .expect("seed h1+h2");
+
+        let h2_entry = headers_db.get_mut(&h2.block_hash()).unwrap();
+        h2_entry.height = anchor.height + 999;
+
+        let res = apply_ltc_header_batch(
+            vec![h1.clone(), h2.clone(), h3.clone()],
+            u32::MAX,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &RetargetParams::LITECOIN,
+        );
+        assert!(res.is_err(), "expected mid-batch height mismatch to reject");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("mismatches known chain"),
+            "expected mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_ltc_header_batch_partial_overlap_skips_prefix() {
+        // v1.9.86 issue #72: partial idempotency for LTC. Mirror of the
+        // BTC test. Pre-v1.9.86 LTC always rejected already-known
+        // headers because apply_ltc_header_batch lacked the v1.9.52
+        // BTC-style idempotency; carrier blocks following a tip advance
+        // hard-rejected.
+        let (anchor, anchor_header) = fresh_anchor();
+        let h1 = mine_ltc_header(anchor.hash, anchor_header.time + 150, anchor.bits);
+        let h2 = mine_ltc_header(h1.block_hash(), anchor_header.time + 300, anchor.bits);
+        let h3 = mine_ltc_header(h2.block_hash(), anchor_header.time + 450, anchor.bits);
+        let mut headers_db: HashMap<[u8; 32], LtcHeaderEntry> = HashMap::new();
+        let mut heights_db: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut tip: Option<[u8; 32]> = None;
+        let mut tip_height: u64 = 0;
+
+        apply_ltc_header_batch(
+            vec![h1.clone()],
+            u32::MAX,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &RetargetParams::LITECOIN,
+        )
+        .expect("first apply seeds h1");
+        assert_eq!(tip, Some(h1.block_hash()));
+
+        let update = apply_ltc_header_batch(
+            vec![h1.clone(), h2.clone(), h3.clone()],
+            u32::MAX,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &RetargetParams::LITECOIN,
+        )
+        .expect("partial idempotency must succeed post-activation");
+
+        assert_eq!(
+            update.headers_added.len(),
+            2,
+            "h1 skipped (known); h2 + h3 staged"
+        );
+        assert_eq!(update.headers_added[0], h2.block_hash());
+        assert_eq!(update.headers_added[1], h3.block_hash());
+        assert_eq!(tip, Some(h3.block_hash()));
+        assert_eq!(tip_height, anchor.height + 3);
+        assert_eq!(headers_db.len(), 3);
     }
 
     #[test]
