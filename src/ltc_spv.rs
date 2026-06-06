@@ -670,6 +670,26 @@ pub fn apply_ltc_header_batch(
         let hash = header.block_hash();
 
         if ltc_headers.contains_key(&hash) {
+            // v1.9.86 issue #72: partial idempotency. After activation
+            // timestamp, treat already-known headers (matching expected
+            // height with same bytes) as skip+continue instead of reject.
+            // Pre-activation: legacy reject.
+            let apply_idempotency_active = crate::activation::apply_idempotency_activation_timestamp()
+                .map(|ts| (iriumd_block_time as u64) >= ts)
+                .unwrap_or(false);
+            if apply_idempotency_active {
+                let entry = ltc_headers.get(&hash).expect("contains_key true");
+                if entry.height != height || entry.header != *header {
+                    return Err(format!(
+                        "apply_ltc_header_batch: header {} mismatches known chain (height/bytes)",
+                        i
+                    ));
+                }
+                prev_hash = hash;
+                prev_height = height;
+                prev_work = entry.total_work.clone();
+                continue;
+            }
             return Err(format!(
                 "apply_ltc_header_batch: header {} already known in chain state",
                 i
