@@ -16,9 +16,12 @@ use tokio::net::{lookup_host, TcpStream};
 use tokio::time::timeout;
 
 use crate::p2p_wire::{
-    build_getheaders_payload, build_version_payload, parse_headers_payload, read_message,
-    sha256d, write_message,
+    build_getdata_payload, build_getheaders_payload, build_version_payload,
+    parse_block_prefix_for_auxpow, parse_headers_payload, read_message, sha256d,
+    write_message, MSG_BLOCK,
 };
+
+use std::collections::HashMap;
 
 /// DOGE mainnet network magic. Wire bytes are `c0 c0 c0 c0`, which
 /// `u32.to_le_bytes()` reproduces from this host integer.
@@ -55,16 +58,21 @@ const MAX_PEER_ATTEMPTS: usize = 20;
 const MAX_HANDSHAKE_MESSAGES: usize = 30;
 const MAX_POST_GETHEADERS_MESSAGES: usize = 30;
 
-/// Fetch DOGE block headers from a connected mainnet peer. `relay_tip_hash`
-/// is what the chain currently holds (natural-byte-order, as stored in
-/// `chain.doge_tip`); the peer returns up to 2000 headers chained from
-/// the first hash in our locator that it also knows.
+/// PR-6 of issue #68: fetch DOGE headers AND, for any header with the
+/// AuxPoW version bit set, the iriumd-format AuxPoW bytes for that
+/// header. Returns each header alongside `Option<Vec<u8>>` where Some
+/// is iriumd-format AuxPoW (ready for `auxpow::deserialize`) and None
+/// means the header has no AuxPoW (pre-371,337 or no-bit pool blocks).
 ///
-/// Returns the parsed 80-byte headers in network order. Returns an
-/// empty Vec when the peer recognises our tip but has nothing newer to
-/// send (we are caught up). Returns Err when every attempted peer
-/// failed — the caller logs and the cycle retries on the next tick.
-pub async fn fetch_headers(relay_tip_hash: [u8; 32]) -> Result<Vec<[u8; 80]>, String> {
+/// Wire protocol: getheaders → headers, then a getdata batch with
+/// `MSG_BLOCK` invs for the AuxPoW headers, drained one block message
+/// at a time. AuxPoW data is extracted by
+/// `p2p_wire::parse_block_prefix_for_auxpow`, which also converts from
+/// DOGE on-wire format (CTransaction coinbase, no length prefix) to
+/// iriumd internal format (varint-prefixed coinbase).
+pub async fn fetch_doge_headers_with_auxpow(
+    relay_tip_hash: [u8; 32],
+) -> Result<Vec<([u8; 80], Option<Vec<u8>>)>, String> {
     let peers = discover_peers().await?;
     let mut last_err = String::new();
     let mut attempts = 0usize;
@@ -73,8 +81,8 @@ pub async fn fetch_headers(relay_tip_hash: [u8; 32]) -> Result<Vec<[u8; 80]>, St
             break;
         }
         attempts += 1;
-        match try_peer(peer, relay_tip_hash).await {
-            Ok(h) => return Ok(h),
+        match try_peer_with_auxpow(peer, relay_tip_hash).await {
+            Ok(items) => return Ok(items),
             Err(e) => {
                 last_err = format!("{peer}: {e}");
                 continue;
@@ -84,6 +92,16 @@ pub async fn fetch_headers(relay_tip_hash: [u8; 32]) -> Result<Vec<[u8; 80]>, St
     Err(format!(
         "all {attempts} DOGE peers failed; last error: {last_err}"
     ))
+}
+
+/// PR-6 deprecated thin wrapper for any leftover callers. Drops AuxPoW
+/// data — callers needing AuxPoW validation must migrate to
+/// `fetch_doge_headers_with_auxpow`.
+#[deprecated(note = "use fetch_doge_headers_with_auxpow; this drops AuxPoW data")]
+#[allow(dead_code)]
+pub async fn fetch_headers(relay_tip_hash: [u8; 32]) -> Result<Vec<[u8; 80]>, String> {
+    let items = fetch_doge_headers_with_auxpow(relay_tip_hash).await?;
+    Ok(items.into_iter().map(|(h, _)| h).collect())
 }
 
 /// Resolve every DOGE DNS seed, dedupe IPs (so we do not waste
@@ -116,10 +134,25 @@ async fn discover_peers() -> Result<Vec<SocketAddr>, String> {
     Ok(out)
 }
 
-/// Full session against one peer: connect, handshake, getheaders,
-/// receive headers. Any step failing returns an error string the
-/// caller logs and rotates to the next peer.
-async fn try_peer(peer: SocketAddr, tip: [u8; 32]) -> Result<Vec<[u8; 80]>, String> {
+/// PR-6 of issue #68: max INV entries per `getdata` message. Bursting
+/// 144 invs in one shot disconnects some peer implementations; 50 is
+/// safely below typical caps and round-trips fast enough that the
+/// cycle's 600s budget is comfortable.
+const INV_BATCH: usize = 50;
+
+/// PR-6 of issue #68: max messages drained while waiting for block
+/// responses to a single getdata batch. Covers the requested blocks
+/// plus typical chatter (ping/inv/addr) interleaved by the peer.
+const MAX_BLOCK_RESPONSE_MESSAGES: usize = 200;
+
+/// PR-6 of issue #68: full session against one peer. Same handshake
+/// + getheaders flow as v1.9.66's `try_peer`, then issues `getdata`
+/// for headers with the AuxPoW bit, parses block prefixes, returns
+/// the header-with-optional-auxpow items in original order.
+async fn try_peer_with_auxpow(
+    peer: SocketAddr,
+    tip: [u8; 32],
+) -> Result<Vec<([u8; 80], Option<Vec<u8>>)>, String> {
     let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(peer))
         .await
         .map_err(|_| "connect timeout".to_string())?
@@ -186,13 +219,15 @@ async fn try_peer(peer: SocketAddr, tip: [u8; 32]) -> Result<Vec<[u8; 80]>, Stri
     // Drain until we see a HEADERS reply (or hit the message cap).
     // Continue answering PING during this window so the peer does not
     // disconnect us mid-conversation.
+    let mut headers: Option<Vec<[u8; 80]>> = None;
     for _ in 0..MAX_POST_GETHEADERS_MESSAGES {
         let msg = read_message(&mut stream, DOGE_MAGIC)
             .await
             .map_err(|e| format!("post-getheaders read: {e}"))?;
         match msg.command.as_str() {
             "headers" => {
-                return parse_headers_payload(&msg.payload);
+                headers = Some(parse_headers_payload(&msg.payload)?);
+                break;
             }
             "ping" => {
                 write_message(&mut stream, DOGE_MAGIC, "pong", &msg.payload)
@@ -204,5 +239,93 @@ async fn try_peer(peer: SocketAddr, tip: [u8; 32]) -> Result<Vec<[u8; 80]>, Stri
             }
         }
     }
-    Err("no headers received after MAX_POST_GETHEADERS_MESSAGES".to_string())
+    let headers = headers
+        .ok_or_else(|| "no headers received after MAX_POST_GETHEADERS_MESSAGES".to_string())?;
+
+    // Build the result vec. Slots for non-AuxPoW headers are filled
+    // immediately; slots for AuxPoW-bit headers wait for a matching
+    // block message.
+    let mut result: Vec<([u8; 80], Option<Vec<u8>>)> = Vec::with_capacity(headers.len());
+    let mut pending: HashMap<[u8; 32], usize> = HashMap::new();
+    for (i, header) in headers.iter().enumerate() {
+        let version = i32::from_le_bytes(header[..4].try_into().unwrap());
+        let has_auxpow_bit = (version as u32) & 0x100 != 0;
+        result.push((*header, None));
+        if has_auxpow_bit {
+            let block_hash = sha256d(header);
+            pending.insert(block_hash, i);
+        }
+    }
+
+    if pending.is_empty() {
+        return Ok(result);
+    }
+
+    // Issue getdata batches and drain block responses.
+    let mut all_hashes: Vec<[u8; 32]> = pending.keys().copied().collect();
+    while !all_hashes.is_empty() {
+        let chunk: Vec<[u8; 32]> = all_hashes.drain(..all_hashes.len().min(INV_BATCH)).collect();
+        let invs: Vec<(u32, [u8; 32])> = chunk.iter().map(|h| (MSG_BLOCK, *h)).collect();
+        let payload = build_getdata_payload(&invs);
+        write_message(&mut stream, DOGE_MAGIC, "getdata", &payload)
+            .await
+            .map_err(|e| format!("send getdata: {e}"))?;
+
+        let mut received_in_batch = 0usize;
+        for _ in 0..MAX_BLOCK_RESPONSE_MESSAGES {
+            if received_in_batch >= chunk.len() {
+                break;
+            }
+            let msg = read_message(&mut stream, DOGE_MAGIC)
+                .await
+                .map_err(|e| format!("post-getdata read: {e}"))?;
+            match msg.command.as_str() {
+                "block" => {
+                    let (block_header, auxpow_bytes) =
+                        parse_block_prefix_for_auxpow(&msg.payload)
+                            .map_err(|e| format!("block prefix parse: {e}"))?;
+                    let block_hash = sha256d(&block_header);
+                    if let Some(&slot) = pending.get(&block_hash) {
+                        result[slot] = (block_header, auxpow_bytes);
+                        pending.remove(&block_hash);
+                        received_in_batch += 1;
+                    }
+                    // Unmatched block: peer sent an unrelated block;
+                    // ignore (rare, but cheap to tolerate).
+                }
+                "ping" => {
+                    write_message(&mut stream, DOGE_MAGIC, "pong", &msg.payload)
+                        .await
+                        .map_err(|e| format!("send pong post-getdata: {e}"))?;
+                }
+                "notfound" => {
+                    // Peer doesn't have one of the requested blocks.
+                    // Stop draining this batch — caller will rotate.
+                    return Err(format!(
+                        "peer returned notfound after {} blocks in batch",
+                        received_in_batch
+                    ));
+                }
+                _ => {
+                    // INV / ADDR / etc — ignore.
+                }
+            }
+        }
+        if received_in_batch < chunk.len() {
+            return Err(format!(
+                "block-response batch short: received {}/{} after {} messages",
+                received_in_batch,
+                chunk.len(),
+                MAX_BLOCK_RESPONSE_MESSAGES
+            ));
+        }
+    }
+
+    if !pending.is_empty() {
+        return Err(format!(
+            "missing {} AuxPoW block responses",
+            pending.len()
+        ));
+    }
+    Ok(result)
 }

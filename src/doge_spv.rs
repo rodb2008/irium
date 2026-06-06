@@ -609,7 +609,6 @@ pub fn parse_doge_header_batch_with_auxpow(
 /// AuxPoW bytes. Used by future tooling / mining code (gated by
 /// activation in a later PR). Pre-activation callers should continue
 /// using `encode_doge_header_batch` (v0x01).
-#[allow(dead_code)] // wired into doge mining / post-activation chain code in later PRs
 pub fn encode_doge_header_batch_with_auxpow(
     items: &[ParsedDogeHeader],
 ) -> Result<Vec<u8>, String> {

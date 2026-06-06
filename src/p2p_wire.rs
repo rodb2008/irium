@@ -255,6 +255,217 @@ fn rand_nonce() -> u64 {
 /// most-recent first; the peer walks it and starts streaming from the
 /// first hash it also knows. `hash_stop = [0u8; 32]` means "send up to
 /// 2000 headers", which is what we always want.
+/// PR-6 of issue #68: INV type for full blocks (Bitcoin/DOGE protocol).
+pub const MSG_BLOCK: u32 = 2;
+
+/// PR-6 of issue #68: peer-payload size cap for a single `block` message.
+/// DOGE's block size limit is ~1 MB; 4 MB gives headroom for SegWit-style
+/// LTC parent coinbases without inviting OOM from a malicious peer.
+pub const MAX_BLOCK_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+/// PR-6 of issue #68: build a `getdata` payload for one or more
+/// inventory entries. Standard Bitcoin format:
+///   varint(count) || (4-byte inv_type LE || 32-byte hash) * count
+pub fn build_getdata_payload(invs: &[(u32, [u8; 32])]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(9 + invs.len() * 36);
+    put_varint(invs.len() as u64, &mut p);
+    for (inv_type, hash) in invs {
+        p.extend_from_slice(&inv_type.to_le_bytes());
+        p.extend_from_slice(hash);
+    }
+    p
+}
+
+/// PR-6 of issue #68: walk one CTransaction starting at `*offset`,
+/// advancing past nVersion + (optional SegWit marker/flag) + vin + vout
+/// + (per-vin witness when SegWit) + nLockTime.
+///
+/// SegWit detection: BIP144 places a 0x00 marker + non-zero flag right
+/// after nVersion. A legacy tx has varint(vin_count) there instead, and
+/// vin_count is never 0 in valid txs (especially not coinbases). So
+/// "data[offset] == 0x00" disambiguates safely.
+///
+/// Does NOT validate any tx semantics — just walks byte structure so the
+/// caller knows where the tx ends. Used by `parse_block_prefix_for_auxpow`
+/// to find the length of the AuxPoW parent coinbase tx (which on the
+/// DOGE wire has no length prefix).
+fn skip_one_tx(data: &[u8], offset: &mut usize) -> Result<(), String> {
+    // nVersion (4 bytes LE)
+    if *offset + 4 > data.len() {
+        return Err("tx: truncated nVersion".to_string());
+    }
+    *offset += 4;
+    // SegWit marker/flag detection
+    if *offset >= data.len() {
+        return Err("tx: truncated after nVersion".to_string());
+    }
+    let is_segwit = data[*offset] == 0x00
+        && *offset + 1 < data.len()
+        && data[*offset + 1] != 0x00;
+    if is_segwit {
+        *offset += 2;
+    }
+    // vin
+    let (vin_count, used) = read_varint_slice(&data[*offset..])?;
+    *offset += used;
+    for _ in 0..vin_count {
+        // prevout: hash(32) + index(4)
+        if *offset + 36 > data.len() {
+            return Err("tx: truncated vin prevout".to_string());
+        }
+        *offset += 36;
+        // scriptSig: varint length + bytes
+        let (script_len, used) = read_varint_slice(&data[*offset..])?;
+        *offset += used;
+        if *offset + script_len as usize > data.len() {
+            return Err("tx: truncated vin scriptSig".to_string());
+        }
+        *offset += script_len as usize;
+        // nSequence (4 bytes)
+        if *offset + 4 > data.len() {
+            return Err("tx: truncated vin nSequence".to_string());
+        }
+        *offset += 4;
+    }
+    // vout
+    let (vout_count, used) = read_varint_slice(&data[*offset..])?;
+    *offset += used;
+    for _ in 0..vout_count {
+        // value (8 bytes)
+        if *offset + 8 > data.len() {
+            return Err("tx: truncated vout value".to_string());
+        }
+        *offset += 8;
+        // scriptPubKey: varint length + bytes
+        let (script_len, used) = read_varint_slice(&data[*offset..])?;
+        *offset += used;
+        if *offset + script_len as usize > data.len() {
+            return Err("tx: truncated vout scriptPubKey".to_string());
+        }
+        *offset += script_len as usize;
+    }
+    // SegWit witnesses (per vin)
+    if is_segwit {
+        for _ in 0..vin_count {
+            let (witness_count, used) = read_varint_slice(&data[*offset..])?;
+            *offset += used;
+            for _ in 0..witness_count {
+                let (wlen, used) = read_varint_slice(&data[*offset..])?;
+                *offset += used;
+                if *offset + wlen as usize > data.len() {
+                    return Err("tx: truncated witness".to_string());
+                }
+                *offset += wlen as usize;
+            }
+        }
+    }
+    // nLockTime (4 bytes)
+    if *offset + 4 > data.len() {
+        return Err("tx: truncated nLockTime".to_string());
+    }
+    *offset += 4;
+    Ok(())
+}
+
+/// PR-6 of issue #68: parse the prefix of a DOGE `block` message payload.
+///
+/// Reads the 80-byte header. If the header has the AuxPoW version bit
+/// (0x100), walks the on-wire AuxPoW structure and converts it to
+/// iriumd's internal format so the existing `auxpow::deserialize`
+/// (called downstream from `apply_doge_header_batch_with_auxpow`)
+/// works unchanged.
+///
+/// Format difference handled here:
+///   - DOGE on-wire AuxPoW starts with a CTransaction (no length prefix).
+///   - iriumd's internal `auxpow::serialize` / `deserialize` use a
+///     varint length prefix on the coinbase bytes; trailing fields are
+///     identical in order and encoding.
+/// The conversion is therefore: walk the CTransaction to find its
+/// length, then re-emit as `varint(tx_len) || tx_bytes || trailing`.
+///
+/// Stops after AuxPoW — never reads tx_count or the tx list. Block
+/// messages > MAX_BLOCK_PAYLOAD_BYTES are rejected.
+pub fn parse_block_prefix_for_auxpow(
+    payload: &[u8],
+) -> Result<([u8; 80], Option<Vec<u8>>), String> {
+    if payload.len() > MAX_BLOCK_PAYLOAD_BYTES {
+        return Err(format!(
+            "block payload {} bytes exceeds cap {}",
+            payload.len(),
+            MAX_BLOCK_PAYLOAD_BYTES
+        ));
+    }
+    if payload.len() < 80 {
+        return Err(format!(
+            "block payload {} bytes too short for 80-byte header",
+            payload.len()
+        ));
+    }
+    let mut header = [0u8; 80];
+    header.copy_from_slice(&payload[..80]);
+    // version is i32 LE in the first 4 bytes
+    let version = i32::from_le_bytes(header[..4].try_into().unwrap());
+    let has_auxpow = (version as u32) & 0x100 != 0;
+    if !has_auxpow {
+        return Ok((header, None));
+    }
+    // Walk the on-wire AuxPoW to find its end.
+    let mut off = 80usize;
+    let tx_start = off;
+    skip_one_tx(payload, &mut off)
+        .map_err(|e| format!("auxpow coinbase: {}", e))?;
+    let tx_end = off;
+    let tx_len = tx_end - tx_start;
+    // parent_hash (32)
+    if off + 32 > payload.len() {
+        return Err("auxpow: truncated parent_hash".to_string());
+    }
+    off += 32;
+    // coinbase_branch (varint count + 32 * count)
+    let (cb_count, used) = read_varint_slice(&payload[off..])?;
+    off += used;
+    if cb_count > 64 {
+        return Err(format!("auxpow: cb_branch_count {} exceeds 64", cb_count));
+    }
+    if off + (cb_count as usize) * 32 > payload.len() {
+        return Err("auxpow: truncated coinbase_branch".to_string());
+    }
+    off += (cb_count as usize) * 32;
+    // coinbase_branch_index (4)
+    if off + 4 > payload.len() {
+        return Err("auxpow: truncated coinbase_branch_index".to_string());
+    }
+    off += 4;
+    // blockchain_branch (varint count + 32 * count)
+    let (bc_count, used) = read_varint_slice(&payload[off..])?;
+    off += used;
+    if bc_count > 64 {
+        return Err(format!("auxpow: bc_branch_count {} exceeds 64", bc_count));
+    }
+    if off + (bc_count as usize) * 32 > payload.len() {
+        return Err("auxpow: truncated blockchain_branch".to_string());
+    }
+    off += (bc_count as usize) * 32;
+    // blockchain_branch_index (4)
+    if off + 4 > payload.len() {
+        return Err("auxpow: truncated blockchain_branch_index".to_string());
+    }
+    off += 4;
+    // parent_header (80)
+    if off + 80 > payload.len() {
+        return Err("auxpow: truncated parent_header".to_string());
+    }
+    off += 80;
+    let auxpow_end = off;
+    // Build iriumd-format bytes: varint(tx_len) || coinbase_tx_bytes || trailing_wire_bytes
+    let trailing = &payload[tx_end..auxpow_end];
+    let mut out = Vec::with_capacity(9 + tx_len + trailing.len());
+    put_varint(tx_len as u64, &mut out);
+    out.extend_from_slice(&payload[tx_start..tx_end]);
+    out.extend_from_slice(trailing);
+    Ok((header, Some(out)))
+}
+
 pub fn build_getheaders_payload(locator: &[[u8; 32]], hash_stop: [u8; 32]) -> Vec<u8> {
     let mut p = Vec::with_capacity(4 + 9 + locator.len() * 32 + 32);
     p.extend_from_slice(&(PROTOCOL_VERSION as u32).to_le_bytes());
@@ -393,5 +604,121 @@ mod tests {
         // Now the 2nd entry's bytes are missing.
         let result = parse_headers_payload(&payload);
         assert!(result.is_err(), "expected truncation error");
+    }
+
+    #[test]
+    fn pr6_build_getdata_payload_single_inv() {
+        let invs = vec![(MSG_BLOCK, [0x11u8; 32])];
+        let p = build_getdata_payload(&invs);
+        // varint(1) = 1 byte; 1 inv = 4 + 32 = 36; total = 37
+        assert_eq!(p.len(), 37);
+        assert_eq!(p[0], 1); // varint count = 1
+        assert_eq!(&p[1..5], &MSG_BLOCK.to_le_bytes());
+        assert_eq!(&p[5..37], &[0x11u8; 32]);
+    }
+
+    #[test]
+    fn pr6_build_getdata_payload_multi_inv() {
+        let invs: Vec<(u32, [u8; 32])> = (0..3u32).map(|i| (MSG_BLOCK, [i as u8; 32])).collect();
+        let p = build_getdata_payload(&invs);
+        // varint(3) = 1 byte; 3 invs = 3 * 36 = 108; total = 109
+        assert_eq!(p.len(), 109);
+        assert_eq!(p[0], 3);
+    }
+
+    #[test]
+    fn pr6_parse_block_prefix_no_auxpow_bit() {
+        // Header with version 0x20000000 (no AuxPoW bit) + varint(0) tx_count + nothing
+        let mut payload = Vec::with_capacity(80 + 1);
+        payload.extend_from_slice(&0x20000000u32.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 76]);
+        payload.push(0); // varint tx_count = 0 (won't actually be read)
+        let (h, ap) = parse_block_prefix_for_auxpow(&payload).expect("parse");
+        assert_eq!(&h[..4], &0x20000000u32.to_le_bytes());
+        assert!(ap.is_none(), "no AuxPoW bit → None");
+    }
+
+    #[test]
+    fn pr6_parse_block_prefix_with_auxpow_bit_roundtrips_iriumd_format() {
+        // Build a wire-format AuxPoW block prefix, parse it, and verify
+        // the returned bytes round-trip through iriumd's auxpow::deserialize.
+        //
+        // Minimal CTransaction (legacy serialization, no SegWit):
+        //   nVersion(4)=01000000 || vin_count(1)=01 ||
+        //     prevout(32+4)=zeros || scriptSig(varint 0 + nothing) || nSequence(4)=ffffffff ||
+        //   vout_count(1)=01 ||
+        //     value(8)=zeros || scriptPubKey(varint 0 + nothing) ||
+        //   nLockTime(4)=00000000
+        // Total = 4 + 1 + 36 + 1 + 4 + 1 + 8 + 1 + 4 = 60 bytes
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1u32.to_le_bytes()); // nVersion
+        tx.push(1); // vin_count varint
+        tx.extend_from_slice(&[0u8; 36]); // prevout
+        tx.push(0); // scriptSig length varint = 0
+        tx.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // nSequence
+        tx.push(1); // vout_count varint
+        tx.extend_from_slice(&[0u8; 8]); // value
+        tx.push(0); // scriptPubKey length varint = 0
+        tx.extend_from_slice(&0u32.to_le_bytes()); // nLockTime
+        assert_eq!(tx.len(), 60);
+
+        // Header with AuxPoW bit set
+        let mut header = [0u8; 80];
+        // version = 0x00010102 (AuxPoW bit at 0x100 + something arbitrary in bits 0..8)
+        header[..4].copy_from_slice(&0x00010102u32.to_le_bytes());
+
+        // Wire AuxPoW = tx || parent_hash(32) || cb_count(0) || cb_index(4) ||
+        //               bc_count(0) || bc_index(4) || parent_header(80)
+        let parent_hash = [0xAAu8; 32];
+        let parent_header = [0xBBu8; 80];
+        let mut wire_auxpow = Vec::new();
+        wire_auxpow.extend_from_slice(&tx);
+        wire_auxpow.extend_from_slice(&parent_hash);
+        wire_auxpow.push(0); // cb_count varint = 0
+        wire_auxpow.extend_from_slice(&0u32.to_le_bytes()); // cb_index
+        wire_auxpow.push(0); // bc_count varint = 0
+        wire_auxpow.extend_from_slice(&0u32.to_le_bytes()); // bc_index
+        wire_auxpow.extend_from_slice(&parent_header);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&header);
+        payload.extend_from_slice(&wire_auxpow);
+        payload.push(0); // varint tx_count = 0 (trailing — should not be parsed)
+
+        let (h_out, ap_out) = parse_block_prefix_for_auxpow(&payload).expect("parse");
+        assert_eq!(h_out, header);
+        let ap_bytes = ap_out.expect("AuxPoW expected");
+
+        // Verify iriumd-format: varint(tx_len=60) || tx || rest
+        // varint(60) is 1 byte (0x3C)
+        assert_eq!(ap_bytes[0], 60, "tx_len varint should be 60");
+        assert_eq!(&ap_bytes[1..61], &tx[..]);
+
+        // Round-trip via auxpow::deserialize
+        let mut off = 0usize;
+        let parsed = crate::auxpow::deserialize(&ap_bytes, &mut off)
+            .expect("iriumd auxpow deserialize");
+        assert_eq!(parsed.coinbase_txn, tx);
+        assert_eq!(parsed.parent_hash, parent_hash);
+        assert_eq!(parsed.coinbase_branch.len(), 0);
+        assert_eq!(parsed.coinbase_branch_index, 0);
+        assert_eq!(parsed.blockchain_branch.len(), 0);
+        assert_eq!(parsed.blockchain_branch_index, 0);
+        assert_eq!(parsed.parent_header, parent_header);
+        assert_eq!(off, ap_bytes.len(), "deserialize should consume all bytes");
+    }
+
+    #[test]
+    fn pr6_parse_block_prefix_rejects_oversized() {
+        let huge = vec![0u8; MAX_BLOCK_PAYLOAD_BYTES + 1];
+        let err = parse_block_prefix_for_auxpow(&huge).unwrap_err();
+        assert!(err.contains("exceeds cap"), "got: {}", err);
+    }
+
+    #[test]
+    fn pr6_parse_block_prefix_rejects_too_short() {
+        let tiny = vec![0u8; 79];
+        let err = parse_block_prefix_for_auxpow(&tiny).unwrap_err();
+        assert!(err.contains("too short"), "got: {}", err);
     }
 }
