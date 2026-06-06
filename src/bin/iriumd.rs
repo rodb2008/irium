@@ -17615,6 +17615,25 @@ async fn run_doge_header_sync_cycle(
             }
         };
 
+        // Defensive: refuse to cache a non-chained batch. The cache is
+        // the only source for the coinbase carrier path (issue #69); a
+        // poisoned cache produces carriers that hard-reject every block
+        // they ride into. Pre-v1.9.85 doge_p2p's wire-format parse bug
+        // emitted exactly this pattern. Re-fetch on the next cycle is
+        // cheap (~10 min).
+        for (i, w) in raw_headers.windows(2).enumerate() {
+            let prev_hash = sha256d(&w[0]);
+            let next_prev: [u8; 32] = w[1][4..36].try_into().unwrap();
+            if prev_hash != next_prev {
+                return Err(format!(
+                    "doge cycle: non-chained headers at index {} (h{}.hash != h{}.prev_hash); refusing to poison cache",
+                    i + 1,
+                    i,
+                    i + 1
+                ));
+            }
+        }
+
         // For each AuxPoW-bit header, fetch AuxPoW via blockchair HTTP.
         // Fail-fast on any HTTP error so we never populate caches with
         // partial data (would cause mid-batch apply rejection).
