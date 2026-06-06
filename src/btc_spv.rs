@@ -1066,6 +1066,65 @@ mod tests {
     }
 
     #[test]
+    fn apply_btc_header_batch_partial_overlap_skips_prefix() {
+        // v1.9.86 issue #72: partial idempotency. When the carrier's
+        // batch starts at relay_tip=X but the chain advanced to X+k by
+        // apply time, the first k headers are already in btc_headers.
+        // Post-activation behavior: skip the known prefix and stage the
+        // new suffix. Pre-v1.9.86 would have rejected with "header 0
+        // already known in chain state" and killed the carrier block.
+        //
+        // u32::MAX iriumd_block_time is post-activation
+        // (MAINNET_APPLY_IDEMPOTENCY_ACTIVATION_TIMESTAMP < u32::MAX).
+        let (anchor, anchor_header) = fresh_anchor();
+        let h1 = mine_btc_header(anchor.hash, anchor_header.time + 600, anchor.bits);
+        let h2 = mine_btc_header(h1.block_hash(), anchor_header.time + 1200, anchor.bits);
+        let h3 = mine_btc_header(h2.block_hash(), anchor_header.time + 1800, anchor.bits);
+        let mut headers_db: HashMap<[u8; 32], BtcHeaderEntry> = HashMap::new();
+        let mut heights_db: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut tip: Option<[u8; 32]> = None;
+        let mut tip_height: u64 = 0;
+
+        // First apply: just [h1] to populate the chain state.
+        apply_btc_header_batch(
+            vec![h1.clone()],
+            u32::MAX,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+        )
+        .expect("first apply seeds h1");
+        assert_eq!(tip, Some(h1.block_hash()));
+
+        // Second apply: [h1, h2, h3]. h1 is known and matches at the
+        // expected height; partial idempotency skips it. h2 and h3 are
+        // new and get staged.
+        let update = apply_btc_header_batch(
+            vec![h1.clone(), h2.clone(), h3.clone()],
+            u32::MAX,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+        )
+        .expect("partial idempotency must succeed post-activation");
+
+        assert_eq!(
+            update.headers_added.len(),
+            2,
+            "h1 skipped (known); h2 + h3 staged"
+        );
+        assert_eq!(update.headers_added[0], h2.block_hash());
+        assert_eq!(update.headers_added[1], h3.block_hash());
+        assert_eq!(tip, Some(h3.block_hash()));
+        assert_eq!(tip_height, anchor.height + 3);
+        assert_eq!(headers_db.len(), 3);
+    }
+
+    #[test]
     fn replaying_identical_batch_is_noop_success() {
         // Issue #59: when /rpc/submitbtcheaders has already applied a batch
         // to chain state and the wrapping mempool tx is later mined into an

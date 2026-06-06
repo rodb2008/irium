@@ -1046,6 +1046,59 @@ mod tests {
     }
 
     #[test]
+    fn apply_ltc_header_batch_partial_overlap_skips_prefix() {
+        // v1.9.86 issue #72: partial idempotency for LTC. Mirror of the
+        // BTC test. Pre-v1.9.86 LTC always rejected already-known
+        // headers because apply_ltc_header_batch lacked the v1.9.52
+        // BTC-style idempotency; carrier blocks following a tip advance
+        // hard-rejected.
+        let (anchor, anchor_header) = fresh_anchor();
+        let h1 = mine_ltc_header(anchor.hash, anchor_header.time + 150, anchor.bits);
+        let h2 = mine_ltc_header(h1.block_hash(), anchor_header.time + 300, anchor.bits);
+        let h3 = mine_ltc_header(h2.block_hash(), anchor_header.time + 450, anchor.bits);
+        let mut headers_db: HashMap<[u8; 32], LtcHeaderEntry> = HashMap::new();
+        let mut heights_db: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut tip: Option<[u8; 32]> = None;
+        let mut tip_height: u64 = 0;
+
+        apply_ltc_header_batch(
+            vec![h1.clone()],
+            u32::MAX,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &RetargetParams::LITECOIN,
+        )
+        .expect("first apply seeds h1");
+        assert_eq!(tip, Some(h1.block_hash()));
+
+        let update = apply_ltc_header_batch(
+            vec![h1.clone(), h2.clone(), h3.clone()],
+            u32::MAX,
+            &mut headers_db,
+            &mut heights_db,
+            &mut tip,
+            &mut tip_height,
+            &anchor,
+            &RetargetParams::LITECOIN,
+        )
+        .expect("partial idempotency must succeed post-activation");
+
+        assert_eq!(
+            update.headers_added.len(),
+            2,
+            "h1 skipped (known); h2 + h3 staged"
+        );
+        assert_eq!(update.headers_added[0], h2.block_hash());
+        assert_eq!(update.headers_added[1], h3.block_hash());
+        assert_eq!(tip, Some(h3.block_hash()));
+        assert_eq!(tip_height, anchor.height + 3);
+        assert_eq!(headers_db.len(), 3);
+    }
+
+    #[test]
     fn apply_then_undo_restores_state() {
         let (anchor, anchor_header) = fresh_anchor();
         let h1 = mine_ltc_header(anchor.hash, anchor_header.time + 150, anchor.bits);
