@@ -4,4 +4,3 @@
 # Keep in sync with bootstrap/seedlist.txt.
 207.244.247.86
 157.173.116.134
-47.143.179.245

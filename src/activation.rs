@@ -20,29 +20,6 @@ pub const MAINNET_LWMA_ACTIVATION_HEIGHT: Option<u64> = Some(16_462);
 /// Historical consensus before this height is unaffected.
 pub const MAINNET_LWMA_V2_ACTIVATION_HEIGHT: Option<u64> = Some(19_740);
 
-/// v1.9.86 issue #72: apply-side idempotency activation timestamp.
-///
-/// When the iriumd block's time reaches or exceeds this Unix timestamp,
-/// `apply_*_header_batch` treats already-known headers as skip+continue
-/// rather than hard-reject. Closes the cache/apply tip race that caused
-/// carrier blocks to fail at apply time when the relay tip advanced
-/// between template build and mine. Pre-activation behavior is unchanged
-/// so nodes can upgrade without consensus risk during the transition.
-const MAINNET_APPLY_IDEMPOTENCY_ACTIVATION_TIMESTAMP: u64 = 1_780_744_179;
-
-/// Accessor with `IRIUM_APPLY_IDEMPOTENCY_ACTIVATION_TS` env override
-/// for tests and ops. Returns Some(timestamp) always (the constant is
-/// the production default; env wins if set to a valid u64).
-pub fn apply_idempotency_activation_timestamp() -> Option<u64> {
-    match std::env::var("IRIUM_APPLY_IDEMPOTENCY_ACTIVATION_TS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        Some(ts) => Some(ts),
-        None => Some(MAINNET_APPLY_IDEMPOTENCY_ACTIVATION_TIMESTAMP),
-    }
-}
-
 /// Mainnet block-time V2 activation height (T 600s → 120s + halving rescale).
 ///
 /// `None` keeps the chain on the V1 protocol target T=600s and the V1

@@ -17324,41 +17324,6 @@ async fn run_btc_header_sync_cycle(
         header_sync_touch_last_file("btc");
         return Ok("p2p_up_to_date".to_string());
     }
-    // v1.9.86 issue #71: verify header[0] extends our relay tip and the
-    // batch is internally chained. Without this, a peer on a different
-    // fork (or off-by-one in the locator walk) could pollute the cache
-    // with mis-aligned headers that fail at apply time.
-    let expected_btc_prev: [u8; 32] = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain.btc_tip.unwrap_or_else(|| {
-            chain
-                .params
-                .btc_spv
-                .as_ref()
-                .map(|p| p.anchor.hash)
-                .unwrap_or([0u8; 32])
-        })
-    };
-    let btc_first_prev: [u8; 32] = raw_headers[0][4..36].try_into().unwrap();
-    if btc_first_prev != expected_btc_prev {
-        return Err(format!(
-            "btc cycle: first header does not extend current relay tip (expected_prev={}, got={}); refusing to poison cache",
-            hex::encode(expected_btc_prev),
-            hex::encode(btc_first_prev)
-        ));
-    }
-    for (i, w) in raw_headers.windows(2).enumerate() {
-        let prev_hash = sha256d(&w[0]);
-        let next_prev: [u8; 32] = w[1][4..36].try_into().unwrap();
-        if prev_hash != next_prev {
-            return Err(format!(
-                "btc cycle: non-chained headers at index {} (h{}.hash != h{}.prev_hash); refusing to poison cache",
-                i + 1,
-                i,
-                i + 1
-            ));
-        }
-    }
     let count = raw_headers.len();
     let headers_hex: String = raw_headers.iter().map(hex::encode).collect();
     let live_relay_tip = {
@@ -17490,39 +17455,6 @@ async fn run_ltc_header_sync_cycle(
         if raw_headers.is_empty() {
             header_sync_touch_last_file("ltc");
             return Ok("p2p_up_to_date".to_string());
-        }
-        // v1.9.86 issue #71: verify header[0] extends our relay tip and
-        // the batch is internally chained. Same rationale as BTC above.
-        let expected_ltc_prev: [u8; 32] = {
-            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-            chain.ltc_tip.unwrap_or_else(|| {
-                chain
-                    .params
-                    .ltc_spv
-                    .as_ref()
-                    .map(|p| p.anchor.hash)
-                    .unwrap_or([0u8; 32])
-            })
-        };
-        let ltc_first_prev: [u8; 32] = raw_headers[0][4..36].try_into().unwrap();
-        if ltc_first_prev != expected_ltc_prev {
-            return Err(format!(
-                "ltc cycle: first header does not extend current relay tip (expected_prev={}, got={}); refusing to poison cache",
-                hex::encode(expected_ltc_prev),
-                hex::encode(ltc_first_prev)
-            ));
-        }
-        for (i, w) in raw_headers.windows(2).enumerate() {
-            let prev_hash = sha256d(&w[0]);
-            let next_prev: [u8; 32] = w[1][4..36].try_into().unwrap();
-            if prev_hash != next_prev {
-                return Err(format!(
-                    "ltc cycle: non-chained headers at index {} (h{}.hash != h{}.prev_hash); refusing to poison cache",
-                    i + 1,
-                    i,
-                    i + 1
-                ));
-            }
         }
         let count = raw_headers.len();
         let headers_hex: String = raw_headers.iter().map(hex::encode).collect();
@@ -17683,32 +17615,12 @@ async fn run_doge_header_sync_cycle(
             }
         };
 
-        // v1.9.85: refuse to cache a non-chained batch (intra-batch).
-        // v1.9.86 issue #71: also verify header[0].prev_hash extends our
-        // current relay tip (or anchor at cold start). Without this, a
-        // peer on a different fork could return chained-but-mis-aligned
-        // headers, and starting_height = doge_tip_height + 1 would
-        // mis-index AuxPoW HTTP fetches (every header 0 fails PoW at
-        // apply time).
-        let expected_doge_prev: [u8; 32] = {
-            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-            chain.doge_tip.unwrap_or_else(|| {
-                chain
-                    .params
-                    .doge_spv
-                    .as_ref()
-                    .map(|p| p.anchor.hash)
-                    .unwrap_or([0u8; 32])
-            })
-        };
-        let doge_first_prev: [u8; 32] = raw_headers[0][4..36].try_into().unwrap();
-        if doge_first_prev != expected_doge_prev {
-            return Err(format!(
-                "doge cycle: first header does not extend current relay tip (expected_prev={}, got={}); refusing to poison cache",
-                hex::encode(expected_doge_prev),
-                hex::encode(doge_first_prev)
-            ));
-        }
+        // Defensive: refuse to cache a non-chained batch. The cache is
+        // the only source for the coinbase carrier path (issue #69); a
+        // poisoned cache produces carriers that hard-reject every block
+        // they ride into. Pre-v1.9.85 doge_p2p's wire-format parse bug
+        // emitted exactly this pattern. Re-fetch on the next cycle is
+        // cheap (~10 min).
         for (i, w) in raw_headers.windows(2).enumerate() {
             let prev_hash = sha256d(&w[0]);
             let next_prev: [u8; 32] = w[1][4..36].try_into().unwrap();
