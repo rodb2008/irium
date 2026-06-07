@@ -15854,6 +15854,11 @@ async fn get_block_template(
                     }
                 }
             }
+            // v1.9.88: STRATUM_DOGE_CARRIERS=off skips only the DOGE carrier so
+            // BTC+LTC can remain active while the fork-block AuxPoW fetch
+            // mismatch is repaired (fetch by height returns canonical-chain
+            // AuxPoW for relay fork blocks — wrong hash, validation fails).
+            if std::env::var("STRATUM_DOGE_CARRIERS").as_deref() != Ok("off") {
             // DOGE — v1.9.63: same shape and re-enable rationale as LTC.
             let doge_cached = state
                 .doge_template_headers_cache
@@ -15913,17 +15918,25 @@ async fn get_block_template(
                                         .map(|h| ParsedDogeHeader { header: h, auxpow: None })
                                         .collect(),
                                 };
-                                if let Ok(script) = encode_doge_header_batch_with_auxpow(&items) {
-                                    out.push(CoinbaseExtraOutput {
-                                        value: 0,
-                                        script_pubkey_hex: hex::encode(script),
-                                    });
+                                match encode_doge_header_batch_with_auxpow(&items) {
+                                    Ok(script) => {
+                                        out.push(CoinbaseExtraOutput {
+                                            value: 0,
+                                            script_pubkey_hex: hex::encode(script),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[getblocktemplate] skip DOGE coinbase carrier (relay_tip={live}): {e}"
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+            } // end STRATUM_DOGE_CARRIERS guard
             out
         } else {
             Vec::new()
