@@ -789,10 +789,38 @@ pub fn write_block_json_with_source(
     block: &Block,
     submit_source: Option<&str>,
 ) -> std::io::Result<()> {
+    let block_hash = hex::encode(block.header.hash_for_height(height));
+    let existing = read_block_json_string(height)?;
+    let existing_has_matching_header = existing
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|v| {
+            v.get("header")
+                .and_then(|h| h.get("hash"))
+                .or_else(|| {
+                    v.get("block")
+                        .and_then(|b| b.get("header"))
+                        .and_then(|h| h.get("hash"))
+                })
+                .and_then(|h| h.as_str())
+                .map(|h| h == block_hash)
+        })
+        .unwrap_or(false);
+
+    if !existing_has_matching_header {
+        write_block_json_sync(height, block)?;
+    }
+
     let mut value = match read_block_json_string(height)? {
         Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
             .unwrap_or_else(|_| serde_json::json!({})),
-        None => serde_json::json!({}),
+        None => {
+            write_block_json_sync(height, block)?;
+            serde_json::from_str::<serde_json::Value>(
+                &read_block_json_string(height)?.unwrap_or_else(|| "{}".to_string()),
+            )
+            .unwrap_or_else(|_| serde_json::json!({}))
+        }
     };
 
     if let Some(src) = submit_source {
@@ -801,7 +829,6 @@ pub fn write_block_json_with_source(
 
     let json = serde_json::to_string_pretty(&value)?;
     write_block_json_string(height, &json)?;
-    let _ = block;
     Ok(())
 }
 
