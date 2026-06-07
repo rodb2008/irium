@@ -520,12 +520,44 @@ pub fn apply_btc_header_batch(
         }
     }
 
-    let mut prev_hash = first.prev_hash;
-    let mut prev_height = start_prev_height;
-    let mut prev_work = start_prev_work;
-    let mut staged: Vec<([u8; 32], BtcHeaderEntry)> = Vec::with_capacity(headers.len());
+    let mut known_prefix = 0usize;
+    let mut prefix_prev_hash = first.prev_hash;
+    let mut prefix_prev_height = start_prev_height;
+    let mut prefix_prev_work = start_prev_work.clone();
+    for header in headers.iter() {
+        if header.prev_hash != prefix_prev_hash {
+            break;
+        }
+        let expected_height = prefix_prev_height + 1;
+        let hash = header.block_hash();
+        let Some(entry) = btc_headers.get(&hash) else {
+            break;
+        };
+        if entry.height != expected_height || entry.header != *header {
+            break;
+        }
+        known_prefix += 1;
+        prefix_prev_hash = hash;
+        prefix_prev_height = expected_height;
+        prefix_prev_work = entry.total_work.clone();
+    }
+    if known_prefix == headers.len() {
+        return Ok(BtcRelayUpdate {
+            tip_before: *btc_tip,
+            tip_height_before: *btc_tip_height,
+            headers_added: Vec::new(),
+        });
+    }
 
-    for (i, header) in headers.iter().enumerate() {
+    let mut prev_hash = prefix_prev_hash;
+    let mut prev_height = prefix_prev_height;
+    let mut prev_work = prefix_prev_work;
+    let headers_to_apply = &headers[known_prefix..];
+    let mut staged: Vec<([u8; 32], BtcHeaderEntry)> =
+        Vec::with_capacity(headers_to_apply.len());
+
+    for (offset, header) in headers_to_apply.iter().enumerate() {
+        let i = known_prefix + offset;
         if header.prev_hash != prev_hash {
             return Err(format!(
                 "apply_btc_header_batch: header {} does not link to previous",

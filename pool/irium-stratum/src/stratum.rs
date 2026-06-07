@@ -34,6 +34,9 @@ const LWMA_MIN_RETARGET_SECS: u64 = 10;
 /// is below this threshold. Reduces stale-share blowback from
 /// micro-adjustments the miner can't usefully react to.
 const LWMA_CHANGE_THRESHOLD: f64 = 0.05;
+const VERSION_ROLLING_MASK: &str = "1fffe000";
+const MIN_REQUESTED_DIFF: u64 = 256;
+const MAX_REQUESTED_DIFF: u64 = 2_000_000;
 /// Per-interval clamp fed into LWMA: any single observed interval longer
 /// than (clamp_multiplier * target_secs) is treated as a connection gap
 /// rather than a true slowdown, preventing one pause from collapsing diff.
@@ -1091,13 +1094,11 @@ pub async fn run(config: StratumConfig) -> Result<()> {
 /// Accepts: "d=8192", "x,d=8192", "anything,d=8192,more", with
 /// whitespace around each segment. The first `d=` token wins.
 fn parse_miner_requested_diff(password: &str) -> Option<f64> {
-    const MIN_REQUESTED: u64 = 256;
-    const MAX_REQUESTED: u64 = 2_000_000;
     for part in password.split(',') {
         let trimmed = part.trim();
         if let Some(value) = trimmed.strip_prefix("d=") {
             if let Ok(n) = value.parse::<u64>() {
-                if (MIN_REQUESTED..=MAX_REQUESTED).contains(&n) {
+                if (MIN_REQUESTED_DIFF..=MAX_REQUESTED_DIFF).contains(&n) {
                     return Some(n as f64);
                 }
             }
@@ -1105,6 +1106,18 @@ fn parse_miner_requested_diff(password: &str) -> Option<f64> {
         }
     }
     None
+}
+
+fn parse_suggested_difficulty(params: &[Value]) -> Option<f64> {
+    let v = params.first()?.as_f64()?;
+    if !v.is_finite() {
+        return None;
+    }
+    let rounded = v.round();
+    if rounded < MIN_REQUESTED_DIFF as f64 || rounded > MAX_REQUESTED_DIFF as f64 {
+        return None;
+    }
+    Some(rounded)
 }
 
 fn select_adapter_kind(config: &StratumConfig) -> AdapterKind {
@@ -1773,7 +1786,7 @@ async fn handle_message(
                 "id": id,
                 "result": {
                     "version-rolling": true,
-                    "version-rolling.mask": "1fffe000"
+                    "version-rolling.mask": VERSION_ROLLING_MASK
                 },
                 "error": null
             });
@@ -1783,29 +1796,52 @@ async fn handle_message(
             let mask_msg = json!({
                 "id": Value::Null,
                 "method": "mining.set_version_mask",
-                "params": ["1fffe000"]
+                "params": [VERSION_ROLLING_MASK]
             });
             write_json(wr, &mask_msg).await?;
             info!(
-                "[configure] conn={} version_rolling=true mask=1fffe000",
-                conn_id
+                "[configure] conn={} version_rolling=true mask={}",
+                conn_id, VERSION_ROLLING_MASK
             );
         }
         "mining.suggest_difficulty" => {
             // Some cgminer-family / Antminer firmware sends a difficulty hint
-            // (mining.suggest_difficulty [diff]) before subscribe. We honour
-            // vardiff regardless; acknowledge with true so the miner does not
-            // log an error or disconnect.
+            // (mining.suggest_difficulty [diff]) before or after subscribe.
+            // Whatsminer/v1.1 sends this after the initial job; if we merely
+            // ACK while keeping a much higher password difficulty, the miner
+            // can remain connected but submit nothing for a long interval.
+            if let Some(diff) = parse_suggested_difficulty(&params) {
+                session.fixed_difficulty = Some(diff);
+                session.difficulty = diff;
+                info!(
+                    "[diff] worker={} fixed_diff={} source=miner_suggested",
+                    session.worker.as_deref().unwrap_or("-"),
+                    diff as u64
+                );
+            }
             let resp = json!({"id": id, "result": true, "error": null});
             write_json(wr, &resp).await?;
+            if session.pkh.is_some() {
+                send_set_difficulty(wr, conn_id, session.worker.as_deref(), session.difficulty).await?;
+            }
         }
         "mining.multi_version" => {
-            // Older Whatsminer BTMiner firmware sends mining.multi_version
-            // to request multi-block-version templates. We do not support it;
-            // return result: false so the miner falls back to single-version
-            // mode rather than treating an error as fatal.
-            let resp = json!({"id": id, "result": false, "error": null});
+            // Older Whatsminer BTMiner firmware negotiates version rolling
+            // with mining.multi_version instead of BIP310 mining.configure.
+            info!(
+                "[multi_version] conn={} worker={} enabled=true mask={}",
+                conn_id,
+                session.worker.as_deref().unwrap_or("-"),
+                VERSION_ROLLING_MASK
+            );
+            let resp = json!({"id": id, "result": true, "error": null});
             write_json(wr, &resp).await?;
+            let mask = json!({
+                "id": Value::Null,
+                "method": "mining.set_version_mask",
+                "params": [VERSION_ROLLING_MASK]
+            });
+            write_json(wr, &mask).await?;
         }
         "mining.subscribe" => {
             // v1.9.77: capture firmware identifier from params[0] so
@@ -1957,6 +1993,15 @@ async fn handle_message(
             session.wants_extranonce_updates = true;
             let resp = json!({"id": id, "result": true, "error": null});
             write_json(wr, &resp).await?;
+            if session.pkh.is_some() {
+                let cur = current.read().await;
+                if let Some(job) = cur.clone() {
+                    session.current_snapshot = Some(build_canonical_job_snapshot(&job, session, config)?);
+                    session.current_job = Some(job.clone());
+                    send_set_difficulty(wr, conn_id, session.worker.as_deref(), session.difficulty).await?;
+                    send_notify(wr, session, &job, true).await?;
+                }
+            }
         }
         _ => {
             let resp = json!({"id": id, "result": null, "error": [20, "unsupported method", null]});
@@ -3481,7 +3526,12 @@ async fn send_set_difficulty(
         "[diff] send conn={} worker={} assigned_diff={}",
         conn_id, worker_name, diff
     );
-    let msg = json!({"id": Value::Null, "method": "mining.set_difficulty", "params": [diff]});
+    let diff_value = if diff.is_finite() && diff.fract() == 0.0 && diff >= 0.0 {
+        json!(diff as u64)
+    } else {
+        json!(diff)
+    };
+    let msg = json!({"id": Value::Null, "method": "mining.set_difficulty", "params": [diff_value]});
     write_json(wr, &msg).await
 }
 

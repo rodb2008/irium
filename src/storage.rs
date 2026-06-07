@@ -725,12 +725,21 @@ fn maybe_quarantine_existing_block(height: u64, new_hash: &str) -> std::io::Resu
 }
 
 fn maybe_advance_contiguous(_dir: &Path, written_height: u64) {
-    let contiguous = persisted_contiguous_height();
-    if written_height == contiguous.saturating_add(1) {
-        // Advance strictly one height at a time based on freshly persisted blocks.
-        // Do not leap ahead by file existence alone; old fork files can create false continuity.
-        set_persisted_contiguous_height(written_height);
+    let mut contiguous = persisted_contiguous_height();
+    if written_height <= contiguous {
+        return;
     }
+
+    let max_height = persisted_height().max(written_height);
+    while contiguous < max_height {
+        let next = contiguous.saturating_add(1);
+        match read_block_json_string(next) {
+            Ok(Some(_)) => contiguous = next,
+            _ => break,
+        }
+    }
+
+    set_persisted_contiguous_height(contiguous);
 }
 
 fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {

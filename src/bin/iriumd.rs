@@ -1565,6 +1565,35 @@ struct BlockTemplateResponse {
     coinbase_extra_outputs: Vec<CoinbaseExtraOutput>,
 }
 
+fn validate_doge_template_items(items: &[ParsedDogeHeader]) -> Result<(), String> {
+    for (i, item) in items.iter().enumerate() {
+        let has_auxpow_bit =
+            (item.header.version as u32) & irium_node_rs::auxpow::AUXPOW_VERSION_BIT != 0;
+        if has_auxpow_bit {
+            let bytes = item.auxpow.as_ref().ok_or_else(|| {
+                format!("doge template header {i} has AuxPoW bit but no AuxPoW bytes")
+            })?;
+            let mut off = 0usize;
+            let auxpow = irium_node_rs::auxpow::deserialize(bytes, &mut off)
+                .map_err(|e| format!("doge template header {i} auxpow decode failed: {e}"))?;
+            if off != bytes.len() {
+                return Err(format!(
+                    "doge template header {i} auxpow has {} trailing bytes",
+                    bytes.len() - off
+                ));
+            }
+            if !item.header.meets_pow_auxpow(&auxpow) {
+                return Err(format!("doge template header {i} AuxPoW does not validate"));
+            }
+        } else if !item.header.meets_pow() {
+            return Err(format!(
+                "doge template header {i} standalone PoW does not validate"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct SubmitBlockHeader {
     version: u32,
@@ -15918,7 +15947,9 @@ async fn get_block_template(
                                         .map(|h| ParsedDogeHeader { header: h, auxpow: None })
                                         .collect(),
                                 };
-                                match encode_doge_header_batch_with_auxpow(&items) {
+                                match validate_doge_template_items(&items)
+                                    .and_then(|_| encode_doge_header_batch_with_auxpow(&items))
+                                {
                                     Ok(script) => {
                                         out.push(CoinbaseExtraOutput {
                                             value: 0,
@@ -15926,8 +15957,22 @@ async fn get_block_template(
                                         });
                                     }
                                     Err(e) => {
+                                        {
+                                            let mut cache = state
+                                                .doge_template_headers_cache
+                                                .lock()
+                                                .unwrap_or_else(|err| err.into_inner());
+                                            *cache = None;
+                                        }
+                                        {
+                                            let mut auxpow_cache = state
+                                                .doge_template_auxpow_cache
+                                                .lock()
+                                                .unwrap_or_else(|err| err.into_inner());
+                                            *auxpow_cache = None;
+                                        }
                                         eprintln!(
-                                            "[getblocktemplate] skip DOGE coinbase carrier (relay_tip={live}): {e}"
+                                            "[getblocktemplate] disabled DOGE coinbase carrier cache (relay_tip={live}): {e}"
                                         );
                                     }
                                 }
@@ -18030,11 +18075,16 @@ async fn main() {
 
     // Build seed list: merge config, signed, and runtime seeds; filter locals.
     // Derive default seed port from the configured P2P bind address; 0 = no default.
-    let default_seed_port: u16 = std::env::var("IRIUM_P2P_BIND").ok()
-        .or_else(|| node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.clone()))
-        .as_deref()
-        .and_then(|b| b.split(':').next_back())
+    let default_seed_port: u16 = std::env::var("IRIUM_P2P_SEED_PORT")
+        .ok()
         .and_then(|p| p.parse().ok())
+        .or_else(|| {
+            std::env::var("IRIUM_P2P_BIND").ok()
+                .or_else(|| node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.clone()))
+                .as_deref()
+                .and_then(|b| b.split(':').next_back())
+                .and_then(|p| p.parse().ok())
+        })
         .unwrap_or(0);
 
     ensure_seedlist_in_bootstrap_dir();

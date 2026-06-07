@@ -1100,15 +1100,15 @@ impl ChainState {
         // height-aware hash. Pre-Fix-2a the hash was computed before height,
         // but the post-30000 byte-order convention depends on height.
         let prev_hash = header.prev_hash;
-        let (parent_height, parent_work) = if let Some(h) = self.headers.get(&prev_hash) {
-            (h.height, h.work.clone())
-        } else if let Some(h) = self.heights.get(&prev_hash) {
+        let (parent_height, parent_work) = if let Some(h) = self.heights.get(&prev_hash) {
             let work = self
                 .cumulative_work
                 .get(&prev_hash)
                 .cloned()
                 .unwrap_or_else(BigUint::zero);
             (*h, work)
+        } else if let Some(h) = self.headers.get(&prev_hash) {
+            (h.height, h.work.clone())
         } else {
             return Err("unknown parent".to_string());
         };
@@ -1434,6 +1434,10 @@ impl ChainState {
         // still applies; a block cannot carry both a coinbase batch and
         // a regular-tx batch for the same chain.
         let coinbase_batch_active = self.coinbase_header_batch_active_at(height);
+        let coinbase_carrier_soft_apply_error = |e: &str| {
+            e.contains("first header does not connect to known chain")
+                || e.contains("already known in chain state")
+        };
         let mut coinbase_btc_batch_count = 0u32;
         let mut coinbase_ltc_batch_count = 0u32;
         let mut coinbase_doge_batch_count = 0u32;
@@ -1465,7 +1469,7 @@ impl ChainState {
                 let headers = parse_btc_header_batch(&output.script_pubkey)
                     .map_err(|e| format!("coinbase BtcHeaderBatch parse failed: {}", e))?;
                 let anchor = self.btc_anchor();
-                let update = apply_btc_header_batch(
+                match apply_btc_header_batch(
                     headers,
                     block.header.time,
                     &mut self.btc_headers,
@@ -1473,8 +1477,11 @@ impl ChainState {
                     &mut self.btc_tip,
                     &mut self.btc_tip_height,
                     &anchor,
-                )?;
-                btc_relay_update = Some(update);
+                ) {
+                    Ok(update) => btc_relay_update = Some(update),
+                    Err(e) if coinbase_carrier_soft_apply_error(&e) => {}
+                    Err(e) => return Err(e),
+                }
                 continue;
             }
             if tag == Some(LTC_HEADER_BATCH_TAG) {
@@ -1504,7 +1511,7 @@ impl ChainState {
                     .map_err(|e| format!("coinbase LtcHeaderBatch parse failed: {}", e))?;
                 let anchor = self.ltc_anchor();
                 let retarget = self.ltc_retarget_params();
-                let update = apply_ltc_header_batch(
+                match apply_ltc_header_batch(
                     headers,
                     block.header.time,
                     &mut self.ltc_headers,
@@ -1513,8 +1520,11 @@ impl ChainState {
                     &mut self.ltc_tip_height,
                     &anchor,
                     &retarget,
-                )?;
-                ltc_relay_update = Some(update);
+                ) {
+                    Ok(update) => ltc_relay_update = Some(update),
+                    Err(e) if coinbase_carrier_soft_apply_error(&e) => {}
+                    Err(e) => return Err(e),
+                }
                 continue;
             }
             if tag == Some(DOGE_HEADER_BATCH_TAG) {
@@ -1544,7 +1554,7 @@ impl ChainState {
                     .map_err(|e| format!("coinbase DogeHeaderBatch parse failed: {}", e))?;
                 let anchor = self.doge_anchor();
                 let retarget = self.doge_retarget_params();
-                let update = apply_doge_header_batch_with_auxpow(
+                match apply_doge_header_batch_with_auxpow(
                     parsed_items,
                     block.header.time,
                     &mut self.doge_headers,
@@ -1553,8 +1563,11 @@ impl ChainState {
                     &mut self.doge_tip_height,
                     &anchor,
                     &retarget,
-                )?;
-                doge_relay_update = Some(update);
+                ) {
+                    Ok(update) => doge_relay_update = Some(update),
+                    Err(e) if coinbase_carrier_soft_apply_error(&e) => {}
+                    Err(e) => return Err(e),
+                }
                 continue;
             }
             validate_output(
@@ -1822,7 +1835,7 @@ impl ChainState {
         // order depends on the block's height, so we cannot compute the hash
         // (and use it as a map key) until we know which height to bind to.
         let parent_hash = block.header.prev_hash;
-        if parent_hash != [0u8; 32] && !self.heights.contains_key(&parent_hash) {
+        if parent_hash != [0u8; 32] && !self.block_store.contains_key(&parent_hash) {
             self.orphan_pool.entry(parent_hash).or_default().push(block);
             self.prune_orphan_pool();
             return Err("block stored as orphan (prev hash unknown)".to_string());
@@ -1835,7 +1848,7 @@ impl ChainState {
         };
 
         let hash = block.header.hash_for_height(block_height);
-        if self.heights.contains_key(&hash) {
+        if self.block_store.contains_key(&hash) {
             return Err("duplicate block".to_string());
         }
 
@@ -1878,10 +1891,23 @@ impl ChainState {
         self.heights.insert(hash, height);
         self.cumulative_work.insert(hash, cumulative.clone());
 
-        if parent_hash == self.tip_hash() && cumulative > self.total_work {
-            self.connect_block(block)?;
+        let mut advanced_tip = false;
+        if parent_hash == self.tip_hash() {
+            if let Err(e) = self.connect_block(block.clone()) {
+                self.block_store.remove(&hash);
+                self.heights.remove(&hash);
+                self.cumulative_work.remove(&hash);
+                return Err(e);
+            }
+            advanced_tip = true;
         } else if cumulative > self.total_work {
-            self.reorg_to_tip(hash)?;
+            if let Err(e) = self.reorg_to_tip(hash) {
+                self.block_store.remove(&hash);
+                self.heights.remove(&hash);
+                self.cumulative_work.remove(&hash);
+                return Err(e);
+            }
+            advanced_tip = true;
         }
 
         let mut new_hash = self.tip_hash();
@@ -1893,6 +1919,10 @@ impl ChainState {
             }
         }
         self.prune_caches();
+
+        if !advanced_tip && self.tip_hash() != hash {
+            return Err("block stored on side chain".to_string());
+        }
 
         Ok((self.height, self.tip_hash()))
     }

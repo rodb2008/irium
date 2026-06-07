@@ -870,6 +870,18 @@ fn block_range_owners() -> Arc<Mutex<HashMap<Vec<u8>, (IpAddr, Instant)>>> {
         .clone()
 }
 
+async fn peer_block_lock(ip: IpAddr) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Arc<Mutex<HashMap<IpAddr, Arc<Mutex<()>>>>>> = OnceLock::new();
+    let locks = LOCKS
+        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone();
+    let mut guard = locks.lock().await;
+    guard
+        .entry(ip)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 fn range_key(start_hash: &[u8], count: u32) -> Vec<u8> {
     let mut key = Vec::with_capacity(4 + start_hash.len());
     key.extend_from_slice(&count.to_be_bytes());
@@ -1796,6 +1808,31 @@ fn locator_hash_at_height(chain: &ChainState, height: u64) -> [u8; 32] {
         .get(height as usize)
         .map(|b| b.header.hash_for_height(height))
         .unwrap_or([0u8; 32])
+}
+
+fn rewinded_getblocks_request(chain: &ChainState, peer_height: u64) -> Option<([u8; 32], u32)> {
+    let tip_height = chain.tip_height();
+    if peer_height <= tip_height {
+        return None;
+    }
+
+    let max = MAX_BLOCKS_PER_REQUEST as u64;
+    let ahead = peer_height.saturating_sub(tip_height);
+    let rewind = if ahead < max {
+        max.saturating_sub(ahead)
+    } else {
+        max / 2
+    }
+    .min(tip_height);
+    let start_height = tip_height.saturating_sub(rewind);
+    let count = peer_height
+        .saturating_sub(start_height)
+        .min(max) as u32;
+    if count == 0 {
+        return None;
+    }
+
+    Some((locator_hash_at_height(chain, start_height), count))
 }
 
 struct OutboundDialGuard {
@@ -2891,7 +2928,10 @@ impl P2PNode {
 
     fn is_soft_block_reject(reason: &str) -> bool {
         let msg = reason.to_lowercase();
-        msg.contains("duplicate block") || msg.contains("orphan") || msg.contains("unknown parent")
+        msg.contains("duplicate block")
+            || msg.contains("orphan")
+            || msg.contains("unknown parent")
+            || msg.contains("side chain")
     }
 
     fn is_duplicate_block(reason: &str) -> bool {
@@ -3864,10 +3904,10 @@ impl P2PNode {
             if prev_peek == [0u8; 32] {
                 0
             } else if let Some(h) = guard
-                .headers
+                .heights
                 .get(&prev_peek)
-                .map(|hw| hw.height)
-                .or_else(|| guard.heights.get(&prev_peek).copied())
+                .copied()
+                .or_else(|| guard.headers.get(&prev_peek).map(|hw| hw.height))
             {
                 h + 1
             } else {
@@ -5221,10 +5261,10 @@ impl P2PNode {
                                             let header_height = if prev_peek == [0u8; 32] {
                                                 0
                                             } else if let Some(h) = guard
-                                                .headers
+                                                .heights
                                                 .get(&prev_peek)
-                                                .map(|hw| hw.height)
-                                                .or_else(|| guard.heights.get(&prev_peek).copied())
+                                                .copied()
+                                                .or_else(|| guard.headers.get(&prev_peek).map(|hw| hw.height))
                                             {
                                                 h + 1
                                             } else {
@@ -5526,12 +5566,19 @@ impl P2PNode {
                                                 if start_hash != [0u8; 32]
                                                     && !guard.heights.contains_key(&start_hash)
                                                 {
-                                                    let tip_h = guard.tip_height();
-                                                    start_hash = guard
-                                                        .chain
-                                                        .last()
-                                                        .map(|b| b.header.hash_for_height(tip_h))
-                                                        .unwrap_or([0u8; 32]);
+                                                    start_hash = rewinded_getblocks_request(
+                                                        &guard,
+                                                        peer_height,
+                                                    )
+                                                    .map(|(hash, _)| hash)
+                                                    .unwrap_or_else(|| {
+                                                        let tip_h = guard.tip_height();
+                                                        guard
+                                                            .chain
+                                                            .last()
+                                                            .map(|b| b.header.hash_for_height(tip_h))
+                                                            .unwrap_or([0u8; 32])
+                                                    });
                                                 }
                                                 let count = std::cmp::min(
                                                     path.len(),
@@ -5547,22 +5594,27 @@ impl P2PNode {
                                                 None
                                             }
                                         } else {
-                                            let tip_h = guard.tip_height();
-                                            let start_hash = guard
-                                                .chain
-                                                .last()
-                                                .map(|b| b.header.hash_for_height(tip_h))
-                                                .unwrap_or([0u8; 32]);
-                                            let count = std::cmp::min(
-                                                best.height.saturating_sub(tip_h) as usize,
-                                                MAX_BLOCKS_PER_REQUEST as usize,
-                                            ) as u32;
-                                            if count > 0 {
-                                                Some((start_hash, count))
-                                            } else {
-                                                None
-                                            }
+                                            rewinded_getblocks_request(&guard, peer_height)
+                                                .or_else(|| {
+                                                    let tip_h = guard.tip_height();
+                                                    let start_hash = guard
+                                                        .chain
+                                                        .last()
+                                                        .map(|b| b.header.hash_for_height(tip_h))
+                                                        .unwrap_or([0u8; 32]);
+                                                    let count = std::cmp::min(
+                                                        best.height.saturating_sub(tip_h) as usize,
+                                                        MAX_BLOCKS_PER_REQUEST as usize,
+                                                    ) as u32;
+                                                    if count > 0 {
+                                                        Some((start_hash, count))
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
                                         }
+                                    } else if peer_height > guard.tip_height() {
+                                        rewinded_getblocks_request(&guard, peer_height)
                                     } else {
                                         None
                                     }
@@ -5781,6 +5833,8 @@ impl P2PNode {
                     MessageType::Block => {
                         if let Some(ref chain_arc) = chain_for_sync {
                             if let Ok(payload) = BlockPayload::from_message(&msg) {
+                                let peer_block_lock = peer_block_lock(addr.ip()).await;
+                                let _peer_block_guard = peer_block_lock.lock_owned().await;
                                 let decode_started = Instant::now();
                                 // Peek prev_hash → look up parent → derive
                                 // block_height before height-aware deserialize.
@@ -5800,10 +5854,10 @@ impl P2PNode {
                                     if prev_peek == [0u8; 32] {
                                         0
                                     } else if let Some(h) = guard
-                                        .headers
+                                        .heights
                                         .get(&prev_peek)
-                                        .map(|hw| hw.height)
-                                        .or_else(|| guard.heights.get(&prev_peek).copied())
+                                        .copied()
+                                        .or_else(|| guard.headers.get(&prev_peek).map(|hw| hw.height))
                                     {
                                         h + 1
                                     } else {
@@ -7564,10 +7618,10 @@ async fn handle_incoming_with_sybil(
                                         let header_height = if prev_peek == [0u8; 32] {
                                             0
                                         } else if let Some(h) = guard
-                                            .headers
+                                            .heights
                                             .get(&prev_peek)
-                                            .map(|hw| hw.height)
-                                            .or_else(|| guard.heights.get(&prev_peek).copied())
+                                            .copied()
+                                            .or_else(|| guard.headers.get(&prev_peek).map(|hw| hw.height))
                                         {
                                             h + 1
                                         } else {
@@ -7886,12 +7940,19 @@ async fn handle_incoming_with_sybil(
                                             if start_hash != [0u8; 32]
                                                 && !guard.heights.contains_key(&start_hash)
                                             {
-                                                let tip_h = guard.tip_height();
-                                                start_hash = guard
-                                                    .chain
-                                                    .last()
-                                                    .map(|b| b.header.hash_for_height(tip_h))
-                                                    .unwrap_or([0u8; 32]);
+                                                start_hash = rewinded_getblocks_request(
+                                                    &guard,
+                                                    peer_height,
+                                                )
+                                                .map(|(hash, _)| hash)
+                                                .unwrap_or_else(|| {
+                                                    let tip_h = guard.tip_height();
+                                                    guard
+                                                        .chain
+                                                        .last()
+                                                        .map(|b| b.header.hash_for_height(tip_h))
+                                                        .unwrap_or([0u8; 32])
+                                                });
                                             }
                                             let count = std::cmp::min(
                                                 path.len(),
@@ -7907,22 +7968,27 @@ async fn handle_incoming_with_sybil(
                                             None
                                         }
                                     } else {
-                                        let tip_h = guard.tip_height();
-                                        let start_hash = guard
-                                            .chain
-                                            .last()
-                                            .map(|b| b.header.hash_for_height(tip_h))
-                                            .unwrap_or([0u8; 32]);
-                                        let count = std::cmp::min(
-                                            best.height.saturating_sub(tip_h) as usize,
-                                            MAX_BLOCKS_PER_REQUEST as usize,
-                                        ) as u32;
-                                        if count > 0 {
-                                            Some((start_hash, count))
-                                        } else {
-                                            None
-                                        }
+                                        rewinded_getblocks_request(&guard, peer_height)
+                                            .or_else(|| {
+                                                let tip_h = guard.tip_height();
+                                                let start_hash = guard
+                                                    .chain
+                                                    .last()
+                                                    .map(|b| b.header.hash_for_height(tip_h))
+                                                    .unwrap_or([0u8; 32]);
+                                                let count = std::cmp::min(
+                                                    best.height.saturating_sub(tip_h) as usize,
+                                                    MAX_BLOCKS_PER_REQUEST as usize,
+                                                ) as u32;
+                                                if count > 0 {
+                                                    Some((start_hash, count))
+                                                } else {
+                                                    None
+                                                }
+                                            })
                                     }
+                                } else if peer_height > guard.tip_height() {
+                                    rewinded_getblocks_request(&guard, peer_height)
                                 } else {
                                     None
                                 }
@@ -8151,6 +8217,8 @@ async fn handle_incoming_with_sybil(
 
                         tokio::spawn(async move {
                             let permit_guard = permit;
+                            let peer_block_lock = peer_block_lock(addr2.ip()).await;
+                            let _peer_block_guard = peer_block_lock.lock_owned().await;
 
                             // Peek prev_hash → look up parent → derive
                             // block_height before height-aware deserialize.
@@ -8175,10 +8243,10 @@ async fn handle_incoming_with_sybil(
                                 if prev_peek == [0u8; 32] {
                                     0
                                 } else if let Some(h) = guard
-                                    .headers
+                                    .heights
                                     .get(&prev_peek)
-                                    .map(|hw| hw.height)
-                                    .or_else(|| guard.heights.get(&prev_peek).copied())
+                                    .copied()
+                                    .or_else(|| guard.headers.get(&prev_peek).map(|hw| hw.height))
                                 {
                                     h + 1
                                 } else {
@@ -8253,7 +8321,16 @@ async fn handle_incoming_with_sybil(
                                         }
                                         Err(e) => {
                                             if P2PNode::is_soft_block_reject(&e) {
-                                                // ignore
+                                                if !P2PNode::is_duplicate_block(&e) {
+                                                    P2PNode::log_event(
+                                                        "info",
+                                                        "chain",
+                                                        format!(
+                                                            "P2P {}: ignored block {} ({})",
+                                                            addr2, short, e
+                                                        ),
+                                                    );
+                                                }
                                             } else {
                                                 verdict = Some(false);
                                                 P2PNode::log_event(

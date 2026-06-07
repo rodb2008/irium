@@ -1013,12 +1013,45 @@ pub fn apply_doge_header_batch_with_auxpow(
     };
 
     let auxpow_activation = crate::activation::doge_auxpow_activation_height();
-    let mut prev_hash = first.prev_hash;
-    let mut prev_height = start_prev_height;
-    let mut prev_work = start_prev_work;
-    let mut staged: Vec<([u8; 32], DogeHeaderEntry)> = Vec::with_capacity(items.len());
+    let mut known_prefix = 0usize;
+    let mut prefix_prev_hash = first.prev_hash;
+    let mut prefix_prev_height = start_prev_height;
+    let mut prefix_prev_work = start_prev_work.clone();
+    for parsed in items.iter() {
+        let header = &parsed.header;
+        if header.prev_hash != prefix_prev_hash {
+            break;
+        }
+        let expected_height = prefix_prev_height + 1;
+        let hash = header.block_hash();
+        let Some(entry) = doge_headers.get(&hash) else {
+            break;
+        };
+        if entry.height != expected_height || entry.header != *header {
+            break;
+        }
+        known_prefix += 1;
+        prefix_prev_hash = hash;
+        prefix_prev_height = expected_height;
+        prefix_prev_work = entry.total_work.clone();
+    }
+    if known_prefix == items.len() {
+        return Ok(DogeRelayUpdate {
+            tip_before: *doge_tip,
+            tip_height_before: *doge_tip_height,
+            headers_added: Vec::new(),
+        });
+    }
 
-    for (i, parsed) in items.iter().enumerate() {
+    let mut prev_hash = prefix_prev_hash;
+    let mut prev_height = prefix_prev_height;
+    let mut prev_work = prefix_prev_work;
+    let items_to_apply = &items[known_prefix..];
+    let mut staged: Vec<([u8; 32], DogeHeaderEntry)> =
+        Vec::with_capacity(items_to_apply.len());
+
+    for (offset, parsed) in items_to_apply.iter().enumerate() {
+        let i = known_prefix + offset;
         let header = &parsed.header;
         if header.prev_hash != prev_hash {
             return Err(format!(
