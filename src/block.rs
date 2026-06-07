@@ -271,7 +271,10 @@ impl Block {
     pub fn deserialize_for_height(raw: &[u8], height: u64) -> Result<(Self, usize), String> {
         let (header, mut offset) = BlockHeader::deserialize_for_height(raw, height)?;
 
-        let auxpow = if header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 {
+        let auxpow_active = crate::activation::MAINNET_AUXPOW_ACTIVATION_HEIGHT
+            .map(|activation_height| height >= activation_height)
+            .unwrap_or(false);
+        let auxpow = if header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 && auxpow_active {
             Some(crate::auxpow::deserialize(raw, &mut offset)?)
         } else {
             None

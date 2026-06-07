@@ -5547,7 +5547,21 @@ impl P2PNode {
                                                 None
                                             }
                                         } else {
-                                            None
+                                            let tip_h = guard.tip_height();
+                                            let start_hash = guard
+                                                .chain
+                                                .last()
+                                                .map(|b| b.header.hash_for_height(tip_h))
+                                                .unwrap_or([0u8; 32]);
+                                            let count = std::cmp::min(
+                                                best.height.saturating_sub(tip_h) as usize,
+                                                MAX_BLOCKS_PER_REQUEST as usize,
+                                            ) as u32;
+                                            if count > 0 {
+                                                Some((start_hash, count))
+                                            } else {
+                                                None
+                                            }
                                         }
                                     } else {
                                         None
@@ -7893,7 +7907,21 @@ async fn handle_incoming_with_sybil(
                                             None
                                         }
                                     } else {
-                                        None
+                                        let tip_h = guard.tip_height();
+                                        let start_hash = guard
+                                            .chain
+                                            .last()
+                                            .map(|b| b.header.hash_for_height(tip_h))
+                                            .unwrap_or([0u8; 32]);
+                                        let count = std::cmp::min(
+                                            best.height.saturating_sub(tip_h) as usize,
+                                            MAX_BLOCKS_PER_REQUEST as usize,
+                                        ) as u32;
+                                        if count > 0 {
+                                            Some((start_hash, count))
+                                        } else {
+                                            None
+                                        }
                                     }
                                 } else {
                                     None

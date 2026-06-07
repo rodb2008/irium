@@ -1584,7 +1584,9 @@ async fn template_loop(
 /// included, the backward-compat path.
 fn is_small_buffer_firmware(user_agent: &str) -> bool {
     let ua = user_agent.to_ascii_lowercase();
-    ua.contains("nerdqaxe")
+    ua.contains("whatsminer")
+        || ua.contains("btminer")
+        || ua.contains("nerdqaxe")
         || ua.contains("bitaxe")
         || ua.contains("esp-miner")
         || ua.contains("bm1370")

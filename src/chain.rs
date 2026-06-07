@@ -1706,12 +1706,22 @@ impl ChainState {
             .unwrap_or([0u8; 32])
     }
 
+    fn is_connected_chain_hash(&self, hash: &[u8; 32]) -> bool {
+        let Some(height) = self.heights.get(hash).copied() else {
+            return false;
+        };
+        let Some(block) = self.chain.get(height as usize) else {
+            return false;
+        };
+        block.header.hash_for_height(height) == *hash
+    }
+
     /// Path of header hashes from the nearest known block up to the provided header tip.
     pub fn header_path_to_known(&self, tip: [u8; 32]) -> Option<Vec<[u8; 32]>> {
         let mut path = Vec::new();
         let mut current = tip;
         loop {
-            if self.heights.contains_key(&current) {
+            if self.is_connected_chain_hash(&current) {
                 path.reverse();
                 return Some(path);
             }

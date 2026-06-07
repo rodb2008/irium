@@ -296,8 +296,9 @@ pub fn init_persist_writer() {
                         "[warn] persist writer failed for block {}: {}",
                         job.height, e
                     );
+                } else {
+                    set_persisted_height(job.height);
                 }
-                set_persisted_height(job.height);
                 PERSIST_QUEUE_LEN.fetch_sub(1, Ordering::Relaxed);
 
                 if last_checkpoint.elapsed() >= Duration::from_secs(5) {
@@ -628,7 +629,15 @@ fn read_block_json_string(height: u64) -> std::io::Result<Option<String>> {
 
 fn write_block_json_string(height: u64, json: &str) -> std::io::Result<()> {
     let path = block_json_path_for_height(height)?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_file_name(format!(
+        "block_{}.json.tmp.{}.{}",
+        height,
+        std::process::id(),
+        format!("{:?}", std::thread::current().id())
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+    ));
     // v1.9.71 atomic write with explicit fsync. The previous bare
     // `fs::write` + `fs::rename` pair was atomic with respect to
     // readers (rename swaps in one step) but not durable across SIGKILL +
@@ -643,7 +652,10 @@ fn write_block_json_string(height: u64, json: &str) -> std::io::Result<()> {
         f.write_all(json.as_bytes())?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, &path)?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if let Some(parent) = path.parent() {
         if let Ok(dir) = std::fs::File::open(parent) {
             let _ = dir.sync_all();
@@ -729,7 +741,7 @@ fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
         .unwrap_or_else(blocks_dir);
 
     let header = &block.header;
-    let hash = header.hash();
+    let hash = header.hash_for_height(height);
 
     let new_hash = hex::encode(hash);
     let _ = maybe_quarantine_existing_block(height, &new_hash);
