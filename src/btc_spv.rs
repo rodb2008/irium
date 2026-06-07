@@ -548,6 +548,11 @@ pub fn apply_btc_header_batch(
             headers_added: Vec::new(),
         });
     }
+    if known_prefix > 0 && prefix_prev_height < *btc_tip_height {
+        return Err(
+            "apply_btc_header_batch: known prefix followed by non-tip fork".to_string(),
+        );
+    }
 
     let mut prev_hash = prefix_prev_hash;
     let mut prev_height = prefix_prev_height;
