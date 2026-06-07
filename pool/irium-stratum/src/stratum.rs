@@ -1845,6 +1845,17 @@ async fn handle_message(
             });
             write_json(wr, &resp).await?;
             send_set_difficulty(wr, conn_id, session.worker.as_deref(), session.difficulty).await?;
+            // v1.9.90: proactively push set_version_mask so BTMiner v1.x firmware
+            // (whatsminer/v1.1) activates its hashing engine without sending
+            // mining.configure. The configure handler also pushes this for miners
+            // that do send configure; receiving it twice is idempotent.
+            let mask_notify = json!({
+                "id": Value::Null,
+                "method": "mining.set_version_mask",
+                "params": ["1fffe000"]
+            });
+            write_json(wr, &mask_notify).await?;
+            info!("[subscribe] conn={} pushed set_version_mask mask=1fffe000", conn_id);
         }
         "mining.authorize" => {
             let user = params.first().and_then(|v| v.as_str()).unwrap_or("");
