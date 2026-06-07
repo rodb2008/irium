@@ -1776,6 +1776,18 @@ async fn handle_message(
                 "error": null
             });
             write_json(wr, &resp).await?;
+            // Push set_version_mask so BTMiner v1.x firmware (whatsminer/v1.1) does not
+            // enter connected-but-idle state after configure negotiation.
+            let mask_msg = json!({
+                "id": Value::Null,
+                "method": "mining.set_version_mask",
+                "params": ["1fffe000"]
+            });
+            write_json(wr, &mask_msg).await?;
+            info!(
+                "[configure] conn={} version_rolling=true mask=1fffe000",
+                conn_id
+            );
         }
         "mining.suggest_difficulty" => {
             // Some cgminer-family / Antminer firmware sends a difficulty hint
