@@ -1424,6 +1424,16 @@ impl ChainState {
                 }
                 continue;
             }
+            // Legacy DOGE header batch carrier (tag 0xc9) was removed from
+            // active relay in v1.9.94, but blocks mined before that deployment
+            // may contain these outputs and must remain valid for chain replay.
+            // Block 26,757 is the only known instance on the canonical chain.
+            const DOGE_CARRIER_LEGACY_CUTOFF: u64 = 27_880;
+            if output.script_pubkey.first().copied() == Some(0xc9)
+                && height < DOGE_CARRIER_LEGACY_CUTOFF
+            {
+                continue;
+            }
             validate_output(
                 output,
                 self.htlcv1_active_at(height),
