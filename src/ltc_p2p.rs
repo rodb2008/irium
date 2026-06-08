@@ -146,7 +146,7 @@ async fn try_peer(peer: SocketAddr, tip: [u8; 32]) -> Result<Vec<[u8; 80]>, Stri
             .map_err(|e| format!("post-getheaders read: {e}"))?;
         match msg.command.as_str() {
             "headers" => {
-                return parse_headers_payload(&msg.payload, false);
+                return parse_headers_payload(&msg.payload);
             }
             "ping" => {
                 write_message(&mut stream, LTC_MAGIC, "pong", &msg.payload)

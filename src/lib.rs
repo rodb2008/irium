@@ -72,8 +72,6 @@ pub mod btc_spv;
 pub mod btc_tx_parse;
 pub mod chain;
 pub mod constants;
-pub mod doge_p2p;
-pub mod doge_spv;
 pub mod genesis;
 pub mod header_sync;
 pub mod ltc_p2p;

@@ -49,14 +49,11 @@ async fn main() {
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
             btc_spv: None,
             ltc_spv: None,
-            doge_spv: None,
-            htlc_doge_swap_v1_activation_height: None,
             htlc_btc_swap_v1_activation_height: None,
             btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
-            doge_swap_order_v1_activation_height: None,
             coinbase_header_batch_activation_height: None,
     };
     let chain = Arc::new(Mutex::new(ChainState::new(params)));

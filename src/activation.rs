@@ -122,71 +122,6 @@ pub const MAINNET_LTC_ANCHOR_BITS: u32 = 0x1929_b619;
 #[allow(dead_code)]
 pub const MAINNET_LTC_ANCHOR_TIME: u32 = 1_778_676_649;
 
-/// Mainnet Dogecoin SPV header relay activation height (Phase A1).
-///
-/// `None` keeps the DOGE SPV header relay disabled on mainnet. When set
-/// to `Some(<height>)`, iriumd blocks at or after that height may carry
-/// a `DogeHeaderBatch` output (script tag `0xc9`) and the validator
-/// will apply such batches into `ChainState.doge_headers`.
-///
-/// Phase A1 ships disabled. Mainnet activation additionally requires
-/// Phase A2 (AuxPoW proof verification) to land first, since ~100% of
-/// live Dogecoin blocks since height 371,337 are merged-mined and their
-/// PoW lives on a parent Litecoin header rather than the DOGE header
-/// itself. Without A2, the relay would only accept solo-mined DOGE
-/// blocks — none in practice.
-pub const MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
-
-/// Mainnet anchor for the DOGE SPV header relay.
-///
-/// Dogecoin mainnet block 6,224,800, picked ~3,374 confirmations deep
-/// (about 56 hours of finality buffer past the 720-confirmation
-/// minimum). Hash stored here in DISPLAY order for readability;
-/// reversed to natural byte order in `DogeAnchor::mainnet()` so it
-/// lines up with `prev_hash` chain-linkage fields.
-///
-/// `PREV_TIME` is the timestamp of block 6,224,799 — needed because
-/// Digishield's per-block retarget reads the grandparent's timestamp,
-/// and for the first relayed header the grandparent IS the block one
-/// step below the anchor.
-///
-/// These constants take effect only after governance flips
-/// `MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT` to `Some(<height>)`.
-#[allow(dead_code)] // wired through ChainParams once Phase B callers come online
-pub const MAINNET_DOGE_ANCHOR_HEIGHT: u64 = 6_224_800;
-#[allow(dead_code)]
-pub const MAINNET_DOGE_ANCHOR_HASH_DISPLAY: [u8; 32] = [
-    0x5e, 0x03, 0x13, 0xd5, 0x88, 0x7e, 0xc7, 0xae,
-    0x67, 0xaa, 0xb7, 0xe2, 0xbe, 0x52, 0x62, 0xb2,
-    0x65, 0x34, 0x36, 0x37, 0xb5, 0xed, 0x92, 0x02,
-    0x81, 0x1b, 0x7e, 0x31, 0x87, 0xf1, 0xc4, 0xc1,
-];
-#[allow(dead_code)]
-pub const MAINNET_DOGE_ANCHOR_BITS: u32 = 0x196a_2b5d;
-#[allow(dead_code)]
-pub const MAINNET_DOGE_ANCHOR_TIME: u32 = 1_779_940_888;
-#[allow(dead_code)]
-pub const MAINNET_DOGE_ANCHOR_PREV_TIME: u32 = 1_779_940_838;
-
-/// Mainnet DOGE merge-mining (AuxPoW) activation height.
-///
-/// At DOGE mainnet block 371,337 (2014-09-11), the Dogecoin chain
-/// switched from standalone Scrypt PoW to AuxPoW merge-mined with
-/// Litecoin. From this height onward, the DOGE block header's
-/// nonce/bits do not produce a valid standalone Scrypt PoW; instead
-/// the parent LTC block's Scrypt PoW serves as the DOGE block's PoW
-/// via the AuxPoW data carried after the 80-byte header.
-///
-/// iriumd's DOGE SPV uses this constant to choose between the
-/// pre-AuxPoW standalone-Scrypt validator path and the AuxPoW
-/// validator path. Devnet/testnet override via
-/// `IRIUM_DOGE_AUXPOW_HEIGHT`.
-///
-/// Issue #68 PR-1: constant + helper only. Validator wiring lands
-/// in later PRs.
-#[allow(dead_code)] // wired into doge_spv apply_doge_header_batch in later PRs
-pub const MAINNET_DOGE_AUXPOW_ACTIVATION_HEIGHT: u64 = 371_337;
-
 /// Mainnet HtlcLtcSwapV1 activation height (Phase C).
 ///
 /// `None` keeps the LTC-proof claim path disabled on mainnet. When set
@@ -212,47 +147,9 @@ pub const MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = Some(24_800)
 /// would otherwise reject every spend.
 pub const MAINNET_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 
-/// Mainnet HtlcDogeSwapV1 activation height (DOGE Phase C).
-///
-/// `None` keeps the DOGE-proof claim path disabled on mainnet. When
-/// set to `Some(<height>)`, blocks at or after that height may carry
-/// HtlcDogeSwapV1 outputs (script tag `0xca`) and the validator will
-/// accept DOGE-proof claim witnesses against them.
-///
-/// DOGE Phase C ships disabled. Activation should not precede
-/// `MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT`, otherwise no proof
-/// would resolve. Mainnet activation is further blocked on DOGE
-/// Phase A2 (AuxPoW proof verification) landing first — without it,
-/// almost no live Dogecoin block can satisfy the relay's PoW check
-/// and any claim proof referencing post-371,337 blocks would fail.
-///
-/// Foundation-only commit: only this constant + the env override /
-/// resolved pair land here. The output type, witness encoders,
-/// consensus arm, and the createdogeswap / claimdogeswap /
-/// refunddogeswap / inspectdogeswap RPC handlers ship in the heavier
-/// Phase C consensus-wiring commit.
-pub const MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
-
-/// Mainnet DogeSwapOrder activation height (DOGE Phase D foundation).
-///
-/// `None` keeps the DOGE on-chain order book disabled on mainnet.
-/// When set to `Some(<height>)`, blocks at or after that height may
-/// carry DogeSwapOrder outputs (script tag `0xcb`) and the validator
-/// will accept Fill / Cancel / ExpireSweep witnesses against them.
-///
-/// Phase D ships disabled. Sell-direction fills emit
-/// `HtlcDogeSwapV1` outputs (Phase C), so this should not be
-/// activated before `MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT` —
-/// the fill covenant would otherwise reject every spend.
-///
-/// Foundation-only: tag 0xcb is reserved but the output type,
-/// witness paths, and RPC handlers ship in the Phase D
-/// consensus-wiring commit.
-pub const MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
-
 /// Mainnet coinbase header-batch activation (v1.9.62 issue #60).
 ///
-/// At this height and above, blocks may carry BTC/LTC/DOGE header batches
+/// At this height and above, blocks may carry BTC/LTC header batches
 /// directly in the coinbase tx as zero-value outputs. Before this height,
 /// coinbase batch outputs are rejected (pre-v1.9.62 behavior). The same
 /// one-per-chain-per-block cap as the regular-tx path is enforced; a block
@@ -260,17 +157,6 @@ pub const MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = Some(24_80
 /// chain. Eliminates the wallet-funded carrier-tx cost entirely.
 pub const MAINNET_COINBASE_HEADER_BATCH_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 
-/// Mainnet HtlcDogeSwapV1 activation height (Phase C).
-///
-/// `None` keeps the DOGE-proof claim path disabled on mainnet. When set
-/// to `Some(<height>)`, blocks at or after that height may carry
-/// HtlcDogeSwapV1 outputs (script tag `0xca`) and the validator will
-/// accept DOGE-proof claim witnesses against them.
-///
-/// Phase C ships disabled. Activation should not precede
-/// `MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT`, otherwise no proof would
-/// resolve.
-///
 /// Mainnet HtlcBtcSwapV1 activation height (Phase 2).
 ///
 /// `None` keeps the BTC-proof claim path disabled on mainnet. When set to
@@ -318,9 +204,6 @@ pub const MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT: Option<u64> = Some(23_850);
 /// LTC piggybacks on `htlc_ltc_swap_v1_activation_height`: when LTC swap
 /// goes live on mainnet, bech32 LTC P2WPKH payments are accepted from
 /// the same block. No separate LTC constant.
-///
-/// DOGE never activated SegWit; the DOGE claim arm remains P2PKH-only
-/// regardless of this constant.
 pub const MAINNET_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT: Option<u64> = None;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,27 +281,6 @@ pub fn resolved_auxpow_activation_height(network: NetworkKind) -> Option<u64> {
     }
 }
 
-/// DOGE AuxPoW activation height with devnet/testnet env override.
-///
-/// On mainnet, returns `MAINNET_DOGE_AUXPOW_ACTIVATION_HEIGHT`
-/// (371,337 — the historical Dogecoin merge-mining boundary). On
-/// devnet/testnet, `IRIUM_DOGE_AUXPOW_HEIGHT` overrides the boundary
-/// for testing.
-///
-/// Unlike `resolved_auxpow_activation_height`, this returns a
-/// concrete `u64` (not `Option<u64>`) because the DOGE merge-mining
-/// transition is a fixed historical chain event — there is no
-/// "AuxPoW never activates" state for the DOGE chain.
-///
-/// Issue #68 PR-1.
-#[allow(dead_code)] // wired into doge_spv apply_doge_header_batch in later PRs
-pub fn doge_auxpow_activation_height() -> u64 {
-    env::var("IRIUM_DOGE_AUXPOW_HEIGHT")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(MAINNET_DOGE_AUXPOW_ACTIVATION_HEIGHT)
-}
-
 /// Devnet/testnet override for the block-time V2 activation height.
 /// Read from `IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT`. Ignored on mainnet,
 /// which uses `MAINNET_BLOCK_TIME_V2_ACTIVATION_HEIGHT`.
@@ -474,23 +336,6 @@ pub fn resolved_ltc_spv_relay_activation_height(network: NetworkKind) -> Option<
     }
 }
 
-/// Devnet/testnet override for the DOGE SPV header relay activation height.
-/// Read from `IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT`. Ignored on mainnet.
-#[allow(dead_code)] // wired through ChainParams once Phase B (doge) callers come online
-pub fn runtime_doge_spv_relay_env_override() -> Option<u64> {
-    env::var("IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-}
-
-#[allow(dead_code)] // wired through ChainParams once Phase B (doge) callers come online
-pub fn resolved_doge_spv_relay_activation_height(network: NetworkKind) -> Option<u64> {
-    match network {
-        NetworkKind::Mainnet => MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT,
-        NetworkKind::Testnet | NetworkKind::Devnet => runtime_doge_spv_relay_env_override(),
-    }
-}
-
 /// Devnet/testnet override for the HtlcLtcSwapV1 activation height.
 /// Read from `IRIUM_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT`. Ignored on mainnet.
 #[allow(dead_code)] // wired through ChainParams once Phase C callers come online
@@ -522,40 +367,6 @@ pub fn resolved_ltc_swap_order_v1_activation_height(network: NetworkKind) -> Opt
     match network {
         NetworkKind::Mainnet => MAINNET_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT,
         NetworkKind::Testnet | NetworkKind::Devnet => runtime_ltc_swap_order_v1_env_override(),
-    }
-}
-
-/// Devnet/testnet override for the HtlcDogeSwapV1 activation height.
-/// Read from `IRIUM_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT`. Ignored on mainnet.
-#[allow(dead_code)] // wired through ChainParams once DOGE Phase C callers come online
-pub fn runtime_htlc_doge_swap_v1_env_override() -> Option<u64> {
-    env::var("IRIUM_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-}
-
-#[allow(dead_code)] // wired through ChainParams once DOGE Phase C callers come online
-pub fn resolved_htlc_doge_swap_v1_activation_height(network: NetworkKind) -> Option<u64> {
-    match network {
-        NetworkKind::Mainnet => MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT,
-        NetworkKind::Testnet | NetworkKind::Devnet => runtime_htlc_doge_swap_v1_env_override(),
-    }
-}
-
-/// Devnet/testnet override for the DogeSwapOrder activation height.
-/// Read from `IRIUM_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT`. Ignored on mainnet.
-#[allow(dead_code)] // wired through ChainParams once DOGE Phase D callers come online
-pub fn runtime_doge_swap_order_v1_env_override() -> Option<u64> {
-    env::var("IRIUM_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-}
-
-#[allow(dead_code)] // wired through ChainParams once DOGE Phase D callers come online
-pub fn resolved_doge_swap_order_v1_activation_height(network: NetworkKind) -> Option<u64> {
-    match network {
-        NetworkKind::Mainnet => MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT,
-        NetworkKind::Testnet | NetworkKind::Devnet => runtime_doge_swap_order_v1_env_override(),
     }
 }
 
@@ -987,56 +798,6 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_doge_spv_height_activated_at_24800() {
-        assert_eq!(
-            MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT,
-            Some(24_800),
-            "DOGE SPV mainnet activation height is set to 24_800"
-        );
-        assert_eq!(
-            resolved_doge_spv_relay_activation_height(NetworkKind::Mainnet),
-            Some(24_800),
-        );
-    }
-
-    #[test]
-    fn mainnet_ignores_doge_spv_env_override() {
-        let _guard = env_lock().lock().unwrap();
-        std::env::set_var("IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT", "6666");
-        let resolved = resolved_doge_spv_relay_activation_height(NetworkKind::Mainnet);
-        std::env::remove_var("IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT");
-        assert_eq!(resolved, MAINNET_DOGE_SPV_RELAY_ACTIVATION_HEIGHT);
-        assert_eq!(resolved, Some(24_800));
-    }
-
-    #[test]
-    fn non_mainnet_uses_doge_spv_env_override() {
-        let _guard = env_lock().lock().unwrap();
-        std::env::set_var("IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT", "88");
-        assert_eq!(
-            resolved_doge_spv_relay_activation_height(NetworkKind::Devnet),
-            Some(88)
-        );
-        assert_eq!(
-            resolved_doge_spv_relay_activation_height(NetworkKind::Testnet),
-            Some(88)
-        );
-        std::env::remove_var("IRIUM_DOGE_SPV_RELAY_ACTIVATION_HEIGHT");
-    }
-
-    #[test]
-    fn mainnet_doge_anchor_constants_have_expected_values() {
-        // Display-order hash (from blockchair.com / Dogecoin Core RPC).
-        // Reversed to natural order in `DogeAnchor::mainnet()`.
-        assert_eq!(MAINNET_DOGE_ANCHOR_HEIGHT, 6_224_800);
-        assert_eq!(MAINNET_DOGE_ANCHOR_BITS, 0x196a_2b5d);
-        assert_eq!(MAINNET_DOGE_ANCHOR_TIME, 1_779_940_888);
-        assert_eq!(MAINNET_DOGE_ANCHOR_PREV_TIME, 1_779_940_838);
-        assert_eq!(MAINNET_DOGE_ANCHOR_HASH_DISPLAY[0], 0x5e);
-        assert_eq!(MAINNET_DOGE_ANCHOR_HASH_DISPLAY[31], 0xc1);
-    }
-
-    #[test]
     fn mainnet_htlc_ltc_swap_v1_height_activated_at_24800() {
         assert_eq!(
             MAINNET_HTLC_LTC_SWAP_V1_ACTIVATION_HEIGHT,
@@ -1110,82 +871,6 @@ mod tests {
             Some(222)
         );
         std::env::remove_var("IRIUM_LTC_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
-    }
-
-    #[test]
-    fn mainnet_htlc_doge_swap_v1_height_activated_at_24800() {
-        assert_eq!(
-            MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT,
-            Some(24_800),
-            "HtlcDogeSwapV1 mainnet activation height is set to 24_800"
-        );
-        assert_eq!(
-            resolved_htlc_doge_swap_v1_activation_height(NetworkKind::Mainnet),
-            Some(24_800),
-        );
-    }
-
-    #[test]
-    fn mainnet_ignores_htlc_doge_swap_v1_env_override() {
-        let _guard = env_lock().lock().unwrap();
-        std::env::set_var("IRIUM_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT", "7777");
-        let resolved = resolved_htlc_doge_swap_v1_activation_height(NetworkKind::Mainnet);
-        std::env::remove_var("IRIUM_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT");
-        assert_eq!(resolved, MAINNET_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT);
-        assert_eq!(resolved, Some(24_800));
-    }
-
-    #[test]
-    fn non_mainnet_uses_htlc_doge_swap_v1_env_override() {
-        let _guard = env_lock().lock().unwrap();
-        std::env::set_var("IRIUM_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT", "111");
-        assert_eq!(
-            resolved_htlc_doge_swap_v1_activation_height(NetworkKind::Devnet),
-            Some(111)
-        );
-        assert_eq!(
-            resolved_htlc_doge_swap_v1_activation_height(NetworkKind::Testnet),
-            Some(111)
-        );
-        std::env::remove_var("IRIUM_HTLC_DOGE_SWAP_V1_ACTIVATION_HEIGHT");
-    }
-
-    #[test]
-    fn mainnet_doge_swap_order_v1_height_activated_at_24800() {
-        assert_eq!(
-            MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT,
-            Some(24_800),
-            "DogeSwapOrder mainnet activation height is set to 24_800"
-        );
-        assert_eq!(
-            resolved_doge_swap_order_v1_activation_height(NetworkKind::Mainnet),
-            Some(24_800),
-        );
-    }
-
-    #[test]
-    fn mainnet_ignores_doge_swap_order_v1_env_override() {
-        let _guard = env_lock().lock().unwrap();
-        std::env::set_var("IRIUM_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT", "4444");
-        let resolved = resolved_doge_swap_order_v1_activation_height(NetworkKind::Mainnet);
-        std::env::remove_var("IRIUM_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
-        assert_eq!(resolved, MAINNET_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT);
-        assert_eq!(resolved, Some(24_800));
-    }
-
-    #[test]
-    fn non_mainnet_uses_doge_swap_order_v1_env_override() {
-        let _guard = env_lock().lock().unwrap();
-        std::env::set_var("IRIUM_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT", "333");
-        assert_eq!(
-            resolved_doge_swap_order_v1_activation_height(NetworkKind::Devnet),
-            Some(333)
-        );
-        assert_eq!(
-            resolved_doge_swap_order_v1_activation_height(NetworkKind::Testnet),
-            Some(333)
-        );
-        std::env::remove_var("IRIUM_DOGE_SWAP_ORDER_V1_ACTIVATION_HEIGHT");
     }
 
     #[test]

@@ -117,17 +117,6 @@ use irium_node_rs::storage;
 use irium_node_rs::tx::{
     compute_funding_binding, decode_full_tx, encode_htlc_btc_swap_claim_witness,
     encode_htlc_btc_swap_refund_witness, encode_htlc_btc_swap_v1_script,
-    encode_htlc_doge_swap_claim_witness, encode_htlc_doge_swap_refund_witness,
-    encode_htlc_doge_swap_v1_script, parse_htlc_doge_swap_v1_script,
-    HtlcDogeSwapV1Output,
-    MAX_HTLC_DOGE_SWAP_CONFIRMATIONS, MIN_HTLC_DOGE_SWAP_CONFIRMATIONS,
-    encode_doge_swap_order_cancel_witness,
-    encode_doge_swap_order_expire_sweep_witness,
-    encode_doge_swap_order_fill_buy_witness, encode_doge_swap_order_fill_sell_witness,
-    encode_doge_swap_order_script, parse_doge_swap_order_script,
-    DogeSwapOrderOutput,
-    DOGE_SWAP_ORDER_DIRECTION_BUY, DOGE_SWAP_ORDER_DIRECTION_SELL,
-    DOGE_SWAP_ORDER_MAX_SWEEP_FEE, DOGE_SWAP_ORDER_MIN_LOCKED_VALUE,
     encode_htlc_ltc_swap_claim_witness, encode_htlc_ltc_swap_refund_witness,
     encode_htlc_ltc_swap_v1_script, encode_ltc_swap_order_cancel_witness,
     encode_ltc_swap_order_expire_sweep_witness,
@@ -156,11 +145,6 @@ use irium_node_rs::btc_spv::{
 use irium_node_rs::ltc_spv::{
     encode_ltc_header_batch, parse_ltc_header_batch, LtcAnchor, LtcHeader, LtcHeaderEntry,
     LTC_HEADER_BYTES, MAX_LTC_HEADERS_PER_BATCH,
-};
-use irium_node_rs::doge_spv::{
-    encode_doge_header_batch, encode_doge_header_batch_with_auxpow,
-    parse_doge_header_batch, DogeAnchor, DogeHeader, ParsedDogeHeader,
-    DOGE_HEADER_BYTES, MAX_DOGE_HEADERS_PER_BATCH,
 };
 use irium_node_rs::wallet_store::{WalletKey, WalletManager, WalletMode};
 use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
@@ -215,14 +199,6 @@ struct AppState {
     btc_template_headers_cache: Arc<Mutex<Option<CachedHeaderBatchForTemplate>>>,
     /// v1.9.61: same as above for LTC.
     ltc_template_headers_cache: Arc<Mutex<Option<CachedHeaderBatchForTemplate>>>,
-    /// v1.9.61: same as above for DOGE.
-    doge_template_headers_cache: Arc<Mutex<Option<CachedHeaderBatchForTemplate>>>,
-    /// PR-6 of issue #68: parallel cache holding per-header iriumd-format
-    /// AuxPoW bytes (hex-encoded). Same length as the headers vec implied
-    /// by doge_template_headers_cache.headers_hex.len() / 80. Some(None)
-    /// for pre-371,337 / no-AuxPoW-bit headers; Some(Some(hex)) when the
-    /// peer returned AuxPoW data. Cleared whenever the headers cache is.
-    doge_template_auxpow_cache: Arc<Mutex<Option<Vec<Option<String>>>>>,
 }
 
 const DISPUTE_RESOLVER_RESPONSE_WINDOW: u64 = 288; // blocks
@@ -1518,7 +1494,7 @@ struct WalletUtxo {
 #[derive(Clone)]
 struct CachedHeaderBatchForTemplate {
     /// Hex-encoded concatenation of 80-byte BTC headers (or 80-byte LTC,
-    /// or DOGE header — same shape per chain). Passed verbatim to the
+    /// same shape per chain). Passed verbatim to the
     /// chain's submit_*_headers_core.
     headers_hex: String,
     /// Chain's *_tip_height at the moment the headers were fetched. The
@@ -1540,7 +1516,7 @@ struct TemplateTx {
 /// v1.9.62 issue #60: zero-cost coinbase header relay. Each entry is appended
 /// by the stratum as an additional output on the coinbase tx after the miner
 /// reward output. `value` is always 0 for batch carriers; the script is the
-/// batch payload as produced by encode_btc_header_batch / ltc / doge.
+/// batch payload as produced by encode_btc_header_batch / ltc.
 #[derive(Serialize)]
 struct CoinbaseExtraOutput {
     value: u64,
@@ -1559,39 +1535,10 @@ struct BlockTemplateResponse {
     coinbase_value: u64,
     mempool_count: usize,
     /// v1.9.62 issue #60: zero-value outputs the stratum must append to the
-    /// coinbase. Empty pre-activation; one entry per chain (BTC/LTC/DOGE)
+    /// coinbase. Empty pre-activation; one entry per chain (BTC/LTC)
     /// post-activation when the cycle has cached fresh headers.
     #[serde(default)]
     coinbase_extra_outputs: Vec<CoinbaseExtraOutput>,
-}
-
-fn validate_doge_template_items(items: &[ParsedDogeHeader]) -> Result<(), String> {
-    for (i, item) in items.iter().enumerate() {
-        let has_auxpow_bit =
-            (item.header.version as u32) & irium_node_rs::auxpow::AUXPOW_VERSION_BIT != 0;
-        if has_auxpow_bit {
-            let bytes = item.auxpow.as_ref().ok_or_else(|| {
-                format!("doge template header {i} has AuxPoW bit but no AuxPoW bytes")
-            })?;
-            let mut off = 0usize;
-            let auxpow = irium_node_rs::auxpow::deserialize(bytes, &mut off)
-                .map_err(|e| format!("doge template header {i} auxpow decode failed: {e}"))?;
-            if off != bytes.len() {
-                return Err(format!(
-                    "doge template header {i} auxpow has {} trailing bytes",
-                    bytes.len() - off
-                ));
-            }
-            if !item.header.meets_pow_auxpow(&auxpow) {
-                return Err(format!("doge template header {i} AuxPoW does not validate"));
-            }
-        } else if !item.header.meets_pow() {
-            return Err(format!(
-                "doge template header {i} standalone PoW does not validate"
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -5668,7 +5615,7 @@ async fn fund_agreement(
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain
             .calculate_fees(&tx)
-            .map_err(|e| { eprintln!("[create_doge_swap] calc_fees_err={}", e); bad("chain_fee_calculation_failed") })?
+            .map_err(|e| { eprintln!("[fund_agreement] calc_fees_err={}", e); bad("chain_fee_calculation_failed") })?
     };
 
     let raw = tx.serialize();
@@ -6954,39 +6901,6 @@ struct LtcRelayTipResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct SubmitDogeHeadersRequest {
-    headers_hex: String,
-    #[serde(default)]
-    broadcast: Option<bool>,
-    #[serde(default)]
-    fee_per_byte: Option<u64>,
-}
-
-#[derive(Debug, Serialize)]
-struct SubmitDogeHeadersResponse {
-    txid: String,
-    accepted: bool,
-    headers_count: u32,
-    new_tip_hash: Option<String>,
-    new_tip_height: Option<u64>,
-    fee: u64,
-    raw_tx_hex: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DogeRelayTipResponse {
-    active: bool,
-    anchor_hash: String,
-    anchor_height: u64,
-    anchor_bits: String,
-    anchor_time: u32,
-    tip_hash: String,
-    tip_height: u64,
-    tip_time: u32,
-    tip_total_work_hex: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct LtcHeaderQuery {
     #[serde(default)]
     hash: Option<String>,
@@ -7257,267 +7171,6 @@ async fn ltc_relay_tip(
     };
 
     Ok(Json(LtcRelayTipResponse {
-        active,
-        anchor_hash: btc_hash_to_display(&anchor.hash),
-        anchor_height: anchor.height,
-        anchor_bits: format!("0x{:08x}", anchor.bits),
-        anchor_time: anchor.time,
-        tip_hash: tip_hash_display,
-        tip_height,
-        tip_time,
-        tip_total_work_hex,
-    }))
-}
-
-/// Core implementation of `/rpc/submitdogeheaders` — see `submit_btc_headers_core`
-/// for the design rationale (auth + rate limit live at the transport layer).
-async fn submit_doge_headers_core(
-    state: &AppState,
-    req: SubmitDogeHeadersRequest,
-) -> Result<SubmitDogeHeadersResponse, (StatusCode, String)> {
-    let bad = |reason: &str| -> (StatusCode, String) {
-        eprintln!("[submit_doge_headers] reject reason={}", reason);
-        (StatusCode::BAD_REQUEST, reason.to_string())
-    };
-
-    {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let active = chain
-            .params
-            .doge_spv
-            .as_ref()
-            .map(|p| chain.height >= p.activation_height)
-            .unwrap_or(false);
-        if !active {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "doge_spv_relay_not_active".to_string(),
-            ));
-        }
-    }
-
-    let raw = hex::decode(req.headers_hex.trim())
-        .map_err(|_| bad("headers_hex_decode_failed"))?;
-    if raw.is_empty() || raw.len() % DOGE_HEADER_BYTES != 0 {
-        return Err(bad("headers_hex_length_not_multiple_of_80"));
-    }
-    let header_count = raw.len() / DOGE_HEADER_BYTES;
-    if header_count == 0 || header_count > MAX_DOGE_HEADERS_PER_BATCH as usize {
-        return Err(bad("header_count_out_of_range"));
-    }
-    let mut parsed_headers: Vec<DogeHeader> = Vec::with_capacity(header_count);
-    for i in 0..header_count {
-        let chunk = &raw[i * DOGE_HEADER_BYTES..(i + 1) * DOGE_HEADER_BYTES];
-        let h = DogeHeader::deserialize(chunk).map_err(|_| bad("ltc_header_deserialize_failed"))?;
-        parsed_headers.push(h);
-    }
-
-    let batch_script = encode_doge_header_batch(&parsed_headers)
-        .map_err(|_| bad("encode_doge_header_batch_failed"))?;
-
-    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
-    {
-        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
-        for key in keys {
-            let bytes = hex::decode(&key.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
-            if bytes.len() != 20 {
-                continue;
-            }
-            let mut arr = [0u8; 20];
-            arr.copy_from_slice(&bytes);
-            key_map.insert(arr, key);
-        }
-    }
-    if key_map.is_empty() {
-        return Err(bad("wallet_key_map_empty"));
-    }
-
-    let (mut utxos, tip_height) = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let mut collected = Vec::new();
-        for (outpoint, utxo) in chain.utxos.iter() {
-            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
-                if key_map.contains_key(&script_pkh) {
-                    collected.push(WalletUtxo {
-                        outpoint: outpoint.clone(),
-                        output: utxo.output.clone(),
-                        height: utxo.height,
-                        is_coinbase: utxo.is_coinbase,
-                        pkh: script_pkh,
-                    });
-                }
-            }
-        }
-        (collected, chain.tip_height())
-    };
-    if utxos.is_empty() {
-        return Err(bad("wallet_utxo_set_empty"));
-    }
-    utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
-
-    let mut fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    if fee_per_byte == 0 {
-        fee_per_byte = 1;
-    }
-
-    let mut selected: Vec<WalletUtxo> = Vec::new();
-    let mut total: u64 = 0;
-    let mut fee: u64 = 0;
-    for utxo in utxos.iter() {
-        let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < coinbase_maturity() {
-            continue;
-        }
-        selected.push(utxo.clone());
-        total = total.saturating_add(utxo.output.value);
-        let base_size = estimate_tx_size(selected.len(), 2);
-        fee = base_size
-            .saturating_add(batch_script.len() as u64)
-            .saturating_mul(fee_per_byte);
-        if total >= fee {
-            break;
-        }
-    }
-    if total < fee {
-        return Err(bad("insufficient_spendable_funds_for_header_batch_fee"));
-    }
-
-    let change_pkh = selected
-        .first()
-        .map(|u| u.pkh)
-        .ok_or_else(|| bad("no_change_pkh_available"))?;
-    let mut change = total.saturating_sub(fee);
-
-    let inputs: Vec<TxInput> = selected
-        .iter()
-        .map(|u| TxInput {
-            prev_txid: u.outpoint.txid,
-            prev_index: u.outpoint.index,
-            script_sig: Vec::new(),
-            sequence: 0xffff_ffff,
-        })
-        .collect();
-
-    let outputs = vec![
-        TxOutput {
-            value: change,
-            script_pubkey: p2pkh_script(&change_pkh),
-        },
-        TxOutput {
-            value: 0,
-            script_pubkey: batch_script,
-        },
-    ];
-
-    let mut tx = Transaction {
-        version: 1,
-        inputs,
-        outputs,
-        locktime: 0,
-    };
-
-    for _ in 0..2 {
-        sign_wallet_inputs(&mut tx, &selected, &key_map)
-            .map_err(|_| bad("sign_wallet_inputs_failed"))?;
-        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
-        if needed_fee > fee {
-            let extra = needed_fee - fee;
-            if change >= extra {
-                fee = needed_fee;
-                change = change.saturating_sub(extra);
-                tx.outputs[0].value = change;
-                continue;
-            } else {
-                return Err(bad("fee_recalculation_exceeded_change"));
-            }
-        }
-        break;
-    }
-
-    let fee_checked = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .calculate_fees(&tx)
-            .map_err(|_| bad("chain_fee_calculation_failed"))?
-    };
-
-    let raw_tx = tx.serialize();
-    let txid = tx.txid();
-    let txid_hex = hex::encode(txid);
-    let mut accepted = false;
-    if req.broadcast.unwrap_or(true) {
-        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        if !mempool.contains(&txid) {
-            match mempool.add_transaction(tx.clone(), raw_tx.clone(), fee_checked) {
-                Ok(_) => accepted = true,
-                Err(e) => {
-                    eprintln!("[submit_doge_headers] mempool_reject reason={}", e);
-                }
-            }
-        }
-    }
-
-    Ok(SubmitDogeHeadersResponse {
-        txid: txid_hex,
-        accepted,
-        headers_count: header_count as u32,
-        new_tip_hash: None,
-        new_tip_height: None,
-        fee: fee_checked,
-        raw_tx_hex: hex::encode(raw_tx),
-    })
-}
-
-async fn submit_doge_headers(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<SubmitDogeHeadersRequest>,
-) -> Result<Json<SubmitDogeHeadersResponse>, (StatusCode, String)> {
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
-    submit_doge_headers_core(&state, req).await.map(Json)
-}
-
-async fn doge_relay_tip(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-) -> Result<Json<DogeRelayTipResponse>, StatusCode> {
-    check_rate_with_auth(&state, &addr, &headers_map)?;
-    require_rpc_auth(&headers_map)?;
-
-    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-    let (active, anchor) = match chain.params.doge_spv.as_ref() {
-        Some(p) => (chain.height >= p.activation_height, p.anchor),
-        None => (false, DogeAnchor::zero()),
-    };
-
-    let (tip_hash_display, tip_height, tip_time, tip_total_work_hex) = match chain.doge_tip {
-        Some(h) => {
-            let entry = chain.doge_headers.get(&h);
-            let time = entry.map(|e| e.header.time).unwrap_or(0);
-            let work_hex = entry
-                .map(|e| e.total_work.to_str_radix(16))
-                .unwrap_or_else(|| "0".to_string());
-            (
-                btc_hash_to_display(&h),
-                chain.doge_tip_height,
-                time,
-                work_hex,
-            )
-        }
-        None => (
-            btc_hash_to_display(&anchor.hash),
-            anchor.height,
-            anchor.time,
-            "0".to_string(),
-        ),
-    };
-
-    Ok(Json(DogeRelayTipResponse {
         active,
         anchor_hash: btc_hash_to_display(&anchor.hash),
         anchor_height: anchor.height,
@@ -9346,836 +8999,6 @@ async fn inspect_ltc_swap(
     }))
 }
 
-// Phase C — HtlcDogeSwapV1 RPC endpoints. Byte-level mirror of the BTC
-// swap RPCs above, gated on `htlc_doge_swap_v1_activation_height` (and
-// additionally on `doge_spv` for the claim path so DOGE header proofs can
-// resolve). All four return SERVICE_UNAVAILABLE while the gate is None.
-
-#[derive(Debug, Deserialize)]
-struct CreateDogeSwapRequest {
-    irm_amount: String,
-    doge_amount_sats: u64,
-    doge_recipient_address: String,
-    recipient_address: String,
-    refund_address: String,
-    confirmations_required: u8,
-    timeout_height: u64,
-    #[serde(default)]
-    fee_per_byte: Option<u64>,
-    #[serde(default)]
-    broadcast: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct CreateDogeSwapResponse {
-    txid: String,
-    accepted: bool,
-    raw_tx_hex: String,
-    swap_vout: u32,
-    funding_binding_hex: String,
-    doge_op_return_payload_hex: String,
-    expected_doge_payment_address: String,
-    expected_doge_amount_sats: u64,
-    fee: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaimDogeSwapRequest {
-    funding_txid: String,
-    vout: u32,
-    destination_address: String,
-    doge_block_hash: String,
-    doge_tx_hex: String,
-    doge_merkle_branch_hex: Vec<String>,
-    doge_merkle_index: u32,
-    #[serde(default)]
-    fee_per_byte: Option<u64>,
-    #[serde(default)]
-    broadcast: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RefundDogeSwapRequest {
-    funding_txid: String,
-    vout: u32,
-    destination_address: String,
-    #[serde(default)]
-    fee_per_byte: Option<u64>,
-    #[serde(default)]
-    broadcast: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct SpendDogeSwapResponse {
-    txid: String,
-    accepted: bool,
-    raw_tx_hex: String,
-    fee: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct InspectDogeSwapQuery {
-    txid: String,
-    vout: u32,
-}
-
-#[derive(Debug, Serialize)]
-struct InspectDogeSwapResponse {
-    exists: bool,
-    funded: bool,
-    unspent: bool,
-    spent: bool,
-    recipient_address: Option<String>,
-    refund_address: Option<String>,
-    doge_recipient_pkh_hex: Option<String>,
-    doge_amount_sats: Option<u64>,
-    confirmations_required: Option<u8>,
-    timeout_height: Option<u64>,
-    funding_binding_hex: Option<String>,
-    claimable_now: bool,
-    refundable_now: bool,
-}
-
-/// Decode a Dogecoin P2PKH address (base58check; mainnet prefix `0x30`,
-/// testnet prefix `0x6f`) into a 20-byte hash. v1 only supports P2PKH —
-/// bech32 (ltc1...) inputs are rejected because consensus only validates
-/// P2PKH at the DOGE OP_RETURN claim path. Structurally identical to
-/// `decode_btc_p2pkh_address`, just different prefix byte.
-fn decode_doge_p2pkh_address(addr: &str) -> Option<[u8; 20]> {
-    let data = bs58::decode(addr.trim()).into_vec().ok()?;
-    if data.len() != 25 {
-        return None;
-    }
-    let (body, checksum) = data.split_at(21);
-    let first = Sha256::digest(body);
-    let second = Sha256::digest(first);
-    if &second[0..4] != checksum {
-        return None;
-    }
-    if body[0] != 0x30 && body[0] != 0x6f {
-        return None;
-    }
-    let mut pkh = [0u8; 20];
-    pkh.copy_from_slice(&body[1..]);
-    Some(pkh)
-}
-
-async fn create_doge_swap(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<CreateDogeSwapRequest>,
-) -> Result<Json<CreateDogeSwapResponse>, (StatusCode, String)> {
-    let bad = |reason: &str| -> (StatusCode, String) {
-        eprintln!("[create_doge_swap] reject reason={}", reason);
-        (StatusCode::BAD_REQUEST, reason.to_string())
-    };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
-
-    {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let active = chain
-            .params
-            .htlc_doge_swap_v1_activation_height
-            .map(|h| chain.height >= h)
-            .unwrap_or(false);
-        if !active {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "htlc_doge_swap_v1_not_active".to_string(),
-            ));
-        }
-    }
-
-    if req.confirmations_required < MIN_HTLC_DOGE_SWAP_CONFIRMATIONS
-        || req.confirmations_required > MAX_HTLC_DOGE_SWAP_CONFIRMATIONS
-    {
-        return Err(bad("confirmations_required_out_of_range"));
-    }
-
-    let amount = parse_irm(&req.irm_amount).map_err(|_| bad("irm_amount_parse_failed"))?;
-    if amount == 0 {
-        return Err(bad("irm_amount_zero"));
-    }
-    if req.doge_amount_sats == 0 {
-        return Err(bad("doge_amount_sats_zero"));
-    }
-
-    let recipient_vec = base58_p2pkh_to_hash(&req.recipient_address)
-        .ok_or_else(|| bad("recipient_address_decode_failed"))?;
-    let refund_vec = base58_p2pkh_to_hash(&req.refund_address)
-        .ok_or_else(|| bad("refund_address_decode_failed"))?;
-    if recipient_vec.len() != 20 || refund_vec.len() != 20 {
-        return Err(bad("iriumd_address_hash_len_invalid"));
-    }
-    let mut recipient_pkh = [0u8; 20];
-    recipient_pkh.copy_from_slice(&recipient_vec);
-    let mut refund_pkh = [0u8; 20];
-    refund_pkh.copy_from_slice(&refund_vec);
-
-    let doge_recipient_pkh = decode_doge_p2pkh_address(&req.doge_recipient_address)
-        .ok_or_else(|| bad("doge_recipient_address_must_be_p2pkh"))?;
-
-    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
-    {
-        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
-        for key in keys {
-            let bytes = hex::decode(&key.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
-            if bytes.len() != 20 {
-                continue;
-            }
-            let mut arr = [0u8; 20];
-            arr.copy_from_slice(&bytes);
-            key_map.insert(arr, key);
-        }
-    }
-    if key_map.is_empty() {
-        return Err(bad("wallet_key_map_empty"));
-    }
-
-    let (mut utxos, tip_height) = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let mut collected = Vec::new();
-        for (outpoint, utxo) in chain.utxos.iter() {
-            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
-                if key_map.contains_key(&script_pkh) {
-                    collected.push(WalletUtxo {
-                        outpoint: outpoint.clone(),
-                        output: utxo.output.clone(),
-                        height: utxo.height,
-                        is_coinbase: utxo.is_coinbase,
-                        pkh: script_pkh,
-                    });
-                }
-            }
-        }
-        (collected, chain.tip_height())
-    };
-    if utxos.is_empty() {
-        return Err(bad("wallet_utxo_set_empty"));
-    }
-    utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
-
-    let mut fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    if fee_per_byte == 0 {
-        fee_per_byte = 1;
-    }
-
-    let mut selected: Vec<WalletUtxo> = Vec::new();
-    let mut total = 0u64;
-    let mut fee = 0u64;
-    for utxo in utxos.iter() {
-        let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < coinbase_maturity() {
-            continue;
-        }
-        selected.push(utxo.clone());
-        total = total.saturating_add(utxo.output.value);
-        let n_outs = if total > amount { 2 } else { 1 };
-        fee = estimate_tx_size(selected.len(), n_outs).saturating_mul(fee_per_byte);
-        if total >= amount.saturating_add(fee) {
-            break;
-        }
-    }
-    if total < amount.saturating_add(fee) {
-        return Err(bad("insufficient_spendable_funds"));
-    }
-
-    let first_input = selected
-        .first()
-        .ok_or_else(|| bad("no_input_for_binding"))?;
-    let funding_binding =
-        compute_funding_binding(&first_input.outpoint.txid, first_input.outpoint.index);
-
-    let swap = HtlcDogeSwapV1Output {
-        confirmations_required: req.confirmations_required,
-        recipient_pkh,
-        refund_pkh,
-        doge_recipient_pkh,
-        doge_amount_sats: req.doge_amount_sats,
-        timeout_height: req.timeout_height,
-        funding_binding,
-    };
-
-    let inputs: Vec<TxInput> = selected
-        .iter()
-        .map(|u| TxInput {
-            prev_txid: u.outpoint.txid,
-            prev_index: u.outpoint.index,
-            script_sig: Vec::new(),
-            sequence: 0xffff_ffff,
-        })
-        .collect();
-
-    let mut outputs = vec![TxOutput {
-        value: amount,
-        script_pubkey: encode_htlc_doge_swap_v1_script(&swap),
-    }];
-    let mut change = total.saturating_sub(amount).saturating_sub(fee);
-    if change > 0 {
-        let change_pkh = selected
-            .first()
-            .map(|u| u.pkh)
-            .ok_or_else(|| bad("no_change_pkh"))?;
-        outputs.push(TxOutput {
-            value: change,
-            script_pubkey: p2pkh_script(&change_pkh),
-        });
-    }
-
-    let mut tx = Transaction {
-        version: 1,
-        inputs,
-        outputs,
-        locktime: 0,
-    };
-
-    for _ in 0..2 {
-        sign_wallet_inputs(&mut tx, &selected, &key_map)
-            .map_err(|_| bad("sign_wallet_inputs_failed"))?;
-        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
-        if needed_fee > fee {
-            let extra = needed_fee - fee;
-            if change >= extra {
-                fee = needed_fee;
-                change = change.saturating_sub(extra);
-                if tx.outputs.len() > 1 {
-                    tx.outputs[1].value = change;
-                }
-                continue;
-            } else {
-                return Err(bad("fee_recalculation_exceeded_change"));
-            }
-        }
-        break;
-    }
-
-    let fee_checked = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .calculate_fees(&tx)
-            .map_err(|_| bad("chain_fee_calculation_failed"))?
-    };
-    let raw = tx.serialize();
-    let txid_arr = tx.txid();
-    let txid_hex = hex::encode(txid_arr);
-    let mut accepted = false;
-    if req.broadcast.unwrap_or(false) {
-        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        if !mempool.contains(&txid_arr) {
-            match mempool.add_transaction(tx.clone(), raw.clone(), fee_checked) {
-                Ok(_) => accepted = true,
-                Err(e) => eprintln!("[create_doge_swap] mempool_reject reason={}", e),
-            }
-        }
-    }
-
-    let mut op_return_payload = Vec::with_capacity(14);
-    op_return_payload.extend_from_slice(b"irmdsw");
-    op_return_payload.extend_from_slice(&funding_binding);
-
-    Ok(Json(CreateDogeSwapResponse {
-        txid: txid_hex,
-        accepted,
-        raw_tx_hex: hex::encode(raw),
-        swap_vout: 0,
-        funding_binding_hex: hex::encode(funding_binding),
-        doge_op_return_payload_hex: hex::encode(op_return_payload),
-        expected_doge_payment_address: req.doge_recipient_address,
-        expected_doge_amount_sats: req.doge_amount_sats,
-        fee: fee_checked,
-    }))
-}
-
-async fn claim_doge_swap(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<ClaimDogeSwapRequest>,
-) -> Result<Json<SpendDogeSwapResponse>, (StatusCode, String)> {
-    let bad = |reason: &str| -> (StatusCode, String) {
-        eprintln!("[claim_doge_swap] reject reason={}", reason);
-        (StatusCode::BAD_REQUEST, reason.to_string())
-    };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
-
-    {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let swap_active = chain
-            .params
-            .htlc_doge_swap_v1_activation_height
-            .map(|h| chain.height >= h)
-            .unwrap_or(false);
-        let spv_active = chain
-            .params
-            .doge_spv
-            .as_ref()
-            .map(|p| chain.height >= p.activation_height)
-            .unwrap_or(false);
-        if !swap_active || !spv_active {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "htlc_doge_swap_or_doge_spv_not_active".to_string(),
-            ));
-        }
-    }
-
-    let txid_arr =
-        hex_to_32(req.funding_txid.trim()).map_err(|_| bad("funding_txid_hex_invalid"))?;
-    let key = OutPoint {
-        txid: txid_arr,
-        index: req.vout,
-    };
-
-    let funding_out = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .utxos
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| bad("funding_outpoint_unspent_or_unknown"))?
-    };
-
-    let swap = parse_htlc_doge_swap_v1_script(&funding_out.output.script_pubkey)
-        .ok_or_else(|| bad("funding_output_not_htlc_doge_swap_v1"))?;
-
-    let signer_pkh = swap.recipient_pkh;
-    let wallet_key = {
-        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
-        let mut found: Option<WalletKey> = None;
-        for k in keys {
-            let b = hex::decode(&k.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
-            if b.len() != 20 {
-                continue;
-            }
-            let mut pkh = [0u8; 20];
-            pkh.copy_from_slice(&b);
-            if pkh == signer_pkh {
-                found = Some(k);
-                break;
-            }
-        }
-        found.ok_or_else(|| bad("recipient_pkh_key_not_in_wallet"))?
-    };
-
-    let dest = base58_p2pkh_to_hash(&req.destination_address)
-        .ok_or_else(|| bad("destination_address_decode_failed"))?;
-    if dest.len() != 20 {
-        return Err(bad("destination_pkh_len_invalid"));
-    }
-    let mut dest_pkh = [0u8; 20];
-    dest_pkh.copy_from_slice(&dest);
-
-    let doge_block_hash =
-        parse_btc_display_hash(&req.doge_block_hash).map_err(|_| bad("doge_block_hash_invalid"))?;
-    let doge_tx_raw =
-        hex::decode(req.doge_tx_hex.trim()).map_err(|_| bad("doge_tx_hex_invalid"))?;
-    if doge_tx_raw.is_empty() {
-        return Err(bad("doge_tx_hex_empty"));
-    }
-    let mut branch: Vec<[u8; 32]> = Vec::with_capacity(req.doge_merkle_branch_hex.len());
-    for s in &req.doge_merkle_branch_hex {
-        let h = parse_btc_display_hash(s).map_err(|_| bad("merkle_branch_node_invalid"))?;
-        branch.push(h);
-    }
-
-    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
-    if funding_out.output.value <= fee {
-        return Err(bad("funding_value_le_fee"));
-    }
-    let mut payout = funding_out.output.value - fee;
-
-    let mut tx = Transaction {
-        version: 1,
-        inputs: vec![TxInput {
-            prev_txid: txid_arr,
-            prev_index: req.vout,
-            script_sig: Vec::new(),
-            sequence: 0xffff_fffe,
-        }],
-        outputs: vec![TxOutput {
-            value: payout,
-            script_pubkey: p2pkh_script(&dest_pkh),
-        }],
-        locktime: 0,
-    };
-
-    let priv_bytes =
-        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
-    if priv_bytes.len() != 32 {
-        return Err(bad("privkey_len_invalid"));
-    }
-    let mut sk_bytes = [0u8; 32];
-    sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
-        .map_err(|_| bad("signing_key_init_failed"))?;
-    let pubkey = signing_key
-        .verifying_key()
-        .to_encoded_point(true)
-        .as_bytes()
-        .to_vec();
-
-    for _ in 0..2 {
-        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
-        let sig: Signature = signing_key
-            .sign_prehash(&digest)
-            .map_err(|_| bad("sig_prehash_failed"))?;
-        let sig = sig.normalize_s().unwrap_or(sig);
-        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-        sig_bytes.push(0x01);
-
-        let witness = encode_htlc_doge_swap_claim_witness(
-            &sig_bytes,
-            &pubkey,
-            &doge_block_hash,
-            &branch,
-            req.doge_merkle_index,
-            &doge_tx_raw,
-        )
-        .ok_or_else(|| bad("encode_claim_witness_failed"))?;
-        tx.inputs[0].script_sig = witness;
-
-        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
-        if needed_fee > fee {
-            let extra = needed_fee - fee;
-            if payout > extra {
-                fee = needed_fee;
-                payout -= extra;
-                tx.outputs[0].value = payout;
-                continue;
-            } else {
-                return Err(bad("fee_recalculation_exceeded_payout"));
-            }
-        }
-        break;
-    }
-
-    let fee_checked = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .calculate_fees(&tx)
-            .map_err(|_| bad("calculate_fees_failed"))?
-    };
-    let raw = tx.serialize();
-    let txid_out = tx.txid();
-    let mut accepted = false;
-    if req.broadcast.unwrap_or(false) {
-        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        if !mempool.contains(&txid_out) {
-            accepted = mempool
-                .add_transaction(tx, raw.clone(), fee_checked)
-                .is_ok();
-        }
-    }
-
-    // Gap A (NAT broadcast): admitting to local mempool alone relies on
-    // the 60s rebroadcast timer to reach peers, which delays order/fill
-    // visibility up to a minute on NAT-bound nodes. Push the tx to all
-    // currently-connected peers immediately so they see it the moment we
-    // accept it. Best-effort; the rebroadcast timer still covers failures.
-    if accepted {
-        if let Some(ref p2p) = state.p2p {
-            let p = p2p.clone();
-            let r = raw.clone();
-            tokio::spawn(async move {
-                if let Err(e) = p.broadcast_tx(&r).await {
-                    eprintln!("[swap-broadcast/claim_doge_swap] error: {e}");
-                }
-            });
-        }
-    }
-    Ok(Json(SpendDogeSwapResponse {
-        txid: hex::encode(txid_out),
-        accepted,
-        raw_tx_hex: hex::encode(raw),
-        fee: fee_checked,
-    }))
-}
-
-async fn refund_doge_swap(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<RefundDogeSwapRequest>,
-) -> Result<Json<SpendDogeSwapResponse>, (StatusCode, String)> {
-    let bad = |reason: &str| -> (StatusCode, String) {
-        eprintln!("[refund_doge_swap] reject reason={}", reason);
-        (StatusCode::BAD_REQUEST, reason.to_string())
-    };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
-
-    {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let active = chain
-            .params
-            .htlc_doge_swap_v1_activation_height
-            .map(|h| chain.height >= h)
-            .unwrap_or(false);
-        if !active {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "htlc_doge_swap_v1_not_active".to_string(),
-            ));
-        }
-    }
-
-    let txid_arr =
-        hex_to_32(req.funding_txid.trim()).map_err(|_| bad("funding_txid_hex_invalid"))?;
-    let key = OutPoint {
-        txid: txid_arr,
-        index: req.vout,
-    };
-
-    let (funding_out, tip_height) = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let utxo = chain
-            .utxos
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| bad("funding_outpoint_unspent_or_unknown"))?;
-        (utxo, chain.tip_height())
-    };
-
-    let swap = parse_htlc_doge_swap_v1_script(&funding_out.output.script_pubkey)
-        .ok_or_else(|| bad("funding_output_not_htlc_doge_swap_v1"))?;
-    if tip_height < swap.timeout_height {
-        return Err(bad("timeout_not_reached"));
-    }
-
-    let signer_pkh = swap.refund_pkh;
-    let wallet_key = {
-        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
-        let mut found: Option<WalletKey> = None;
-        for k in keys {
-            let b = hex::decode(&k.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
-            if b.len() != 20 {
-                continue;
-            }
-            let mut pkh = [0u8; 20];
-            pkh.copy_from_slice(&b);
-            if pkh == signer_pkh {
-                found = Some(k);
-                break;
-            }
-        }
-        found.ok_or_else(|| bad("refund_pkh_key_not_in_wallet"))?
-    };
-
-    let dest = base58_p2pkh_to_hash(&req.destination_address)
-        .ok_or_else(|| bad("destination_address_decode_failed"))?;
-    if dest.len() != 20 {
-        return Err(bad("destination_pkh_len_invalid"));
-    }
-    let mut dest_pkh = [0u8; 20];
-    dest_pkh.copy_from_slice(&dest);
-
-    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
-    if funding_out.output.value <= fee {
-        return Err(bad("funding_value_le_fee"));
-    }
-    let mut payout = funding_out.output.value - fee;
-
-    let mut tx = Transaction {
-        version: 1,
-        inputs: vec![TxInput {
-            prev_txid: txid_arr,
-            prev_index: req.vout,
-            script_sig: Vec::new(),
-            sequence: 0xffff_fffe,
-        }],
-        outputs: vec![TxOutput {
-            value: payout,
-            script_pubkey: p2pkh_script(&dest_pkh),
-        }],
-        locktime: 0,
-    };
-
-    let priv_bytes =
-        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
-    if priv_bytes.len() != 32 {
-        return Err(bad("privkey_len_invalid"));
-    }
-    let mut sk_bytes = [0u8; 32];
-    sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
-        .map_err(|_| bad("signing_key_init_failed"))?;
-    let pubkey = signing_key
-        .verifying_key()
-        .to_encoded_point(true)
-        .as_bytes()
-        .to_vec();
-
-    for _ in 0..2 {
-        let digest = signature_digest(&tx, 0, &funding_out.output.script_pubkey);
-        let sig: Signature = signing_key
-            .sign_prehash(&digest)
-            .map_err(|_| bad("sig_prehash_failed"))?;
-        let sig = sig.normalize_s().unwrap_or(sig);
-        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-        sig_bytes.push(0x01);
-
-        let witness = encode_htlc_doge_swap_refund_witness(&sig_bytes, &pubkey)
-            .ok_or_else(|| bad("encode_refund_witness_failed"))?;
-        tx.inputs[0].script_sig = witness;
-
-        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
-        if needed_fee > fee {
-            let extra = needed_fee - fee;
-            if payout > extra {
-                fee = needed_fee;
-                payout -= extra;
-                tx.outputs[0].value = payout;
-                continue;
-            } else {
-                return Err(bad("fee_recalculation_exceeded_payout"));
-            }
-        }
-        break;
-    }
-
-    let fee_checked = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .calculate_fees(&tx)
-            .map_err(|_| bad("calculate_fees_failed"))?
-    };
-    let raw = tx.serialize();
-    let txid_out = tx.txid();
-    let mut accepted = false;
-    if req.broadcast.unwrap_or(false) {
-        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        if !mempool.contains(&txid_out) {
-            accepted = mempool
-                .add_transaction(tx, raw.clone(), fee_checked)
-                .is_ok();
-        }
-    }
-
-    // Gap A (NAT broadcast): admitting to local mempool alone relies on
-    // the 60s rebroadcast timer to reach peers, which delays order/fill
-    // visibility up to a minute on NAT-bound nodes. Push the tx to all
-    // currently-connected peers immediately so they see it the moment we
-    // accept it. Best-effort; the rebroadcast timer still covers failures.
-    if accepted {
-        if let Some(ref p2p) = state.p2p {
-            let p = p2p.clone();
-            let r = raw.clone();
-            tokio::spawn(async move {
-                if let Err(e) = p.broadcast_tx(&r).await {
-                    eprintln!("[swap-broadcast/refund_doge_swap] error: {e}");
-                }
-            });
-        }
-    }
-    Ok(Json(SpendDogeSwapResponse {
-        txid: hex::encode(txid_out),
-        accepted,
-        raw_tx_hex: hex::encode(raw),
-        fee: fee_checked,
-    }))
-}
-
-async fn inspect_doge_swap(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    Query(q): Query<InspectDogeSwapQuery>,
-) -> Result<Json<InspectDogeSwapResponse>, StatusCode> {
-    check_rate_with_auth(&state, &addr, &headers_map)?;
-    require_rpc_auth(&headers_map)?;
-
-    let txid = hex_to_32(q.txid.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let key = OutPoint {
-        txid,
-        index: q.vout,
-    };
-
-    let (tip_height, maybe_utxo, swap_active, spv_active) = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let utxo = chain.utxos.get(&key).cloned();
-        let swap_active = chain
-            .params
-            .htlc_doge_swap_v1_activation_height
-            .map(|h| chain.height >= h)
-            .unwrap_or(false);
-        let spv_active = chain
-            .params
-            .doge_spv
-            .as_ref()
-            .map(|p| chain.height >= p.activation_height)
-            .unwrap_or(false);
-        (chain.tip_height(), utxo, swap_active, spv_active)
-    };
-
-    let Some(utxo) = maybe_utxo else {
-        return Ok(Json(InspectDogeSwapResponse {
-            exists: false,
-            funded: false,
-            unspent: false,
-            spent: true,
-            recipient_address: None,
-            refund_address: None,
-            doge_recipient_pkh_hex: None,
-            doge_amount_sats: None,
-            confirmations_required: None,
-            timeout_height: None,
-            funding_binding_hex: None,
-            claimable_now: false,
-            refundable_now: false,
-        }));
-    };
-
-    let swap = match parse_htlc_doge_swap_v1_script(&utxo.output.script_pubkey) {
-        Some(v) => v,
-        None => {
-            return Ok(Json(InspectDogeSwapResponse {
-                exists: false,
-                funded: false,
-                unspent: false,
-                spent: false,
-                recipient_address: None,
-                refund_address: None,
-                doge_recipient_pkh_hex: None,
-                doge_amount_sats: None,
-                confirmations_required: None,
-                timeout_height: None,
-                funding_binding_hex: None,
-                claimable_now: false,
-                refundable_now: false,
-            }))
-        }
-    };
-
-    Ok(Json(InspectDogeSwapResponse {
-        exists: true,
-        funded: true,
-        unspent: true,
-        spent: false,
-        recipient_address: Some(base58_p2pkh_from_hash(&swap.recipient_pkh)),
-        refund_address: Some(base58_p2pkh_from_hash(&swap.refund_pkh)),
-        doge_recipient_pkh_hex: Some(hex::encode(swap.doge_recipient_pkh)),
-        doge_amount_sats: Some(swap.doge_amount_sats),
-        confirmations_required: Some(swap.confirmations_required),
-        timeout_height: Some(swap.timeout_height),
-        funding_binding_hex: Some(hex::encode(swap.funding_binding)),
-        claimable_now: swap_active && spv_active,
-        refundable_now: tip_height >= swap.timeout_height,
-    }))
-}
 
 // Phase 4 Part 3 — SwapOrder RPC endpoints. Six endpoints behind the
 // `swap_order_v1_activation_height` gate. C5 sell-direction fills create
@@ -11801,142 +10624,6 @@ fn parse_ltc_swap_direction(s: &str) -> Option<u8> {
     }
 }
 
-async fn sweep_doge_expired_order(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<SweepExpiredOrderRequest>,
-) -> Result<Json<SwapSpendResponse>, (StatusCode, String)> {
-    let bad = |reason: &str| -> (StatusCode, String) {
-        eprintln!("[sweep_doge_expired_order] reject reason={}", reason);
-        (StatusCode::BAD_REQUEST, reason.to_string())
-    };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
-
-    {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let active = chain
-            .params
-            .doge_swap_order_v1_activation_height
-            .map(|h| chain.height >= h)
-            .unwrap_or(false);
-        if !active {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "doge_swap_order_v1_not_active".to_string(),
-            ));
-        }
-    }
-
-    let txid_arr =
-        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
-    let key = OutPoint {
-        txid: txid_arr,
-        index: req.order_vout,
-    };
-
-    let (funding_out, tip_height) = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let utxo = chain
-            .utxos
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| bad("order_outpoint_unspent_or_unknown"))?;
-        (utxo, chain.tip_height())
-    };
-
-    let order = parse_doge_swap_order_script(&funding_out.output.script_pubkey)
-        .ok_or_else(|| bad("funding_output_not_doge_swap_order"))?;
-    if tip_height < order.expiry_height {
-        return Err(bad("expiry_height_not_reached"));
-    }
-
-    let utxo_value = funding_out.output.value;
-    let minimum_payout = utxo_value.saturating_sub(DOGE_SWAP_ORDER_MAX_SWEEP_FEE);
-    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let est_fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
-    let mut payout = if utxo_value >= est_fee.saturating_add(minimum_payout) {
-        utxo_value - est_fee
-    } else {
-        minimum_payout
-    };
-    if payout < minimum_payout {
-        return Err(bad("payout_below_consensus_minimum"));
-    }
-
-    let mut tx = Transaction {
-        version: 1,
-        inputs: vec![TxInput {
-            prev_txid: txid_arr,
-            prev_index: req.order_vout,
-            script_sig: encode_doge_swap_order_expire_sweep_witness(),
-            sequence: 0xffff_fffe,
-        }],
-        outputs: vec![TxOutput {
-            value: payout,
-            script_pubkey: p2pkh_script(&order.maker_iriumd_pkh),
-        }],
-        locktime: 0,
-    };
-
-    // Fee recalc against the actual serialized size. The 1-byte
-    // expire-sweep witness is constant so a single pass suffices.
-    let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
-    if needed_fee > est_fee {
-        let extra = needed_fee - est_fee;
-        if payout >= minimum_payout.saturating_add(extra) {
-            payout -= extra;
-            tx.outputs[0].value = payout;
-        } else {
-            return Err(bad("fee_recalculation_exceeded_payout_floor"));
-        }
-    }
-
-    let fee_checked = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .calculate_fees(&tx)
-            .map_err(|_| bad("calculate_fees_failed"))?
-    };
-    let raw = tx.serialize();
-    let txid_out = tx.txid();
-    let mut accepted = false;
-    if req.broadcast.unwrap_or(false) {
-        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        if !mempool.contains(&txid_out) {
-            accepted = mempool
-                .add_transaction(tx.clone(), raw.clone(), fee_checked)
-                .is_ok();
-        }
-    }
-
-    // Gap A (NAT broadcast): admitting to local mempool alone relies on
-    // the 60s rebroadcast timer to reach peers, which delays order/fill
-    // visibility up to a minute on NAT-bound nodes. Push the tx to all
-    // currently-connected peers immediately so they see it the moment we
-    // accept it. Best-effort; the rebroadcast timer still covers failures.
-    if accepted {
-        if let Some(ref p2p) = state.p2p {
-            let p = p2p.clone();
-            let r = raw.clone();
-            tokio::spawn(async move {
-                if let Err(e) = p.broadcast_tx(&r).await {
-                    eprintln!("[swap-broadcast/sweep_doge_expired_order] error: {e}");
-                }
-            });
-        }
-    }
-    Ok(Json(SwapSpendResponse {
-        txid: hex::encode(txid_out),
-        accepted,
-        raw_tx_hex: hex::encode(raw),
-        fee: fee_checked,
-    }))
-}
-
 async fn post_ltc_swap_order(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -12907,1123 +11594,6 @@ async fn fill_ltc_swap_order(
     }))
 }
 
-// ---- Phase D — DogeSwapOrder RPC endpoints. Byte-level mirror of the
-// BTC SwapOrder RPCs above, gated on `doge_swap_order_v1_activation_height`.
-// Sell-direction fills emit `HtlcDogeSwapV1` outputs (Phase C); buy-direction
-// fills emit `HTLCv1` outputs identical to the BTC SwapOrder buy-fill since
-// the IRM hashlock is chain-agnostic.
-
-#[derive(Debug, Deserialize)]
-struct PostDogeSwapOrderRequest {
-    direction: String,
-    irm_amount: String,
-    doge_amount_sats: u64,
-    maker_iriumd_address: String,
-    maker_doge_address: String,
-    confirmations_required: u8,
-    expiry_blocks_from_now: u64,
-    #[serde(default)]
-    expected_hash_hex: Option<String>,
-    #[serde(default)]
-    fee_per_byte: Option<u64>,
-    #[serde(default)]
-    broadcast: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct PostDogeSwapOrderResponse {
-    txid: String,
-    accepted: bool,
-    raw_tx_hex: String,
-    order_outpoint: OutPointJson,
-    order_id_hex: String,
-    expiry_height: u64,
-    fee: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListDogeSwapOrdersQuery {
-    #[serde(default)]
-    direction: Option<String>,
-    #[serde(default)]
-    min_irm: Option<u64>,
-    #[serde(default)]
-    max_irm: Option<u64>,
-    #[serde(default)]
-    min_ltc: Option<u64>,
-    #[serde(default)]
-    max_ltc: Option<u64>,
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    offset: Option<usize>,
-    #[serde(default)]
-    sort: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct DogeSwapOrderJson {
-    outpoint: OutPointJson,
-    order_id_hex: String,
-    direction: String,
-    irm_amount: u64,
-    doge_amount_sats: u64,
-    implied_ltc_per_irm_sats: f64,
-    maker_iriumd_address: String,
-    maker_doge_pkh_hex: String,
-    confirmations_required: u8,
-    expiry_height: u64,
-    locked_value: u64,
-    expected_hash_hex: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ListDogeSwapOrdersResponse {
-    orders: Vec<DogeSwapOrderJson>,
-    total_open: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct GetDogeSwapOrderQuery {
-    txid: String,
-    vout: u32,
-}
-
-#[derive(Debug, Serialize)]
-struct GetDogeSwapOrderResponse {
-    found: bool,
-    order: Option<DogeSwapOrderJson>,
-    status: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CancelDogeSwapOrderRequest {
-    order_txid: String,
-    order_vout: u32,
-    destination_address: String,
-    #[serde(default)]
-    fee_per_byte: Option<u64>,
-    #[serde(default)]
-    broadcast: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FillDogeSwapOrderRequest {
-    order_txid: String,
-    order_vout: u32,
-    taker_iriumd_address: String,
-    #[serde(default)]
-    taker_ltc_address: Option<String>,
-    timeout_blocks_from_now: u64,
-    #[serde(default)]
-    fee_per_byte: Option<u64>,
-    #[serde(default)]
-    broadcast: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct FillDogeSwapOrderResponse {
-    txid: String,
-    accepted: bool,
-    raw_tx_hex: String,
-    new_outpoint: OutPointJson,
-    direction: String,
-    fee: u64,
-}
-
-fn compute_doge_swap_order_id(o: &DogeSwapOrderOutput) -> [u8; 8] {
-    let mut hasher = Sha256::new();
-    hasher.update([o.direction, o.confirmations_required]);
-    hasher.update(o.irm_amount.to_le_bytes());
-    hasher.update(o.doge_amount_sats.to_le_bytes());
-    hasher.update(o.maker_iriumd_pkh);
-    hasher.update(o.maker_doge_pkh);
-    hasher.update(o.expiry_height.to_le_bytes());
-    if let Some(h) = &o.expected_hash {
-        hasher.update(h);
-    }
-    let digest = hasher.finalize();
-    let mut out = [0u8; 8];
-    out.copy_from_slice(&digest[..8]);
-    out
-}
-
-fn doge_swap_direction_label(direction: u8) -> &'static str {
-    match direction {
-        DOGE_SWAP_ORDER_DIRECTION_SELL => "sell_irm",
-        DOGE_SWAP_ORDER_DIRECTION_BUY => "buy_irm",
-        _ => "unknown",
-    }
-}
-
-fn parse_doge_swap_direction(s: &str) -> Option<u8> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "sell_irm" | "sell" => Some(DOGE_SWAP_ORDER_DIRECTION_SELL),
-        "buy_irm" | "buy" => Some(DOGE_SWAP_ORDER_DIRECTION_BUY),
-        _ => None,
-    }
-}
-
-async fn post_doge_swap_order(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<PostDogeSwapOrderRequest>,
-) -> Result<Json<PostDogeSwapOrderResponse>, (StatusCode, String)> {
-    let bad = |reason: &str| -> (StatusCode, String) {
-        eprintln!("[post_doge_swap_order] reject reason={}", reason);
-        (StatusCode::BAD_REQUEST, reason.to_string())
-    };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
-
-    let tip_height_before = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let active = chain
-            .params
-            .doge_swap_order_v1_activation_height
-            .map(|h| chain.height >= h)
-            .unwrap_or(false);
-        if !active {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "doge_swap_order_v1_not_active".to_string(),
-            ));
-        }
-        chain.tip_height()
-    };
-
-    let direction =
-        parse_doge_swap_direction(&req.direction).ok_or_else(|| bad("direction_invalid"))?;
-    let irm_amount = parse_irm(&req.irm_amount).map_err(|_| bad("irm_amount_parse_failed"))?;
-    if irm_amount == 0 {
-        return Err(bad("irm_amount_zero"));
-    }
-    if req.doge_amount_sats == 0 {
-        return Err(bad("doge_amount_sats_zero"));
-    }
-    if req.confirmations_required < MIN_HTLC_DOGE_SWAP_CONFIRMATIONS
-        || req.confirmations_required > MAX_HTLC_DOGE_SWAP_CONFIRMATIONS
-    {
-        return Err(bad("confirmations_required_out_of_range"));
-    }
-    if req.expiry_blocks_from_now == 0 {
-        return Err(bad("expiry_blocks_from_now_zero"));
-    }
-    let expiry_height = tip_height_before.saturating_add(req.expiry_blocks_from_now);
-
-    let maker_iriumd_vec = base58_p2pkh_to_hash(&req.maker_iriumd_address)
-        .ok_or_else(|| bad("maker_iriumd_address_decode_failed"))?;
-    if maker_iriumd_vec.len() != 20 {
-        return Err(bad("maker_iriumd_pkh_len_invalid"));
-    }
-    let mut maker_iriumd_pkh = [0u8; 20];
-    maker_iriumd_pkh.copy_from_slice(&maker_iriumd_vec);
-
-    let maker_doge_pkh = decode_doge_p2pkh_address(&req.maker_doge_address)
-        .ok_or_else(|| bad("maker_doge_address_must_be_p2pkh"))?;
-
-    let expected_hash = if direction == DOGE_SWAP_ORDER_DIRECTION_BUY {
-        let h_hex = req
-            .expected_hash_hex
-            .as_deref()
-            .ok_or_else(|| bad("expected_hash_hex_required_for_buy_irm"))?;
-        let bytes = hex::decode(h_hex.trim()).map_err(|_| bad("expected_hash_hex_invalid"))?;
-        if bytes.len() != 32 {
-            return Err(bad("expected_hash_len_invalid"));
-        }
-        let mut h = [0u8; 32];
-        h.copy_from_slice(&bytes);
-        Some(h)
-    } else {
-        None
-    };
-
-    let mut order = DogeSwapOrderOutput {
-        direction,
-        confirmations_required: req.confirmations_required,
-        irm_amount,
-        doge_amount_sats: req.doge_amount_sats,
-        maker_iriumd_pkh,
-        maker_doge_pkh,
-        expiry_height,
-        order_id: [0u8; 8],
-        expected_hash,
-    };
-    order.order_id = compute_doge_swap_order_id(&order);
-
-    let order_script = encode_doge_swap_order_script(&order);
-    let order_value = if direction == DOGE_SWAP_ORDER_DIRECTION_SELL {
-        irm_amount
-    } else {
-        DOGE_SWAP_ORDER_MIN_LOCKED_VALUE
-    };
-
-    let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
-    {
-        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
-        for key in keys {
-            let bytes = hex::decode(&key.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
-            if bytes.len() != 20 {
-                continue;
-            }
-            let mut arr = [0u8; 20];
-            arr.copy_from_slice(&bytes);
-            key_map.insert(arr, key);
-        }
-    }
-    if key_map.is_empty() {
-        return Err(bad("wallet_key_map_empty"));
-    }
-
-    let (mut utxos, tip_height) = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let mut collected = Vec::new();
-        for (outpoint, utxo) in chain.utxos.iter() {
-            if let Some(script_pkh) = p2pkh_hash_from_script(&utxo.output.script_pubkey) {
-                if key_map.contains_key(&script_pkh) {
-                    collected.push(WalletUtxo {
-                        outpoint: outpoint.clone(),
-                        output: utxo.output.clone(),
-                        height: utxo.height,
-                        is_coinbase: utxo.is_coinbase,
-                        pkh: script_pkh,
-                    });
-                }
-            }
-        }
-        (collected, chain.tip_height())
-    };
-    if utxos.is_empty() {
-        return Err(bad("wallet_utxo_set_empty"));
-    }
-    utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
-
-    let mut fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    if fee_per_byte == 0 {
-        fee_per_byte = 1;
-    }
-
-    let mut selected: Vec<WalletUtxo> = Vec::new();
-    let mut total = 0u64;
-    let mut fee = 0u64;
-    for utxo in utxos.iter() {
-        let confirmations = tip_height.saturating_sub(utxo.height);
-        if utxo.is_coinbase && confirmations < coinbase_maturity() {
-            continue;
-        }
-        selected.push(utxo.clone());
-        total = total.saturating_add(utxo.output.value);
-        let n_outs = if total > order_value { 2 } else { 1 };
-        fee = estimate_tx_size(selected.len(), n_outs)
-            .saturating_add(order_script.len() as u64)
-            .saturating_mul(fee_per_byte);
-        if total >= order_value.saturating_add(fee) {
-            break;
-        }
-    }
-    if total < order_value.saturating_add(fee) {
-        return Err(bad("insufficient_spendable_funds"));
-    }
-
-    let inputs: Vec<TxInput> = selected
-        .iter()
-        .map(|u| TxInput {
-            prev_txid: u.outpoint.txid,
-            prev_index: u.outpoint.index,
-            script_sig: Vec::new(),
-            sequence: 0xffff_ffff,
-        })
-        .collect();
-
-    let mut outputs = vec![TxOutput {
-        value: order_value,
-        script_pubkey: order_script,
-    }];
-    let mut change = total.saturating_sub(order_value).saturating_sub(fee);
-    if change > 0 {
-        let change_pkh = selected
-            .first()
-            .map(|u| u.pkh)
-            .ok_or_else(|| bad("no_change_pkh"))?;
-        outputs.push(TxOutput {
-            value: change,
-            script_pubkey: p2pkh_script(&change_pkh),
-        });
-    }
-
-    let mut tx = Transaction {
-        version: 1,
-        inputs,
-        outputs,
-        locktime: 0,
-    };
-
-    for _ in 0..2 {
-        sign_wallet_inputs(&mut tx, &selected, &key_map)
-            .map_err(|_| bad("sign_wallet_inputs_failed"))?;
-        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
-        if needed_fee > fee {
-            let extra = needed_fee - fee;
-            if change >= extra {
-                fee = needed_fee;
-                change = change.saturating_sub(extra);
-                if tx.outputs.len() > 1 {
-                    tx.outputs[1].value = change;
-                }
-                continue;
-            } else {
-                return Err(bad("fee_recalculation_exceeded_change"));
-            }
-        }
-        break;
-    }
-
-    let fee_checked = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .calculate_fees(&tx)
-            .map_err(|_| bad("chain_fee_calculation_failed"))?
-    };
-    let raw = tx.serialize();
-    let txid_arr = tx.txid();
-    let txid_hex = hex::encode(txid_arr);
-    let mut accepted = false;
-    if req.broadcast.unwrap_or(false) {
-        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        if !mempool.contains(&txid_arr) {
-            match mempool.add_transaction(tx.clone(), raw.clone(), fee_checked) {
-                Ok(_) => accepted = true,
-                Err(e) => eprintln!("[post_doge_swap_order] mempool_reject reason={}", e),
-            }
-        }
-    }
-
-    // Gap A (NAT broadcast): admitting to local mempool alone relies on
-    // the 60s rebroadcast timer to reach peers, which delays order/fill
-    // visibility up to a minute on NAT-bound nodes. Push the tx to all
-    // currently-connected peers immediately so they see it the moment we
-    // accept it. Best-effort; the rebroadcast timer still covers failures.
-    if accepted {
-        if let Some(ref p2p) = state.p2p {
-            let p = p2p.clone();
-            let r = raw.clone();
-            tokio::spawn(async move {
-                if let Err(e) = p.broadcast_tx(&r).await {
-                    eprintln!("[swap-broadcast/post_doge_swap_order] error: {e}");
-                }
-            });
-        }
-    }
-
-    Ok(Json(PostDogeSwapOrderResponse {
-        txid: txid_hex.clone(),
-        accepted,
-        raw_tx_hex: hex::encode(raw),
-        order_outpoint: OutPointJson {
-            txid: txid_hex,
-            vout: 0,
-        },
-        order_id_hex: hex::encode(order.order_id),
-        expiry_height,
-        fee: fee_checked,
-    }))
-}
-
-async fn list_doge_swap_orders(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    Query(q): Query<ListDogeSwapOrdersQuery>,
-) -> Result<Json<ListDogeSwapOrdersResponse>, StatusCode> {
-    check_rate_with_auth(&state, &addr, &headers_map)?;
-    require_rpc_auth(&headers_map)?;
-
-    let direction_filter = match q.direction.as_deref() {
-        None | Some("both") => None,
-        Some(s) => match parse_doge_swap_direction(s) {
-            Some(d) => Some(d),
-            None => return Err(StatusCode::BAD_REQUEST),
-        },
-    };
-    let limit = q.limit.unwrap_or(100).min(1000);
-    let offset = q.offset.unwrap_or(0);
-    let sort = q.sort.as_deref().unwrap_or("recent");
-
-    let mut all: Vec<DogeSwapOrderJson> = Vec::new();
-    {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        for (outpoint, utxo) in chain.utxos.iter() {
-            let order = match parse_doge_swap_order_script(&utxo.output.script_pubkey) {
-                Some(o) => o,
-                None => continue,
-            };
-            if let Some(d) = direction_filter {
-                if order.direction != d {
-                    continue;
-                }
-            }
-            if let Some(min) = q.min_irm {
-                if order.irm_amount < min {
-                    continue;
-                }
-            }
-            if let Some(max) = q.max_irm {
-                if order.irm_amount > max {
-                    continue;
-                }
-            }
-            if let Some(min) = q.min_ltc {
-                if order.doge_amount_sats < min {
-                    continue;
-                }
-            }
-            if let Some(max) = q.max_ltc {
-                if order.doge_amount_sats > max {
-                    continue;
-                }
-            }
-            let implied = if order.irm_amount > 0 {
-                order.doge_amount_sats as f64 / order.irm_amount as f64
-            } else {
-                0.0
-            };
-            all.push(DogeSwapOrderJson {
-                outpoint: OutPointJson {
-                    txid: hex::encode(outpoint.txid),
-                    vout: outpoint.index,
-                },
-                order_id_hex: hex::encode(order.order_id),
-                direction: doge_swap_direction_label(order.direction).to_string(),
-                irm_amount: order.irm_amount,
-                doge_amount_sats: order.doge_amount_sats,
-                implied_ltc_per_irm_sats: implied,
-                maker_iriumd_address: base58_p2pkh_from_hash(&order.maker_iriumd_pkh),
-                maker_doge_pkh_hex: hex::encode(order.maker_doge_pkh),
-                confirmations_required: order.confirmations_required,
-                expiry_height: order.expiry_height,
-                locked_value: utxo.output.value,
-                expected_hash_hex: order.expected_hash.map(hex::encode),
-            });
-        }
-    }
-
-    let total_open = all.len();
-    match sort {
-        "price_asc" => all.sort_by(|a, b| {
-            a.implied_ltc_per_irm_sats
-                .partial_cmp(&b.implied_ltc_per_irm_sats)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-        "price_desc" => all.sort_by(|a, b| {
-            b.implied_ltc_per_irm_sats
-                .partial_cmp(&a.implied_ltc_per_irm_sats)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-        _ => all.sort_by(|a, b| b.expiry_height.cmp(&a.expiry_height)),
-    }
-
-    let page: Vec<DogeSwapOrderJson> = all.into_iter().skip(offset).take(limit).collect();
-    Ok(Json(ListDogeSwapOrdersResponse {
-        orders: page,
-        total_open,
-    }))
-}
-
-async fn get_doge_swap_order(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    Query(q): Query<GetDogeSwapOrderQuery>,
-) -> Result<Json<GetDogeSwapOrderResponse>, StatusCode> {
-    check_rate_with_auth(&state, &addr, &headers_map)?;
-    require_rpc_auth(&headers_map)?;
-
-    let txid = hex_to_32(q.txid.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let key = OutPoint {
-        txid,
-        index: q.vout,
-    };
-
-    let (tip_height, maybe_utxo) = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        (chain.tip_height(), chain.utxos.get(&key).cloned())
-    };
-
-    let Some(utxo) = maybe_utxo else {
-        return Ok(Json(GetDogeSwapOrderResponse {
-            found: false,
-            order: None,
-            status: "closed".to_string(),
-        }));
-    };
-
-    let order = match parse_doge_swap_order_script(&utxo.output.script_pubkey) {
-        Some(o) => o,
-        None => {
-            return Ok(Json(GetDogeSwapOrderResponse {
-                found: false,
-                order: None,
-                status: "not_a_doge_swap_order".to_string(),
-            }));
-        }
-    };
-
-    let implied = if order.irm_amount > 0 {
-        order.doge_amount_sats as f64 / order.irm_amount as f64
-    } else {
-        0.0
-    };
-    let status = if tip_height >= order.expiry_height {
-        "expired"
-    } else {
-        "open"
-    };
-    Ok(Json(GetDogeSwapOrderResponse {
-        found: true,
-        order: Some(DogeSwapOrderJson {
-            outpoint: OutPointJson {
-                txid: hex::encode(key.txid),
-                vout: key.index,
-            },
-            order_id_hex: hex::encode(order.order_id),
-            direction: doge_swap_direction_label(order.direction).to_string(),
-            irm_amount: order.irm_amount,
-            doge_amount_sats: order.doge_amount_sats,
-            implied_ltc_per_irm_sats: implied,
-            maker_iriumd_address: base58_p2pkh_from_hash(&order.maker_iriumd_pkh),
-            maker_doge_pkh_hex: hex::encode(order.maker_doge_pkh),
-            confirmations_required: order.confirmations_required,
-            expiry_height: order.expiry_height,
-            locked_value: utxo.output.value,
-            expected_hash_hex: order.expected_hash.map(hex::encode),
-        }),
-        status: status.to_string(),
-    }))
-}
-
-async fn cancel_doge_swap_order(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<CancelDogeSwapOrderRequest>,
-) -> Result<Json<SwapSpendResponse>, (StatusCode, String)> {
-    let bad = |reason: &str| -> (StatusCode, String) {
-        eprintln!("[cancel_doge_swap_order] reject reason={}", reason);
-        (StatusCode::BAD_REQUEST, reason.to_string())
-    };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
-
-    {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let active = chain
-            .params
-            .doge_swap_order_v1_activation_height
-            .map(|h| chain.height >= h)
-            .unwrap_or(false);
-        if !active {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "doge_swap_order_v1_not_active".to_string(),
-            ));
-        }
-    }
-
-    let txid_arr =
-        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
-    let key = OutPoint {
-        txid: txid_arr,
-        index: req.order_vout,
-    };
-
-    let (funding_out, tip_height) = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let utxo = chain
-            .utxos
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| bad("order_outpoint_unspent_or_unknown"))?;
-        (utxo, chain.tip_height())
-    };
-
-    let order = parse_doge_swap_order_script(&funding_out.output.script_pubkey)
-        .ok_or_else(|| bad("funding_output_not_doge_swap_order"))?;
-    if tip_height >= order.expiry_height {
-        return Err(bad("order_already_expired"));
-    }
-
-    let signer_pkh = order.maker_iriumd_pkh;
-    let wallet_key = {
-        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
-        let mut found: Option<WalletKey> = None;
-        for k in keys {
-            let b = hex::decode(&k.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
-            if b.len() != 20 {
-                continue;
-            }
-            let mut pkh = [0u8; 20];
-            pkh.copy_from_slice(&b);
-            if pkh == signer_pkh {
-                found = Some(k);
-                break;
-            }
-        }
-        found.ok_or_else(|| bad("maker_iriumd_pkh_key_not_in_wallet"))?
-    };
-
-    let dest = base58_p2pkh_to_hash(&req.destination_address)
-        .ok_or_else(|| bad("destination_address_decode_failed"))?;
-    if dest.len() != 20 {
-        return Err(bad("destination_pkh_len_invalid"));
-    }
-    let mut dest_pkh = [0u8; 20];
-    dest_pkh.copy_from_slice(&dest);
-
-    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
-    if funding_out.output.value <= fee {
-        return Err(bad("funding_value_le_fee"));
-    }
-    let mut payout = funding_out.output.value - fee;
-
-    let mut tx = Transaction {
-        version: 1,
-        inputs: vec![TxInput {
-            prev_txid: txid_arr,
-            prev_index: req.order_vout,
-            script_sig: Vec::new(),
-            sequence: 0xffff_fffe,
-        }],
-        outputs: vec![TxOutput {
-            value: payout,
-            script_pubkey: p2pkh_script(&dest_pkh),
-        }],
-        locktime: 0,
-    };
-
-    let scriptcode = encode_doge_swap_order_script(&order);
-    let priv_bytes =
-        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
-    if priv_bytes.len() != 32 {
-        return Err(bad("privkey_len_invalid"));
-    }
-    let mut sk_bytes = [0u8; 32];
-    sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
-        .map_err(|_| bad("signing_key_init_failed"))?;
-    let pubkey = signing_key
-        .verifying_key()
-        .to_encoded_point(true)
-        .as_bytes()
-        .to_vec();
-
-    for _ in 0..2 {
-        let digest = signature_digest(&tx, 0, &scriptcode);
-        let sig: Signature = signing_key
-            .sign_prehash(&digest)
-            .map_err(|_| bad("sig_prehash_failed"))?;
-        let sig = sig.normalize_s().unwrap_or(sig);
-        let mut sig_bytes = sig.to_der().as_bytes().to_vec();
-        sig_bytes.push(0x01);
-
-        let witness = encode_doge_swap_order_cancel_witness(&sig_bytes, &pubkey)
-            .ok_or_else(|| bad("encode_cancel_witness_failed"))?;
-        tx.inputs[0].script_sig = witness;
-
-        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
-        if needed_fee > fee {
-            let extra = needed_fee - fee;
-            if payout > extra {
-                fee = needed_fee;
-                payout -= extra;
-                tx.outputs[0].value = payout;
-                continue;
-            } else {
-                return Err(bad("fee_recalculation_exceeded_payout"));
-            }
-        }
-        break;
-    }
-
-    let fee_checked = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .calculate_fees(&tx)
-            .map_err(|_| bad("calculate_fees_failed"))?
-    };
-    let raw = tx.serialize();
-    let txid_out = tx.txid();
-    let mut accepted = false;
-    if req.broadcast.unwrap_or(false) {
-        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        if !mempool.contains(&txid_out) {
-            accepted = mempool
-                .add_transaction(tx, raw.clone(), fee_checked)
-                .is_ok();
-        }
-    }
-
-    // Gap A (NAT broadcast): admitting to local mempool alone relies on
-    // the 60s rebroadcast timer to reach peers, which delays order/fill
-    // visibility up to a minute on NAT-bound nodes. Push the tx to all
-    // currently-connected peers immediately so they see it the moment we
-    // accept it. Best-effort; the rebroadcast timer still covers failures.
-    if accepted {
-        if let Some(ref p2p) = state.p2p {
-            let p = p2p.clone();
-            let r = raw.clone();
-            tokio::spawn(async move {
-                if let Err(e) = p.broadcast_tx(&r).await {
-                    eprintln!("[swap-broadcast/cancel_doge_swap_order] error: {e}");
-                }
-            });
-        }
-    }
-    Ok(Json(SwapSpendResponse {
-        txid: hex::encode(txid_out),
-        accepted,
-        raw_tx_hex: hex::encode(raw),
-        fee: fee_checked,
-    }))
-}
-
-async fn fill_doge_swap_order(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers_map: HeaderMap,
-    AxumJson(req): AxumJson<FillDogeSwapOrderRequest>,
-) -> Result<Json<FillDogeSwapOrderResponse>, (StatusCode, String)> {
-    let bad = |reason: &str| -> (StatusCode, String) {
-        eprintln!("[fill_doge_swap_order] reject reason={}", reason);
-        (StatusCode::BAD_REQUEST, reason.to_string())
-    };
-
-    check_rate_with_auth(&state, &addr, &headers_map)
-        .map_err(|sc| (sc, "rate_limit_or_auth_failed".to_string()))?;
-    require_rpc_auth(&headers_map).map_err(|sc| (sc, format!("rpc_auth_failed:{sc}")))?;
-
-    {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let active = chain
-            .params
-            .doge_swap_order_v1_activation_height
-            .map(|h| chain.height >= h)
-            .unwrap_or(false);
-        if !active {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "doge_swap_order_v1_not_active".to_string(),
-            ));
-        }
-    }
-
-    let _ = req.taker_ltc_address;
-
-    let txid_arr =
-        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
-    let key = OutPoint {
-        txid: txid_arr,
-        index: req.order_vout,
-    };
-
-    let (funding_out, tip_height) = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let utxo = chain
-            .utxos
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| bad("order_outpoint_unspent_or_unknown"))?;
-        (utxo, chain.tip_height())
-    };
-
-    let order = parse_doge_swap_order_script(&funding_out.output.script_pubkey)
-        .ok_or_else(|| bad("funding_output_not_doge_swap_order"))?;
-    if tip_height > order.expiry_height {
-        return Err(bad("order_expired"));
-    }
-    if req.timeout_blocks_from_now == 0 {
-        return Err(bad("timeout_blocks_from_now_zero"));
-    }
-    let timeout_height = tip_height.saturating_add(req.timeout_blocks_from_now);
-
-    let taker_iriumd_vec = base58_p2pkh_to_hash(&req.taker_iriumd_address)
-        .ok_or_else(|| bad("taker_iriumd_address_decode_failed"))?;
-    if taker_iriumd_vec.len() != 20 {
-        return Err(bad("taker_iriumd_pkh_len_invalid"));
-    }
-    let mut taker_iriumd_pkh = [0u8; 20];
-    taker_iriumd_pkh.copy_from_slice(&taker_iriumd_vec);
-
-    let wallet_key = {
-        let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-        let keys = wallet.keys().map_err(|_| bad("wallet_keys_unavailable"))?;
-        let mut found: Option<WalletKey> = None;
-        for k in keys {
-            let b = hex::decode(&k.pkh).map_err(|_| bad("wallet_key_pkh_decode_failed"))?;
-            if b.len() != 20 {
-                continue;
-            }
-            let mut pkh = [0u8; 20];
-            pkh.copy_from_slice(&b);
-            if pkh == taker_iriumd_pkh {
-                found = Some(k);
-                break;
-            }
-        }
-        found.ok_or_else(|| bad("taker_iriumd_pkh_key_not_in_wallet"))?
-    };
-
-    let priv_bytes =
-        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
-    if priv_bytes.len() != 32 {
-        return Err(bad("privkey_len_invalid"));
-    }
-    let mut sk_bytes = [0u8; 32];
-    sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
-        .map_err(|_| bad("signing_key_init_failed"))?;
-    let pubkey = signing_key
-        .verifying_key()
-        .to_encoded_point(true)
-        .as_bytes()
-        .to_vec();
-
-    let covenant_output = match order.direction {
-        DOGE_SWAP_ORDER_DIRECTION_SELL => {
-            let funding_binding = compute_funding_binding(&txid_arr, req.order_vout);
-            let swap = HtlcDogeSwapV1Output {
-                confirmations_required: order.confirmations_required,
-                recipient_pkh: taker_iriumd_pkh,
-                refund_pkh: order.maker_iriumd_pkh,
-                doge_recipient_pkh: order.maker_doge_pkh,
-                doge_amount_sats: order.doge_amount_sats,
-                timeout_height,
-                funding_binding,
-            };
-            TxOutput {
-                value: order.irm_amount,
-                script_pubkey: encode_htlc_doge_swap_v1_script(&swap),
-            }
-        }
-        DOGE_SWAP_ORDER_DIRECTION_BUY => {
-            let expected_hash = order
-                .expected_hash
-                .ok_or_else(|| bad("buy_order_missing_expected_hash"))?;
-            let sha = Sha256::digest(&pubkey);
-            let rip = ripemd::Ripemd160::digest(sha);
-            let mut taker_refund_pkh = [0u8; 20];
-            taker_refund_pkh.copy_from_slice(&rip);
-            let htlc = HtlcV1Output {
-                expected_hash,
-                recipient_pkh: order.maker_iriumd_pkh,
-                refund_pkh: taker_refund_pkh,
-                timeout_height,
-            };
-            TxOutput {
-                value: order.irm_amount,
-                script_pubkey: encode_htlcv1_script(&htlc),
-            }
-        }
-        _ => return Err(bad("order_direction_unknown")),
-    };
-
-    let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
-    let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
-    if order.direction == DOGE_SWAP_ORDER_DIRECTION_SELL
-        && funding_out.output.value < order.irm_amount
-    {
-        return Err(bad("order_value_below_required_irm_amount"));
-    }
-
-    let mut inputs: Vec<TxInput> = vec![TxInput {
-        prev_txid: txid_arr,
-        prev_index: req.order_vout,
-        script_sig: Vec::new(),
-        sequence: 0xffff_fffe,
-    }];
-    let mut outputs = vec![covenant_output];
-
-    let mut extra_inputs: Vec<WalletUtxo> = Vec::new();
-    let mut extra_total = 0u64;
-    if order.direction == DOGE_SWAP_ORDER_DIRECTION_BUY
-        || funding_out.output.value < order.irm_amount.saturating_add(fee)
-    {
-        let needed = order
-            .irm_amount
-            .saturating_add(fee)
-            .saturating_sub(funding_out.output.value);
-        let mut wallet_utxos = {
-            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-            let mut collected = Vec::new();
-            for (out, ut) in chain.utxos.iter() {
-                if let Some(pkh) = p2pkh_hash_from_script(&ut.output.script_pubkey) {
-                    if pkh == taker_iriumd_pkh {
-                        collected.push(WalletUtxo {
-                            outpoint: out.clone(),
-                            output: ut.output.clone(),
-                            height: ut.height,
-                            is_coinbase: ut.is_coinbase,
-                            pkh,
-                        });
-                    }
-                }
-            }
-            collected
-        };
-        wallet_utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
-        for u in wallet_utxos.iter() {
-            if u.is_coinbase
-                && tip_height.saturating_sub(u.height) < coinbase_maturity()
-            {
-                continue;
-            }
-            extra_inputs.push(u.clone());
-            extra_total = extra_total.saturating_add(u.output.value);
-            inputs.push(TxInput {
-                prev_txid: u.outpoint.txid,
-                prev_index: u.outpoint.index,
-                script_sig: Vec::new(),
-                sequence: 0xffff_ffff,
-            });
-            if extra_total >= needed {
-                break;
-            }
-        }
-        if extra_total < needed {
-            return Err(bad("insufficient_taker_funds_to_fill_order"));
-        }
-        let change = funding_out
-            .output
-            .value
-            .saturating_add(extra_total)
-            .saturating_sub(order.irm_amount)
-            .saturating_sub(fee);
-        if change > 0 {
-            outputs.push(TxOutput {
-                value: change,
-                script_pubkey: p2pkh_script(&taker_iriumd_pkh),
-            });
-        }
-    }
-
-    let mut tx = Transaction {
-        version: 1,
-        inputs,
-        outputs,
-        locktime: 0,
-    };
-
-    let scriptcode_order = encode_doge_swap_order_script(&order);
-
-    for _ in 0..2 {
-        let digest_order = signature_digest(&tx, 0, &scriptcode_order);
-        let order_sig: Signature = signing_key
-            .sign_prehash(&digest_order)
-            .map_err(|_| bad("sig_prehash_failed"))?;
-        let order_sig = order_sig.normalize_s().unwrap_or(order_sig);
-        let mut order_sig_bytes = order_sig.to_der().as_bytes().to_vec();
-        order_sig_bytes.push(0x01);
-
-        let witness = match order.direction {
-            DOGE_SWAP_ORDER_DIRECTION_SELL => encode_doge_swap_order_fill_sell_witness(
-                &order_sig_bytes,
-                &pubkey,
-                &taker_iriumd_pkh,
-                timeout_height,
-            )
-            .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
-            DOGE_SWAP_ORDER_DIRECTION_BUY => encode_doge_swap_order_fill_buy_witness(
-                &order_sig_bytes,
-                &pubkey,
-                timeout_height,
-            )
-            .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
-            _ => return Err(bad("order_direction_unknown")),
-        };
-        tx.inputs[0].script_sig = witness;
-
-        if !extra_inputs.is_empty() {
-            let mut key_map: HashMap<[u8; 20], WalletKey> = HashMap::new();
-            key_map.insert(taker_iriumd_pkh, wallet_key.clone());
-            sign_wallet_inputs(&mut tx, &extra_inputs, &key_map)
-                .map_err(|_| bad("sign_extra_inputs_failed"))?;
-        }
-
-        let needed_fee = (tx.serialize().len() as u64).saturating_mul(fee_per_byte);
-        if needed_fee > fee {
-            let extra = needed_fee - fee;
-            // Covenant output 0 is pinned by the sell/buy fill rule; only
-            // change (last output) can absorb the shortfall.
-            if tx.outputs.len() > 1 {
-                let change_idx = tx.outputs.len() - 1;
-                if tx.outputs[change_idx].value > extra {
-                    fee = needed_fee;
-                    tx.outputs[change_idx].value -= extra;
-                    continue;
-                } else {
-                    return Err(bad("fee_recalculation_exceeded_change"));
-                }
-            } else {
-                return Err(bad("fee_recalculation_no_change_to_reduce"));
-            }
-        }
-        break;
-    }
-
-    let fee_checked = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .calculate_fees(&tx)
-            .map_err(|_| bad("calculate_fees_failed"))?
-    };
-    let raw = tx.serialize();
-    let txid_out = tx.txid();
-    let mut accepted = false;
-    if req.broadcast.unwrap_or(false) {
-        let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        if !mempool.contains(&txid_out) {
-            accepted = mempool
-                .add_transaction(tx, raw.clone(), fee_checked)
-                .is_ok();
-        }
-    }
-
-    // Gap A (NAT broadcast): admitting to local mempool alone relies on
-    // the 60s rebroadcast timer to reach peers, which delays order/fill
-    // visibility up to a minute on NAT-bound nodes. Push the tx to all
-    // currently-connected peers immediately so they see it the moment we
-    // accept it. Best-effort; the rebroadcast timer still covers failures.
-    if accepted {
-        if let Some(ref p2p) = state.p2p {
-            let p = p2p.clone();
-            let r = raw.clone();
-            tokio::spawn(async move {
-                if let Err(e) = p.broadcast_tx(&r).await {
-                    eprintln!("[swap-broadcast/fill_doge_swap_order] error: {e}");
-                }
-            });
-        }
-    }
-
-    Ok(Json(FillDogeSwapOrderResponse {
-        txid: hex::encode(txid_out),
-        accepted,
-        raw_tx_hex: hex::encode(raw),
-        new_outpoint: OutPointJson {
-            txid: hex::encode(txid_out),
-            vout: 0,
-        },
-        direction: doge_swap_direction_label(order.direction).to_string(),
-        fee: fee_checked,
-    }))
-}
 
 async fn create_htlc(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -14292,7 +11862,7 @@ async fn decode_htlc(
             recipient_address: None,
             refund_address: None,
         })),
-        OutputEncumbrance::MpsoV1(_) | OutputEncumbrance::HtlcBtcSwapV1(_) | OutputEncumbrance::HtlcLtcSwapV1(_) | OutputEncumbrance::HtlcDogeSwapV1(_) | OutputEncumbrance::SwapOrder(_) | OutputEncumbrance::LtcSwapOrder(_) | OutputEncumbrance::DogeSwapOrder(_) | OutputEncumbrance::Unknown => Ok(Json(DecodeHtlcResponse {
+        OutputEncumbrance::MpsoV1(_) | OutputEncumbrance::HtlcBtcSwapV1(_) | OutputEncumbrance::HtlcLtcSwapV1(_) | OutputEncumbrance::SwapOrder(_) | OutputEncumbrance::LtcSwapOrder(_) | OutputEncumbrance::Unknown => Ok(Json(DecodeHtlcResponse {
             found: false,
             vout: Some(idx as u32),
             output_type: "unknown".to_string(),
@@ -15705,7 +13275,7 @@ async fn get_block_template(
         });
     }
     // Consensus enforces at-most-one of each header-batch carrier per block
-    // (chain.rs: 'block contains more than one {Btc,Ltc,Doge}HeaderBatch
+    // (chain.rs: 'block contains more than one {Btc,Ltc}HeaderBatch
     // output'). The mempool can hold many in transit when peers re-gossip
     // stale carriers after an iriumd restart, so the template builder must
     // filter — otherwise the pool stuffs all of them into a block and
@@ -15715,20 +13285,15 @@ async fn get_block_template(
     {
         let mut btc_seen = false;
         let mut ltc_seen = false;
-        let mut doge_seen = false;
         mempool_entries.retain(|e| {
             let mut has_btc = false;
             let mut has_ltc = false;
-            let mut has_doge = false;
             for out in &e.tx.outputs {
                 if parse_btc_header_batch(&out.script_pubkey).is_ok() {
                     has_btc = true;
                 }
                 if parse_ltc_header_batch(&out.script_pubkey).is_ok() {
                     has_ltc = true;
-                }
-                if parse_doge_header_batch(&out.script_pubkey).is_ok() {
-                    has_doge = true;
                 }
             }
             if has_btc && btc_seen {
@@ -15737,17 +13302,11 @@ async fn get_block_template(
             if has_ltc && ltc_seen {
                 return false;
             }
-            if has_doge && doge_seen {
-                return false;
-            }
             if has_btc {
                 btc_seen = true;
             }
             if has_ltc {
                 ltc_seen = true;
-            }
-            if has_doge {
-                doge_seen = true;
             }
             true
         });
@@ -15883,105 +13442,6 @@ async fn get_block_template(
                     }
                 }
             }
-            // v1.9.88: STRATUM_DOGE_CARRIERS=off skips only the DOGE carrier so
-            // BTC+LTC can remain active while the fork-block AuxPoW fetch
-            // mismatch is repaired (fetch by height returns canonical-chain
-            // AuxPoW for relay fork blocks — wrong hash, validation fails).
-            if std::env::var("STRATUM_DOGE_CARRIERS").as_deref() != Ok("off") {
-            // DOGE — v1.9.63: same shape and re-enable rationale as LTC.
-            let doge_cached = state
-                .doge_template_headers_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            if let Some(c) = doge_cached {
-                let fresh = c
-                    .built_at
-                    .elapsed()
-                    .map(|d| d.as_secs() <= COINBASE_BATCH_CACHE_TTL_SECS)
-                    .unwrap_or(false);
-                // v1.9.64: DOGE needs strict tip match for the same reason
-                // as LTC — apply_doge_header_batch lacks v1.9.52-style
-                // idempotency, so re-injecting a known batch hard-rejects.
-                let live = {
-                    let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-                    chain.doge_tip_height
-                };
-                if fresh && live == c.expected_relay_tip_height {
-                    if let Ok(raw) = hex::decode(c.headers_hex.trim()) {
-                        if !raw.is_empty() && raw.len() % DOGE_HEADER_BYTES == 0 {
-                            let mut headers: Vec<DogeHeader> = Vec::new();
-                            let mut ok = true;
-                            for chunk in raw.chunks(DOGE_HEADER_BYTES) {
-                                match DogeHeader::deserialize(chunk) {
-                                    Ok(h) => headers.push(h),
-                                    Err(_) => {
-                                        ok = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if ok {
-                                // PR-6 of issue #68: zip with parallel
-                                // AuxPoW cache and emit v0x02 batches so
-                                // post-371,337 headers carry the AuxPoW
-                                // data their PR-5 validator requires.
-                                let auxpow_cache = state
-                                    .doge_template_auxpow_cache
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .clone();
-                                let items: Vec<ParsedDogeHeader> = match auxpow_cache {
-                                    Some(ap_vec) if ap_vec.len() == headers.len() => headers
-                                        .into_iter()
-                                        .zip(ap_vec.into_iter())
-                                        .map(|(h, ap_hex_opt)| ParsedDogeHeader {
-                                            header: h,
-                                            auxpow: ap_hex_opt
-                                                .as_ref()
-                                                .and_then(|s| hex::decode(s).ok()),
-                                        })
-                                        .collect(),
-                                    _ => headers
-                                        .into_iter()
-                                        .map(|h| ParsedDogeHeader { header: h, auxpow: None })
-                                        .collect(),
-                                };
-                                match validate_doge_template_items(&items)
-                                    .and_then(|_| encode_doge_header_batch_with_auxpow(&items))
-                                {
-                                    Ok(script) => {
-                                        out.push(CoinbaseExtraOutput {
-                                            value: 0,
-                                            script_pubkey_hex: hex::encode(script),
-                                        });
-                                    }
-                                    Err(e) => {
-                                        {
-                                            let mut cache = state
-                                                .doge_template_headers_cache
-                                                .lock()
-                                                .unwrap_or_else(|err| err.into_inner());
-                                            *cache = None;
-                                        }
-                                        {
-                                            let mut auxpow_cache = state
-                                                .doge_template_auxpow_cache
-                                                .lock()
-                                                .unwrap_or_else(|err| err.into_inner());
-                                            *auxpow_cache = None;
-                                        }
-                                        eprintln!(
-                                            "[getblocktemplate] disabled DOGE coinbase carrier cache (relay_tip={live}): {e}"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            } // end STRATUM_DOGE_CARRIERS guard
             out
         } else {
             Vec::new()
@@ -16225,7 +13685,7 @@ fn decode_compact_tx(raw: &[u8]) -> Result<Transaction, String> {
         let value = read_u64(raw, &mut offset)?;
         // v1.9.73: read script_len as varint to match TxOutput::serialize
         // (which switched to varint to support outputs > 252 bytes such as
-        // BtcHeaderBatch / LtcHeaderBatch / DogeHeaderBatch / large MPSO
+        // BtcHeaderBatch / LtcHeaderBatch / large MPSO
         // covenants). Previously this single-byte read produced a garbage
         // tx for any output whose script_pubkey was > 252 bytes — the
         // recomputed txid then differed from the original, the merkle
@@ -16684,14 +14144,14 @@ async fn mempool_spent_by(
 
 // =====================================================================
 // In-process header sync background tasks (replacing the standalone
-// `src/bin/{btc,ltc,doge}-header-sync.rs` binaries + their systemd
+// `src/bin/{btc,ltc}-header-sync.rs` binaries + their systemd
 // timers). One tokio task per chain, spawned from main() once the
 // corresponding `resolved_*_spv_relay_activation_height(network)`
 // returns `Some(_)`. Each task loops forever:
 //   1. Read relay tip + activation gate directly from ChainState
 //      (in-process, no HTTP, no auth).
 //   2. Fetch external-chain tip via the async helpers in
-//      `irium_node_rs::header_sync::{btc,ltc,doge}`.
+//      `irium_node_rs::header_sync::{btc,ltc}`.
 //   3. Compute target = net_tip - SAFETY_LAG; bail if up to date.
 //   4. Fetch the [relay_tip+1 ..= target] header range (max 144).
 //   5. Call the corresponding `submit_*_headers_core` directly.
@@ -17172,7 +14632,7 @@ fn header_sync_startup_jitter_secs() -> u64 {
 
 /// True iff the mempool contains a tx whose outputs include a script
 /// that the supplied parser recognises (i.e. a pending unconfirmed
-/// BtcHeaderBatch / LtcHeaderBatch / DogeHeaderBatch carrier tx). When
+/// BtcHeaderBatch / LtcHeaderBatch carrier tx). When
 /// true, the cycle skips submitting another batch: with the same
 /// wallet inputs and same headers, the resulting tx is byte-identical
 /// to the pending one, which the mempool rejects as a duplicate and
@@ -17294,58 +14754,6 @@ fn maybe_spawn_ltc_header_sync(state: AppState, network: NetworkKind) {
     });
 }
 
-fn maybe_spawn_doge_header_sync(state: AppState, network: NetworkKind) {
-    let act_height = match irium_node_rs::activation::resolved_doge_spv_relay_activation_height(network) {
-        Some(h) => h,
-        None => {
-            eprintln!(
-                "[header-sync/doge] activation gate is None on {:?}; not spawning",
-                network
-            );
-            return;
-        }
-    };
-    let source = match header_sync::common::Source::from_env("IRIUM_DOGE_HEADER_SYNC_SOURCE") {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[header-sync/doge] source detection failed: {e}; thread exiting");
-            return;
-        }
-    };
-    tokio::spawn(async move {
-        let client = match reqwest::Client::builder()
-            .user_agent("iriumd-doge-header-sync/1.0")
-            .timeout(std::time::Duration::from_secs(
-                header_sync::common::HTTP_TIMEOUT_SECS,
-            ))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[header-sync/doge] failed to build http client: {e}; thread exiting");
-                return;
-            }
-        };
-        let jitter = header_sync_startup_jitter_secs();
-        eprintln!("[header-sync/doge] startup jitter {jitter}s");
-        tokio::time::sleep(std::time::Duration::from_secs(jitter)).await;
-        loop {
-            match run_doge_header_sync_cycle(&state, &client, act_height, source).await {
-                Ok(outcome) => {
-                    eprintln!("[header-sync/doge] cycle ok: {outcome}");
-                }
-                Err(e) => {
-                    eprintln!("[header-sync/doge] cycle error: {e}");
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(
-                header_sync::common::CYCLE_PERIOD_SECS,
-            ))
-            .await;
-        }
-    });
-}
-
 async fn run_btc_header_sync_cycle(
     state: &AppState,
     client: &reqwest::Client,
@@ -17375,7 +14783,7 @@ async fn run_btc_header_sync_cycle(
         .await
         .map_err(|e| format!("p2p fetch: {e}"))?;
     // v1.9.70: cap BTC batch to 144 headers (~11.5 KB encoded) for the
-    // same reason as the v1.9.69 DOGE cap — a 2000-header P2P response
+    // same reason — a 2000-header P2P response
     // produces a 160 KB coinbase OP_RETURN that stalls local mining.
     let raw_headers: Vec<[u8; 80]> = raw_headers.into_iter().take(144).collect();
     if raw_headers.is_empty() {
@@ -17432,7 +14840,7 @@ async fn run_btc_header_sync_cycle(
     // FIX 2 (v1.9.63): floor at anchor.height on cold start. ChainState
     // initialises btc_tip_height to 0 even when btc_spv is configured;
     // fetching from height 1 would produce headers that do not connect
-    // to the anchor (LTC/DOGE hit this hard at v1.9.62 activation; apply
+    // to the anchor (LTC hit this hard at v1.9.62 activation; apply
     // BTC the same protection for consistency even though v1.9.55
     // bootstrap usually beats the cycle to it).
     let anchor_height = {
@@ -17482,7 +14890,7 @@ async fn run_ltc_header_sync_cycle(
     act_height: u64,
     source: header_sync::common::Source,
 ) -> Result<String, String> {
-    let (_relay_tip, gate_open) = {
+    let (relay_tip, gate_open) = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let open = chain.height >= act_height;
         (chain.ltc_tip_height, open)
@@ -17598,197 +15006,6 @@ async fn run_ltc_header_sync_cycle(
         });
     }
     header_sync_touch_last_file("ltc");
-    Ok(format!(
-        "cached_headers start={start} end={end} relay_tip={live_relay_tip} source={source:?}"
-    ))
-}
-
-async fn run_doge_header_sync_cycle(
-    state: &AppState,
-    client: &reqwest::Client,
-    act_height: u64,
-    source: header_sync::common::Source,
-) -> Result<String, String> {
-    let (relay_tip, gate_open) = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let open = chain.height >= act_height;
-        (chain.doge_tip_height, open)
-    };
-    if !gate_open {
-        return Ok("gate_closed".to_string());
-    }
-    // v1.9.66 Issue #60 phase 1: mainnet uses native P2P (no HTTP
-    // block-explorer APIs anymore). Regtest still goes through the
-    // local dogecoind RPC path because that is how the integration
-    // test rigs operate — the P2P client only knows how to dial
-    // mainnet seeds.
-    if source == header_sync::common::Source::Mainnet {
-        // Locator: the natural-byte-order block hash of our current
-        // DOGE relay tip if we have one, otherwise the anchor hash.
-        // The peer walks our locator and replies with up to 2000
-        // headers chained from the first hash it also knows.
-        let tip_hash = {
-            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-            chain.doge_tip.unwrap_or_else(|| {
-                chain
-                    .params
-                    .doge_spv
-                    .as_ref()
-                    .map(|p| p.anchor.hash)
-                    .unwrap_or([0u8; 32])
-            })
-        };
-        // Issue #68 Option B (v1.9.83): headers come via P2P (mirrors
-        // BTC/LTC), AuxPoW data comes via HTTP from blockchair. PR-6's
-        // P2P getdata path didn't work against real DOGE peers.
-        let raw_headers = irium_node_rs::doge_p2p::fetch_headers(tip_hash)
-            .await
-            .map_err(|e| format!("p2p fetch: {e}"))?;
-        // v1.9.83: tightened DOGE batch from 144 to 20 to stay under
-        // blockchair's free-tier HTTP quota (~1500 req/day). At ~43%
-        // AuxPoW-bit headers post-371,337, this is ~9 HTTP calls per
-        // cycle × 144 cycles/day = ~1,300 req/day with headroom for
-        // retries.
-        let raw_headers: Vec<[u8; 80]> = raw_headers.into_iter().take(20).collect();
-        if raw_headers.is_empty() {
-            header_sync_touch_last_file("doge");
-            return Ok("p2p_up_to_date".to_string());
-        }
-
-        // Compute the DOGE height of the first header in this batch.
-        // If we have no relay tip yet, headers chain from the anchor;
-        // otherwise from current chain.doge_tip_height + 1.
-        let starting_height = {
-            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-            let anchor_h = chain
-                .params
-                .doge_spv
-                .as_ref()
-                .map(|p| p.anchor.height)
-                .unwrap_or(0);
-            if chain.doge_tip.is_none() {
-                anchor_h + 1
-            } else {
-                chain.doge_tip_height + 1
-            }
-        };
-
-        // Defensive: refuse to cache a non-chained batch. The cache is
-        // the only source for the coinbase carrier path (issue #69); a
-        // poisoned cache produces carriers that hard-reject every block
-        // they ride into. Pre-v1.9.85 doge_p2p's wire-format parse bug
-        // emitted exactly this pattern. Re-fetch on the next cycle is
-        // cheap (~10 min).
-        for (i, w) in raw_headers.windows(2).enumerate() {
-            let prev_hash = sha256d(&w[0]);
-            let next_prev: [u8; 32] = w[1][4..36].try_into().unwrap();
-            if prev_hash != next_prev {
-                return Err(format!(
-                    "doge cycle: non-chained headers at index {} (h{}.hash != h{}.prev_hash); refusing to poison cache",
-                    i + 1,
-                    i,
-                    i + 1
-                ));
-            }
-        }
-
-        // For each AuxPoW-bit header, fetch AuxPoW via blockchair HTTP.
-        // Fail-fast on any HTTP error so we never populate caches with
-        // partial data (would cause mid-batch apply rejection).
-        let mut auxpow_hex_vec: Vec<Option<String>> = Vec::with_capacity(raw_headers.len());
-        for (i, header) in raw_headers.iter().enumerate() {
-            let version = i32::from_le_bytes(header[..4].try_into().unwrap());
-            if (version as u32) & 0x100 != 0 {
-                let h = starting_height + i as u64;
-                let bytes = header_sync::doge::fetch_doge_block_auxpow(client, h)
-                    .await
-                    .map_err(|e| format!("auxpow http fetch h={h}: {e}"))?;
-                auxpow_hex_vec.push(bytes.map(hex::encode));
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    header_sync::doge::DOGE_AUXPOW_POLITE_SLEEP_MS,
-                ))
-                .await;
-            } else {
-                auxpow_hex_vec.push(None);
-            }
-        }
-
-        let count = raw_headers.len();
-        let headers_hex: String = raw_headers.iter().map(hex::encode).collect();
-        let auxpow_count = auxpow_hex_vec.iter().filter(|x| x.is_some()).count();
-        let live_relay_tip = {
-            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-            chain.doge_tip_height
-        };
-        {
-            let mut cache = state
-                .doge_template_headers_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *cache = Some(CachedHeaderBatchForTemplate {
-                headers_hex,
-                expected_relay_tip_height: live_relay_tip,
-                built_at: std::time::SystemTime::now(),
-            });
-        }
-        {
-            let mut ap_cache = state
-                .doge_template_auxpow_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *ap_cache = Some(auxpow_hex_vec);
-        }
-        header_sync_touch_last_file("doge");
-        return Ok(format!(
-            "p2p_headers+http_auxpow count={count} with_auxpow={auxpow_count} relay_tip={live_relay_tip} starting_h={starting_height}"
-        ));
-    }
-
-    // Regtest path (unchanged from pre-v1.9.66): dogecoind JSON-RPC.
-    let doge_net_tip = header_sync::doge::fetch_doge_net_tip(client, source).await?;
-    let target = doge_net_tip;
-    if relay_tip >= target {
-        header_sync_touch_last_file("doge");
-        return Ok(format!(
-            "up_to_date relay_tip={relay_tip} doge_net={doge_net_tip} target={target} source={source:?}"
-        ));
-    }
-    let anchor_height = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .params
-            .doge_spv
-            .as_ref()
-            .map(|p| p.anchor.height)
-            .unwrap_or(0)
-    };
-    let effective_relay_tip = std::cmp::max(relay_tip, anchor_height);
-    let start = effective_relay_tip + 1;
-    let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
-    let headers_hex =
-        header_sync::doge::fetch_doge_headers(client, source, start, end).await?;
-    let live_relay_tip = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain.doge_tip_height
-    };
-    if live_relay_tip >= end {
-        header_sync_touch_last_file("doge");
-        return Ok(format!(
-            "stand_down: chain advanced from {relay_tip} to {live_relay_tip} during fetch (planned end {end})"
-        ));
-    }
-    {
-        let mut cache = state
-            .doge_template_headers_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *cache = Some(CachedHeaderBatchForTemplate {
-            headers_hex,
-            expected_relay_tip_height: live_relay_tip,
-            built_at: std::time::SystemTime::now(),
-        });
-    }
-    header_sync_touch_last_file("doge");
     Ok(format!(
         "cached_headers start={start} end={end} relay_tip={live_relay_tip} source={source:?}"
     ))
@@ -17943,21 +15160,16 @@ async fn main() {
         auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
             btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
             ltc_spv: irium_node_rs::ltc_spv::resolve_ltc_spv_params(network),
-            doge_spv: irium_node_rs::doge_spv::resolve_doge_spv_params(network),
             htlc_btc_swap_v1_activation_height:
                 irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
             btc_swap_bech32_payment_activation_height:
                 irium_node_rs::activation::resolved_btc_swap_bech32_payment_activation_height(network),
             htlc_ltc_swap_v1_activation_height:
                 irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
-            htlc_doge_swap_v1_activation_height:
-                irium_node_rs::activation::resolved_htlc_doge_swap_v1_activation_height(network),
             swap_order_v1_activation_height:
                 irium_node_rs::activation::resolved_swap_order_v1_activation_height(network),
             ltc_swap_order_v1_activation_height:
                 irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
-            doge_swap_order_v1_activation_height:
-                irium_node_rs::activation::resolved_doge_swap_order_v1_activation_height(network),
             coinbase_header_batch_activation_height:
                 irium_node_rs::activation::resolved_coinbase_header_batch_activation_height(network),
     };
@@ -18890,15 +16102,13 @@ async fn main() {
         resolvers_index: Arc::new(Mutex::new(load_all_resolvers_at_startup())),
         btc_template_headers_cache: Arc::new(Mutex::new(None)),
         ltc_template_headers_cache: Arc::new(Mutex::new(None)),
-        doge_template_headers_cache: Arc::new(Mutex::new(None)),
-        doge_template_auxpow_cache: Arc::new(Mutex::new(None)),
     };
 
     // Spawn the in-process header-sync background tasks. Each one no-ops
     // (and logs once) when the corresponding `resolved_*_spv_relay_activation_height`
     // is `None` on the running network — so devnet / dev nodes pay nothing
     // for chains they haven't enabled. Replaces the standalone
-    // src/bin/{btc,ltc,doge}-header-sync.rs binaries + systemd timers.
+    // src/bin/{btc,ltc}-header-sync.rs binaries + systemd timers.
     // v1.9.54: pre-seed BTC headers from mempool.space on fresh installs so
     // Irium blocks that carry a BtcHeaderBatch tx whose first header references
     // a BTC block past the anchor can be applied. Runs as a tokio::spawn task
@@ -18919,7 +16129,6 @@ async fn main() {
 
     maybe_spawn_btc_header_sync(app_state.clone(), network);
     maybe_spawn_ltc_header_sync(app_state.clone(), network);
-    maybe_spawn_doge_header_sync(app_state.clone(), network);
     spawn_mempool_rebroadcast(app_state.clone());
     spawn_offer_rebroadcast(app_state.clone());
 
@@ -19982,9 +17191,7 @@ async fn explorer_stats(
         .route("/rpc/btcrelaytip", get(btc_relay_tip))
         .route("/rpc/btcheader", get(btc_header))
         .route("/rpc/submitltcheaders", post(submit_ltc_headers))
-        .route("/rpc/submitdogeheaders", post(submit_doge_headers))
         .route("/rpc/ltcrelaytip", get(ltc_relay_tip))
-        .route("/rpc/dogerelaytip", get(doge_relay_tip))
         .route("/rpc/ltcheader", get(ltc_header))
         .route("/rpc/createbtcswap", post(create_btc_swap))
         .route("/rpc/claimbtcswap", post(claim_btc_swap))
@@ -19992,17 +17199,8 @@ async fn explorer_stats(
         .route("/rpc/inspectbtcswap", get(inspect_btc_swap))
         .route("/rpc/createltcswap", post(create_ltc_swap))
         .route("/rpc/claimltcswap", post(claim_ltc_swap))
-        .route("/rpc/postdogeswaporder", post(post_doge_swap_order))
-        .route("/rpc/listdogeswaporders", get(list_doge_swap_orders))
-        .route("/rpc/getdogeswaporder", get(get_doge_swap_order))
-        .route("/rpc/canceldogeswaporder", post(cancel_doge_swap_order))
-        .route("/rpc/filldogeswaporder", post(fill_doge_swap_order))
         .route("/rpc/refundltcswap", post(refund_ltc_swap))
         .route("/rpc/inspectltcswap", get(inspect_ltc_swap))
-        .route("/rpc/createdogeswap", post(create_doge_swap))
-        .route("/rpc/claimdogeswap", post(claim_doge_swap))
-        .route("/rpc/refunddogeswap", post(refund_doge_swap))
-        .route("/rpc/inspectdogeswap", get(inspect_doge_swap))
         .route("/rpc/postswaporder", post(post_swap_order))
         .route("/rpc/listswaporders", get(list_swap_orders))
         .route("/rpc/getswaporder", get(get_swap_order))
@@ -20014,7 +17212,6 @@ async fn explorer_stats(
         .route("/rpc/cancelltcswaporder", post(cancel_ltc_swap_order))
         .route("/rpc/fillltcswaporder", post(fill_ltc_swap_order))
         .route("/rpc/sweepltcexpiredorder", post(sweep_ltc_expired_order))
-        .route("/rpc/sweepdogeexpiredorder", post(sweep_doge_expired_order))
         .route("/rpc/sweepexpiredorder", post(sweep_expired_order))
         .route("/wallet/create", post(wallet_create))
         .route("/wallet/unlock", post(wallet_unlock))
@@ -20203,14 +17400,11 @@ mod tests {
             auxpow_activation_height: None,
             btc_spv: None,
             ltc_spv: None,
-            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
-            htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
-            doge_swap_order_v1_activation_height: None,
             coinbase_header_batch_activation_height: None,
         };
         let chain = Arc::new(Mutex::new(ChainState::new(params)));
@@ -20271,9 +17465,7 @@ mod tests {
             resolvers_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
             btc_template_headers_cache: Arc::new(Mutex::new(None)),
             ltc_template_headers_cache: Arc::new(Mutex::new(None)),
-            doge_template_headers_cache: Arc::new(Mutex::new(None)),
-        doge_template_auxpow_cache: Arc::new(Mutex::new(None)),
-        };
+            };
 
         (state, sender, recipient, refund)
     }
@@ -21132,14 +18324,11 @@ mod tests {
             auxpow_activation_height: None,
             btc_spv: None,
             ltc_spv: None,
-            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
-            htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
-            doge_swap_order_v1_activation_height: None,
             coinbase_header_batch_activation_height: None,
         };
         let chain = ChainState::new(params);
@@ -27562,14 +24751,11 @@ mod tests {
             auxpow_activation_height: None,
             btc_spv: None,
             ltc_spv: None,
-            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
-            htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
-            doge_swap_order_v1_activation_height: None,
             coinbase_header_batch_activation_height: None,
         };
         let chain = Arc::new(Mutex::new(ChainState::new(params)));
@@ -27616,9 +24802,7 @@ mod tests {
             resolvers_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
             btc_template_headers_cache: Arc::new(Mutex::new(None)),
             ltc_template_headers_cache: Arc::new(Mutex::new(None)),
-            doge_template_headers_cache: Arc::new(Mutex::new(None)),
-        doge_template_auxpow_cache: Arc::new(Mutex::new(None)),
-        }
+            }
     }
 
     /// Empty headers; with IRIUM_RPC_TOKEN unset (which
