@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::btc_spv::parse_btc_header_batch;
 use crate::chain::ChainState;
-use crate::doge_spv::parse_doge_header_batch;
 use crate::ltc_spv::parse_ltc_header_batch;
 use crate::tx::{decode_full_tx, Transaction};
 
@@ -22,7 +21,7 @@ pub const HEADER_RELAY_PER_IP_INTERVAL_SECS: u64 = 600;
 
 /// Mempool admission class. `ZeroFeeAllowed` covers the three buyer-side
 /// shapes that a BTC-only wallet has to broadcast and cannot fund from
-/// its own IRM balance: BTC/LTC/DOGE `*HeaderBatch` carriers, HtlcBtcSwap
+/// its own IRM balance: BTC/LTC `*HeaderBatch` carriers, HtlcBtcSwap
 /// claim spends (witness selector `0x01`), and sell-direction SwapOrder
 /// fills (witness selector `0x01`). The class is exempt from
 /// `min_fee_per_byte` and is the first to be evicted when the mempool
@@ -253,7 +252,7 @@ impl MempoolManager {
         }
 
         // Per-chain header-batch dedup. Consensus caps each
-        // {Btc,Ltc,Doge}HeaderBatch carrier at one per block (chain.rs).
+        // {Btc,Ltc}HeaderBatch carrier at one per block (chain.rs).
         // The mempool can hold many in transit when peers re-gossip
         // stale carriers after an iriumd restart — each cycle of the
         // wallet-funded carrier-tx builder uses different UTXOs, so
@@ -271,11 +270,7 @@ impl MempoolManager {
             .outputs
             .iter()
             .any(|o| parse_ltc_header_batch(&o.script_pubkey).is_ok());
-        let new_has_doge = tx
-            .outputs
-            .iter()
-            .any(|o| parse_doge_header_batch(&o.script_pubkey).is_ok());
-        if new_has_btc || new_has_ltc || new_has_doge {
+        if new_has_btc || new_has_ltc {
             for entry in self.entries.values() {
                 if new_has_btc
                     && entry
@@ -294,15 +289,6 @@ impl MempoolManager {
                         .any(|o| parse_ltc_header_batch(&o.script_pubkey).is_ok())
                 {
                     return Err("duplicate_ltc_header_batch_pending".to_string());
-                }
-                if new_has_doge
-                    && entry
-                        .tx
-                        .outputs
-                        .iter()
-                        .any(|o| parse_doge_header_batch(&o.script_pubkey).is_ok())
-                {
-                    return Err("duplicate_doge_header_batch_pending".to_string());
                 }
             }
         }

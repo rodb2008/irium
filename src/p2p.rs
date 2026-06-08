@@ -13,8 +13,9 @@ use tokio::net::{tcp::OwnedWriteHalf, TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use crate::block::{Block, BlockHeader};
-use crate::chain::ChainState;
 use crate::chain::classify_tx_priority;
+use crate::chain::whatsminer_compat_pow_hash_for_height;
+use crate::chain::ChainState;
 use crate::mempool::{evict_invalid_mempool_entries, MempoolManager};
 use crate::network::{PeerDirectory, PeerRecord};
 use crate::pow::meets_target;
@@ -416,7 +417,12 @@ async fn enqueue_persist_block(height: u64, hash: [u8; 32], block: Block) {
 
 fn stateless_block_precheck(block: &Block, height: u64) -> Result<(), String> {
     let hash = block.header.hash_for_height(height);
-    if !meets_target(&hash, block.header.target()) {
+    if !meets_target(&hash, block.header.target())
+        && !whatsminer_compat_pow_hash_for_height(&block.header, height)
+            .as_ref()
+            .map(|h| meets_target(h, block.header.target()))
+            .unwrap_or(false)
+    {
         return Err("pow precheck failed".to_string());
     }
     if block.header.prev_hash != [0u8; 32] {
@@ -8706,14 +8712,11 @@ mod tests {
             auxpow_activation_height: None,
             btc_spv: None,
             ltc_spv: None,
-            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
-            htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
-            doge_swap_order_v1_activation_height: None,
             coinbase_header_batch_activation_height: None,
         };
         let mut chain = ChainState::new(params);
@@ -8774,14 +8777,11 @@ mod tests {
             auxpow_activation_height: None,
             btc_spv: None,
             ltc_spv: None,
-            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
-            htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
-            doge_swap_order_v1_activation_height: None,
             coinbase_header_batch_activation_height: None,
         };
         let chain = ChainState::new(params);
@@ -8827,14 +8827,11 @@ mod tests {
             auxpow_activation_height: None,
             btc_spv: None,
             ltc_spv: None,
-            doge_spv: None,
             htlc_btc_swap_v1_activation_height: None,
             btc_swap_bech32_payment_activation_height: None,
             htlc_ltc_swap_v1_activation_height: None,
-            htlc_doge_swap_v1_activation_height: None,
             swap_order_v1_activation_height: None,
             ltc_swap_order_v1_activation_height: None,
-            doge_swap_order_v1_activation_height: None,
             coinbase_header_batch_activation_height: None,
         };
         let chain = ChainState::new(params);

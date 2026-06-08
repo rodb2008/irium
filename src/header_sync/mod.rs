@@ -5,7 +5,7 @@
 //! JSON-RPC port) and return raw-hex header blobs ready for direct
 //! submission via the corresponding `submit_*_headers_core` in iriumd.
 //!
-//! The standalone `src/bin/{btc,ltc,doge}-header-sync.rs` binaries
+//! The standalone `src/bin/{btc,ltc}-header-sync.rs` binaries
 //! retain their own duplicate implementations using `reqwest::blocking`
 //! and are kept for one-shot manual top-ups and as a fallback for
 //! operators who can't upgrade iriumd immediately. New deployments
@@ -13,5 +13,4 @@
 
 pub mod btc;
 pub mod common;
-pub mod doge;
 pub mod ltc;
