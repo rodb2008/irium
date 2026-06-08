@@ -1605,6 +1605,11 @@ fn is_small_buffer_firmware(user_agent: &str) -> bool {
         || ua.contains("bm1370")
 }
 
+fn is_whatsminer_firmware(user_agent: &str) -> bool {
+    let ua = user_agent.to_ascii_lowercase();
+    ua.contains("whatsminer") || ua.contains("btminer")
+}
+
 /// Per-session view of coinbase carrier extras. Returns an empty slice
 /// for small-buffer firmware so its mining.notify body stays under the
 /// parser limit; returns the full job-level extras for everyone else.
@@ -1807,10 +1812,18 @@ async fn handle_message(
         "mining.suggest_difficulty" => {
             // Some cgminer-family / Antminer firmware sends a difficulty hint
             // (mining.suggest_difficulty [diff]) before or after subscribe.
-            // Whatsminer/v1.1 sends this after the initial job; if we merely
-            // ACK while keeping a much higher password difficulty, the miner
-            // can remain connected but submit nothing for a long interval.
-            if let Some(diff) = parse_suggested_difficulty(&params) {
+            // Honor it only while vardiff controls the session. If the worker
+            // password already supplied an explicit d=NNNN value, that is the
+            // operator's chosen fixed difficulty and must not be overwritten
+            // by firmware defaults emitted after authorize.
+            if session.fixed_difficulty.is_some() {
+                info!(
+                    "[diff] worker={} ignored_suggested_diff={:?} source=miner_suggested fixed_diff={}",
+                    session.worker.as_deref().unwrap_or("-"),
+                    params.first(),
+                    session.difficulty as u64
+                );
+            } else if let Some(diff) = parse_suggested_difficulty(&params) {
                 session.fixed_difficulty = Some(diff);
                 session.difficulty = diff;
                 info!(
@@ -1883,17 +1896,32 @@ async fn handle_message(
             });
             write_json(wr, &resp).await?;
             send_set_difficulty(wr, conn_id, session.worker.as_deref(), session.difficulty).await?;
-            // v1.9.90: proactively push set_version_mask so BTMiner v1.x firmware
-            // (whatsminer/v1.1) activates its hashing engine without sending
-            // mining.configure. The configure handler also pushes this for miners
-            // that do send configure; receiving it twice is idempotent.
-            let mask_notify = json!({
-                "id": Value::Null,
-                "method": "mining.set_version_mask",
-                "params": ["1fffe000"]
-            });
-            write_json(wr, &mask_notify).await?;
-            info!("[subscribe] conn={} pushed set_version_mask mask=1fffe000", conn_id);
+            // Do not send unsolicited version-mask extensions to Whatsminer
+            // BTMiner firmware. Live v1.1 units subscribe+authorize normally
+            // but then sit idle after receiving the out-of-band
+            // mining.set_version_mask notification. If a miner explicitly
+            // negotiates mining.configure or mining.multi_version, those
+            // handlers still send the mask.
+            let suppress_unsolicited_mask = session
+                .user_agent
+                .as_deref()
+                .map(is_whatsminer_firmware)
+                .unwrap_or(false);
+            if suppress_unsolicited_mask {
+                info!(
+                    "[subscribe] conn={} user_agent={:?} skipped unsolicited set_version_mask",
+                    conn_id,
+                    session.user_agent.as_deref()
+                );
+            } else {
+                let mask_notify = json!({
+                    "id": Value::Null,
+                    "method": "mining.set_version_mask",
+                    "params": ["1fffe000"]
+                });
+                write_json(wr, &mask_notify).await?;
+                info!("[subscribe] conn={} pushed set_version_mask mask=1fffe000", conn_id);
+            }
         }
         "mining.authorize" => {
             let user = params.first().and_then(|v| v.as_str()).unwrap_or("");
@@ -3357,9 +3385,6 @@ async fn handle_submit_legacy_rewardable(
         // merkle field, `chosen.hash` (= sha256d of the chosen variant
         // header, natural order) now IS the natural canonical hash.
         // Reversing yields the display-order hash iriumd expects.
-        let mut hash_display = hash;
-        hash_display.reverse();
-
         // Fix E: the ASIC may have applied BIP310 version rolling. The chosen
         // variant's header[0..4] holds the LE bytes the ASIC actually hashed.
         // iriumd will canonicalize with `version.to_le_bytes()`, so we must
@@ -3368,6 +3393,21 @@ async fn handle_submit_legacy_rewardable(
             .and_then(|idx| checks.get(idx))
             .map(|c| u32::from_le_bytes(c.header[0..4].try_into().unwrap()))
             .unwrap_or(1u32);
+        let mut canonical_header80 = [0u8; 80];
+        canonical_header80[0..4].copy_from_slice(&canonical_version.to_le_bytes());
+        let mut prev_wire = job.prev_hash;
+        prev_wire.reverse();
+        canonical_header80[4..36].copy_from_slice(&prev_wire);
+        let mut merkle_wire = merkle_root_for_json;
+        if job.height < STANDARD_HEADER_ACTIVATION_HEIGHT {
+            merkle_wire.reverse();
+        }
+        canonical_header80[36..68].copy_from_slice(&merkle_wire);
+        canonical_header80[68..72].copy_from_slice(&ntime.to_le_bytes());
+        canonical_header80[72..76].copy_from_slice(&job.bits.to_le_bytes());
+        canonical_header80[76..80].copy_from_slice(&nonce.to_le_bytes());
+        let mut hash_display = sha256d(&canonical_header80);
+        hash_display.reverse();
 
         let req = SubmitRequest {
             height: job.height,
