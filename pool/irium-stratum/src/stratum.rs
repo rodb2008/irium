@@ -3358,17 +3358,6 @@ async fn handle_submit_legacy_rewardable(
         return Err(anyhow!("low_difficulty"));
     }
 
-    {
-        let server_now_u32 = unix_now_secs() as u32;
-        if ok_block && ntime > server_now_u32.saturating_add(60) {
-            warn!(
-                "[block] ntime_gated worker={} ntime={} server_now={} drift=+{}s block_not_submitted",
-                worker, ntime, server_now_u32, ntime.saturating_sub(server_now_u32)
-            );
-            ok_block = false;
-        }
-    }
-
     if ok_block {
         mark_candidate_detected();
         info!(
