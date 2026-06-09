@@ -15015,7 +15015,7 @@ async fn run_ltc_header_sync_cycle(
 async fn main() {
     // Added to allow --version to be displayed
     let args: Vec<String> = std::env::args().collect();
-    if args.contains(&"--version".to_string()) || args.contains(&"-v".to_string()) {
+    if args.contains(&"--version".to_string()) || args.contains(&"-V".to_string()) {
         println!("iriumd version {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
