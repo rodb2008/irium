@@ -15013,6 +15013,13 @@ async fn run_ltc_header_sync_cycle(
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
+    // Added to allow --version to be displayed
+    let args: Vec<String> = std::env::args().collect();
+    if args.contains(&"--version".to_string()) || args.contains(&"-v".to_string()) {
+        println!("iriumd version {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+    // -----------------------
     // Install ring as the default rustls crypto provider before any TLS code runs.
     // When both ring and aws-lc-rs appear in the dep tree, rustls 0.23 panics
     // unless install_default() is called explicitly (e.g. on nodes using TLS RPC).
