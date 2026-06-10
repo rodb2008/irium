@@ -13381,6 +13381,7 @@ async fn get_block_template(
                                 }
                             }
                             if ok {
+                                headers.truncate(25);
                                 if let Ok(script) = encode_btc_header_batch(&headers) {
                                     out.push(CoinbaseExtraOutput {
                                         value: 0,
@@ -13431,6 +13432,7 @@ async fn get_block_template(
                                 }
                             }
                             if ok {
+                                headers.truncate(25);
                                 if let Ok(script) = encode_ltc_header_batch(&headers) {
                                     out.push(CoinbaseExtraOutput {
                                         value: 0,
