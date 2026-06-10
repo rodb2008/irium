@@ -13240,11 +13240,7 @@ async fn get_block_template(
         let bits = target.bits;
         let prev_time = tip.map(|b| b.header.time).unwrap_or(0);
         let now = Utc::now().timestamp() as u32;
-        let min_valid_ntime = prev_time.saturating_add(1);
-        let time = now.max(min_valid_ntime);
-        if min_valid_ntime > now.saturating_add(60) {
-            eprintln!("[getblocktemplate] chain timestamps ahead of wall clock: prev_block_time={} min_valid_ntime={} wall_clock={}", prev_time, min_valid_ntime, now);
-        }
+        let time = now.max(prev_time.saturating_add(1));
         (height, prev_hash, bits, target_hex(bits), time)
     };
 
