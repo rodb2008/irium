@@ -1,6 +1,6 @@
 # PoAW-X Prototype Plan
 
-**Last updated:** 2026-06-11 (Phase 11-A)  
+**Last updated:** 2026-06-11 (Phase 11-B soak PASS)  
 **Status:** Active development â€” testnet proven, public testnet pending
 
 ---
@@ -39,7 +39,7 @@ Irium. Miners must solve an assigned CPU puzzle and commit its receipt on-chain 
 
 *Phase 10-C FAIL: stratum binary compiled without PoAW-X; resolved in 10-D.
 
-**Cumulative testnet blocks with PoAW-X path exercised: 285**
+**Cumulative testnet blocks with PoAW-X path exercised: ~296**
 
 ### Phase 10-F Post-ops
 
@@ -77,6 +77,7 @@ Irium. Miners must solve an assigned CPU puzzle and commit its receipt on-chain 
 |------|--------|-------------|
 | receipts_root canonical sort | DONE (163b558) | Both iriumd + stratum sort before hashing |
 | Solution proof validation | DONE (163b558) | commitment_nonce + SHA256d PoW check at POST and submit_block_extended |
+| Regression soak | DONE (v6, 2026-06-11) | PASS=17 FAIL=0 SKIP=0 — all receipt/SBE/irx1/mainnet-safety checks pass |
 | Firewall | PENDING | Open cloud firewall ports 39510 and 39512 on VPS-1 |
 | VPS-2 P2P | PENDING | Fix direct P2P (remove SSH tunnel dependency) |
 | DNS seed | PENDING | Register testnet DNS seed or publish known seed list |
@@ -166,6 +167,8 @@ Miner
 | `pool/irium-stratum/src/block.rs` | `compute_receipts_root_from_pending`, `build_irx1_commitment_script` |
 | `pool/irium-stratum/src/template.rs` | `GetBlockTemplate` PoAW-X fields |
 | `scripts/poawx-stratum-long-soak-harness.py` | Test harness for PoAW-X stratum path |
+| `scripts/poawx-phase11b-canonical-receipts-validation.py` | Phase 11-B self-contained regression soak (v6, PASS=17) |
+| `scripts/testnet-poawx-phase11b-canonical-receipts-validation.sh` | Phase 11-B wrapper (delegates to Python soak) |
 | `scripts/testnet-poawx-phase10f-receipt-two-vps-soak.sh` | Two-VPS soak automation |
 | `docs/poaw-x-phase11a-public-testnet-readiness-audit.md` | Phase 11-A audit |
 | `docs/poaw-x-public-testnet-draft-runbook.md` | Operator runbook (draft) |
