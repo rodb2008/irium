@@ -1,6 +1,6 @@
 # PoAW-X Prototype Plan
 
-**Last updated:** 2026-06-12 (Phase 11-C networking readiness audit)  
+**Last updated:** 2026-06-12 (Phase 11-D firewall direct P2P preflight PASS)
 **Status:** Active development â€” testnet proven, public testnet pending
 
 ---
@@ -95,15 +95,22 @@ Irium. Miners must solve an assigned CPU puzzle and commit its receipt on-chain 
 | Network plan | DONE | `docs/poaw-x-public-testnet-network-plan.md` |
 | Tester guide update | DONE | Phase 11-C hardening |
 | Runbook update | DONE | Updated for Phase 11-C findings |
-| Cloud firewall TCP 39510/39512 | PENDING APPROVAL | VPS-1 inbound rules not yet applied |
+| Cloud firewall TCP 39510/39512 | DONE | UFW rules applied VPS-1; left open after preflight |
 | systemd service files | PENDING | Templates documented; not yet installed |
 
-### Phase 11-D: Limited External Miner Pilot
+### Phase 11-D: Firewall Direct P2P Preflight -- COMPLETE
 
-- Onboard 1-3 trusted external testers.
-- Confirm Stratum PoAW-X path with external participants.
-- Collect feedback on miner guide.
-- Confirm irx1 end-to-end with non-harness miner (if available).
+| Item | Status |
+|------|--------|
+| UFW rules 39510/39512 on VPS-1 | DONE (left open) |
+| Port reachability from VPS-2 | PASS |
+| Direct VPS-to-VPS P2P (no SSH tunnel) | PASS: peers=1 both sides |
+| Stratum TCP reachability from VPS-2 | PASS |
+| 6-block mining test with irx1 | PASS: receipt_test=PASS |
+| VPS-2 P2P sync to height 9 | PASS |
+| Bogus share rejection | PASS |
+| Disabled-mode 503 / RPC private | PASS |
+| Mainnet isolation | PASS: height 30074 untouched |
 
 ### Phase 11-E: Public Testnet Launch Candidate
 
@@ -180,5 +187,6 @@ Miner
 | `docs/poaw-x-testnet-reset-rollback-policy.md` | Testnet chain reset and rollback policy |
 | `scripts/testnet-poawx-phase10f-receipt-two-vps-soak.sh` | Two-VPS soak automation |
 | `docs/poaw-x-phase11a-public-testnet-readiness-audit.md` | Phase 11-A audit |
+| `docs/poaw-x-phase11d-firewall-p2p-preflight.md` | Phase 11-D preflight results |
 | `docs/poaw-x-public-testnet-draft-runbook.md` | Operator runbook (draft) |
 | `docs/poaw-x-public-tester-miner-draft-guide.md` | Miner guide (draft) |

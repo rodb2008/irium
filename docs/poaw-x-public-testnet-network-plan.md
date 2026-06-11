@@ -2,7 +2,7 @@
 
 **Status:** PLAN — not yet activated
 **Date:** 2026-06-12
-**Phase:** 11-C
+**Phase:** 11-D
 
 ---
 

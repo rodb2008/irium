@@ -97,7 +97,7 @@ nc -z -w3 127.0.0.1 39512 && echo stratum_ok || echo stratum_not_ready
 On VPS-2:
 ```bash
 cd /home/irium/irium  # required cwd
-IRIUM_NETWORK=devnet IRIUM_POAWX_MODE=active IRIUM_DATA_DIR=/home/irium/irium-poawx-testnet-vps2 IRIUM_BOOTSTRAP_DIR=/home/irium/irium-poawx-testnet-vps2 IRIUM_RPC_TOKEN=<same-token> IRIUM_P2P_BIND=0.0.0.0:39610 IRIUM_NODE_HOST=127.0.0.1 IRIUM_NODE_PORT=39611 IRIUM_ADDNODE=207.244.247.86:39510 IRIUM_DEV_EASY_BITS_TEMPLATE=1   /tmp/iriumd-poawx-testnet   >> /home/irium/irium-poawx-testnet-vps2/iriumd.log 2>&1 &
+IRIUM_NETWORK=devnet IRIUM_POAWX_MODE=active IRIUM_DATA_DIR=/home/irium/irium-poawx-testnet-vps2 IRIUM_BOOTSTRAP_DIR=/home/irium/irium-poawx-testnet-vps2 IRIUM_RPC_TOKEN=<same-token> IRIUM_P2P_BIND=0.0.0.0:39610 IRIUM_NODE_HOST=127.0.0.1 IRIUM_NODE_PORT=39611 IRIUM_ADDNODE=207.244.247.86:39510 IRIUM_P2P_SEED_PORT=39510 IRIUM_DEV_EASY_BITS_TEMPLATE=1   /tmp/iriumd-poawx-testnet   >> /home/irium/irium-poawx-testnet-vps2/iriumd.log 2>&1 &
 echo $! > /tmp/testnet-iriumd-vps2.pid
 ```
 

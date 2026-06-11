@@ -3,7 +3,7 @@
 **Date:** 2026-06-11  
 **Branch:** `testnet/poawx-phase11a-public-testnet-readiness`  
 **Starting checkpoint:** `a5e5feb` (Phase 10-F remote cleanup complete)  
-**Scope:** Audit-only (Phase 11-A). Phase 11-C resolved: disabled-mode endpoints, irx1_root, reset policy. Firewall still PENDING.
+**Scope:** Audit-only (Phase 11-A). Phase 11-C resolved: disabled-mode endpoints, irx1_root, reset policy. Phase 11-D resolved: firewall applied, direct P2P validated.
 
 ---
 
