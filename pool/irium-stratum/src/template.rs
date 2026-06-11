@@ -33,6 +33,25 @@ pub struct GetBlockTemplate {
     /// still produces a valid template.
     #[serde(default)]
     pub coinbase_extra_outputs: Vec<CoinbaseExtraOutput>,
+    /// Phase 10-D: PoAW-X mode string ("active" or "").
+    #[serde(default)]
+    pub poawx_mode: String,
+    /// Phase 10-D: pending puzzle receipts from /poawx/receipt.
+    #[serde(default)]
+    pub poawx_pending_receipts: Vec<PoawxPendingReceipt>,
+    /// Phase 10-D: hex receipts_root computed by iriumd.
+    #[serde(default)]
+    pub receipts_root: String,
+}
+
+/// Phase 10-D: per-worker puzzle receipt as stored in iriumd pending list.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PoawxPendingReceipt {
+    pub height: u64,
+    pub lane: String,
+    pub worker_pkh: String,
+    pub solution: String,
+    pub commitment_nonce: String,
 }
 
 #[derive(Clone)]

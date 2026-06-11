@@ -1,5 +1,7 @@
 use crate::pow::sha256d;
+use crate::template::PoawxPendingReceipt;
 use anyhow::{anyhow, Result};
+use sha2::{Digest, Sha256};
 
 pub fn parse_address_to_pkh(addr: &str) -> Result<[u8; 20]> {
     let decoded = bs58::decode(addr).into_vec().map_err(|e| anyhow!("base58 decode: {e}"))?;
@@ -258,6 +260,33 @@ pub fn parse_hex32(s: &str) -> Result<[u8; 32]> {
 pub fn parse_u32_hex(s: &str) -> Result<u32> {
     let t = s.trim_start_matches("0x");
     Ok(u32::from_str_radix(t, 16).map_err(|e| anyhow!("hex parse: {e}"))?)
+}
+
+/// Phase 10-D: compute receipts root for PoAW-X irx1 commitment.
+/// Algorithm: SHA256(concat(SHA256(receipt_fields) for each receipt)).
+pub fn compute_receipts_root_from_pending(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
+    let mut outer = Sha256::new();
+    for r in receipts {
+        let mut inner = Sha256::new();
+        inner.update(r.height.to_le_bytes());
+        inner.update(r.lane.as_bytes());
+        inner.update(hex::decode(&r.worker_pkh).unwrap_or_default());
+        inner.update(hex::decode(&r.solution).unwrap_or_default());
+        inner.update(hex::decode(&r.commitment_nonce).unwrap_or_default());
+        outer.update(inner.finalize());
+    }
+    outer.finalize().into()
+}
+
+/// Phase 10-D: build irx1 OP_RETURN script for coinbase.
+/// Format: 0x6a 0x24 "irx1" <32-byte receipts_root> = 38 bytes.
+pub fn build_irx1_commitment_script(receipts_root: &[u8; 32]) -> Vec<u8> {
+    let mut s = Vec::with_capacity(38);
+    s.push(0x6a); // OP_RETURN
+    s.push(0x24); // PUSH 36 bytes
+    s.extend_from_slice(b"irx1");
+    s.extend_from_slice(receipts_root);
+    s
 }
 
 pub fn header_bytes(version: u32, prev_hash: [u8; 32], merkle_root: [u8; 32], ntime: u32, nbits: u32, nonce: u32) -> [u8; 80] {

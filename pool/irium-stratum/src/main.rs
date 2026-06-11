@@ -152,6 +152,15 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(300);
 
+    let poawx_enabled = env::var("IRIUM_STRATUM_POAWX")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    if poawx_enabled {
+        warn!("[poawx] IRIUM_STRATUM_POAWX=1: PoAW-X receipt path enabled");
+    } else {
+        warn!("[poawx] IRIUM_STRATUM_POAWX unset: PoAW-X receipt path disabled (legacy submit)");
+    }
+
     if default_diff_raw < 1.0 {
         warn!(
             "[config] STRATUM_DEFAULT_DIFF={} below diff1; clamped to 1",
@@ -202,6 +211,7 @@ async fn main() -> Result<()> {
         conn_window_secs,
         ban_threshold,
         ban_duration_secs,
+        poawx_enabled,
     };
 
     run(cfg).await

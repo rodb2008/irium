@@ -199,6 +199,8 @@ struct AppState {
     btc_template_headers_cache: Arc<Mutex<Option<CachedHeaderBatchForTemplate>>>,
     /// v1.9.61: same as above for LTC.
     ltc_template_headers_cache: Arc<Mutex<Option<CachedHeaderBatchForTemplate>>>,
+    /// Phase 10-D: pending PoAW-X puzzle receipts, cleared on block commit.
+    poawx_pending_receipts: Arc<Mutex<Vec<PoawxPendingReceipt>>>,
 }
 
 const DISPUTE_RESOLVER_RESPONSE_WINDOW: u64 = 288; // blocks
@@ -1523,6 +1525,39 @@ struct CoinbaseExtraOutput {
     script_pubkey_hex: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PoawxPendingReceipt {
+    height: u64,
+    lane: String,
+    worker_pkh: String,
+    solution: String,
+    commitment_nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PoawxReceiptRequest {
+    height: u64,
+    lane: String,
+    worker_pkh: String,
+    solution: String,
+    commitment_nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitBlockExtendedRequest {
+    height: u64,
+    header: SubmitBlockHeader,
+    tx_hex: Vec<String>,
+    #[serde(default)]
+    auxpow_hex: Option<String>,
+    #[serde(default)]
+    submit_source: Option<String>,
+    #[serde(default)]
+    poawx_receipts: Vec<PoawxPendingReceipt>,
+    #[serde(default)]
+    poawx_receipts_root: String,
+}
+
 #[derive(Serialize)]
 struct BlockTemplateResponse {
     height: u64,
@@ -1539,9 +1574,15 @@ struct BlockTemplateResponse {
     /// post-activation when the cycle has cached fresh headers.
     #[serde(default)]
     coinbase_extra_outputs: Vec<CoinbaseExtraOutput>,
+    #[serde(default)]
+    poawx_mode: String,
+    #[serde(default)]
+    poawx_pending_receipts: Vec<PoawxPendingReceipt>,
+    #[serde(default)]
+    receipts_root: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct SubmitBlockHeader {
     version: u32,
     prev_hash: String,
@@ -13450,6 +13491,28 @@ async fn get_block_template(
         }
     };
 
+    let (poawx_mode_str, poawx_receipts_for_template, receipts_root_str) = {
+        let is_active = std::env::var("IRIUM_POAWX_MODE")
+            .map(|v| v.trim() == "active")
+            .unwrap_or(false);
+        let is_non_mainnet = network_kind_from_env() != NetworkKind::Mainnet;
+        if is_active && is_non_mainnet {
+            let receipts = state
+                .poawx_pending_receipts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let root = if receipts.is_empty() {
+                String::new()
+            } else {
+                hex::encode(compute_poawx_receipts_root(&receipts))
+            };
+            ("active".to_string(), receipts, root)
+        } else {
+            (String::new(), Vec::new(), String::new())
+        }
+    };
+
     Ok(Json(BlockTemplateResponse {
         height,
         prev_hash,
@@ -13461,7 +13524,299 @@ async fn get_block_template(
         coinbase_value,
         mempool_count,
         coinbase_extra_outputs,
+        poawx_mode: poawx_mode_str,
+        poawx_pending_receipts: poawx_receipts_for_template,
+        receipts_root: receipts_root_str,
     }))
+}
+
+// --- Phase 10-D: PoAW-X helpers and endpoints ---
+
+fn compute_poawx_receipts_root(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
+    let mut outer = Sha256::new();
+    for r in receipts {
+        let mut inner = Sha256::new();
+        inner.update(r.height.to_le_bytes());
+        inner.update(r.lane.as_bytes());
+        inner.update(hex::decode(&r.worker_pkh).unwrap_or_default());
+        inner.update(hex::decode(&r.solution).unwrap_or_default());
+        inner.update(hex::decode(&r.commitment_nonce).unwrap_or_default());
+        outer.update(inner.finalize());
+    }
+    outer.finalize().into()
+}
+
+async fn poawx_get_assignment(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    let is_active = std::env::var("IRIUM_POAWX_MODE")
+        .map(|v| v.trim() == "active")
+        .unwrap_or(false);
+    let is_non_mainnet = network_kind_from_env() != NetworkKind::Mainnet;
+    if !is_active || !is_non_mainnet {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let (height, tip_hash_bytes, bits) = {
+        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let tip_h = guard.tip_height();
+        if tip_h == 0 {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let tip_hash = guard
+            .chain
+            .last()
+            .map(|b| b.header.hash_for_height(tip_h))
+            .unwrap_or([0u8; 32]);
+        let target = guard.target_for_height(tip_h);
+        (tip_h, tip_hash, target.bits)
+    };
+    let mut seed_hasher = Sha256::new();
+    seed_hasher.update(&tip_hash_bytes);
+    seed_hasher.update(height.to_le_bytes());
+    seed_hasher.update(b"poawx_assignment_seed_v1");
+    let seed: [u8; 32] = seed_hasher.finalize().into();
+    let mut nonce_hasher = Sha256::new();
+    nonce_hasher.update(&seed);
+    nonce_hasher.update(b"commitment_nonce");
+    let commitment_nonce: [u8; 32] = nonce_hasher.finalize().into();
+    eprintln!(
+        "[poawx] assignment height={} seed={} pow_bits={:08x}",
+        height,
+        hex::encode(seed),
+        bits
+    );
+    Ok(Json(serde_json::json!({
+        "height": height,
+        "seed": hex::encode(seed),
+        "commitment_nonce": hex::encode(commitment_nonce),
+        "puzzle_difficulty": 1u64,
+        "lane": "cpu",
+        "pow_bits": format!("{:08x}", bits),
+    })))
+}
+
+async fn poawx_post_receipt(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<PoawxReceiptRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    let is_active = std::env::var("IRIUM_POAWX_MODE")
+        .map(|v| v.trim() == "active")
+        .unwrap_or(false);
+    let is_non_mainnet = network_kind_from_env() != NetworkKind::Mainnet;
+    if !is_active || !is_non_mainnet {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    hex::decode(&req.solution).map_err(|_| StatusCode::BAD_REQUEST)?;
+    hex::decode(&req.commitment_nonce).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let current_height = {
+        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        guard.height
+    };
+    if req.height == 0 || req.height + 2 < current_height {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let receipt = PoawxPendingReceipt {
+        height: req.height,
+        lane: req.lane.clone(),
+        worker_pkh: req.worker_pkh.clone(),
+        solution: req.solution.clone(),
+        commitment_nonce: req.commitment_nonce.clone(),
+    };
+    let count = {
+        let mut pending = state
+            .poawx_pending_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending.retain(|r| {
+            !(r.height == req.height
+                && r.lane == req.lane
+                && r.worker_pkh == req.worker_pkh)
+        });
+        pending.push(receipt);
+        pending.len()
+    };
+    eprintln!(
+        "[poawx] receipt stored height={} lane={} worker_pkh={} pending_count={}",
+        req.height, req.lane, req.worker_pkh, count
+    );
+    Ok(Json(serde_json::json!({ "ok": true, "pending_count": count })))
+}
+
+async fn submit_block_extended(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumJson(req): AxumJson<SubmitBlockExtendedRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    check_rate_with_auth(&state, &addr, &headers)?;
+    require_rpc_auth(&headers)?;
+    let expected_root = if req.poawx_receipts.is_empty() {
+        [0u8; 32]
+    } else {
+        compute_poawx_receipts_root(&req.poawx_receipts)
+    };
+    let submitted_root_bytes = if req.poawx_receipts_root.is_empty() {
+        [0u8; 32]
+    } else {
+        let b = hex::decode(&req.poawx_receipts_root).map_err(|_| StatusCode::BAD_REQUEST)?;
+        if b.len() != 32 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&b);
+        arr
+    };
+    if !req.poawx_receipts.is_empty() && expected_root != submitted_root_bytes {
+        eprintln!(
+            "[submit_block_extended] reject receipts_root mismatch: expected={} got={}",
+            hex::encode(expected_root),
+            hex::encode(submitted_root_bytes)
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let header = &req.header;
+    let prev_bytes = hex::decode(&header.prev_hash).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let merkle_bytes = hex::decode(&header.merkle_root).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let hash_bytes = hex::decode(&header.hash).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if prev_bytes.len() != 32 || merkle_bytes.len() != 32 || hash_bytes.len() != 32 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let bits = parse_header_bits(&header.bits).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut prev_hash_arr = [0u8; 32];
+    prev_hash_arr.copy_from_slice(&prev_bytes);
+    let mut merkle_root_arr = [0u8; 32];
+    merkle_root_arr.copy_from_slice(&merkle_bytes);
+    let block_header = BlockHeader {
+        version: header.version,
+        prev_hash: prev_hash_arr,
+        merkle_root: merkle_root_arr,
+        time: header.time,
+        bits,
+        nonce: header.nonce,
+    };
+    let derived_hash = block_header.hash_for_height(req.height);
+    if derived_hash[..] != hash_bytes[..] {
+        eprintln!(
+            "[submit_block_extended] reject hash_mismatch derived={} provided={}",
+            hex::encode(derived_hash),
+            hex::encode(&hash_bytes)
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if req.tx_hex.is_empty() || req.tx_hex.len() > MAX_SUBMIT_BLOCK_TXS {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let mut txs: Vec<Transaction> = Vec::new();
+    for tx_hex_str in &req.tx_hex {
+        let raw = hex::decode(tx_hex_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let tx = decode_full_tx(&raw).map_err(|_| StatusCode::BAD_REQUEST)?;
+        txs.push(tx);
+    }
+    let auxpow = if block_header.version & irium_node_rs::auxpow::AUXPOW_VERSION_BIT != 0 {
+        let hex_str = req.auxpow_hex.as_deref().ok_or_else(|| {
+            eprintln!("[submit_block_extended] AuxPoW block missing auxpow_hex");
+            StatusCode::BAD_REQUEST
+        })?;
+        let bytes = hex::decode(hex_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let mut off = 0usize;
+        let ap = irium_node_rs::auxpow::deserialize(&bytes, &mut off).map_err(|e| {
+            eprintln!("[submit_block_extended] auxpow decode error: {e}");
+            StatusCode::BAD_REQUEST
+        })?;
+        Some(ap)
+    } else {
+        None
+    };
+    if !req.poawx_receipts.is_empty() {
+        let irx1_tag: &[u8] = b"irx1";
+        let coinbase = txs.first().ok_or(StatusCode::BAD_REQUEST)?;
+        let found = coinbase.outputs.iter().any(|out| {
+            let s = &out.script_pubkey;
+            s.len() == 38
+                && s[0] == 0x6a
+                && s[1] == 0x24
+                && &s[2..6] == irx1_tag
+                && s[6..38] == expected_root[..]
+        });
+        if !found {
+            eprintln!(
+                "[submit_block_extended] reject: no irx1 commitment in coinbase for root={}",
+                hex::encode(expected_root)
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    let block = Block {
+        header: block_header,
+        transactions: txs,
+        auxpow,
+    };
+    let (new_height, new_tip_hash) = {
+        let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        if req.height != chain.height {
+            eprintln!(
+                "[submit_block_extended] reject height_mismatch req={} chain={}",
+                req.height, chain.height
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if let Err(e) = chain.connect_block(block.clone()) {
+            eprintln!("[submit_block_extended] reject connect_block_failed err={}", e);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        {
+            let mut mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+            for tx in block.transactions.iter().skip(1) {
+                mempool.remove(&tx.txid());
+            }
+            evict_invalid_mempool_entries(&chain, &mut mempool);
+        }
+        let new_tip_h = chain.tip_height();
+        let tip_hash = block.header.hash_for_height(new_tip_h);
+        (new_tip_h, hex::encode(tip_hash))
+    };
+    if let Some(ref anchors) = state.anchors {
+        if !anchors.is_chain_valid(new_height, &new_tip_hash) {
+            eprintln!(
+                "[submit_block_extended] reject anchor_reject height={} tip={}",
+                new_height, new_tip_hash
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    if !req.poawx_receipts.is_empty() {
+        let committed_height = req.height;
+        let mut pending = state
+            .poawx_pending_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = pending.len();
+        pending.retain(|r| r.height != committed_height);
+        eprintln!(
+            "[poawx] block_extended accepted height={} cleared_receipts={} remaining={}",
+            new_height,
+            before - pending.len(),
+            pending.len()
+        );
+    }
+    if let Err(_e) = storage::write_block_json(req.height, &block) {}
+    eprintln!(
+        "[submit_block_extended] accepted height={} tip={} source={}",
+        new_height,
+        new_tip_hash,
+        req.submit_source.as_deref().unwrap_or("unknown")
+    );
+    Ok(Json(serde_json::json!({
+        "accepted": true,
+        "height": new_height,
+        "tip": new_tip_hash,
+    })))
 }
 
 fn block_json_for(height: u64, block: &Block) -> Value {
@@ -16111,6 +16466,7 @@ async fn main() {
         resolvers_index: Arc::new(Mutex::new(load_all_resolvers_at_startup())),
         btc_template_headers_cache: Arc::new(Mutex::new(None)),
         ltc_template_headers_cache: Arc::new(Mutex::new(None)),
+        poawx_pending_receipts: Arc::new(Mutex::new(Vec::new())),
     };
 
     // Spawn the in-process header-sync background tasks. Each one no-ops
@@ -17129,6 +17485,9 @@ async fn explorer_stats(
         .route("/rpc/block_by_hash", get(get_block_by_hash))
         .route("/rpc/tx", get(get_tx))
         .route("/rpc/submit_block", post(submit_block))
+        .route("/rpc/submit_block_extended", post(submit_block_extended))
+        .route("/poawx/assignment", get(poawx_get_assignment))
+        .route("/poawx/receipt", post(poawx_post_receipt))
         .route("/rpc/submit_tx", post(submit_tx))
         // Fix D: pending-tx introspection + per-address pending-spent
         // outpoints. Both are public (rate-limited only) so the wallet's
@@ -17474,6 +17833,7 @@ mod tests {
             resolvers_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
             btc_template_headers_cache: Arc::new(Mutex::new(None)),
             ltc_template_headers_cache: Arc::new(Mutex::new(None)),
+            poawx_pending_receipts: Arc::new(Mutex::new(Vec::new())),
             };
 
         (state, sender, recipient, refund)
@@ -24811,6 +25171,7 @@ mod tests {
             resolvers_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
             btc_template_headers_cache: Arc::new(Mutex::new(None)),
             ltc_template_headers_cache: Arc::new(Mutex::new(None)),
+            poawx_pending_receipts: Arc::new(Mutex::new(Vec::new())),
             }
     }
 

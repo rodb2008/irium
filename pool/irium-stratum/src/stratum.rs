@@ -1,9 +1,10 @@
 use crate::block::{
-    build_coinbase_tx, build_merkle_branches, coinbase_prefix_suffix,
-    header_bytes, merkle_root_from_coinbase, parse_address_to_pkh, parse_hex32, parse_u32_hex,
+    build_coinbase_tx, build_irx1_commitment_script, build_merkle_branches,
+    coinbase_prefix_suffix, compute_receipts_root_from_pending, header_bytes,
+    merkle_root_from_coinbase, parse_address_to_pkh, parse_hex32, parse_u32_hex,
 };
 use crate::pow::{hash_meets_target, sha256d, target_from_bits, target_from_difficulty_with_limit};
-use crate::template::{GetBlockTemplate, TemplateClient};
+use crate::template::{GetBlockTemplate, PoawxPendingReceipt, TemplateClient};
 
 /// Mirror of iriumd's STANDARD_HEADER_ACTIVATION_HEIGHT (Fix 2a hard fork).
 /// Must stay in sync with `irium_node_rs::constants::STANDARD_HEADER_ACTIVATION_HEIGHT`.
@@ -181,6 +182,8 @@ pub struct StratumConfig {
     pub conn_window_secs: u64,
     pub ban_threshold: u32,
     pub ban_duration_secs: u64,
+    /// Phase 10-D: enable PoAW-X receipt path via IRIUM_STRATUM_POAWX=1.
+    pub poawx_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -199,6 +202,10 @@ struct Job {
     /// coinbase tx. Empty when the chain is pre-coinbase-activation or the
     /// iriumd sync cycle has no fresh cached headers.
     coinbase_extras: Vec<(u64, Vec<u8>)>,
+    /// Phase 10-D: PoAW-X mode from template ("active" or "").
+    poawx_mode: String,
+    /// Phase 10-D: pending receipts from template for irx1 coinbase injection.
+    poawx_pending_receipts: Vec<PoawxPendingReceipt>,
 }
 
 #[derive(Clone)]
@@ -967,6 +974,18 @@ struct SubmitRequest {
 }
 
 #[derive(serde::Serialize)]
+struct SubmitBlockExtendedRequest {
+    height: u64,
+    header: SubmitHeader,
+    tx_hex: Vec<String>,
+    submit_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auxpow_hex: Option<String>,
+    poawx_receipts: Vec<PoawxPendingReceipt>,
+    poawx_receipts_root: String,
+}
+
+#[derive(serde::Serialize)]
 struct FoundBlockRecord {
     height: u64,
     hash: String,
@@ -1644,7 +1663,7 @@ fn to_job(seq: u64, tpl: &GetBlockTemplate) -> Result<Job> {
     // bodies. When set, this drops the BTC/LTC/DOGE header-batch carrier
     // outputs that ride in the coinbase. The pool still mines blocks
     // normally; only the header-relay throughput from this port is paused.
-    let coinbase_extras: Vec<(u64, Vec<u8>)> =
+    let mut coinbase_extras: Vec<(u64, Vec<u8>)> =
         if std::env::var("STRATUM_CARRIERS").as_deref() == Ok("off") {
             Vec::new()
         } else {
@@ -1653,6 +1672,26 @@ fn to_job(seq: u64, tpl: &GetBlockTemplate) -> Result<Job> {
                 .filter_map(|e| hex::decode(e.script_pubkey_hex.trim()).ok().map(|b| (e.value, b)))
                 .collect()
         };
+    // Phase 10-D: inject irx1 OP_RETURN coinbase output when PoAW-X is active.
+    let poawx_enabled = std::env::var("IRIUM_STRATUM_POAWX")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    let poawx_mode = tpl.poawx_mode.clone();
+    let poawx_pending_receipts = tpl.poawx_pending_receipts.clone();
+    if poawx_enabled && poawx_mode == "active" && !poawx_pending_receipts.is_empty() {
+        let root = compute_receipts_root_from_pending(&poawx_pending_receipts);
+        let irx1_script = build_irx1_commitment_script(&root);
+        coinbase_extras.push((0u64, irx1_script));
+        tracing::info!(
+            "[poawx] to_job: job={:016x} mode=active pending={} irx1_len={} receipts_root={}",
+            seq, poawx_pending_receipts.len(), 38, hex::encode(root)
+        );
+    } else if poawx_enabled {
+        tracing::warn!(
+            "[poawx] poawx_enabled but job has no receipts_root (mode='{}'); using legacy submit",
+            poawx_mode
+        );
+    }
     Ok(Job {
         job_id: format!("{seq:016x}"),
         height: tpl.height,
@@ -1665,6 +1704,8 @@ fn to_job(seq: u64, tpl: &GetBlockTemplate) -> Result<Job> {
         branches,
         template_target_hex: tpl.target.clone(),
         coinbase_extras,
+        poawx_mode,
+        poawx_pending_receipts,
     })
 }
 
@@ -3427,14 +3468,32 @@ async fn handle_submit_legacy_rewardable(
 
         mark_candidate_submitted();
         mark_block_submit_attempt();
-        let url = format!("{}/rpc/submit_block", config.rpc_base.trim_end_matches('/'));
-        let client = reqwest::Client::builder().build()?;
-        let resp = client
-            .post(url)
-            .bearer_auth(&config.rpc_token)
-            .json(&req)
-            .send()
-            .await?;
+        // Phase 10-D: use submit_block_extended when PoAW-X receipts present.
+        let resp = if config.poawx_enabled && !job.poawx_pending_receipts.is_empty() {
+            let receipts_root = hex::encode(
+                compute_receipts_root_from_pending(&job.poawx_pending_receipts)
+            );
+            let ext_req = SubmitBlockExtendedRequest {
+                height: req.height,
+                header: req.header,
+                tx_hex: req.tx_hex,
+                submit_source: req.submit_source,
+                auxpow_hex: req.auxpow_hex,
+                poawx_receipts: job.poawx_pending_receipts.clone(),
+                poawx_receipts_root: receipts_root.clone(),
+            };
+            let url = format!("{}/rpc/submit_block_extended", config.rpc_base.trim_end_matches('/'));
+            info!(
+                "[block] submit_block_extended worker={} height={} receipts={} root={}",
+                worker, job.height, job.poawx_pending_receipts.len(), receipts_root
+            );
+            let client = reqwest::Client::builder().build()?;
+            client.post(url).bearer_auth(&config.rpc_token).json(&ext_req).send().await?
+        } else {
+            let url = format!("{}/rpc/submit_block", config.rpc_base.trim_end_matches('/'));
+            let client = reqwest::Client::builder().build()?;
+            client.post(url).bearer_auth(&config.rpc_token).json(&req).send().await?
+        };
         if resp.status().is_success() {
             mark_submit_accepted();
             info!(
