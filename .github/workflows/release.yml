@@ -306,7 +306,7 @@ jobs:
             ghcr.io/iriumlabs/irium:latest
             ghcr.io/iriumlabs/irium:${{ steps.meta.outputs.version }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
 
       - name: Build and push irium-miner image
         uses: docker/build-push-action@v6
@@ -318,4 +318,4 @@ jobs:
             ghcr.io/iriumlabs/irium-miner:latest
             ghcr.io/iriumlabs/irium-miner:${{ steps.meta.outputs.version }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
