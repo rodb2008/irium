@@ -73,14 +73,14 @@ Irium. Miners must solve an assigned CPU puzzle and commit its receipt on-chain 
 
 ### Phase 11-B: Blocker Fixes
 
-| Item | Description |
-|------|-------------|
-| Firewall | Open cloud firewall ports 39510 and 39512 on VPS-1 |
-| VPS-2 P2P | Fix direct P2P (remove SSH tunnel dependency) |
-| receipts_root | Add canonical sort order for multi-miner safety |
-| DNS seed | Register testnet DNS seed or publish known seed list |
-| Chain reset policy | Document and implement chain reset procedure |
-| Rollback plan | Finalize emergency stop and rollback runbook |
+| Item | Status | Description |
+|------|--------|-------------|
+| receipts_root canonical sort | DONE (163b558) | Both iriumd + stratum sort before hashing |
+| Solution proof validation | DONE (163b558) | commitment_nonce + SHA256d PoW check at POST and submit_block_extended |
+| Firewall | PENDING | Open cloud firewall ports 39510 and 39512 on VPS-1 |
+| VPS-2 P2P | PENDING | Fix direct P2P (remove SSH tunnel dependency) |
+| DNS seed | PENDING | Register testnet DNS seed or publish known seed list |
+| Chain reset policy | PENDING | Document and implement chain reset procedure |
 
 ### Phase 11-C: Operator Runbook
 
@@ -117,10 +117,10 @@ Irium. Miners must solve an assigned CPU puzzle and commit its receipt on-chain 
 | `/rpc/getblocktemplate` PoAW-X fields | READY |
 | `/rpc/submit_block_extended` | READY |
 | irx1 OP_RETURN format | FINAL (38 bytes) |
-| receipts_root algorithm | IMPLEMENTED (needs sort fix for multi-miner) |
+| receipts_root algorithm | CANONICAL SORT (Phase 11-B, multi-miner safe) |
 | Stratum irx1 injection | READY |
 | Mainnet hard-disable | SOLID |
-| Solution proof validation | NOT IMPLEMENTED (deferred) |
+| Solution proof validation | IMPLEMENTED (Phase 11-B, commitment_nonce + PoW) |
 | Receipt persistence | IN-MEMORY ONLY (deferred) |
 | Adaptive puzzle difficulty | DEFERRED (hardcoded 1) |
 
