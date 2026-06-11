@@ -368,12 +368,19 @@ def main():
     log("Step 0: iriumd h=%d bits=%s" % (status.get("height", 0), bits))
     assert bits == "207fffff", "Expected devnet bits 207fffff, got %r" % bits
 
-    # Verify PoAW-X active mode via /poawx/assignment (503 if disabled)
+    # Verify PoAW-X is not disabled (503 = explicitly disabled; 404 at h=0 is expected)
     try:
-        asgn_check = rpc_get("/poawx/assignment")
+        rpc_get("/poawx/assignment")
         log("Step 0: /poawx/assignment accessible - PoAW-X mode active")
+    except urllib.error.HTTPError as e:
+        if e.code == 503:
+            raise AssertionError("PoAW-X is disabled - /poawx/assignment returned 503")
+        elif e.code == 404:
+            log("Step 0: /poawx/assignment 404 at h=0 - expected before first block, continuing")
+        else:
+            raise AssertionError("PoAW-X unexpected HTTP %d from /poawx/assignment" % e.code)
     except Exception as e:
-        raise AssertionError("PoAW-X not in active mode - /poawx/assignment unreachable: %s" % e)
+        raise AssertionError("PoAW-X RPC unreachable: %s" % e)
 
     asgn = rpc_get("/poawx/assignment")
     log("Step 0: /poawx/assignment lane=%s diff=%s" % (
