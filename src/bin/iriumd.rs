@@ -13509,7 +13509,7 @@ async fn get_block_template(
             };
             ("active".to_string(), receipts, root)
         } else {
-            (String::new(), Vec::new(), String::new())
+            ("disabled".to_string(), Vec::new(), String::new())
         }
     };
 
@@ -13931,6 +13931,17 @@ async fn submit_block_extended(
     })))
 }
 
+fn irx1_root_from_block(block: &Block) -> Option<String> {
+    let coinbase = block.transactions.first()?;
+    for output in &coinbase.outputs {
+        let s = &output.script_pubkey;
+        if s.len() == 38 && s[0] == 0x6a && s[1] == 0x24 && &s[2..6] == b"irx1" {
+            return Some(hex::encode(&s[6..38]));
+        }
+    }
+    None
+}
+
 fn block_json_for(height: u64, block: &Block) -> Value {
     let header = &block.header;
     serde_json::json!({
@@ -13947,6 +13958,7 @@ fn block_json_for(height: u64, block: &Block) -> Value {
         "tx_hex": block.transactions.iter().map(|tx| hex::encode(tx.serialize())).collect::<Vec<_>>(),
         "auxpow_hex": block.auxpow.as_ref().map(|ap| hex::encode(irium_node_rs::auxpow::serialize(ap))),
         "miner_address": miner_address_from_block(block),
+        "irx1_root": irx1_root_from_block(block),
         "submit_source": storage::read_block_submit_source(height),
     })
 }

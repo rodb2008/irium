@@ -3,7 +3,7 @@
 **Date:** 2026-06-11  
 **Branch:** `testnet/poawx-phase11a-public-testnet-readiness`  
 **Starting checkpoint:** `a5e5feb` (Phase 10-F remote cleanup complete)  
-**Scope:** Audit-only. No public testnet launched. No firewall changes. No pushes.
+**Scope:** Audit-only (Phase 11-A). Phase 11-C resolved: disabled-mode endpoints, irx1_root, reset policy. Firewall still PENDING.
 
 ---
 
@@ -255,7 +255,7 @@ Resolved in Phase 10-D by rebuilding both binaries from PoAW-X branch.
 | Monitoring / logging | **READY WITH MANUAL OPS** | Structured logs exist; no metrics dashboard |
 | Metrics endpoint | **DEFER** | /rpc/mining_metrics exists; no PoAW-X metrics |
 | Peer discovery | **NEEDS FIX** | No public DNS seed; manual ADDNODE only |
-| Chain reset policy | **NEEDS FIX** | Not documented |
+| Chain reset policy | **DONE (11-C)** | docs/poaw-x-testnet-reset-rollback-policy.md |
 | Testnet faucet / reward policy | **DEFER** | Devnet coins worthless; faucet needed for external testers |
 | Block explorer for testnet | **DEFER** | irium-explorer exists; no public testnet instance |
 | Wallet compatibility | **READY WITH MANUAL OPS** | Existing wallet works; no PoAW-X wallet UI |
@@ -263,11 +263,11 @@ Resolved in Phase 10-D by rebuilding both binaries from PoAW-X branch.
 | Git branch hygiene | **READY** | Remote testnet branch deleted; main clean |
 | Secret hygiene (committed files) | **READY WITH MANUAL OPS** | Testnet RPC tokens in scripts (low risk); PAT removed |
 | Receipt in-memory only | **KNOWN GAP** | Lost on restart; miners re-submit; defer to production |
-| Disabled-mode port 39513 | **KNOWN SKIP** | Not reliably responsive; timing issue |
+| Disabled-mode endpoints | **RESOLVED (11-C)** | 503 on assignment/receipt, poawx_mode=disabled confirmed |
 | receipts_root insertion-order dependency | **HIGH RISK** | Multi-worker unsafe; needs canonical sort |
 | Solution/proof not validated | **HIGH RISK** | `solution` opaque hex; no cryptographic check |
 | Adaptive puzzle difficulty | **DEFER** | Hardcoded 1; fine for single-miner testnet |
-| getblock endpoint path | **READY** | Exists at /rpc/block?height=N; harness had wrong URL |
+| getblock endpoint path | **READY (11-C)** | Exists at /rpc/block?height=N; irx1_root field added in Phase 11-C |
 | Cargo fmt drift | **DEFER** | Cosmetic; not checked this phase |
 | Public communication plan | **NEEDS FIX** | No announcement plan |
 
@@ -419,7 +419,7 @@ Manual rotation from GitHub settings still recommended but not yet confirmed.
 | Phase | Goal |
 |-------|------|
 | **11-B** | Fix blockers: open firewall ports 39510/39512, fix VPS-2 P2P direct routing, add receipts_root canonical sort, basic solution hex format validation |
-| **11-C** | Operator runbook: systemd testnet service files, chain reset procedure, log rotation, monitoring setup |
+| **11-C** | Networking readiness: P2P audit, firewall plan, getblock irx1_root, disabled-mode fix, reset policy, tester guide — DONE (2026-06-12) |
 | **11-D** | Limited external miner pilot: 1-3 trusted testers, confirm stratum PoAW-X with external participants |
 | **11-E** | Public-testnet launch candidate: DNS seed, public explorer instance, chain reset policy, faucet |
 

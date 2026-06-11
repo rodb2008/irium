@@ -1,6 +1,6 @@
 # PoAW-X Prototype Plan
 
-**Last updated:** 2026-06-11 (Phase 11-B soak PASS)  
+**Last updated:** 2026-06-12 (Phase 11-C networking readiness audit)  
 **Status:** Active development â€” testnet proven, public testnet pending
 
 ---
@@ -83,14 +83,20 @@ Irium. Miners must solve an assigned CPU puzzle and commit its receipt on-chain 
 | DNS seed | PENDING | Register testnet DNS seed or publish known seed list |
 | Chain reset policy | PENDING | Document and implement chain reset procedure |
 
-### Phase 11-C: Operator Runbook
+### Phase 11-C: Networking Readiness
 
-| Item | Description |
-|------|-------------|
-| systemd service files | Testnet iriumd and stratum service files (separate from mainnet) |
-| Log rotation | logrotate config for testnet logs |
-| Monitoring | Key log patterns and alerting |
-| Runbook | finalize `docs/poaw-x-public-testnet-draft-runbook.md` |
+| Item | Status | Description |
+|------|--------|-------------|
+| P2P audit | DONE | Cloud firewall blocks 39510/39512; exact rules documented |
+| Direct P2P test | BLOCKED | Awaiting cloud firewall approval for port 39510 |
+| getblock irx1_root | DONE | `/rpc/block` now returns `irx1_root` field |
+| poawx_mode descriptor | DONE | getblocktemplate returns `disabled` (was ``) |
+| Chain reset policy | DONE | `docs/poaw-x-testnet-reset-rollback-policy.md` |
+| Network plan | DONE | `docs/poaw-x-public-testnet-network-plan.md` |
+| Tester guide update | DONE | Phase 11-C hardening |
+| Runbook update | DONE | Updated for Phase 11-C findings |
+| Cloud firewall TCP 39510/39512 | PENDING APPROVAL | VPS-1 inbound rules not yet applied |
+| systemd service files | PENDING | Templates documented; not yet installed |
 
 ### Phase 11-D: Limited External Miner Pilot
 
@@ -169,6 +175,9 @@ Miner
 | `scripts/poawx-stratum-long-soak-harness.py` | Test harness for PoAW-X stratum path |
 | `scripts/poawx-phase11b-canonical-receipts-validation.py` | Phase 11-B self-contained regression soak (v6, PASS=17) |
 | `scripts/testnet-poawx-phase11b-canonical-receipts-validation.sh` | Phase 11-B wrapper (delegates to Python soak) |
+| `docs/poaw-x-phase11c-networking-readiness.md` | Phase 11-C networking audit |
+| `docs/poaw-x-public-testnet-network-plan.md` | Testnet network plan and service layout |
+| `docs/poaw-x-testnet-reset-rollback-policy.md` | Testnet chain reset and rollback policy |
 | `scripts/testnet-poawx-phase10f-receipt-two-vps-soak.sh` | Two-VPS soak automation |
 | `docs/poaw-x-phase11a-public-testnet-readiness-audit.md` | Phase 11-A audit |
 | `docs/poaw-x-public-testnet-draft-runbook.md` | Operator runbook (draft) |
