@@ -3849,6 +3849,7 @@ mod tests {
             conn_window_secs: 0,
             ban_threshold: 0,
             ban_duration_secs: 0,
+            poawx_enabled: false,
         }
     }
 
@@ -3884,6 +3885,8 @@ mod tests {
             branches: vec![],
             template_target_hex: biguint_to_32hex(&target_from_bits(0x1d00ffff)),
             coinbase_extras: vec![],
+            poawx_mode: String::new(),
+            poawx_pending_receipts: vec![],
         }
     }
 
@@ -3900,6 +3903,8 @@ mod tests {
             branches: vec![],
             template_target_hex: biguint_to_32hex(&target_from_bits(0x207fffff)),
             coinbase_extras: vec![],
+            poawx_mode: String::new(),
+            poawx_pending_receipts: vec![],
         }
     }
 
