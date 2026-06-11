@@ -13533,8 +13533,15 @@ async fn get_block_template(
 // --- Phase 10-D: PoAW-X helpers and endpoints ---
 
 fn compute_poawx_receipts_root(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
+    let mut sorted: Vec<&PoawxPendingReceipt> = receipts.iter().collect();
+    sorted.sort_unstable_by(|a, b| {
+        a.height.cmp(&b.height)
+            .then_with(|| a.lane.as_bytes().cmp(b.lane.as_bytes()))
+            .then_with(|| a.worker_pkh.as_bytes().cmp(b.worker_pkh.as_bytes()))
+            .then_with(|| a.commitment_nonce.as_bytes().cmp(b.commitment_nonce.as_bytes()))
+    });
     let mut outer = Sha256::new();
-    for r in receipts {
+    for r in sorted {
         let mut inner = Sha256::new();
         inner.update(r.height.to_le_bytes());
         inner.update(r.lane.as_bytes());
@@ -13612,15 +13619,67 @@ async fn poawx_post_receipt(
     if !is_active || !is_non_mainnet {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    hex::decode(&req.solution).map_err(|_| StatusCode::BAD_REQUEST)?;
-    hex::decode(&req.commitment_nonce).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let current_height = {
-        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        guard.height
-    };
-    if req.height == 0 || req.height + 2 < current_height {
+    let solution_bytes = hex::decode(&req.solution).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let submitted_nonce_bytes = hex::decode(&req.commitment_nonce).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if submitted_nonce_bytes.len() != 32 {
         return Err(StatusCode::BAD_REQUEST);
     }
+
+    let (derived_seed, derived_nonce) = {
+        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        if req.height == 0 || req.height + 2 < guard.height {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let parent_h = req.height - 1;
+        if parent_h as usize >= guard.chain.len() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let parent_hash = guard.chain[parent_h as usize].header.hash_for_height(parent_h);
+        let mut seed_hasher = Sha256::new();
+        seed_hasher.update(&parent_hash);
+        seed_hasher.update(parent_h.to_le_bytes());
+        seed_hasher.update(b"poawx_assignment_seed_v1");
+        let seed: [u8; 32] = seed_hasher.finalize().into();
+        let mut nonce_hasher = Sha256::new();
+        nonce_hasher.update(&seed);
+        nonce_hasher.update(b"commitment_nonce");
+        let nonce: [u8; 32] = nonce_hasher.finalize().into();
+        (seed, nonce)
+    };
+
+    if submitted_nonce_bytes != derived_nonce {
+        eprintln!(
+            "[poawx] receipt rejected: commitment_nonce mismatch height={} lane={} worker_pkh={}",
+            req.height, req.lane, req.worker_pkh
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    {
+        let mut pow_input = Vec::with_capacity(32 + 32 + solution_bytes.len());
+        pow_input.extend_from_slice(&derived_seed);
+        pow_input.extend_from_slice(&derived_nonce);
+        pow_input.extend_from_slice(&solution_bytes);
+        let pow_hash = sha256d(&pow_input);
+        let leading: u32 = {
+            let mut bits = 0u32;
+            for &b in pow_hash.iter() {
+                let z = b.leading_zeros();
+                bits += z;
+                if z < 8 { break; }
+            }
+            bits
+        };
+        const PUZZLE_DIFFICULTY: u32 = 1;
+        if leading < PUZZLE_DIFFICULTY {
+            eprintln!(
+                "[poawx] receipt rejected: insufficient PoW leading_zeros={} required={} height={} lane={} worker_pkh={}",
+                leading, PUZZLE_DIFFICULTY, req.height, req.lane, req.worker_pkh
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
     let receipt = PoawxPendingReceipt {
         height: req.height,
         lane: req.lane.clone(),
@@ -13680,6 +13739,59 @@ async fn submit_block_extended(
         );
         return Err(StatusCode::BAD_REQUEST);
     }
+    if !req.poawx_receipts.is_empty() {
+        let (sbe_seed, sbe_nonce) = {
+            let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            if req.height == 0 || req.height as usize > guard.chain.len() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            let parent_h = req.height - 1;
+            let parent_hash = guard.chain[parent_h as usize].header.hash_for_height(parent_h);
+            let mut s_hasher = Sha256::new();
+            s_hasher.update(&parent_hash);
+            s_hasher.update(parent_h.to_le_bytes());
+            s_hasher.update(b"poawx_assignment_seed_v1");
+            let seed: [u8; 32] = s_hasher.finalize().into();
+            let mut n_hasher = Sha256::new();
+            n_hasher.update(&seed);
+            n_hasher.update(b"commitment_nonce");
+            let nonce: [u8; 32] = n_hasher.finalize().into();
+            (seed, nonce)
+        };
+        let sbe_nonce_hex = hex::encode(sbe_nonce);
+        for r in &req.poawx_receipts {
+            if r.commitment_nonce != sbe_nonce_hex {
+                eprintln!(
+                    "[submit_block_extended] reject: commitment_nonce mismatch height={}",
+                    req.height
+                );
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            let sol = hex::decode(&r.solution).map_err(|_| StatusCode::BAD_REQUEST)?;
+            let mut pow_input = Vec::with_capacity(32 + 32 + sol.len());
+            pow_input.extend_from_slice(&sbe_seed);
+            pow_input.extend_from_slice(&sbe_nonce);
+            pow_input.extend_from_slice(&sol);
+            let pow_hash = sha256d(&pow_input);
+            let leading: u32 = {
+                let mut bits = 0u32;
+                for &b in pow_hash.iter() {
+                    let z = b.leading_zeros();
+                    bits += z;
+                    if z < 8 { break; }
+                }
+                bits
+            };
+            if leading < 1 {
+                eprintln!(
+                    "[submit_block_extended] reject: puzzle PoW insufficient leading_zeros={} height={}",
+                    leading, req.height
+                );
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+
     let header = &req.header;
     let prev_bytes = hex::decode(&header.prev_hash).map_err(|_| StatusCode::BAD_REQUEST)?;
     let merkle_bytes = hex::decode(&header.merkle_root).map_err(|_| StatusCode::BAD_REQUEST)?;

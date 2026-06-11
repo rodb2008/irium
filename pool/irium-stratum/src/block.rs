@@ -264,9 +264,18 @@ pub fn parse_u32_hex(s: &str) -> Result<u32> {
 
 /// Phase 10-D: compute receipts root for PoAW-X irx1 commitment.
 /// Algorithm: SHA256(concat(SHA256(receipt_fields) for each receipt)).
+/// Phase 11-B: sort canonically by (height, lane, worker_pkh, commitment_nonce)
+/// so the root is deterministic regardless of receipt insertion order.
 pub fn compute_receipts_root_from_pending(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
+    let mut sorted: Vec<&PoawxPendingReceipt> = receipts.iter().collect();
+    sorted.sort_unstable_by(|a, b| {
+        a.height.cmp(&b.height)
+            .then_with(|| a.lane.as_bytes().cmp(b.lane.as_bytes()))
+            .then_with(|| a.worker_pkh.as_bytes().cmp(b.worker_pkh.as_bytes()))
+            .then_with(|| a.commitment_nonce.as_bytes().cmp(b.commitment_nonce.as_bytes()))
+    });
     let mut outer = Sha256::new();
-    for r in receipts {
+    for r in sorted {
         let mut inner = Sha256::new();
         inner.update(r.height.to_le_bytes());
         inner.update(r.lane.as_bytes());
@@ -276,6 +285,65 @@ pub fn compute_receipts_root_from_pending(receipts: &[PoawxPendingReceipt]) -> [
         outer.update(inner.finalize());
     }
     outer.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::template::PoawxPendingReceipt;
+
+    fn mkr(height: u64, lane: &str, pkh: &str, sol: &str, nonce: &str) -> PoawxPendingReceipt {
+        PoawxPendingReceipt {
+            height,
+            lane: lane.to_string(),
+            worker_pkh: pkh.to_string(),
+            solution: sol.to_string(),
+            commitment_nonce: nonce.to_string(),
+        }
+    }
+
+    #[test]
+    fn single_receipt_stable() {
+        let r = mkr(1, "cpu", "aabb", "dead", "cafe");
+        assert_eq!(
+            compute_receipts_root_from_pending(&[r.clone()]),
+            compute_receipts_root_from_pending(&[r])
+        );
+    }
+
+    #[test]
+    fn two_receipts_order_independent() {
+        let r1 = mkr(1, "cpu", "aaaa", "0001", "0011");
+        let r2 = mkr(1, "cpu", "bbbb", "0002", "0022");
+        assert_eq!(
+            compute_receipts_root_from_pending(&[r1.clone(), r2.clone()]),
+            compute_receipts_root_from_pending(&[r2, r1]),
+            "root must not depend on insertion order"
+        );
+    }
+
+    #[test]
+    fn many_receipts_shuffled_same_root() {
+        let receipts: Vec<PoawxPendingReceipt> = (0u64..5)
+            .map(|i| mkr(1, "cpu", &format!("{:04x}", i * 17), &format!("{:04x}", i), &format!("{:04x}", i + 100)))
+            .collect();
+        let mut rev = receipts.clone();
+        rev.reverse();
+        assert_eq!(
+            compute_receipts_root_from_pending(&receipts),
+            compute_receipts_root_from_pending(&rev)
+        );
+    }
+
+    #[test]
+    fn different_heights_different_root() {
+        let r1 = mkr(1, "cpu", "aaaa", "0001", "0011");
+        let r2 = mkr(2, "cpu", "aaaa", "0001", "0011");
+        assert_ne!(
+            compute_receipts_root_from_pending(&[r1]),
+            compute_receipts_root_from_pending(&[r2])
+        );
+    }
 }
 
 /// Phase 10-D: build irx1 OP_RETURN script for coinbase.
