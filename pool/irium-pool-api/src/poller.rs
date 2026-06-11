@@ -132,7 +132,7 @@ async fn tick(
     let chain_height = get_node_status(&state.client, &cfg.iriumd_rpc).await.height;
 
     if chain_height > db_tip {
-        let fetch_count = (chain_height - db_tip).min(100) + 1;
+        let fetch_count = (chain_height - db_tip).min(500) + 1;
         let blocks = get_explorer_blocks(&state.client, &cfg.explorer_url, fetch_count).await;
         let conn = state.db.lock().unwrap();
         let mut inserted = 0u64;
