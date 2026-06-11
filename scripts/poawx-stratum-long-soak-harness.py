@@ -382,9 +382,12 @@ def main():
     except Exception as e:
         raise AssertionError("PoAW-X RPC unreachable: %s" % e)
 
-    asgn = rpc_get("/poawx/assignment")
-    log("Step 0: /poawx/assignment lane=%s diff=%s" % (
-        asgn.get("lane", "?"), asgn.get("puzzle_difficulty", "?")))
+    try:
+        asgn = rpc_get("/poawx/assignment")
+        log("Step 0: /poawx/assignment lane=%s diff=%s" % (
+            asgn.get("lane", "?"), asgn.get("puzzle_difficulty", "?")))
+    except urllib.error.HTTPError:
+        log("Step 0: /poawx/assignment not yet available at h=0 (will be ready after first block)")
 
     stratum = Stratum(STRATUM_HOST, STRATUM_PORT)
     en1_hex, en2_size = stratum.subscribe()
