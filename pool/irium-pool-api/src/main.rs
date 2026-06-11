@@ -15,7 +15,7 @@ use tracing::info;
 #[derive(Default, Clone)]
 pub struct CachedMiner {
     pub address:         String,
-    pub hashrate_hps:    f64,
+    pub hashrate_hps:    Option<f64>,
     pub accepted:        u64,
     pub rejected:        u64,
     pub reject_rate_pct: f64,

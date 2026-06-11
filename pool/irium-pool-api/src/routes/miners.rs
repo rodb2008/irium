@@ -11,7 +11,7 @@ fn miner_to_json(m: &CachedMiner) -> Value {
     let ago = now_secs().saturating_sub(m.last_share_at);
     json!({
         "address":           m.address,
-        "hashrate_hps":      m.hashrate_hps as u64,
+        "hashrate_hps":      m.hashrate_hps.map(|h| h as u64),
         "accepted_shares":   m.accepted,
         "rejected_shares":   m.rejected,
         "reject_rate_pct":   (m.reject_rate_pct * 100.0).round() / 100.0,
@@ -67,7 +67,7 @@ pub async fn single_handler(
         let ago = now_secs().saturating_sub(m.last_share_at);
         Json(json!({
             "address":              m.address,
-            "hashrate_hps":         m.hashrate_hps as u64,
+            "hashrate_hps":         m.hashrate_hps.map(|h| h as u64),
             "accepted_shares":      m.accepted,
             "rejected_shares":      m.rejected,
             "reject_rate_pct":      (m.reject_rate_pct * 100.0).round() / 100.0,
