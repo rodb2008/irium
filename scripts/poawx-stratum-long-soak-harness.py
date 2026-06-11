@@ -364,10 +364,16 @@ def main():
 
     status = rpc_get("/status")
     tpl    = rpc_get("/rpc/getblocktemplate")
-    log("Step 0: iriumd h=%d poawx_mode=%s bits=%s" % (
-        status.get("height", 0), tpl.get("poawx_mode", "?"), tpl.get("bits", "?")))
-    assert tpl.get("poawx_mode") == "active", \
-        "Expected poawx_mode=active, got %r" % tpl.get("poawx_mode")
+    bits   = tpl.get("bits", "")
+    log("Step 0: iriumd h=%d bits=%s" % (status.get("height", 0), bits))
+    assert bits == "207fffff", "Expected devnet bits 207fffff, got %r" % bits
+
+    # Verify PoAW-X active mode via /poawx/assignment (503 if disabled)
+    try:
+        asgn_check = rpc_get("/poawx/assignment")
+        log("Step 0: /poawx/assignment accessible - PoAW-X mode active")
+    except Exception as e:
+        raise AssertionError("PoAW-X not in active mode - /poawx/assignment unreachable: %s" % e)
 
     asgn = rpc_get("/poawx/assignment")
     log("Step 0: /poawx/assignment lane=%s diff=%s" % (

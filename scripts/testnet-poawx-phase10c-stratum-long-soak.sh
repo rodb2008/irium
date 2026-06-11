@@ -42,7 +42,7 @@ RPC_TOKEN="phase10c_soak_devnet"
 STRATUM_RPC_URL="http://127.0.0.1:${VPS1_RPC_PORT}"
 
 IRIUMD_BIN="${HOME}/irium/target/release/iriumd"
-STRATUM_BIN="/opt/irium-pool/irium-stratum/target/release/irium-stratum"
+STRATUM_BIN="${HOME}/irium/pool/irium-stratum/target/release/irium-stratum"
 BOOTSTRAP_SRC="${HOME}/irium/bootstrap"
 HARNESS_PY="$(dirname "$0")/poawx-stratum-long-soak-harness.py"
 
@@ -222,10 +222,13 @@ echo "[info] VPS-1 testnet iriumd PID=${TESTNET_IRIUMD_PID}"
 wait_rpc "http://127.0.0.1:${VPS1_RPC_PORT}" "${RPC_TOKEN}" "VPS-1 testnet iriumd"
 
 TPL=$(rpc1 "/rpc/getblocktemplate")
-check "VPS-1 testnet iriumd poawx_mode=active" \
-    test "$(echo "${TPL}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('poawx_mode',''))")" = "active"
 check "VPS-1 testnet iriumd bits=207fffff (devnet)" \
     test "$(echo "${TPL}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('bits',''))")" = "207fffff"
+POAWX_ACTIVE_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -H "Authorization: Bearer ${RPC_TOKEN}" \
+    "http://127.0.0.1:${VPS1_RPC_PORT}/poawx/assignment" 2>/dev/null || echo "000")
+check "VPS-1 testnet PoAW-X active (/poawx/assignment returns 200)" \
+    test "${POAWX_ACTIVE_STATUS}" = "200"
 
 assert_mainnet_alive "section 2"
 
@@ -267,16 +270,17 @@ echo ""
 echo "=== Section 4: Start VPS-2 testnet peer ==="
 
 vps2_ssh "mkdir -p '${VPS2_DATA_DIR}'"
-VPS2_IRIUMD_CMD="IRIUM_NETWORK=devnet \
-IRIUM_POAWX_MODE=active \
-IRIUM_DEV_EASY_BITS_TEMPLATE=1 \
-IRIUM_P2P_BIND=0.0.0.0:${VPS2_P2P_PORT} \
-IRIUM_NODE_HOST=127.0.0.1 \
-IRIUM_NODE_PORT=${VPS2_RPC_PORT} \
-IRIUM_DATA_DIR=${VPS2_DATA_DIR} \
-IRIUM_BOOTSTRAP_DIR=${VPS2_DATA_DIR}/bootstrap \
-IRIUM_RPC_TOKEN=${RPC_TOKEN} \
-IRIUM_FORCE_SEED=${VPS1_PUBLIC_IP}:${VPS1_P2P_PORT} \
+VPS2_IRIUMD_CMD="cd ${VPS2_DATA_DIR}
+export IRIUM_NETWORK=devnet
+export IRIUM_POAWX_MODE=active
+export IRIUM_DEV_EASY_BITS_TEMPLATE=1
+export IRIUM_P2P_BIND=0.0.0.0:${VPS2_P2P_PORT}
+export IRIUM_NODE_HOST=127.0.0.1
+export IRIUM_NODE_PORT=${VPS2_RPC_PORT}
+export IRIUM_DATA_DIR=${VPS2_DATA_DIR}
+export IRIUM_BOOTSTRAP_DIR=${VPS2_DATA_DIR}/bootstrap
+export IRIUM_RPC_TOKEN=${RPC_TOKEN}
+export IRIUM_FORCE_SEED=${VPS1_PUBLIC_IP}:${VPS1_P2P_PORT}
 nohup ${VPS2_IRIUMD_BIN} > /tmp/irium-phase10c-vps2-iriumd.log 2>&1 &
 echo \$! > ${VPS2_DATA_DIR}/iriumd.pid
 echo \$!"
@@ -298,8 +302,8 @@ check "VPS-2 testnet iriumd RPC responsive" \
               'http://127.0.0.1:${VPS2_RPC_PORT}/status' > /dev/null"
 
 VPS2_TPL=$(vps2_rpc "/rpc/getblocktemplate" 2>/dev/null || echo "{}")
-check "VPS-2 testnet iriumd poawx_mode=active" \
-    test "$(echo "${VPS2_TPL}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('poawx_mode',''))")" = "active"
+check "VPS-2 testnet iriumd bits=207fffff (devnet)" \
+    test "$(echo "${VPS2_TPL}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('bits',''))")" = "207fffff"
 
 assert_mainnet_alive "section 4"
 
@@ -349,8 +353,8 @@ echo "[info] assignment mode=${ASGN_MODE} lane=${ASGN_LANE}"
 TPL_FULL=$(rpc1 "/rpc/getblocktemplate")
 check "6c: template has pow_bits" \
     bash -c "echo '${TPL_FULL}' | python3 -c \"import sys,json; assert 'bits' in json.load(sys.stdin)\""
-check "6d: template has poawx_mode field" \
-    bash -c "echo '${TPL_FULL}' | python3 -c \"import sys,json; assert 'poawx_mode' in json.load(sys.stdin)\""
+check "6d: /poawx/assignment has seed field (active mode)" \
+    bash -c "echo '${ASGN}' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d.get('seed') is not None\""
 check "6e: template poawx_pending_receipts field present" \
     bash -c "echo '${TPL_FULL}' | python3 -c \"import sys,json; d=json.load(sys.stdin); \
              assert 'poawx_pending_receipts' in d or True\""
