@@ -257,6 +257,7 @@ def estimate_miner_hashrate(worker, accepted_now, diff):
         # daemon restarts. Hashrate calc only needs (ts, accepted).
         oldest_ts = oldest_entry[0]
         oldest_accepted = oldest_entry[1]
+        buf_len = len(buf)
     now = time.time()
     delta_shares = accepted_now - oldest_accepted
     delta_seconds = now - oldest_ts
@@ -275,6 +276,15 @@ def estimate_miner_hashrate(worker, accepted_now, diff):
     if delta_seconds < MIN_SECONDS_PER_MINER:
         return (None, int(delta_seconds))
     if delta_shares < MIN_SHARES:
+        # Single-entry deque: cleared by restart detection and
+        # repopulated with the post-first-share count. oldest ==
+        # accepted_now so delta is zero, but the miner IS actively
+        # hashing; we just lack a pre-share baseline. Return None
+        # ("Collecting...") instead of a false 0 H/s. Once the
+        # second sample lands (<=30 s) buf_len >= 2 and the normal
+        # path takes over.
+        if accepted_now > 0 and buf_len < 2:
+            return (None, int(delta_seconds))
         return (0, int(delta_seconds))
     hashrate_hps = (delta_shares * diff * (1 << 32)) / delta_seconds
     return (hashrate_hps, int(delta_seconds))
