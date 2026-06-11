@@ -1635,7 +1635,7 @@ fn session_coinbase_extras<'a>(
 fn to_job(seq: u64, tpl: &GetBlockTemplate) -> Result<Job> {
     let prev_hash = parse_hex32(&tpl.prev_hash)?;
     let bits = parse_u32_hex(&tpl.bits)?;
-    let ntime_hex = format!("{:08x}", tpl.time);
+    let ntime_hex = format!("{:08x}", tpl.time + 1);
     let tx_hex: Vec<String> = tpl.txs.iter().map(|t| t.hex.clone()).collect();
     let branches = build_merkle_branches(&tx_hex)?;
 
