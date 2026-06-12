@@ -1,50 +1,64 @@
-# Irium node + miner — docker-compose setup.
-# Copy .env.example to .env and fill in your values before running.
-# Start with: docker-compose up -d
+version: '3.8'
 
 services:
-  iriumd:
-    image: ghcr.io/iriumlabs/irium:latest
-    build:
-      context: .
-      dockerfile: Dockerfile.iriumd
-    volumes:
-      - irium_data:/home/irium/.irium
-    ports:
-      - "${IRIUM_P2P_EXTERNAL_PORT:-38291}:38291"
-      - "${IRIUM_RPC_EXTERNAL_PORT:-38300}:38300"
-      - "${IRIUM_STATUS_EXTERNAL_PORT:-8080}:8080"
-    environment:
-      IRIUM_DATA_DIR: /home/irium/.irium
-      IRIUM_P2P_BIND: "0.0.0.0:38291"
-      IRIUM_NODE_HOST: "0.0.0.0"
-      IRIUM_NODE_PORT: "38300"
-      IRIUM_STATUS_HOST: "0.0.0.0"
-      IRIUM_STATUS_PORT: "8080"
-      IRIUM_NODE_PUBLIC_IP: "${IRIUM_NODE_PUBLIC_IP:-}"
-      IRIUM_RPC_TOKEN: "${IRIUM_RPC_TOKEN:-}"
+  db:
+    image: postgres:16-alpine
     restart: unless-stopped
+    environment:
+      POSTGRES_USER: irium_explorer
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_DB: irium_explorer
+    volumes:
+      - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:38300/status || exit 1"]
-      interval: 30s
+      test: ["CMD-SHELL", "pg_isready -U irium_explorer"]
+      interval: 5s
       timeout: 5s
-      retries: 3
-      start_period: 10s
+      retries: 10
 
-  irium-miner:
-    image: ghcr.io/iriumlabs/irium-miner:latest
+  indexer:
     build:
-      context: .
-      dockerfile: Dockerfile.irium-miner
+      context: ./explorer
+      dockerfile: ../docker/Dockerfile.indexer
+    restart: unless-stopped
     depends_on:
-      iriumd:
+      db:
         condition: service_healthy
     environment:
-      IRIUM_MINER_ADDRESS: "${IRIUM_MINER_ADDRESS}"
-      IRIUM_NODE_RPC: "http://iriumd:38300"
-      IRIUM_MINER_THREADS: "${IRIUM_MINER_THREADS:-2}"
-      IRIUM_RPC_TOKEN: "${IRIUM_RPC_TOKEN:-}"
+      DATABASE_URL: postgres://irium_explorer:${DB_PASSWORD:-changeme}@db:5432/irium_explorer
+      IRIUMD_RPC_URL: ${IRIUMD_RPC_URL:-http://host.docker.internal:38300}
+      INDEXER_BATCH_SIZE: ${INDEXER_BATCH_SIZE:-500}
+      INDEXER_POLL_MS: ${INDEXER_POLL_MS:-2000}
+      RUST_LOG: irium_explorer_indexer=info
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  api:
+    build:
+      context: ./explorer
+      dockerfile: ../docker/Dockerfile.api
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3400:3400"
+    environment:
+      DATABASE_URL: postgres://irium_explorer:${DB_PASSWORD:-changeme}@db:5432/irium_explorer
+      API_HOST: 0.0.0.0
+      API_PORT: "3400"
+      API_RATE_LIMIT_RPS: ${API_RATE_LIMIT_RPS:-60}
+      RUST_LOG: irium_explorer_api=info
+
+  frontend:
+    build:
+      context: .
+      dockerfile: ./docker/Dockerfile.frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3401:80"
+    depends_on:
+      - api
 
 volumes:
-  irium_data:
+  db_data:

@@ -1,0 +1,11 @@
+
+FROM rust:latest AS builder
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p irium-explorer-api
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/irium-explorer-api /usr/local/bin/
+ENTRYPOINT ["irium-explorer-api"]

@@ -3364,6 +3364,9 @@ fn check_rate_with_auth(
 }
 
 fn check_rate(state: &AppState, addr: &SocketAddr) -> Result<(), StatusCode> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
     let mut limiter = state.limiter.lock().unwrap_or_else(|e| e.into_inner());
     if limiter.is_allowed(&addr.ip().to_string()) {
         Ok(())

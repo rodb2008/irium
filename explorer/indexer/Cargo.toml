@@ -1,0 +1,40 @@
+
+[package]
+name = "irium-explorer-indexer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "irium-explorer-indexer"
+path = "src/main.rs"
+
+[dependencies]
+# Decoder layer
+hex       = "0.4"
+sha2      = "0.10"
+bs58      = "0.5"
+anyhow    = "1"
+thiserror = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialisation
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# PostgreSQL (runtime query API, no offline compile-time check needed)
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "migrate", "chrono"] }
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+# Config / env
+dotenvy = "0.15"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
