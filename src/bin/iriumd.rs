@@ -1965,13 +1965,18 @@ fn load_persisted_startup_seeds(
             seeds.push(seed);
         }
     }
-    for seed in load_runtime_seeds() {
-        let normalized = match parse_seed_to_socketaddr(&seed, default_seed_port) {
-            Ok(addr) => addr.to_string(),
-            Err(_) => seed,
-        };
-        if !seeds.iter().any(|existing| existing == &normalized) {
-            seeds.push(normalized);
+    // Mainnet only: don't import mainnet runtime seeds into devnet/testnet nodes.
+    // storage::bootstrap_dir() may fall back to the mainnet .irium/ dir when
+    // IRIUM_DATA_DIR is not under $HOME, pulling in mainnet peers at port 38291.
+    if network_kind_from_env() == NetworkKind::Mainnet {
+        for seed in load_runtime_seeds() {
+            let normalized = match parse_seed_to_socketaddr(&seed, default_seed_port) {
+                Ok(addr) => addr.to_string(),
+                Err(_) => seed,
+            };
+            if !seeds.iter().any(|existing| existing == &normalized) {
+                seeds.push(normalized);
+            }
         }
     }
     seeds
@@ -16243,13 +16248,20 @@ async fn main() {
             }
         }
     }
-    let fallback_seeds = load_builtin_fallback_seeds();
-    let dns_seed_hosts = load_dns_seed_hosts(node_cfg.as_ref());
-    let signed_seeds = if load_runtime_seeds().len() >= 5 {
-        Vec::new()
+    // Devnet/testnet must not fall back to mainnet bootstrap peers.
+    let fallback_seeds = if network_kind_from_env() == NetworkKind::Mainnet {
+        load_builtin_fallback_seeds()
     } else {
-        load_signed_seeds()
+        Vec::new()
     };
+    let dns_seed_hosts = load_dns_seed_hosts(node_cfg.as_ref());
+    // Devnet/testnet: skip signed (mainnet-only) seed list entirely.
+    let signed_seeds =
+        if network_kind_from_env() != NetworkKind::Mainnet || load_runtime_seeds().len() >= 5 {
+            Vec::new()
+        } else {
+            load_signed_seeds()
+        };
     let p2p_bind_for_local = std::env::var("IRIUM_P2P_BIND")
         .ok()
         .or_else(|| node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.clone()));
@@ -28545,6 +28557,74 @@ mod tests {
             result.unwrap_err(),
             StatusCode::METHOD_NOT_ALLOWED,
             "12-I: legacy submit_block must still return 405 when PoAW-X active"
+        );
+    }
+
+    // ── Phase 12-L: Devnet P2P seed isolation ────────────────────────────────
+
+    /// Devnet must not be identified as mainnet (guards the seed isolation logic).
+    #[test]
+    fn test_12l_devnet_network_kind_is_not_mainnet() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let is_mainnet = network_kind_from_env() == NetworkKind::Mainnet;
+        std::env::remove_var("IRIUM_NETWORK");
+        assert!(!is_mainnet, "devnet must not be classified as mainnet");
+    }
+
+    /// Testnet must not be identified as mainnet (same guard, testnet variant).
+    #[test]
+    fn test_12l_testnet_network_kind_is_not_mainnet() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let is_mainnet = network_kind_from_env() == NetworkKind::Mainnet;
+        std::env::remove_var("IRIUM_NETWORK");
+        assert!(!is_mainnet, "testnet must not be classified as mainnet");
+    }
+
+    /// Default (no IRIUM_NETWORK) must be mainnet so fallback/signed seeds load.
+    #[test]
+    fn test_12l_default_network_kind_is_mainnet() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRIUM_NETWORK");
+        let is_mainnet = network_kind_from_env() == NetworkKind::Mainnet;
+        assert!(is_mainnet, "unset IRIUM_NETWORK must be mainnet");
+    }
+
+    /// The fallback seed gate: devnet → empty; mainnet → calls loader.
+    #[test]
+    fn test_12l_devnet_fallback_seed_gate_returns_empty() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        let fallback: Vec<String> = if network_kind_from_env() == NetworkKind::Mainnet {
+            load_builtin_fallback_seeds()
+        } else {
+            Vec::new()
+        };
+        std::env::remove_var("IRIUM_NETWORK");
+        assert!(
+            fallback.is_empty(),
+            "devnet fallback seed gate must return empty Vec, got: {:?}",
+            fallback
+        );
+    }
+
+    /// The signed seed gate: devnet → skipped; mainnet → may load.
+    #[test]
+    fn test_12l_devnet_signed_seed_gate_skipped() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "devnet");
+        // The condition in the patched code: non-mainnet OR runtime_seeds >= 5 → Vec::new()
+        let signed: Vec<String> =
+            if network_kind_from_env() != NetworkKind::Mainnet || load_runtime_seeds().len() >= 5 {
+                Vec::new()
+            } else {
+                load_signed_seeds()
+            };
+        std::env::remove_var("IRIUM_NETWORK");
+        assert!(
+            signed.is_empty(),
+            "devnet signed seed gate must return empty Vec"
         );
     }
 }
