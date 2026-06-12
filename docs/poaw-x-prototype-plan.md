@@ -1,6 +1,6 @@
 # PoAW-X Prototype Plan
 
-**Last updated:** 2026-06-12 (Phase 11-D firewall direct P2P preflight PASS)
+**Last updated:** 2026-06-12 (Phase 11-E limited miner pilot COMPLETE)
 **Status:** Active development â€” testnet proven, public testnet pending
 
 ---
@@ -112,7 +112,22 @@ Irium. Miners must solve an assigned CPU puzzle and commit its receipt on-chain 
 | Disabled-mode 503 / RPC private | PASS |
 | Mainnet isolation | PASS: height 30074 untouched |
 
-### Phase 11-E: Public Testnet Launch Candidate
+### Phase 11-E: Limited Miner Pilot — COMPLETE (VPS-2 simulation)
+
+**Branch:** `testnet/poawx-phase11e-limited-miner-pilot`
+
+| Item | Status | Detail |
+|------|--------|--------|
+| VPS-1 pilot iriumd + stratum | PASS | poawx_mode=active, 39510/39512 public |
+| VPS-2 simulation (external peer) | PASS | peers=1, stratum TCP reachable |
+| Real external miner | NOT RUN | Package: docs/poaw-x-limited-miner-pilot-guide.md |
+| 12-block pilot test | PASS | 12/12 blocks, 9/12 irx1, receipt PASS, bogus rejected |
+| VPS-2 P2P sync | PASS | height=12 |
+| Negative checks | PASS | 422/503/bogus/RPC-private/mainnet-intact |
+
+---
+
+### Phase 11-F: Public Testnet Launch Candidate
 
 - Public DNS seed.
 - Public block explorer instance.
@@ -188,5 +203,7 @@ Miner
 | `scripts/testnet-poawx-phase10f-receipt-two-vps-soak.sh` | Two-VPS soak automation |
 | `docs/poaw-x-phase11a-public-testnet-readiness-audit.md` | Phase 11-A audit |
 | `docs/poaw-x-phase11d-firewall-p2p-preflight.md` | Phase 11-D preflight results |
+| `docs/poaw-x-phase11e-limited-miner-pilot.md` | Phase 11-E pilot results |
+| `docs/poaw-x-limited-miner-pilot-guide.md` | External miner connection guide |
 | `docs/poaw-x-public-testnet-draft-runbook.md` | Operator runbook (draft) |
 | `docs/poaw-x-public-tester-miner-draft-guide.md` | Miner guide (draft) |

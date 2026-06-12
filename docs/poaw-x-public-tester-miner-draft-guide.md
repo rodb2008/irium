@@ -220,3 +220,13 @@ Mainnet ports (38300, 38291, 3333, 8080, 38310, 38320) are completely separate.
 ---
 
 *Guide updated for Phase 11-C. External distribution pending Phase 11-D launch.*
+
+
+---
+
+## Phase 11-E Status
+
+Limited miner pilot run 2026-06-12 using VPS-2 simulation.
+Results: 12/12 blocks PASS, irx1 in 9/12 blocks, receipt PASS.
+External miner package: `docs/poaw-x-limited-miner-pilot-guide.md`
+Real external miner validation: PENDING (next pilot session)
