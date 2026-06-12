@@ -595,16 +595,30 @@ fn extract_height_from_coinbase1_hex(coinbase1_hex: &str) -> Option<u64> {
     }
 }
 
+fn coinbase_tag() -> Option<&'static str> {
+    static TAG: OnceLock<Option<String>> = OnceLock::new();
+    TAG.get_or_init(|| {
+        let tag = env::var("IRIUM_COINBASE_TAG").ok()?;
+        let tag = tag.trim().to_string();
+        if tag.is_empty() || !tag.is_ascii() {
+            eprintln!("[warn] IRIUM_COINBASE_TAG must be non-empty ASCII; ignoring");
+            return None;
+        }
+        Some(if tag.len() > 20 { tag[..20].to_string() } else { tag })
+    })
+    .as_deref()
+}
+
 fn build_coinbase(height: u64, reward: u64) -> Result<Transaction, String> {
     let pkh = miner_pubkey_hash().ok_or_else(|| {
         "missing or invalid miner payout address; set IRIUM_MINER_ADDRESS to a valid Irium address"
             .to_string()
     })?;
-    Ok(build_coinbase_with_pkh(
-        reward,
-        &pkh,
-        format!("Block {}", height).into_bytes(),
-    ))
+    let script = match coinbase_tag() {
+        Some(tag) => format!("Block {}/{}", height, tag).into_bytes(),
+        None => format!("Block {}", height).into_bytes(),
+    };
+    Ok(build_coinbase_with_pkh(reward, &pkh, script))
 }
 
 #[derive(Deserialize)]
@@ -2710,7 +2724,10 @@ fn build_solo_stratum_job(
 
     let extranonce1_bytes =
         hex::decode(extranonce1).map_err(|e| format!("extranonce1 decode: {e}"))?;
-    let prefix = format!("Block {} solo ", template.height).into_bytes();
+    let prefix = match coinbase_tag() {
+        Some(tag) => format!("Block {} solo {} ", template.height, tag).into_bytes(),
+        None => format!("Block {} solo ", template.height).into_bytes(),
+    };
     let mut script_sig = prefix.clone();
     script_sig.extend(std::iter::repeat(0u8).take(extranonce1_bytes.len() + extranonce2_size));
 
