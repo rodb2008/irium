@@ -1,0 +1,19 @@
+
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background-color: #0a0a0b;
+  color: #e4e4e7;
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+.mono { font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace; }
+
+/* Subtle scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #111113; }
+::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
