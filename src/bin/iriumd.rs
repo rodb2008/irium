@@ -27094,6 +27094,110 @@ mod tests {
             "difficulty check must still reject trivial difficulty even when receipt file exists"
         );
     }
+
+    #[test]
+    fn test_poawx_12f_irx1_commitment_false_for_no_irx1_script() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: [0u8; 32],
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    prev_txid: [0u8; 32],
+                    prev_index: 0xffff_ffff,
+                    script_sig: vec![0x01, 0x00],
+                    sequence: 0xffff_ffff,
+                }],
+                outputs: vec![TxOutput {
+                    value: 50_0000_0000,
+                    script_pubkey: vec![0x51],
+                }],
+                locktime: 0,
+            }],
+            auxpow: None,
+        };
+        assert!(
+            !irium_node_rs::poawx::block_has_irx1_commitment(&block),
+            "block without irx1 output must return false (same function called from connect_block)"
+        );
+    }
+
+    #[test]
+    fn test_poawx_12f_irx1_commitment_true_for_valid_script() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut root = [0u8; 32];
+        root[0] = 0xde;
+        root[31] = 0xad;
+        let mut irx1_script = vec![0x6a, 0x24u8];
+        irx1_script.extend_from_slice(b"irx1");
+        irx1_script.extend_from_slice(&root);
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: [0u8; 32],
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    prev_txid: [0u8; 32],
+                    prev_index: 0xffff_ffff,
+                    script_sig: vec![0x01, 0x00],
+                    sequence: 0xffff_ffff,
+                }],
+                outputs: vec![
+                    TxOutput {
+                        value: 50_0000_0000,
+                        script_pubkey: vec![0x51],
+                    },
+                    TxOutput {
+                        value: 0,
+                        script_pubkey: irx1_script,
+                    },
+                ],
+                locktime: 0,
+            }],
+            auxpow: None,
+        };
+        assert!(
+            irium_node_rs::poawx::block_has_irx1_commitment(&block),
+            "block with valid irx1 output must return true (same function called from connect_block)"
+        );
+    }
+
+    #[test]
+    fn test_poawx_12f_receipt_persistence_regression() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let tmp = std::env::temp_dir().join("irium_test_poawx_12f_regression.json");
+        let _ = std::fs::remove_file(&tmp);
+        std::env::set_var("IRIUM_POAWX_RECEIPTS_FILE", tmp.to_str().unwrap());
+        let receipts = vec![PoawxPendingReceipt {
+            height: 42,
+            lane: "cpu".to_string(),
+            worker_pkh: "ab".repeat(20),
+            solution: "cd".repeat(32),
+            commitment_nonce: "ef".repeat(32),
+        }];
+        save_poawx_pending_receipts(&receipts);
+        let loaded = load_poawx_pending_receipts();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].height, 42);
+        assert_eq!(loaded[0].lane, "cpu");
+        std::env::remove_var("IRIUM_POAWX_RECEIPTS_FILE");
+        std::env::remove_var("IRIUM_NETWORK");
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 // ============================================================================

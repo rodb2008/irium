@@ -22,6 +22,8 @@ mod ltc_spv;
 mod mempool;
 mod pow;
 #[allow(dead_code)]
+mod poawx;
+#[allow(dead_code)]
 mod scrypt_pow;
 mod tx;
 

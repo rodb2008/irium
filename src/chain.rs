@@ -829,6 +829,7 @@ impl ChainState {
         let expected_height = self.height;
         let previous = self.chain.last();
         self.validate_block_header(&block, expected_height, previous)?;
+        validate_poawx_coinbase(&block, expected_height)?;
 
         let reward = block_reward(expected_height);
         let (_fees, _coinbase_total, subsidy_created, undo) = self
@@ -1860,6 +1861,35 @@ impl ChainState {
 
         Ok(())
     }
+}
+
+fn validate_poawx_coinbase(block: &Block, height: u64) -> Result<(), String> {
+    let act_h = match std::env::var("IRIUM_POAWX_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    if !std::env::var("IRIUM_POAWX_MODE")
+        .map(|v| v.trim() == "active")
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
+        return Ok(());
+    }
+    if height < act_h {
+        return Ok(());
+    }
+    if !crate::poawx::block_has_irx1_commitment(block) {
+        return Err(format!(
+            "connect_block: poawx irx1 commitment missing at height {} (active from {})",
+            height, act_h
+        ));
+    }
+    Ok(())
 }
 
 fn is_coinbase(tx: &Transaction) -> bool {
@@ -5233,5 +5263,151 @@ mod tests {
         assert_eq!(mempool.len(), 0);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    fn chain_poawx_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn make_poawx_test_block(coinbase_script: Vec<u8>) -> Block {
+        use crate::block::BlockHeader;
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: [0u8; 32],
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    prev_txid: [0u8; 32],
+                    prev_index: 0xffff_ffff,
+                    script_sig: vec![0x01, 0x00],
+                    sequence: 0xffff_ffff,
+                }],
+                outputs: vec![
+                    TxOutput {
+                        value: 50_0000_0000,
+                        script_pubkey: vec![0x51],
+                    },
+                    TxOutput {
+                        value: 0,
+                        script_pubkey: coinbase_script,
+                    },
+                ],
+                locktime: 0,
+            }],
+            auxpow: None,
+        }
+    }
+
+    fn irx1_script_for_chain(root: [u8; 32]) -> Vec<u8> {
+        let mut s = vec![0x6a, 0x24u8];
+        s.extend_from_slice(b"irx1");
+        s.extend_from_slice(&root);
+        s
+    }
+
+    #[test]
+    fn test_validate_poawx_coinbase_no_activation_env_always_ok() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        let block = make_poawx_test_block(vec![0x51]);
+        assert!(validate_poawx_coinbase(&block, 100).is_ok());
+    }
+
+    #[test]
+    fn test_validate_poawx_coinbase_mode_inactive_always_ok() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        let block = make_poawx_test_block(vec![0x51]);
+        assert!(validate_poawx_coinbase(&block, 100).is_ok());
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn test_validate_poawx_coinbase_pre_activation_height_ok() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "100");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let block = make_poawx_test_block(vec![0x51]);
+        assert!(validate_poawx_coinbase(&block, 99).is_ok());
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn test_validate_poawx_coinbase_rejects_missing_commitment() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let block = make_poawx_test_block(vec![0x51]);
+        let result = validate_poawx_coinbase(&block, 10);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("irx1"), "error must mention irx1: {}", msg);
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn test_validate_poawx_coinbase_rejects_zero_root() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let script = irx1_script_for_chain([0u8; 32]);
+        let block = make_poawx_test_block(script);
+        let result = validate_poawx_coinbase(&block, 100);
+        assert!(result.is_err(), "zero irx1 root must be rejected");
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn test_validate_poawx_coinbase_accepts_valid_irx1() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let mut root = [0u8; 32];
+        root[0] = 0xca;
+        root[31] = 0xfe;
+        let script = irx1_script_for_chain(root);
+        let block = make_poawx_test_block(script);
+        assert!(validate_poawx_coinbase(&block, 100).is_ok());
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn test_validate_poawx_coinbase_mainnet_gate_skips_check() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        let block = make_poawx_test_block(vec![0x51]);
+        assert!(
+            validate_poawx_coinbase(&block, 100).is_ok(),
+            "mainnet must skip irx1 check"
+        );
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
     }
 }
