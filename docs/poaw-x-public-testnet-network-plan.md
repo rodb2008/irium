@@ -1,8 +1,8 @@
 # PoAW-X Public Testnet Network Plan
 
-**Status:** PILOT COMPLETE — VPS-2 simulation PASS, external miner package ready (Phase 11-E)
+**Status:** READY FOR REAL MINER — Phase 11-F validation in progress
 **Date:** 2026-06-12
-**Phase:** 11-E
+**Phase:** 11-F
 
 ---
 

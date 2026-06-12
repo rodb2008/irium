@@ -1,6 +1,6 @@
 # PoAW-X Prototype Plan
 
-**Last updated:** 2026-06-12 (Phase 11-E limited miner pilot COMPLETE)
+**Last updated:** 2026-06-12 (Phase 11-F real external miner validation READY)
 **Status:** Active development â€” testnet proven, public testnet pending
 
 ---
@@ -205,5 +205,7 @@ Miner
 | `docs/poaw-x-phase11d-firewall-p2p-preflight.md` | Phase 11-D preflight results |
 | `docs/poaw-x-phase11e-limited-miner-pilot.md` | Phase 11-E pilot results |
 | `docs/poaw-x-limited-miner-pilot-guide.md` | External miner connection guide |
+| `docs/poaw-x-real-miner-pilot-invite.md` | Phase 11-F real miner invite package |
+| `docs/poaw-x-phase11f-real-external-miner-validation.md` | Phase 11-F validation run record |
 | `docs/poaw-x-public-testnet-draft-runbook.md` | Operator runbook (draft) |
 | `docs/poaw-x-public-tester-miner-draft-guide.md` | Miner guide (draft) |

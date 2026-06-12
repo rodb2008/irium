@@ -1,8 +1,8 @@
 # PoAW-X Public Testnet Draft Runbook
 
-**Status:** DRAFT — Phase 11-E limited miner pilot COMPLETE. Ready for external participants.
+**Status:** DRAFT — Phase 11-F real external miner validation. Invite package ready.
 **Date:** 2026-06-12
-**Phase:** 11-E
+**Phase:** 11-F
 
 ---
 
