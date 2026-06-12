@@ -1523,6 +1523,10 @@ struct PoawxPendingReceipt {
     worker_pkh: String,
     solution: String,
     commitment_nonce: String,
+    #[serde(default)]
+    worker_pubkey: String,
+    #[serde(default)]
+    worker_sig: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1532,6 +1536,10 @@ struct PoawxReceiptRequest {
     worker_pkh: String,
     solution: String,
     commitment_nonce: String,
+    #[serde(default)]
+    worker_pubkey: String,
+    #[serde(default)]
+    worker_sig: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -13711,6 +13719,40 @@ fn prune_expired_poawx_receipts(receipts: &mut Vec<PoawxPendingReceipt>, tip_hei
     }
 }
 
+fn verify_worker_identity(
+    worker_pkh: &str,
+    worker_pubkey: &str,
+    worker_sig: &str,
+    solution_bytes: &[u8],
+    nonce_bytes: &[u8],
+    height: u64,
+) -> Result<(), &'static str> {
+    if worker_pubkey.is_empty() || worker_sig.is_empty() {
+        return Err("worker identity not bound: missing pubkey or sig");
+    }
+    let pubkey_bytes = hex::decode(worker_pubkey).map_err(|_| "worker_pubkey: invalid hex")?;
+    let verifying_key = VerifyingKey::from_sec1_bytes(&pubkey_bytes)
+        .map_err(|_| "worker_pubkey: invalid secp256k1 key")?;
+    let sha = Sha256::digest(&pubkey_bytes);
+    let rip = ripemd::Ripemd160::digest(sha);
+    let mut computed_pkh = [0u8; 20];
+    computed_pkh.copy_from_slice(&rip);
+    if hex::encode(computed_pkh) != worker_pkh {
+        return Err("worker_pkh does not match worker_pubkey");
+    }
+    let mut challenge_hasher = Sha256::new();
+    challenge_hasher.update(solution_bytes);
+    challenge_hasher.update(nonce_bytes);
+    challenge_hasher.update(&height.to_le_bytes());
+    let challenge: [u8; 32] = challenge_hasher.finalize().into();
+    let sig_bytes = hex::decode(worker_sig).map_err(|_| "worker_sig: invalid hex")?;
+    let parsed_sig =
+        Signature::from_slice(&sig_bytes).map_err(|_| "worker_sig: invalid signature bytes")?;
+    verifying_key
+        .verify_prehash(&challenge, &parsed_sig)
+        .map_err(|_| "worker identity signature verification failed")
+}
+
 async fn poawx_get_assignment(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -13824,6 +13866,21 @@ async fn poawx_post_receipt(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    if let Err(e) = verify_worker_identity(
+        &req.worker_pkh,
+        &req.worker_pubkey,
+        &req.worker_sig,
+        &solution_bytes,
+        &derived_nonce,
+        req.height,
+    ) {
+        eprintln!(
+            "[poawx] receipt rejected: identity ({}) height={} lane={} worker_pkh={}",
+            e, req.height, req.lane, req.worker_pkh
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     {
         let mut pow_input = Vec::with_capacity(32 + 32 + solution_bytes.len());
         pow_input.extend_from_slice(&derived_seed);
@@ -13846,6 +13903,8 @@ async fn poawx_post_receipt(
         worker_pkh: req.worker_pkh.clone(),
         solution: req.solution.clone(),
         commitment_nonce: req.commitment_nonce.clone(),
+        worker_pubkey: req.worker_pubkey.clone(),
+        worker_sig: req.worker_sig.clone(),
     };
     let tip_height = state
         .chain
@@ -13971,6 +14030,20 @@ async fn submit_block_extended(
                 return Err(StatusCode::BAD_REQUEST);
             }
             let sol = hex::decode(&r.solution).map_err(|_| StatusCode::BAD_REQUEST)?;
+            if let Err(e) = verify_worker_identity(
+                &r.worker_pkh,
+                &r.worker_pubkey,
+                &r.worker_sig,
+                &sol,
+                &sbe_nonce,
+                req.height,
+            ) {
+                eprintln!(
+                    "[submit_block_extended] reject: worker identity failed ({}) height={}",
+                    e, req.height
+                );
+                return Err(StatusCode::BAD_REQUEST);
+            }
             let mut pow_input = Vec::with_capacity(32 + 32 + sol.len());
             pow_input.extend_from_slice(&sbe_seed);
             pow_input.extend_from_slice(&sbe_nonce);
@@ -26459,6 +26532,8 @@ mod tests {
             worker_pkh: "ab".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         let req = SubmitBlockExtendedRequest {
             height: 1,
@@ -26561,6 +26636,8 @@ mod tests {
             worker_pkh: "ab".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         let req = SubmitBlockExtendedRequest {
             height: 1,
@@ -26603,6 +26680,8 @@ mod tests {
             worker_pkh: "ab".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         let result = poawx_post_receipt(
             ConnectInfo(test_socket()),
@@ -26635,6 +26714,8 @@ mod tests {
             worker_pkh: "ab".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         let req = SubmitBlockExtendedRequest {
             height: 1,
@@ -26675,6 +26756,8 @@ mod tests {
             worker_pkh: "ab".repeat(20),
             solution: "cd".repeat(32),
             commitment_nonce: "ef".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         save_poawx_pending_receipts(&[receipt.clone()]);
         let loaded = load_poawx_pending_receipts();
@@ -26750,6 +26833,8 @@ mod tests {
             worker_pkh: "00".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         save_poawx_pending_receipts(&[receipt]);
         let exists = tmp.exists();
@@ -26771,6 +26856,8 @@ mod tests {
             worker_pkh: "00".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         let json = serde_json::to_string(&vec![receipt]).unwrap();
         std::fs::write(&tmp, json).unwrap();
@@ -26798,6 +26885,8 @@ mod tests {
                 worker_pkh: "00".repeat(20),
                 solution: "00".repeat(32),
                 commitment_nonce: "00".repeat(32),
+                worker_pubkey: String::new(),
+                worker_sig: String::new(),
             })
             .collect();
         if receipts.len() > POAWX_MAX_PENDING_RECEIPTS {
@@ -26829,6 +26918,8 @@ mod tests {
             worker_pkh: "00".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         let mut receipts = vec![make_r(100), make_r(200)];
         save_poawx_pending_receipts(&receipts);
@@ -26859,6 +26950,8 @@ mod tests {
             worker_pkh: "00".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         }];
         prune_expired_poawx_receipts(&mut receipts, 100);
         assert_eq!(receipts.len(), 1, "fresh receipt at tip must be retained");
@@ -26872,6 +26965,8 @@ mod tests {
             worker_pkh: "00".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         }];
         let tip = 10 + POAWX_RECEIPT_MAX_AGE_BLOCKS + 1;
         prune_expired_poawx_receipts(&mut receipts, tip);
@@ -26889,6 +26984,8 @@ mod tests {
             worker_pkh: "00".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         let mut receipts = vec![make_r(50), make_r(80), make_r(100)];
         // tip=105: 50+24=74<105 stale, 80+24=104<105 stale, 100+24=124>=105 fresh
@@ -26905,6 +27002,8 @@ mod tests {
             worker_pkh: "00".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         }];
         prune_expired_poawx_receipts(&mut receipts, 50);
         assert_eq!(
@@ -26934,6 +27033,8 @@ mod tests {
             worker_pkh: "00".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         save_poawx_pending_receipts(&[stale]);
         let mut receipts = load_poawx_pending_receipts();
@@ -26961,6 +27062,8 @@ mod tests {
             worker_pkh: "00".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         let mut receipts = vec![make_r(1), make_r(500)];
         save_poawx_pending_receipts(&receipts);
@@ -26992,6 +27095,8 @@ mod tests {
             worker_pkh: "00".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         save_poawx_pending_receipts(&[receipt]);
         let loaded = load_poawx_pending_receipts();
@@ -27021,6 +27126,8 @@ mod tests {
             worker_pkh: "00".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         save_poawx_pending_receipts(&[receipt_on_disk]);
         let (state, _, _, _) = create_test_state(None);
@@ -27067,6 +27174,8 @@ mod tests {
             worker_pkh: "00".repeat(20),
             solution: "00".repeat(32),
             commitment_nonce: "00".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         };
         save_poawx_pending_receipts(&[receipt_on_disk.clone()]);
         let (state, _, _, _) = create_test_state(None);
@@ -27191,6 +27300,8 @@ mod tests {
             worker_pkh: "ab".repeat(20),
             solution: "cd".repeat(32),
             commitment_nonce: "ef".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         }];
         save_poawx_pending_receipts(&receipts);
         let loaded = load_poawx_pending_receipts();
@@ -27200,6 +27311,278 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_RECEIPTS_FILE");
         std::env::remove_var("IRIUM_NETWORK");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // --- Phase 12-G: Worker Identity Binding ---
+
+    fn make_test_worker_identity() -> (SigningKey, String, String) {
+        let secret_bytes = [0x42u8; 32];
+        let sk = SigningKey::from_bytes((&secret_bytes).into()).unwrap();
+        let vk = sk.verifying_key();
+        let pubkey_ep = vk.to_encoded_point(true);
+        let pubkey_bytes = pubkey_ep.as_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+        let sha = Sha256::digest(pubkey_bytes);
+        let rip = ripemd::Ripemd160::digest(sha);
+        let pkh_hex = hex::encode(&*rip);
+        (sk, pubkey_hex, pkh_hex)
+    }
+
+    fn sign_worker_challenge(
+        sk: &SigningKey,
+        solution_bytes: &[u8],
+        nonce_bytes: &[u8],
+        height: u64,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(solution_bytes);
+        hasher.update(nonce_bytes);
+        hasher.update(&height.to_le_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let sig: Signature = sk.sign_prehash(&digest).unwrap();
+        hex::encode(sig.to_bytes())
+    }
+
+    #[test]
+    fn test_verify_worker_identity_valid() {
+        let (sk, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let solution = b"deadbeef00000000";
+        let nonce = [0xabu8; 32];
+        let height = 42u64;
+        let sig_hex = sign_worker_challenge(&sk, solution, &nonce, height);
+        let result =
+            verify_worker_identity(&pkh_hex, &pubkey_hex, &sig_hex, solution, &nonce, height);
+        assert!(
+            result.is_ok(),
+            "valid binding must be accepted: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_verify_worker_identity_empty_fields_rejected() {
+        let result = verify_worker_identity(&"ab".repeat(20), "", "", b"solution", &[0u8; 32], 1);
+        assert!(result.is_err(), "empty worker_pubkey/sig must be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("missing"),
+            "error must mention missing: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_verify_worker_identity_spoofed_pkh_rejected() {
+        let (sk, pubkey_hex, _) = make_test_worker_identity();
+        let solution = b"somesolution";
+        let nonce = [0x01u8; 32];
+        let height = 10u64;
+        let sig_hex = sign_worker_challenge(&sk, solution, &nonce, height);
+        let wrong_pkh = "ff".repeat(20);
+        let result =
+            verify_worker_identity(&wrong_pkh, &pubkey_hex, &sig_hex, solution, &nonce, height);
+        assert!(result.is_err(), "spoofed pkh must be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("does not match"),
+            "error must mention mismatch: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_verify_worker_identity_bad_pubkey_hex() {
+        let result =
+            verify_worker_identity(&"ab".repeat(20), "NOTVALIDHEX!", "", b"sol", &[0u8; 32], 1);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("invalid hex") || msg.contains("missing"),
+            "expected hex or missing error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_verify_worker_identity_bad_sig_hex() {
+        let (_, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let result =
+            verify_worker_identity(&pkh_hex, &pubkey_hex, "NOTVALIDHEX!", b"sol", &[0u8; 32], 1);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("invalid") || msg.contains("mismatch"),
+            "expected invalid sig error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_verify_worker_identity_wrong_height() {
+        let (sk, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let solution = b"testsolution";
+        let nonce = [0xbbu8; 32];
+        let sig_hex = sign_worker_challenge(&sk, solution, &nonce, 100u64);
+        let result =
+            verify_worker_identity(&pkh_hex, &pubkey_hex, &sig_hex, solution, &nonce, 101u64);
+        assert!(result.is_err(), "sig at height 100 must fail at height 101");
+    }
+
+    #[test]
+    fn test_verify_worker_identity_wrong_solution() {
+        let (sk, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let real_solution = b"correct_solution_bytes_here";
+        let fake_solution = b"different_solution_content!!";
+        let nonce = [0xccu8; 32];
+        let height = 5u64;
+        let sig_hex = sign_worker_challenge(&sk, real_solution, &nonce, height);
+        let result = verify_worker_identity(
+            &pkh_hex,
+            &pubkey_hex,
+            &sig_hex,
+            fake_solution,
+            &nonce,
+            height,
+        );
+        assert!(
+            result.is_err(),
+            "sig for different solution must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_verify_worker_identity_truncated_sig_rejected() {
+        let (_, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let result =
+            verify_worker_identity(&pkh_hex, &pubkey_hex, "deadbeef", b"sol", &[0u8; 32], 1);
+        assert!(result.is_err(), "truncated sig must be rejected");
+    }
+
+    #[test]
+    fn test_poawx_12g_receipt_with_identity_fields_persists() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let tmp = std::env::temp_dir().join("irium_test_poawx_12g_persist.json");
+        let _ = std::fs::remove_file(&tmp);
+        std::env::set_var("IRIUM_POAWX_RECEIPTS_FILE", tmp.to_str().unwrap());
+        let receipt = PoawxPendingReceipt {
+            height: 77,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex.clone(),
+            solution: "ab".repeat(32),
+            commitment_nonce: "cd".repeat(32),
+            worker_pubkey: pubkey_hex.clone(),
+            worker_sig: "ef".repeat(64),
+        };
+        save_poawx_pending_receipts(&[receipt]);
+        let loaded = load_poawx_pending_receipts();
+        std::env::remove_var("IRIUM_POAWX_RECEIPTS_FILE");
+        std::env::remove_var("IRIUM_NETWORK");
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].worker_pubkey, pubkey_hex);
+        assert_eq!(loaded[0].worker_pkh, pkh_hex);
+        assert_eq!(loaded[0].worker_sig, "ef".repeat(64));
+    }
+
+    #[tokio::test]
+    async fn test_poawx_12g_mode_inactive_still_503() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let (state, _, _, _) = create_test_state(None);
+        let (_, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let req = PoawxReceiptRequest {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex,
+            solution: "aa".repeat(32),
+            commitment_nonce: "bb".repeat(32),
+            worker_pubkey: pubkey_hex,
+            worker_sig: "cc".repeat(64),
+        };
+        let result = poawx_post_receipt(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "inactive mode must still return 503 (O-2 guard)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poawx_12g_trivial_difficulty_still_503() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "2");
+        let (state, _, _, _) = create_test_state(None);
+        let (_, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let req = PoawxReceiptRequest {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex,
+            solution: "aa".repeat(32),
+            commitment_nonce: "bb".repeat(32),
+            worker_pubkey: pubkey_hex,
+            worker_sig: "cc".repeat(64),
+        };
+        let result = poawx_post_receipt(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "trivial difficulty must still return 503"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poawx_12g_mainnet_receipt_still_503() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        let (state, _, _, _) = create_test_state(None);
+        let (_, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let req = PoawxReceiptRequest {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex,
+            solution: "aa".repeat(32),
+            commitment_nonce: "bb".repeat(32),
+            worker_pubkey: pubkey_hex,
+            worker_sig: "cc".repeat(64),
+        };
+        let result = poawx_post_receipt(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "mainnet must still return 503 (O-2 guard)"
+        );
     }
 }
 
