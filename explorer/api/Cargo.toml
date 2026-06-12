@@ -1,0 +1,37 @@
+
+[package]
+name = "irium-explorer-api"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "irium-explorer-api"
+path = "src/main.rs"
+
+[dependencies]
+# Async
+tokio  = { version = "1", features = ["full"] }
+axum   = { version = "0.7", features = ["macros"] }
+tower  = { version = "0.5" }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# DB
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono"] }
+
+# Serialisation
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+# Rate limiting
+governor = "0.6"
+
+# Config / env
+dotenvy = "0.15"
+
+# Errors / tracing
+anyhow             = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
