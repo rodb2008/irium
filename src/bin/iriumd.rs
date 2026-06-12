@@ -13690,6 +13690,24 @@ fn save_poawx_pending_receipts(receipts: &[PoawxPendingReceipt]) {
     }
 }
 
+/// Receipts older than this many blocks behind the current tip are expired.
+const POAWX_RECEIPT_MAX_AGE_BLOCKS: u64 = 24;
+
+/// Removes receipts whose height is more than POAWX_RECEIPT_MAX_AGE_BLOCKS behind tip_height.
+/// Future-height receipts (height > tip_height) are always retained.
+/// Pure function: no I/O, no mainnet check required (callers ensure mainnet-safe data).
+fn prune_expired_poawx_receipts(receipts: &mut Vec<PoawxPendingReceipt>, tip_height: u64) {
+    let before = receipts.len();
+    receipts.retain(|r| r.height.saturating_add(POAWX_RECEIPT_MAX_AGE_BLOCKS) >= tip_height);
+    let pruned = before - receipts.len();
+    if pruned > 0 {
+        eprintln!(
+            "[poawx] pruned {} expired receipts (older than {} blocks) at tip_height={}",
+            pruned, POAWX_RECEIPT_MAX_AGE_BLOCKS, tip_height
+        );
+    }
+}
+
 async fn poawx_get_assignment(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -13826,6 +13844,11 @@ async fn poawx_post_receipt(
         solution: req.solution.clone(),
         commitment_nonce: req.commitment_nonce.clone(),
     };
+    let tip_height = state
+        .chain
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .tip_height();
     let (count, receipts_snapshot) = {
         let mut pending = state
             .poawx_pending_receipts
@@ -13843,6 +13866,7 @@ async fn poawx_post_receipt(
             );
             pending.drain(0..excess);
         }
+        prune_expired_poawx_receipts(&mut pending, tip_height);
         (pending.len(), pending.clone())
     };
     save_poawx_pending_receipts(&receipts_snapshot);
@@ -14082,10 +14106,12 @@ async fn submit_block_extended(
                 .unwrap_or_else(|e| e.into_inner());
             let before = pending.len();
             pending.retain(|r| r.height != committed_height);
+            let cleared = before - pending.len();
+            prune_expired_poawx_receipts(&mut pending, new_height);
             eprintln!(
                 "[poawx] block_extended accepted height={} cleared_receipts={} remaining={}",
                 new_height,
-                before - pending.len(),
+                cleared,
                 pending.len()
             );
             pending.clone()
@@ -16860,7 +16886,16 @@ async fn main() {
         resolvers_index: Arc::new(Mutex::new(load_all_resolvers_at_startup())),
         btc_template_headers_cache: Arc::new(Mutex::new(None)),
         ltc_template_headers_cache: Arc::new(Mutex::new(None)),
-        poawx_pending_receipts: Arc::new(Mutex::new(load_poawx_pending_receipts())),
+        poawx_pending_receipts: Arc::new(Mutex::new({
+            let mut receipts = load_poawx_pending_receipts();
+            let tip = shared_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .tip_height();
+            prune_expired_poawx_receipts(&mut receipts, tip);
+            save_poawx_pending_receipts(&receipts);
+            receipts
+        })),
     };
 
     // Spawn the in-process header-sync background tasks. Each one no-ops
@@ -26808,6 +26843,255 @@ mod tests {
         assert_eq!(
             loaded[0].height, 200,
             "only uncommitted receipt must survive"
+        );
+    }
+
+    // --- Phase 12-E: Receipt Expiry & Lifecycle Cleanup ---
+
+    #[test]
+    fn test_poawx_fresh_receipt_retained() {
+        let mut receipts = vec![PoawxPendingReceipt {
+            height: 100,
+            lane: "cpu".to_string(),
+            worker_pkh: "00".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        }];
+        prune_expired_poawx_receipts(&mut receipts, 100);
+        assert_eq!(receipts.len(), 1, "fresh receipt at tip must be retained");
+    }
+
+    #[test]
+    fn test_poawx_stale_receipt_pruned() {
+        let mut receipts = vec![PoawxPendingReceipt {
+            height: 10,
+            lane: "cpu".to_string(),
+            worker_pkh: "00".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        }];
+        let tip = 10 + POAWX_RECEIPT_MAX_AGE_BLOCKS + 1;
+        prune_expired_poawx_receipts(&mut receipts, tip);
+        assert!(
+            receipts.is_empty(),
+            "receipt older than max age must be pruned"
+        );
+    }
+
+    #[test]
+    fn test_poawx_mixed_receipts_leaves_only_fresh() {
+        let make_r = |h: u64| PoawxPendingReceipt {
+            height: h,
+            lane: "cpu".to_string(),
+            worker_pkh: "00".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        };
+        let mut receipts = vec![make_r(50), make_r(80), make_r(100)];
+        // tip=105: 50+24=74<105 stale, 80+24=104<105 stale, 100+24=124>=105 fresh
+        prune_expired_poawx_receipts(&mut receipts, 105);
+        assert_eq!(receipts.len(), 1, "only fresh receipt must remain");
+        assert_eq!(receipts[0].height, 100);
+    }
+
+    #[test]
+    fn test_poawx_future_height_receipt_retained() {
+        let mut receipts = vec![PoawxPendingReceipt {
+            height: 200,
+            lane: "cpu".to_string(),
+            worker_pkh: "00".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        }];
+        prune_expired_poawx_receipts(&mut receipts, 50);
+        assert_eq!(
+            receipts.len(),
+            1,
+            "future-height receipt must never be pruned"
+        );
+    }
+
+    #[test]
+    fn test_poawx_prune_empty_list_safe() {
+        let mut receipts: Vec<PoawxPendingReceipt> = Vec::new();
+        prune_expired_poawx_receipts(&mut receipts, 9999);
+        assert!(receipts.is_empty(), "pruning empty list must not panic");
+    }
+
+    #[test]
+    fn test_poawx_startup_prune_stale_persisted() {
+        let _env_guard = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let tmp = std::env::temp_dir().join("irium_test_poawx_e6.json");
+        let _ = std::fs::remove_file(&tmp);
+        std::env::set_var("IRIUM_POAWX_RECEIPTS_FILE", tmp.to_str().unwrap());
+        let stale = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: "00".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        };
+        save_poawx_pending_receipts(&[stale]);
+        let mut receipts = load_poawx_pending_receipts();
+        let simulated_tip = 1 + POAWX_RECEIPT_MAX_AGE_BLOCKS + 1;
+        prune_expired_poawx_receipts(&mut receipts, simulated_tip);
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_RECEIPTS_FILE");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            receipts.is_empty(),
+            "startup must prune stale persisted receipts"
+        );
+    }
+
+    #[test]
+    fn test_poawx_save_after_prune_updates_file() {
+        let _env_guard = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let tmp = std::env::temp_dir().join("irium_test_poawx_e7.json");
+        let _ = std::fs::remove_file(&tmp);
+        std::env::set_var("IRIUM_POAWX_RECEIPTS_FILE", tmp.to_str().unwrap());
+        let make_r = |h: u64| PoawxPendingReceipt {
+            height: h,
+            lane: "cpu".to_string(),
+            worker_pkh: "00".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        };
+        let mut receipts = vec![make_r(1), make_r(500)];
+        save_poawx_pending_receipts(&receipts);
+        let tip = 1 + POAWX_RECEIPT_MAX_AGE_BLOCKS + 1;
+        prune_expired_poawx_receipts(&mut receipts, tip);
+        save_poawx_pending_receipts(&receipts);
+        let reloaded = load_poawx_pending_receipts();
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_RECEIPTS_FILE");
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            reloaded.len(),
+            1,
+            "file must contain only fresh receipt after save-after-prune"
+        );
+        assert_eq!(reloaded[0].height, 500);
+    }
+
+    #[test]
+    fn test_poawx_mainnet_ignores_persistence_and_pruning() {
+        let _env_guard = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRIUM_NETWORK");
+        let tmp = std::env::temp_dir().join("irium_test_poawx_e8.json");
+        let _ = std::fs::remove_file(&tmp);
+        std::env::set_var("IRIUM_POAWX_RECEIPTS_FILE", tmp.to_str().unwrap());
+        let receipt = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: "00".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        };
+        save_poawx_pending_receipts(&[receipt]);
+        let loaded = load_poawx_pending_receipts();
+        let mut v = loaded.clone();
+        prune_expired_poawx_receipts(&mut v, 9999);
+        std::env::remove_var("IRIUM_POAWX_RECEIPTS_FILE");
+        assert!(!tmp.exists(), "mainnet must not write any receipt file");
+        assert!(loaded.is_empty(), "mainnet must not load any receipts");
+        assert!(
+            v.is_empty(),
+            "mainnet prune on empty Vec must be safe no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poawx_12e_c3_gate_still_fires_with_receipt_file() {
+        let _env_guard = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        let tmp = std::env::temp_dir().join("irium_test_poawx_e9.json");
+        let _ = std::fs::remove_file(&tmp);
+        std::env::set_var("IRIUM_POAWX_RECEIPTS_FILE", tmp.to_str().unwrap());
+        let receipt_on_disk = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: "00".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        };
+        save_poawx_pending_receipts(&[receipt_on_disk]);
+        let (state, _, _, _) = create_test_state(None);
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![],
+            poawx_receipts_root: "00".repeat(32),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_POAWX_RECEIPTS_FILE");
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::BAD_REQUEST,
+            "C-3 gate must reject empty receipts even when receipt file exists on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poawx_12e_difficulty_check_still_fires_with_receipt_file() {
+        let _env_guard = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "2");
+        let tmp = std::env::temp_dir().join("irium_test_poawx_e10.json");
+        let _ = std::fs::remove_file(&tmp);
+        std::env::set_var("IRIUM_POAWX_RECEIPTS_FILE", tmp.to_str().unwrap());
+        let receipt_on_disk = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: "00".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        };
+        save_poawx_pending_receipts(&[receipt_on_disk.clone()]);
+        let (state, _, _, _) = create_test_state(None);
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![receipt_on_disk],
+            poawx_receipts_root: "aa".repeat(32),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        std::env::remove_var("IRIUM_POAWX_RECEIPTS_FILE");
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "difficulty check must still reject trivial difficulty even when receipt file exists"
         );
     }
 }
