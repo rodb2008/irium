@@ -10945,10 +10945,12 @@ impl DisputeEvidence {
         }
         match self.evidence_type.as_str() {
             "payment_proof" | "delivery_proof" | "communication_proof" => {}
-            other => return Err(format!(
+            other => {
+                return Err(format!(
                 "evidence_type must be payment_proof|delivery_proof|communication_proof (got {})",
                 other
-            )),
+            ))
+            }
         }
         if self.evidence_payload.is_empty() {
             return Err("evidence_payload required".to_string());

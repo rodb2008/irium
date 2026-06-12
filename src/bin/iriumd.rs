@@ -13584,6 +13584,49 @@ fn compute_poawx_receipts_root(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
     outer.finalize().into()
 }
 
+const POAWX_DEFAULT_DIFFICULTY_BITS: u32 = 8;
+const POAWX_MIN_ACTIVE_DIFFICULTY_BITS: u32 = 4;
+const POAWX_MAX_DIFFICULTY_BITS: u32 = 24;
+
+/// Returns the configured PoAW-X puzzle difficulty in leading-zero bits.
+/// Reads IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS.
+///   Not set        -> POAWX_DEFAULT_DIFFICULTY_BITS (8)
+///   Invalid string -> 0  (fail-closed: active-mode callers will reject)
+///   > MAX          -> capped at POAWX_MAX_DIFFICULTY_BITS (24)
+fn poawx_puzzle_difficulty_bits() -> u32 {
+    match std::env::var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        None => POAWX_DEFAULT_DIFFICULTY_BITS,
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) => n.min(POAWX_MAX_DIFFICULTY_BITS),
+            Err(_) => {
+                eprintln!(
+                    "[poawx] IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS invalid: {:?}; failing closed",
+                    v
+                );
+                0
+            }
+        },
+    }
+}
+
+/// Counts leading zero bits in a 32-byte hash.
+fn count_leading_zero_bits(hash: &[u8; 32]) -> u32 {
+    let mut bits = 0u32;
+    for &b in hash.iter() {
+        let z = b.leading_zeros();
+        bits += z;
+        if z < 8 {
+            break;
+        }
+    }
+    bits
+}
+
 async fn poawx_get_assignment(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -13630,7 +13673,7 @@ async fn poawx_get_assignment(
         "height": height,
         "seed": hex::encode(seed),
         "commitment_nonce": hex::encode(commitment_nonce),
-        "puzzle_difficulty": 1u64,
+        "puzzle_difficulty": poawx_puzzle_difficulty_bits() as u64,
         "lane": "cpu",
         "pow_bits": format!("{:08x}", bits),
     })))
@@ -13648,6 +13691,14 @@ async fn poawx_post_receipt(
         .unwrap_or(false);
     let is_non_mainnet = network_kind_from_env() != NetworkKind::Mainnet;
     if !is_active || !is_non_mainnet {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let difficulty = poawx_puzzle_difficulty_bits();
+    if difficulty < POAWX_MIN_ACTIVE_DIFFICULTY_BITS {
+        eprintln!(
+            "[poawx] puzzle difficulty {} bits below minimum {}; failing closed",
+            difficulty, POAWX_MIN_ACTIVE_DIFFICULTY_BITS
+        );
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let solution_bytes = hex::decode(&req.solution).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -13695,22 +13746,11 @@ async fn poawx_post_receipt(
         pow_input.extend_from_slice(&derived_nonce);
         pow_input.extend_from_slice(&solution_bytes);
         let pow_hash = sha256d(&pow_input);
-        let leading: u32 = {
-            let mut bits = 0u32;
-            for &b in pow_hash.iter() {
-                let z = b.leading_zeros();
-                bits += z;
-                if z < 8 {
-                    break;
-                }
-            }
-            bits
-        };
-        const PUZZLE_DIFFICULTY: u32 = 1;
-        if leading < PUZZLE_DIFFICULTY {
+        let leading = count_leading_zero_bits(&pow_hash);
+        if leading < difficulty {
             eprintln!(
                 "[poawx] receipt rejected: insufficient PoW leading_zeros={} required={} height={} lane={} worker_pkh={}",
-                leading, PUZZLE_DIFFICULTY, req.height, req.lane, req.worker_pkh
+                leading, difficulty, req.height, req.lane, req.worker_pkh
             );
             return Err(StatusCode::BAD_REQUEST);
         }
@@ -13768,6 +13808,14 @@ async fn submit_block_extended(
             );
             return Err(StatusCode::BAD_REQUEST);
         }
+    }
+    let difficulty = poawx_puzzle_difficulty_bits();
+    if !req.poawx_receipts.is_empty() && difficulty < POAWX_MIN_ACTIVE_DIFFICULTY_BITS {
+        eprintln!(
+            "[submit_block_extended] puzzle difficulty {} bits below minimum {}; failing closed",
+            difficulty, POAWX_MIN_ACTIVE_DIFFICULTY_BITS
+        );
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let expected_root = if req.poawx_receipts.is_empty() {
         [0u8; 32]
@@ -13829,21 +13877,11 @@ async fn submit_block_extended(
             pow_input.extend_from_slice(&sbe_nonce);
             pow_input.extend_from_slice(&sol);
             let pow_hash = sha256d(&pow_input);
-            let leading: u32 = {
-                let mut bits = 0u32;
-                for &b in pow_hash.iter() {
-                    let z = b.leading_zeros();
-                    bits += z;
-                    if z < 8 {
-                        break;
-                    }
-                }
-                bits
-            };
-            if leading < 1 {
+            let leading = count_leading_zero_bits(&pow_hash);
+            if leading < difficulty {
                 eprintln!(
-                    "[submit_block_extended] reject: puzzle PoW insufficient leading_zeros={} height={}",
-                    leading, req.height
+                    "[submit_block_extended] reject: puzzle PoW insufficient leading_zeros={} required={} height={}",
+                    leading, difficulty, req.height
                 );
                 return Err(StatusCode::BAD_REQUEST);
             }
@@ -26328,6 +26366,183 @@ mod tests {
             result.unwrap_err(),
             StatusCode::SERVICE_UNAVAILABLE,
             "SBE must return 503 when poawx receipts submitted on mainnet"
+        );
+    }
+
+    // ---- Phase 12-C: puzzle difficulty configuration tests ----
+
+    /// Default difficulty (no env var) must be sane: >= MIN_ACTIVE and > 1.
+    #[test]
+    fn test_poawx_difficulty_default_is_sane() {
+        let _guard = poawx_env_lock().lock().unwrap();
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        let d = poawx_puzzle_difficulty_bits();
+        assert!(
+            d >= POAWX_MIN_ACTIVE_DIFFICULTY_BITS,
+            "default difficulty {} must be >= MIN_ACTIVE {}",
+            d,
+            POAWX_MIN_ACTIVE_DIFFICULTY_BITS
+        );
+        assert!(d > 1, "default difficulty {} must be greater than 1", d);
+    }
+
+    /// Valid env value is parsed and returned unchanged (if within MAX).
+    #[test]
+    fn test_poawx_difficulty_env_parsed() {
+        let _guard = poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "10");
+        let d = poawx_puzzle_difficulty_bits();
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert_eq!(d, 10, "difficulty must equal the parsed env value");
+    }
+
+    /// Invalid (non-numeric) env value fails closed: returns 0.
+    #[test]
+    fn test_poawx_difficulty_invalid_fails_closed() {
+        let _guard = poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "notanumber");
+        let d = poawx_puzzle_difficulty_bits();
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert_eq!(d, 0, "invalid env value must fail closed (return 0)");
+    }
+
+    /// Value above MAX is capped at POAWX_MAX_DIFFICULTY_BITS.
+    #[test]
+    fn test_poawx_difficulty_too_high_is_capped() {
+        let _guard = poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "9999");
+        let d = poawx_puzzle_difficulty_bits();
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert_eq!(
+            d, POAWX_MAX_DIFFICULTY_BITS,
+            "difficulty above MAX must be capped to {}",
+            POAWX_MAX_DIFFICULTY_BITS
+        );
+    }
+
+    /// Value below MIN_ACTIVE is returned as-is; callers enforce the minimum.
+    #[test]
+    fn test_poawx_difficulty_below_min_returned_raw() {
+        let _guard = poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "2");
+        let d = poawx_puzzle_difficulty_bits();
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert_eq!(d, 2, "value below MIN_ACTIVE returned as-is");
+        assert!(d < POAWX_MIN_ACTIVE_DIFFICULTY_BITS);
+    }
+
+    /// SBE returns 503 when difficulty is below minimum while mode=active (testnet).
+    /// The difficulty check fires before the chain-height check so no populated chain is needed.
+    #[tokio::test]
+    async fn test_sbe_rejects_trivial_difficulty_when_active() {
+        let _env_guard = poawx_env_lock().lock().unwrap();
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "2");
+        let (state, _, _, _) = create_test_state(None);
+        let fake_receipt = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: "ab".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        };
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![fake_receipt],
+            poawx_receipts_root: "aa".repeat(32),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SBE must return 503 when difficulty below minimum on active testnet"
+        );
+    }
+
+    /// post_receipt returns 503 when difficulty is below minimum while mode=active (testnet).
+    #[tokio::test]
+    async fn test_poawx_receipt_rejects_trivial_difficulty() {
+        let _env_guard = poawx_env_lock().lock().unwrap();
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "2");
+        let (state, _, _, _) = create_test_state(None);
+        let req = PoawxReceiptRequest {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: "ab".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        };
+        let result = poawx_post_receipt(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "post_receipt must return 503 when difficulty below minimum on active testnet"
+        );
+    }
+
+    /// Mainnet returns 503 for poawx receipts regardless of difficulty setting (O-2 fires first).
+    #[tokio::test]
+    async fn test_poawx_mainnet_ignores_difficulty_setting() {
+        let _env_guard = poawx_env_lock().lock().unwrap();
+        ensure_rpc_token_env();
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "4");
+        let (state, _, _, _) = create_test_state(None);
+        let fake_receipt = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: "ab".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        };
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![fake_receipt],
+            poawx_receipts_root: "aa".repeat(32),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SBE must return 503 on mainnet regardless of difficulty setting (O-2)"
         );
     }
 }
