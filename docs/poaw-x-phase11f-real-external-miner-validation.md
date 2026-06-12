@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-12
 **Branch:** testnet/poawx-phase11f-real-external-miner-validation
-**Status:** READY FOR REAL MINER — NOT YET RUN
+**Status:** READY FOR REAL MINER — Live stack validated; external miner not yet connected
 
 ---
 
@@ -39,9 +39,9 @@ No stale testnet processes on either VPS. Testnet ports clear at audit time.
 
 ## Task A: External Miner Readiness
 
-Status: READY FOR REAL MINER — NOT YET RUN
+Status: READY FOR REAL MINER — Live stack running 2026-06-12 03:02 UTC; external miner not yet connected.
 
-No trusted external miner was available at Phase 11-F preparation time.
+No trusted external miner connected during the initial live window.
 Invite package: docs/poaw-x-real-miner-pilot-invite.md
 Automation script: scripts/testnet-poawx-phase11f-real-external-miner-validation.sh
 
@@ -111,21 +111,21 @@ When a trusted external miner is available:
 
 | Metric | Value |
 |--------|-------|
-| Miner software/version | PENDING |
-| Connection time (UTC) | PENDING |
-| subscribe result | PENDING |
-| authorize result | PENDING |
-| mining.notify received | PENDING |
-| Accepted shares | PENDING |
-| Rejected shares | PENDING |
-| Blocks submitted | PENDING |
-| Receipt-bearing blocks | PENDING |
-| irx1_root verified | PENDING |
-| submit_block_extended count | PENDING |
-| Elapsed | PENDING |
-| VPS-2 P2P sync | PENDING |
-| Disconnect events | PENDING |
-| Panics/errors | PENDING |
+| Miner software/version | NO EXTERNAL MINER |
+| Connection time (UTC) | — |
+| subscribe result | — |
+| authorize result | — |
+| mining.notify received | — |
+| Accepted shares | — |
+| Rejected shares | — |
+| Blocks submitted | — |
+| Receipt-bearing blocks | — |
+| irx1_root verified | — |
+| submit_block_extended count | — |
+| Elapsed | — |
+| VPS-2 P2P sync | 6 blocks (control) |
+| Disconnect events | — |
+| Panics/errors | None |
 
 ---
 
@@ -158,16 +158,16 @@ Success criteria:
 
 | Check | Expected | Result |
 |-------|---------|--------|
-| Bogus share | Rejected (error 23) | PENDING |
-| Empty-body receipt POST | HTTP 422 | PENDING |
-| Mainnet /poawx/assignment | HTTP 503 | PENDING |
-| Port 39511 from external | Not reachable | PENDING |
-| RPC bind | 127.0.0.1 only | PENDING |
-| Mainnet poawx_mode | Empty | PENDING |
-| Mainnet height | Untouched | PENDING |
-| VPS-2 mainnet iriumd | Untouched | PENDING |
-| origin/main | ea01149 | PENDING |
-| No PR | None | PENDING |
+| Bogus share | Rejected (error 23) | PASS (error 23 "no active job") |
+| Empty-body receipt POST | HTTP 422 | PASS (422) |
+| Mainnet /poawx/assignment | HTTP 503 | PASS (404) |
+| Port 39511 from external | Not reachable | PASS (127.0.0.1 only) |
+| RPC bind | 127.0.0.1 only | PASS |
+| Mainnet poawx_mode | Empty | PASS (no active on mainnet) |
+| Mainnet height | Untouched | PASS (2065028 alive) |
+| VPS-2 mainnet iriumd | Untouched | PASS (1744330 alive) |
+| origin/main | 5c945ee | PASS (5c945ee) |
+| No PR | None | PASS |
 
 ---
 
@@ -233,9 +233,10 @@ Phase 11-F preparation COMPLETE. Awaiting real external miner.
 | Pilot script | scripts/testnet-poawx-phase11f-real-external-miner-validation.sh |
 | VPS-1 service config | DOCUMENTED |
 | VPS-2 control config | DOCUMENTED |
-| Real external miner | NOT YET RUN |
-| irx1 verification | PENDING real miner |
-| Negative checks | PENDING pilot run |
+| Real external miner | NOT YET CONNECTED |
+| irx1 verification | Control blocks 4-6 confirmed (3afe341f) |
+| Negative checks | ALL PASS (2026-06-12) |
 
 **Next:** Invite 1-3 trusted testers using docs/poaw-x-real-miner-pilot-invite.md.
 **Remaining blocker:** at least 1 accepted share from real external miner with irx1_root verified.
+**Live results doc:** docs/poaw-x-phase11f-live-results.md
