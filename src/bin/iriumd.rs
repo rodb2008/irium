@@ -13703,6 +13703,9 @@ fn save_poawx_pending_receipts(receipts: &[PoawxPendingReceipt]) {
 
 /// Receipts older than this many blocks behind the current tip are expired.
 const POAWX_RECEIPT_MAX_AGE_BLOCKS: u64 = 24;
+/// Worker reward share as permille (1/1000) of the block subsidy per receipt.
+/// With value 100, each worker earns 10% per receipt they have validated.
+const POAWX_WORKER_REWARD_PERMILLE: u32 = 100;
 
 /// Removes receipts whose height is more than POAWX_RECEIPT_MAX_AGE_BLOCKS behind tip_height.
 /// Future-height receipts (height > tip_height) are always retained.
@@ -13717,6 +13720,50 @@ fn prune_expired_poawx_receipts(receipts: &mut Vec<PoawxPendingReceipt>, tip_hei
             pruned, POAWX_RECEIPT_MAX_AGE_BLOCKS, tip_height
         );
     }
+}
+
+fn poawx_worker_due(base_reward: u64) -> u64 {
+    base_reward * POAWX_WORKER_REWARD_PERMILLE as u64 / 1000
+}
+
+fn poawx_validate_reward_split(
+    coinbase: &Transaction,
+    receipts: &[PoawxPendingReceipt],
+    height: u64,
+) -> Result<(), String> {
+    if receipts.is_empty() {
+        return Ok(());
+    }
+    let base_reward = block_reward(height);
+    let worker_due = poawx_worker_due(base_reward);
+    let mut worker_counts: std::collections::HashMap<String, u64> = Default::default();
+    for r in receipts {
+        *worker_counts.entry(r.worker_pkh.clone()).or_insert(0) += 1;
+    }
+    for (pkh_hex, count) in &worker_counts {
+        let pkh_bytes =
+            hex::decode(pkh_hex).map_err(|_| format!("invalid worker_pkh hex: {}", pkh_hex))?;
+        if pkh_bytes.len() != 20 {
+            return Err(format!("worker_pkh wrong length for: {}", pkh_hex));
+        }
+        let mut pkh_arr = [0u8; 20];
+        pkh_arr.copy_from_slice(&pkh_bytes);
+        let expected_script = p2pkh_script(&pkh_arr);
+        let total_paid: u64 = coinbase
+            .outputs
+            .iter()
+            .filter(|out| out.script_pubkey == expected_script)
+            .map(|out| out.value)
+            .sum();
+        let required = worker_due.saturating_mul(*count);
+        if total_paid < required {
+            return Err(format!(
+                "worker {} payout {} < required {} ({} receipt(s) * {} each)",
+                pkh_hex, total_paid, required, count, worker_due
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verify_worker_identity(
@@ -14131,6 +14178,10 @@ async fn submit_block_extended(
             );
             return Err(StatusCode::BAD_REQUEST);
         }
+        poawx_validate_reward_split(coinbase, &req.poawx_receipts, req.height).map_err(|e| {
+            eprintln!("[submit_block_extended] reject: reward split: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
     }
     let block = Block {
         header: block_header,
@@ -27582,6 +27633,254 @@ mod tests {
             result.unwrap_err(),
             StatusCode::SERVICE_UNAVAILABLE,
             "mainnet must still return 503 (O-2 guard)"
+        );
+    }
+
+    // ── Phase 12-H: Reward Split Enforcement ──────────────────────────────────
+
+    fn make_coinbase(outputs: Vec<TxOutput>) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0u8; 32],
+                prev_index: 0xffff_ffff,
+                script_sig: vec![0x01, 0x00],
+                sequence: 0xffff_ffff,
+            }],
+            outputs,
+            locktime: 0,
+        }
+    }
+
+    fn pkh_arr(byte: u8) -> [u8; 20] {
+        [byte; 20]
+    }
+
+    fn receipts_for(pkh_hex: &str, count: usize) -> Vec<PoawxPendingReceipt> {
+        (0..count)
+            .map(|_| PoawxPendingReceipt {
+                height: 1,
+                lane: "cpu".to_string(),
+                worker_pkh: pkh_hex.to_string(),
+                solution: "aa".repeat(32),
+                commitment_nonce: "bb".repeat(32),
+                worker_pubkey: String::new(),
+                worker_sig: String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_poawx_worker_due_calculation() {
+        assert_eq!(poawx_worker_due(5_000_000_000), 500_000_000);
+        assert_eq!(poawx_worker_due(2_500_000_000), 250_000_000);
+        assert_eq!(poawx_worker_due(0), 0);
+    }
+
+    #[test]
+    fn test_poawx_validate_reward_split_empty_receipts_ok() {
+        let coinbase = make_coinbase(vec![]);
+        assert!(
+            poawx_validate_reward_split(&coinbase, &[], 1).is_ok(),
+            "empty receipts must not require any payment"
+        );
+    }
+
+    #[test]
+    fn test_poawx_validate_reward_split_valid_payout() {
+        let arr = pkh_arr(0xab);
+        let script = p2pkh_script(&arr);
+        let due = poawx_worker_due(block_reward(1));
+        let coinbase = make_coinbase(vec![TxOutput {
+            value: due,
+            script_pubkey: script,
+        }]);
+        let receipts = receipts_for(&hex::encode(arr), 1);
+        assert!(
+            poawx_validate_reward_split(&coinbase, &receipts, 1).is_ok(),
+            "exact required payment must pass"
+        );
+    }
+
+    #[test]
+    fn test_poawx_validate_reward_split_underpaid() {
+        let arr = pkh_arr(0xab);
+        let script = p2pkh_script(&arr);
+        let due = poawx_worker_due(block_reward(1));
+        let coinbase = make_coinbase(vec![TxOutput {
+            value: due - 1,
+            script_pubkey: script,
+        }]);
+        let receipts = receipts_for(&hex::encode(arr), 1);
+        let err = poawx_validate_reward_split(&coinbase, &receipts, 1).unwrap_err();
+        assert!(
+            err.contains("payout"),
+            "error must reference payout: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_poawx_validate_reward_split_missing_output() {
+        let worker = pkh_arr(0xab);
+        let other = pkh_arr(0xcd);
+        let due = poawx_worker_due(block_reward(1));
+        let coinbase = make_coinbase(vec![TxOutput {
+            value: due,
+            script_pubkey: p2pkh_script(&other),
+        }]);
+        let receipts = receipts_for(&hex::encode(worker), 1);
+        assert!(
+            poawx_validate_reward_split(&coinbase, &receipts, 1).is_err(),
+            "worker with no matching output must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_poawx_validate_reward_split_wrong_script_type() {
+        let arr = pkh_arr(0xab);
+        let coinbase = make_coinbase(vec![TxOutput {
+            value: 9_999_999_999,
+            script_pubkey: vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef],
+        }]);
+        let receipts = receipts_for(&hex::encode(arr), 1);
+        assert!(
+            poawx_validate_reward_split(&coinbase, &receipts, 1).is_err(),
+            "OP_RETURN-only coinbase must be rejected for worker payout"
+        );
+    }
+
+    #[test]
+    fn test_poawx_validate_reward_split_multiple_workers_both_paid() {
+        let arr_a = pkh_arr(0xaa);
+        let arr_b = pkh_arr(0xbb);
+        let due = poawx_worker_due(block_reward(1));
+        let coinbase = make_coinbase(vec![
+            TxOutput {
+                value: due,
+                script_pubkey: p2pkh_script(&arr_a),
+            },
+            TxOutput {
+                value: due,
+                script_pubkey: p2pkh_script(&arr_b),
+            },
+        ]);
+        let mut receipts = receipts_for(&hex::encode(arr_a), 1);
+        receipts.extend(receipts_for(&hex::encode(arr_b), 1));
+        assert!(
+            poawx_validate_reward_split(&coinbase, &receipts, 1).is_ok(),
+            "both workers paid correctly must pass"
+        );
+    }
+
+    #[test]
+    fn test_poawx_validate_reward_split_multiple_workers_one_missing() {
+        let arr_a = pkh_arr(0xaa);
+        let arr_b = pkh_arr(0xbb);
+        let due = poawx_worker_due(block_reward(1));
+        let coinbase = make_coinbase(vec![TxOutput {
+            value: due,
+            script_pubkey: p2pkh_script(&arr_a),
+        }]);
+        let mut receipts = receipts_for(&hex::encode(arr_a), 1);
+        receipts.extend(receipts_for(&hex::encode(arr_b), 1));
+        assert!(
+            poawx_validate_reward_split(&coinbase, &receipts, 1).is_err(),
+            "missing second worker payout must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_poawx_validate_reward_split_multi_receipts_same_worker_paid() {
+        let arr = pkh_arr(0xab);
+        let due = poawx_worker_due(block_reward(1));
+        let coinbase = make_coinbase(vec![TxOutput {
+            value: due * 2,
+            script_pubkey: p2pkh_script(&arr),
+        }]);
+        let receipts = receipts_for(&hex::encode(arr), 2);
+        assert!(
+            poawx_validate_reward_split(&coinbase, &receipts, 2).is_ok(),
+            "double-receipt double-pay must pass"
+        );
+    }
+
+    #[test]
+    fn test_poawx_validate_reward_split_multi_receipts_same_worker_underpaid() {
+        let arr = pkh_arr(0xab);
+        let due = poawx_worker_due(block_reward(1));
+        let coinbase = make_coinbase(vec![TxOutput {
+            value: due,
+            script_pubkey: p2pkh_script(&arr),
+        }]);
+        let receipts = receipts_for(&hex::encode(arr), 2);
+        assert!(
+            poawx_validate_reward_split(&coinbase, &receipts, 2).is_err(),
+            "double-receipt single-pay must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poawx_12h_mainnet_still_503() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        let (state, _, _, _) = create_test_state(None);
+        let (_, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let req = PoawxReceiptRequest {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex,
+            solution: "aa".repeat(32),
+            commitment_nonce: "bb".repeat(32),
+            worker_pubkey: pubkey_hex,
+            worker_sig: "cc".repeat(64),
+        };
+        let result = poawx_post_receipt(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "12-H: mainnet must still return 503 (O-2 guard)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poawx_12h_inactive_mode_still_503() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        let (state, _, _, _) = create_test_state(None);
+        let (_, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let req = PoawxReceiptRequest {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex,
+            solution: "aa".repeat(32),
+            commitment_nonce: "bb".repeat(32),
+            worker_pubkey: pubkey_hex,
+            worker_sig: "cc".repeat(64),
+        };
+        let result = poawx_post_receipt(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "12-H: inactive mode must still return 503"
         );
     }
 }
