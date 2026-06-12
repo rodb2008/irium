@@ -26,11 +26,15 @@ pub async fn index_block(pool: &PgPool, block: &RpcBlock) -> Result<()> {
         .map(|(_, t)| t.outputs.iter().map(|o| o.value).sum())
         .unwrap_or(0);
 
+    let coinbase_tag: Option<String> = parsed_txs.get(0)
+        .and_then(|(_, t)| t.inputs.first())
+        .and_then(|inp| extract_coinbase_tag(&inp.script_sig));
+
     // Upsert block
     sqlx::query(
         "INSERT INTO blocks \
-         (height,hash,prev_hash,merkle_root,timestamp,difficulty,nonce,tx_count,total_reward,miner_address,size_bytes) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+         (height,hash,prev_hash,merkle_root,timestamp,difficulty,nonce,tx_count,total_reward,miner_address,size_bytes,coinbase_tag) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
          ON CONFLICT (height) DO NOTHING"
     )
     .bind(block.height)
@@ -44,6 +48,7 @@ pub async fn index_block(pool: &PgPool, block: &RpcBlock) -> Result<()> {
     .bind(total_reward)
     .bind(block.miner_address.as_deref())
     .bind(0i32)
+    .bind(coinbase_tag.as_deref())
     .execute(&mut *dbtx)
     .await?;
 
@@ -301,6 +306,32 @@ async fn upsert_miner(
     .bind(address).bind(reward).bind(block_height).bind(block_hash)
     .execute(&mut **dbtx).await?;
     Ok(())
+}
+
+fn extract_coinbase_tag(script_sig: &[u8]) -> Option<String> {
+    // Only works on ASCII text scriptSigs (solo miner format).
+    // Pool BIP34 scriptSigs contain binary bytes that fail utf8 decode -> None.
+    let text = std::str::from_utf8(script_sig).ok()?;
+    // Strip trailing null bytes appended by stratum solo extranonce padding.
+    let text = text.trim_end_matches('\0');
+
+    // Text mode: "Block {height}/{tag}"
+    if let Some(pos) = text.find('/') {
+        let tag = &text[pos + 1..];
+        if !tag.is_empty() && tag.len() <= 20 && tag.is_ascii() {
+            return Some(tag.to_string());
+        }
+    }
+
+    // Stratum solo mode: "Block {height} solo {tag} "
+    if let Some(pos) = text.find(" solo ") {
+        let after = text[pos + 6..].trim_end();
+        if !after.is_empty() && after.len() <= 20 && after.is_ascii() {
+            return Some(after.to_string());
+        }
+    }
+
+    None
 }
 
 pub async fn rollback_above(pool: &PgPool, reorg_height: i64) -> Result<()> {

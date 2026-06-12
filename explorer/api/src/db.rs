@@ -21,7 +21,7 @@ pub async fn get_status(pool: &PgPool) -> Result<ExplorerStatus> {
 
 pub async fn get_blocks(pool: &PgPool, limit: i64, offset: i64) -> Result<Vec<BlockSummary>> {
     let rows = sqlx::query(
-        "SELECT height,hash,timestamp,tx_count,miner_address,total_reward \
+        "SELECT height,hash,timestamp,tx_count,miner_address,total_reward,coinbase_tag \
          FROM blocks ORDER BY height DESC LIMIT $1 OFFSET $2"
     )
     .bind(limit)
@@ -35,12 +35,13 @@ pub async fn get_blocks(pool: &PgPool, limit: i64, offset: i64) -> Result<Vec<Bl
         tx_count: r.get("tx_count"),
         miner_address: r.get("miner_address"),
         total_reward: r.get("total_reward"),
+        coinbase_tag: r.get("coinbase_tag"),
     }).collect())
 }
 
 pub async fn get_block_by_height(pool: &PgPool, height: i64) -> Result<Option<BlockDetail>> {
     let row = sqlx::query(
-        "SELECT height,hash,prev_hash,merkle_root,timestamp,difficulty,nonce,tx_count,miner_address,total_reward \
+        "SELECT height,hash,prev_hash,merkle_root,timestamp,difficulty,nonce,tx_count,miner_address,total_reward,coinbase_tag \
          FROM blocks WHERE height=$1"
     )
     .bind(height)
@@ -61,12 +62,13 @@ pub async fn get_block_by_height(pool: &PgPool, height: i64) -> Result<Option<Bl
         miner_address: row.get("miner_address"),
         total_reward: row.get("total_reward"),
         txids,
+        coinbase_tag: row.get("coinbase_tag"),
     }))
 }
 
 pub async fn get_block_by_hash(pool: &PgPool, hash: &str) -> Result<Option<BlockDetail>> {
     let row = sqlx::query(
-        "SELECT height,hash,prev_hash,merkle_root,timestamp,difficulty,nonce,tx_count,miner_address,total_reward \
+        "SELECT height,hash,prev_hash,merkle_root,timestamp,difficulty,nonce,tx_count,miner_address,total_reward,coinbase_tag \
          FROM blocks WHERE hash=$1"
     )
     .bind(hash)
@@ -88,6 +90,7 @@ pub async fn get_block_by_hash(pool: &PgPool, hash: &str) -> Result<Option<Block
         miner_address: row.get("miner_address"),
         total_reward: row.get("total_reward"),
         txids,
+        coinbase_tag: row.get("coinbase_tag"),
     }))
 }
 
