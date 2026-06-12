@@ -27883,6 +27883,670 @@ mod tests {
             "12-H: inactive mode must still return 503"
         );
     }
+
+    // ── Phase 12-I: Internal End-to-End PoAW-X Cycle ─────────────────────────────
+
+    fn sbe_seed_nonce_for_height(state: &AppState, height: u64) -> ([u8; 32], [u8; 32]) {
+        let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let parent_h = height - 1;
+        let parent_hash = guard.chain[parent_h as usize]
+            .header
+            .hash_for_height(parent_h);
+        let mut s = Sha256::new();
+        s.update(&parent_hash);
+        s.update(parent_h.to_le_bytes());
+        s.update(b"poawx_assignment_seed_v1");
+        let seed: [u8; 32] = s.finalize().into();
+        let mut n = Sha256::new();
+        n.update(&seed);
+        n.update(b"commitment_nonce");
+        let nonce: [u8; 32] = n.finalize().into();
+        (seed, nonce)
+    }
+
+    fn brute_force_solution(seed: &[u8; 32], nonce: &[u8; 32], bits: u32) -> Vec<u8> {
+        let mut ctr: u64 = 0;
+        loop {
+            let sol = ctr.to_le_bytes().to_vec();
+            let mut inp = Vec::new();
+            inp.extend_from_slice(seed);
+            inp.extend_from_slice(nonce);
+            inp.extend_from_slice(&sol);
+            if count_leading_zero_bits(&sha256d(&inp)) >= bits {
+                return sol;
+            }
+            ctr += 1;
+        }
+    }
+
+    fn make_e2e_receipt(
+        state: &AppState,
+        height: u64,
+        sk: &SigningKey,
+        bits: u32,
+    ) -> PoawxPendingReceipt {
+        let (seed, nonce) = sbe_seed_nonce_for_height(state, height);
+        let solution = brute_force_solution(&seed, &nonce, bits);
+        let sig_str = sign_worker_challenge(sk, &solution, &nonce, height);
+        let vk = sk.verifying_key();
+        let pubkey_bytes = vk.to_encoded_point(true);
+        let pubkey_hex = hex::encode(pubkey_bytes.as_bytes());
+        let pkh_hex = hex::encode(&*ripemd::Ripemd160::digest(Sha256::digest(
+            pubkey_bytes.as_bytes(),
+        )));
+        PoawxPendingReceipt {
+            height,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex,
+            solution: hex::encode(&solution),
+            commitment_nonce: hex::encode(nonce),
+            worker_pubkey: pubkey_hex,
+            worker_sig: sig_str,
+        }
+    }
+
+    fn header_for_height(height: u64) -> SubmitBlockHeader {
+        let bh = BlockHeader {
+            version: 1,
+            prev_hash: [0u8; 32],
+            merkle_root: [0u8; 32],
+            time: 1_700_000_000,
+            bits: 0x207f_ffff,
+            nonce: 0,
+        };
+        SubmitBlockHeader {
+            version: 1,
+            prev_hash: "00".repeat(32),
+            merkle_root: "00".repeat(32),
+            time: 1_700_000_000,
+            bits: "207fffff".to_string(),
+            nonce: 0,
+            hash: hex::encode(bh.hash_for_height(height)),
+        }
+    }
+
+    fn coinbase_no_irx1_hex() -> String {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0u8; 32],
+                prev_index: 0xffff_ffff,
+                script_sig: vec![0x51],
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 1000,
+                script_pubkey: vec![0x51],
+            }],
+            locktime: 0,
+        };
+        hex::encode(tx.serialize())
+    }
+
+    fn coinbase_irx1_no_payout_hex(root: &[u8; 32]) -> String {
+        let mut op_return = vec![0x6a_u8, 0x24];
+        op_return.extend_from_slice(b"irx1");
+        op_return.extend_from_slice(root);
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0u8; 32],
+                prev_index: 0xffff_ffff,
+                script_sig: vec![0x51],
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![TxOutput {
+                value: 0,
+                script_pubkey: op_return,
+            }],
+            locktime: 0,
+        };
+        hex::encode(tx.serialize())
+    }
+
+    fn coinbase_irx1_wrong_pkh_hex(root: &[u8; 32], wrong_pkh: &[u8; 20], amount: u64) -> String {
+        let mut op_return = vec![0x6a_u8, 0x24];
+        op_return.extend_from_slice(b"irx1");
+        op_return.extend_from_slice(root);
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0u8; 32],
+                prev_index: 0xffff_ffff,
+                script_sig: vec![0x51],
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![
+                TxOutput {
+                    value: 0,
+                    script_pubkey: op_return,
+                },
+                TxOutput {
+                    value: amount,
+                    script_pubkey: p2pkh_script(wrong_pkh),
+                },
+            ],
+            locktime: 0,
+        };
+        hex::encode(tx.serialize())
+    }
+
+    // Test 1: receipt posting returns 200 and updates pending state
+    #[tokio::test]
+    async fn test_poawx_12i_receipt_post_full_cycle() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "4");
+        let (state, _, _, _) = create_test_state(None);
+        let (sk, _, _) = make_test_worker_identity();
+        let (seed, nonce) = sbe_seed_nonce_for_height(&state, 1);
+        let solution = brute_force_solution(&seed, &nonce, 4);
+        let sig = sign_worker_challenge(&sk, &solution, &nonce, 1);
+        let vk = sk.verifying_key();
+        let pubkey_bytes = vk.to_encoded_point(true);
+        let pubkey_hex = hex::encode(pubkey_bytes.as_bytes());
+        let pkh_hex = hex::encode(&*ripemd::Ripemd160::digest(Sha256::digest(
+            pubkey_bytes.as_bytes(),
+        )));
+        let req = PoawxReceiptRequest {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex.clone(),
+            solution: hex::encode(&solution),
+            commitment_nonce: hex::encode(nonce),
+            worker_pubkey: pubkey_hex,
+            worker_sig: sig,
+        };
+        let result = poawx_post_receipt(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert!(result.is_ok(), "receipt post must succeed: {:?}", result);
+        let pending = state
+            .poawx_pending_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(pending.len(), 1, "one receipt must be in pending state");
+        assert_eq!(pending[0].worker_pkh, pkh_hex, "worker_pkh must match");
+        assert_eq!(pending[0].height, 1, "height must be 1");
+    }
+
+    // Test 2: all receipt fields are preserved exactly in pending state
+    #[tokio::test]
+    async fn test_poawx_12i_receipt_fields_preserved_in_state() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "4");
+        let (state, _, _, _) = create_test_state(None);
+        let (sk, _, _) = make_test_worker_identity();
+        let (seed, nonce) = sbe_seed_nonce_for_height(&state, 1);
+        let solution = brute_force_solution(&seed, &nonce, 4);
+        let solution_hex = hex::encode(&solution);
+        let nonce_hex = hex::encode(nonce);
+        let sig = sign_worker_challenge(&sk, &solution, &nonce, 1);
+        let vk = sk.verifying_key();
+        let pubkey_bytes = vk.to_encoded_point(true);
+        let pubkey_hex = hex::encode(pubkey_bytes.as_bytes());
+        let pkh_hex = hex::encode(&*ripemd::Ripemd160::digest(Sha256::digest(
+            pubkey_bytes.as_bytes(),
+        )));
+        let req = PoawxReceiptRequest {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex.clone(),
+            solution: solution_hex.clone(),
+            commitment_nonce: nonce_hex.clone(),
+            worker_pubkey: pubkey_hex.clone(),
+            worker_sig: sig.clone(),
+        };
+        let result = poawx_post_receipt(
+            ConnectInfo(test_socket()),
+            State(state.clone()),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert!(result.is_ok(), "receipt post must succeed: {:?}", result);
+        let pending = state
+            .poawx_pending_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let r = &pending[0];
+        assert_eq!(r.lane, "cpu", "lane preserved");
+        assert_eq!(r.solution, solution_hex, "solution preserved");
+        assert_eq!(r.commitment_nonce, nonce_hex, "nonce preserved");
+        assert_eq!(r.worker_pubkey, pubkey_hex, "pubkey preserved");
+        assert_eq!(r.worker_sig, sig, "sig preserved");
+    }
+
+    // Test 3: receipt for stale height (too far behind chain tip) is rejected
+    #[tokio::test]
+    async fn test_poawx_12i_stale_receipt_rejected() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        let (state, _, _, _) = create_test_state(None);
+        state.chain.lock().unwrap_or_else(|e| e.into_inner()).height = 100;
+        let (_, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let req = PoawxReceiptRequest {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex,
+            solution: "aa".repeat(8),
+            commitment_nonce: "bb".repeat(32),
+            worker_pubkey: pubkey_hex,
+            worker_sig: "cc".repeat(64),
+        };
+        let result = poawx_post_receipt(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::BAD_REQUEST,
+            "stale receipt (height 1, chain at 100) must be rejected"
+        );
+    }
+
+    // Test 4: SBE receipt with empty worker_sig is rejected at identity check
+    #[tokio::test]
+    async fn test_poawx_12i_sbe_missing_worker_sig_rejected() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        let (state, _, _, _) = create_test_state(None);
+        let (_, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let (_, nonce) = sbe_seed_nonce_for_height(&state, 1);
+        let receipt = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex,
+            solution: "aa".repeat(32),
+            commitment_nonce: hex::encode(nonce),
+            worker_pubkey: pubkey_hex,
+            worker_sig: String::new(),
+        };
+        let root = compute_poawx_receipts_root(&[receipt.clone()]);
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![receipt],
+            poawx_receipts_root: hex::encode(root),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::BAD_REQUEST,
+            "empty worker_sig must be rejected at identity check"
+        );
+    }
+
+    // Test 5: SBE receipt with spoofed worker_pkh is rejected at identity check
+    #[tokio::test]
+    async fn test_poawx_12i_sbe_spoofed_pkh_rejected() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        let (state, _, _, _) = create_test_state(None);
+        let (_, pubkey_hex, _) = make_test_worker_identity();
+        let (_, nonce) = sbe_seed_nonce_for_height(&state, 1);
+        let receipt = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: "ab".repeat(20),
+            solution: "aa".repeat(32),
+            commitment_nonce: hex::encode(nonce),
+            worker_pubkey: pubkey_hex,
+            worker_sig: "dd".repeat(64),
+        };
+        let root = compute_poawx_receipts_root(&[receipt.clone()]);
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![receipt],
+            poawx_receipts_root: hex::encode(root),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::BAD_REQUEST,
+            "spoofed worker_pkh must be rejected at identity check"
+        );
+    }
+
+    // Test 6: SBE receipt with wrong commitment_nonce is rejected at nonce check
+    #[tokio::test]
+    async fn test_poawx_12i_sbe_wrong_nonce_rejected() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        let (state, _, _, _) = create_test_state(None);
+        let (_, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let receipt = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex,
+            solution: "aa".repeat(32),
+            commitment_nonce: "00".repeat(32),
+            worker_pubkey: pubkey_hex,
+            worker_sig: "dd".repeat(64),
+        };
+        let root = compute_poawx_receipts_root(&[receipt.clone()]);
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![receipt],
+            poawx_receipts_root: hex::encode(root),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::BAD_REQUEST,
+            "all-zero nonce must be rejected at nonce check"
+        );
+    }
+
+    // Test 7: SBE receipt with insufficient puzzle PoW is rejected
+    #[tokio::test]
+    async fn test_poawx_12i_sbe_insufficient_pow_rejected() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        let (state, _, _, _) = create_test_state(None);
+        let (sk, _, pkh_hex) = make_test_worker_identity();
+        let (seed, nonce) = sbe_seed_nonce_for_height(&state, 1);
+        let bad_solution = vec![0xff_u8; 32];
+        let mut pow_in = Vec::new();
+        pow_in.extend_from_slice(&seed);
+        pow_in.extend_from_slice(&nonce);
+        pow_in.extend_from_slice(&bad_solution);
+        let leading = count_leading_zero_bits(&sha256d(&pow_in));
+        assert!(
+            leading < 8,
+            "test invariant: 0xff*32 must not meet 8-bit difficulty (got {})",
+            leading
+        );
+        let vk = sk.verifying_key();
+        let pubkey_hex = hex::encode(vk.to_encoded_point(true).as_bytes());
+        let sig = sign_worker_challenge(&sk, &bad_solution, &nonce, 1);
+        let receipt = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh_hex,
+            solution: hex::encode(&bad_solution),
+            commitment_nonce: hex::encode(nonce),
+            worker_pubkey: pubkey_hex,
+            worker_sig: sig,
+        };
+        let root = compute_poawx_receipts_root(&[receipt.clone()]);
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![receipt],
+            poawx_receipts_root: hex::encode(root),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::BAD_REQUEST,
+            "insufficient puzzle PoW must be rejected"
+        );
+    }
+
+    // Test 8: valid receipt + valid header, coinbase has no irx1 OP_RETURN
+    #[tokio::test]
+    async fn test_poawx_12i_sbe_missing_irx1_rejected() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "4");
+        let (state, _, _, _) = create_test_state(None);
+        let (sk, _, _) = make_test_worker_identity();
+        let receipt = make_e2e_receipt(&state, 1, &sk, 4);
+        let root = compute_poawx_receipts_root(&[receipt.clone()]);
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: header_for_height(1),
+            tx_hex: vec![coinbase_no_irx1_hex()],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![receipt],
+            poawx_receipts_root: hex::encode(root),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::BAD_REQUEST,
+            "missing irx1 OP_RETURN must be rejected"
+        );
+    }
+
+    // Test 9: irx1 present but no P2PKH payout to worker
+    #[tokio::test]
+    async fn test_poawx_12i_sbe_missing_worker_payout_rejected() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "4");
+        let (state, _, _, _) = create_test_state(None);
+        let (sk, _, _) = make_test_worker_identity();
+        let receipt = make_e2e_receipt(&state, 1, &sk, 4);
+        let root = compute_poawx_receipts_root(&[receipt.clone()]);
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: header_for_height(1),
+            tx_hex: vec![coinbase_irx1_no_payout_hex(&root)],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![receipt],
+            poawx_receipts_root: hex::encode(root),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::BAD_REQUEST,
+            "irx1 with no worker payout must be rejected"
+        );
+    }
+
+    // Test 10: irx1 present + payout to wrong worker pkh is rejected
+    #[tokio::test]
+    async fn test_poawx_12i_sbe_wrong_payout_pkh_rejected() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "4");
+        let (state, _, _, _) = create_test_state(None);
+        let (sk, _, _) = make_test_worker_identity();
+        let receipt = make_e2e_receipt(&state, 1, &sk, 4);
+        let root = compute_poawx_receipts_root(&[receipt.clone()]);
+        let wrong_pkh = [0xde_u8; 20];
+        let amount = poawx_worker_due(block_reward(1));
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: header_for_height(1),
+            tx_hex: vec![coinbase_irx1_wrong_pkh_hex(&root, &wrong_pkh, amount)],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![receipt],
+            poawx_receipts_root: hex::encode(root),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::BAD_REQUEST,
+            "payout to wrong pkh must be rejected"
+        );
+    }
+
+    // Test 11: mainnet SBE with receipts still returns 503 (O-2 regression)
+    #[tokio::test]
+    async fn test_poawx_12i_mainnet_sbe_unaffected() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        let (state, _, _, _) = create_test_state(None);
+        let (_, pubkey_hex, pkh_hex) = make_test_worker_identity();
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![PoawxPendingReceipt {
+                height: 1,
+                lane: "cpu".to_string(),
+                worker_pkh: pkh_hex,
+                solution: "aa".repeat(32),
+                commitment_nonce: "bb".repeat(32),
+                worker_pubkey: pubkey_hex,
+                worker_sig: "cc".repeat(64),
+            }],
+            poawx_receipts_root: "dd".repeat(32),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "12-I: mainnet SBE must still return 503 (O-2 guard)"
+        );
+    }
+
+    // Test 12: legacy submit_block returns 405 when PoAW-X active (C-3 regression)
+    #[tokio::test]
+    async fn test_poawx_12i_legacy_submit_rejected_when_active() {
+        let _g = poawx_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let (state, _, _, _) = create_test_state(None);
+        let req = SubmitBlockRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+        };
+        let result = submit_block(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "12-I: legacy submit_block must still return 405 when PoAW-X active"
+        );
+    }
 }
 
 // ============================================================================
