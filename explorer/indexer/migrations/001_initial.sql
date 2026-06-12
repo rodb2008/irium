@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     prev_hash       TEXT        NOT NULL,
     merkle_root     TEXT        NOT NULL,
     timestamp       TIMESTAMPTZ NOT NULL,
-    difficulty      NUMERIC     NOT NULL,
+    difficulty      TEXT        NOT NULL,   -- compact bits (e.g. "1d00ffff")
     nonce           TEXT        NOT NULL,   -- hex; large value, store as text
     tx_count        INT         NOT NULL,
     total_reward    BIGINT      NOT NULL,   -- satoshis (coinbase output sum)

@@ -38,9 +38,15 @@ pub struct RpcHeader {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct BestHeaderTip {
+    pub height: i64,
+    pub hash: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct StatusResponse {
     pub height: i64,
-    pub best_hash: String,
+    pub best_header_tip: BestHeaderTip,
 }
 
 // ─── Client ──────────────────────────────────────────────────────────────────
