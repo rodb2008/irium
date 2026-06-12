@@ -5,7 +5,7 @@ use crate::{db, error::{ApiError, ApiResult}};
 use axum::http::StatusCode;
 
 pub fn router() -> Router<PgPool> {
-    Router::new().route("/tx/{txid}", get(get_tx))
+    Router::new().route("/tx/:txid", get(get_tx))
 }
 
 async fn get_tx(

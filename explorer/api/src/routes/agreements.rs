@@ -5,7 +5,7 @@ use crate::{db, error::{ApiError, ApiResult}};
 use axum::http::StatusCode;
 
 pub fn router() -> Router<PgPool> {
-    Router::new().route("/agreement/{hash}", get(get_agreement))
+    Router::new().route("/agreement/:hash", get(get_agreement))
 }
 
 async fn get_agreement(

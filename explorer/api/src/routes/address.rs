@@ -7,9 +7,9 @@ use axum::http::StatusCode;
 
 pub fn router() -> Router<PgPool> {
     Router::new()
-        .route("/address/{address}", get(get_address))
-        .route("/address/{address}/txs", get(get_address_txs))
-        .route("/address/{address}/htlcs", get(get_address_htlcs))
+        .route("/address/:address", get(get_address))
+        .route("/address/:address/txs", get(get_address_txs))
+        .route("/address/:address/htlcs", get(get_address_htlcs))
 }
 
 #[derive(Deserialize)]

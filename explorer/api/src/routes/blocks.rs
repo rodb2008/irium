@@ -8,8 +8,8 @@ use axum::http::StatusCode;
 pub fn router() -> Router<PgPool> {
     Router::new()
         .route("/blocks", get(list_blocks))
-        .route("/blocks/height/{height}", get(get_by_height))
-        .route("/blocks/hash/{hash}", get(get_by_hash))
+        .route("/blocks/height/:height", get(get_by_height))
+        .route("/blocks/hash/:hash", get(get_by_hash))
 }
 
 #[derive(Deserialize)]
