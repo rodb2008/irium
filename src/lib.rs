@@ -63,9 +63,9 @@
 #![allow(clippy::needless_lifetimes)]
 
 pub mod activation;
+pub mod anchors;
 pub mod attestor_bond;
 pub mod auxpow;
-pub mod anchors;
 pub mod block;
 pub mod btc_p2p;
 pub mod btc_spv;
@@ -81,6 +81,7 @@ pub mod network;
 pub mod network_era;
 pub mod p2p;
 pub mod p2p_wire;
+pub mod poawx;
 pub mod pow;
 pub mod protocol;
 pub mod qr;

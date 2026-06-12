@@ -207,7 +207,9 @@ impl Block {
                 h
             })
             .collect();
-        if leaves.is_empty() { return [0u8; 32]; }
+        if leaves.is_empty() {
+            return [0u8; 32];
+        }
         while leaves.len() > 1 {
             if leaves.len() % 2 == 1 {
                 let last = leaves[leaves.len() - 1]; // safe: len > 1 by while guard
@@ -440,9 +442,18 @@ mod fix2a_boundary_tests {
         let pre_hash = h.hash_for_height(22_887);
         let post_hash = h.hash_for_height(22_888);
 
-        assert_eq!(pre_hash, legacy_hash, "pre-fork hash must match legacy hash()");
-        assert_ne!(post_hash, legacy_hash, "post-fork hash must differ from legacy");
-        assert_ne!(post_hash, pre_hash, "post-fork hash must differ from pre-fork hash");
+        assert_eq!(
+            pre_hash, legacy_hash,
+            "pre-fork hash must match legacy hash()"
+        );
+        assert_ne!(
+            post_hash, legacy_hash,
+            "post-fork hash must differ from legacy"
+        );
+        assert_ne!(
+            post_hash, pre_hash,
+            "post-fork hash must differ from pre-fork hash"
+        );
     }
 
     /// peek_prev_hash reads bytes [4..36] reversed regardless of fork side.

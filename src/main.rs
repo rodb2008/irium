@@ -4,8 +4,8 @@
 #![allow(warnings)]
 
 mod activation;
-mod auxpow;
 mod anchors;
+mod auxpow;
 mod block;
 mod btc_spv;
 mod btc_tx_parse;
@@ -60,14 +60,14 @@ fn main() {
         lwma_v2: resolved_lwma_v2_activation_height(network)
             .map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
         auxpow_activation_height: crate::activation::resolved_auxpow_activation_height(network),
-            btc_spv: None,
-            ltc_spv: None,
-            htlc_btc_swap_v1_activation_height: None,
-            btc_swap_bech32_payment_activation_height: None,
-            htlc_ltc_swap_v1_activation_height: None,
-            swap_order_v1_activation_height: None,
-            ltc_swap_order_v1_activation_height: None,
-            coinbase_header_batch_activation_height: None,
+        btc_spv: None,
+        ltc_spv: None,
+        htlc_btc_swap_v1_activation_height: None,
+        btc_swap_bech32_payment_activation_height: None,
+        htlc_ltc_swap_v1_activation_height: None,
+        swap_order_v1_activation_height: None,
+        ltc_swap_order_v1_activation_height: None,
+        coinbase_header_batch_activation_height: None,
     };
 
     let state = ChainState::new(params);

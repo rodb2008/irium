@@ -506,12 +506,15 @@ fn fetch_template_with_base(client: &Client, base: &str) -> Result<BlockTemplate
     }
     let resp = req.send().map_err(|e| format!("{e}"))?;
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err("HTTP 401 Unauthorized — set IRIUM_RPC_TOKEN to match the node token".to_string());
+        return Err(
+            "HTTP 401 Unauthorized — set IRIUM_RPC_TOKEN to match the node token".to_string(),
+        );
     }
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
-    resp.json::<BlockTemplate>().map_err(|e| format!("parse template: {e}"))
+    resp.json::<BlockTemplate>()
+        .map_err(|e| format!("parse template: {e}"))
 }
 
 fn fetch_template(client: &Client) -> Result<BlockTemplate, String> {
@@ -739,7 +742,12 @@ const MIN_BATCH_SIZE: usize = 1 << 16;
 unsafe impl Send for GpuMiner {}
 
 impl GpuMiner {
-    fn new(platform: Platform, platform_idx: usize, device_idx: usize, batch_size: usize) -> Result<Self, String> {
+    fn new(
+        platform: Platform,
+        platform_idx: usize,
+        device_idx: usize,
+        batch_size: usize,
+    ) -> Result<Self, String> {
         let devices = Device::list_all(platform).map_err(|e| format!("OpenCL device list: {e}"))?;
         if devices.is_empty() {
             return Err(format!(
@@ -757,7 +765,7 @@ impl GpuMiner {
         })?;
 
         let plat_name = platform.name().unwrap_or_else(|_| "?".into());
-        let dev_name  = device.name().unwrap_or_else(|_| "?".into());
+        let dev_name = device.name().unwrap_or_else(|_| "?".into());
         println!("[GPU] Platform {platform_idx} ({plat_name}), Device {device_idx}: {dev_name}");
 
         let context = Context::builder()
@@ -966,18 +974,12 @@ fn tail_from_header(ser: &[u8]) -> [u32; 3] {
 /// vendor strings for each silicon family.
 fn vendor_is_nvidia(vendor: &str) -> bool {
     let v = vendor.to_lowercase();
-    v.contains("nvidia")
-        || v.contains("cuda")
-        || v.contains("geforce")
-        || v.contains("quadro")
+    v.contains("nvidia") || v.contains("cuda") || v.contains("geforce") || v.contains("quadro")
 }
 
 fn vendor_is_amd(vendor: &str) -> bool {
     let v = vendor.to_lowercase();
-    v.contains("amd")
-        || v.contains("advanced micro")
-        || v.contains("radeon")
-        || v.contains("ati")
+    v.contains("amd") || v.contains("advanced micro") || v.contains("radeon") || v.contains("ati")
 }
 
 fn vendor_is_intel(vendor: &str) -> bool {
@@ -996,9 +998,8 @@ fn enumerate_platforms() -> Vec<(Platform, String, Vec<String>)> {
     // Platform::list() panics when the ICD loader finds no platform drivers.
     // Wrap with AssertUnwindSafe so --list-platforms prints a friendly message
     // instead of crashing on machines without a GPU OpenCL runtime.
-    let platform_list = match std::panic::catch_unwind(
-        std::panic::AssertUnwindSafe(Platform::list),
-    ) {
+    let platform_list = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(Platform::list))
+    {
         Ok(list) => list,
         Err(_) => return Vec::new(),
     };
@@ -1099,9 +1100,10 @@ fn auto_select_platform(platforms: &[(Platform, String, Vec<String>)]) -> usize 
         // NVIDIA or AMD. That platform may have been discarded only because
         // device enumeration failed, which is exactly the case the user wants
         // to know about so they can pursue a driver fix or pass --platform.
-        let has_other_discrete = platforms.iter().enumerate().any(|(j, (_, v, _))| {
-            j != i && vendor_is_discrete(v)
-        });
+        let has_other_discrete = platforms
+            .iter()
+            .enumerate()
+            .any(|(j, (_, v, _))| j != i && vendor_is_discrete(v));
         if has_other_discrete {
             eprintln!(
                 "[GPU] WARNING: Selected Intel GPU but NVIDIA/AMD also available. \
@@ -1147,12 +1149,10 @@ fn resolve_devices(
     platform_sel: Option<&str>,
 ) -> Result<Vec<(usize, usize)>, String> {
     if platforms.is_empty() {
-        return Err(
-            "No OpenCL platforms found.\n\
+        return Err("No OpenCL platforms found.\n\
              Install your GPU driver and the ICD loader:\n\
              apt install ocl-icd-opencl-dev"
-                .into(),
-        );
+            .into());
     }
     let plat_idx = resolve_platform_idx(platforms, platform_sel)?;
     let dev_count = platforms[plat_idx].2.len();
@@ -1199,7 +1199,9 @@ fn init_gpus(
 ) -> Result<Vec<GpuMiner>, String> {
     device_refs
         .iter()
-        .map(|&(plat_idx, dev_idx)| GpuMiner::new(platforms[plat_idx].0, plat_idx, dev_idx, batch_size))
+        .map(|&(plat_idx, dev_idx)| {
+            GpuMiner::new(platforms[plat_idx].0, plat_idx, dev_idx, batch_size)
+        })
         .collect()
 }
 

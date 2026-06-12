@@ -26,7 +26,8 @@ use sha2::{Digest, Sha256};
 
 use irium_node_rs::activation::{
     network_kind_from_env, resolved_htlcv1_activation_height, resolved_lwma_activation_height,
-    resolved_lwma_v2_activation_height, resolved_mpsov1_activation_height, runtime_lwma_env_override,
+    resolved_lwma_v2_activation_height, resolved_mpsov1_activation_height,
+    runtime_lwma_env_override,
 };
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
@@ -248,7 +249,10 @@ fn advertise_peer_output() -> Option<TxOutput> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_coinbase, build_coinbase_with_pkh, extract_height_from_coinbase1_hex, script_from_relay_address};
+    use super::{
+        build_coinbase, build_coinbase_with_pkh, extract_height_from_coinbase1_hex,
+        script_from_relay_address,
+    };
     use irium_node_rs::activation::{resolved_htlcv1_activation_height, NetworkKind};
     use irium_node_rs::activation::{
         resolved_lwma_v2_activation_height, MAINNET_LWMA_V2_ACTIVATION_HEIGHT,
@@ -371,48 +375,61 @@ mod tests {
 
     #[test]
     fn build_coinbase_returns_error_when_address_unset() {
-        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         let _guard = ENV_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap();
-        let saved_addr  = std::env::var("IRIUM_MINER_ADDRESS").ok();
+        let saved_addr = std::env::var("IRIUM_MINER_ADDRESS").ok();
         let saved_relay = std::env::var("IRIUM_RELAY_ADDRESS").ok();
-        let saved_pkh   = std::env::var("IRIUM_MINER_PKH").ok();
+        let saved_pkh = std::env::var("IRIUM_MINER_PKH").ok();
         std::env::remove_var("IRIUM_MINER_ADDRESS");
         std::env::remove_var("IRIUM_RELAY_ADDRESS");
         std::env::remove_var("IRIUM_MINER_PKH");
         let result = build_coinbase(1, 5_000_000_000);
-        if let Some(v) = saved_addr  { std::env::set_var("IRIUM_MINER_ADDRESS", v); }
-        if let Some(v) = saved_relay { std::env::set_var("IRIUM_RELAY_ADDRESS", v); }
-        if let Some(v) = saved_pkh   { std::env::set_var("IRIUM_MINER_PKH", v); }
+        if let Some(v) = saved_addr {
+            std::env::set_var("IRIUM_MINER_ADDRESS", v);
+        }
+        if let Some(v) = saved_relay {
+            std::env::set_var("IRIUM_RELAY_ADDRESS", v);
+        }
+        if let Some(v) = saved_pkh {
+            std::env::set_var("IRIUM_MINER_PKH", v);
+        }
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("missing or invalid miner payout address"),
+            result
+                .unwrap_err()
+                .contains("missing or invalid miner payout address"),
             "error message must name the problem"
         );
     }
 
     #[test]
     fn build_coinbase_returns_error_for_invalid_base58_address() {
-        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         let _guard = ENV_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap();
-        let saved_addr  = std::env::var("IRIUM_MINER_ADDRESS").ok();
+        let saved_addr = std::env::var("IRIUM_MINER_ADDRESS").ok();
         let saved_relay = std::env::var("IRIUM_RELAY_ADDRESS").ok();
-        let saved_pkh   = std::env::var("IRIUM_MINER_PKH").ok();
+        let saved_pkh = std::env::var("IRIUM_MINER_PKH").ok();
         std::env::set_var("IRIUM_MINER_ADDRESS", "not_a_valid_address_!!!");
         std::env::remove_var("IRIUM_RELAY_ADDRESS");
         std::env::remove_var("IRIUM_MINER_PKH");
         let result = build_coinbase(1, 5_000_000_000);
-        if let Some(v) = saved_addr  { std::env::set_var("IRIUM_MINER_ADDRESS", v); }
-            else { std::env::remove_var("IRIUM_MINER_ADDRESS"); }
-        if let Some(v) = saved_relay { std::env::set_var("IRIUM_RELAY_ADDRESS", v); }
-        if let Some(v) = saved_pkh   { std::env::set_var("IRIUM_MINER_PKH", v); }
+        if let Some(v) = saved_addr {
+            std::env::set_var("IRIUM_MINER_ADDRESS", v);
+        } else {
+            std::env::remove_var("IRIUM_MINER_ADDRESS");
+        }
+        if let Some(v) = saved_relay {
+            std::env::set_var("IRIUM_RELAY_ADDRESS", v);
+        }
+        if let Some(v) = saved_pkh {
+            std::env::set_var("IRIUM_MINER_PKH", v);
+        }
         assert!(result.is_err(), "invalid address must be rejected");
     }
 
@@ -420,16 +437,16 @@ mod tests {
     fn extract_height_from_coinbase1_bip34() {
         // BIP34 mode: height 22656 = 0x5880 -> 2 LE bytes [0x80, 0x58]
         let mut tx: Vec<u8> = Vec::new();
-        tx.extend_from_slice(&1u32.to_le_bytes());            // version
-        tx.push(0x01);                                        // tx_in count varint
-        tx.extend_from_slice(&[0u8; 32]);                     // prev_txid
-        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());  // prev_index
+        tx.extend_from_slice(&1u32.to_le_bytes()); // version
+        tx.push(0x01); // tx_in count varint
+        tx.extend_from_slice(&[0u8; 32]); // prev_txid
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prev_index
         let script_sig: Vec<u8> = {
             let mut s = vec![0x02u8, 0x80, 0x58]; // BIP34 push: len=2, height LE
             s.extend_from_slice(b"Irium");
             s
         };
-        tx.push(script_sig.len() as u8);                      // script_sig length varint
+        tx.push(script_sig.len() as u8); // script_sig length varint
         tx.extend_from_slice(&script_sig);
         let hex_str = hex::encode(&tx);
         assert_eq!(extract_height_from_coinbase1_hex(&hex_str), Some(22_656));
@@ -506,11 +523,7 @@ fn miner_pubkey_hash() -> Option<Vec<u8>> {
     miner_address_info().map(|(_, pkh)| pkh)
 }
 
-fn build_coinbase_with_pkh(
-    reward: u64,
-    payout_pkh: &[u8],
-    script_sig: Vec<u8>,
-) -> Transaction {
+fn build_coinbase_with_pkh(reward: u64, payout_pkh: &[u8], script_sig: Vec<u8>) -> Transaction {
     let coinbase_input = TxInput {
         prev_txid: [0u8; 32],
         prev_index: 0xffff_ffff,
@@ -580,7 +593,11 @@ fn extract_height_from_coinbase1_hex(coinbase1_hex: &str) -> Option<u64> {
             o += 1;
             saw_digit = true;
         }
-        if saw_digit { Some(h) } else { None }
+        if saw_digit {
+            Some(h)
+        } else {
+            None
+        }
     } else {
         let push_n = bytes[o] as usize;
         o += 1;
@@ -1583,7 +1600,10 @@ fn reconcile_with_template(
                 }
             }
             Err(e) => {
-                eprintln!("[warn] Miner failed to download blocks {}..+{}: {}", h, want, e);
+                eprintln!(
+                    "[warn] Miner failed to download blocks {}..+{}: {}",
+                    h, want, e
+                );
                 break 'sync;
             }
         };
@@ -2220,19 +2240,14 @@ fn stratum_reader(
             // count accepted vs rejected shares.
             _ => {
                 if msg.get("id").is_some() && method.is_none() {
-                    let accepted = msg.get("result")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
+                    let accepted = msg.get("result").and_then(|v| v.as_bool()).unwrap_or(false);
                     if accepted {
                         println!("[stratum] share accepted");
                     } else {
                         // Stratum error is typically [code, "message", traceback].
-                        let reason = msg.get("error")
-                            .and_then(|e| {
-                                e.get(1)
-                                    .and_then(|v| v.as_str())
-                                    .or_else(|| e.as_str())
-                            })
+                        let reason = msg
+                            .get("error")
+                            .and_then(|e| e.get(1).and_then(|v| v.as_str()).or_else(|| e.as_str()))
                             .unwrap_or("unknown reason");
                         eprintln!("[stratum] share rejected: {}", reason);
                     }
@@ -2509,7 +2524,9 @@ fn solo_stratum_listen_addr() -> Option<String> {
 
     if enabled {
         if listen.is_none() {
-            eprintln!("Error: IRIUM_SOLO_STRATUM_LISTEN must be set when --solo-stratum is enabled");
+            eprintln!(
+                "Error: IRIUM_SOLO_STRATUM_LISTEN must be set when --solo-stratum is enabled"
+            );
             std::process::exit(1);
         }
         listen
@@ -3217,21 +3234,23 @@ fn main() {
         mpsov1_activation_height: resolved_mpsov1_activation_height(network),
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
-        auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
-            btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
-            ltc_spv: irium_node_rs::ltc_spv::resolve_ltc_spv_params(network),
-            htlc_btc_swap_v1_activation_height:
-                irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
-            btc_swap_bech32_payment_activation_height:
-                irium_node_rs::activation::resolved_btc_swap_bech32_payment_activation_height(network),
-            htlc_ltc_swap_v1_activation_height:
-                irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
-            swap_order_v1_activation_height:
-                irium_node_rs::activation::resolved_swap_order_v1_activation_height(network),
-            ltc_swap_order_v1_activation_height:
-                irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
-            coinbase_header_batch_activation_height:
-                irium_node_rs::activation::resolved_coinbase_header_batch_activation_height(network),
+        auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(
+            network,
+        ),
+        btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
+        ltc_spv: irium_node_rs::ltc_spv::resolve_ltc_spv_params(network),
+        htlc_btc_swap_v1_activation_height:
+            irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
+        btc_swap_bech32_payment_activation_height:
+            irium_node_rs::activation::resolved_btc_swap_bech32_payment_activation_height(network),
+        htlc_ltc_swap_v1_activation_height:
+            irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
+        swap_order_v1_activation_height:
+            irium_node_rs::activation::resolved_swap_order_v1_activation_height(network),
+        ltc_swap_order_v1_activation_height:
+            irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
+        coinbase_header_batch_activation_height:
+            irium_node_rs::activation::resolved_coinbase_header_batch_activation_height(network),
     };
 
     let mut state = ChainState::new(params.clone());
@@ -3262,16 +3281,17 @@ fn main() {
     }
 
     match std::env::var("IRIUM_ADVERTISE_ADDR") {
-        Ok(ref v) if !v.trim().is_empty() => {
-            match v.trim().parse::<std::net::SocketAddr>() {
-                Ok(sa) if sa.port() != 0 => {
-                    eprintln!("[advertise] embedding peer address {} in coinbase outputs", sa);
-                }
-                _ => {
-                    eprintln!("[advertise] IRIUM_ADVERTISE_ADDR={} is not a valid ip:port — peer embedding disabled", v.trim());
-                }
+        Ok(ref v) if !v.trim().is_empty() => match v.trim().parse::<std::net::SocketAddr>() {
+            Ok(sa) if sa.port() != 0 => {
+                eprintln!(
+                    "[advertise] embedding peer address {} in coinbase outputs",
+                    sa
+                );
             }
-        }
+            _ => {
+                eprintln!("[advertise] IRIUM_ADVERTISE_ADDR={} is not a valid ip:port — peer embedding disabled", v.trim());
+            }
+        },
         _ => {
             eprintln!("[advertise] IRIUM_ADVERTISE_ADDR not set — peer embedding disabled");
         }

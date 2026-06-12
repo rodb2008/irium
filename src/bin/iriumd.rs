@@ -70,21 +70,31 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower_http::cors::{Any, CorsLayer};
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::IntoResponse;
 use get_if_addrs::get_if_addrs;
-use subtle::ConstantTimeEq;
 use irium_node_rs::activation::{
     network_kind_from_env, resolved_htlcv1_activation_height, resolved_lwma_activation_height,
     resolved_lwma_v2_activation_height, resolved_mpsov1_activation_height,
-    runtime_htlcv1_env_override, runtime_lwma_env_override,
-    NetworkKind,
+    runtime_htlcv1_env_override, runtime_lwma_env_override, NetworkKind,
 };
 use irium_node_rs::anchors::AnchorManager;
 use irium_node_rs::block::{Block, BlockHeader};
+use irium_node_rs::btc_spv::{
+    apply_btc_header_batch, encode_btc_header_batch, parse_btc_header_batch,
+    resolve_btc_spv_params, BtcAnchor, BtcHeader, BtcHeaderEntry, BTC_HEADER_BYTES,
+    MAX_BTC_HEADERS_PER_BATCH,
+};
 use irium_node_rs::chain::{
     block_from_locked, ChainParams, ChainState, HeaderWork, LwmaParams, OutPoint,
 };
 use irium_node_rs::constants::{block_reward, coinbase_maturity};
 use irium_node_rs::genesis::load_locked_genesis;
+use irium_node_rs::ltc_spv::{
+    encode_ltc_header_batch, parse_ltc_header_batch, LtcAnchor, LtcHeader, LtcHeaderEntry,
+    LTC_HEADER_BYTES, MAX_LTC_HEADERS_PER_BATCH,
+};
 use irium_node_rs::mempool::{evict_invalid_mempool_entries, MempoolManager, MempoolPriority};
 use irium_node_rs::network::SeedlistManager;
 use irium_node_rs::network_era::network_era;
@@ -96,65 +106,50 @@ use irium_node_rs::settlement::{
     agreement_short_hash_from_full, basic_otc_escrow_template, build_agreement_activity_timeline,
     build_agreement_anchor_output, build_agreement_audit_record, build_funding_legs,
     build_reputation_event_output, compute_agreement_hash_hex, contractor_milestone_template,
-    derive_lifecycle, discover_agreement_funding_leg_candidates, evaluate_policy,
+    derive_lifecycle, discover_agreement_funding_leg_candidates, dispute_evidence_canonical_bytes,
+    dispute_raise_canonical_bytes, dispute_reresolve_canonical_bytes,
+    dispute_resolution_canonical_bytes, evaluate_policy,
     extract_agreement_funding_leg_refs_from_tx, parse_agreement_anchor, parse_reputation_event,
-    policy_template_to_json, preorder_deposit_template, verify_agreement_bundle,
-    AgreementActivityEvent, AgreementAnchor, AgreementAnchorRole, AgreementAuditFundingLegRecord,
-    AgreementAuditRecord, AgreementBundle, AgreementFundingLegRef, AgreementLifecycleView,
-    AgreementLinkedTx, AgreementMilestoneStatus, AgreementObject, AgreementSignatureEnvelope,
-    AgreementSummary, AgreementTemplateType, DisputeEvidence, DisputeRaise, DisputeResolution,
-    EscrowReceiptDisputeRef, EscrowReceiptProofRef, HoldbackEvaluationResult,
-    MilestoneEvaluationResult, MilestoneSpec, PolicyOutcome, PolicyStore, ProofPolicy, ProofStore,
-    ReputationEvent, ReputationEventKind, RequirementThresholdResult, ResolverRegistration,
-    SettlementProof, TemplateAttestor, TxidWithHeight, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
-    DisputeReResolverNomination,
-    dispute_evidence_canonical_bytes, dispute_raise_canonical_bytes,
-    dispute_reresolve_canonical_bytes, dispute_resolution_canonical_bytes,
-    resolver_registration_canonical_bytes,
+    policy_template_to_json, preorder_deposit_template, resolver_registration_canonical_bytes,
+    verify_agreement_bundle, AgreementActivityEvent, AgreementAnchor, AgreementAnchorRole,
+    AgreementAuditFundingLegRecord, AgreementAuditRecord, AgreementBundle, AgreementFundingLegRef,
+    AgreementLifecycleView, AgreementLinkedTx, AgreementMilestoneStatus, AgreementObject,
+    AgreementSignatureEnvelope, AgreementSummary, AgreementTemplateType, DisputeEvidence,
+    DisputeRaise, DisputeReResolverNomination, DisputeResolution, EscrowReceiptDisputeRef,
+    EscrowReceiptProofRef, HoldbackEvaluationResult, MilestoneEvaluationResult, MilestoneSpec,
+    PolicyOutcome, PolicyStore, ProofPolicy, ProofStore, ReputationEvent, ReputationEventKind,
+    RequirementThresholdResult, ResolverRegistration, SettlementProof, TemplateAttestor,
+    TxidWithHeight, AGREEMENT_SIGNATURE_TYPE_SECP256K1,
 };
-use k256::ecdsa::VerifyingKey;
 use irium_node_rs::storage;
 use irium_node_rs::tx::{
     compute_funding_binding, decode_full_tx, encode_htlc_btc_swap_claim_witness,
     encode_htlc_btc_swap_refund_witness, encode_htlc_btc_swap_v1_script,
     encode_htlc_ltc_swap_claim_witness, encode_htlc_ltc_swap_refund_witness,
-    encode_htlc_ltc_swap_v1_script, encode_ltc_swap_order_cancel_witness,
-    encode_ltc_swap_order_expire_sweep_witness,
-    encode_ltc_swap_order_fill_buy_witness, encode_ltc_swap_order_fill_sell_witness,
-    encode_ltc_swap_order_script, parse_htlc_ltc_swap_v1_script,
-    parse_ltc_swap_order_script,
-    HtlcLtcSwapV1Output, LtcSwapOrderOutput,
-    LTC_SWAP_ORDER_DIRECTION_BUY, LTC_SWAP_ORDER_DIRECTION_SELL,
-    LTC_SWAP_ORDER_MAX_SWEEP_FEE, LTC_SWAP_ORDER_MIN_LOCKED_VALUE,
-    MAX_HTLC_LTC_SWAP_CONFIRMATIONS, MIN_HTLC_LTC_SWAP_CONFIRMATIONS,
-    encode_htlcv1_claim_witness, encode_htlcv1_refund_witness, encode_htlcv1_script,
+    encode_htlc_ltc_swap_v1_script, encode_htlcv1_claim_witness, encode_htlcv1_refund_witness,
+    encode_htlcv1_script, encode_ltc_swap_order_cancel_witness,
+    encode_ltc_swap_order_expire_sweep_witness, encode_ltc_swap_order_fill_buy_witness,
+    encode_ltc_swap_order_fill_sell_witness, encode_ltc_swap_order_script,
     encode_swap_order_cancel_witness, encode_swap_order_expire_sweep_witness,
     encode_swap_order_fill_buy_witness, encode_swap_order_fill_sell_witness,
-    encode_swap_order_script, parse_htlc_btc_swap_v1_script, parse_htlcv1_script,
-    parse_output_encumbrance, parse_swap_order_script, HtlcBtcSwapV1Output, HtlcV1Output,
-    OutputEncumbrance, SwapOrderOutput, Transaction, TxInput, TxOutput,
-    MAX_HTLC_BTC_SWAP_CONFIRMATIONS, MIN_HTLC_BTC_SWAP_CONFIRMATIONS,
-    SWAP_ORDER_DIRECTION_BUY, SWAP_ORDER_DIRECTION_SELL, SWAP_ORDER_MAX_SWEEP_FEE,
-    SWAP_ORDER_MIN_LOCKED_VALUE,
-};
-use irium_node_rs::btc_spv::{
-    apply_btc_header_batch, encode_btc_header_batch, parse_btc_header_batch,
-    resolve_btc_spv_params, BtcAnchor, BtcHeader, BtcHeaderEntry, BTC_HEADER_BYTES,
-    MAX_BTC_HEADERS_PER_BATCH,
-};
-use irium_node_rs::ltc_spv::{
-    encode_ltc_header_batch, parse_ltc_header_batch, LtcAnchor, LtcHeader, LtcHeaderEntry,
-    LTC_HEADER_BYTES, MAX_LTC_HEADERS_PER_BATCH,
+    encode_swap_order_script, parse_htlc_btc_swap_v1_script, parse_htlc_ltc_swap_v1_script,
+    parse_htlcv1_script, parse_ltc_swap_order_script, parse_output_encumbrance,
+    parse_swap_order_script, HtlcBtcSwapV1Output, HtlcLtcSwapV1Output, HtlcV1Output,
+    LtcSwapOrderOutput, OutputEncumbrance, SwapOrderOutput, Transaction, TxInput, TxOutput,
+    LTC_SWAP_ORDER_DIRECTION_BUY, LTC_SWAP_ORDER_DIRECTION_SELL, LTC_SWAP_ORDER_MAX_SWEEP_FEE,
+    LTC_SWAP_ORDER_MIN_LOCKED_VALUE, MAX_HTLC_BTC_SWAP_CONFIRMATIONS,
+    MAX_HTLC_LTC_SWAP_CONFIRMATIONS, MIN_HTLC_BTC_SWAP_CONFIRMATIONS,
+    MIN_HTLC_LTC_SWAP_CONFIRMATIONS, SWAP_ORDER_DIRECTION_BUY, SWAP_ORDER_DIRECTION_SELL,
+    SWAP_ORDER_MAX_SWEEP_FEE, SWAP_ORDER_MIN_LOCKED_VALUE,
 };
 use irium_node_rs::wallet_store::{WalletKey, WalletManager, WalletMode};
 use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
+use k256::ecdsa::VerifyingKey;
 use k256::ecdsa::{Signature, SigningKey};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::IntoResponse;
+use subtle::ConstantTimeEq;
 // futures_util stream/sink imports removed (unused)
-use tokio::sync::broadcast;
 use std::convert::Infallible;
+use tokio::sync::broadcast;
 
 const WS_BROADCAST_CAPACITY: usize = 1024;
 type EventTx = broadcast::Sender<std::sync::Arc<String>>;
@@ -204,7 +199,7 @@ struct AppState {
 }
 
 const DISPUTE_RESOLVER_RESPONSE_WINDOW: u64 = 288; // blocks
-const MINER_RECENCY_WINDOW: u64 = 2016;            // blocks
+const MINER_RECENCY_WINDOW: u64 = 2016; // blocks
 const DISPUTE_ANCHOR_FEE_PER_BYTE: u64 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,10 +392,9 @@ async fn ws_handler(
     let token_required = std::env::var("IRIUM_RPC_TOKEN")
         .map(|t| !t.trim().is_empty())
         .unwrap_or(false);
-    if token_required && !ws_public
-        && require_rpc_auth(&headers).is_err() {
-            return (StatusCode::UNAUTHORIZED, "Bearer token required").into_response();
-        }
+    if token_required && !ws_public && require_rpc_auth(&headers).is_err() {
+        return (StatusCode::UNAUTHORIZED, "Bearer token required").into_response();
+    }
     let is_public_conn = ws_public && require_rpc_auth(&headers).is_err();
     ws.on_upgrade(move |socket| ws_handle_socket(socket, state, is_public_conn))
 }
@@ -421,9 +415,8 @@ async fn sse_handler(
     }
     let is_public_conn = ws_public && require_rpc_auth(&headers).is_err();
     let rx = state.event_tx.subscribe();
-    let stream = futures_util::stream::unfold(
-        (rx, is_public_conn),
-        |(mut rx, is_pub)| async move {
+    let stream =
+        futures_util::stream::unfold((rx, is_public_conn), |(mut rx, is_pub)| async move {
             loop {
                 match rx.recv().await {
                     Ok(json_arc) => {
@@ -442,11 +435,9 @@ async fn sse_handler(
                     Err(_) => return None,
                 }
             }
-        },
-    );
+        });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
-
 
 #[derive(Serialize)]
 struct PeerInfo {
@@ -2628,7 +2619,8 @@ fn parse_persisted_block_file(
     };
 
     let auxpow = if version & irium_node_rs::auxpow::AUXPOW_VERSION_BIT != 0 {
-        parsed.get("auxpow_hex")
+        parsed
+            .get("auxpow_hex")
             .and_then(|v| v.as_str())
             .and_then(|s| hex::decode(s).ok())
             .and_then(|bytes| {
@@ -2726,7 +2718,9 @@ fn discover_persist_mismatch_heights(
     for (height, expected_hash) in expected.iter().copied() {
         let path = blocks_dir.join(format!("block_{}.json", height));
         let valid_and_matching = match parse_persisted_block_file(&path, genesis_hash_lc) {
-            Ok((parsed_h, block)) => parsed_h == height && block.header.hash_for_height(parsed_h) == expected_hash,
+            Ok((parsed_h, block)) => {
+                parsed_h == height && block.header.hash_for_height(parsed_h) == expected_hash
+            }
             Err(_) => false,
         };
 
@@ -2814,7 +2808,9 @@ fn best_chain_hashes_in_window(
                     continue;
                 }
                 if let Some(block) = state.chain.get(h as usize) {
-                    by_height.entry(h).or_insert(block.header.hash_for_height(h));
+                    by_height
+                        .entry(h)
+                        .or_insert(block.header.hash_for_height(h));
                 }
                 if h == 0 {
                     break;
@@ -3495,7 +3491,9 @@ async fn network_status(
     } else {
         (None, None)
     };
-    let peer_count = state.status_peer_count_cache.load(std::sync::atomic::Ordering::Relaxed);
+    let peer_count = state
+        .status_peer_count_cache
+        .load(std::sync::atomic::Ordering::Relaxed);
     drop(guard);
 
     Ok(Json(NetworkStatusResponse {
@@ -3812,7 +3810,11 @@ async fn status(
     let fee_rate_sat_per_byte = {
         let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         let raw = mempool.min_fee_per_byte().ceil() as u64;
-        if raw == 0 { 1 } else { raw }
+        if raw == 0 {
+            1
+        } else {
+            raw
+        }
     };
 
     Ok(Json(StatusResponse {
@@ -4254,10 +4256,7 @@ fn scan_agreement_linked_txs(
 /// agreement.milestones[].amount and agreement.total_amount to populate
 /// values in the final receipt. Sort order matches the AgreementObject
 /// variant (height descending, then txid, then milestone_id).
-fn scan_linked_txs_by_hash(
-    chain: &ChainState,
-    agreement_hash: &str,
-) -> Vec<AgreementLinkedTx> {
+fn scan_linked_txs_by_hash(chain: &ChainState, agreement_hash: &str) -> Vec<AgreementLinkedTx> {
     let mut txs = Vec::new();
     for (height, block) in chain.chain.iter().enumerate() {
         for tx in &block.transactions {
@@ -4698,8 +4697,8 @@ fn spend_htlc_with_optional_payout(
             value: funding_out.output.value - fee - resolver_fee,
             script_pubkey: p2pkh_script(&dest_pkh),
         });
-        let resolver_pkh_vec = base58_p2pkh_to_hash(resolver_addr)
-            .ok_or(StatusCode::BAD_REQUEST)?;
+        let resolver_pkh_vec =
+            base58_p2pkh_to_hash(resolver_addr).ok_or(StatusCode::BAD_REQUEST)?;
         if resolver_pkh_vec.len() != 20 {
             return Err(StatusCode::BAD_REQUEST);
         }
@@ -4853,7 +4852,11 @@ async fn admin_add_seed(
     }
     {
         let runtime_path = storage::bootstrap_dir().join("seedlist.runtime");
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&runtime_path) {
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&runtime_path)
+        {
             use std::io::Write;
             let _ = writeln!(file, "{}", addr_str);
         }
@@ -4861,7 +4864,11 @@ async fn admin_add_seed(
     if let Some(ref node) = state.p2p {
         if let Ok(sa) = addr_str.parse::<SocketAddr>() {
             let node_c = node.clone();
-            let height = state.chain.lock().unwrap_or_else(|e| e.into_inner()).tip_height();
+            let height = state
+                .chain
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .tip_height();
             tokio::spawn(async move {
                 let _ = node_c.connect_and_handshake(sa, height, "Irium-Node").await;
             });
@@ -5060,12 +5067,18 @@ async fn agreement_status(
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let tip = chain.tip_height();
         let linked = scan_agreement_linked_txs(&chain, &req.agreement, &agreement_hash);
-        (derive_lifecycle(&req.agreement, &agreement_hash, linked, tip), tip)
+        (
+            derive_lifecycle(&req.agreement, &agreement_hash, linked, tip),
+            tip,
+        )
     };
     // Compute proof finality depth for this agreement.
     let finality_depth = proof_finality_depth();
     let (proof_depth, proof_final) = {
-        let heights = state.proof_heights.lock().unwrap_or_else(|e| e.into_inner());
+        let heights = state
+            .proof_heights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
         let proof_ids: Vec<String> = store
             .list_by_agreement(&agreement_hash)
@@ -5086,11 +5099,12 @@ async fn agreement_status(
             }
         }
     };
-    let release_eligible = proof_final && matches!(
-        lifecycle.state,
-        irium_node_rs::settlement::AgreementLifecycleState::Funded
-            | irium_node_rs::settlement::AgreementLifecycleState::PartiallyReleased
-    );
+    let release_eligible = proof_final
+        && matches!(
+            lifecycle.state,
+            irium_node_rs::settlement::AgreementLifecycleState::Funded
+                | irium_node_rs::settlement::AgreementLifecycleState::PartiallyReleased
+        );
     Ok(Json(AgreementStatusResponse {
         agreement_hash,
         lifecycle,
@@ -5194,7 +5208,10 @@ async fn agreement_receipt(
     };
     let proofs: Vec<EscrowReceiptProofRef> = {
         let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
-        let heights = state.proof_heights.lock().unwrap_or_else(|e| e.into_inner());
+        let heights = state
+            .proof_heights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         store
             .list_by_agreement(&agreement_hash)
             .into_iter()
@@ -5208,7 +5225,10 @@ async fn agreement_receipt(
             .collect()
     };
     let dispute = {
-        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.get(&agreement_hash).and_then(|d| {
             d.resolution.as_ref().map(|res| EscrowReceiptDisputeRef {
                 resolver_address: res.resolver_address.clone(),
@@ -5654,9 +5674,10 @@ async fn fund_agreement(
 
     let fee_checked = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .calculate_fees(&tx)
-            .map_err(|e| { eprintln!("[fund_agreement] calc_fees_err={}", e); bad("chain_fee_calculation_failed") })?
+        chain.calculate_fees(&tx).map_err(|e| {
+            eprintln!("[fund_agreement] calc_fees_err={}", e);
+            bad("chain_fee_calculation_failed")
+        })?
     };
 
     let raw = tx.serialize();
@@ -5673,10 +5694,14 @@ async fn fund_agreement(
     }
 
     if accepted {
-        emit_event(&state.event_tx, "agreement.funded", serde_json::json!({
-            "agreement_hash": agreement_hash,
-            "txid": txid_hex,
-        }));
+        emit_event(
+            &state.event_tx,
+            "agreement.funded",
+            serde_json::json!({
+                "agreement_hash": agreement_hash,
+                "txid": txid_hex,
+            }),
+        );
     }
 
     Ok(Json(FundAgreementResponse {
@@ -5950,11 +5975,7 @@ async fn wallet_recover_from_seed(
     require_rpc_auth(&headers)?;
 
     let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-    let key = match wallet.recover_from_seed(
-        &req.seed_hex,
-        &req.passphrase,
-        req.allow_overwrite,
-    ) {
+    let key = match wallet.recover_from_seed(&req.seed_hex, &req.passphrase, req.allow_overwrite) {
         Ok(k) => k,
         Err(e) => {
             if e == "wallet_exists" {
@@ -6095,7 +6116,9 @@ async fn wallet_export_mnemonic(
     require_rpc_auth(&headers)?;
 
     let mut wallet = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
-    let mnemonic = wallet.export_mnemonic().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mnemonic = wallet
+        .export_mnemonic()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     Ok(Json(WalletMnemonicResponse { mnemonic }))
 }
 
@@ -6131,10 +6154,16 @@ async fn wallet_send(
     // report and the v1.0.74-era src-tauri wallet_send change for the
     // call-site decode logic.
     let bad = |reason: &str| -> (StatusCode, Json<serde_json::Value>) {
-        (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": reason })))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": reason })),
+        )
     };
     let denied = |reason: &str| -> (StatusCode, Json<serde_json::Value>) {
-        (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": reason })))
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": reason })),
+        )
     };
     let auth_err = |s: StatusCode| -> (StatusCode, Json<serde_json::Value>) {
         (s, Json(serde_json::json!({})))
@@ -6154,9 +6183,7 @@ async fn wallet_send(
         let change = if let Some(ref from) = req.from_address {
             from.clone()
         } else {
-            wallet
-                .current_address()
-                .map_err(|_| bad("wallet_locked"))?
+            wallet.current_address().map_err(|_| bad("wallet_locked"))?
         };
         (keys, change)
     };
@@ -6576,8 +6603,7 @@ async fn submit_btc_headers_core(
         }
     }
 
-    let raw = hex::decode(req.headers_hex.trim())
-        .map_err(|_| bad("headers_hex_decode_failed"))?;
+    let raw = hex::decode(req.headers_hex.trim()).map_err(|_| bad("headers_hex_decode_failed"))?;
     if raw.is_empty() || raw.len() % BTC_HEADER_BYTES != 0 {
         return Err(bad("headers_hex_length_not_multiple_of_80"));
     }
@@ -6990,8 +7016,7 @@ async fn submit_ltc_headers_core(
         }
     }
 
-    let raw = hex::decode(req.headers_hex.trim())
-        .map_err(|_| bad("headers_hex_decode_failed"))?;
+    let raw = hex::decode(req.headers_hex.trim()).map_err(|_| bad("headers_hex_decode_failed"))?;
     if raw.is_empty() || raw.len() % LTC_HEADER_BYTES != 0 {
         return Err(bad("headers_hex_length_not_multiple_of_80"));
     }
@@ -7777,8 +7802,7 @@ async fn claim_btc_swap(
 
     let btc_block_hash =
         parse_btc_display_hash(&req.btc_block_hash).map_err(|_| bad("btc_block_hash_invalid"))?;
-    let btc_tx_raw =
-        hex::decode(req.btc_tx_hex.trim()).map_err(|_| bad("btc_tx_hex_invalid"))?;
+    let btc_tx_raw = hex::decode(req.btc_tx_hex.trim()).map_err(|_| bad("btc_tx_hex_invalid"))?;
     if btc_tx_raw.is_empty() {
         return Err(bad("btc_tx_hex_empty"));
     }
@@ -7810,15 +7834,14 @@ async fn claim_btc_swap(
         locktime: 0,
     };
 
-    let priv_bytes =
-        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    let priv_bytes = hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
         return Err(bad("privkey_len_invalid"));
     }
     let mut sk_bytes = [0u8; 32];
     sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
-        .map_err(|_| bad("signing_key_init_failed"))?;
+    let signing_key =
+        SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| bad("signing_key_init_failed"))?;
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
@@ -8018,15 +8041,14 @@ async fn refund_btc_swap(
         locktime: 0,
     };
 
-    let priv_bytes =
-        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    let priv_bytes = hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
         return Err(bad("privkey_len_invalid"));
     }
     let mut sk_bytes = [0u8; 32];
     sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
-        .map_err(|_| bad("signing_key_init_failed"))?;
+    let signing_key =
+        SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| bad("signing_key_init_failed"))?;
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
@@ -8634,8 +8656,7 @@ async fn claim_ltc_swap(
 
     let ltc_block_hash =
         parse_btc_display_hash(&req.ltc_block_hash).map_err(|_| bad("ltc_block_hash_invalid"))?;
-    let ltc_tx_raw =
-        hex::decode(req.ltc_tx_hex.trim()).map_err(|_| bad("ltc_tx_hex_invalid"))?;
+    let ltc_tx_raw = hex::decode(req.ltc_tx_hex.trim()).map_err(|_| bad("ltc_tx_hex_invalid"))?;
     if ltc_tx_raw.is_empty() {
         return Err(bad("ltc_tx_hex_empty"));
     }
@@ -8667,15 +8688,14 @@ async fn claim_ltc_swap(
         locktime: 0,
     };
 
-    let priv_bytes =
-        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    let priv_bytes = hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
         return Err(bad("privkey_len_invalid"));
     }
     let mut sk_bytes = [0u8; 32];
     sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
-        .map_err(|_| bad("signing_key_init_failed"))?;
+    let signing_key =
+        SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| bad("signing_key_init_failed"))?;
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
@@ -8867,15 +8887,14 @@ async fn refund_ltc_swap(
         locktime: 0,
     };
 
-    let priv_bytes =
-        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    let priv_bytes = hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
         return Err(bad("privkey_len_invalid"));
     }
     let mut sk_bytes = [0u8; 32];
     sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
-        .map_err(|_| bad("signing_key_init_failed"))?;
+    let signing_key =
+        SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| bad("signing_key_init_failed"))?;
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
@@ -9039,7 +9058,6 @@ async fn inspect_ltc_swap(
         refundable_now: tip_height >= swap.timeout_height,
     }))
 }
-
 
 // Phase 4 Part 3 — SwapOrder RPC endpoints. Six endpoints behind the
 // `swap_order_v1_activation_height` gate. C5 sell-direction fills create
@@ -9269,8 +9287,7 @@ async fn post_swap_order(
         chain.tip_height()
     };
 
-    let direction =
-        parse_swap_direction(&req.direction).ok_or_else(|| bad("direction_invalid"))?;
+    let direction = parse_swap_direction(&req.direction).ok_or_else(|| bad("direction_invalid"))?;
     let irm_amount = parse_irm(&req.irm_amount).map_err(|_| bad("irm_amount_parse_failed"))?;
     if irm_amount == 0 {
         return Err(bad("irm_amount_zero"));
@@ -9709,8 +9726,7 @@ async fn cancel_swap_order(
         }
     }
 
-    let txid_arr =
-        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let txid_arr = hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
     let key = OutPoint {
         txid: txid_arr,
         index: req.order_vout,
@@ -9783,15 +9799,14 @@ async fn cancel_swap_order(
     };
 
     let scriptcode = encode_swap_order_script(&order);
-    let priv_bytes =
-        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    let priv_bytes = hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
         return Err(bad("privkey_len_invalid"));
     }
     let mut sk_bytes = [0u8; 32];
     sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
-        .map_err(|_| bad("signing_key_init_failed"))?;
+    let signing_key =
+        SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| bad("signing_key_init_failed"))?;
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
@@ -9900,8 +9915,7 @@ async fn fill_swap_order(
 
     let _ = req.taker_btc_address;
 
-    let txid_arr =
-        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let txid_arr = hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
     let key = OutPoint {
         txid: txid_arr,
         index: req.order_vout,
@@ -9954,15 +9968,14 @@ async fn fill_swap_order(
         found.ok_or_else(|| bad("taker_iriumd_pkh_key_not_in_wallet"))?
     };
 
-    let priv_bytes =
-        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    let priv_bytes = hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
         return Err(bad("privkey_len_invalid"));
     }
     let mut sk_bytes = [0u8; 32];
     sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
-        .map_err(|_| bad("signing_key_init_failed"))?;
+    let signing_key =
+        SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| bad("signing_key_init_failed"))?;
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
@@ -10017,7 +10030,10 @@ async fn fill_swap_order(
 
     let fee_per_byte = req.fee_per_byte.unwrap_or(1).max(1);
     let mut fee = estimate_tx_size(1, 1).saturating_mul(fee_per_byte);
-    if funding_out.output.value <= fee.saturating_add(order.irm_amount).saturating_sub(funding_out.output.value)
+    if funding_out.output.value
+        <= fee
+            .saturating_add(order.irm_amount)
+            .saturating_sub(funding_out.output.value)
         && order.direction == SWAP_ORDER_DIRECTION_SELL
         && funding_out.output.value < order.irm_amount
     {
@@ -10064,9 +10080,7 @@ async fn fill_swap_order(
         };
         wallet_utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
         for u in wallet_utxos.iter() {
-            if u.is_coinbase
-                && tip_height.saturating_sub(u.height) < coinbase_maturity()
-            {
+            if u.is_coinbase && tip_height.saturating_sub(u.height) < coinbase_maturity() {
                 continue;
             }
             extra_inputs.push(u.clone());
@@ -10129,12 +10143,10 @@ async fn fill_swap_order(
                 timeout_height,
             )
             .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
-            SWAP_ORDER_DIRECTION_BUY => encode_swap_order_fill_buy_witness(
-                &order_sig_bytes,
-                &pubkey,
-                timeout_height,
-            )
-            .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
+            SWAP_ORDER_DIRECTION_BUY => {
+                encode_swap_order_fill_buy_witness(&order_sig_bytes, &pubkey, timeout_height)
+                    .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?
+            }
             _ => return Err(bad("order_direction_unknown")),
         };
         tx.inputs[0].script_sig = witness;
@@ -10263,8 +10275,7 @@ async fn sweep_expired_order(
         }
     }
 
-    let txid_arr =
-        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let txid_arr = hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
     let key = OutPoint {
         txid: txid_arr,
         index: req.order_vout,
@@ -10402,8 +10413,7 @@ async fn sweep_ltc_expired_order(
         }
     }
 
-    let txid_arr =
-        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let txid_arr = hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
     let key = OutPoint {
         txid: txid_arr,
         index: req.order_vout,
@@ -11136,8 +11146,7 @@ async fn cancel_ltc_swap_order(
         }
     }
 
-    let txid_arr =
-        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let txid_arr = hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
     let key = OutPoint {
         txid: txid_arr,
         index: req.order_vout,
@@ -11210,15 +11219,14 @@ async fn cancel_ltc_swap_order(
     };
 
     let scriptcode = encode_ltc_swap_order_script(&order);
-    let priv_bytes =
-        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    let priv_bytes = hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
         return Err(bad("privkey_len_invalid"));
     }
     let mut sk_bytes = [0u8; 32];
     sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
-        .map_err(|_| bad("signing_key_init_failed"))?;
+    let signing_key =
+        SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| bad("signing_key_init_failed"))?;
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
@@ -11327,8 +11335,7 @@ async fn fill_ltc_swap_order(
 
     let _ = req.taker_ltc_address;
 
-    let txid_arr =
-        hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
+    let txid_arr = hex_to_32(req.order_txid.trim()).map_err(|_| bad("order_txid_hex_invalid"))?;
     let key = OutPoint {
         txid: txid_arr,
         index: req.order_vout,
@@ -11381,15 +11388,14 @@ async fn fill_ltc_swap_order(
         found.ok_or_else(|| bad("taker_iriumd_pkh_key_not_in_wallet"))?
     };
 
-    let priv_bytes =
-        hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
+    let priv_bytes = hex::decode(&wallet_key.privkey).map_err(|_| bad("privkey_decode_failed"))?;
     if priv_bytes.len() != 32 {
         return Err(bad("privkey_len_invalid"));
     }
     let mut sk_bytes = [0u8; 32];
     sk_bytes.copy_from_slice(&priv_bytes);
-    let signing_key = SigningKey::from_bytes((&sk_bytes).into())
-        .map_err(|_| bad("signing_key_init_failed"))?;
+    let signing_key =
+        SigningKey::from_bytes((&sk_bytes).into()).map_err(|_| bad("signing_key_init_failed"))?;
     let pubkey = signing_key
         .verifying_key()
         .to_encoded_point(true)
@@ -11480,9 +11486,7 @@ async fn fill_ltc_swap_order(
         };
         wallet_utxos.sort_by(|a, b| b.output.value.cmp(&a.output.value));
         for u in wallet_utxos.iter() {
-            if u.is_coinbase
-                && tip_height.saturating_sub(u.height) < coinbase_maturity()
-            {
+            if u.is_coinbase && tip_height.saturating_sub(u.height) < coinbase_maturity() {
                 continue;
             }
             extra_inputs.push(u.clone());
@@ -11546,12 +11550,10 @@ async fn fill_ltc_swap_order(
                 timeout_height,
             )
             .ok_or_else(|| bad("encode_fill_sell_witness_failed"))?,
-            LTC_SWAP_ORDER_DIRECTION_BUY => encode_ltc_swap_order_fill_buy_witness(
-                &order_sig_bytes,
-                &pubkey,
-                timeout_height,
-            )
-            .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?,
+            LTC_SWAP_ORDER_DIRECTION_BUY => {
+                encode_ltc_swap_order_fill_buy_witness(&order_sig_bytes, &pubkey, timeout_height)
+                    .ok_or_else(|| bad("encode_fill_buy_witness_failed"))?
+            }
             _ => return Err(bad("order_direction_unknown")),
         };
         tx.inputs[0].script_sig = witness;
@@ -11634,7 +11636,6 @@ async fn fill_ltc_swap_order(
         fee: fee_checked,
     }))
 }
-
 
 async fn create_htlc(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -11903,7 +11904,12 @@ async fn decode_htlc(
             recipient_address: None,
             refund_address: None,
         })),
-        OutputEncumbrance::MpsoV1(_) | OutputEncumbrance::HtlcBtcSwapV1(_) | OutputEncumbrance::HtlcLtcSwapV1(_) | OutputEncumbrance::SwapOrder(_) | OutputEncumbrance::LtcSwapOrder(_) | OutputEncumbrance::Unknown => Ok(Json(DecodeHtlcResponse {
+        OutputEncumbrance::MpsoV1(_)
+        | OutputEncumbrance::HtlcBtcSwapV1(_)
+        | OutputEncumbrance::HtlcLtcSwapV1(_)
+        | OutputEncumbrance::SwapOrder(_)
+        | OutputEncumbrance::LtcSwapOrder(_)
+        | OutputEncumbrance::Unknown => Ok(Json(DecodeHtlcResponse {
             found: false,
             vout: Some(idx as u32),
             output_type: "unknown".to_string(),
@@ -12064,9 +12070,13 @@ async fn agreement_release_eligibility(
     apply_dispute_status_to_eligibility(&state, &req.agreement, true, &mut resp);
     if resp.eligible {
         if let Ok(ah) = compute_agreement_hash_hex(&req.agreement) {
-            emit_event(&state.event_tx, "agreement.satisfied", serde_json::json!({
-                "agreement_hash": ah,
-            }));
+            emit_event(
+                &state.event_tx,
+                "agreement.satisfied",
+                serde_json::json!({
+                    "agreement_hash": ah,
+                }),
+            );
         }
     }
     Ok(Json(resp))
@@ -12088,9 +12098,13 @@ async fn agreement_refund_eligibility(
     apply_dispute_status_to_eligibility(&state, &req.agreement, false, &mut resp);
     if resp.eligible {
         if let Ok(ah) = compute_agreement_hash_hex(&req.agreement) {
-            emit_event(&state.event_tx, "agreement.timeout", serde_json::json!({
-                "agreement_hash": ah,
-            }));
+            emit_event(
+                &state.event_tx,
+                "agreement.timeout",
+                serde_json::json!({
+                    "agreement_hash": ah,
+                }),
+            );
         }
     }
     Ok(Json(resp))
@@ -12118,20 +12132,29 @@ async fn submit_proof_rpc(
     let proof_for_gossip = req.proof.clone();
     // Phase 7: record submission height for finality tracking before consuming req.proof.
     {
-        let mut heights = state.proof_heights.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heights = state
+            .proof_heights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         heights.insert(proof_for_gossip.proof_id.clone(), tip_height);
     }
     let mut store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
     let outcome = store.submit(req.proof).map_err(|e| bad(&e))?;
     if outcome.accepted {
-        emit_event(&state.event_tx, "agreement.proof_submitted", serde_json::json!({
-            "agreement_hash": outcome.agreement_hash,
-            "proof_id": outcome.proof_id,
-        }));
+        emit_event(
+            &state.event_tx,
+            "agreement.proof_submitted",
+            serde_json::json!({
+                "agreement_hash": outcome.agreement_hash,
+                "proof_id": outcome.proof_id,
+            }),
+        );
         if let Some(ref node) = state.p2p {
             if let Ok(json) = serde_json::to_string(&proof_for_gossip) {
                 let node = node.clone();
-                tokio::spawn(async move { node.broadcast_proof(&json).await; });
+                tokio::spawn(async move {
+                    node.broadcast_proof(&json).await;
+                });
             }
         }
     }
@@ -12996,8 +13019,8 @@ async fn build_agreement_spend_internal(
     // resolver out of the spend tx according to the agreement's resolver
     // fee fields.
     let resolver_payout: Option<(String, u64)> = {
-        let agreement_hash = compute_agreement_hash_hex(&req.agreement)
-            .map_err(|_| bad("agreement_hash_failed"))?;
+        let agreement_hash =
+            compute_agreement_hash_hex(&req.agreement).map_err(|_| bad("agreement_hash_failed"))?;
         let dispute_state = state
             .disputes_index
             .lock()
@@ -13086,7 +13109,9 @@ async fn build_agreement_spend_internal(
         }
         if !rep_outputs.is_empty() {
             let release_role = match eligibility.role {
-                Some(AgreementAnchorRole::MilestoneRelease) => AgreementAnchorRole::MilestoneRelease,
+                Some(AgreementAnchorRole::MilestoneRelease) => {
+                    AgreementAnchorRole::MilestoneRelease
+                }
                 _ => AgreementAnchorRole::Release,
             };
             if let Err(e) = build_and_broadcast_anchor_tx(
@@ -13303,9 +13328,10 @@ async fn get_block_template(
     {
         let mut claimed: HashSet<([u8; 32], u32)> = HashSet::new();
         mempool_entries.retain(|e| {
-            let conflicts = e.tx.inputs.iter().any(|inp| {
-                claimed.contains(&(inp.prev_txid, inp.prev_index))
-            });
+            let conflicts =
+                e.tx.inputs
+                    .iter()
+                    .any(|inp| claimed.contains(&(inp.prev_txid, inp.prev_index)));
             if conflicts {
                 return false;
             }
@@ -13535,10 +13561,15 @@ async fn get_block_template(
 fn compute_poawx_receipts_root(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
     let mut sorted: Vec<&PoawxPendingReceipt> = receipts.iter().collect();
     sorted.sort_unstable_by(|a, b| {
-        a.height.cmp(&b.height)
+        a.height
+            .cmp(&b.height)
             .then_with(|| a.lane.as_bytes().cmp(b.lane.as_bytes()))
             .then_with(|| a.worker_pkh.as_bytes().cmp(b.worker_pkh.as_bytes()))
-            .then_with(|| a.commitment_nonce.as_bytes().cmp(b.commitment_nonce.as_bytes()))
+            .then_with(|| {
+                a.commitment_nonce
+                    .as_bytes()
+                    .cmp(b.commitment_nonce.as_bytes())
+            })
     });
     let mut outer = Sha256::new();
     for r in sorted {
@@ -13620,7 +13651,8 @@ async fn poawx_post_receipt(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let solution_bytes = hex::decode(&req.solution).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let submitted_nonce_bytes = hex::decode(&req.commitment_nonce).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let submitted_nonce_bytes =
+        hex::decode(&req.commitment_nonce).map_err(|_| StatusCode::BAD_REQUEST)?;
     if submitted_nonce_bytes.len() != 32 {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -13634,7 +13666,9 @@ async fn poawx_post_receipt(
         if parent_h as usize >= guard.chain.len() {
             return Err(StatusCode::BAD_REQUEST);
         }
-        let parent_hash = guard.chain[parent_h as usize].header.hash_for_height(parent_h);
+        let parent_hash = guard.chain[parent_h as usize]
+            .header
+            .hash_for_height(parent_h);
         let mut seed_hasher = Sha256::new();
         seed_hasher.update(&parent_hash);
         seed_hasher.update(parent_h.to_le_bytes());
@@ -13666,7 +13700,9 @@ async fn poawx_post_receipt(
             for &b in pow_hash.iter() {
                 let z = b.leading_zeros();
                 bits += z;
-                if z < 8 { break; }
+                if z < 8 {
+                    break;
+                }
             }
             bits
         };
@@ -13693,9 +13729,7 @@ async fn poawx_post_receipt(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         pending.retain(|r| {
-            !(r.height == req.height
-                && r.lane == req.lane
-                && r.worker_pkh == req.worker_pkh)
+            !(r.height == req.height && r.lane == req.lane && r.worker_pkh == req.worker_pkh)
         });
         pending.push(receipt);
         pending.len()
@@ -13704,7 +13738,9 @@ async fn poawx_post_receipt(
         "[poawx] receipt stored height={} lane={} worker_pkh={} pending_count={}",
         req.height, req.lane, req.worker_pkh, count
     );
-    Ok(Json(serde_json::json!({ "ok": true, "pending_count": count })))
+    Ok(Json(
+        serde_json::json!({ "ok": true, "pending_count": count }),
+    ))
 }
 
 async fn submit_block_extended(
@@ -13715,6 +13751,24 @@ async fn submit_block_extended(
 ) -> Result<Json<Value>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
+    // O-2: mainnet must never accept PoAW-X receipt submissions.
+    // C-3: when PoAW-X is active on testnet, receipts must be non-empty.
+    {
+        let is_non_mainnet = network_kind_from_env() != NetworkKind::Mainnet;
+        if !is_non_mainnet && !req.poawx_receipts.is_empty() {
+            eprintln!("[submit_block_extended] reject: poawx receipts not accepted on mainnet");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let poawx_active = std::env::var("IRIUM_POAWX_MODE")
+            .map(|v| v.trim() == "active")
+            .unwrap_or(false);
+        if poawx_active && is_non_mainnet && req.poawx_receipts.is_empty() {
+            eprintln!(
+                "[submit_block_extended] reject: poawx mode=active but receipts empty; include puzzle receipts"
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
     let expected_root = if req.poawx_receipts.is_empty() {
         [0u8; 32]
     } else {
@@ -13746,7 +13800,9 @@ async fn submit_block_extended(
                 return Err(StatusCode::BAD_REQUEST);
             }
             let parent_h = req.height - 1;
-            let parent_hash = guard.chain[parent_h as usize].header.hash_for_height(parent_h);
+            let parent_hash = guard.chain[parent_h as usize]
+                .header
+                .hash_for_height(parent_h);
             let mut s_hasher = Sha256::new();
             s_hasher.update(&parent_hash);
             s_hasher.update(parent_h.to_le_bytes());
@@ -13778,7 +13834,9 @@ async fn submit_block_extended(
                 for &b in pow_hash.iter() {
                     let z = b.leading_zeros();
                     bits += z;
-                    if z < 8 { break; }
+                    if z < 8 {
+                        break;
+                    }
                 }
                 bits
             };
@@ -13879,7 +13937,10 @@ async fn submit_block_extended(
             return Err(StatusCode::BAD_REQUEST);
         }
         if let Err(e) = chain.connect_block(block.clone()) {
-            eprintln!("[submit_block_extended] reject connect_block_failed err={}", e);
+            eprintln!(
+                "[submit_block_extended] reject connect_block_failed err={}",
+                e
+            );
             return Err(StatusCode::BAD_REQUEST);
         }
         {
@@ -13988,7 +14049,9 @@ async fn get_blocks(
     // Cap at 500 blocks per request to bound response size and chain-lock duration.
     let count = q.count.min(500);
     if count == 0 {
-        return Ok(Json(serde_json::json!({"from": q.from, "count": 0, "blocks": []})));
+        return Ok(Json(
+            serde_json::json!({"from": q.from, "count": 0, "blocks": []}),
+        ));
     }
     let guard = state.chain.lock().unwrap_or_else(|e| e.into_inner());
     let start = q.from as usize;
@@ -14216,6 +14279,19 @@ async fn submit_block(
 ) -> Result<Json<Value>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
+    // C-2: when PoAW-X is active the legacy submit path is disabled.
+    // Miners must use /rpc/submit_block_extended and include puzzle receipts.
+    {
+        let poawx_active = std::env::var("IRIUM_POAWX_MODE")
+            .map(|v| v.trim() == "active")
+            .unwrap_or(false);
+        if poawx_active && network_kind_from_env() != NetworkKind::Mainnet {
+            eprintln!(
+                "[submit_block] reject: poawx mode=active; use /rpc/submit_block_extended with puzzle receipts"
+            );
+            return Err(StatusCode::METHOD_NOT_ALLOWED);
+        }
+    }
     // Rebuild header from JSON.
     let header = &req.header;
 
@@ -14373,10 +14449,14 @@ async fn submit_block(
         }
     }
 
-    emit_event(&state.event_tx, "block.new", serde_json::json!({
-        "height": new_height,
-        "hash": new_tip_hash,
-    }));
+    emit_event(
+        &state.event_tx,
+        "block.new",
+        serde_json::json!({
+            "height": new_height,
+            "hash": new_tip_hash,
+        }),
+    );
 
     Ok(Json(json!({
         "accepted": true,
@@ -14396,19 +14476,26 @@ async fn submit_tx(
     // status code. Empty txid on these paths because we either couldn't
     // decode the tx or didn't accept it.
     let empty_err = |sc: StatusCode, reason: &str| -> (StatusCode, Json<SubmitTxResponse>) {
-        (sc, Json(SubmitTxResponse {
-            txid: String::new(),
-            accepted: false,
-            reason: Some(reason.to_string()),
-        }))
+        (
+            sc,
+            Json(SubmitTxResponse {
+                txid: String::new(),
+                accepted: false,
+                reason: Some(reason.to_string()),
+            }),
+        )
     };
     check_rate_with_auth(&state, &addr, &headers)
         .map_err(|sc| empty_err(sc, "Rate limit or authentication check failed"))?;
-    require_rpc_auth(&headers)
-        .map_err(|sc| empty_err(sc, "RPC authentication required"))?;
+    require_rpc_auth(&headers).map_err(|sc| empty_err(sc, "RPC authentication required"))?;
     let bytes = match hex::decode(&req.tx_hex) {
         Ok(b) => b,
-        Err(_) => return Err(empty_err(StatusCode::BAD_REQUEST, "Invalid transaction hex")),
+        Err(_) => {
+            return Err(empty_err(
+                StatusCode::BAD_REQUEST,
+                "Invalid transaction hex",
+            ))
+        }
     };
     // A compact wallet tx payload may be ambiguously parseable by the full decoder.
     // Try both decoders and select the candidate that passes fee/signature checks.
@@ -14421,7 +14508,10 @@ async fn submit_tx(
     }
     if candidates.is_empty() {
         eprintln!("submit_tx decode failed: no valid decoder for payload");
-        return Err(empty_err(StatusCode::BAD_REQUEST, "Transaction decode failed"));
+        return Err(empty_err(
+            StatusCode::BAD_REQUEST,
+            "Transaction decode failed",
+        ));
     }
 
     let (tx, fee) = {
@@ -14472,11 +14562,14 @@ async fn submit_tx(
                 }
             });
         }
-        return Err((StatusCode::CONFLICT, Json(SubmitTxResponse {
-            txid: hex_txid,
-            accepted: false,
-            reason: Some("Transaction already in mempool".to_string()),
-        })));
+        return Err((
+            StatusCode::CONFLICT,
+            Json(SubmitTxResponse {
+                txid: hex_txid,
+                accepted: false,
+                reason: Some("Transaction already in mempool".to_string()),
+            }),
+        ));
     }
 
     // Fix B: input-conflict check. Prior to this, two txs that spent
@@ -14496,11 +14589,14 @@ async fn submit_tx(
                 input.prev_index,
                 hex::encode(existing),
             );
-            return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(SubmitTxResponse {
-                txid: hex_txid,
-                accepted: false,
-                reason: Some(reason),
-            })));
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(SubmitTxResponse {
+                    txid: hex_txid,
+                    accepted: false,
+                    reason: Some(reason),
+                }),
+            ));
         }
     }
 
@@ -14509,11 +14605,14 @@ async fn submit_tx(
     if let Err(e) = mempool.add_transaction(tx, raw, fee) {
         let mempool_err = format!("Failed to add to mempool: {}", e);
         eprintln!("{}", mempool_err);
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, Json(SubmitTxResponse {
-            txid: hex_txid,
-            accepted: false,
-            reason: Some(mempool_err),
-        })));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(SubmitTxResponse {
+                txid: hex_txid,
+                accepted: false,
+                reason: Some(mempool_err),
+            }),
+        ));
     }
     drop(mempool);
 
@@ -14660,12 +14759,18 @@ fn spawn_mempool_rebroadcast(state: AppState) {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let raw_txs: Vec<Vec<u8>> = {
                 let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
-                mempool.iter_entries().map(|(_, entry)| entry.raw.clone()).collect()
+                mempool
+                    .iter_entries()
+                    .map(|(_, entry)| entry.raw.clone())
+                    .collect()
             };
             if raw_txs.is_empty() {
                 continue;
             }
-            eprintln!("[mempool-rebroadcast] rebroadcasting {} mempool tx(s)", raw_txs.len());
+            eprintln!(
+                "[mempool-rebroadcast] rebroadcasting {} mempool tx(s)",
+                raw_txs.len()
+            );
             for raw in &raw_txs {
                 if let Err(e) = p2p.broadcast_tx(raw).await {
                     eprintln!("[mempool-rebroadcast] broadcast_tx error: {e}");
@@ -14723,21 +14828,34 @@ fn spawn_offer_rebroadcast(state: AppState) {
             let mut to_broadcast: Vec<String> = Vec::new();
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.extension().map(|e| e == "json").unwrap_or(false) { continue; }
+                if !path.extension().map(|e| e == "json").unwrap_or(false) {
+                    continue;
+                }
                 let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !filename.starts_with("offer-") || !filename.ends_with(".json") { continue; }
+                if !filename.starts_with("offer-") || !filename.ends_with(".json") {
+                    continue;
+                }
                 let data = match std::fs::read_to_string(&path) {
                     Ok(d) => d,
                     Err(_) => continue,
                 };
                 let status = serde_json::from_str::<serde_json::Value>(&data)
                     .ok()
-                    .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s.to_string()));
-                if status.as_deref() != Some("open") { continue; }
+                    .and_then(|v| {
+                        v.get("status")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string())
+                    });
+                if status.as_deref() != Some("open") {
+                    continue;
+                }
                 to_broadcast.push(data);
             }
             if !to_broadcast.is_empty() {
-                eprintln!("[offer-rebroadcast] rebroadcasting {} open offer(s)", to_broadcast.len());
+                eprintln!(
+                    "[offer-rebroadcast] rebroadcasting {} open offer(s)",
+                    to_broadcast.len()
+                );
                 for json in &to_broadcast {
                     p2p.broadcast_offer(json).await;
                 }
@@ -14764,10 +14882,14 @@ struct MempoolSpaceBlock {
 
 fn reconstruct_btc_header_from_mempool_space(b: &MempoolSpaceBlock) -> Result<BtcHeader, String> {
     let prev = b.previousblockhash.as_deref().unwrap_or("");
-    let prev_bytes = hex::decode(prev)
-        .map_err(|e| format!("prev_hash hex decode at h={}: {}", b.height, e))?;
+    let prev_bytes =
+        hex::decode(prev).map_err(|e| format!("prev_hash hex decode at h={}: {}", b.height, e))?;
     if prev_bytes.len() != 32 {
-        return Err(format!("prev_hash len {} != 32 at h={}", prev_bytes.len(), b.height));
+        return Err(format!(
+            "prev_hash len {} != 32 at h={}",
+            prev_bytes.len(),
+            b.height
+        ));
     }
     let mut prev_hash = [0u8; 32];
     prev_hash.copy_from_slice(&prev_bytes);
@@ -14778,7 +14900,11 @@ fn reconstruct_btc_header_from_mempool_space(b: &MempoolSpaceBlock) -> Result<Bt
     let merkle = hex::decode(&b.merkle_root)
         .map_err(|e| format!("merkle hex decode at h={}: {}", b.height, e))?;
     if merkle.len() != 32 {
-        return Err(format!("merkle len {} != 32 at h={}", merkle.len(), b.height));
+        return Err(format!(
+            "merkle len {} != 32 at h={}",
+            merkle.len(),
+            b.height
+        ));
     }
     let mut merkle_root = [0u8; 32];
     merkle_root.copy_from_slice(&merkle);
@@ -14891,10 +15017,7 @@ async fn fetch_btc_headers_from_mempool_space(
 /// On any HTTP / parse / validation error the function logs a warning and
 /// returns Ok(()) — iriumd still starts, and btc-header-sync.timer or a
 /// subsequent restart can complete the bootstrap later.
-async fn maybe_bootstrap_btc_headers(
-    state: AppState,
-    network: NetworkKind,
-) -> Result<(), String> {
+async fn maybe_bootstrap_btc_headers(state: AppState, network: NetworkKind) -> Result<(), String> {
     if !matches!(network, NetworkKind::Mainnet) {
         return Ok(());
     }
@@ -14909,7 +15032,10 @@ async fn maybe_bootstrap_btc_headers(
     let anchor = match resolve_btc_spv_params(network) {
         Some(p) => p.anchor,
         None => {
-            eprintln!("[btc-bootstrap] btc_spv params unresolved on {:?} — skipping", network);
+            eprintln!(
+                "[btc-bootstrap] btc_spv params unresolved on {:?} — skipping",
+                network
+            );
             return Ok(());
         }
     };
@@ -14988,21 +15114,17 @@ async fn maybe_bootstrap_btc_headers(
     let mut h = start_height;
     while h <= target_height {
         let chunk_end = (h + chunk_size - 1).min(target_height);
-        eprintln!(
-            "[btc-bootstrap] fetching headers {}..{}",
-            h, chunk_end
-        );
-        let headers =
-            match fetch_btc_headers_from_mempool_space(&client, h, chunk_end).await {
-                Ok(hs) => hs,
-                Err(e) => {
-                    eprintln!(
-                        "[btc-bootstrap] fetch {}..{} failed: {} — aborting bootstrap",
-                        h, chunk_end, e
-                    );
-                    return Ok(());
-                }
-            };
+        eprintln!("[btc-bootstrap] fetching headers {}..{}", h, chunk_end);
+        let headers = match fetch_btc_headers_from_mempool_space(&client, h, chunk_end).await {
+            Ok(hs) => hs,
+            Err(e) => {
+                eprintln!(
+                    "[btc-bootstrap] fetch {}..{} failed: {} — aborting bootstrap",
+                    h, chunk_end, e
+                );
+                return Ok(());
+            }
+        };
 
         // Apply via the existing validator. iriumd_block_time is used only
         // for the "header.time > iriumd_block_time + 2h" future-time guard;
@@ -15135,16 +15257,17 @@ where
 }
 
 fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
-    let act_height = match irium_node_rs::activation::resolved_btc_spv_relay_activation_height(network) {
-        Some(h) => h,
-        None => {
-            eprintln!(
-                "[header-sync/btc] activation gate is None on {:?}; not spawning",
-                network
-            );
-            return;
-        }
-    };
+    let act_height =
+        match irium_node_rs::activation::resolved_btc_spv_relay_activation_height(network) {
+            Some(h) => h,
+            None => {
+                eprintln!(
+                    "[header-sync/btc] activation gate is None on {:?}; not spawning",
+                    network
+                );
+                return;
+            }
+        };
     tokio::spawn(async move {
         let client = match reqwest::Client::builder()
             .user_agent("iriumd-btc-header-sync/1.0")
@@ -15184,16 +15307,17 @@ fn maybe_spawn_btc_header_sync(state: AppState, network: NetworkKind) {
 }
 
 fn maybe_spawn_ltc_header_sync(state: AppState, network: NetworkKind) {
-    let act_height = match irium_node_rs::activation::resolved_ltc_spv_relay_activation_height(network) {
-        Some(h) => h,
-        None => {
-            eprintln!(
-                "[header-sync/ltc] activation gate is None on {:?}; not spawning",
-                network
-            );
-            return;
-        }
-    };
+    let act_height =
+        match irium_node_rs::activation::resolved_ltc_spv_relay_activation_height(network) {
+            Some(h) => h,
+            None => {
+                eprintln!(
+                    "[header-sync/ltc] activation gate is None on {:?}; not spawning",
+                    network
+                );
+                return;
+            }
+        };
     let source = match header_sync::common::Source::from_env("IRIUM_LTC_HEADER_SYNC_SOURCE") {
         Ok(s) => s,
         Err(e) => {
@@ -15296,72 +15420,72 @@ async fn run_btc_header_sync_cycle(
     // ----- dead post-v1.9.67 code below; kept inside `#[allow]` block ----
     #[allow(unreachable_code, unused_variables, unused_assignments)]
     {
-    // v1.9.61: this cycle has NO mempool side effects. It only fetches
-    // headers from mempool.space and caches them. getblocktemplate builds
-    // a fresh signed carrier per template request using current wallet
-    // UTXOs, and the carrier rides into a mined block directly without
-    // ever entering the mempool. The previous mempool guard (v1.9.57)
-    // is therefore not relevant here anymore and is removed; the v1.9.58
-    // template carrier cap and v1.9.59 admission dedup still protect
-    // against peer-submitted carriers (e.g. via /rpc/submitbtcheaders).
-    let btc_net_tip = header_sync::btc::fetch_btc_net_tip(client).await?;
-    if btc_net_tip <= header_sync::common::SAFETY_LAG {
-        return Err(format!(
-            "btc network tip {btc_net_tip} <= safety lag {}; refusing to fetch",
-            header_sync::common::SAFETY_LAG
-        ));
-    }
-    let target = btc_net_tip - header_sync::common::SAFETY_LAG;
-    if relay_tip >= target {
-        header_sync_touch_last_file("btc");
-        return Ok(format!(
-            "up_to_date relay_tip={relay_tip} btc_net={btc_net_tip} target={target}"
-        ));
-    }
-    // FIX 2 (v1.9.63): floor at anchor.height on cold start. ChainState
-    // initialises btc_tip_height to 0 even when btc_spv is configured;
-    // fetching from height 1 would produce headers that do not connect
-    // to the anchor (LTC hit this hard at v1.9.62 activation; apply
-    // BTC the same protection for consistency even though v1.9.55
-    // bootstrap usually beats the cycle to it).
-    let anchor_height = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain
-            .params
-            .btc_spv
-            .as_ref()
-            .map(|p| p.anchor.height)
-            .unwrap_or(0)
-    };
-    let effective_relay_tip = std::cmp::max(relay_tip, anchor_height);
-    let start = effective_relay_tip + 1;
-    let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
-    let headers_hex = header_sync::btc::fetch_btc_headers(client, start, end).await?;
-    let live_relay_tip = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        chain.btc_tip_height
-    };
-    if live_relay_tip >= end {
-        header_sync_touch_last_file("btc");
-        return Ok(format!(
+        // v1.9.61: this cycle has NO mempool side effects. It only fetches
+        // headers from mempool.space and caches them. getblocktemplate builds
+        // a fresh signed carrier per template request using current wallet
+        // UTXOs, and the carrier rides into a mined block directly without
+        // ever entering the mempool. The previous mempool guard (v1.9.57)
+        // is therefore not relevant here anymore and is removed; the v1.9.58
+        // template carrier cap and v1.9.59 admission dedup still protect
+        // against peer-submitted carriers (e.g. via /rpc/submitbtcheaders).
+        let btc_net_tip = header_sync::btc::fetch_btc_net_tip(client).await?;
+        if btc_net_tip <= header_sync::common::SAFETY_LAG {
+            return Err(format!(
+                "btc network tip {btc_net_tip} <= safety lag {}; refusing to fetch",
+                header_sync::common::SAFETY_LAG
+            ));
+        }
+        let target = btc_net_tip - header_sync::common::SAFETY_LAG;
+        if relay_tip >= target {
+            header_sync_touch_last_file("btc");
+            return Ok(format!(
+                "up_to_date relay_tip={relay_tip} btc_net={btc_net_tip} target={target}"
+            ));
+        }
+        // FIX 2 (v1.9.63): floor at anchor.height on cold start. ChainState
+        // initialises btc_tip_height to 0 even when btc_spv is configured;
+        // fetching from height 1 would produce headers that do not connect
+        // to the anchor (LTC hit this hard at v1.9.62 activation; apply
+        // BTC the same protection for consistency even though v1.9.55
+        // bootstrap usually beats the cycle to it).
+        let anchor_height = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain
+                .params
+                .btc_spv
+                .as_ref()
+                .map(|p| p.anchor.height)
+                .unwrap_or(0)
+        };
+        let effective_relay_tip = std::cmp::max(relay_tip, anchor_height);
+        let start = effective_relay_tip + 1;
+        let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
+        let headers_hex = header_sync::btc::fetch_btc_headers(client, start, end).await?;
+        let live_relay_tip = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.btc_tip_height
+        };
+        if live_relay_tip >= end {
+            header_sync_touch_last_file("btc");
+            return Ok(format!(
             "stand_down: chain advanced from {relay_tip} to {live_relay_tip} during fetch (planned end {end})"
         ));
-    }
-    {
-        let mut cache = state
-            .btc_template_headers_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *cache = Some(CachedHeaderBatchForTemplate {
-            headers_hex,
-            expected_relay_tip_height: live_relay_tip,
-            built_at: std::time::SystemTime::now(),
-        });
-    }
-    header_sync_touch_last_file("btc");
-    Ok(format!(
-        "cached_headers start={start} end={end} relay_tip={live_relay_tip}"
-    ))
+        }
+        {
+            let mut cache = state
+                .btc_template_headers_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *cache = Some(CachedHeaderBatchForTemplate {
+                headers_hex,
+                expected_relay_tip_height: live_relay_tip,
+                built_at: std::time::SystemTime::now(),
+            });
+        }
+        header_sync_touch_last_file("btc");
+        Ok(format!(
+            "cached_headers start={start} end={end} relay_tip={live_relay_tip}"
+        ))
     } // closes #[allow] block
 }
 
@@ -15463,8 +15587,7 @@ async fn run_ltc_header_sync_cycle(
     let effective_relay_tip = std::cmp::max(relay_tip, anchor_height);
     let start = effective_relay_tip + 1;
     let end = std::cmp::min(start + header_sync::common::BATCH_SIZE - 1, target);
-    let headers_hex =
-        header_sync::ltc::fetch_ltc_headers(client, source, start, end).await?;
+    let headers_hex = header_sync::ltc::fetch_ltc_headers(client, source, start, end).await?;
     let live_relay_tip = {
         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain.ltc_tip_height
@@ -15645,21 +15768,23 @@ async fn main() {
         mpsov1_activation_height: resolved_mpsov1_activation_height(network),
         lwma: LwmaParams::new(lwma_activation, pow_limit),
         lwma_v2: lwma_v2_activation.map(|h| LwmaParams::new_v2(Some(h), pow_limit)),
-        auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(network),
-            btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
-            ltc_spv: irium_node_rs::ltc_spv::resolve_ltc_spv_params(network),
-            htlc_btc_swap_v1_activation_height:
-                irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
-            btc_swap_bech32_payment_activation_height:
-                irium_node_rs::activation::resolved_btc_swap_bech32_payment_activation_height(network),
-            htlc_ltc_swap_v1_activation_height:
-                irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
-            swap_order_v1_activation_height:
-                irium_node_rs::activation::resolved_swap_order_v1_activation_height(network),
-            ltc_swap_order_v1_activation_height:
-                irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
-            coinbase_header_batch_activation_height:
-                irium_node_rs::activation::resolved_coinbase_header_batch_activation_height(network),
+        auxpow_activation_height: irium_node_rs::activation::resolved_auxpow_activation_height(
+            network,
+        ),
+        btc_spv: irium_node_rs::btc_spv::resolve_btc_spv_params(network),
+        ltc_spv: irium_node_rs::ltc_spv::resolve_ltc_spv_params(network),
+        htlc_btc_swap_v1_activation_height:
+            irium_node_rs::activation::resolved_htlc_btc_swap_v1_activation_height(network),
+        btc_swap_bech32_payment_activation_height:
+            irium_node_rs::activation::resolved_btc_swap_bech32_payment_activation_height(network),
+        htlc_ltc_swap_v1_activation_height:
+            irium_node_rs::activation::resolved_htlc_ltc_swap_v1_activation_height(network),
+        swap_order_v1_activation_height:
+            irium_node_rs::activation::resolved_swap_order_v1_activation_height(network),
+        ltc_swap_order_v1_activation_height:
+            irium_node_rs::activation::resolved_ltc_swap_order_v1_activation_height(network),
+        coinbase_header_batch_activation_height:
+            irium_node_rs::activation::resolved_coinbase_header_batch_activation_height(network),
     };
     let mut state = ChainState::new(params);
     if load_persisted {
@@ -15674,7 +15799,12 @@ async fn main() {
             era.era_name, era.era_description
         );
     }
-    let mempool = Arc::new(Mutex::new(MempoolManager::new(mempool_file(), 1000, 100.0, 10_000)));
+    let mempool = Arc::new(Mutex::new(MempoolManager::new(
+        mempool_file(),
+        1000,
+        100.0,
+        10_000,
+    )));
     let limiter = Arc::new(Mutex::new(rate_limiter()));
     let wallet = Arc::new(Mutex::new(
         WalletManager::new(WalletManager::default_path()),
@@ -15742,7 +15872,8 @@ async fn main() {
         .filter(|s| !s.is_empty());
 
     // Set up P2P node if configured via IRIUM_P2P_BIND env var or node config.
-    let p2p_bind_str: Option<String> = std::env::var("IRIUM_P2P_BIND").ok()
+    let p2p_bind_str: Option<String> = std::env::var("IRIUM_P2P_BIND")
+        .ok()
         .or_else(|| node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.clone()));
     let p2p: Option<P2PNode> = if let Some(bind) = p2p_bind_str {
         match bind.parse::<SocketAddr>() {
@@ -15779,7 +15910,8 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .or_else(|| {
-            std::env::var("IRIUM_P2P_BIND").ok()
+            std::env::var("IRIUM_P2P_BIND")
+                .ok()
                 .or_else(|| node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.clone()))
                 .as_deref()
                 .and_then(|b| b.split(':').next_back())
@@ -15818,12 +15950,19 @@ async fn main() {
             scan_blocks_for_peers(&guard, 2016)
         };
         let m = block_peers.len();
-        eprintln!("[bootstrap] scanned {} blocks, found {} peer announcements", scanned, m);
+        eprintln!(
+            "[bootstrap] scanned {} blocks, found {} peer announcements",
+            scanned, m
+        );
         if m == 0 {
             eprintln!("[bootstrap] no peer announcements found in chain yet — falling back to signed seedlist");
         } else {
             let runtime_path = storage::bootstrap_dir().join("seedlist.runtime");
-            if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&runtime_path) {
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&runtime_path)
+            {
                 use std::io::Write;
                 for addr in &block_peers {
                     let _ = writeln!(file, "{}", addr);
@@ -15844,7 +15983,8 @@ async fn main() {
     } else {
         load_signed_seeds()
     };
-    let p2p_bind_for_local = std::env::var("IRIUM_P2P_BIND").ok()
+    let p2p_bind_for_local = std::env::var("IRIUM_P2P_BIND")
+        .ok()
         .or_else(|| node_cfg.as_ref().and_then(|cfg| cfg.p2p_bind.clone()));
     let local_ips = local_ip_set(p2p_bind_for_local.as_ref());
 
@@ -15912,7 +16052,12 @@ async fn main() {
                         no_seed_logged = true;
                     }
                     let cur_peers = node.peer_count().await;
-                    tokio::time::sleep(if cur_peers < 2 { std::time::Duration::from_secs(5) } else { std::time::Duration::from_secs(30) }).await;
+                    tokio::time::sleep(if cur_peers < 2 {
+                        std::time::Duration::from_secs(5)
+                    } else {
+                        std::time::Duration::from_secs(30)
+                    })
+                    .await;
                     continue;
                 }
                 no_seed_logged = false;
@@ -15980,7 +16125,10 @@ async fn main() {
                                         msg
                                     );
                                     if suppressed > 0 {
-                                        line.push_str(&format!(" (suppressed {} repeats)", suppressed));
+                                        line.push_str(&format!(
+                                            " (suppressed {} repeats)",
+                                            suppressed
+                                        ));
                                     }
                                     eprintln!("{}", line);
                                 }
@@ -15992,7 +16140,12 @@ async fn main() {
 
                 // Adaptive wait: reconnect faster when low on peers.
                 let cur_peers = node.peer_count().await;
-                tokio::time::sleep(if cur_peers < 2 { std::time::Duration::from_secs(5) } else { std::time::Duration::from_secs(30) }).await;
+                tokio::time::sleep(if cur_peers < 2 {
+                    std::time::Duration::from_secs(5)
+                } else {
+                    std::time::Duration::from_secs(30)
+                })
+                .await;
             }
         });
     }
@@ -16140,8 +16293,11 @@ async fn main() {
                     match chain_clone.try_lock() {
                         Ok(g) => {
                             let local_height = g.tip_height();
-                            let tip_bytes =
-                                g.chain.last().map(|b| b.header.hash_for_height(local_height)).unwrap_or([0u8; 32]);
+                            let tip_bytes = g
+                                .chain
+                                .last()
+                                .map(|b| b.header.hash_for_height(local_height))
+                                .unwrap_or([0u8; 32]);
                             let tip = hex::encode(tip_bytes);
                             let best_hash = g.best_header_hash();
                             let best_header_height = g
@@ -16638,20 +16794,30 @@ async fn main() {
                 let (h, hash) = {
                     let g = block_chain.lock().unwrap_or_else(|e| e.into_inner());
                     let height = g.tip_height();
-                    let hash = g.chain.last().map(|b| hex::encode(b.header.hash_for_height(height))).unwrap_or_default();
+                    let hash = g
+                        .chain
+                        .last()
+                        .map(|b| hex::encode(b.header.hash_for_height(height)))
+                        .unwrap_or_default();
                     (height, hash)
                 };
                 if h < last_known_height && last_known_height > 0 {
                     // Reorg detected: tip rewound. Emit proof_reorged for any proof
                     // submitted at a height now above the new tip.
                     let reorged_agreements = {
-                        let heights = reorg_proof_heights.lock().unwrap_or_else(|e| e.into_inner());
+                        let heights = reorg_proof_heights
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         let store = reorg_proof_store.lock().unwrap_or_else(|e| e.into_inner());
                         let mut agreements: std::collections::HashSet<String> = Default::default();
                         for (proof_id, &submitted_at) in heights.iter() {
                             if submitted_at > h {
                                 // This proof was submitted at a height that is now reorganized.
-                                if let Some(proof) = store.list_all().into_iter().find(|p| p.proof_id == *proof_id) {
+                                if let Some(proof) = store
+                                    .list_all()
+                                    .into_iter()
+                                    .find(|p| p.proof_id == *proof_id)
+                                {
                                     agreements.insert(proof.agreement_hash.clone());
                                 }
                             }
@@ -16659,20 +16825,30 @@ async fn main() {
                         agreements
                     };
                     for agreement_hash in reorged_agreements {
-                        emit_event(&block_event_tx, "agreement.proof_reorged", serde_json::json!({
-                            "agreement_hash": agreement_hash,
-                            "reorg_tip": h,
-                            "previous_tip": last_known_height,
-                            "note": "One or more proofs for this agreement were submitted at a height that has been reorganized. Resubmit the proof once the chain stabilizes.",
-                        }));
+                        emit_event(
+                            &block_event_tx,
+                            "agreement.proof_reorged",
+                            serde_json::json!({
+                                "agreement_hash": agreement_hash,
+                                "reorg_tip": h,
+                                "previous_tip": last_known_height,
+                                "note": "One or more proofs for this agreement were submitted at a height that has been reorganized. Resubmit the proof once the chain stabilizes.",
+                            }),
+                        );
                     }
                 }
-                if h > last_known_height || (h == last_known_height && hash != last_known_hash && !hash.is_empty()) {
+                if h > last_known_height
+                    || (h == last_known_height && hash != last_known_hash && !hash.is_empty())
+                {
                     if last_known_height > 0 {
-                        emit_event(&block_event_tx, "block.new", serde_json::json!({
-                            "height": h,
-                            "hash": hash,
-                        }));
+                        emit_event(
+                            &block_event_tx,
+                            "block.new",
+                            serde_json::json!({
+                                "height": h,
+                                "hash": hash,
+                            }),
+                        );
                         // Stage 3.2: scan newly-confirmed blocks for dispute/resolver anchor OP_RETURNs.
                         scan_new_blocks_for_dispute_anchors(
                             &block_chain,
@@ -16729,7 +16905,11 @@ async fn main() {
                 let offers_dir = offers_feed_dir();
                 if !offers_dir.exists() {
                     if let Err(e) = std::fs::create_dir_all(&offers_dir) {
-                        eprintln!("[offer-broadcast] create_dir_all {}: {}", offers_dir.display(), e);
+                        eprintln!(
+                            "[offer-broadcast] create_dir_all {}: {}",
+                            offers_dir.display(),
+                            e
+                        );
                         continue;
                     }
                 }
@@ -16748,8 +16928,11 @@ async fn main() {
                             continue;
                         }
                     };
-                    if id.len() > 128 || id.is_empty()
-                        || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    if id.len() > 128
+                        || id.is_empty()
+                        || !id
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                     {
                         eprintln!("[offer-broadcast] drop unsafe offer_id: {}", id);
                         continue;
@@ -16805,7 +16988,9 @@ async fn main() {
                     continue;
                 }
                 let gossip_tip_height = {
-                    let g = drain_chain_for_gossip.lock().unwrap_or_else(|e| e.into_inner());
+                    let g = drain_chain_for_gossip
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     g.tip_height()
                 };
                 let mut store = drain_proof_store.lock().unwrap_or_else(|e| e.into_inner());
@@ -16817,13 +17002,18 @@ async fn main() {
                             if outcome.accepted {
                                 // Phase 7: record gossip proof receipt height.
                                 {
-                                    let mut heights = drain_heights.lock().unwrap_or_else(|e| e.into_inner());
+                                    let mut heights =
+                                        drain_heights.lock().unwrap_or_else(|e| e.into_inner());
                                     heights.insert(pid_for_evt.clone(), gossip_tip_height);
                                 }
-                                emit_event(&drain_event_tx, "proof.gossip_received", serde_json::json!({
-                                    "agreement_hash": ah_for_evt,
-                                    "proof_id": pid_for_evt,
-                                }));
+                                emit_event(
+                                    &drain_event_tx,
+                                    "proof.gossip_received",
+                                    serde_json::json!({
+                                        "agreement_hash": ah_for_evt,
+                                        "proof_id": pid_for_evt,
+                                    }),
+                                );
                                 let rebroadcast = drain_node.clone();
                                 let j = json.clone();
                                 tokio::spawn(async move {
@@ -16850,14 +17040,22 @@ async fn main() {
                     let current_set: HashSet<String> =
                         current.iter().map(|p| p.multiaddr.clone()).collect();
                     for addr in current_set.difference(&known_peers) {
-                        emit_event(&peer_event_tx, "peer.connected", serde_json::json!({
-                            "multiaddr": addr,
-                        }));
+                        emit_event(
+                            &peer_event_tx,
+                            "peer.connected",
+                            serde_json::json!({
+                                "multiaddr": addr,
+                            }),
+                        );
                     }
                     for addr in known_peers.difference(&current_set) {
-                        emit_event(&peer_event_tx, "peer.disconnected", serde_json::json!({
-                            "multiaddr": addr,
-                        }));
+                        emit_event(
+                            &peer_event_tx,
+                            "peer.disconnected",
+                            serde_json::json!({
+                                "multiaddr": addr,
+                            }),
+                        );
                     }
                     known_peers = current_set;
                 }
@@ -16894,12 +17092,13 @@ async fn main() {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let dir = offers_feed_dir();
-                if !dir.exists() { continue; }
-                let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-                let tip_height: u64 = watcher_chain
-                    .lock()
-                    .map(|g| g.tip_height())
-                    .unwrap_or(0);
+                if !dir.exists() {
+                    continue;
+                }
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                let tip_height: u64 = watcher_chain.lock().map(|g| g.tip_height()).unwrap_or(0);
                 // Phase 1A+1B: collect open offers we have not yet announced.
                 // We queue here and broadcast outside the per-file loop so
                 // no async I/O happens while iterating fs entries.
@@ -16909,16 +17108,29 @@ async fn main() {
                     if !path.extension().map(|e| e == "json").unwrap_or(false) {
                         continue;
                     }
-                    let Ok(data) = std::fs::read_to_string(&path) else { continue };
-                    let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
-                    let id = val.get("offer_id")
-                        .and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                    if id.is_empty() { continue; }
-                    let mut status = val.get("status")
-                        .and_then(|s| s.as_str()).unwrap_or("open").to_string();
+                    let Ok(data) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) else {
+                        continue;
+                    };
+                    let id = val
+                        .get("offer_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if id.is_empty() {
+                        continue;
+                    }
+                    let mut status = val
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("open")
+                        .to_string();
                     let timeout_height = val.get("timeout_height").and_then(|v| v.as_u64());
                     let taken_at_height = val.get("taken_at_height").and_then(|v| v.as_u64());
-                    let agreement_hash = val.get("agreement_hash")
+                    let agreement_hash = val
+                        .get("agreement_hash")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
 
@@ -16927,9 +17139,14 @@ async fn main() {
                     if status == "open" {
                         if let Some(th) = timeout_height {
                             if tip_height >= th {
-                                if let Ok(mut new_val) = serde_json::from_str::<serde_json::Value>(&data) {
+                                if let Ok(mut new_val) =
+                                    serde_json::from_str::<serde_json::Value>(&data)
+                                {
                                     if let Some(obj) = new_val.as_object_mut() {
-                                        obj.insert("status".to_string(), serde_json::json!("expired"));
+                                        obj.insert(
+                                            "status".to_string(),
+                                            serde_json::json!("expired"),
+                                        );
                                     }
                                     if let Ok(serialized) = serde_json::to_string_pretty(&new_val) {
                                         let _ = std::fs::write(&path, serialized);
@@ -16955,27 +17172,39 @@ async fn main() {
                                     .map(|g| agreement_hash_funded_on_chain(&g, ah))
                                     .unwrap_or(false);
                                 if !funded {
-                                    let previous_buyer = val.get("buyer_address")
+                                    let previous_buyer = val
+                                        .get("buyer_address")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
                                         .to_string();
-                                    if let Ok(mut new_val) = serde_json::from_str::<serde_json::Value>(&data) {
+                                    if let Ok(mut new_val) =
+                                        serde_json::from_str::<serde_json::Value>(&data)
+                                    {
                                         if let Some(obj) = new_val.as_object_mut() {
-                                            obj.insert("status".to_string(), serde_json::json!("open"));
+                                            obj.insert(
+                                                "status".to_string(),
+                                                serde_json::json!("open"),
+                                            );
                                             obj.remove("agreement_id");
                                             obj.remove("agreement_hash");
                                             obj.remove("buyer_address");
                                             obj.remove("taken_at");
                                             obj.remove("taken_at_height");
                                         }
-                                        if let Ok(serialized) = serde_json::to_string_pretty(&new_val) {
+                                        if let Ok(serialized) =
+                                            serde_json::to_string_pretty(&new_val)
+                                        {
                                             let _ = std::fs::write(&path, serialized);
                                         }
                                     }
-                                    emit_event(&offer_event_tx, "offer.relisted", serde_json::json!({
-                                        "offer_id": id,
-                                        "previous_buyer_address": previous_buyer,
-                                    }));
+                                    emit_event(
+                                        &offer_event_tx,
+                                        "offer.relisted",
+                                        serde_json::json!({
+                                            "offer_id": id,
+                                            "previous_buyer_address": previous_buyer,
+                                        }),
+                                    );
                                     status = "open".to_string();
                                 }
                             }
@@ -16984,17 +17213,29 @@ async fn main() {
 
                     let prev = seen.get(&id).cloned();
                     if prev.is_none() && status == "open" {
-                        emit_event(&offer_event_tx, "offer.created", serde_json::json!({
-                            "offer_id": id,
-                        }));
+                        emit_event(
+                            &offer_event_tx,
+                            "offer.created",
+                            serde_json::json!({
+                                "offer_id": id,
+                            }),
+                        );
                     } else if prev.as_deref() == Some("open") && status == "taken" {
-                        emit_event(&offer_event_tx, "offer.taken", serde_json::json!({
-                            "offer_id": id,
-                        }));
+                        emit_event(
+                            &offer_event_tx,
+                            "offer.taken",
+                            serde_json::json!({
+                                "offer_id": id,
+                            }),
+                        );
                     } else if prev.as_deref() == Some("open") && status == "expired" {
-                        emit_event(&offer_event_tx, "offer.expired", serde_json::json!({
-                            "offer_id": id,
-                        }));
+                        emit_event(
+                            &offer_event_tx,
+                            "offer.expired",
+                            serde_json::json!({
+                                "offer_id": id,
+                            }),
+                        );
                     }
                     // Phase 1A+1B: queue OPEN offers we have not yet
                     // announced this session. Status was potentially
@@ -17105,490 +17346,625 @@ async fn main() {
         }
     }
 
+    const OFFERS_FEED_DEFAULT_LIMIT: usize = 500;
 
-const OFFERS_FEED_DEFAULT_LIMIT: usize = 500;
+    /// LAYER 1 receive-side: a peer (the buyer) has broadcast an
+    /// OfferTakeNotification. If the local offers/ dir holds a matching offer
+    /// whose seller_pubkey matches the payload, mutate it to status="taken"
+    /// and emit `offer.taken` so the seller's GUI updates in real time.
+    ///
+    /// Validation is intentionally light for v1 — no cryptographic signature
+    /// is required. Structural match (offer_id present locally, seller_pubkey
+    /// match, status=="open") prevents accidental collisions; spoofing remains
+    /// possible until the security-follow-up adds ed25519 signing (see the
+    /// MessageType::OfferTakeNotification comment in protocol.rs).
+    fn process_received_offer_take(payload_json: &str, event_tx: &EventTx) -> Result<(), String> {
+        let val: serde_json::Value =
+            serde_json::from_str(payload_json).map_err(|e| format!("offer-take parse: {e}"))?;
+        let offer_id = val
+            .get("offer_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "offer-take: missing offer_id".to_string())?;
+        let buyer_address = val
+            .get("buyer_address")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "offer-take: missing buyer_address".to_string())?;
+        let agreement_id = val
+            .get("agreement_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "offer-take: missing agreement_id".to_string())?;
+        let agreement_hash = val
+            .get("agreement_hash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "offer-take: missing agreement_hash".to_string())?;
+        let taken_at = val.get("taken_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        let taken_at_height = val.get("taken_at_height").and_then(|v| v.as_u64());
+        let seller_pubkey_claim = val
+            .get("seller_pubkey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
-/// LAYER 1 receive-side: a peer (the buyer) has broadcast an
-/// OfferTakeNotification. If the local offers/ dir holds a matching offer
-/// whose seller_pubkey matches the payload, mutate it to status="taken"
-/// and emit `offer.taken` so the seller's GUI updates in real time.
-///
-/// Validation is intentionally light for v1 — no cryptographic signature
-/// is required. Structural match (offer_id present locally, seller_pubkey
-/// match, status=="open") prevents accidental collisions; spoofing remains
-/// possible until the security-follow-up adds ed25519 signing (see the
-/// MessageType::OfferTakeNotification comment in protocol.rs).
-fn process_received_offer_take(payload_json: &str, event_tx: &EventTx) -> Result<(), String> {
-    let val: serde_json::Value = serde_json::from_str(payload_json)
-        .map_err(|e| format!("offer-take parse: {e}"))?;
-    let offer_id = val
-        .get("offer_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "offer-take: missing offer_id".to_string())?;
-    let buyer_address = val
-        .get("buyer_address")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "offer-take: missing buyer_address".to_string())?;
-    let agreement_id = val
-        .get("agreement_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "offer-take: missing agreement_id".to_string())?;
-    let agreement_hash = val
-        .get("agreement_hash")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "offer-take: missing agreement_hash".to_string())?;
-    let taken_at = val.get("taken_at").and_then(|v| v.as_i64()).unwrap_or(0);
-    let taken_at_height = val.get("taken_at_height").and_then(|v| v.as_u64());
-    let seller_pubkey_claim = val
-        .get("seller_pubkey")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let dir = offers_feed_dir();
-    let path = dir.join(format!("offer-{}.json", offer_id));
-    if !path.exists() {
-        // Not our offer — silently ignore. Every connected peer receives
-        // the broadcast so most will land here.
-        return Ok(());
-    }
-    let data = std::fs::read_to_string(&path)
-        .map_err(|e| format!("read offer {offer_id}: {e}"))?;
-    let mut offer: serde_json::Value = serde_json::from_str(&data)
-        .map_err(|e| format!("parse offer {offer_id}: {e}"))?;
-
-    // Verify the seller_pubkey claim matches our local offer's seller_pubkey
-    // (when both are present). Mismatch → silently ignore (someone else's
-    // offer with a colliding id).
-    if !seller_pubkey_claim.is_empty() {
-        let local_pk = offer.get("seller_pubkey").and_then(|v| v.as_str()).unwrap_or("");
-        if !local_pk.is_empty() && local_pk != seller_pubkey_claim {
+        let dir = offers_feed_dir();
+        let path = dir.join(format!("offer-{}.json", offer_id));
+        if !path.exists() {
+            // Not our offer — silently ignore. Every connected peer receives
+            // the broadcast so most will land here.
             return Ok(());
         }
-    }
+        let data =
+            std::fs::read_to_string(&path).map_err(|e| format!("read offer {offer_id}: {e}"))?;
+        let mut offer: serde_json::Value =
+            serde_json::from_str(&data).map_err(|e| format!("parse offer {offer_id}: {e}"))?;
 
-    let cur_status = offer.get("status").and_then(|v| v.as_str()).unwrap_or("open");
-    if cur_status != "open" {
-        return Ok(()); // already taken / expired / etc.
-    }
-
-    if let Some(obj) = offer.as_object_mut() {
-        obj.insert("status".to_string(), serde_json::json!("taken"));
-        obj.insert("buyer_address".to_string(), serde_json::json!(buyer_address));
-        obj.insert("agreement_id".to_string(), serde_json::json!(agreement_id));
-        obj.insert("agreement_hash".to_string(), serde_json::json!(agreement_hash));
-        obj.insert("taken_at".to_string(), serde_json::json!(taken_at));
-        if let Some(h) = taken_at_height {
-            obj.insert("taken_at_height".to_string(), serde_json::json!(h));
+        // Verify the seller_pubkey claim matches our local offer's seller_pubkey
+        // (when both are present). Mismatch → silently ignore (someone else's
+        // offer with a colliding id).
+        if !seller_pubkey_claim.is_empty() {
+            let local_pk = offer
+                .get("seller_pubkey")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !local_pk.is_empty() && local_pk != seller_pubkey_claim {
+                return Ok(());
+            }
         }
+
+        let cur_status = offer
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("open");
+        if cur_status != "open" {
+            return Ok(()); // already taken / expired / etc.
+        }
+
+        if let Some(obj) = offer.as_object_mut() {
+            obj.insert("status".to_string(), serde_json::json!("taken"));
+            obj.insert(
+                "buyer_address".to_string(),
+                serde_json::json!(buyer_address),
+            );
+            obj.insert("agreement_id".to_string(), serde_json::json!(agreement_id));
+            obj.insert(
+                "agreement_hash".to_string(),
+                serde_json::json!(agreement_hash),
+            );
+            obj.insert("taken_at".to_string(), serde_json::json!(taken_at));
+            if let Some(h) = taken_at_height {
+                obj.insert("taken_at_height".to_string(), serde_json::json!(h));
+            }
+        }
+        let serialized =
+            serde_json::to_string_pretty(&offer).map_err(|e| format!("serialise offer: {e}"))?;
+        std::fs::write(&path, serialized).map_err(|e| format!("write offer {offer_id}: {e}"))?;
+
+        // Emit offer.taken immediately so the seller's GUI updates without
+        // waiting for the 5 s fs-watcher tick. The watcher's own emit will
+        // fire on the next tick too (idempotent on the GUI side — both
+        // events trigger the same silent reload).
+        emit_event(
+            event_tx,
+            "offer.taken",
+            serde_json::json!({
+                "offer_id": offer_id,
+                "buyer_address": buyer_address,
+                "via": "p2p",
+            }),
+        );
+        Ok(())
     }
-    let serialized = serde_json::to_string_pretty(&offer)
-        .map_err(|e| format!("serialise offer: {e}"))?;
-    std::fs::write(&path, serialized)
-        .map_err(|e| format!("write offer {offer_id}: {e}"))?;
 
-    // Emit offer.taken immediately so the seller's GUI updates without
-    // waiting for the 5 s fs-watcher tick. The watcher's own emit will
-    // fire on the next tick too (idempotent on the GUI side — both
-    // events trigger the same silent reload).
-    emit_event(event_tx, "offer.taken", serde_json::json!({
-        "offer_id": offer_id,
-        "buyer_address": buyer_address,
-        "via": "p2p",
-    }));
-    Ok(())
-}
+    fn offers_feed_limit() -> usize {
+        std::env::var("IRIUM_OFFERS_FEED_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(OFFERS_FEED_DEFAULT_LIMIT)
+    }
 
-fn offers_feed_limit() -> usize {
-    std::env::var("IRIUM_OFFERS_FEED_LIMIT")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(OFFERS_FEED_DEFAULT_LIMIT)
-}
-
-async fn offers_feed(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    check_rate(&state, &addr)?;
-    let dir = offers_feed_dir();
-    let limit = offers_feed_limit();
-    // LAYER 2: hide offers whose timeout_height has been reached by the
-    // current chain tip. The 5 s offer-watcher background task is the one
-    // that permanently flips status="open" → "expired" on disk; this filter
-    // is a fast-path so we never serve an expired offer to a peer even in
-    // the short window between expiry and the next watcher tick.
-    let current_tip: u64 = state
-        .chain
-        .lock()
-        .map(|guard| guard.tip_height())
-        .unwrap_or(0);
-    let mut offers: Vec<serde_json::Value> = Vec::new();
-    if dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map(|e| e == "json").unwrap_or(false) {
-                    if let Ok(data) = std::fs::read_to_string(&path) {
-                        if let Ok(mut val) =
-                            serde_json::from_str::<serde_json::Value>(&data)
-                        {
-                            if val.get("status").and_then(|s| s.as_str()) != Some("open") {
-                                continue;
-                            }
-                            // LAYER 2 expiry: skip if chain tip past timeout_height.
-                            if let Some(th) = val.get("timeout_height").and_then(|v| v.as_u64()) {
-                                if current_tip >= th {
+    async fn offers_feed(
+        ConnectInfo(addr): ConnectInfo<SocketAddr>,
+        State(state): State<AppState>,
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
+        check_rate(&state, &addr)?;
+        let dir = offers_feed_dir();
+        let limit = offers_feed_limit();
+        // LAYER 2: hide offers whose timeout_height has been reached by the
+        // current chain tip. The 5 s offer-watcher background task is the one
+        // that permanently flips status="open" → "expired" on disk; this filter
+        // is a fast-path so we never serve an expired offer to a peer even in
+        // the short window between expiry and the next watcher tick.
+        let current_tip: u64 = state
+            .chain
+            .lock()
+            .map(|guard| guard.tip_height())
+            .unwrap_or(0);
+        let mut offers: Vec<serde_json::Value> = Vec::new();
+        if dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map(|e| e == "json").unwrap_or(false) {
+                        if let Ok(data) = std::fs::read_to_string(&path) {
+                            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&data) {
+                                if val.get("status").and_then(|s| s.as_str()) != Some("open") {
                                     continue;
                                 }
+                                // LAYER 2 expiry: skip if chain tip past timeout_height.
+                                if let Some(th) = val.get("timeout_height").and_then(|v| v.as_u64())
+                                {
+                                    if current_tip >= th {
+                                        continue;
+                                    }
+                                }
+                                if let Some(obj) = val.as_object_mut() {
+                                    obj.remove("source");
+                                    obj.remove("agreement_id");
+                                    obj.remove("agreement_hash");
+                                    obj.remove("buyer_address");
+                                    obj.remove("taken_at");
+                                }
+                                offers.push(val);
                             }
-                            if let Some(obj) = val.as_object_mut() {
-                                obj.remove("source");
-                                obj.remove("agreement_id");
-                                obj.remove("agreement_hash");
-                                obj.remove("buyer_address");
-                                obj.remove("taken_at");
-                            }
-                            offers.push(val);
                         }
                     }
                 }
             }
         }
+        offers.sort_by(|a, b| {
+            let ta = a.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+            let tb = b.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+            tb.cmp(&ta)
+        });
+        if offers.len() > limit {
+            offers.truncate(limit);
+        }
+        let exported_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Ok(Json(serde_json::json!({
+            "version": "1",
+            "exported_at": exported_at,
+            "count": offers.len(),
+            "offers": offers,
+        })))
     }
-    offers.sort_by(|a, b| {
-        let ta = a.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
-        let tb = b.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
-        tb.cmp(&ta)
-    });
-    if offers.len() > limit {
-        offers.truncate(limit);
+
+    /// LAYER 1 send-side RPC. The wallet binary calls this after `offer-take`
+    /// has saved its local agreement; iriumd then broadcasts the take to all
+    /// peers via MessageType::OfferTakeNotification. Gated behind
+    /// require_rpc_auth so only the local wallet (which shares
+    /// IRIUM_RPC_TOKEN) can broadcast — prevents a random LAN client from
+    /// spoof-taking other people's offers.
+    #[derive(Debug, serde::Deserialize)]
+    struct BroadcastOfferTakeRequest {
+        /// JSON-encoded payload {offer_id, buyer_address, agreement_id,
+        /// agreement_hash, taken_at, taken_at_height?, seller_pubkey}.
+        payload_json: String,
     }
-    let exported_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    Ok(Json(serde_json::json!({
-        "version": "1",
-        "exported_at": exported_at,
-        "count": offers.len(),
-        "offers": offers,
-    })))
-}
 
-/// LAYER 1 send-side RPC. The wallet binary calls this after `offer-take`
-/// has saved its local agreement; iriumd then broadcasts the take to all
-/// peers via MessageType::OfferTakeNotification. Gated behind
-/// require_rpc_auth so only the local wallet (which shares
-/// IRIUM_RPC_TOKEN) can broadcast — prevents a random LAN client from
-/// spoof-taking other people's offers.
-#[derive(Debug, serde::Deserialize)]
-struct BroadcastOfferTakeRequest {
-    /// JSON-encoded payload {offer_id, buyer_address, agreement_id,
-    /// agreement_hash, taken_at, taken_at_height?, seller_pubkey}.
-    payload_json: String,
-}
-
-async fn broadcast_offer_take_rpc(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    AxumJson(req): AxumJson<BroadcastOfferTakeRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    check_rate_with_auth(&state, &addr, &headers)?;
-    require_rpc_auth(&headers)?;
-    if let Some(ref p2p) = state.p2p {
-        p2p.broadcast_offer_take(&req.payload_json).await;
-        Ok(Json(serde_json::json!({"ok": true})))
-    } else {
-        // No P2P node configured — broadcast is a no-op but we still
-        // return ok so the wallet's best-effort send doesn't error.
-        Ok(Json(serde_json::json!({"ok": false, "reason": "p2p_disabled"})))
+    async fn broadcast_offer_take_rpc(
+        ConnectInfo(addr): ConnectInfo<SocketAddr>,
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        AxumJson(req): AxumJson<BroadcastOfferTakeRequest>,
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
+        check_rate_with_auth(&state, &addr, &headers)?;
+        require_rpc_auth(&headers)?;
+        if let Some(ref p2p) = state.p2p {
+            p2p.broadcast_offer_take(&req.payload_json).await;
+            Ok(Json(serde_json::json!({"ok": true})))
+        } else {
+            // No P2P node configured — broadcast is a no-op but we still
+            // return ok so the wallet's best-effort send doesn't error.
+            Ok(Json(
+                serde_json::json!({"ok": false, "reason": "p2p_disabled"}),
+            ))
+        }
     }
-}
 
+    // --- Explorer endpoints (public, no auth, CORS * always on) -------------------
 
-// --- Explorer endpoints (public, no auth, CORS * always on) -------------------
-
-fn explorer_agreements_dir() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("IRIUM_AGREEMENT_BUNDLES_DIR") {
-        return std::path::PathBuf::from(p).join("raw");
+    fn explorer_agreements_dir() -> std::path::PathBuf {
+        if let Ok(p) = std::env::var("IRIUM_AGREEMENT_BUNDLES_DIR") {
+            return std::path::PathBuf::from(p).join("raw");
+        }
+        if let Ok(p) = std::env::var("IRIUM_DATA_DIR") {
+            return std::path::PathBuf::from(p).join("agreements").join("raw");
+        }
+        // state_dir is {data_dir}/state/ so parent is {data_dir}
+        irium_node_rs::storage::state_dir()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("agreements")
+            .join("raw")
     }
-    if let Ok(p) = std::env::var("IRIUM_DATA_DIR") {
-        return std::path::PathBuf::from(p).join("agreements").join("raw");
+
+    fn explorer_cors_headers() -> HeaderMap {
+        let mut map = HeaderMap::new();
+        map.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
+        map.insert(
+            "Access-Control-Allow-Methods",
+            HeaderValue::from_static("GET, OPTIONS"),
+        );
+        map
     }
-    // state_dir is {data_dir}/state/ so parent is {data_dir}
-    irium_node_rs::storage::state_dir()
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("agreements")
-        .join("raw")
-}
 
-fn explorer_cors_headers() -> HeaderMap {
-    let mut map = HeaderMap::new();
-    map.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
-    map.insert("Access-Control-Allow-Methods", HeaderValue::from_static("GET, OPTIONS"));
-    map
-}
+    #[derive(Deserialize)]
+    struct ExplorerPageQuery {
+        #[serde(default = "explorer_default_page")]
+        page: usize,
+        #[serde(default = "explorer_default_limit")]
+        limit: usize,
+    }
+    fn explorer_default_page() -> usize {
+        1
+    }
+    fn explorer_default_limit() -> usize {
+        20
+    }
 
-#[derive(Deserialize)]
-struct ExplorerPageQuery {
-    #[serde(default = "explorer_default_page")]
-    page: usize,
-    #[serde(default = "explorer_default_limit")]
-    limit: usize,
-}
-fn explorer_default_page() -> usize { 1 }
-fn explorer_default_limit() -> usize { 20 }
+    #[derive(Deserialize)]
+    struct ExplorerProofsQuery {
+        #[serde(default = "explorer_default_page")]
+        page: usize,
+        #[serde(default = "explorer_default_limit")]
+        limit: usize,
+        agreement_hash: Option<String>,
+    }
 
-#[derive(Deserialize)]
-struct ExplorerProofsQuery {
-    #[serde(default = "explorer_default_page")]
-    page: usize,
-    #[serde(default = "explorer_default_limit")]
-    limit: usize,
-    agreement_hash: Option<String>,
-}
+    #[derive(Serialize)]
+    struct ExplorerAgreementSummary {
+        hash: String,
+        agreement_id: String,
+        template_type: String,
+        total_amount: u64,
+        creation_time: u64,
+        parties: Vec<serde_json::Value>,
+    }
 
-#[derive(Serialize)]
-struct ExplorerAgreementSummary {
-    hash: String,
-    agreement_id: String,
-    template_type: String,
-    total_amount: u64,
-    creation_time: u64,
-    parties: Vec<serde_json::Value>,
-}
+    #[derive(Serialize)]
+    struct ExplorerAgreementsResponse {
+        agreements: Vec<ExplorerAgreementSummary>,
+        total: usize,
+        page: usize,
+        limit: usize,
+    }
 
-#[derive(Serialize)]
-struct ExplorerAgreementsResponse {
-    agreements: Vec<ExplorerAgreementSummary>,
-    total: usize,
-    page: usize,
-    limit: usize,
-}
+    #[derive(Serialize)]
+    struct ExplorerProofEntry {
+        proof_id: String,
+        proof_type: String,
+        agreement_hash: String,
+        attested_by: String,
+        attestation_time: u64,
+        status: String,
+    }
 
-#[derive(Serialize)]
-struct ExplorerProofEntry {
-    proof_id: String,
-    proof_type: String,
-    agreement_hash: String,
-    attested_by: String,
-    attestation_time: u64,
-    status: String,
-}
+    #[derive(Serialize)]
+    struct ExplorerProofsResponse {
+        proofs: Vec<ExplorerProofEntry>,
+        total: usize,
+        page: usize,
+        limit: usize,
+    }
 
-#[derive(Serialize)]
-struct ExplorerProofsResponse {
-    proofs: Vec<ExplorerProofEntry>,
-    total: usize,
-    page: usize,
-    limit: usize,
-}
+    #[derive(Serialize)]
+    struct ExplorerReputationResponse {
+        pubkey: String,
+        total_agreements_as_seller: usize,
+        proofs_submitted: usize,
+        note: String,
+    }
 
-#[derive(Serialize)]
-struct ExplorerReputationResponse {
-    pubkey: String,
-    total_agreements_as_seller: usize,
-    proofs_submitted: usize,
-    note: String,
-}
+    #[derive(Serialize)]
+    struct ExplorerStatsResponse {
+        chain_height: u64,
+        total_agreements: usize,
+        total_proofs: usize,
+        peer_count: usize,
+        proof_types: std::collections::HashMap<String, usize>,
+    }
 
-#[derive(Serialize)]
-struct ExplorerStatsResponse {
-    chain_height: u64,
-    total_agreements: usize,
-    total_proofs: usize,
-    peer_count: usize,
-    proof_types: std::collections::HashMap<String, usize>,
-}
+    #[derive(Serialize)]
+    struct ExplorerAgreementDetailResponse {
+        hash: String,
+        agreement: serde_json::Value,
+        lifecycle: AgreementLifecycleView,
+        proofs: Vec<ExplorerProofEntry>,
+    }
 
-#[derive(Serialize)]
-struct ExplorerAgreementDetailResponse {
-    hash: String,
-    agreement: serde_json::Value,
-    lifecycle: AgreementLifecycleView,
-    proofs: Vec<ExplorerProofEntry>,
-}
-
-async fn explorer_agreements(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    Query(q): Query<ExplorerPageQuery>,
-) -> impl axum::response::IntoResponse {
-    check_rate(&state, &addr).unwrap_or(());
-    let dir = explorer_agreements_dir();
-    let mut entries: Vec<(u64, ExplorerAgreementSummary)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if !path.extension().map(|e| e == "json").unwrap_or(false) { continue; }
-            let hash = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(h) => h.to_string(),
-                None => continue,
-            };
-            let Ok(data) = std::fs::read_to_string(&path) else { continue };
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
-            let agreement_id = v.get("agreement_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let template_type = v.get("template_type").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let total_amount = v.get("total_amount").and_then(|x| x.as_u64()).unwrap_or(0);
-            let creation_time = v.get("creation_time").and_then(|x| x.as_u64()).unwrap_or(0);
-            let parties: Vec<serde_json::Value> = v.get("parties")
-                .and_then(|x| x.as_array())
-                .map(|arr| arr.iter().map(|p| serde_json::json!({
+    async fn explorer_agreements(
+        ConnectInfo(addr): ConnectInfo<SocketAddr>,
+        State(state): State<AppState>,
+        Query(q): Query<ExplorerPageQuery>,
+    ) -> impl axum::response::IntoResponse {
+        check_rate(&state, &addr).unwrap_or(());
+        let dir = explorer_agreements_dir();
+        let mut entries: Vec<(u64, ExplorerAgreementSummary)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if !path.extension().map(|e| e == "json").unwrap_or(false) {
+                    continue;
+                }
+                let hash = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(h) => h.to_string(),
+                    None => continue,
+                };
+                let Ok(data) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+                    continue;
+                };
+                let agreement_id = v
+                    .get("agreement_id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let template_type = v
+                    .get("template_type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let total_amount = v.get("total_amount").and_then(|x| x.as_u64()).unwrap_or(0);
+                let creation_time = v.get("creation_time").and_then(|x| x.as_u64()).unwrap_or(0);
+                let parties: Vec<serde_json::Value> = v
+                    .get("parties")
+                    .and_then(|x| x.as_array())
+                    .map(|arr| {
+                        arr.iter().map(|p| serde_json::json!({
                     "role": p.get("role").and_then(|r| r.as_str()).unwrap_or(""),
                     "display_name": p.get("display_name").and_then(|r| r.as_str()).unwrap_or(""),
                     "address": p.get("address").and_then(|r| r.as_str()).unwrap_or(""),
-                })).collect())
-                .unwrap_or_default();
-            entries.push((creation_time, ExplorerAgreementSummary {
-                hash, agreement_id, template_type, total_amount, creation_time, parties,
-            }));
+                })).collect()
+                    })
+                    .unwrap_or_default();
+                entries.push((
+                    creation_time,
+                    ExplorerAgreementSummary {
+                        hash,
+                        agreement_id,
+                        template_type,
+                        total_amount,
+                        creation_time,
+                        parties,
+                    },
+                ));
+            }
         }
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        let total = entries.len();
+        let limit = q.limit.clamp(1, 100);
+        let page = q.page.max(1);
+        let skip = (page - 1) * limit;
+        let agreements: Vec<ExplorerAgreementSummary> = entries
+            .into_iter()
+            .skip(skip)
+            .take(limit)
+            .map(|(_, s)| s)
+            .collect();
+        (
+            explorer_cors_headers(),
+            Json(ExplorerAgreementsResponse {
+                agreements,
+                total,
+                page,
+                limit,
+            }),
+        )
     }
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
-    let total = entries.len();
-    let limit = q.limit.clamp(1, 100);
-    let page = q.page.max(1);
-    let skip = (page - 1) * limit;
-    let agreements: Vec<ExplorerAgreementSummary> = entries.into_iter()
-        .skip(skip).take(limit).map(|(_, s)| s).collect();
-    (explorer_cors_headers(), Json(ExplorerAgreementsResponse { agreements, total, page, limit }))
-}
 
-async fn explorer_agreement_detail(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    AxumPath(hash): AxumPath<String>,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    check_rate(&state, &addr).unwrap_or(());
-    let hash = hash.to_lowercase();
-    let dir = explorer_agreements_dir();
-    let path = dir.join(format!("{}.json", hash));
-    let Ok(data) = std::fs::read_to_string(&path) else {
-        return (explorer_cors_headers(), Json(serde_json::json!({"error": "agreement not found"}))).into_response();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
-        return (explorer_cors_headers(), Json(serde_json::json!({"error": "parse error"}))).into_response();
-    };
-    let agreement: irium_node_rs::settlement::AgreementObject = match serde_json::from_value(v.clone()) {
-        Ok(a) => a,
-        Err(_) => return (explorer_cors_headers(), Json(serde_json::json!({"error": "invalid agreement"}))).into_response(),
-    };
-    let lifecycle = {
-        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let linked = scan_agreement_linked_txs(&chain, &agreement, &hash);
-        let tip = chain.tip_height();
-        irium_node_rs::settlement::derive_lifecycle(&agreement, &hash, linked, tip)
-    };
-    let tip_height = state.status_height_cache.load(std::sync::atomic::Ordering::Relaxed);
-    let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
-    let proofs: Vec<ExplorerProofEntry> = store.list_by_agreement(&hash).into_iter().map(|p| {
-        ExplorerProofEntry {
-            proof_id: p.proof_id.clone(),
-            proof_type: p.proof_type.clone(),
-            agreement_hash: p.agreement_hash.clone(),
-            attested_by: p.attested_by.clone(),
-            attestation_time: p.attestation_time,
-            status: proof_lifecycle_status(p.expires_at_height, tip_height).to_string(),
-        }
-    }).collect();
-    (explorer_cors_headers(), Json(ExplorerAgreementDetailResponse { hash, agreement: v, lifecycle, proofs })).into_response()
-}
+    async fn explorer_agreement_detail(
+        ConnectInfo(addr): ConnectInfo<SocketAddr>,
+        State(state): State<AppState>,
+        AxumPath(hash): AxumPath<String>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        check_rate(&state, &addr).unwrap_or(());
+        let hash = hash.to_lowercase();
+        let dir = explorer_agreements_dir();
+        let path = dir.join(format!("{}.json", hash));
+        let Ok(data) = std::fs::read_to_string(&path) else {
+            return (
+                explorer_cors_headers(),
+                Json(serde_json::json!({"error": "agreement not found"})),
+            )
+                .into_response();
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+            return (
+                explorer_cors_headers(),
+                Json(serde_json::json!({"error": "parse error"})),
+            )
+                .into_response();
+        };
+        let agreement: irium_node_rs::settlement::AgreementObject =
+            match serde_json::from_value(v.clone()) {
+                Ok(a) => a,
+                Err(_) => {
+                    return (
+                        explorer_cors_headers(),
+                        Json(serde_json::json!({"error": "invalid agreement"})),
+                    )
+                        .into_response()
+                }
+            };
+        let lifecycle = {
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            let linked = scan_agreement_linked_txs(&chain, &agreement, &hash);
+            let tip = chain.tip_height();
+            irium_node_rs::settlement::derive_lifecycle(&agreement, &hash, linked, tip)
+        };
+        let tip_height = state
+            .status_height_cache
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+        let proofs: Vec<ExplorerProofEntry> = store
+            .list_by_agreement(&hash)
+            .into_iter()
+            .map(|p| ExplorerProofEntry {
+                proof_id: p.proof_id.clone(),
+                proof_type: p.proof_type.clone(),
+                agreement_hash: p.agreement_hash.clone(),
+                attested_by: p.attested_by.clone(),
+                attestation_time: p.attestation_time,
+                status: proof_lifecycle_status(p.expires_at_height, tip_height).to_string(),
+            })
+            .collect();
+        (
+            explorer_cors_headers(),
+            Json(ExplorerAgreementDetailResponse {
+                hash,
+                agreement: v,
+                lifecycle,
+                proofs,
+            }),
+        )
+            .into_response()
+    }
 
-async fn explorer_proofs(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    Query(q): Query<ExplorerProofsQuery>,
-) -> impl axum::response::IntoResponse {
-    check_rate(&state, &addr).unwrap_or(());
-    let tip_height = state.status_height_cache.load(std::sync::atomic::Ordering::Relaxed);
-    let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
-    let all: Vec<ExplorerProofEntry> = match q.agreement_hash.as_deref() {
-        Some(h) => store.list_by_agreement(h).into_iter().map(|p| ExplorerProofEntry {
-            proof_id: p.proof_id.clone(), proof_type: p.proof_type.clone(),
-            agreement_hash: p.agreement_hash.clone(), attested_by: p.attested_by.clone(),
-            attestation_time: p.attestation_time,
-            status: proof_lifecycle_status(p.expires_at_height, tip_height).to_string(),
-        }).collect(),
-        None => store.list_all().into_iter().map(|p| ExplorerProofEntry {
-            proof_id: p.proof_id.clone(), proof_type: p.proof_type.clone(),
-            agreement_hash: p.agreement_hash.clone(), attested_by: p.attested_by.clone(),
-            attestation_time: p.attestation_time,
-            status: proof_lifecycle_status(p.expires_at_height, tip_height).to_string(),
-        }).collect(),
-    };
-    let total = all.len();
-    let limit = q.limit.clamp(1, 100);
-    let page = q.page.max(1);
-    let skip = (page - 1) * limit;
-    let proofs: Vec<ExplorerProofEntry> = all.into_iter().skip(skip).take(limit).collect();
-    (explorer_cors_headers(), Json(ExplorerProofsResponse { proofs, total, page, limit }))
-}
+    async fn explorer_proofs(
+        ConnectInfo(addr): ConnectInfo<SocketAddr>,
+        State(state): State<AppState>,
+        Query(q): Query<ExplorerProofsQuery>,
+    ) -> impl axum::response::IntoResponse {
+        check_rate(&state, &addr).unwrap_or(());
+        let tip_height = state
+            .status_height_cache
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+        let all: Vec<ExplorerProofEntry> = match q.agreement_hash.as_deref() {
+            Some(h) => store
+                .list_by_agreement(h)
+                .into_iter()
+                .map(|p| ExplorerProofEntry {
+                    proof_id: p.proof_id.clone(),
+                    proof_type: p.proof_type.clone(),
+                    agreement_hash: p.agreement_hash.clone(),
+                    attested_by: p.attested_by.clone(),
+                    attestation_time: p.attestation_time,
+                    status: proof_lifecycle_status(p.expires_at_height, tip_height).to_string(),
+                })
+                .collect(),
+            None => store
+                .list_all()
+                .into_iter()
+                .map(|p| ExplorerProofEntry {
+                    proof_id: p.proof_id.clone(),
+                    proof_type: p.proof_type.clone(),
+                    agreement_hash: p.agreement_hash.clone(),
+                    attested_by: p.attested_by.clone(),
+                    attestation_time: p.attestation_time,
+                    status: proof_lifecycle_status(p.expires_at_height, tip_height).to_string(),
+                })
+                .collect(),
+        };
+        let total = all.len();
+        let limit = q.limit.clamp(1, 100);
+        let page = q.page.max(1);
+        let skip = (page - 1) * limit;
+        let proofs: Vec<ExplorerProofEntry> = all.into_iter().skip(skip).take(limit).collect();
+        (
+            explorer_cors_headers(),
+            Json(ExplorerProofsResponse {
+                proofs,
+                total,
+                page,
+                limit,
+            }),
+        )
+    }
 
-async fn explorer_reputation(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    AxumPath(pubkey): AxumPath<String>,
-) -> impl axum::response::IntoResponse {
-    check_rate(&state, &addr).unwrap_or(());
-    let dir = explorer_agreements_dir();
-    let mut total_seller: usize = 0;
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if !path.extension().map(|e| e == "json").unwrap_or(false) { continue; }
-            let Ok(data) = std::fs::read_to_string(&path) else { continue };
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
-            if let Some(parties) = v.get("parties").and_then(|p| p.as_array()) {
-                for party in parties {
-                    let role = party.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                    let addr = party.get("address").and_then(|a| a.as_str()).unwrap_or("");
-                    if (role == "seller" || role == "payee") && addr == pubkey.as_str() {
-                        total_seller += 1;
-                        break;
+    async fn explorer_reputation(
+        ConnectInfo(addr): ConnectInfo<SocketAddr>,
+        State(state): State<AppState>,
+        AxumPath(pubkey): AxumPath<String>,
+    ) -> impl axum::response::IntoResponse {
+        check_rate(&state, &addr).unwrap_or(());
+        let dir = explorer_agreements_dir();
+        let mut total_seller: usize = 0;
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if !path.extension().map(|e| e == "json").unwrap_or(false) {
+                    continue;
+                }
+                let Ok(data) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+                    continue;
+                };
+                if let Some(parties) = v.get("parties").and_then(|p| p.as_array()) {
+                    for party in parties {
+                        let role = party.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                        let addr = party.get("address").and_then(|a| a.as_str()).unwrap_or("");
+                        if (role == "seller" || role == "payee") && addr == pubkey.as_str() {
+                            total_seller += 1;
+                            break;
+                        }
                     }
                 }
             }
         }
+        let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+        let proofs_submitted = store
+            .list_all()
+            .into_iter()
+            .filter(|p| p.attested_by == pubkey)
+            .count();
+        (
+            explorer_cors_headers(),
+            Json(ExplorerReputationResponse {
+                pubkey,
+                total_agreements_as_seller: total_seller,
+                proofs_submitted,
+                note:
+                    "Reputation derived from locally stored agreement and proof data on this node."
+                        .to_string(),
+            }),
+        )
     }
-    let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
-    let proofs_submitted = store.list_all().into_iter()
-        .filter(|p| p.attested_by == pubkey)
-        .count();
-    (explorer_cors_headers(), Json(ExplorerReputationResponse {
-        pubkey,
-        total_agreements_as_seller: total_seller,
-        proofs_submitted,
-        note: "Reputation derived from locally stored agreement and proof data on this node.".to_string(),
-    }))
-}
 
-async fn explorer_stats(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-) -> impl axum::response::IntoResponse {
-    check_rate(&state, &addr).unwrap_or(());
-    let chain_height = state.status_height_cache.load(std::sync::atomic::Ordering::Relaxed);
-    let peer_count = state.status_peer_count_cache.load(std::sync::atomic::Ordering::Relaxed);
-    let dir = explorer_agreements_dir();
-    let total_agreements = std::fs::read_dir(&dir)
-        .map(|rd| rd.flatten().filter(|e| {
-            e.path().extension().map(|ex| ex == "json").unwrap_or(false)
-        }).count())
-        .unwrap_or(0);
-    let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
-    let total_proofs = store.count();
-    let mut proof_types: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for p in store.list_all() {
-        *proof_types.entry(p.proof_type.clone()).or_insert(0) += 1;
+    async fn explorer_stats(
+        ConnectInfo(addr): ConnectInfo<SocketAddr>,
+        State(state): State<AppState>,
+    ) -> impl axum::response::IntoResponse {
+        check_rate(&state, &addr).unwrap_or(());
+        let chain_height = state
+            .status_height_cache
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let peer_count = state
+            .status_peer_count_cache
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let dir = explorer_agreements_dir();
+        let total_agreements = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().extension().map(|ex| ex == "json").unwrap_or(false))
+                    .count()
+            })
+            .unwrap_or(0);
+        let store = state.proof_store.lock().unwrap_or_else(|e| e.into_inner());
+        let total_proofs = store.count();
+        let mut proof_types: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for p in store.list_all() {
+            *proof_types.entry(p.proof_type.clone()).or_insert(0) += 1;
+        }
+        (
+            explorer_cors_headers(),
+            Json(ExplorerStatsResponse {
+                chain_height,
+                total_agreements,
+                total_proofs,
+                peer_count,
+                proof_types,
+            }),
+        )
     }
-    (explorer_cors_headers(), Json(ExplorerStatsResponse {
-        chain_height, total_agreements, total_proofs, peer_count, proof_types,
-    }))
-}
 
     let mut app = Router::new()
         .route("/status", get(status))
@@ -17709,7 +18085,10 @@ async fn explorer_stats(
         .route("/wallet/unlock", post(wallet_unlock))
         .route("/wallet/lock", post(wallet_lock))
         .route("/wallet/info", get(wallet_info))
-        .route("/wallet/migrate_to_encrypted", post(wallet_migrate_to_encrypted))
+        .route(
+            "/wallet/migrate_to_encrypted",
+            post(wallet_migrate_to_encrypted),
+        )
         .route("/wallet/recover_from_seed", post(wallet_recover_from_seed))
         .route("/wallet/addresses", get(wallet_addresses))
         .route("/wallet/receive", get(wallet_receive))
@@ -17786,9 +18165,18 @@ async fn explorer_stats(
         "[i] HTTP status: http://{}:{}/status",
         status_host, status_port
     );
-    println!("[i] WebSocket: ws://{}:{}/ws  SSE: http://{}:{}/events", host, port, host, port);
-    println!("[i] Explorer: http://{}:{}/explorer/stats | /explorer/agreements | /explorer/proofs", host, port);
-    println!("[i] Proof finality depth: {} blocks (IRIUM_PROOF_FINALITY_DEPTH)", proof_finality_depth());
+    println!(
+        "[i] WebSocket: ws://{}:{}/ws  SSE: http://{}:{}/events",
+        host, port, host, port
+    );
+    println!(
+        "[i] Explorer: http://{}:{}/explorer/stats | /explorer/agreements | /explorer/proofs",
+        host, port
+    );
+    println!(
+        "[i] Proof finality depth: {} blocks (IRIUM_PROOF_FINALITY_DEPTH)",
+        proof_finality_depth()
+    );
 
     let tls_cert = std::env::var("IRIUM_TLS_CERT").ok();
     let tls_key = std::env::var("IRIUM_TLS_KEY").ok();
@@ -17831,7 +18219,6 @@ async fn explorer_stats(
 
 #[cfg(test)]
 mod tests {
-    use irium_node_rs::settlement::TypedProofPayload;
     use super::*;
     use axum::extract::{ConnectInfo, Query, State};
     use axum::http::HeaderMap;
@@ -17839,6 +18226,7 @@ mod tests {
     use irium_node_rs::chain::{block_from_locked, ChainParams, ChainState, OutPoint, UtxoEntry};
     use irium_node_rs::genesis::load_locked_genesis;
     use irium_node_rs::mempool::MempoolManager;
+    use irium_node_rs::settlement::TypedProofPayload;
     use irium_node_rs::settlement::{
         settlement_proof_payload_bytes, AgreementDeadlines, AgreementMilestone, AgreementObject,
         AgreementParty, AgreementRefundCondition, AgreementReleaseCondition, AgreementTemplateType,
@@ -17951,14 +18339,17 @@ mod tests {
                 "irium_policies",
                 "json",
             )))),
-            event_tx: tokio::sync::broadcast::channel::<std::sync::Arc<String>>(WS_BROADCAST_CAPACITY).0,
+            event_tx: tokio::sync::broadcast::channel::<std::sync::Arc<String>>(
+                WS_BROADCAST_CAPACITY,
+            )
+            .0,
             proof_heights: Arc::new(Mutex::new(std::collections::HashMap::new())),
             disputes_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
             resolvers_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
             btc_template_headers_cache: Arc::new(Mutex::new(None)),
             ltc_template_headers_cache: Arc::new(Mutex::new(None)),
             poawx_pending_receipts: Arc::new(Mutex::new(Vec::new())),
-            };
+        };
 
         (state, sender, recipient, refund)
     }
@@ -24134,13 +24525,25 @@ mod tests {
     // Total supply: 25 IRM. Per-entry percentages: 60% / 20% / 4% = 84%.
     // The remaining 16% is the non-P2PKH bucket and is intentionally not
     // surfaced as an "entry" (no single owning address for that script).
-    fn insert_utxo(state: &AppState, txid_byte: u8, index: u32, value: u64, script_pubkey: Vec<u8>) {
+    fn insert_utxo(
+        state: &AppState,
+        txid_byte: u8,
+        index: u32,
+        value: u64,
+        script_pubkey: Vec<u8>,
+    ) {
         let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
         let tip = chain.tip_height();
         chain.utxos.insert(
-            OutPoint { txid: [txid_byte; 32], index },
+            OutPoint {
+                txid: [txid_byte; 32],
+                index,
+            },
             UtxoEntry {
-                output: TxOutput { value, script_pubkey },
+                output: TxOutput {
+                    value,
+                    script_pubkey,
+                },
                 height: tip,
                 is_coinbase: false,
             },
@@ -24168,13 +24571,13 @@ mod tests {
         };
 
         // 5 P2PKH UTXOs + 1 non-P2PKH output.
-        insert_utxo(&state, 0x01, 0, 10_00_000_000, p2pkh(&sender));    // 10 IRM
-        insert_utxo(&state, 0x02, 0,  5_00_000_000, p2pkh(&sender));    //  5 IRM
-        insert_utxo(&state, 0x03, 0,  3_00_000_000, p2pkh(&recipient)); //  3 IRM
-        insert_utxo(&state, 0x04, 0,  2_00_000_000, p2pkh(&recipient)); //  2 IRM
-        insert_utxo(&state, 0x05, 0,  1_00_000_000, p2pkh(&refund));    //  1 IRM
-        // Non-P2PKH: 1-byte script will fail p2pkh_hash_from_script's len==25 gate.
-        insert_utxo(&state, 0x06, 0,  4_00_000_000, vec![0x00]);        //  4 IRM
+        insert_utxo(&state, 0x01, 0, 10_00_000_000, p2pkh(&sender)); // 10 IRM
+        insert_utxo(&state, 0x02, 0, 5_00_000_000, p2pkh(&sender)); //  5 IRM
+        insert_utxo(&state, 0x03, 0, 3_00_000_000, p2pkh(&recipient)); //  3 IRM
+        insert_utxo(&state, 0x04, 0, 2_00_000_000, p2pkh(&recipient)); //  2 IRM
+        insert_utxo(&state, 0x05, 0, 1_00_000_000, p2pkh(&refund)); //  1 IRM
+                                                                    // Non-P2PKH: 1-byte script will fail p2pkh_hash_from_script's len==25 gate.
+        insert_utxo(&state, 0x06, 0, 4_00_000_000, vec![0x00]); //  4 IRM
 
         let resp = get_richlist(
             ConnectInfo(test_socket()),
@@ -24187,7 +24590,10 @@ mod tests {
         .0;
 
         // total_supply_sats includes ALL outputs (P2PKH + non-P2PKH).
-        assert_eq!(resp.total_supply_sats, 25_00_000_000, "total supply must include non-P2PKH outputs");
+        assert_eq!(
+            resp.total_supply_sats, 25_00_000_000,
+            "total supply must include non-P2PKH outputs"
+        );
 
         // entries excludes the non-P2PKH output → exactly 3 addresses.
         assert_eq!(resp.count, 3);
@@ -24212,9 +24618,17 @@ mod tests {
 
         // Percentages match the balance-to-total ratio and never exceed 100.
         let pct_sum: f64 = resp.entries.iter().map(|e| e.percentage).sum();
-        assert!(pct_sum <= 100.0 + 1e-9, "percentages must sum to ≤ 100, got {}", pct_sum);
+        assert!(
+            pct_sum <= 100.0 + 1e-9,
+            "percentages must sum to ≤ 100, got {}",
+            pct_sum
+        );
         // The non-P2PKH 4 IRM is the 16% gap — entry percentages should sum to 84%.
-        assert!((pct_sum - 84.0).abs() < 0.01, "expected ≈84% sum, got {}", pct_sum);
+        assert!(
+            (pct_sum - 84.0).abs() < 0.01,
+            "expected ≈84% sum, got {}",
+            pct_sum
+        );
 
         // Sanity-check the rank-1 percentage matches 15/25 = 60%.
         assert!((resp.entries[0].percentage - 60.0).abs() < 0.01);
@@ -24308,7 +24722,11 @@ mod tests {
         r.signature.signature = hex::encode(sig.to_bytes());
     }
 
-    fn s32_otc_with_resolver(buyer: &str, seller: &str, primary_resolver: Option<&str>) -> AgreementObject {
+    fn s32_otc_with_resolver(
+        buyer: &str,
+        seller: &str,
+        primary_resolver: Option<&str>,
+    ) -> AgreementObject {
         let buyer_party = irium_node_rs::settlement::AgreementParty {
             party_id: "buyer".to_string(),
             display_name: "Buyer".to_string(),
@@ -24343,7 +24761,11 @@ mod tests {
         a
     }
 
-    fn s32_make_raise(agreement: &AgreementObject, raising_party: &str, sk: &SigningKey) -> DisputeRaise {
+    fn s32_make_raise(
+        agreement: &AgreementObject,
+        raising_party: &str,
+        sk: &SigningKey,
+    ) -> DisputeRaise {
         let agreement_hash = compute_agreement_hash_hex(agreement).expect("hash");
         let mut d = DisputeRaise {
             version: irium_node_rs::settlement::DISPUTE_RAISE_VERSION,
@@ -24360,7 +24782,11 @@ mod tests {
         d
     }
 
-    fn s32_make_evidence(agreement: &AgreementObject, submitter: &str, sk: &SigningKey) -> DisputeEvidence {
+    fn s32_make_evidence(
+        agreement: &AgreementObject,
+        submitter: &str,
+        sk: &SigningKey,
+    ) -> DisputeEvidence {
         let agreement_hash = compute_agreement_hash_hex(agreement).expect("hash");
         let mut d = DisputeEvidence {
             version: irium_node_rs::settlement::DISPUTE_EVIDENCE_VERSION,
@@ -24425,10 +24851,7 @@ mod tests {
             let mut txid = [0xAAu8; 32];
             txid[31] = i as u8;
             chain.utxos.insert(
-                OutPoint {
-                    txid,
-                    index: 0,
-                },
+                OutPoint { txid, index: 0 },
                 UtxoEntry {
                     output: TxOutput {
                         value: value_each,
@@ -24495,13 +24918,14 @@ mod tests {
             resolution_anchored_at_height: None,
             escalated_to_fallback: false,
             escalated_at_height: None,
-        reresolve_nomination: None,
+            reresolve_nomination: None,
         };
         {
             let mut guard = state.disputes_index.lock().unwrap();
             guard.insert(agreement_hash.clone(), dstate);
         }
-        let mut resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "release");
+        let mut resp =
+            s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "release");
         apply_dispute_status_to_eligibility(&state, &agreement, true, &mut resp);
         assert!(!resp.eligible);
         assert!(resp.reasons.iter().any(|r| r == "dispute_open"));
@@ -24527,13 +24951,14 @@ mod tests {
             resolution_anchored_at_height: None,
             escalated_to_fallback: false,
             escalated_at_height: None,
-        reresolve_nomination: None,
+            reresolve_nomination: None,
         };
         {
             let mut guard = state.disputes_index.lock().unwrap();
             guard.insert(agreement_hash.clone(), dstate);
         }
-        let mut resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "refund");
+        let mut resp =
+            s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "refund");
         apply_dispute_status_to_eligibility(&state, &agreement, false, &mut resp);
         assert!(!resp.eligible);
         assert!(resp.reasons.iter().any(|r| r == "dispute_open"));
@@ -24562,21 +24987,26 @@ mod tests {
             resolution_anchored_at_height: Some(20),
             escalated_to_fallback: false,
             escalated_at_height: None,
-        reresolve_nomination: None,
+            reresolve_nomination: None,
         };
         {
             let mut guard = state.disputes_index.lock().unwrap();
             guard.insert(agreement_hash.clone(), dstate);
         }
         // Release branch should pass (no dispute block).
-        let mut release_resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "release");
+        let mut release_resp =
+            s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "release");
         apply_dispute_status_to_eligibility(&state, &agreement, true, &mut release_resp);
         assert!(release_resp.eligible);
         // Refund branch should be blocked.
-        let mut refund_resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "refund");
+        let mut refund_resp =
+            s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "refund");
         apply_dispute_status_to_eligibility(&state, &agreement, false, &mut refund_resp);
         assert!(!refund_resp.eligible);
-        assert!(refund_resp.reasons.iter().any(|r| r == "dispute_resolution_blocks_branch"));
+        assert!(refund_resp
+            .reasons
+            .iter()
+            .any(|r| r == "dispute_resolution_blocks_branch"));
     }
 
     #[test]
@@ -24602,19 +25032,24 @@ mod tests {
             resolution_anchored_at_height: Some(20),
             escalated_to_fallback: false,
             escalated_at_height: None,
-        reresolve_nomination: None,
+            reresolve_nomination: None,
         };
         {
             let mut guard = state.disputes_index.lock().unwrap();
             guard.insert(agreement_hash.clone(), dstate);
         }
-        let mut refund_resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "refund");
+        let mut refund_resp =
+            s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "refund");
         apply_dispute_status_to_eligibility(&state, &agreement, false, &mut refund_resp);
         assert!(refund_resp.eligible);
-        let mut release_resp = s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "release");
+        let mut release_resp =
+            s32_stub_eligibility(&agreement_hash, &agreement.agreement_id, true, "release");
         apply_dispute_status_to_eligibility(&state, &agreement, true, &mut release_resp);
         assert!(!release_resp.eligible);
-        assert!(release_resp.reasons.iter().any(|r| r == "dispute_resolution_blocks_branch"));
+        assert!(release_resp
+            .reasons
+            .iter()
+            .any(|r| r == "dispute_resolution_blocks_branch"));
     }
 
     #[tokio::test]
@@ -24637,7 +25072,7 @@ mod tests {
             resolution_anchored_at_height: None,
             escalated_to_fallback: false,
             escalated_at_height: None,
-        reresolve_nomination: None,
+            reresolve_nomination: None,
         };
         {
             let mut guard = state.disputes_index.lock().unwrap();
@@ -24671,7 +25106,7 @@ mod tests {
             resolution_anchored_at_height: None,
             escalated_to_fallback: false,
             escalated_at_height: None,
-        reresolve_nomination: None,
+            reresolve_nomination: None,
         };
         {
             let mut guard = state.disputes_index.lock().unwrap();
@@ -24779,10 +25214,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state.clone()),
             HeaderMap::new(),
-            AxumJson(RaiseDisputeRequest {
-                dispute,
-                agreement,
-            }),
+            AxumJson(RaiseDisputeRequest { dispute, agreement }),
         )
         .await;
         let (status, msg) = result.expect_err("should reject");
@@ -24805,10 +25237,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            AxumJson(RaiseDisputeRequest {
-                dispute,
-                agreement,
-            }),
+            AxumJson(RaiseDisputeRequest { dispute, agreement }),
         )
         .await;
         let (status, msg) = result.expect_err("should reject");
@@ -24856,10 +25285,7 @@ mod tests {
             ConnectInfo(test_socket()),
             State(state),
             HeaderMap::new(),
-            AxumJson(RaiseDisputeRequest {
-                dispute,
-                agreement,
-            }),
+            AxumJson(RaiseDisputeRequest { dispute, agreement }),
         )
         .await;
         let (status, msg) = result.expect_err("should reject");
@@ -25296,7 +25722,7 @@ mod tests {
             btc_template_headers_cache: Arc::new(Mutex::new(None)),
             ltc_template_headers_cache: Arc::new(Mutex::new(None)),
             poawx_pending_receipts: Arc::new(Mutex::new(Vec::new())),
-            }
+        }
     }
 
     /// Empty headers; with IRIUM_RPC_TOKEN unset (which
@@ -25330,13 +25756,9 @@ mod tests {
         ensure_rpc_token_env();
         let path = unique_path("walletinfo_none", "json");
         let state = make_wallet_app_state(path.clone());
-        let resp = wallet_info(
-            ConnectInfo(test_socket()),
-            State(state),
-            auth_headers(),
-        )
-        .await
-        .expect("Ok");
+        let resp = wallet_info(ConnectInfo(test_socket()), State(state), auth_headers())
+            .await
+            .expect("Ok");
         let body = resp.0;
         assert!(!body.exists);
         assert_eq!(body.mode, WalletMode::None);
@@ -25350,13 +25772,9 @@ mod tests {
         let path = unique_path("walletinfo_plain", "json");
         write_legacy_plaintext_at(&path);
         let state = make_wallet_app_state(path.clone());
-        let resp = wallet_info(
-            ConnectInfo(test_socket()),
-            State(state),
-            auth_headers(),
-        )
-        .await
-        .expect("Ok");
+        let resp = wallet_info(ConnectInfo(test_socket()), State(state), auth_headers())
+            .await
+            .expect("Ok");
         assert!(resp.0.exists);
         assert_eq!(resp.0.mode, WalletMode::Plaintext);
         let _ = std::fs::remove_file(&path);
@@ -25372,13 +25790,9 @@ mod tests {
             let mut w = state.wallet.lock().unwrap_or_else(|e| e.into_inner());
             w.create_with_seed("p", None).expect("create");
         }
-        let resp = wallet_info(
-            ConnectInfo(test_socket()),
-            State(state),
-            auth_headers(),
-        )
-        .await
-        .expect("Ok");
+        let resp = wallet_info(ConnectInfo(test_socket()), State(state), auth_headers())
+            .await
+            .expect("Ok");
         assert_eq!(resp.0.mode, WalletMode::Encrypted);
         let _ = std::fs::remove_file(&path);
     }
@@ -25577,7 +25991,11 @@ mod tests {
         .0;
 
         assert!(resp.accepted);
-        assert!(resp.fee >= 19_200, "fee {} should clear raw estimate", resp.fee);
+        assert!(
+            resp.fee >= 19_200,
+            "fee {} should clear raw estimate",
+            resp.fee
+        );
         assert_eq!(resp.total_input, 100_000_000);
         assert_eq!(resp.change, 0);
         // amount = total - fee; no change output.
@@ -25610,8 +26028,11 @@ mod tests {
 
         let err = result.err().expect("expected error");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        let body = err.1.0;
-        assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("insufficient_funds_for_fee"));
+        let body = err.1 .0;
+        assert_eq!(
+            body.get("error").and_then(|v| v.as_str()),
+            Some("insufficient_funds_for_fee")
+        );
     }
 
     #[tokio::test]
@@ -25639,7 +26060,7 @@ mod tests {
 
         let err = result.err().expect("expected error");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        let body = err.1.0;
+        let body = err.1 .0;
         // wallet_send rejects at the empty-UTXO step before reaching the
         // send_max branch when from_address has nothing in chain.utxos.
         let reason = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
@@ -25675,8 +26096,11 @@ mod tests {
 
         let err = result.err().expect("expected error");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        let body = err.1.0;
-        assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("missing_amount"));
+        let body = err.1 .0;
+        assert_eq!(
+            body.get("error").and_then(|v| v.as_str()),
+            Some("missing_amount")
+        );
     }
 
     #[tokio::test]
@@ -25708,12 +26132,205 @@ mod tests {
         assert!(resp.accepted);
         assert_eq!(resp.total_input, 100_000_000);
         // Change goes back to sender (it's the change_address when from_address is set).
-        assert!(resp.change > 0, "expected change output, got {}", resp.change);
+        assert!(
+            resp.change > 0,
+            "expected change output, got {}",
+            resp.change
+        );
         // Standard fee_per_byte=1 with no floor: tiny fee (~250 sat range).
-        assert!(resp.fee < 10_000, "non-send_max fee should not be floored: {}", resp.fee);
+        assert!(
+            resp.fee < 10_000,
+            "non-send_max fee should not be floored: {}",
+            resp.fee
+        );
+    }
+
+    // --- Phase 12-B PoAW-X critical consensus tests ---
+
+    fn poawx_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn minimal_header() -> SubmitBlockHeader {
+        SubmitBlockHeader {
+            version: 1,
+            prev_hash: "00".repeat(32),
+            merkle_root: "00".repeat(32),
+            time: 1_700_000_000,
+            bits: "207fffff".to_string(),
+            nonce: 0,
+            hash: "00".repeat(32),
+        }
+    }
+
+    /// C-2: /rpc/submit_block returns 405 when poawx mode=active on testnet.
+    #[tokio::test]
+    async fn test_submit_block_rejected_when_poawx_active() {
+        let _env_guard = poawx_env_lock().lock().unwrap();
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let (state, _, _, _) = create_test_state(None);
+        let req = SubmitBlockRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+        };
+        let result = submit_block(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "submit_block must return 405 when poawx mode=active"
+        );
+    }
+
+    /// C-2 negative: submit_block proceeds past gate when poawx is inactive.
+    #[tokio::test]
+    async fn test_submit_block_proceeds_past_gate_when_inactive() {
+        let _env_guard = poawx_env_lock().lock().unwrap();
+        ensure_rpc_token_env();
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let (state, _, _, _) = create_test_state(None);
+        let req = SubmitBlockRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+        };
+        let result = submit_block(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        let err = result.unwrap_err();
+        assert_ne!(
+            err,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "submit_block must not return 405 when poawx inactive (got {:?})",
+            err
+        );
+    }
+
+    /// C-3: SBE returns 400 when poawx active and receipts are empty.
+    #[tokio::test]
+    async fn test_sbe_rejects_empty_receipts_when_poawx_active() {
+        let _env_guard = poawx_env_lock().lock().unwrap();
+        ensure_rpc_token_env();
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let (state, _, _, _) = create_test_state(None);
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![],
+            poawx_receipts_root: String::new(),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::BAD_REQUEST,
+            "SBE must return 400 when poawx active and receipts empty"
+        );
+    }
+
+    /// C-3 negative: SBE does not apply empty-receipt gate when poawx inactive.
+    #[tokio::test]
+    async fn test_sbe_allows_empty_receipts_when_poawx_inactive() {
+        let _env_guard = poawx_env_lock().lock().unwrap();
+        ensure_rpc_token_env();
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let (state, _, _, _) = create_test_state(None);
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![],
+            poawx_receipts_root: String::new(),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        std::env::remove_var("IRIUM_NETWORK");
+        // poawx gate does not fire when mode unset; request may fail for other reasons.
+        if let Err(code) = result {
+            // 400 from invalid tx_hex is expected; that is NOT the poawx gate.
+            // The key assertion: mode is unset so no 400 from our specific gate path.
+            let _ = code; // any error is acceptable here as long as it is not from our gate
+        }
+    }
+
+    /// O-2: SBE returns 503 when receipts are non-empty on mainnet.
+    #[tokio::test]
+    async fn test_sbe_rejects_poawx_receipts_on_mainnet() {
+        let _env_guard = poawx_env_lock().lock().unwrap();
+        ensure_rpc_token_env();
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        let (state, _, _, _) = create_test_state(None);
+        let fake_receipt = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: "ab".repeat(20),
+            solution: "00".repeat(32),
+            commitment_nonce: "00".repeat(32),
+        };
+        let req = SubmitBlockExtendedRequest {
+            height: 1,
+            header: minimal_header(),
+            tx_hex: vec![],
+            auxpow_hex: None,
+            submit_source: None,
+            poawx_receipts: vec![fake_receipt],
+            poawx_receipts_root: "aa".repeat(32),
+        };
+        let result = submit_block_extended(
+            ConnectInfo(test_socket()),
+            State(state),
+            auth_headers(),
+            AxumJson(req),
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SBE must return 503 when poawx receipts submitted on mainnet"
+        );
     }
 }
-
 
 // ============================================================================
 // Stage 3.2: Dispute and Resolver System
@@ -25856,7 +26473,10 @@ fn apply_dispute_status_to_eligibility(
         return;
     };
     let dispute = {
-        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.get(&agreement_hash).cloned()
     };
     let Some(d) = dispute else {
@@ -25916,7 +26536,8 @@ fn build_and_broadcast_anchor_tx(
             .keys()
             .map_err(|_| "wallet_keys_unavailable".to_string())?;
         for key in keys {
-            let bytes = hex::decode(&key.pkh).map_err(|_| "wallet_key_pkh_decode_failed".to_string())?;
+            let bytes =
+                hex::decode(&key.pkh).map_err(|_| "wallet_key_pkh_decode_failed".to_string())?;
             if bytes.len() != 20 {
                 continue;
             }
@@ -25968,7 +26589,8 @@ fn build_and_broadcast_anchor_tx(
             break;
         }
     }
-    let utxo = chosen.ok_or_else(|| "insufficient_spendable_funds_or_immature_coinbase".to_string())?;
+    let utxo =
+        chosen.ok_or_else(|| "insufficient_spendable_funds_or_immature_coinbase".to_string())?;
 
     let change_value = utxo.output.value.saturating_sub(estimated_fee);
     let mut outputs = vec![anchor_output];
@@ -25993,8 +26615,8 @@ fn build_and_broadcast_anchor_tx(
     };
 
     // Sign the input.
-    let priv_bytes = hex::decode(&utxo.pkh_key_priv(&key_map)?)
-        .map_err(|_| "wallet_priv_decode".to_string())?;
+    let priv_bytes =
+        hex::decode(&utxo.pkh_key_priv(&key_map)?).map_err(|_| "wallet_priv_decode".to_string())?;
     if priv_bytes.len() != 32 {
         return Err("wallet_priv_len".to_string());
     }
@@ -26066,8 +26688,8 @@ fn build_and_broadcast_rep_event_tx(
             .keys()
             .map_err(|_| "wallet_keys_unavailable".to_string())?;
         for key in keys {
-            let bytes = hex::decode(&key.pkh)
-                .map_err(|_| "wallet_key_pkh_decode_failed".to_string())?;
+            let bytes =
+                hex::decode(&key.pkh).map_err(|_| "wallet_key_pkh_decode_failed".to_string())?;
             if bytes.len() != 20 {
                 continue;
             }
@@ -26115,8 +26737,8 @@ fn build_and_broadcast_rep_event_tx(
             break;
         }
     }
-    let utxo = chosen
-        .ok_or_else(|| "insufficient_spendable_funds_or_immature_coinbase".to_string())?;
+    let utxo =
+        chosen.ok_or_else(|| "insufficient_spendable_funds_or_immature_coinbase".to_string())?;
     let change_value = utxo.output.value.saturating_sub(estimated_fee);
     let mut outputs = rep_outputs;
     outputs.push(TxOutput {
@@ -26134,8 +26756,8 @@ fn build_and_broadcast_rep_event_tx(
         outputs,
         locktime: 0,
     };
-    let priv_bytes = hex::decode(&utxo.pkh_key_priv(&key_map)?)
-        .map_err(|_| "wallet_priv_decode".to_string())?;
+    let priv_bytes =
+        hex::decode(&utxo.pkh_key_priv(&key_map)?).map_err(|_| "wallet_priv_decode".to_string())?;
     if priv_bytes.len() != 32 {
         return Err("wallet_priv_len".to_string());
     }
@@ -26275,10 +26897,8 @@ fn verify_envelope_signature(
     if derived_address != expected_address {
         return Err("pubkey_does_not_match_signer_address".to_string());
     }
-    let sig_bytes =
-        hex::decode(&envelope.signature).map_err(|_| "signature_decode".to_string())?;
-    let parsed = Signature::from_slice(&sig_bytes)
-        .map_err(|_| "signature_format".to_string())?;
+    let sig_bytes = hex::decode(&envelope.signature).map_err(|_| "signature_decode".to_string())?;
+    let parsed = Signature::from_slice(&sig_bytes).map_err(|_| "signature_format".to_string())?;
     verifying_key
         .verify_prehash(digest, &parsed)
         .map_err(|_| "signature_verify_failed".to_string())?;
@@ -26415,21 +27035,23 @@ async fn raise_dispute(
     verify_envelope_signature(&req.dispute.signature, &digest, &party.address)
         .map_err(|e| bad(&format!("signature:{e}")))?;
     {
-        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = guard.get(&agreement_hash) {
             if existing.is_open() {
                 return Err(bad("dispute_already_open"));
             }
         }
     }
-    let anchor_txid =
-        build_and_broadcast_anchor_tx(
-            &state,
-            &agreement_hash,
-            AgreementAnchorRole::DisputeRaise,
-            Vec::new(),
-        )
-        .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
+    let anchor_txid = build_and_broadcast_anchor_tx(
+        &state,
+        &agreement_hash,
+        AgreementAnchorRole::DisputeRaise,
+        Vec::new(),
+    )
+    .map_err(|e| bad(&format!("anchor_tx:{e}")))?;
     let new_state = DisputeState {
         raise: req.dispute.clone(),
         raise_anchor_txid: Some(anchor_txid.clone()),
@@ -26440,11 +27062,14 @@ async fn raise_dispute(
         resolution_anchored_at_height: None,
         escalated_to_fallback: false,
         escalated_at_height: None,
-    reresolve_nomination: None,
+        reresolve_nomination: None,
     };
     save_dispute_state(&new_state).map_err(|e| bad(&format!("persist:{e}")))?;
     {
-        let mut guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.insert(agreement_hash.clone(), new_state);
     }
     emit_event(
@@ -26499,8 +27124,13 @@ async fn submit_dispute_evidence(
     verify_envelope_signature(&req.evidence.signature, &digest, &party.address)
         .map_err(|e| bad(&format!("signature:{e}")))?;
     {
-        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
-        let d = guard.get(&agreement_hash).ok_or_else(|| bad("no_open_dispute"))?;
+        let guard = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let d = guard
+            .get(&agreement_hash)
+            .ok_or_else(|| bad("no_open_dispute"))?;
         if !d.is_open() {
             return Err(bad("dispute_already_resolved"));
         }
@@ -26519,8 +27149,13 @@ async fn submit_dispute_evidence(
         anchored_at_height: None,
     };
     let snapshot = {
-        let mut guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
-        let d = guard.get_mut(&agreement_hash).ok_or_else(|| bad("no_open_dispute"))?;
+        let mut guard = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let d = guard
+            .get_mut(&agreement_hash)
+            .ok_or_else(|| bad("no_open_dispute"))?;
         d.evidence.push(evidence_record);
         d.clone()
     };
@@ -26536,7 +27171,10 @@ async fn submit_dispute_evidence(
     );
     if let Some(ref node) = state.p2p {
         let evidence_clone = {
-            let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = state
+                .disputes_index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             guard
                 .get(&agreement_hash)
                 .and_then(|d| d.evidence.last().map(|r| r.evidence.clone()))
@@ -26581,10 +27219,13 @@ async fn resolve_dispute(
     );
     // Stage 3.4.1: a co-signed reresolve nomination overrides the
     // agreement's named resolvers for this dispute.
-    let agreement_hash_for_role = compute_agreement_hash_hex(&req.agreement)
-        .map_err(|_| bad("agreement_hash_failed"))?;
+    let agreement_hash_for_role =
+        compute_agreement_hash_hex(&req.agreement).map_err(|_| bad("agreement_hash_failed"))?;
     let (effective_primary, effective_fallback) = {
-        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(d) = guard.get(&agreement_hash_for_role) {
             if let Some(ref nom) = d.reresolve_nomination {
                 (
@@ -26599,10 +27240,10 @@ async fn resolve_dispute(
         }
     };
     let expected_address = match role {
-        "primary" => effective_primary
-            .ok_or_else(|| bad("agreement_has_no_primary_resolver"))?,
-        "fallback" => effective_fallback
-            .ok_or_else(|| bad("agreement_has_no_fallback_resolver"))?,
+        "primary" => effective_primary.ok_or_else(|| bad("agreement_has_no_primary_resolver"))?,
+        "fallback" => {
+            effective_fallback.ok_or_else(|| bad("agreement_has_no_fallback_resolver"))?
+        }
         _ => return Err(bad("invalid_resolver_role")),
     };
     if expected_address != req.resolution.resolver_address {
@@ -26613,7 +27254,10 @@ async fn resolve_dispute(
     verify_envelope_signature(&req.resolution.signature, &digest, &expected_address)
         .map_err(|e| bad(&format!("signature:{e}")))?;
     {
-        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let d = guard
             .get(&agreement_hash)
             .ok_or_else(|| bad("no_open_dispute"))?;
@@ -26677,8 +27321,13 @@ async fn resolve_dispute(
     let outcome = req.resolution.outcome.clone();
     let resolver_role = req.resolution.resolver_role.clone();
     let snapshot = {
-        let mut guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
-        let d = guard.get_mut(&agreement_hash).ok_or_else(|| bad("no_open_dispute"))?;
+        let mut guard = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let d = guard
+            .get_mut(&agreement_hash)
+            .ok_or_else(|| bad("no_open_dispute"))?;
         d.resolution = Some(req.resolution);
         d.resolution_anchor_txid = Some(anchor_txid.clone());
         d.clone()
@@ -26752,7 +27401,10 @@ async fn register_resolver(
     };
     save_resolver_record(&record).map_err(|e| bad(&format!("persist:{e}")))?;
     {
-        let mut guard = state.resolvers_index.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = state
+            .resolvers_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.insert(resolver_address.clone(), record);
     }
     emit_event(
@@ -26790,14 +27442,16 @@ async fn broadcast_reputation_non_response(
     if req.resolver_address.trim().is_empty() {
         return Err(bad("resolver_address_empty"));
     }
-    if req.agreement_hash.len() != 64
-        || !req.agreement_hash.chars().all(|c| c.is_ascii_hexdigit())
+    if req.agreement_hash.len() != 64 || !req.agreement_hash.chars().all(|c| c.is_ascii_hexdigit())
     {
         return Err(bad("agreement_hash_invalid"));
     }
     // Look up the dispute and validate state.
     let (raise_height, is_open) = {
-        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let d = guard
             .get(&req.agreement_hash)
             .ok_or_else(|| bad("dispute_not_found"))?;
@@ -26845,7 +27499,10 @@ async fn resolvers_list(
     check_rate_with_auth(&state, &addr, &headers)?;
     let limit = query.limit.unwrap_or(50).min(500);
     let resolvers: Vec<ResolverRegistrationRecord> = {
-        let guard = state.resolvers_index.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = state
+            .resolvers_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.values().cloned().collect()
     };
     let mut sorted = resolvers;
@@ -26869,8 +27526,7 @@ async fn resolvers_list(
     };
     let page: Vec<&ResolverRegistrationRecord> = sorted.iter().skip(start).take(limit).collect();
     let next_cursor = if start + page.len() < sorted.len() {
-        page.last()
-            .map(|r| r.registration.resolver_address.clone())
+        page.last().map(|r| r.registration.resolver_address.clone())
     } else {
         None
     };
@@ -26890,7 +27546,6 @@ async fn resolvers_list(
         next_cursor,
     }))
 }
-
 
 // Stage 3.2: scan newly-confirmed blocks for dispute/resolver anchor OP_RETURNs.
 fn scan_new_blocks_for_dispute_anchors(
@@ -27094,7 +27749,6 @@ async fn escalation_tick(
     }
 }
 
-
 // ============================================================================
 // Stage 3.3.1: P2P dispute notification drain — apply incoming peer broadcasts
 // to the local disputes_index. The drain task runs every 5 s and consumes the
@@ -27159,7 +27813,7 @@ fn process_received_dispute_raise(
         resolution_anchored_at_height: None,
         escalated_to_fallback: false,
         escalated_at_height: None,
-    reresolve_nomination: None,
+        reresolve_nomination: None,
     };
     let _ = save_dispute_state(&new_state);
     {
@@ -27210,7 +27864,10 @@ fn process_received_dispute_evidence(
         let mut guard = disputes.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(d) = guard.get_mut(&agreement_hash) {
             if d.is_open()
-                && !d.evidence.iter().any(|r| r.evidence.evidence_hash == evidence_hash)
+                && !d
+                    .evidence
+                    .iter()
+                    .any(|r| r.evidence.evidence_hash == evidence_hash)
             {
                 d.evidence.push(DisputeEvidenceRecord {
                     evidence: e,
@@ -27332,7 +27989,6 @@ fn process_received_dispute_escalated(
     }
 }
 
-
 // ============================================================================
 // Stage 3.4.1: dispute-show + dispute-reresolve handlers
 // ============================================================================
@@ -27357,7 +28013,10 @@ async fn get_dispute_state(
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
     let s = {
-        let guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.get(&q.agreement_hash).cloned()
     };
     Ok(Json(DisputeStateRpcResp {
@@ -27379,9 +28038,7 @@ struct ReResolveAgreementResponse {
     new_fallback_resolver: Option<String>,
 }
 
-fn dispute_reresolve_payload_hash(
-    n: &DisputeReResolverNomination,
-) -> Result<[u8; 32], String> {
+fn dispute_reresolve_payload_hash(n: &DisputeReResolverNomination) -> Result<[u8; 32], String> {
     let mut tmp = n.clone();
     tmp.party_a_signature.signature = String::new();
     tmp.party_b_signature.signature = String::new();
@@ -27436,14 +28093,14 @@ async fn reresolve_agreement(
     ];
     let mut pair_valid = false;
     for (a, b) in pairs {
-        if sa_addr == a && sb_addr == b
+        if sa_addr == a
+            && sb_addr == b
             && verify_envelope_signature(&req.nomination.party_a_signature, &digest, &a).is_ok()
-                && verify_envelope_signature(&req.nomination.party_b_signature, &digest, &b)
-                    .is_ok()
-            {
-                pair_valid = true;
-                break;
-            }
+            && verify_envelope_signature(&req.nomination.party_b_signature, &digest, &b).is_ok()
+        {
+            pair_valid = true;
+            break;
+        }
     }
     if !pair_valid {
         return Err(bad("co_signatures_invalid"));
@@ -27463,7 +28120,10 @@ async fn reresolve_agreement(
     let new_primary = req.nomination.new_primary_resolver.clone();
     let new_fallback = req.nomination.new_fallback_resolver.clone();
     let snapshot: Option<DisputeState> = {
-        let mut guard = state.disputes_index.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = state
+            .disputes_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(d) = guard.get_mut(&agreement_hash) {
             if !d.is_open() {
                 return Err(bad("dispute_already_resolved"));

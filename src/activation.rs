@@ -79,10 +79,8 @@ pub const MAINNET_BTC_ANCHOR_HASH: [u8; 32] = [
     // (display hex 000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880
     // reversed - chain-linkage checks compare to header.prev_hash which is also
     // stored in natural order).
-    0x80, 0x28, 0xca, 0x5c, 0xec, 0x82, 0x20, 0xcf,
-    0x1d, 0xfd, 0x2a, 0x9c, 0x9a, 0x96, 0x07, 0x05,
-    0x40, 0x3c, 0x3c, 0x28, 0x17, 0x0b, 0x01, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x80, 0x28, 0xca, 0x5c, 0xec, 0x82, 0x20, 0xcf, 0x1d, 0xfd, 0x2a, 0x9c, 0x9a, 0x96, 0x07, 0x05,
+    0x40, 0x3c, 0x3c, 0x28, 0x17, 0x0b, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 #[allow(dead_code)] // anchor placeholder; populated by the Phase 1 activation commit
 pub const MAINNET_BTC_ANCHOR_BITS: u32 = 0x17028c61;
@@ -112,10 +110,8 @@ pub const MAINNET_LTC_SPV_RELAY_ACTIVATION_HEIGHT: Option<u64> = Some(24_800);
 pub const MAINNET_LTC_ANCHOR_HEIGHT: u64 = 3_106_656;
 #[allow(dead_code)]
 pub const MAINNET_LTC_ANCHOR_HASH_DISPLAY: [u8; 32] = [
-    0x8a, 0x89, 0xd2, 0xe5, 0x23, 0x29, 0xaa, 0xbe,
-    0x63, 0xfa, 0xbe, 0xb9, 0xd4, 0xcf, 0x73, 0x4d,
-    0x8a, 0x44, 0xde, 0x15, 0x85, 0x98, 0xaf, 0xb6,
-    0x56, 0x0f, 0x20, 0xf8, 0xc9, 0x47, 0xbe, 0x64,
+    0x8a, 0x89, 0xd2, 0xe5, 0x23, 0x29, 0xaa, 0xbe, 0x63, 0xfa, 0xbe, 0xb9, 0xd4, 0xcf, 0x73, 0x4d,
+    0x8a, 0x44, 0xde, 0x15, 0x85, 0x98, 0xaf, 0xb6, 0x56, 0x0f, 0x20, 0xf8, 0xc9, 0x47, 0xbe, 0x64,
 ];
 #[allow(dead_code)]
 pub const MAINNET_LTC_ANCHOR_BITS: u32 = 0x1929_b619;
@@ -419,7 +415,9 @@ pub fn runtime_btc_swap_bech32_payment_env_override() -> Option<u64> {
 pub fn resolved_btc_swap_bech32_payment_activation_height(network: NetworkKind) -> Option<u64> {
     match network {
         NetworkKind::Mainnet => MAINNET_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT,
-        NetworkKind::Testnet | NetworkKind::Devnet => runtime_btc_swap_bech32_payment_env_override(),
+        NetworkKind::Testnet | NetworkKind::Devnet => {
+            runtime_btc_swap_bech32_payment_env_override()
+        }
     }
 }
 
@@ -440,13 +438,13 @@ pub fn runtime_mpsov1_env_override() -> Option<u64> {
 pub fn resolved_coinbase_header_batch_activation_height(network: NetworkKind) -> Option<u64> {
     match network {
         NetworkKind::Mainnet => MAINNET_COINBASE_HEADER_BATCH_ACTIVATION_HEIGHT,
-        NetworkKind::Devnet | NetworkKind::Testnet => env::var(
-            "IRIUM_COINBASE_HEADER_BATCH_ACTIVATION_HEIGHT",
-        )
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Some)
-        .unwrap_or(None),
+        NetworkKind::Devnet | NetworkKind::Testnet => {
+            env::var("IRIUM_COINBASE_HEADER_BATCH_ACTIVATION_HEIGHT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Some)
+                .unwrap_or(None)
+        }
     }
 }
 
@@ -640,7 +638,8 @@ mod tests {
     #[test]
     fn mainnet_btc_spv_relay_height_is_23850() {
         assert_eq!(
-            MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT, Some(23_850),
+            MAINNET_BTC_SPV_RELAY_ACTIVATION_HEIGHT,
+            Some(23_850),
             "Phase 1 activated on mainnet at height 23850"
         );
         assert_eq!(
@@ -677,7 +676,8 @@ mod tests {
     #[test]
     fn mainnet_htlc_btc_swap_v1_height_is_23850() {
         assert_eq!(
-            MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT, Some(23_850),
+            MAINNET_HTLC_BTC_SWAP_V1_ACTIVATION_HEIGHT,
+            Some(23_850),
             "Phase 2 activated on mainnet at height 23850"
         );
         assert_eq!(
@@ -714,7 +714,8 @@ mod tests {
     #[test]
     fn mainnet_swap_order_v1_height_is_23850() {
         assert_eq!(
-            MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT, Some(23_850),
+            MAINNET_SWAP_ORDER_V1_ACTIVATION_HEIGHT,
+            Some(23_850),
             "Phase 3 activated on mainnet at height 23850"
         );
         assert_eq!(
@@ -906,5 +907,4 @@ mod tests {
         );
         std::env::remove_var("IRIUM_BTC_SWAP_BECH32_PAYMENT_ACTIVATION_HEIGHT");
     }
-
 }

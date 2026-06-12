@@ -167,8 +167,7 @@ impl Message {
         // Unknown message is silently dropped while the peer stays
         // connected. Lets newer peers introduce additional MessageType
         // variants without forcing a coordinated upgrade.
-        let msg_type = MessageType::try_from(msg_type_byte)
-            .unwrap_or(MessageType::Unknown);
+        let msg_type = MessageType::try_from(msg_type_byte).unwrap_or(MessageType::Unknown);
         Ok(Message { msg_type, payload })
     }
 }
@@ -191,7 +190,7 @@ pub struct HandshakePayload {
     pub tip_hash: Option<String>,
     #[serde(default)]
     pub capabilities: Option<Vec<String>>,
-/// Optional URL of this node's marketplace offer feed (e.g. http://host:port/offers/feed).
+    /// Optional URL of this node's marketplace offer feed (e.g. http://host:port/offers/feed).
     /// Propagated via P2P handshake so peers can discover feeds without manual configuration.
     #[serde(default)]
     pub marketplace_feed: Option<String>,
@@ -277,7 +276,6 @@ impl OfferTakeNotificationPayload {
         })
     }
 }
-
 
 impl PingPayload {
     pub fn to_message(&self) -> Message {
@@ -692,7 +690,6 @@ impl DisconnectPayload {
     }
 }
 
-
 /// Gossip payload for a raised dispute. Raw JSON bytes of a DisputeRaise.
 pub struct DisputeRaisedNotificationPayload {
     pub json: Vec<u8>,
@@ -821,7 +818,10 @@ mod tests {
     #[test]
     fn message_type_try_from_offer_broadcast_25() {
         // Forward-compat: byte 25 maps to OfferBroadcast.
-        assert_eq!(MessageType::try_from(25u8).unwrap(), MessageType::OfferBroadcast);
+        assert_eq!(
+            MessageType::try_from(25u8).unwrap(),
+            MessageType::OfferBroadcast
+        );
     }
 
     #[test]
@@ -834,7 +834,9 @@ mod tests {
     #[test]
     fn offer_broadcast_payload_roundtrip() {
         let json = br#"{"id":"abc","status":"open","amount_sats":1000}"#.to_vec();
-        let payload = OfferBroadcastPayload { offer_json: json.clone() };
+        let payload = OfferBroadcastPayload {
+            offer_json: json.clone(),
+        };
         let msg = payload.to_message();
         assert_eq!(msg.msg_type, MessageType::OfferBroadcast);
         assert_eq!(msg.payload, json);
@@ -847,7 +849,10 @@ mod tests {
     fn offer_broadcast_payload_rejects_wrong_message_type() {
         // from_message must refuse a message tagged with a different variant —
         // protects callers that match on msg_type before dispatching.
-        let msg = Message { msg_type: MessageType::Tx, payload: vec![1, 2, 3] };
+        let msg = Message {
+            msg_type: MessageType::Tx,
+            payload: vec![1, 2, 3],
+        };
         assert!(OfferBroadcastPayload::from_message(&msg).is_err());
     }
 
@@ -856,7 +861,10 @@ mod tests {
         // End-to-end: payload → Message → serialized bytes → deserialized
         // Message → parsed payload. Catches breakage in the framing layer.
         let json = br#"{"id":"x","status":"open"}"#.to_vec();
-        let msg = OfferBroadcastPayload { offer_json: json.clone() }.to_message();
+        let msg = OfferBroadcastPayload {
+            offer_json: json.clone(),
+        }
+        .to_message();
         let bytes = msg.serialize();
         let parsed_msg = Message::deserialize(&bytes).expect("deserialize ok");
         assert_eq!(parsed_msg.msg_type, MessageType::OfferBroadcast);

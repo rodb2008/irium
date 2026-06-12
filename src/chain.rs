@@ -13,51 +13,41 @@ use sha2::{Digest, Sha256};
 use crate::block::{Block, BlockHeader};
 use crate::btc_spv::{
     apply_btc_header_batch, parse_btc_header_batch, undo_btc_relay_update, BtcAnchor,
-    BtcHeaderEntry, BtcRelayUpdate, BtcSpvParams, BTC_HEADER_BATCH_TAG,
-    MAX_BTC_HEADER_BATCH_BYTES,
+    BtcHeaderEntry, BtcRelayUpdate, BtcSpvParams, BTC_HEADER_BATCH_TAG, MAX_BTC_HEADER_BATCH_BYTES,
 };
 use crate::btc_tx_parse::{btc_txid, parse_btc_tx_outputs, BtcOutputScript};
+use crate::constants::{
+    block_reward, block_target_interval, coinbase_maturity, BLOCK_TARGET_INTERVAL_V1,
+    DIFFICULTY_RETARGET_INTERVAL, LWMA_MAX_TARGET_DOWN_FACTOR, LWMA_MAX_TARGET_UP_FACTOR,
+    LWMA_MIN_DIFFICULTY_FLOOR, LWMA_SOLVETIME_CLAMP_FACTOR, LWMA_V2_MAX_TARGET_DOWN_FACTOR,
+    LWMA_V2_MAX_TARGET_UP_FACTOR, LWMA_V2_SOLVETIME_CLAMP_FACTOR, LWMA_V2_WINDOW, LWMA_WINDOW,
+    MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
+};
+use crate::genesis::LockedGenesis;
 use crate::ltc_spv::{
     apply_ltc_header_batch, parse_ltc_header_batch, undo_ltc_relay_update, LtcAnchor,
     LtcHeaderEntry, LtcRelayUpdate, LtcSpvParams, RetargetParams, LTC_HEADER_BATCH_TAG,
     MAX_LTC_HEADER_BATCH_BYTES,
 };
-use crate::constants::{
-    block_reward, block_target_interval, coinbase_maturity, BLOCK_TARGET_INTERVAL_V1, DIFFICULTY_RETARGET_INTERVAL, LWMA_MAX_TARGET_DOWN_FACTOR,
-    LWMA_MAX_TARGET_UP_FACTOR, LWMA_MIN_DIFFICULTY_FLOOR, LWMA_SOLVETIME_CLAMP_FACTOR,
-    LWMA_V2_MAX_TARGET_DOWN_FACTOR, LWMA_V2_MAX_TARGET_UP_FACTOR, LWMA_V2_SOLVETIME_CLAMP_FACTOR,
-    LWMA_V2_WINDOW, LWMA_WINDOW, MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
-};
-use crate::genesis::LockedGenesis;
 use crate::pow::{meets_target, min_difficulty_target, sha256d, Target};
 use crate::tx::{
-    compute_funding_binding, decode_hex,
-    encode_htlc_btc_swap_v1_script, encode_htlc_ltc_swap_v1_script,
-    encode_htlcv1_script,
-    encode_ltc_swap_order_script,
-    encode_mpso_script, encode_swap_order_script,
-    p2pkh_script,
-    parse_htlc_btc_swap_v1_script, parse_htlc_btc_swap_witness,
-    parse_htlc_ltc_swap_v1_script, parse_htlc_ltc_swap_witness,
-    parse_htlcv1_script, parse_input_witness,
-    parse_ltc_swap_order_script, parse_ltc_swap_order_witness, parse_mpso_script,
-    parse_output_encumbrance, parse_swap_order_script, parse_swap_order_witness,
-    HtlcBtcSwapV1Output, HtlcBtcSwapWitness,
-    HtlcLtcSwapV1Output, HtlcLtcSwapWitness,
-    HtlcV1Output, InputWitness, LtcSwapOrderWitness, MpsoV1Output,
-    OutputEncumbrance, SwapOrderWitness, Transaction, TxInput, TxOutput,
-    BTC_OP_RETURN_BINDING_LEN, BTC_OP_RETURN_BINDING_MAGIC,
-    LTC_OP_RETURN_BINDING_LEN, LTC_OP_RETURN_BINDING_MAGIC,
-    HTLC_BTC_SWAP_V1_SCRIPT_LEN, HTLC_BTC_SWAP_V1_TAG,
-    HTLC_LTC_SWAP_V1_SCRIPT_LEN, HTLC_LTC_SWAP_V1_TAG,
-    HTLC_V1_SCRIPT_TAG,
-    LTC_SWAP_ORDER_BUY_SCRIPT_LEN, LTC_SWAP_ORDER_DIRECTION_BUY,
-    LTC_SWAP_ORDER_DIRECTION_SELL, LTC_SWAP_ORDER_MAX_SWEEP_FEE,
+    compute_funding_binding, decode_hex, encode_htlc_btc_swap_v1_script,
+    encode_htlc_ltc_swap_v1_script, encode_htlcv1_script, encode_ltc_swap_order_script,
+    encode_mpso_script, encode_swap_order_script, p2pkh_script, parse_htlc_btc_swap_v1_script,
+    parse_htlc_btc_swap_witness, parse_htlc_ltc_swap_v1_script, parse_htlc_ltc_swap_witness,
+    parse_htlcv1_script, parse_input_witness, parse_ltc_swap_order_script,
+    parse_ltc_swap_order_witness, parse_mpso_script, parse_output_encumbrance,
+    parse_swap_order_script, parse_swap_order_witness, HtlcBtcSwapV1Output, HtlcBtcSwapWitness,
+    HtlcLtcSwapV1Output, HtlcLtcSwapWitness, HtlcV1Output, InputWitness, LtcSwapOrderWitness,
+    MpsoV1Output, OutputEncumbrance, SwapOrderWitness, Transaction, TxInput, TxOutput,
+    BTC_OP_RETURN_BINDING_LEN, BTC_OP_RETURN_BINDING_MAGIC, HTLC_BTC_SWAP_V1_SCRIPT_LEN,
+    HTLC_BTC_SWAP_V1_TAG, HTLC_LTC_SWAP_V1_SCRIPT_LEN, HTLC_LTC_SWAP_V1_TAG, HTLC_V1_SCRIPT_TAG,
+    LTC_OP_RETURN_BINDING_LEN, LTC_OP_RETURN_BINDING_MAGIC, LTC_SWAP_ORDER_BUY_SCRIPT_LEN,
+    LTC_SWAP_ORDER_DIRECTION_BUY, LTC_SWAP_ORDER_DIRECTION_SELL, LTC_SWAP_ORDER_MAX_SWEEP_FEE,
     LTC_SWAP_ORDER_MIN_LOCKED_VALUE, LTC_SWAP_ORDER_SELL_SCRIPT_LEN, LTC_SWAP_ORDER_V1_TAG,
     MAX_HTLC_BTC_SWAP_CONFIRMATIONS, MAX_HTLC_LTC_SWAP_CONFIRMATIONS,
-    MIN_HTLC_BTC_SWAP_CONFIRMATIONS, MIN_HTLC_LTC_SWAP_CONFIRMATIONS,
-    MPSO_V1_MAX_WITNESS_SIZE, MPSO_V1_TAG,
-    SWAP_ORDER_BUY_SCRIPT_LEN, SWAP_ORDER_DIRECTION_BUY, SWAP_ORDER_DIRECTION_SELL,
+    MIN_HTLC_BTC_SWAP_CONFIRMATIONS, MIN_HTLC_LTC_SWAP_CONFIRMATIONS, MPSO_V1_MAX_WITNESS_SIZE,
+    MPSO_V1_TAG, SWAP_ORDER_BUY_SCRIPT_LEN, SWAP_ORDER_DIRECTION_BUY, SWAP_ORDER_DIRECTION_SELL,
     SWAP_ORDER_MAX_SWEEP_FEE, SWAP_ORDER_MIN_LOCKED_VALUE, SWAP_ORDER_SELL_SCRIPT_LEN,
     SWAP_ORDER_V1_TAG,
 };
@@ -198,7 +188,6 @@ pub struct ChainParams {
     /// BTC/LTC header batches in the coinbase as zero-value outputs.
     /// Pre-activation blocks still reject coinbase batch outputs (the
     /// historical rule). `None` keeps the rule strict on this network.
-
     pub coinbase_header_batch_activation_height: Option<u64>,
 }
 
@@ -610,10 +599,12 @@ impl ChainState {
         // connect_genesis panics with a bits mismatch. Override is applied
         // at the target-lookup layer so miner-expected and validator-required
         // bits agree, avoiding a fork between them.
-        if height > 0 && matches!(
-            std::env::var("IRIUM_NETWORK").as_deref(),
-            Ok("devnet") | Ok("regtest")
-        ) {
+        if height > 0
+            && matches!(
+                std::env::var("IRIUM_NETWORK").as_deref(),
+                Ok("devnet") | Ok("regtest")
+            )
+        {
             return Target { bits: 0x207fffff };
         }
         if height == 0 {
@@ -625,7 +616,9 @@ impl ChainState {
             .expect("chain should have at least genesis when querying target");
 
         // Pre-activation consensus path. Historical blocks must remain unchanged.
-        if height < DIFFICULTY_RETARGET_INTERVAL || !height.is_multiple_of(DIFFICULTY_RETARGET_INTERVAL) {
+        if height < DIFFICULTY_RETARGET_INTERVAL
+            || !height.is_multiple_of(DIFFICULTY_RETARGET_INTERVAL)
+        {
             return last_block.header.target();
         }
 
@@ -691,10 +684,12 @@ impl ChainState {
         // connect_genesis panics with a bits mismatch. Override is applied
         // at the target-lookup layer so miner-expected and validator-required
         // bits agree, avoiding a fork between them.
-        if self.chain.len() > 1 && matches!(
-            std::env::var("IRIUM_NETWORK").as_deref(),
-            Ok("devnet") | Ok("regtest")
-        ) {
+        if self.chain.len() > 1
+            && matches!(
+                std::env::var("IRIUM_NETWORK").as_deref(),
+                Ok("devnet") | Ok("regtest")
+            )
+        {
             return Target { bits: 0x207fffff };
         }
         let last_block = self
@@ -1051,7 +1046,9 @@ impl ChainState {
             }
             return Ok(self.headers.get(&hash).map(|hw| hw.height).unwrap_or(0));
         }
-        let auxpow_active = self.params.auxpow_activation_height
+        let auxpow_active = self
+            .params
+            .auxpow_activation_height
             .map(|ah| height >= ah)
             .unwrap_or(false);
         if header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 && auxpow_active {
@@ -1079,7 +1076,9 @@ impl ChainState {
         let tip_height = self.height.saturating_sub(1);
         let mut best = (
             self.total_work.clone(),
-            self.chain.last().map(|b| b.header.hash_for_height(tip_height)),
+            self.chain
+                .last()
+                .map(|b| b.header.hash_for_height(tip_height)),
         );
         for hw in self.headers.values() {
             if hw.work > best.0 {
@@ -1093,10 +1092,10 @@ impl ChainState {
     pub fn best_header_if_better(&self) -> Option<HeaderWork> {
         let mut best: Option<HeaderWork> = None;
         for hw in self.headers.values() {
-            if hw.work > self.total_work
-                && best.as_ref().map(|b| b.work < hw.work).unwrap_or(true) {
-                    best = Some(hw.clone());
-                }
+            if hw.work > self.total_work && best.as_ref().map(|b| b.work < hw.work).unwrap_or(true)
+            {
+                best = Some(hw.clone());
+            }
         }
         best
     }
@@ -1195,12 +1194,16 @@ impl ChainState {
         if block.header.target().bits != target.bits {
             return Err("Block bits mismatch".to_string());
         }
-        let auxpow_active = self.params.auxpow_activation_height
+        let auxpow_active = self
+            .params
+            .auxpow_activation_height
             .map(|ah| height >= ah)
             .unwrap_or(false);
         if block.header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 && auxpow_active {
             let header_bytes = block.header.serialize_for_height(height);
-            let ap = block.auxpow.as_ref()
+            let ap = block
+                .auxpow
+                .as_ref()
                 .ok_or_else(|| "AuxPoW block is missing AuxPoW data".to_string())?;
             crate::auxpow::validate(ap, &header_bytes, target)?;
         } else if !meets_target(&header_hash, target)
@@ -1264,13 +1267,13 @@ impl ChainState {
                     // validate_transaction_internal above. Now apply the batch
                     // into BTC relay state.
                     if !self.btc_spv_relay_active_at(height) {
-                        return Err(
-                            "BtcHeaderBatch output before SPV relay activation".to_string(),
-                        );
+                        return Err("BtcHeaderBatch output before SPV relay activation".to_string());
                     }
                     btc_batch_count += 1;
                     if btc_batch_count > 1 {
-                        return Err("block contains more than one BtcHeaderBatch output".to_string());
+                        return Err(
+                            "block contains more than one BtcHeaderBatch output".to_string()
+                        );
                     }
                     let headers = parse_btc_header_batch(&output.script_pubkey)
                         .map_err(|e| format!("BtcHeaderBatch apply parse failed: {}", e))?;
@@ -1294,13 +1297,13 @@ impl ChainState {
                     // already enforced by validate_output. Now thread the batch
                     // into LTC relay state, parallel to the BTC arm above.
                     if !self.ltc_spv_relay_active_at(height) {
-                        return Err(
-                            "LtcHeaderBatch output before SPV relay activation".to_string(),
-                        );
+                        return Err("LtcHeaderBatch output before SPV relay activation".to_string());
                     }
                     ltc_batch_count += 1;
                     if ltc_batch_count > 1 {
-                        return Err("block contains more than one LtcHeaderBatch output".to_string());
+                        return Err(
+                            "block contains more than one LtcHeaderBatch output".to_string()
+                        );
                     }
                     let headers = parse_ltc_header_batch(&output.script_pubkey)
                         .map_err(|e| format!("LtcHeaderBatch apply parse failed: {}", e))?;
@@ -1345,22 +1348,18 @@ impl ChainState {
                     return Err("BtcHeaderBatch output not allowed in coinbase".to_string());
                 }
                 if !self.btc_spv_relay_active_at(height) {
-                    return Err(
-                        "coinbase BtcHeaderBatch before SPV relay activation".to_string(),
-                    );
+                    return Err("coinbase BtcHeaderBatch before SPV relay activation".to_string());
                 }
                 if output.value != 0 {
                     return Err("coinbase BtcHeaderBatch output must have value=0".to_string());
                 }
                 coinbase_btc_batch_count += 1;
                 if coinbase_btc_batch_count > 1 {
-                    return Err(
-                        "coinbase contains more than one BtcHeaderBatch output".to_string(),
-                    );
+                    return Err("coinbase contains more than one BtcHeaderBatch output".to_string());
                 }
                 if btc_relay_update.is_some() {
                     return Err(
-                        "block contains both coinbase and regular-tx BtcHeaderBatch".to_string(),
+                        "block contains both coinbase and regular-tx BtcHeaderBatch".to_string()
                     );
                 }
                 let headers = parse_btc_header_batch(&output.script_pubkey)
@@ -1386,22 +1385,18 @@ impl ChainState {
                     return Err("LtcHeaderBatch output not allowed in coinbase".to_string());
                 }
                 if !self.ltc_spv_relay_active_at(height) {
-                    return Err(
-                        "coinbase LtcHeaderBatch before SPV relay activation".to_string(),
-                    );
+                    return Err("coinbase LtcHeaderBatch before SPV relay activation".to_string());
                 }
                 if output.value != 0 {
                     return Err("coinbase LtcHeaderBatch output must have value=0".to_string());
                 }
                 coinbase_ltc_batch_count += 1;
                 if coinbase_ltc_batch_count > 1 {
-                    return Err(
-                        "coinbase contains more than one LtcHeaderBatch output".to_string(),
-                    );
+                    return Err("coinbase contains more than one LtcHeaderBatch output".to_string());
                 }
                 if ltc_relay_update.is_some() {
                     return Err(
-                        "block contains both coinbase and regular-tx LtcHeaderBatch".to_string(),
+                        "block contains both coinbase and regular-tx LtcHeaderBatch".to_string()
                     );
                 }
                 let headers = parse_ltc_header_batch(&output.script_pubkey)
@@ -1654,9 +1649,7 @@ impl ChainState {
         new_state.connect_genesis(genesis.clone())?;
         let mut cumulative = ChainState::block_work(genesis);
         let genesis_hash = genesis.header.hash_for_height(0);
-        new_state
-            .block_store
-            .insert(genesis_hash, genesis.clone());
+        new_state.block_store.insert(genesis_hash, genesis.clone());
         new_state.heights.insert(genesis_hash, 0);
         new_state
             .cumulative_work
@@ -1699,12 +1692,16 @@ impl ChainState {
             return Err("duplicate block".to_string());
         }
 
-        let auxpow_active = self.params.auxpow_activation_height
+        let auxpow_active = self
+            .params
+            .auxpow_activation_height
             .map(|ah| block_height >= ah)
             .unwrap_or(false);
         if block.header.version & crate::auxpow::AUXPOW_VERSION_BIT != 0 && auxpow_active {
             let header_bytes = block.header.serialize_for_height(block_height);
-            let ap = block.auxpow.as_ref()
+            let ap = block
+                .auxpow
+                .as_ref()
                 .ok_or_else(|| "AuxPoW block is missing AuxPoW data".to_string())?;
             crate::auxpow::validate(ap, &header_bytes, block.header.target())?;
         } else if !meets_target(&hash, block.header.target())
@@ -1969,9 +1966,7 @@ fn validate_output(
         if swap.confirmations_required < MIN_HTLC_BTC_SWAP_CONFIRMATIONS
             || swap.confirmations_required > MAX_HTLC_BTC_SWAP_CONFIRMATIONS
         {
-            return Err(
-                "HtlcBtcSwapV1 confirmations_required out of allowed range".to_string()
-            );
+            return Err("HtlcBtcSwapV1 confirmations_required out of allowed range".to_string());
         }
         if swap.timeout_height <= height {
             return Err("HtlcBtcSwapV1 timeout_height must exceed current height".to_string());
@@ -1990,9 +1985,7 @@ fn validate_output(
         if swap.confirmations_required < MIN_HTLC_LTC_SWAP_CONFIRMATIONS
             || swap.confirmations_required > MAX_HTLC_LTC_SWAP_CONFIRMATIONS
         {
-            return Err(
-                "HtlcLtcSwapV1 confirmations_required out of allowed range".to_string()
-            );
+            return Err("HtlcLtcSwapV1 confirmations_required out of allowed range".to_string());
         }
         if swap.timeout_height <= height {
             return Err("HtlcLtcSwapV1 timeout_height must exceed current height".to_string());
@@ -2017,16 +2010,12 @@ fn validate_output(
         }
         if order.direction == SWAP_ORDER_DIRECTION_SELL {
             if output.value != order.irm_amount {
-                return Err(
-                    "Sell-IRM SwapOrder output value must equal irm_amount".to_string(),
-                );
+                return Err("Sell-IRM SwapOrder output value must equal irm_amount".to_string());
             }
             if order.confirmations_required < MIN_HTLC_BTC_SWAP_CONFIRMATIONS
                 || order.confirmations_required > MAX_HTLC_BTC_SWAP_CONFIRMATIONS
             {
-                return Err(
-                    "SwapOrder confirmations_required out of range".to_string()
-                );
+                return Err("SwapOrder confirmations_required out of range".to_string());
             }
         }
     }
@@ -2050,16 +2039,12 @@ fn validate_output(
         }
         if order.direction == LTC_SWAP_ORDER_DIRECTION_SELL {
             if output.value != order.irm_amount {
-                return Err(
-                    "Sell-IRM LtcSwapOrder output value must equal irm_amount".to_string(),
-                );
+                return Err("Sell-IRM LtcSwapOrder output value must equal irm_amount".to_string());
             }
             if order.confirmations_required < MIN_HTLC_LTC_SWAP_CONFIRMATIONS
                 || order.confirmations_required > MAX_HTLC_LTC_SWAP_CONFIRMATIONS
             {
-                return Err(
-                    "LtcSwapOrder confirmations_required out of range".to_string()
-                );
+                return Err("LtcSwapOrder confirmations_required out of range".to_string());
             }
         }
     }
@@ -2379,8 +2364,7 @@ fn verify_transaction_signature(
                         Ok(o) => o,
                         Err(_) => return false,
                     };
-                    let mut expected_payload =
-                        Vec::with_capacity(BTC_OP_RETURN_BINDING_LEN);
+                    let mut expected_payload = Vec::with_capacity(BTC_OP_RETURN_BINDING_LEN);
                     expected_payload.extend_from_slice(&BTC_OP_RETURN_BINDING_MAGIC);
                     expected_payload.extend_from_slice(&swap.funding_binding);
                     let mut pays = false;
@@ -2388,8 +2372,7 @@ fn verify_transaction_signature(
                     for o in &outs {
                         match &o.script {
                             BtcOutputScript::P2pkh(pkh) => {
-                                if *pkh == swap.btc_recipient_pkh
-                                    && o.value >= swap.btc_amount_sats
+                                if *pkh == swap.btc_recipient_pkh && o.value >= swap.btc_amount_sats
                                 {
                                     pays = true;
                                 }
@@ -2439,13 +2422,7 @@ fn verify_transaction_signature(
                         return false;
                     }
                     let scriptcode = encode_htlc_btc_swap_v1_script(&swap);
-                    if !verify_sig_with_pubkey(
-                        tx,
-                        input_index,
-                        &scriptcode,
-                        &sig,
-                        &pubkey,
-                    ) {
+                    if !verify_sig_with_pubkey(tx, input_index, &scriptcode, &sig, &pubkey) {
                         return false;
                     }
                     btc_outpoints_consumed.push(consumed);
@@ -2518,8 +2495,7 @@ fn verify_transaction_signature(
                         Ok(o) => o,
                         Err(_) => return false,
                     };
-                    let mut expected_payload =
-                        Vec::with_capacity(LTC_OP_RETURN_BINDING_LEN);
+                    let mut expected_payload = Vec::with_capacity(LTC_OP_RETURN_BINDING_LEN);
                     expected_payload.extend_from_slice(&LTC_OP_RETURN_BINDING_MAGIC);
                     expected_payload.extend_from_slice(&swap.funding_binding);
                     let mut pays = false;
@@ -2527,8 +2503,7 @@ fn verify_transaction_signature(
                     for o in &outs {
                         match &o.script {
                             BtcOutputScript::P2pkh(pkh) => {
-                                if *pkh == swap.ltc_recipient_pkh
-                                    && o.value >= swap.ltc_amount_sats
+                                if *pkh == swap.ltc_recipient_pkh && o.value >= swap.ltc_amount_sats
                                 {
                                     pays = true;
                                 }
@@ -2541,8 +2516,7 @@ fn verify_transaction_signature(
                                 // returned at function entry), and its
                                 // initial mainnet activation will land
                                 // with bech32 acceptance on day one.
-                                if *pkh == swap.ltc_recipient_pkh
-                                    && o.value >= swap.ltc_amount_sats
+                                if *pkh == swap.ltc_recipient_pkh && o.value >= swap.ltc_amount_sats
                                 {
                                     pays = true;
                                 }
@@ -2576,13 +2550,7 @@ fn verify_transaction_signature(
                         return false;
                     }
                     let scriptcode = encode_htlc_ltc_swap_v1_script(&swap);
-                    if !verify_sig_with_pubkey(
-                        tx,
-                        input_index,
-                        &scriptcode,
-                        &sig,
-                        &pubkey,
-                    ) {
+                    if !verify_sig_with_pubkey(tx, input_index, &scriptcode, &sig, &pubkey) {
                         return false;
                     }
                     ltc_outpoints_consumed.push(consumed);
@@ -2637,8 +2605,7 @@ fn verify_transaction_signature(
                     // outpoint breaks the loop: it's known before the
                     // spending tx is built and matches what the wallet
                     // (iriumd.rs fillswaporder) writes into the script.
-                    let funding_binding =
-                        compute_funding_binding(&txin.prev_txid, txin.prev_index);
+                    let funding_binding = compute_funding_binding(&txin.prev_txid, txin.prev_index);
                     let expected = HtlcBtcSwapV1Output {
                         confirmations_required: order.confirmations_required,
                         recipient_pkh: taker_iriumd_pkh,
@@ -2760,8 +2727,7 @@ fn verify_transaction_signature(
                     // Funding binding derived from the spent order outpoint,
                     // matching the BTC SwapOrder pattern — using tx.txid()
                     // would be self-referential.
-                    let funding_binding =
-                        compute_funding_binding(&txin.prev_txid, txin.prev_index);
+                    let funding_binding = compute_funding_binding(&txin.prev_txid, txin.prev_index);
                     let expected = HtlcLtcSwapV1Output {
                         confirmations_required: order.confirmations_required,
                         recipient_pkh: taker_iriumd_pkh,
@@ -2964,8 +2930,7 @@ pub fn decode_compact_tx(raw: &[u8]) -> Transaction {
         // header batches, large MPSO covenants, etc.) need varint length
         // decoding. Backward-compatible: for n < 253 the encoding is a
         // single byte identical to the previous u8.
-        let script_len = crate::tx::read_varint_at(raw, &mut offset)
-            .unwrap_or(0) as usize;
+        let script_len = crate::tx::read_varint_at(raw, &mut offset).unwrap_or(0) as usize;
         let script_pubkey = read_bytes(raw, &mut offset, script_len);
         outputs.push(TxOutput {
             value,
@@ -3007,8 +2972,7 @@ pub fn classify_tx_priority(
 
     for o in &tx.outputs {
         match o.script_pubkey.first().copied() {
-            Some(BTC_HEADER_BATCH_TAG)
-            | Some(LTC_HEADER_BATCH_TAG) => {
+            Some(BTC_HEADER_BATCH_TAG) | Some(LTC_HEADER_BATCH_TAG) => {
                 return MempoolPriority::ZeroFeeAllowed;
             }
             _ => {}
@@ -3024,22 +2988,17 @@ pub fn classify_tx_priority(
             let script = &utxo.output.script_pubkey;
             let first_witness_byte = input0.script_sig.first().copied();
             // BTC buyer paths.
-            if parse_htlc_btc_swap_v1_script(script).is_some()
-                && first_witness_byte == Some(0x01)
-            {
+            if parse_htlc_btc_swap_v1_script(script).is_some() && first_witness_byte == Some(0x01) {
                 return MempoolPriority::ZeroFeeAllowed;
             }
             if let Some(order) = parse_swap_order_script(script) {
-                if order.direction == SWAP_ORDER_DIRECTION_SELL
-                    && first_witness_byte == Some(0x01)
+                if order.direction == SWAP_ORDER_DIRECTION_SELL && first_witness_byte == Some(0x01)
                 {
                     return MempoolPriority::ZeroFeeAllowed;
                 }
             }
             // LTC buyer paths (Phase C/D parity).
-            if parse_htlc_ltc_swap_v1_script(script).is_some()
-                && first_witness_byte == Some(0x01)
-            {
+            if parse_htlc_ltc_swap_v1_script(script).is_some() && first_witness_byte == Some(0x01) {
                 return MempoolPriority::ZeroFeeAllowed;
             }
             if let Some(order) = parse_ltc_swap_order_script(script) {
@@ -3078,7 +3037,7 @@ mod tests {
             mpsov1_activation_height: None,
             lwma: LwmaParams::new(None, pow_limit),
             lwma_v2: None,
-        auxpow_activation_height: None,
+            auxpow_activation_height: None,
             btc_spv: None,
             ltc_spv: None,
             htlc_btc_swap_v1_activation_height: None,
@@ -3160,7 +3119,7 @@ mod tests {
             mpsov1_activation_height: None,
             lwma: LwmaParams::new(lwma_activation, pow_limit),
             lwma_v2: None,
-        auxpow_activation_height: None,
+            auxpow_activation_height: None,
             btc_spv: None,
             ltc_spv: None,
             htlc_btc_swap_v1_activation_height: None,
@@ -3206,7 +3165,9 @@ mod tests {
             return chain.params.genesis_block.header.target();
         }
         let last_block = chain.chain.last().expect("last block");
-        if height < DIFFICULTY_RETARGET_INTERVAL || !height.is_multiple_of(DIFFICULTY_RETARGET_INTERVAL) {
+        if height < DIFFICULTY_RETARGET_INTERVAL
+            || !height.is_multiple_of(DIFFICULTY_RETARGET_INTERVAL)
+        {
             return last_block.header.target();
         }
         let interval = DIFFICULTY_RETARGET_INTERVAL as usize;
@@ -4144,10 +4105,7 @@ mod tests {
     /// the fast-mining shortcut.
     fn set_block_time_v2_fork(fork: u64) {
         std::env::set_var("IRIUM_NETWORK", "testnet");
-        std::env::set_var(
-            "IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT",
-            fork.to_string(),
-        );
+        std::env::set_var("IRIUM_BLOCK_TIME_V2_ACTIVATION_HEIGHT", fork.to_string());
     }
 
     fn clear_block_time_v2_fork() {
@@ -4278,7 +4236,7 @@ mod tests {
             mpsov1_activation_height: activation,
             lwma: LwmaParams::new(None, pow_limit),
             lwma_v2: None,
-        auxpow_activation_height: None,
+            auxpow_activation_height: None,
             btc_spv: None,
             ltc_spv: None,
             htlc_btc_swap_v1_activation_height: None,
@@ -5159,8 +5117,7 @@ mod tests {
         );
 
         let path = fresh_mempool_path("double_spend");
-        let mut mempool =
-            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0, 0);
+        let mut mempool = crate::mempool::MempoolManager::new(path.clone(), 100, 0.0, 0);
         let raw = tx.serialize();
         mempool
             .add_transaction(tx.clone(), raw, 0)
@@ -5173,8 +5130,7 @@ mod tests {
         // undo log). The mempool entry now references a missing UTXO.
         chain.utxos.remove(&prev);
 
-        let evicted =
-            crate::mempool::evict_invalid_mempool_entries(&chain, &mut mempool);
+        let evicted = crate::mempool::evict_invalid_mempool_entries(&chain, &mut mempool);
         assert_eq!(evicted, 1, "double-spend conflict must be evicted");
         assert_eq!(mempool.len(), 0);
 
@@ -5190,8 +5146,7 @@ mod tests {
         assert!(chain.validate_transaction(&tx).is_ok());
 
         let path = fresh_mempool_path("valid_kept");
-        let mut mempool =
-            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0, 0);
+        let mut mempool = crate::mempool::MempoolManager::new(path.clone(), 100, 0.0, 0);
         let raw = tx.serialize();
         mempool
             .add_transaction(tx.clone(), raw, 0)
@@ -5199,8 +5154,7 @@ mod tests {
         assert_eq!(mempool.len(), 1);
 
         // No conflict: chain still has the UTXO; tx is still valid.
-        let evicted =
-            crate::mempool::evict_invalid_mempool_entries(&chain, &mut mempool);
+        let evicted = crate::mempool::evict_invalid_mempool_entries(&chain, &mut mempool);
         assert_eq!(evicted, 0, "still-valid tx must not be evicted");
         assert_eq!(mempool.len(), 1);
         assert!(mempool.contains(&tx.txid()));
@@ -5250,8 +5204,7 @@ mod tests {
         );
 
         let path = fresh_mempool_path("multi_conflict");
-        let mut mempool =
-            crate::mempool::MempoolManager::new(path.clone(), 100, 0.0, 0);
+        let mut mempool = crate::mempool::MempoolManager::new(path.clone(), 100, 0.0, 0);
         for (i, prev) in [&prev0, &prev1, &prev2].iter().enumerate() {
             let tx = build_signed_spend(
                 &chain,
@@ -5272,8 +5225,7 @@ mod tests {
         chain.utxos.remove(&prev1);
         chain.utxos.remove(&prev2);
 
-        let evicted =
-            crate::mempool::evict_invalid_mempool_entries(&chain, &mut mempool);
+        let evicted = crate::mempool::evict_invalid_mempool_entries(&chain, &mut mempool);
         assert_eq!(
             evicted, 3,
             "all three conflicting entries must be evicted in one pass"

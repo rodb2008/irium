@@ -1,9 +1,9 @@
+use std::io::Write;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc::{sync_channel, SyncSender, TrySendError},
     Mutex, OnceLock,
 };
-use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{
@@ -499,10 +499,7 @@ pub fn ensure_runtime_dirs() -> std::io::Result<(PathBuf, PathBuf)> {
                 continue;
             }
             if name.starts_with("orphaned_") {
-                let is_dir = entry
-                    .file_type()
-                    .map(|ft| ft.is_dir())
-                    .unwrap_or(false);
+                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
                 if !is_dir {
                     continue;
                 }
@@ -771,7 +768,10 @@ fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
             .iter()
             .map(|tx| hex::encode(tx.serialize()))
             .collect(),
-        auxpow_hex: block.auxpow.as_ref().map(|ap| hex::encode(crate::auxpow::serialize(ap))),
+        auxpow_hex: block
+            .auxpow
+            .as_ref()
+            .map(|ap| hex::encode(crate::auxpow::serialize(ap))),
         miner_address: miner_address_from_block(block),
         submit_source: None,
     };
