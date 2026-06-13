@@ -8,6 +8,16 @@ use crate::decoder::{
 };
 use crate::rpc::RpcBlock;
 
+/// PostgreSQL TEXT columns reject null bytes. Strip them before Postgres insertion.
+#[inline]
+fn clean(s: &str) -> String {
+    if s.contains('\0') { s.replace('\0', "") } else { s.to_owned() }
+}
+#[inline]
+fn clean_opt(s: Option<&str>) -> Option<String> {
+    s.map(|v| if v.contains('\0') { v.replace('\0', "") } else { v.to_owned() })
+}
+
 // ─── Top-level entry point ─────────────────────────────────────────────────
 
 pub async fn index_block(pool: &PgPool, block: &RpcBlock) -> Result<()> {
@@ -48,7 +58,7 @@ pub async fn index_block(pool: &PgPool, block: &RpcBlock) -> Result<()> {
     .bind(total_reward)
     .bind(block.miner_address.as_deref())
     .bind(0i32)
-    .bind(coinbase_tag.as_deref())
+    .bind(clean_opt(coinbase_tag.as_deref()))
     .execute(&mut *dbtx)
     .await?;
 
@@ -246,7 +256,7 @@ async fn insert_output(
         .bind(anch.anchor_type.as_str())
         .bind(txid)
         .bind(block_height)
-        .bind(anch.milestone_id.as_deref())
+        .bind(clean_opt(anch.milestone_id.as_deref()))
         .execute(&mut **dbtx)
         .await?;
     }
@@ -319,7 +329,8 @@ fn extract_coinbase_tag(script_sig: &[u8]) -> Option<String> {
     if let Some(pos) = text.find('/') {
         let tag = &text[pos + 1..];
         if !tag.is_empty() && tag.len() <= 20 && tag.is_ascii() {
-            return Some(tag.to_string());
+            let t = tag.replace('\0', "");
+            if !t.is_empty() { return Some(t); }
         }
     }
 
@@ -327,7 +338,8 @@ fn extract_coinbase_tag(script_sig: &[u8]) -> Option<String> {
     if let Some(pos) = text.find(" solo ") {
         let after = text[pos + 6..].trim_end();
         if !after.is_empty() && after.len() <= 20 && after.is_ascii() {
-            return Some(after.to_string());
+            let t = after.replace('\0', "");
+            if !t.is_empty() { return Some(t); }
         }
     }
 

@@ -217,7 +217,10 @@ fn parse_agr_anchor(data: &[u8]) -> Option<AgrAnchor> {
     if !hash_slice.iter().all(|b| b.is_ascii_hexdigit()) { return None; }
     let agreement_hash = String::from_utf8(hash_slice.to_vec()).ok()?;
     let milestone_id = if data.len() > 72 && data[71] == b':' {
-        String::from_utf8(data[72..].to_vec()).ok()
+        String::from_utf8(data[72..].to_vec())
+            .ok()
+            .map(|s| s.replace('\0', ""))
+            .filter(|s| !s.is_empty())
     } else {
         None
     };
