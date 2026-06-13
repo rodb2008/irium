@@ -14251,6 +14251,17 @@ async fn submit_block_extended(
         save_poawx_pending_receipts(&receipts_snapshot);
     }
     if let Err(_e) = storage::write_block_json(req.height, &block) {}
+    // Phase 12-M: broadcast accepted block to pre-connected peers via P2P.
+    if let Some(ref p2p) = state.p2p {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&block.header.serialize_for_height(new_height));
+        for tx in &block.transactions {
+            bytes.extend_from_slice(&tx.serialize());
+        }
+        if let Err(e) = p2p.broadcast_block(&bytes).await {
+            eprintln!("Failed to broadcast accepted block over P2P: {}", e);
+        }
+    }
     eprintln!(
         "[submit_block_extended] accepted height={} tip={} source={}",
         new_height,
