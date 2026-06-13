@@ -3,6 +3,7 @@
 //! Env-var reads are intentionally absent here — callers own activation gating.
 
 use crate::block::Block;
+use sha2::{Digest, Sha256};
 
 const IRX1_TAG: &[u8] = b"irx1";
 /// 0x6a 0x24 b"irx1" <32-byte root> = 38 bytes
@@ -115,6 +116,50 @@ pub fn irx1_root_from_block_bytes(block: &Block) -> Option<[u8; 32]> {
         }
     }
     None
+}
+
+/// Counts leading zero bits in a 32-byte hash.
+/// Used by connect_block (Phase 13-B) and submit_block_extended for puzzle PoW checks.
+pub fn count_leading_zero_bits(hash: &[u8; 32]) -> u32 {
+    let mut bits = 0u32;
+    for &b in hash.iter() {
+        let z = b.leading_zeros();
+        bits += z;
+        if z < 8 {
+            break;
+        }
+    }
+    bits
+}
+
+/// Computes the irx1 root from block-contained receipt data deterministically.
+///
+/// Sort order and inner hash algorithm match `compute_poawx_receipts_root` in
+/// iriumd.rs (which operates on `PoawxPendingReceipt` hex fields):
+///   inner = SHA256(height_le8 || lane_byte || worker_pkh_bytes ||
+///                  solution_bytes || commitment_nonce_bytes)
+///   root  = SHA256(concat inner hashes; receipts sorted by
+///                  (height, lane, worker_pkh, commitment_nonce))
+pub fn irx1_root_from_block_receipts(receipts: &[PoawxBlockReceipt]) -> [u8; 32] {
+    let mut sorted: Vec<&PoawxBlockReceipt> = receipts.iter().collect();
+    sorted.sort_unstable_by(|a, b| {
+        a.height
+            .cmp(&b.height)
+            .then_with(|| a.lane.cmp(&b.lane))
+            .then_with(|| a.worker_pkh.cmp(&b.worker_pkh))
+            .then_with(|| a.commitment_nonce.cmp(&b.commitment_nonce))
+    });
+    let mut outer = Sha256::new();
+    for r in &sorted {
+        let mut inner = Sha256::new();
+        inner.update(r.height.to_le_bytes());
+        inner.update([r.lane]);
+        inner.update(r.worker_pkh);
+        inner.update(r.solution);
+        inner.update(r.commitment_nonce);
+        outer.update(inner.finalize());
+    }
+    outer.finalize().into()
 }
 
 #[cfg(test)]

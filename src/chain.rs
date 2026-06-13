@@ -830,6 +830,7 @@ impl ChainState {
         let previous = self.chain.last();
         self.validate_block_header(&block, expected_height, previous)?;
         validate_poawx_coinbase(&block, expected_height)?;
+        validate_poawx_block_receipts(&block, expected_height, previous)?;
 
         let reward = block_reward(expected_height);
         let (_fees, _coinbase_total, subsidy_created, undo) = self
@@ -1889,6 +1890,238 @@ fn validate_poawx_coinbase(block: &Block, height: u64) -> Result<(), String> {
             height, act_h
         ));
     }
+    Ok(())
+}
+
+/// Reads IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS. Semantics match iriumd.rs.
+fn poawx_block_difficulty_bits() -> u32 {
+    const DEFAULT: u32 = 8;
+    const MAX: u32 = 24;
+    match std::env::var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        None => DEFAULT,
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) => n.min(MAX),
+            Err(_) => 0,
+        },
+    }
+}
+
+fn validate_poawx_reward_split_from_block(
+    block: &Block,
+    receipts: &[crate::poawx::PoawxBlockReceipt],
+    height: u64,
+) -> Result<(), String> {
+    if receipts.is_empty() {
+        return Ok(());
+    }
+    let coinbase = block
+        .transactions
+        .first()
+        .ok_or_else(|| "connect_block: no coinbase for reward split check".to_string())?;
+    let base_reward = block_reward(height);
+    const WORKER_REWARD_PERMILLE: u64 = 100;
+    let worker_due = base_reward * WORKER_REWARD_PERMILLE / 1000;
+    let mut worker_counts: std::collections::HashMap<[u8; 20], u64> = Default::default();
+    for r in receipts {
+        *worker_counts.entry(r.worker_pkh).or_insert(0) += 1;
+    }
+    for (pkh, count) in &worker_counts {
+        let expected_script = p2pkh_script(pkh);
+        let total_paid: u64 = coinbase
+            .outputs
+            .iter()
+            .filter(|out| out.script_pubkey == expected_script)
+            .map(|out| out.value)
+            .sum();
+        let required = worker_due.saturating_mul(*count);
+        if total_paid < required {
+            return Err(format!(
+                "connect_block: worker {} underpaid: paid {} < required {} ({} receipt(s) x {})",
+                hex::encode(pkh),
+                total_paid,
+                required,
+                count,
+                worker_due,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Phase 13-B: Verify block-contained PoAW-X receipts in connect_block.
+///
+/// Checks (active non-mainnet after activation only):
+///  1. Receipts present and non-empty.
+///  2. irx1 root recomputed from receipts matches coinbase OP_RETURN.
+///  3. Every receipt commitment_nonce equals the deterministic parent-derived nonce.
+///  4. Every receipt worker_pkh = RIPEMD160(SHA256(worker_pubkey)).
+///  5. Every receipt worker_sig is a valid secp256k1 ECDSA signature over
+///     SHA256(solution || commitment_nonce || height_le8).
+///  6. Every receipt sha256d(seed || nonce || solution) >= configured difficulty.
+///  7. Reward split: each worker_pkh paid at least worker_due * receipt_count.
+fn validate_poawx_block_receipts(
+    block: &Block,
+    height: u64,
+    previous: Option<&Block>,
+) -> Result<(), String> {
+    // Activation gate — identical conditions to validate_poawx_coinbase.
+    let act_h = match std::env::var("IRIUM_POAWX_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    if !std::env::var("IRIUM_POAWX_MODE")
+        .map(|v| v.trim() == "active")
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
+        return Ok(());
+    }
+    if height < act_h {
+        return Ok(());
+    }
+
+    // Require non-empty receipts.
+    let receipts = match block.poawx_receipts.as_ref().filter(|v| !v.is_empty()) {
+        Some(r) => r.as_slice(),
+        None => {
+            return Err(format!(
+                "connect_block: poawx receipts missing or empty at height {} (active from {})",
+                height, act_h
+            ))
+        }
+    };
+
+    // Extract irx1 root from coinbase OP_RETURN.
+    let coinbase_root = crate::poawx::irx1_root_from_block_bytes(block).ok_or_else(|| {
+        format!(
+            "connect_block: no irx1 OP_RETURN in coinbase at height {}",
+            height
+        )
+    })?;
+    if coinbase_root == [0u8; 32] {
+        return Err(format!(
+            "connect_block: zero irx1 root at height {}",
+            height
+        ));
+    }
+
+    // Recompute root from block-contained receipts; must match coinbase.
+    let computed_root = crate::poawx::irx1_root_from_block_receipts(receipts);
+    if computed_root != coinbase_root {
+        return Err(format!(
+            "connect_block: irx1 root mismatch at height {} coinbase={} computed={}",
+            height,
+            hex::encode(coinbase_root),
+            hex::encode(computed_root),
+        ));
+    }
+
+    // Derive deterministic seed and nonce from the parent block.
+    let parent_block = previous.ok_or_else(|| {
+        format!(
+            "connect_block: no parent block for poawx nonce derivation at height {}",
+            height
+        )
+    })?;
+    let parent_height = height.saturating_sub(1);
+    let parent_hash = parent_block.header.hash_for_height(parent_height);
+    let seed: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(parent_hash);
+        h.update(parent_height.to_le_bytes());
+        h.update(b"poawx_assignment_seed_v1");
+        h.finalize().into()
+    };
+    let expected_nonce: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(seed);
+        h.update(b"commitment_nonce");
+        h.finalize().into()
+    };
+
+    let difficulty = poawx_block_difficulty_bits();
+
+    for (i, r) in receipts.iter().enumerate() {
+        // (1) Commitment nonce must match the deterministic expected value.
+        if r.commitment_nonce != expected_nonce {
+            return Err(format!(
+                "connect_block: receipt[{}] commitment_nonce mismatch at height {}",
+                i, height
+            ));
+        }
+
+        // (2+3) Worker identity: pubkey-to-pkh derivation and challenge signature.
+        {
+            use k256::ecdsa::signature::hazmat::PrehashVerifier;
+            use k256::ecdsa::{Signature, VerifyingKey};
+
+            let vk = VerifyingKey::from_sec1_bytes(&r.worker_pubkey).map_err(|_| {
+                format!(
+                    "connect_block: receipt[{}] invalid worker_pubkey at height {}",
+                    i, height
+                )
+            })?;
+            let sha_of_pk = Sha256::digest(r.worker_pubkey);
+            let rip = Ripemd160::digest(sha_of_pk);
+            let mut computed_pkh = [0u8; 20];
+            computed_pkh.copy_from_slice(&rip);
+            if computed_pkh != r.worker_pkh {
+                return Err(format!(
+                    "connect_block: receipt[{}] worker_pkh/pubkey mismatch at height {}",
+                    i, height
+                ));
+            }
+            let challenge: [u8; 32] = {
+                let mut h = Sha256::new();
+                h.update(r.solution);
+                h.update(r.commitment_nonce);
+                h.update(r.height.to_le_bytes());
+                h.finalize().into()
+            };
+            let sig = Signature::from_slice(&r.worker_sig).map_err(|_| {
+                format!(
+                    "connect_block: receipt[{}] malformed worker_sig at height {}",
+                    i, height
+                )
+            })?;
+            vk.verify_prehash(&challenge, &sig).map_err(|_| {
+                format!(
+                    "connect_block: receipt[{}] worker_sig verification failed at height {}",
+                    i, height
+                )
+            })?;
+        }
+
+        // (4) Puzzle PoW: sha256d(seed || nonce || solution) >= difficulty leading zeros.
+        {
+            let mut pow_input = [0u8; 72];
+            pow_input[..32].copy_from_slice(&seed);
+            pow_input[32..64].copy_from_slice(&expected_nonce);
+            pow_input[64..].copy_from_slice(&r.solution);
+            let pow_hash = sha256d(&pow_input);
+            let leading = crate::poawx::count_leading_zero_bits(&pow_hash);
+            if leading < difficulty {
+                return Err(format!(
+                    "connect_block: receipt[{}] insufficient puzzle PoW: {} bits < {} required at height {}",
+                    i, leading, difficulty, height
+                ));
+            }
+        }
+    }
+
+    // (5) Reward split.
+    validate_poawx_reward_split_from_block(block, receipts, height)?;
+
     Ok(())
 }
 
@@ -5412,5 +5645,507 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_POAWX_MODE");
         std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    // ── Phase 13-B: validate_poawx_block_receipts tests ──────────────────
+
+    fn test_signing_key() -> k256::ecdsa::SigningKey {
+        // Fixed non-zero 32-byte scalar — valid k256 private key.
+        k256::ecdsa::SigningKey::from_bytes((&[0x42u8; 32]).into()).unwrap()
+    }
+
+    fn phase13b_parent_block() -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: [0u8; 32],
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: None,
+        }
+    }
+
+    /// Build a PoawxBlockReceipt that satisfies all Phase 13-B checks with
+    /// the given difficulty (number of required leading zero bits).
+    fn make_test_receipt(
+        height: u64,
+        sk: &k256::ecdsa::SigningKey,
+        parent_hash: [u8; 32],
+        difficulty: u32,
+    ) -> crate::poawx::PoawxBlockReceipt {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        use k256::ecdsa::VerifyingKey;
+
+        let vk = VerifyingKey::from(sk);
+        let pubkey_bytes: Vec<u8> = vk.to_encoded_point(true).as_bytes().to_vec();
+        let sha_of_pk = Sha256::digest(&pubkey_bytes);
+        let rip = ripemd::Ripemd160::digest(sha_of_pk);
+        let mut worker_pkh = [0u8; 20];
+        worker_pkh.copy_from_slice(&rip);
+        let mut worker_pubkey = [0u8; 33];
+        worker_pubkey.copy_from_slice(&pubkey_bytes);
+
+        let parent_height = height.saturating_sub(1);
+        let seed: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(parent_hash);
+            h.update(parent_height.to_le_bytes());
+            h.update(b"poawx_assignment_seed_v1");
+            h.finalize().into()
+        };
+        let nonce: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(seed);
+            h.update(b"commitment_nonce");
+            h.finalize().into()
+        };
+
+        // Search for a solution satisfying the required difficulty.
+        let mut solution = [0u8; 8];
+        for n in 0u64..100_000_000 {
+            solution.copy_from_slice(&n.to_le_bytes());
+            let mut pow_input = [0u8; 72];
+            pow_input[..32].copy_from_slice(&seed);
+            pow_input[32..64].copy_from_slice(&nonce);
+            pow_input[64..].copy_from_slice(&solution);
+            let pow_hash = sha256d(&pow_input);
+            if crate::poawx::count_leading_zero_bits(&pow_hash) >= difficulty {
+                break;
+            }
+        }
+
+        // Sign the challenge.
+        let challenge: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(solution);
+            h.update(nonce);
+            h.update(height.to_le_bytes());
+            h.finalize().into()
+        };
+        let sig: k256::ecdsa::Signature = sk.sign_prehash(&challenge).unwrap();
+        let mut worker_sig = [0u8; 64];
+        worker_sig.copy_from_slice(&sig.to_bytes());
+
+        crate::poawx::PoawxBlockReceipt {
+            height,
+            lane: b'A',
+            worker_pkh,
+            worker_pubkey,
+            worker_sig,
+            solution,
+            commitment_nonce: nonce,
+        }
+    }
+
+    /// Build a valid Phase 13-B block from a receipt.
+    fn make_valid_poawx_block(
+        parent_hash: [u8; 32],
+        height: u64,
+        receipt: crate::poawx::PoawxBlockReceipt,
+        payout_ok: bool,
+    ) -> Block {
+        use crate::poawx::irx1_root_from_block_receipts;
+
+        let irx1_root = irx1_root_from_block_receipts(&[receipt.clone()]);
+        let mut irx1_script = vec![0x6a, 0x24u8];
+        irx1_script.extend_from_slice(b"irx1");
+        irx1_script.extend_from_slice(&irx1_root);
+
+        let base_reward = block_reward(height);
+        let worker_due = base_reward * 100 / 1000;
+        let payout_val = if payout_ok { worker_due } else { 0 };
+        let worker_script = p2pkh_script(&receipt.worker_pkh);
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0u8; 32],
+                prev_index: 0xffff_ffff,
+                script_sig: vec![0x01, 0x00],
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![
+                TxOutput {
+                    value: base_reward - payout_val,
+                    script_pubkey: vec![0x51],
+                },
+                TxOutput {
+                    value: payout_val,
+                    script_pubkey: worker_script,
+                },
+                TxOutput {
+                    value: 0,
+                    script_pubkey: irx1_script,
+                },
+            ],
+            locktime: 0,
+        };
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: parent_hash,
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+            auxpow: None,
+            poawx_receipts: Some(vec![receipt]),
+        }
+    }
+
+    #[test]
+    fn phase13b_inactive_mode_always_ok() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        let parent = phase13b_parent_block();
+        let block = make_poawx_test_block(vec![0x51]);
+        assert!(validate_poawx_block_receipts(&block, 100, Some(&parent)).is_ok());
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn phase13b_pre_activation_height_ok() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "100");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let parent = phase13b_parent_block();
+        let block = make_poawx_test_block(vec![0x51]);
+        assert!(validate_poawx_block_receipts(&block, 99, Some(&parent)).is_ok());
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn phase13b_mainnet_unchanged() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        let parent = phase13b_parent_block();
+        let block = make_poawx_test_block(vec![0x51]);
+        assert!(
+            validate_poawx_block_receipts(&block, 100, Some(&parent)).is_ok(),
+            "mainnet must skip poawx receipt check"
+        );
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn phase13b_missing_receipts_rejected() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        let parent = phase13b_parent_block();
+        // Block has irx1 commitment but poawx_receipts = None.
+        let mut root = [0u8; 32];
+        root[0] = 0xde;
+        let block = make_poawx_test_block(irx1_script_for_chain(root));
+        let result = validate_poawx_block_receipts(&block, 10, Some(&parent));
+        assert!(result.is_err(), "missing receipts must be rejected");
+        assert!(result.unwrap_err().contains("missing or empty"));
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+    }
+
+    #[test]
+    fn phase13b_empty_receipts_rejected() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        let parent = phase13b_parent_block();
+        let mut root = [0u8; 32];
+        root[0] = 0xde;
+        let mut block = make_poawx_test_block(irx1_script_for_chain(root));
+        block.poawx_receipts = Some(vec![]);
+        let result = validate_poawx_block_receipts(&block, 10, Some(&parent));
+        assert!(result.is_err(), "empty receipts must be rejected");
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+    }
+
+    #[test]
+    fn phase13b_zero_irx1_root_rejected() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        let parent = phase13b_parent_block();
+        let mut block = make_poawx_test_block(irx1_script_for_chain([0u8; 32]));
+        block.poawx_receipts = Some(vec![]);
+        let result = validate_poawx_block_receipts(&block, 10, Some(&parent));
+        assert!(result.is_err(), "zero irx1 root must be rejected");
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+    }
+
+    #[test]
+    fn phase13b_valid_block_accepted() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        let sk = test_signing_key();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(
+            result.is_ok(),
+            "valid poawx block must be accepted: {:?}",
+            result
+        );
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+    }
+
+    #[test]
+    fn phase13b_irx1_root_mismatch_rejected() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        let sk = test_signing_key();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        let mut block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        // Corrupt the irx1 root in the coinbase OP_RETURN output.
+        let coinbase = &mut block.transactions[0];
+        if let Some(irx1_out) = coinbase
+            .outputs
+            .iter_mut()
+            .find(|o| o.script_pubkey.len() == 38)
+        {
+            irx1_out.script_pubkey[10] ^= 0xff;
+        }
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err(), "irx1 root mismatch must be rejected");
+        assert!(
+            result.unwrap_err().contains("mismatch"),
+            "error must mention mismatch"
+        );
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+    }
+
+    #[test]
+    fn phase13b_wrong_commitment_nonce_rejected() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        let sk = test_signing_key();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let mut receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        // Corrupt nonce byte in receipt; rebuild irx1 root to match.
+        receipt.commitment_nonce[0] ^= 0xff;
+        let irx1_root = crate::poawx::irx1_root_from_block_receipts(&[receipt.clone()]);
+        let mut irx1_script = vec![0x6a, 0x24u8];
+        irx1_script.extend_from_slice(b"irx1");
+        irx1_script.extend_from_slice(&irx1_root);
+        let base_reward = block_reward(height);
+        let worker_due = base_reward * 100 / 1000;
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0u8; 32],
+                prev_index: 0xffff_ffff,
+                script_sig: vec![0x01, 0x00],
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![
+                TxOutput {
+                    value: base_reward - worker_due,
+                    script_pubkey: vec![0x51],
+                },
+                TxOutput {
+                    value: worker_due,
+                    script_pubkey: p2pkh_script(&receipt.worker_pkh),
+                },
+                TxOutput {
+                    value: 0,
+                    script_pubkey: irx1_script,
+                },
+            ],
+            locktime: 0,
+        };
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: parent_hash,
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0x207fffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+            auxpow: None,
+            poawx_receipts: Some(vec![receipt]),
+        };
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err(), "wrong nonce must be rejected");
+        assert!(
+            result.unwrap_err().contains("nonce"),
+            "error must mention nonce"
+        );
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+    }
+
+    #[test]
+    fn phase13b_bad_worker_sig_rejected() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        let sk = test_signing_key();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let mut receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        // Flip two bytes of the signature — almost certain to produce invalid sig.
+        receipt.worker_sig[0] ^= 0xff;
+        receipt.worker_sig[32] ^= 0xff;
+        // Rebuild block with matching irx1 root.
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err(), "corrupted sig must be rejected");
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+    }
+
+    #[test]
+    fn phase13b_spoofed_pkh_rejected() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        let sk = test_signing_key();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let mut receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        // Replace worker_pkh with a value that doesn't match worker_pubkey.
+        receipt.worker_pkh[0] ^= 0xff;
+        // Rebuild block with matching irx1 root (root uses binary fields).
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err(), "spoofed pkh must be rejected");
+        assert!(
+            result.unwrap_err().contains("mismatch"),
+            "error must mention mismatch"
+        );
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+    }
+
+    #[test]
+    fn phase13b_insufficient_puzzle_difficulty_rejected() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        let sk = test_signing_key();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        // Build receipt satisfying only 1 leading zero bit.
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        let receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        // Require 20 bits — near-zero chance the 1-bit solution also satisfies 20 bits.
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "20");
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(
+            result.is_err(),
+            "low-difficulty solution should be rejected at higher difficulty"
+        );
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+    }
+
+    #[test]
+    fn phase13b_missing_worker_payout_rejected() {
+        let _g = chain_poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        let sk = test_signing_key();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        // payout_ok=false → worker receives 0 (underpaid).
+        let block = make_valid_poawx_block(parent_hash, height, receipt, false);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err(), "missing worker payout must be rejected");
+        assert!(
+            result.unwrap_err().contains("underpaid"),
+            "error must mention underpaid"
+        );
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+    }
+
+    #[test]
+    fn phase13b_legacy_block_wire_still_parses() {
+        // Verify that a block with no receipt section (pre-Phase-13-A wire)
+        // still deserializes correctly after Phase 13-B changes.
+        let block = make_poawx_test_block(vec![0x51]);
+        let bytes = block.serialize_for_height(1);
+        let (decoded, used) =
+            Block::deserialize_for_height(&bytes, 1).expect("legacy block must still parse");
+        assert_eq!(used, bytes.len());
+        assert!(decoded.poawx_receipts.is_none());
     }
 }
