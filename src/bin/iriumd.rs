@@ -13699,9 +13699,7 @@ fn compute_poawx_receipts_root(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
 
 /// Converts a binary block receipt to the hex-string pending-receipt format.
 /// Reverse of `pending_receipt_to_block_receipt`. Used in Phase 13-C reorg restore.
-fn block_receipt_to_pending(
-    r: &irium_node_rs::poawx::PoawxBlockReceipt,
-) -> PoawxPendingReceipt {
+fn block_receipt_to_pending(r: &irium_node_rs::poawx::PoawxBlockReceipt) -> PoawxPendingReceipt {
     PoawxPendingReceipt {
         height: r.height,
         lane: (r.lane as char).to_string(),
@@ -28824,7 +28822,11 @@ mod tests {
     }
     // --- Phase 13-C: Reorg Receipt Restore unit tests ---
 
-    fn make_test_block_receipt_c(height: u64, lane: u8, pkh_byte: u8) -> irium_node_rs::poawx::PoawxBlockReceipt {
+    fn make_test_block_receipt_c(
+        height: u64,
+        lane: u8,
+        pkh_byte: u8,
+    ) -> irium_node_rs::poawx::PoawxBlockReceipt {
         irium_node_rs::poawx::PoawxBlockReceipt {
             height,
             lane,
@@ -28836,7 +28838,9 @@ mod tests {
         }
     }
 
-    fn make_block_with_receipts_c(receipts: Option<Vec<irium_node_rs::poawx::PoawxBlockReceipt>>) -> irium_node_rs::block::Block {
+    fn make_block_with_receipts_c(
+        receipts: Option<Vec<irium_node_rs::poawx::PoawxBlockReceipt>>,
+    ) -> irium_node_rs::block::Block {
         use irium_node_rs::block::{Block, BlockHeader};
         Block {
             header: BlockHeader {
@@ -28923,7 +28927,11 @@ mod tests {
         let block = make_block_with_receipts_c(Some(vec![receipt]));
         let mut pending: Vec<PoawxPendingReceipt> = Vec::new();
         restore_orphaned_poawx_receipts(&mut pending, &[block], 100);
-        assert_eq!(pending.len(), 1, "receipt at exact boundary should be restored");
+        assert_eq!(
+            pending.len(),
+            1,
+            "receipt at exact boundary should be restored"
+        );
     }
 
     #[test]
@@ -28933,7 +28941,10 @@ mod tests {
         let block = make_block_with_receipts_c(Some(vec![receipt]));
         let mut pending: Vec<PoawxPendingReceipt> = Vec::new();
         restore_orphaned_poawx_receipts(&mut pending, &[block], 100);
-        assert!(pending.is_empty(), "receipt expired by 1 must not be restored");
+        assert!(
+            pending.is_empty(),
+            "receipt expired by 1 must not be restored"
+        );
     }
 
     #[test]
@@ -28943,7 +28954,11 @@ mod tests {
         let block2 = make_block_with_receipts_c(Some(vec![receipt]));
         let mut pending: Vec<PoawxPendingReceipt> = Vec::new();
         restore_orphaned_poawx_receipts(&mut pending, &[block1, block2], 100);
-        assert_eq!(pending.len(), 1, "same receipt from two blocks added only once");
+        assert_eq!(
+            pending.len(),
+            1,
+            "same receipt from two blocks added only once"
+        );
     }
 
     #[test]
@@ -28953,7 +28968,11 @@ mod tests {
         let receipt = make_test_block_receipt_c(90, b'A', 7);
         let block = make_block_with_receipts_c(Some(vec![receipt]));
         restore_orphaned_poawx_receipts(&mut pending, &[block], 100);
-        assert_eq!(pending.len(), 2, "existing pending receipt must be preserved");
+        assert_eq!(
+            pending.len(),
+            2,
+            "existing pending receipt must be preserved"
+        );
         assert_eq!(pending[0].height, 80, "existing entry not disturbed");
     }
 
@@ -28963,9 +28982,11 @@ mod tests {
         let block_empty = make_block_with_receipts_c(Some(vec![]));
         let mut pending: Vec<PoawxPendingReceipt> = Vec::new();
         restore_orphaned_poawx_receipts(&mut pending, &[block_none, block_empty], 100);
-        assert!(pending.is_empty(), "blocks with no receipts must not affect pending");
+        assert!(
+            pending.is_empty(),
+            "blocks with no receipts must not affect pending"
+        );
     }
-
 }
 
 // ============================================================================

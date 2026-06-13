@@ -20,9 +20,9 @@ mod ltc_spv;
 // Not used by main() itself.
 #[allow(dead_code)]
 mod mempool;
-mod pow;
 #[allow(dead_code)]
 mod poawx;
+mod pow;
 #[allow(dead_code)]
 mod scrypt_pow;
 mod tx;

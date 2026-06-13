@@ -1015,11 +1015,13 @@ impl ChainState {
         );
         let _ = connected_count;
         // Phase 13-C: stash blocks with PoAW-X receipts for iriumd.rs to restore
-        self.reorg_orphaned_blocks.extend(
-            disconnected.into_iter().filter(|b| {
-                b.poawx_receipts.as_ref().map(|r| !r.is_empty()).unwrap_or(false)
-            }),
-        );
+        self.reorg_orphaned_blocks
+            .extend(disconnected.into_iter().filter(|b| {
+                b.poawx_receipts
+                    .as_ref()
+                    .map(|r| !r.is_empty())
+                    .unwrap_or(false)
+            }));
         Ok(())
     }
 
