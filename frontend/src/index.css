@@ -1,19 +1,57 @@
-
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
 @import "tailwindcss";
 
+*, *::before, *::after { box-sizing: border-box; }
+
 :root {
-  color-scheme: dark;
+  --bg: #0A1226;
+  --bg-elev-1: rgba(8,11,22,0.94);
+  --bg-elev-2: rgba(4,7,18,0.97);
+  --brand: #6ec6ff;
+  --brand-dim: rgba(110,198,255,0.55);
+  --brand-line: rgba(110,198,255,0.14);
+  --brand-line-hi: rgba(110,198,255,0.30);
+  --border-accent: rgba(110,198,255,0.40);
+  --t1: #eef0ff;
+  --t2: rgba(255,255,255,0.55);
+  --t3: rgba(255,255,255,0.30);
+  --accent-2: #a78bfa;
+  --accent-hi: #d4eeff;
+  --green-hi: #34d399;
+  --amber-hi: #fbbf24;
 }
 
 body {
-  background-color: #0a0a0b;
-  color: #e4e4e7;
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(ellipse 65% 55% at 12% 18%, rgba(59,59,255,0.22) 0%, transparent 65%),
+    radial-gradient(ellipse 50% 65% at 88% 78%, rgba(167,139,250,0.18) 0%, transparent 65%),
+    radial-gradient(ellipse 40% 40% at 60% 40%, rgba(110,198,255,0.12) 0%, transparent 55%);
+  background-attachment: fixed;
+  color: var(--t1);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-.mono { font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace; }
+.mono {
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  font-feature-settings: 'liga' 0, 'calt' 0;
+}
 
-/* Subtle scrollbar */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: #111113; }
-::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(110,198,255,0.20); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(110,198,255,0.35); }
+
+@keyframes pulseRow {
+  0%   { background-color: rgba(110,198,255,0.12); }
+  100% { background-color: transparent; }
+}
+.new-row { animation: pulseRow 2s ease-out forwards; }
+
+@keyframes explorerLivePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.live-dot { animation: explorerLivePulse 1.8s ease-in-out infinite; }
