@@ -2897,6 +2897,7 @@ pub fn block_from_locked(gen: &LockedGenesis) -> Result<Block, String> {
         header: block_header,
         transactions: txs,
         auxpow: None,
+        poawx_receipts: None,
     })
 }
 
@@ -3181,6 +3182,7 @@ mod tests {
             },
             transactions: Vec::new(),
             auxpow: None,
+            poawx_receipts: None,
         });
         chain.height = chain.chain.len() as u64;
     }
@@ -5302,6 +5304,7 @@ mod tests {
                 locktime: 0,
             }],
             auxpow: None,
+            poawx_receipts: None,
         }
     }
 

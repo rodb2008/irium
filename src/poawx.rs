@@ -27,6 +27,81 @@ pub fn block_has_irx1_commitment(block: &Block) -> bool {
     })
 }
 
+/// Eight-byte magic that precedes the PoAW-X receipt section appended after
+/// all transactions in the block wire encoding. Chosen to be unambiguous
+/// as a transaction start (version `0x575041AF` is not a real tx version).
+pub const POAWX_RECEIPT_SECTION_MAGIC: &[u8; 8] = b"POAWXR\x01\x00";
+
+/// Per-receipt data embedded in the block wire/storage format so that every
+/// node can validate PoAW-X receipts from block-contained data (Phase 13-A).
+/// All multi-byte integers are little-endian.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoawxBlockReceipt {
+    pub height: u64,
+    /// Raw lane byte (e.g. `b'A'`).
+    pub lane: u8,
+    pub worker_pkh: [u8; 20],
+    pub worker_pubkey: [u8; 33],
+    pub worker_sig: [u8; 64],
+    pub solution: [u8; 8],
+    pub commitment_nonce: [u8; 32],
+}
+
+impl PoawxBlockReceipt {
+    /// Fixed wire size: 8 + 1 + 20 + 33 + 64 + 8 + 32 = 166 bytes.
+    pub const WIRE_SIZE: usize = 8 + 1 + 20 + 33 + 64 + 8 + 32;
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::WIRE_SIZE);
+        out.extend_from_slice(&self.height.to_le_bytes());
+        out.push(self.lane);
+        out.extend_from_slice(&self.worker_pkh);
+        out.extend_from_slice(&self.worker_pubkey);
+        out.extend_from_slice(&self.worker_sig);
+        out.extend_from_slice(&self.solution);
+        out.extend_from_slice(&self.commitment_nonce);
+        out
+    }
+
+    pub fn deserialize(raw: &[u8]) -> Result<Self, String> {
+        if raw.len() < Self::WIRE_SIZE {
+            return Err(format!(
+                "poawx receipt too short: {} < {}",
+                raw.len(),
+                Self::WIRE_SIZE
+            ));
+        }
+        let mut off = 0usize;
+        let height = u64::from_le_bytes(raw[off..off + 8].try_into().expect("slice len checked"));
+        off += 8;
+        let lane = raw[off];
+        off += 1;
+        let mut worker_pkh = [0u8; 20];
+        worker_pkh.copy_from_slice(&raw[off..off + 20]);
+        off += 20;
+        let mut worker_pubkey = [0u8; 33];
+        worker_pubkey.copy_from_slice(&raw[off..off + 33]);
+        off += 33;
+        let mut worker_sig = [0u8; 64];
+        worker_sig.copy_from_slice(&raw[off..off + 64]);
+        off += 64;
+        let mut solution = [0u8; 8];
+        solution.copy_from_slice(&raw[off..off + 8]);
+        off += 8;
+        let mut commitment_nonce = [0u8; 32];
+        commitment_nonce.copy_from_slice(&raw[off..off + 32]);
+        Ok(Self {
+            height,
+            lane,
+            worker_pkh,
+            worker_pubkey,
+            worker_sig,
+            solution,
+            commitment_nonce,
+        })
+    }
+}
+
 /// Extracts the 32-byte `irx1` root from the block coinbase if a well-formed
 /// `irx1` OP_RETURN output is present. Root may be all-zeros.
 pub fn irx1_root_from_block_bytes(block: &Block) -> Option<[u8; 32]> {
@@ -80,6 +155,7 @@ mod tests {
                 locktime: 0,
             }],
             auxpow: None,
+            poawx_receipts: None,
         }
     }
 
@@ -104,6 +180,7 @@ mod tests {
             },
             transactions: vec![],
             auxpow: None,
+            poawx_receipts: None,
         };
         assert!(!block_has_irx1_commitment(&block));
     }
@@ -157,5 +234,60 @@ mod tests {
     fn irx1_root_absent_returns_none() {
         let block = make_block_with_coinbase_script(vec![0x51]);
         assert_eq!(irx1_root_from_block_bytes(&block), None);
+    }
+
+    // ── Phase 13-A receipt wire format tests ─────────────────────────────
+
+    fn make_test_receipt(height: u64) -> PoawxBlockReceipt {
+        PoawxBlockReceipt {
+            height,
+            lane: b'A',
+            worker_pkh: [0x11u8; 20],
+            worker_pubkey: [0x22u8; 33],
+            worker_sig: [0x33u8; 64],
+            solution: [0x44u8; 8],
+            commitment_nonce: [0x55u8; 32],
+        }
+    }
+
+    #[test]
+    fn phase13a_receipt_serialize_deserialize_roundtrip() {
+        let r = make_test_receipt(42);
+        let bytes = r.serialize();
+        assert_eq!(bytes.len(), PoawxBlockReceipt::WIRE_SIZE);
+        let r2 = PoawxBlockReceipt::deserialize(&bytes).expect("deserialize");
+        assert_eq!(r, r2);
+        assert_eq!(r2.height, 42);
+        assert_eq!(r2.lane, b'A');
+        assert_eq!(r2.worker_pkh, [0x11u8; 20]);
+        assert_eq!(r2.worker_pubkey, [0x22u8; 33]);
+        assert_eq!(r2.worker_sig, [0x33u8; 64]);
+        assert_eq!(r2.solution, [0x44u8; 8]);
+        assert_eq!(r2.commitment_nonce, [0x55u8; 32]);
+    }
+
+    #[test]
+    fn phase13a_receipt_wire_size_is_166() {
+        assert_eq!(PoawxBlockReceipt::WIRE_SIZE, 166);
+        let r = make_test_receipt(1);
+        assert_eq!(r.serialize().len(), 166);
+    }
+
+    #[test]
+    fn phase13a_receipt_truncated_deserialize_fails() {
+        let r = make_test_receipt(1);
+        let bytes = r.serialize();
+        // Truncate by 1 byte — must error.
+        assert!(
+            PoawxBlockReceipt::deserialize(&bytes[..165]).is_err(),
+            "truncated bytes must fail to deserialize"
+        );
+        // Empty slice — must also error.
+        assert!(PoawxBlockReceipt::deserialize(&[]).is_err());
+    }
+
+    #[test]
+    fn phase13a_receipt_section_magic_length() {
+        assert_eq!(POAWX_RECEIPT_SECTION_MAGIC.len(), 8);
     }
 }

@@ -621,7 +621,11 @@ fn coinbase_tag() -> Option<&'static str> {
             eprintln!("[warn] IRIUM_COINBASE_TAG must be non-empty ASCII; ignoring");
             return None;
         }
-        Some(if tag.len() > 20 { tag[..20].to_string() } else { tag })
+        Some(if tag.len() > 20 {
+            tag[..20].to_string()
+        } else {
+            tag
+        })
     })
     .as_deref()
 }
@@ -1146,6 +1150,7 @@ fn load_persisted_blocks(state: &mut ChainState) {
                     },
                     transactions: txs,
                     auxpow: None,
+                    poawx_receipts: None,
                 };
                 // Recompute merkle to be safe.
                 block.header.merkle_root = block.merkle_root();
@@ -1494,6 +1499,7 @@ fn connect_block_from_json(state: &mut ChainState, v: &serde_json::Value) -> Res
         },
         transactions: txs,
         auxpow: None,
+        poawx_receipts: None,
     };
     block.header.merkle_root = block.merkle_root();
     state.connect_block(block).map(|_| ())
@@ -1866,6 +1872,7 @@ fn mine_once(
         header,
         transactions: txs.clone(),
         auxpow: None,
+        poawx_receipts: None,
     };
     let merkle = block.merkle_root();
     block.header.merkle_root = merkle;
@@ -2947,6 +2954,7 @@ fn submit_solo_share(
             header,
             transactions: txs,
             auxpow: None,
+            poawx_receipts: None,
         };
         if block.merkle_root() != merkle_root {
             return Err("submitted share merkle mismatch".to_string());

@@ -376,6 +376,17 @@ struct JsonHeader {
 }
 
 #[derive(Serialize)]
+struct JsonPoawxReceipt {
+    height: u64,
+    lane: String,
+    worker_pkh: String,
+    worker_pubkey: String,
+    worker_sig: String,
+    solution: String,
+    commitment_nonce: String,
+}
+
+#[derive(Serialize)]
 struct JsonBlock {
     height: u64,
     header: JsonHeader,
@@ -386,6 +397,8 @@ struct JsonBlock {
     miner_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     submit_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    poawx_receipts: Option<Vec<JsonPoawxReceipt>>,
 }
 
 #[cfg(unix)]
@@ -774,6 +787,19 @@ fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
             .map(|ap| hex::encode(crate::auxpow::serialize(ap))),
         miner_address: miner_address_from_block(block),
         submit_source: None,
+        poawx_receipts: block.poawx_receipts.as_ref().map(|recs| {
+            recs.iter()
+                .map(|r| JsonPoawxReceipt {
+                    height: r.height,
+                    lane: std::str::from_utf8(&[r.lane]).unwrap_or("?").to_string(),
+                    worker_pkh: hex::encode(r.worker_pkh),
+                    worker_pubkey: hex::encode(r.worker_pubkey),
+                    worker_sig: hex::encode(r.worker_sig),
+                    solution: hex::encode(r.solution),
+                    commitment_nonce: hex::encode(r.commitment_nonce),
+                })
+                .collect()
+        }),
     };
 
     let json = serde_json::to_string_pretty(&jb)?;

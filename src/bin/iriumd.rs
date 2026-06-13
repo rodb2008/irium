@@ -2644,6 +2644,69 @@ fn parse_persisted_block_file(
         None
     };
 
+    let poawx_receipts = parsed
+        .get("poawx_receipts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    fn to20(s: &str) -> Option<[u8; 20]> {
+                        let b = hex::decode(s).ok()?;
+                        if b.len() != 20 {
+                            return None;
+                        }
+                        let mut a = [0u8; 20];
+                        a.copy_from_slice(&b);
+                        Some(a)
+                    }
+                    fn to33(s: &str) -> Option<[u8; 33]> {
+                        let b = hex::decode(s).ok()?;
+                        if b.len() != 33 {
+                            return None;
+                        }
+                        let mut a = [0u8; 33];
+                        a.copy_from_slice(&b);
+                        Some(a)
+                    }
+                    fn to64(s: &str) -> Option<[u8; 64]> {
+                        let b = hex::decode(s).ok()?;
+                        if b.len() != 64 {
+                            return None;
+                        }
+                        let mut a = [0u8; 64];
+                        a.copy_from_slice(&b);
+                        Some(a)
+                    }
+                    fn to8(s: &str) -> Option<[u8; 8]> {
+                        let b = hex::decode(s).ok()?;
+                        if b.len() != 8 {
+                            return None;
+                        }
+                        let mut a = [0u8; 8];
+                        a.copy_from_slice(&b);
+                        Some(a)
+                    }
+                    fn to32(s: &str) -> Option<[u8; 32]> {
+                        let b = hex::decode(s).ok()?;
+                        if b.len() != 32 {
+                            return None;
+                        }
+                        let mut a = [0u8; 32];
+                        a.copy_from_slice(&b);
+                        Some(a)
+                    }
+                    Some(irium_node_rs::poawx::PoawxBlockReceipt {
+                        height: r.get("height")?.as_u64()?,
+                        lane: r.get("lane")?.as_str()?.bytes().next()?,
+                        worker_pkh: to20(r.get("worker_pkh")?.as_str()?)?,
+                        worker_pubkey: to33(r.get("worker_pubkey")?.as_str()?)?,
+                        worker_sig: to64(r.get("worker_sig")?.as_str()?)?,
+                        solution: to8(r.get("solution")?.as_str()?)?,
+                        commitment_nonce: to32(r.get("commitment_nonce")?.as_str()?)?,
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
     let block = Block {
         header: BlockHeader {
             version,
@@ -2655,6 +2718,7 @@ fn parse_persisted_block_file(
         },
         transactions: txs,
         auxpow,
+        poawx_receipts,
     };
 
     if height == 0 {
@@ -13574,6 +13638,39 @@ async fn get_block_template(
 
 // --- Phase 10-D: PoAW-X helpers and endpoints ---
 
+fn pending_receipt_to_block_receipt(
+    r: &PoawxPendingReceipt,
+) -> Option<irium_node_rs::poawx::PoawxBlockReceipt> {
+    let pkh = hex::decode(&r.worker_pkh).ok()?;
+    let pubk = hex::decode(&r.worker_pubkey).ok()?;
+    let sig = hex::decode(&r.worker_sig).ok()?;
+    let sol = hex::decode(&r.solution).ok()?;
+    let nonce = hex::decode(&r.commitment_nonce).ok()?;
+    if pkh.len() != 20 || pubk.len() != 33 || sig.len() != 64 || sol.len() != 8 || nonce.len() != 32
+    {
+        return None;
+    }
+    let mut worker_pkh = [0u8; 20];
+    worker_pkh.copy_from_slice(&pkh);
+    let mut worker_pubkey = [0u8; 33];
+    worker_pubkey.copy_from_slice(&pubk);
+    let mut worker_sig = [0u8; 64];
+    worker_sig.copy_from_slice(&sig);
+    let mut solution = [0u8; 8];
+    solution.copy_from_slice(&sol);
+    let mut commitment_nonce = [0u8; 32];
+    commitment_nonce.copy_from_slice(&nonce);
+    Some(irium_node_rs::poawx::PoawxBlockReceipt {
+        height: r.height,
+        lane: r.lane.bytes().next().unwrap_or(b'A'),
+        worker_pkh,
+        worker_pubkey,
+        worker_sig,
+        solution,
+        commitment_nonce,
+    })
+}
+
 fn compute_poawx_receipts_root(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
     let mut sorted: Vec<&PoawxPendingReceipt> = receipts.iter().collect();
     sorted.sort_unstable_by(|a, b| {
@@ -14188,10 +14285,23 @@ async fn submit_block_extended(
             StatusCode::BAD_REQUEST
         })?;
     }
-    let block = Block {
-        header: block_header,
-        transactions: txs,
-        auxpow,
+    let block = {
+        let receipts = if req.poawx_receipts.is_empty() {
+            None
+        } else {
+            Some(
+                req.poawx_receipts
+                    .iter()
+                    .filter_map(pending_receipt_to_block_receipt)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        Block {
+            header: block_header,
+            transactions: txs,
+            auxpow,
+            poawx_receipts: receipts,
+        }
     };
     let (new_height, new_tip_hash) = {
         let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -14251,13 +14361,9 @@ async fn submit_block_extended(
         save_poawx_pending_receipts(&receipts_snapshot);
     }
     if let Err(_e) = storage::write_block_json(req.height, &block) {}
-    // Phase 12-M: broadcast accepted block to pre-connected peers via P2P.
+    // Phase 12-M/13-A: broadcast accepted block (with receipts) to pre-connected peers.
     if let Some(ref p2p) = state.p2p {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&block.header.serialize_for_height(new_height));
-        for tx in &block.transactions {
-            bytes.extend_from_slice(&tx.serialize());
-        }
+        let bytes = block.serialize_for_height(new_height);
         if let Err(e) = p2p.broadcast_block(&bytes).await {
             eprintln!("Failed to broadcast accepted block over P2P: {}", e);
         }
@@ -14652,6 +14758,7 @@ async fn submit_block(
         header: block_header,
         transactions: txs,
         auxpow,
+        poawx_receipts: None,
     };
 
     // Apply to chain state under lock, enforcing consensus rules.
@@ -27308,6 +27415,7 @@ mod tests {
                 locktime: 0,
             }],
             auxpow: None,
+            poawx_receipts: None,
         };
         assert!(
             !irium_node_rs::poawx::block_has_irx1_commitment(&block),
@@ -27354,6 +27462,7 @@ mod tests {
                 locktime: 0,
             }],
             auxpow: None,
+            poawx_receipts: None,
         };
         assert!(
             irium_node_rs::poawx::block_has_irx1_commitment(&block),

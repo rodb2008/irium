@@ -2093,6 +2093,7 @@ fn main() {
             },
             transactions: txs.clone(),
             auxpow: None,
+            poawx_receipts: None,
         };
         block.header.merkle_root = block.merkle_root();
 

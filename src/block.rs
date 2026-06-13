@@ -191,6 +191,9 @@ pub struct Block {
     pub transactions: Vec<Transaction>,
     /// AuxPoW extension present when `header.version & AUXPOW_VERSION_BIT` is set.
     pub auxpow: Option<AuxPoW>,
+    /// PoAW-X receipts carried in the block wire/storage format (Phase 13-A).
+    /// `None` for legacy and mainnet blocks.
+    pub poawx_receipts: Option<Vec<crate::poawx::PoawxBlockReceipt>>,
 }
 
 impl Block {
@@ -237,7 +240,30 @@ impl Block {
         };
 
         let mut txs = Vec::new();
+        let mut poawx_receipts: Option<Vec<crate::poawx::PoawxBlockReceipt>> = None;
         while offset < raw.len() {
+            if raw.len() - offset >= 8
+                && &raw[offset..offset + 8] == crate::poawx::POAWX_RECEIPT_SECTION_MAGIC
+            {
+                offset += 8;
+                if offset >= raw.len() {
+                    return Err("receipt section: missing count byte".to_string());
+                }
+                let count = raw[offset] as usize;
+                offset += 1;
+                let mut receipts = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if raw.len() - offset < crate::poawx::PoawxBlockReceipt::WIRE_SIZE {
+                        return Err("receipt section truncated".to_string());
+                    }
+                    receipts.push(crate::poawx::PoawxBlockReceipt::deserialize(
+                        &raw[offset..],
+                    )?);
+                    offset += crate::poawx::PoawxBlockReceipt::WIRE_SIZE;
+                }
+                poawx_receipts = Some(receipts);
+                break;
+            }
             let tx = crate::tx::decode_full_tx_at(raw, &mut offset)?;
             txs.push(tx);
         }
@@ -247,6 +273,7 @@ impl Block {
                 header,
                 transactions: txs,
                 auxpow,
+                poawx_receipts,
             },
             offset,
         ))
@@ -261,6 +288,15 @@ impl Block {
         }
         for tx in &self.transactions {
             out.extend_from_slice(&tx.serialize());
+        }
+        if let Some(receipts) = &self.poawx_receipts {
+            if !receipts.is_empty() {
+                out.extend_from_slice(crate::poawx::POAWX_RECEIPT_SECTION_MAGIC);
+                out.push(receipts.len() as u8);
+                for r in receipts {
+                    out.extend_from_slice(&r.serialize());
+                }
+            }
         }
         out
     }
@@ -283,7 +319,30 @@ impl Block {
         };
 
         let mut txs = Vec::new();
+        let mut poawx_receipts: Option<Vec<crate::poawx::PoawxBlockReceipt>> = None;
         while offset < raw.len() {
+            if raw.len() - offset >= 8
+                && &raw[offset..offset + 8] == crate::poawx::POAWX_RECEIPT_SECTION_MAGIC
+            {
+                offset += 8;
+                if offset >= raw.len() {
+                    return Err("receipt section: missing count byte".to_string());
+                }
+                let count = raw[offset] as usize;
+                offset += 1;
+                let mut receipts = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if raw.len() - offset < crate::poawx::PoawxBlockReceipt::WIRE_SIZE {
+                        return Err("receipt section truncated".to_string());
+                    }
+                    receipts.push(crate::poawx::PoawxBlockReceipt::deserialize(
+                        &raw[offset..],
+                    )?);
+                    offset += crate::poawx::PoawxBlockReceipt::WIRE_SIZE;
+                }
+                poawx_receipts = Some(receipts);
+                break;
+            }
             let tx = crate::tx::decode_full_tx_at(raw, &mut offset)?;
             txs.push(tx);
         }
@@ -293,6 +352,7 @@ impl Block {
                 header,
                 transactions: txs,
                 auxpow,
+                poawx_receipts,
             },
             offset,
         ))
@@ -309,6 +369,15 @@ impl Block {
         }
         for tx in &self.transactions {
             out.extend_from_slice(&tx.serialize());
+        }
+        if let Some(receipts) = &self.poawx_receipts {
+            if !receipts.is_empty() {
+                out.extend_from_slice(crate::poawx::POAWX_RECEIPT_SECTION_MAGIC);
+                out.push(receipts.len() as u8);
+                for r in receipts {
+                    out.extend_from_slice(&r.serialize());
+                }
+            }
         }
         out
     }
@@ -516,6 +585,7 @@ mod fix2a_boundary_tests {
             header: header.clone(),
             transactions: vec![],
             auxpow: None,
+            poawx_receipts: None,
         };
         for height in [0u64, 22_887, 22_888] {
             assert_eq!(
@@ -524,5 +594,119 @@ mod fix2a_boundary_tests {
                 "Block::serialize_for_height({height}) prefix must equal header.serialize_for_height({height})",
             );
         }
+    }
+
+    // ── Phase 13-A: block wire receipt encoding tests ────────────────────
+
+    fn make_receipt(height: u64) -> crate::poawx::PoawxBlockReceipt {
+        crate::poawx::PoawxBlockReceipt {
+            height,
+            lane: b'L',
+            worker_pkh: [0xaau8; 20],
+            worker_pubkey: [0xbbu8; 33],
+            worker_sig: [0xccu8; 64],
+            solution: [0xddu8; 8],
+            commitment_nonce: [0xeeu8; 32],
+        }
+    }
+
+    fn make_block_with_receipts(height: u64) -> Block {
+        Block {
+            header: sample_header(),
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![make_receipt(height)]),
+        }
+    }
+
+    #[test]
+    fn phase13a_block_with_receipts_serialize_deserialize_roundtrip() {
+        let block = make_block_with_receipts(7);
+        let bytes = block.serialize_for_height(1);
+        let (decoded, used) =
+            Block::deserialize_for_height(&bytes, 1).expect("deserialize_for_height must succeed");
+        assert_eq!(used, bytes.len(), "all bytes consumed");
+        let receipts = decoded.poawx_receipts.expect("receipts present");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0], make_receipt(7));
+        assert_eq!(receipts[0].lane, b'L');
+    }
+
+    #[test]
+    fn phase13a_block_without_receipts_no_magic_appended() {
+        // A block with poawx_receipts=None must produce bytes identical to
+        // a pre-Phase-13-A serialization (no POAWX_RECEIPT_SECTION_MAGIC).
+        let block = Block {
+            header: sample_header(),
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: None,
+        };
+        let bytes = block.serialize_for_height(1);
+        let magic = crate::poawx::POAWX_RECEIPT_SECTION_MAGIC;
+        // Confirm magic does NOT appear in the output.
+        let contains_magic = bytes.windows(8).any(|w| w == magic);
+        assert!(
+            !contains_magic,
+            "blocks without receipts must not contain POAWX_RECEIPT_SECTION_MAGIC"
+        );
+        // And bytes must equal header-only serialization.
+        assert_eq!(bytes, block.header.serialize_for_height(1));
+    }
+
+    #[test]
+    fn phase13a_block_empty_receipts_vec_no_magic() {
+        // Some([]) must also produce no magic (empty receipt list is treated as absent).
+        let block = Block {
+            header: sample_header(),
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![]),
+        };
+        let bytes = block.serialize_for_height(1);
+        let magic = crate::poawx::POAWX_RECEIPT_SECTION_MAGIC;
+        let contains_magic = bytes.windows(8).any(|w| w == magic);
+        assert!(
+            !contains_magic,
+            "empty receipt list must produce no magic bytes"
+        );
+    }
+
+    #[test]
+    fn phase13a_truncated_receipt_section_rejected() {
+        // Build valid bytes then corrupt the count byte to claim more receipts.
+        let block = make_block_with_receipts(5);
+        let valid_bytes = block.serialize_for_height(1);
+        // Truncate by removing the last 10 bytes — now the receipt body is incomplete.
+        let truncated = &valid_bytes[..valid_bytes.len() - 10];
+        let result = Block::deserialize_for_height(truncated, 1);
+        assert!(
+            result.is_err(),
+            "truncated receipt section must cause deserialize_for_height to fail"
+        );
+    }
+
+    #[test]
+    fn phase13a_receipts_count_byte_correct() {
+        // Encode 3 receipts and confirm the count byte in the wire bytes is 3.
+        let receipts: Vec<_> = (0..3).map(make_receipt).collect();
+        let block = Block {
+            header: sample_header(),
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(receipts),
+        };
+        let bytes = block.serialize_for_height(1);
+        // Find magic position.
+        let magic = crate::poawx::POAWX_RECEIPT_SECTION_MAGIC;
+        let magic_pos = bytes
+            .windows(8)
+            .position(|w| w == magic)
+            .expect("magic must be present");
+        let count_byte = bytes[magic_pos + 8];
+        assert_eq!(count_byte, 3, "count byte must be 3 for 3 receipts");
+        // And the total length must be header + magic(8) + count(1) + 3*166.
+        let expected_len = 80 + 8 + 1 + 3 * crate::poawx::PoawxBlockReceipt::WIRE_SIZE;
+        assert_eq!(bytes.len(), expected_len);
     }
 }
