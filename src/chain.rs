@@ -282,6 +282,10 @@ pub struct ChainState {
     /// Replay-protection set: LTC outpoints already consumed by an
     /// HtlcLtcSwapV1 claim (Phase C). Mirrors `claimed_btc_outpoints`.
     pub claimed_ltc_outpoints: HashSet<([u8; 32], u32)>,
+    /// Blocks disconnected during a reorg that carried PoAW-X receipts.
+    /// Drained by iriumd.rs `submit_block_extended` to restore orphaned
+    /// receipts to `poawx_pending_receipts` (Phase 13-C).
+    pub reorg_orphaned_blocks: Vec<Block>,
 }
 
 #[derive(Debug, Clone)]
@@ -356,6 +360,7 @@ impl ChainState {
             ltc_tip: None,
             ltc_tip_height: 0,
             claimed_ltc_outpoints: HashSet::new(),
+            reorg_orphaned_blocks: Vec::new(),
         };
         let genesis = state.params.genesis_block.clone();
         state
@@ -1009,6 +1014,12 @@ impl ChainState {
             disconnected_count,
         );
         let _ = connected_count;
+        // Phase 13-C: stash blocks with PoAW-X receipts for iriumd.rs to restore
+        self.reorg_orphaned_blocks.extend(
+            disconnected.into_iter().filter(|b| {
+                b.poawx_receipts.as_ref().map(|r| !r.is_empty()).unwrap_or(false)
+            }),
+        );
         Ok(())
     }
 
@@ -1641,6 +1652,7 @@ impl ChainState {
             ltc_tip: self.ltc_tip,
             ltc_tip_height: self.ltc_tip_height,
             claimed_ltc_outpoints: self.claimed_ltc_outpoints.clone(),
+            reorg_orphaned_blocks: Vec::new(),
         };
 
         let branch = self.gather_branch_to_genesis(tip_hash)?;

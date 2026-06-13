@@ -13697,6 +13697,55 @@ fn compute_poawx_receipts_root(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
     outer.finalize().into()
 }
 
+/// Converts a binary block receipt to the hex-string pending-receipt format.
+/// Reverse of `pending_receipt_to_block_receipt`. Used in Phase 13-C reorg restore.
+fn block_receipt_to_pending(
+    r: &irium_node_rs::poawx::PoawxBlockReceipt,
+) -> PoawxPendingReceipt {
+    PoawxPendingReceipt {
+        height: r.height,
+        lane: (r.lane as char).to_string(),
+        worker_pkh: hex::encode(r.worker_pkh),
+        solution: hex::encode(r.solution),
+        commitment_nonce: hex::encode(r.commitment_nonce),
+        worker_pubkey: hex::encode(r.worker_pubkey),
+        worker_sig: hex::encode(r.worker_sig),
+    }
+}
+
+/// Restores PoAW-X receipts from reorg-orphaned blocks into `pending`.
+///
+/// Rules:
+/// * Skips receipts expired by more than POAWX_RECEIPT_MAX_AGE_BLOCKS below tip_height.
+/// * Skips duplicate (height, lane, worker_pkh) triplets already in pending.
+/// * Does not remove any existing entries in pending.
+fn restore_orphaned_poawx_receipts(
+    pending: &mut Vec<PoawxPendingReceipt>,
+    orphaned_blocks: &[irium_node_rs::block::Block],
+    tip_height: u64,
+) {
+    for block in orphaned_blocks {
+        let receipts = match &block.poawx_receipts {
+            Some(r) => r,
+            None => continue,
+        };
+        for r in receipts {
+            if r.height + POAWX_RECEIPT_MAX_AGE_BLOCKS < tip_height {
+                continue;
+            }
+            let p = block_receipt_to_pending(r);
+            let dup = pending.iter().any(|existing| {
+                existing.height == p.height
+                    && existing.lane == p.lane
+                    && existing.worker_pkh == p.worker_pkh
+            });
+            if !dup {
+                pending.push(p);
+            }
+        }
+    }
+}
+
 const POAWX_DEFAULT_DIFFICULTY_BITS: u32 = 8;
 const POAWX_MIN_ACTIVE_DIFFICULTY_BITS: u32 = 4;
 const POAWX_MAX_DIFFICULTY_BITS: u32 = 24;
@@ -14098,6 +14147,32 @@ async fn submit_block_extended(
 ) -> Result<Json<Value>, StatusCode> {
     check_rate_with_auth(&state, &addr, &headers)?;
     require_rpc_auth(&headers)?;
+    // Phase 13-C: drain reorg-orphaned blocks and restore receipts to pending.
+    // These blocks were disconnected by a p2p-triggered reorg; their receipts
+    // may still be valid for inclusion in a future block.
+    {
+        let (orphaned, tip_h) = {
+            let mut chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            let orphaned = std::mem::take(&mut chain.reorg_orphaned_blocks);
+            let h = chain.tip_height();
+            (orphaned, h)
+        };
+        if !orphaned.is_empty() {
+            let receipts_snapshot = {
+                let mut pending = state
+                    .poawx_pending_receipts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                restore_orphaned_poawx_receipts(&mut pending, &orphaned, tip_h);
+                pending.clone()
+            };
+            save_poawx_pending_receipts(&receipts_snapshot);
+            eprintln!(
+                "[poawx] restored orphaned receipts from {} reorg block(s)",
+                orphaned.len()
+            );
+        }
+    }
     // O-2: mainnet must never accept PoAW-X receipt submissions.
     // C-3: when PoAW-X is active on testnet, receipts must be non-empty.
     {
@@ -28747,6 +28822,150 @@ mod tests {
             "devnet signed seed gate must return empty Vec"
         );
     }
+    // --- Phase 13-C: Reorg Receipt Restore unit tests ---
+
+    fn make_test_block_receipt_c(height: u64, lane: u8, pkh_byte: u8) -> irium_node_rs::poawx::PoawxBlockReceipt {
+        irium_node_rs::poawx::PoawxBlockReceipt {
+            height,
+            lane,
+            worker_pkh: [pkh_byte; 20],
+            worker_pubkey: [pkh_byte; 33],
+            worker_sig: [pkh_byte; 64],
+            solution: [pkh_byte; 8],
+            commitment_nonce: [pkh_byte; 32],
+        }
+    }
+
+    fn make_block_with_receipts_c(receipts: Option<Vec<irium_node_rs::poawx::PoawxBlockReceipt>>) -> irium_node_rs::block::Block {
+        use irium_node_rs::block::{Block, BlockHeader};
+        Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: [0u8; 32],
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            transactions: Vec::new(),
+            auxpow: None,
+            poawx_receipts: receipts,
+        }
+    }
+
+    fn pending_entry_c(height: u64, lane: &str, pkh_hex: &str) -> PoawxPendingReceipt {
+        PoawxPendingReceipt {
+            height,
+            lane: lane.to_string(),
+            worker_pkh: pkh_hex.to_string(),
+            solution: "0000000000000000".to_string(),
+            commitment_nonce: "0".repeat(64),
+            worker_pubkey: "00".repeat(33),
+            worker_sig: "00".repeat(64),
+        }
+    }
+
+    #[test]
+    fn phase13c_block_receipt_to_pending_fields_correct() {
+        let r = make_test_block_receipt_c(42, b'A', 0xab);
+        let p = block_receipt_to_pending(&r);
+        assert_eq!(p.height, 42);
+        assert_eq!(p.lane, "A");
+        assert_eq!(p.worker_pkh, hex::encode([0xabu8; 20]));
+        assert_eq!(p.solution, hex::encode([0xabu8; 8]));
+        assert_eq!(p.commitment_nonce, hex::encode([0xabu8; 32]));
+        assert_eq!(p.worker_pubkey, hex::encode([0xabu8; 33]));
+        assert_eq!(p.worker_sig, hex::encode([0xabu8; 64]));
+    }
+
+    #[test]
+    fn phase13c_restore_empty_orphaned_noop() {
+        let mut pending: Vec<PoawxPendingReceipt> = Vec::new();
+        restore_orphaned_poawx_receipts(&mut pending, &[], 100);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn phase13c_restore_adds_receipts_to_pending() {
+        let receipt = make_test_block_receipt_c(90, b'A', 1);
+        let block = make_block_with_receipts_c(Some(vec![receipt]));
+        let mut pending: Vec<PoawxPendingReceipt> = Vec::new();
+        restore_orphaned_poawx_receipts(&mut pending, &[block], 100);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].height, 90);
+        assert_eq!(pending[0].lane, "A");
+    }
+
+    #[test]
+    fn phase13c_restore_idempotent_no_duplicates() {
+        let receipt = make_test_block_receipt_c(90, b'A', 1);
+        let block = make_block_with_receipts_c(Some(vec![receipt]));
+        let blocks = [block.clone(), block.clone()];
+        let mut pending: Vec<PoawxPendingReceipt> = Vec::new();
+        restore_orphaned_poawx_receipts(&mut pending, &blocks, 100);
+        assert_eq!(pending.len(), 1, "duplicate not added");
+    }
+
+    #[test]
+    fn phase13c_expired_receipt_not_restored() {
+        // height=1, tip=100: 1 + 24 = 25 < 100 => expired
+        let receipt = make_test_block_receipt_c(1, b'A', 2);
+        let block = make_block_with_receipts_c(Some(vec![receipt]));
+        let mut pending: Vec<PoawxPendingReceipt> = Vec::new();
+        restore_orphaned_poawx_receipts(&mut pending, &[block], 100);
+        assert!(pending.is_empty(), "expired receipt must not be restored");
+    }
+
+    #[test]
+    fn phase13c_non_expired_at_boundary_restored() {
+        // height=76, tip=100: 76 + 24 = 100 == tip, NOT expired (condition is < tip)
+        let receipt = make_test_block_receipt_c(76, b'A', 3);
+        let block = make_block_with_receipts_c(Some(vec![receipt]));
+        let mut pending: Vec<PoawxPendingReceipt> = Vec::new();
+        restore_orphaned_poawx_receipts(&mut pending, &[block], 100);
+        assert_eq!(pending.len(), 1, "receipt at exact boundary should be restored");
+    }
+
+    #[test]
+    fn phase13c_receipt_expired_by_one_skipped() {
+        // height=75, tip=100: 75 + 24 = 99 < 100 => expired
+        let receipt = make_test_block_receipt_c(75, b'A', 4);
+        let block = make_block_with_receipts_c(Some(vec![receipt]));
+        let mut pending: Vec<PoawxPendingReceipt> = Vec::new();
+        restore_orphaned_poawx_receipts(&mut pending, &[block], 100);
+        assert!(pending.is_empty(), "receipt expired by 1 must not be restored");
+    }
+
+    #[test]
+    fn phase13c_dedup_across_two_orphaned_blocks() {
+        let receipt = make_test_block_receipt_c(90, b'A', 5);
+        let block1 = make_block_with_receipts_c(Some(vec![receipt.clone()]));
+        let block2 = make_block_with_receipts_c(Some(vec![receipt]));
+        let mut pending: Vec<PoawxPendingReceipt> = Vec::new();
+        restore_orphaned_poawx_receipts(&mut pending, &[block1, block2], 100);
+        assert_eq!(pending.len(), 1, "same receipt from two blocks added only once");
+    }
+
+    #[test]
+    fn phase13c_restore_does_not_remove_existing_pending() {
+        let existing = pending_entry_c(80, "B", &hex::encode([0x11u8; 20]));
+        let mut pending = vec![existing];
+        let receipt = make_test_block_receipt_c(90, b'A', 7);
+        let block = make_block_with_receipts_c(Some(vec![receipt]));
+        restore_orphaned_poawx_receipts(&mut pending, &[block], 100);
+        assert_eq!(pending.len(), 2, "existing pending receipt must be preserved");
+        assert_eq!(pending[0].height, 80, "existing entry not disturbed");
+    }
+
+    #[test]
+    fn phase13c_block_without_receipts_ignored() {
+        let block_none = make_block_with_receipts_c(None);
+        let block_empty = make_block_with_receipts_c(Some(vec![]));
+        let mut pending: Vec<PoawxPendingReceipt> = Vec::new();
+        restore_orphaned_poawx_receipts(&mut pending, &[block_none, block_empty], 100);
+        assert!(pending.is_empty(), "blocks with no receipts must not affect pending");
+    }
+
 }
 
 // ============================================================================
