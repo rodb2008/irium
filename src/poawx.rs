@@ -33,6 +33,9 @@ pub fn block_has_irx1_commitment(block: &Block) -> bool {
 /// as a transaction start (version `0x575041AF` is not a real tx version).
 pub const POAWX_RECEIPT_SECTION_MAGIC: &[u8; 8] = b"POAWXR\x01\x00";
 
+/// Worker reward per receipt as permille (1/1000) of the block subsidy.
+pub const POAWX_WORKER_REWARD_PERMILLE: u64 = 100;
+
 /// Per-receipt data embedded in the block wire/storage format so that every
 /// node can validate PoAW-X receipts from block-contained data (Phase 13-A).
 /// All multi-byte integers are little-endian.

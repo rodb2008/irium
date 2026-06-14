@@ -1938,8 +1938,7 @@ fn validate_poawx_reward_split_from_block(
         .first()
         .ok_or_else(|| "connect_block: no coinbase for reward split check".to_string())?;
     let base_reward = block_reward(height);
-    const WORKER_REWARD_PERMILLE: u64 = 100;
-    let worker_due = base_reward * WORKER_REWARD_PERMILLE / 1000;
+    let worker_due = base_reward * crate::poawx::POAWX_WORKER_REWARD_PERMILLE / 1000;
     let mut worker_counts: std::collections::HashMap<[u8; 20], u64> = Default::default();
     for r in receipts {
         *worker_counts.entry(r.worker_pkh).or_insert(0) += 1;

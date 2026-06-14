@@ -13676,7 +13676,11 @@ fn compute_poawx_receipts_root(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
     sorted.sort_unstable_by(|a, b| {
         a.height
             .cmp(&b.height)
-            .then_with(|| a.lane.as_bytes().cmp(b.lane.as_bytes()))
+            .then_with(|| {
+                let la = a.lane.bytes().next().unwrap_or(b'A');
+                let lb = b.lane.bytes().next().unwrap_or(b'A');
+                la.cmp(&lb)
+            })
             .then_with(|| a.worker_pkh.as_bytes().cmp(b.worker_pkh.as_bytes()))
             .then_with(|| {
                 a.commitment_nonce
@@ -13687,8 +13691,9 @@ fn compute_poawx_receipts_root(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
     let mut outer = Sha256::new();
     for r in sorted {
         let mut inner = Sha256::new();
+        let lane_byte = r.lane.bytes().next().unwrap_or(b'A');
         inner.update(r.height.to_le_bytes());
-        inner.update(r.lane.as_bytes());
+        inner.update([lane_byte]);
         inner.update(hex::decode(&r.worker_pkh).unwrap_or_default());
         inner.update(hex::decode(&r.solution).unwrap_or_default());
         inner.update(hex::decode(&r.commitment_nonce).unwrap_or_default());
@@ -13728,7 +13733,7 @@ fn restore_orphaned_poawx_receipts(
             None => continue,
         };
         for r in receipts {
-            if r.height + POAWX_RECEIPT_MAX_AGE_BLOCKS < tip_height {
+            if r.height.saturating_add(POAWX_RECEIPT_MAX_AGE_BLOCKS) < tip_height {
                 continue;
             }
             let p = block_receipt_to_pending(r);
@@ -13787,7 +13792,8 @@ fn count_leading_zero_bits(hash: &[u8; 32]) -> u32 {
     bits
 }
 
-const POAWX_MAX_PENDING_RECEIPTS: usize = 500;
+// Limited to 255: the block wire format encodes receipt count as u8.
+const POAWX_MAX_PENDING_RECEIPTS: usize = 255;
 
 fn poawx_receipts_file() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("IRIUM_POAWX_RECEIPTS_FILE") {
@@ -13852,9 +13858,6 @@ fn save_poawx_pending_receipts(receipts: &[PoawxPendingReceipt]) {
 
 /// Receipts older than this many blocks behind the current tip are expired.
 const POAWX_RECEIPT_MAX_AGE_BLOCKS: u64 = 24;
-/// Worker reward share as permille (1/1000) of the block subsidy per receipt.
-/// With value 100, each worker earns 10% per receipt they have validated.
-const POAWX_WORKER_REWARD_PERMILLE: u32 = 100;
 
 /// Removes receipts whose height is more than POAWX_RECEIPT_MAX_AGE_BLOCKS behind tip_height.
 /// Future-height receipts (height > tip_height) are always retained.
@@ -13872,7 +13875,7 @@ fn prune_expired_poawx_receipts(receipts: &mut Vec<PoawxPendingReceipt>, tip_hei
 }
 
 fn poawx_worker_due(base_reward: u64) -> u64 {
-    base_reward * POAWX_WORKER_REWARD_PERMILLE as u64 / 1000
+    base_reward * irium_node_rs::poawx::POAWX_WORKER_REWARD_PERMILLE / 1000
 }
 
 fn poawx_validate_reward_split(
@@ -27880,6 +27883,38 @@ mod tests {
         assert_eq!(poawx_worker_due(5_000_000_000), 500_000_000);
         assert_eq!(poawx_worker_due(2_500_000_000), 250_000_000);
         assert_eq!(poawx_worker_due(0), 0);
+    }
+
+    #[test]
+    fn test_poawx_max_pending_within_wire_limit() {
+        assert!(
+            POAWX_MAX_PENDING_RECEIPTS <= 255,
+            "POAWX_MAX_PENDING_RECEIPTS must not exceed u8::MAX (block wire format limit)"
+        );
+    }
+
+    #[test]
+    fn test_compute_receipts_root_lane_cpu_matches_block_receipt_root() {
+        // B-1 regression: lane "cpu" was hashed as 3 bytes; fix canonicalises to first byte.
+        let pkh = "ab".repeat(20);
+        let pubk = "02".to_string() + &"cd".repeat(32);
+        let r = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: pkh,
+            worker_pubkey: pubk,
+            worker_sig: "ee".repeat(64),
+            solution: "0123456789abcdef".to_string(),
+            commitment_nonce: "ff".repeat(32),
+        };
+        let pending_root = compute_poawx_receipts_root(&[r.clone()]);
+        let block_receipt = pending_receipt_to_block_receipt(&r).expect("valid test receipt");
+        let block_root = irium_node_rs::poawx::irx1_root_from_block_receipts(&[block_receipt]);
+        assert_eq!(
+            hex::encode(pending_root),
+            hex::encode(block_root),
+            "B-1: lane multi-byte string must hash as single canonical byte"
+        );
     }
 
     #[test]
