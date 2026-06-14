@@ -83,7 +83,7 @@ use irium_node_rs::block::{Block, BlockHeader};
 use irium_node_rs::chain::{
     block_from_locked, ChainParams, ChainState, HeaderWork, LwmaParams, OutPoint,
 };
-use irium_node_rs::constants::{block_reward, coinbase_maturity};
+use irium_node_rs::constants::{block_reward, coinbase_maturity, MTP_ACTIVATION_HEIGHT};
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::mempool::{evict_invalid_mempool_entries, MempoolManager, MempoolPriority};
 use irium_node_rs::network::SeedlistManager;
@@ -13243,7 +13243,12 @@ async fn get_block_template(
         let bits = target.bits;
         let prev_time = tip.map(|b| b.header.time).unwrap_or(0);
         let now = Utc::now().timestamp() as u32;
-        let time = now.max(prev_time.saturating_add(1));
+        let time = if height >= MTP_ACTIVATION_HEIGHT {
+            let mtp = guard.median_time_past();
+            now.max(mtp.saturating_add(1))
+        } else {
+            now.max(prev_time.saturating_add(1))
+        };
         (height, prev_hash, bits, target_hex(bits), time)
     };
 

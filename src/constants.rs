@@ -26,6 +26,7 @@ pub const BLOCK_TARGET_INTERVAL_V2: u64 = 120;
 
 pub const DIFFICULTY_RETARGET_INTERVAL: u64 = 2016; // blocks
 pub const MAX_FUTURE_BLOCK_TIME: i64 = 7200; // 2 hours
+pub const MTP_ACTIVATION_HEIGHT: u64 = 41_515;
 pub const COINBASE_MATURITY: u64 = 100; // blocks
 pub const LWMA_WINDOW: u64 = 60; // blocks
 pub const LWMA_SOLVETIME_CLAMP_FACTOR: u64 = 6; // clamp to [1, 6T]
