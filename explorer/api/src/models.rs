@@ -114,3 +114,14 @@ pub struct ExplorerStatus {
     pub synced_height: i64,
     pub synced_block_hash: String,
 }
+
+#[derive(Serialize)]
+pub struct ChainStats {
+    pub height: i64,
+    pub total_txs: i64,
+    pub total_addresses: i64,
+    pub difficulty: Option<f64>,
+    pub network_hashrate: Option<f64>,
+    pub peer_count: u64,
+    pub circulating_supply: i64,
+}

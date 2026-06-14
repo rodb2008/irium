@@ -1,10 +1,10 @@
-
 mod blocks;
 mod txs;
 mod address;
 mod agreements;
 mod miners;
 mod search;
+mod stats;
 mod status;
 
 use axum::Router;
@@ -19,4 +19,5 @@ pub fn router() -> Router<PgPool> {
         .merge(agreements::router())
         .merge(miners::router())
         .merge(search::router())
+        .merge(stats::router())
 }
