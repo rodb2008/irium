@@ -21,7 +21,7 @@ use crate::constants::{
     DIFFICULTY_RETARGET_INTERVAL, LWMA_MAX_TARGET_DOWN_FACTOR, LWMA_MAX_TARGET_UP_FACTOR,
     LWMA_MIN_DIFFICULTY_FLOOR, LWMA_SOLVETIME_CLAMP_FACTOR, LWMA_V2_MAX_TARGET_DOWN_FACTOR,
     LWMA_V2_MAX_TARGET_UP_FACTOR, LWMA_V2_SOLVETIME_CLAMP_FACTOR, LWMA_V2_WINDOW, LWMA_WINDOW,
-    MAX_FUTURE_BLOCK_TIME, MAX_MONEY,
+    MAX_FUTURE_BLOCK_TIME, MAX_MONEY, MTP_ACTIVATION_HEIGHT,
 };
 use crate::genesis::LockedGenesis;
 use crate::ltc_spv::{
@@ -378,6 +378,17 @@ impl ChainState {
 
     pub fn tip_height(&self) -> u64 {
         self.height.saturating_sub(1)
+    }
+
+    pub fn median_time_past(&self) -> u32 {
+        let count = self.chain.len().min(11);
+        if count == 0 {
+            return 0;
+        }
+        let start = self.chain.len() - count;
+        let mut times: Vec<u32> = self.chain[start..].iter().map(|b| b.header.time).collect();
+        times.sort_unstable();
+        times[count / 2]
     }
 
     fn htlcv1_active_at(&self, height: u64) -> bool {
@@ -1188,7 +1199,12 @@ impl ChainState {
         if (block.header.time as i64) > current_time + MAX_FUTURE_BLOCK_TIME {
             return Err("Block timestamp too far in future".to_string());
         }
-        if let Some(prev) = previous {
+        if height >= MTP_ACTIVATION_HEIGHT {
+            let mtp = self.median_time_past();
+            if block.header.time <= mtp {
+                return Err("Block timestamp must be greater than median time past".to_string());
+            }
+        } else if let Some(prev) = previous {
             if block.header.time <= prev.header.time {
                 return Err("Block timestamp must be greater than previous block".to_string());
             }

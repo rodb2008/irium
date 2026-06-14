@@ -89,7 +89,7 @@ use irium_node_rs::btc_spv::{
 use irium_node_rs::chain::{
     block_from_locked, ChainParams, ChainState, HeaderWork, LwmaParams, OutPoint,
 };
-use irium_node_rs::constants::{block_reward, coinbase_maturity};
+use irium_node_rs::constants::{block_reward, coinbase_maturity, MTP_ACTIVATION_HEIGHT};
 use irium_node_rs::genesis::load_locked_genesis;
 use irium_node_rs::ltc_spv::{
     encode_ltc_header_batch, parse_ltc_header_batch, LtcAnchor, LtcHeader, LtcHeaderEntry,
@@ -13386,7 +13386,12 @@ async fn get_block_template(
         let bits = target.bits;
         let prev_time = tip.map(|b| b.header.time).unwrap_or(0);
         let now = Utc::now().timestamp() as u32;
-        let time = now.max(prev_time.saturating_add(1));
+        let time = if height >= MTP_ACTIVATION_HEIGHT {
+            let mtp = guard.median_time_past();
+            now.max(mtp.saturating_add(1))
+        } else {
+            now.max(prev_time.saturating_add(1))
+        };
         (height, prev_hash, bits, target_hex(bits), time)
     };
 
@@ -13428,20 +13433,48 @@ async fn get_block_template(
     // filter — otherwise the pool stuffs all of them into a block and
     // submit_block rejects, stalling production network-wide. Keep the
     // highest-fee carrier of each chain (ordered_entries is fee-per-byte
-    // desc) and drop the rest.
+    // desc) and drop the rest. Additionally, exclude any carrier whose first
+    // header does not connect to the current relay tip — such stale carriers
+    // (e.g. re-gossiped from pre-restart state) cause connect_block_failed.
+    let (btc_relay_tip, ltc_relay_tip) = {
+        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+        (chain.btc_tip, chain.ltc_tip)
+    };
     {
         let mut btc_seen = false;
         let mut ltc_seen = false;
         mempool_entries.retain(|e| {
             let mut has_btc = false;
             let mut has_ltc = false;
+            let mut is_btc_carrier = false;
+            let mut is_ltc_carrier = false;
             for out in &e.tx.outputs {
-                if parse_btc_header_batch(&out.script_pubkey).is_ok() {
-                    has_btc = true;
+                if let Ok(headers) = parse_btc_header_batch(&out.script_pubkey) {
+                    is_btc_carrier = true;
+                    if headers
+                        .first()
+                        .and_then(|h| btc_relay_tip.map(|t| t == h.prev_hash))
+                        .unwrap_or(false)
+                    {
+                        has_btc = true;
+                    }
                 }
-                if parse_ltc_header_batch(&out.script_pubkey).is_ok() {
-                    has_ltc = true;
+                if let Ok(headers) = parse_ltc_header_batch(&out.script_pubkey) {
+                    is_ltc_carrier = true;
+                    if headers
+                        .first()
+                        .and_then(|h| ltc_relay_tip.map(|t| t == h.prev_hash))
+                        .unwrap_or(false)
+                    {
+                        has_ltc = true;
+                    }
                 }
+            }
+            if is_btc_carrier && !has_btc {
+                return false;
+            }
+            if is_ltc_carrier && !has_ltc {
+                return false;
             }
             if has_btc && btc_seen {
                 return false;

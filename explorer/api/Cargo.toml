@@ -1,4 +1,3 @@
-
 [package]
 name = "irium-explorer-api"
 version = "0.1.0"
@@ -30,6 +29,9 @@ governor = "0.6"
 
 # Config / env
 dotenvy = "0.15"
+
+# HTTP client (iriumd RPC calls from /stats handler)
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 # Errors / tracing
 anyhow             = "1"

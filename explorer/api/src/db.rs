@@ -21,7 +21,7 @@ pub async fn get_status(pool: &PgPool) -> Result<ExplorerStatus> {
 
 pub async fn get_blocks(pool: &PgPool, limit: i64, offset: i64) -> Result<Vec<BlockSummary>> {
     let rows = sqlx::query(
-        "SELECT height,hash,timestamp,tx_count,miner_address,total_reward \
+        "SELECT height,hash,timestamp,tx_count,miner_address,total_reward,coinbase_tag \
          FROM blocks ORDER BY height DESC LIMIT $1 OFFSET $2"
     )
     .bind(limit)
@@ -35,12 +35,13 @@ pub async fn get_blocks(pool: &PgPool, limit: i64, offset: i64) -> Result<Vec<Bl
         tx_count: r.get("tx_count"),
         miner_address: r.get("miner_address"),
         total_reward: r.get("total_reward"),
+        coinbase_tag: r.get("coinbase_tag"),
     }).collect())
 }
 
 pub async fn get_block_by_height(pool: &PgPool, height: i64) -> Result<Option<BlockDetail>> {
     let row = sqlx::query(
-        "SELECT height,hash,prev_hash,merkle_root,timestamp,difficulty,nonce,tx_count,miner_address,total_reward \
+        "SELECT height,hash,prev_hash,merkle_root,timestamp,difficulty,nonce,tx_count,miner_address,total_reward,coinbase_tag \
          FROM blocks WHERE height=$1"
     )
     .bind(height)
@@ -61,12 +62,13 @@ pub async fn get_block_by_height(pool: &PgPool, height: i64) -> Result<Option<Bl
         miner_address: row.get("miner_address"),
         total_reward: row.get("total_reward"),
         txids,
+        coinbase_tag: row.get("coinbase_tag"),
     }))
 }
 
 pub async fn get_block_by_hash(pool: &PgPool, hash: &str) -> Result<Option<BlockDetail>> {
     let row = sqlx::query(
-        "SELECT height,hash,prev_hash,merkle_root,timestamp,difficulty,nonce,tx_count,miner_address,total_reward \
+        "SELECT height,hash,prev_hash,merkle_root,timestamp,difficulty,nonce,tx_count,miner_address,total_reward,coinbase_tag \
          FROM blocks WHERE hash=$1"
     )
     .bind(hash)
@@ -88,6 +90,7 @@ pub async fn get_block_by_hash(pool: &PgPool, hash: &str) -> Result<Option<Block
         miner_address: row.get("miner_address"),
         total_reward: row.get("total_reward"),
         txids,
+        coinbase_tag: row.get("coinbase_tag"),
     }))
 }
 
@@ -285,4 +288,66 @@ pub async fn search(pool: &PgPool, query: &str) -> Result<Option<SearchResult>> 
         if addr_exists { return Ok(Some(SearchResult::Address(q.to_string()))); }
     }
     Ok(None)
+}
+
+// ─── Agreements list ─────────────────────────────────────────────────────────
+
+pub async fn get_agreements_list(pool: &PgPool, limit: i64) -> Result<Vec<AgreementInfo>> {
+    let rows = sqlx::query(
+        "SELECT agreement_hash,anchor_type,txid,block_height,milestone_id          FROM agreements ORDER BY block_height DESC LIMIT $1"
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| AgreementInfo {
+        agreement_hash: r.get("agreement_hash"),
+        anchor_type: r.get("anchor_type"),
+        txid: r.get("txid"),
+        block_height: r.get("block_height"),
+        milestone_id: r.get("milestone_id"),
+    }).collect())
+}
+
+// ─── All HTLCs ───────────────────────────────────────────────────────────────
+
+pub async fn get_all_htlcs(pool: &PgPool, limit: i64) -> Result<Vec<HtlcInfo>> {
+    let rows = sqlx::query(
+        "SELECT txid,vout,block_height,htlc_type,value,recipient_addr,refund_addr,                secret_hash,timeout_height,state,spend_txid          FROM htlc_outputs ORDER BY block_height DESC LIMIT $1"
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| HtlcInfo {
+        txid: r.get("txid"),
+        vout: r.get("vout"),
+        block_height: r.get("block_height"),
+        htlc_type: r.get("htlc_type"),
+        value: r.get("value"),
+        recipient_addr: r.get("recipient_addr"),
+        refund_addr: r.get("refund_addr"),
+        secret_hash: r.get("secret_hash"),
+        timeout_height: r.get("timeout_height"),
+        state: r.get("state"),
+        spend_txid: r.get("spend_txid"),
+    }).collect())
+}
+
+// ─── Chain stats ─────────────────────────────────────────────────────────────
+
+pub async fn get_db_stats(pool: &PgPool) -> Result<(i64, i64, i64, i64)> {
+    let row = sqlx::query(
+        "SELECT \
+         (SELECT synced_height FROM indexer_state WHERE id=1)::bigint AS height, \
+         (SELECT COUNT(*) FROM txs)::bigint AS total_txs, \
+         (SELECT COUNT(*) FROM address_stats)::bigint AS total_addresses, \
+         (SELECT COALESCE(SUM(total_reward),0) FROM blocks)::bigint AS circulating_supply"
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok((
+        row.get("height"),
+        row.get("total_txs"),
+        row.get("total_addresses"),
+        row.get("circulating_supply"),
+    ))
 }
