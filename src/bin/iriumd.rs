@@ -2417,6 +2417,34 @@ fn miner_address_from_block(block: &Block) -> Option<String> {
     block.transactions.first().and_then(miner_address_from_tx)
 }
 
+fn extract_coinbase_tag(script_sig: &[u8]) -> Option<String> {
+    // Only works on ASCII text scriptSigs (solo miner format).
+    // Pool BIP34 scriptSigs contain binary bytes that fail utf8 decode -> None.
+    let text = std::str::from_utf8(script_sig).ok()?;
+    // Strip trailing null bytes appended by stratum solo extranonce padding.
+    let text = text.trim_end_matches('\0');
+
+    // Text mode: "Block {height}/{tag}"
+    if let Some(pos) = text.find('/') {
+        let tag = &text[pos + 1..];
+        if !tag.is_empty() && tag.len() <= 20 && tag.is_ascii() {
+            let t = tag.replace('\0', "");
+            if !t.is_empty() { return Some(t); }
+        }
+    }
+
+    // Stratum solo mode: "Block {height} solo {tag} "
+    if let Some(pos) = text.find(" solo ") {
+        let after = text[pos + 6..].trim_end();
+        if !after.is_empty() && after.len() <= 20 && after.is_ascii() {
+            let t = after.replace('\0', "");
+            if !t.is_empty() { return Some(t); }
+        }
+    }
+
+    None
+}
+
 fn p2pkh_hash_from_script(script: &[u8]) -> Option<[u8; 20]> {
     if script.len() != 25 {
         return None;
@@ -13515,6 +13543,9 @@ fn block_json_for(height: u64, block: &Block) -> Value {
         "auxpow_hex": block.auxpow.as_ref().map(|ap| hex::encode(irium_node_rs::auxpow::serialize(ap))),
         "miner_address": miner_address_from_block(block),
         "submit_source": storage::read_block_submit_source(height),
+        "coinbase_tag": block.transactions.first()
+            .and_then(|tx| tx.inputs.first())
+            .and_then(|inp| extract_coinbase_tag(&inp.script_sig)),
     })
 }
 async fn get_block(
