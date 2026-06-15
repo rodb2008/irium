@@ -13,7 +13,32 @@ use crate::template::{GetBlockTemplate, PoawxPendingReceipt, TemplateClient};
 /// and above this height the pool switches to Bitcoin-standard wire format
 /// (swap4(natural) prev, natural merkle in canonical header) so cgminer-family
 /// miners produce iriumd-canonical bytes directly.
-const STANDARD_HEADER_ACTIVATION_HEIGHT: u64 = 22_888;
+/// Resolved per-process from this stratum's network env (IRIUM_NETWORK).
+/// Mainnet (default) = 22888 (historical mirror of iriumd; env ignored);
+/// testnet/devnet default to 0 (standard headers from genesis), overridable
+/// via IRIUM_STANDARD_HEADER_ACTIVATION_HEIGHT. Cached once; must agree with
+/// the paired iriumd node's resolved value.
+fn standard_header_activation_height() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let is_mainnet = std::env::var("IRIUM_NETWORK")
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "testnet" | "devnet" | "regtest" | "trial"
+                )
+            })
+            .unwrap_or(true);
+        if is_mainnet {
+            22_888
+        } else {
+            std::env::var("IRIUM_STANDARD_HEADER_ACTIVATION_HEIGHT")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(1)
+        }
+    })
+}
 
 /// LWMA-style vardiff parameters. Window holds the last N share intervals
 /// per session; recent intervals are weighted higher so the algorithm
@@ -1512,7 +1537,7 @@ fn reconstruct_canonical_header80(
     // iriumd writes the natural sha256d bytes unchanged (Bitcoin-standard).
     // Stay byte-for-byte aligned with iriumd's BlockHeader::serialize_for_height.
     let mut merkle_wire = merkle_root_internal;
-    if snapshot.height < STANDARD_HEADER_ACTIVATION_HEIGHT {
+    if snapshot.height < standard_header_activation_height() {
         merkle_wire.reverse();
     }
     header[36..68].copy_from_slice(&merkle_wire);
@@ -1583,12 +1608,12 @@ async fn template_loop(
                 let job = to_job(seq, &tpl)?;
                 // Guardrail: refuse stale pre-fork templates once we've
                 // seen the network at/above the activation height.
-                if job.height < STANDARD_HEADER_ACTIVATION_HEIGHT
-                    && max_seen_height >= STANDARD_HEADER_ACTIVATION_HEIGHT
+                if job.height < standard_header_activation_height()
+                    && max_seen_height >= standard_header_activation_height()
                 {
                     warn!(
                         "[tmpl] refusing stale pre-fork template: height={} max_seen={} threshold={}; iriumd is likely re-syncing - will retry on next poll",
-                        job.height, max_seen_height, STANDARD_HEADER_ACTIVATION_HEIGHT
+                        job.height, max_seen_height, standard_header_activation_height()
                     );
                     // Fall through to the wait-and-retry block at the
                     // bottom of the loop body. Do NOT update last_key,
@@ -2184,7 +2209,7 @@ fn mode_allows_combo(
     //
     // Pre-fork the variant scan must allow `prev_swap4`; post-fork `prev_rev32`.
     // This is the only height-dependent constraint.
-    let post_fork = height >= STANDARD_HEADER_ACTIVATION_HEIGHT;
+    let post_fork = height >= standard_header_activation_height();
 
     let v_ok = v_name == "v_be"
         || v_name == "v_le"
@@ -2551,7 +2576,13 @@ fn decode_cpuminer_compat_submit(
 
     Ok(CanonicalSolve {
         adapter_id: "cpuminer_compat",
-        rewardable: true,
+        // PoAW-X hardening (gated: testnet/devnet only). The compatibility adapter
+        // accepts shares via a byte-order variant sweep that cannot deterministically
+        // reconstruct the iriumd-canonical block, so on the PoAW-X path it must NEVER
+        // promote a rewardable candidate. Force non-rewardable when poawx_enabled so
+        // rewardable block production flows ONLY through the deterministic
+        // native_rewardable path. Mainnet/legacy (poawx_enabled=false) is byte-identical.
+        rewardable: !config.poawx_enabled,
         share_variant,
         extranonce2_hex: submit.extranonce2_hex.clone(),
         ntime_hex: submit.ntime_hex.clone(),
@@ -3713,7 +3744,7 @@ async fn handle_submit_legacy_rewardable(
         prev_wire.reverse();
         canonical_header80[4..36].copy_from_slice(&prev_wire);
         let mut merkle_wire = merkle_root_for_json;
-        if job.height < STANDARD_HEADER_ACTIVATION_HEIGHT {
+        if job.height < standard_header_activation_height() {
             merkle_wire.reverse();
         }
         canonical_header80[36..68].copy_from_slice(&merkle_wire);
@@ -4509,6 +4540,77 @@ mod tests {
         assert!(solve.share_ok);
         assert!(solve.rewardable);
         assert_eq!(solve.adapter_id, "cpuminer_compat");
+    }
+
+    /// Mainnet/legacy behavior unchanged: with poawx_enabled=false the compat
+    /// solve stays rewardable and its promotability is gated ONLY by block_ok
+    /// (byte-identical to pre-hardening behavior).
+    #[test]
+    fn cpuminer_compat_mainnet_legacy_rewardable_unchanged() {
+        let _guard = test_guard();
+        let config = test_config(MinerFamilyMode::Cpuminer); // poawx_enabled = false
+        let session = test_session(AdapterKind::CpuminerCompatibility);
+        let snapshot = build_canonical_job_snapshot(&test_job(), &session, &config).unwrap();
+        let submit = SubmitTuple {
+            job_id: snapshot.job_id.clone(),
+            extranonce2_hex: "00000000".to_string(),
+            ntime_hex: format!("{:08x}", snapshot.base_ntime),
+            nonce_hex: "00000001".to_string(),
+            rolled_version_hex: None,
+        };
+        let solve = decode_cpuminer_compat_submit(&snapshot, &session, &config, &submit).unwrap();
+        assert!(solve.rewardable, "legacy compat must remain rewardable");
+        assert_eq!(
+            rewardable_candidate_allowed(&solve),
+            solve.block_ok,
+            "legacy promotion is gated only by block_ok (unchanged)"
+        );
+    }
+
+    /// PoAW-X hardening: with poawx_enabled=true the compat adapter is
+    /// non-rewardable and can NEVER promote a candidate, even when block_ok
+    /// (no variant sweep may decide promotion on the PoAW-X path).
+    #[test]
+    fn cpuminer_compat_poawx_nonrewardable_cannot_promote() {
+        let _guard = test_guard();
+        let mut config = test_config(MinerFamilyMode::Cpuminer);
+        config.poawx_enabled = true;
+        let session = test_session(AdapterKind::CpuminerCompatibility);
+        let snapshot = build_canonical_job_snapshot(&test_job(), &session, &config).unwrap();
+        let submit = SubmitTuple {
+            job_id: snapshot.job_id.clone(),
+            extranonce2_hex: "00000000".to_string(),
+            ntime_hex: format!("{:08x}", snapshot.base_ntime),
+            nonce_hex: "00000001".to_string(),
+            rolled_version_hex: None,
+        };
+        let solve = decode_cpuminer_compat_submit(&snapshot, &session, &config, &submit).unwrap();
+        assert!(
+            !solve.rewardable,
+            "compat must be non-rewardable on the PoAW-X path"
+        );
+        // rewardable_candidate_allowed == rewardable && block_ok; with rewardable
+        // forced false the candidate is never promotable regardless of block_ok.
+        assert!(
+            !rewardable_candidate_allowed(&solve),
+            "compat must not promote on the PoAW-X path"
+        );
+    }
+
+    /// PoAW-X rewardable production is deterministic/canonical: decoding the
+    /// identical native submit twice yields byte-identical canonical header and
+    /// hash (no variant sweep, no byte-order guessing), and it is the rewardable path.
+    #[test]
+    fn native_rewardable_is_deterministic_canonical() {
+        let (_cfg, _sess, snapshot, _issued, submit, solve1) = native_fixture();
+        let solve2 = decode_native_rewardable_submit(&snapshot, &submit).unwrap();
+        assert_eq!(solve1.canonical_header80, solve2.canonical_header80);
+        assert_eq!(solve1.canonical_hash, solve2.canonical_hash);
+        assert_eq!(solve1.share_variant, "canonical_native");
+        assert!(
+            solve1.rewardable,
+            "native_rewardable is the rewardable path"
+        );
     }
 
     #[test]

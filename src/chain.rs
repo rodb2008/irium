@@ -311,7 +311,7 @@ pub(crate) fn whatsminer_compat_pow_hash_for_height(
     header: &BlockHeader,
     height: u64,
 ) -> Option<[u8; 32]> {
-    if height < crate::constants::STANDARD_HEADER_ACTIVATION_HEIGHT {
+    if height < crate::block::standard_header_activation_height() {
         return None;
     }
 

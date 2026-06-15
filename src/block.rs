@@ -3,6 +3,23 @@ use crate::auxpow::AuxPoW;
 use crate::pow::{header_hash, Target};
 use crate::tx::Transaction;
 
+static RESOLVED_STD_HEADER_ACTIVATION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Set the process-wide resolved standard-header (Fix 2a) activation height.
+/// Call once at binary startup with the network-resolved value (first set wins).
+pub fn set_standard_header_activation_height(height: u64) {
+    let _ = RESOLVED_STD_HEADER_ACTIVATION.set(height);
+}
+
+/// Process-wide resolved standard-header activation height. Defaults to the
+/// mainnet historical constant when unset (unit tests / binaries that do not
+/// wire it), keeping mainnet/default serialization byte-stable.
+pub fn standard_header_activation_height() -> u64 {
+    *RESOLVED_STD_HEADER_ACTIVATION
+        .get()
+        .unwrap_or(&crate::constants::STANDARD_HEADER_ACTIVATION_HEIGHT)
+}
+
 #[derive(Debug, Clone)]
 pub struct BlockHeader {
     pub version: u32,
@@ -92,13 +109,19 @@ impl BlockHeader {
     /// rationale and Fix 2a migration plan.
     #[allow(dead_code)]
     pub fn serialize_for_height(&self, height: u64) -> Vec<u8> {
+        self.serialize_with_activation(height, standard_header_activation_height())
+    }
+
+    /// As `serialize_for_height` but with an explicit standard-header activation
+    /// height (testable; the public method delegates with the resolved value).
+    pub fn serialize_with_activation(&self, height: u64, std_header_activation: u64) -> Vec<u8> {
         let mut out = Vec::with_capacity(80);
         out.extend_from_slice(&self.version.to_le_bytes());
         let mut prev = self.prev_hash;
         prev.reverse();
         out.extend_from_slice(&prev);
         let mut merkle = self.merkle_root;
-        if height < crate::constants::STANDARD_HEADER_ACTIVATION_HEIGHT {
+        if height < std_header_activation {
             merkle.reverse();
         }
         out.extend_from_slice(&merkle);
@@ -142,6 +165,16 @@ impl BlockHeader {
     /// merkle_root after reading; at/post-activation only prev_hash is reversed.
     #[allow(dead_code)]
     pub fn deserialize_for_height(raw: &[u8], height: u64) -> Result<(Self, usize), String> {
+        Self::deserialize_with_activation(raw, height, standard_header_activation_height())
+    }
+
+    /// As `deserialize_for_height` but with an explicit standard-header
+    /// activation height (testable; the public method delegates).
+    pub fn deserialize_with_activation(
+        raw: &[u8],
+        height: u64,
+        std_header_activation: u64,
+    ) -> Result<(Self, usize), String> {
         if raw.len() < 80 {
             return Err("header too short".to_string());
         }
@@ -163,7 +196,7 @@ impl BlockHeader {
         offset += 32;
         let mut merkle_root = [0u8; 32];
         merkle_root.copy_from_slice(&raw[offset..offset + 32]);
-        if height < crate::constants::STANDARD_HEADER_ACTIVATION_HEIGHT {
+        if height < std_header_activation {
             merkle_root.reverse();
         }
         offset += 32;
@@ -424,6 +457,69 @@ mod fix2a_boundary_tests {
     #[test]
     fn activation_height_is_23_500() {
         assert_eq!(STANDARD_HEADER_ACTIVATION_HEIGHT, 22_888);
+    }
+
+    /// Devnet/testnet (activation=0): even height 1 uses the natural merkle
+    /// layout (Bitcoin-standard), so standard cpuminers validate from genesis.
+    #[test]
+    fn devnet_activation_zero_uses_natural_merkle_from_genesis() {
+        let h = sample_header();
+        let dev = h.serialize_with_activation(1, 0);
+        let pre = h.serialize_with_activation(1, STANDARD_HEADER_ACTIVATION_HEIGHT);
+        assert_eq!(
+            &dev[36..68],
+            &h.merkle_root[..],
+            "devnet height 1 = natural merkle"
+        );
+        let mut rev = h.merkle_root;
+        rev.reverse();
+        assert_eq!(
+            &pre[36..68],
+            &rev[..],
+            "mainnet pre-fork height 1 = reversed merkle"
+        );
+        assert_ne!(dev, pre);
+    }
+
+    /// Round-trip at devnet height 1 with activation=0.
+    #[test]
+    fn devnet_serialize_deserialize_roundtrip_height_1() {
+        let h = sample_header();
+        let ser = h.serialize_with_activation(1, 0);
+        let (back, n) = BlockHeader::deserialize_with_activation(&ser, 1, 0).unwrap();
+        assert_eq!(n, 80);
+        assert_eq!(back.merkle_root, h.merkle_root);
+        assert_eq!(back.prev_hash, h.prev_hash);
+        assert_eq!(back.version, h.version);
+        assert_eq!(back.time, h.time);
+        assert_eq!(back.bits, h.bits);
+        assert_eq!(back.nonce, h.nonce);
+    }
+
+    /// Mainnet regression: explicit activation=22888 preserves pre/post-fork
+    /// behavior, and the default serialize_for_height (global unset in tests)
+    /// resolves to 22888 — byte-identical to the historical const path.
+    #[test]
+    fn mainnet_serialization_byte_stable() {
+        let h = sample_header();
+        let mut rev = h.merkle_root;
+        rev.reverse();
+        assert_eq!(
+            &h.serialize_with_activation(100, STANDARD_HEADER_ACTIVATION_HEIGHT)[36..68],
+            &rev[..]
+        );
+        assert_eq!(
+            &h.serialize_with_activation(
+                STANDARD_HEADER_ACTIVATION_HEIGHT,
+                STANDARD_HEADER_ACTIVATION_HEIGHT
+            )[36..68],
+            &h.merkle_root[..]
+        );
+        // Default (global unset) must equal explicit mainnet const.
+        assert_eq!(
+            h.serialize_for_height(100),
+            h.serialize_with_activation(100, STANDARD_HEADER_ACTIVATION_HEIGHT)
+        );
     }
 
     /// For every pre-fork height (0, 1, 100, … 22_887) the new

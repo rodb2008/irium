@@ -270,6 +270,41 @@ pub fn resolved_lwma_v2_activation_height(network: NetworkKind) -> Option<u64> {
     }
 }
 
+/// Non-mainnet-only env override for the standard-header (Fix 2a) activation
+/// height. Parsed from IRIUM_STANDARD_HEADER_ACTIVATION_HEIGHT.
+pub fn runtime_standard_header_activation_env_override() -> Option<u64> {
+    env::var("IRIUM_STANDARD_HEADER_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// Resolve the standard-header (Fix 2a) activation height for `network`.
+/// MAINNET is ALWAYS the historical constant and IGNORES any env override, so
+/// mainnet header serialization/hashing is permanently byte-stable. Testnet/
+/// devnet default to 1 (genesis-preserving: height 0 keeps the legacy header so
+/// the fixed devnet/testnet genesis stays valid; every MINED block height >= 1
+/// uses Bitcoin-standard natural-merkle headers so standard miners validate) —
+/// with an optional env override for tests.
+pub fn resolved_standard_header_activation_height(network: NetworkKind) -> u64 {
+    resolve_standard_header_activation(network, runtime_standard_header_activation_env_override())
+}
+
+/// Pure resolver (no env read) for testability. Mainnet ALWAYS returns the
+/// historical constant and ignores `env_override`; testnet/devnet use the
+/// override or default to 1 (genesis-preserving).
+pub(crate) fn resolve_standard_header_activation(
+    network: NetworkKind,
+    env_override: Option<u64>,
+) -> u64 {
+    match network {
+        NetworkKind::Mainnet => crate::constants::STANDARD_HEADER_ACTIVATION_HEIGHT,
+        // 1 (not 0): genesis (height 0) keeps the legacy header format so the
+        // fixed devnet/testnet genesis stays valid; every MINED block (height >= 1)
+        // uses the Bitcoin-standard header so standard miners (cpuminer) validate.
+        NetworkKind::Testnet | NetworkKind::Devnet => env_override.unwrap_or(1),
+    }
+}
+
 pub fn resolved_auxpow_activation_height(network: NetworkKind) -> Option<u64> {
     match network {
         NetworkKind::Mainnet => MAINNET_AUXPOW_ACTIVATION_HEIGHT,
@@ -463,6 +498,53 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn standard_header_resolver_mainnet_ignores_override() {
+        assert_eq!(
+            resolve_standard_header_activation(NetworkKind::Mainnet, Some(5)),
+            crate::constants::STANDARD_HEADER_ACTIVATION_HEIGHT
+        );
+        assert_eq!(
+            resolve_standard_header_activation(NetworkKind::Mainnet, None),
+            crate::constants::STANDARD_HEADER_ACTIVATION_HEIGHT
+        );
+    }
+
+    #[test]
+    fn standard_header_resolver_non_mainnet_default_one_or_override() {
+        assert_eq!(
+            resolve_standard_header_activation(NetworkKind::Devnet, None),
+            1
+        );
+        assert_eq!(
+            resolve_standard_header_activation(NetworkKind::Testnet, None),
+            1
+        );
+        assert_eq!(
+            resolve_standard_header_activation(NetworkKind::Devnet, Some(123)),
+            123
+        );
+        assert_eq!(
+            resolve_standard_header_activation(NetworkKind::Testnet, Some(7)),
+            7
+        );
+    }
+
+    #[test]
+    fn standard_header_mainnet_ignores_env_var() {
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_STANDARD_HEADER_ACTIVATION_HEIGHT", "9");
+        assert_eq!(
+            resolved_standard_header_activation_height(NetworkKind::Mainnet),
+            crate::constants::STANDARD_HEADER_ACTIVATION_HEIGHT
+        );
+        assert_eq!(
+            resolved_standard_header_activation_height(NetworkKind::Devnet),
+            9
+        );
+        std::env::remove_var("IRIUM_STANDARD_HEADER_ACTIVATION_HEIGHT");
     }
 
     #[test]

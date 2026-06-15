@@ -16251,6 +16251,14 @@ async fn main() {
 
     let pow_limit = Target { bits: 0x1d00_ffff };
     let network = network_kind_from_env();
+    // Resolve the standard-header (Fix 2a) activation height for this network and
+    // pin it process-wide before any header serialization/validation. Mainnet is
+    // always the historical constant; testnet/devnet default to 1
+    // (genesis-preserving; mined blocks height >= 1 use standard headers).
+    // Keeps mainnet byte-stable; lets fresh testnets be mined by standard miners.
+    irium_node_rs::block::set_standard_header_activation_height(
+        irium_node_rs::activation::resolved_standard_header_activation_height(network),
+    );
     let env_override = runtime_htlcv1_env_override();
     let lwma_env_override = runtime_lwma_env_override();
     let htlc_activation = resolved_htlcv1_activation_height(network);
