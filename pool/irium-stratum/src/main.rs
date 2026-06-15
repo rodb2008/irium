@@ -43,9 +43,11 @@ async fn main() -> Result<()> {
             .ok()
             .filter(|v| {
                 let t = v.trim();
-                t.starts_with("127.0.0.1:") || t.starts_with("localhost:") || t.starts_with("[::1]:")
+                t.starts_with("127.0.0.1:")
+                    || t.starts_with("localhost:")
+                    || t.starts_with("[::1]:")
             })
-            .unwrap_or_else(|| "127.0.0.1:3334".to_string())
+            .unwrap_or_else(|| "127.0.0.1:3334".to_string()),
     );
 
     let max_template_age_seconds = env::var("IRIUM_TEMPLATE_MAX_AGE_SECONDS")
@@ -176,8 +178,7 @@ async fn main() -> Result<()> {
     if vardiff_max_diff_raw < vardiff_min_diff {
         warn!(
             "[config] IRIUM_STRATUM_VARDIFF_MAX_DIFF={} below min {}; clamped",
-            vardiff_max_diff_raw,
-            vardiff_min_diff
+            vardiff_max_diff_raw, vardiff_min_diff
         );
     }
 

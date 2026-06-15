@@ -1,7 +1,7 @@
 use crate::block::{
-    build_coinbase_tx, build_irx1_commitment_script, build_merkle_branches,
-    coinbase_prefix_suffix, compute_receipts_root_from_pending, header_bytes,
-    merkle_root_from_coinbase, parse_address_to_pkh, parse_hex32, parse_u32_hex,
+    build_coinbase_tx, build_irx1_commitment_script, build_merkle_branches, coinbase_prefix_suffix,
+    compute_receipts_root_from_pending, header_bytes, merkle_root_from_coinbase,
+    parse_address_to_pkh, parse_hex32, parse_u32_hex,
 };
 use crate::pow::{hash_meets_target, sha256d, target_from_bits, target_from_difficulty_with_limit};
 use crate::template::{GetBlockTemplate, PoawxPendingReceipt, TemplateClient};
@@ -54,13 +54,15 @@ const LWMA_INTERVAL_CLAMP_MULTIPLIER: u64 = 4;
 const VARIANT_NONE_DISCONNECT_THRESHOLD: u64 = 50;
 
 use anyhow::{anyhow, Result};
+use dashmap::DashMap;
 use num_bigint::BigUint;
+use once_cell::sync::Lazy;
 use serde_json::{json, Value};
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
-use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -69,8 +71,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Notify, RwLock};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
-use dashmap::DashMap;
-use once_cell::sync::Lazy;
 
 #[derive(Clone, Debug)]
 pub enum HashCmpMode {
@@ -80,7 +80,11 @@ pub enum HashCmpMode {
 
 impl HashCmpMode {
     pub fn from_env(value: Option<String>) -> Self {
-        match value.unwrap_or_else(|| "le".to_string()).to_ascii_lowercase().as_str() {
+        match value
+            .unwrap_or_else(|| "le".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "be" => Self::Be,
             _ => Self::Le,
         }
@@ -104,7 +108,11 @@ pub enum MinerFamilyMode {
 
 impl MinerFamilyMode {
     pub fn from_env(value: Option<String>) -> Self {
-        match value.unwrap_or_else(|| "auto".to_string()).to_ascii_lowercase().as_str() {
+        match value
+            .unwrap_or_else(|| "auto".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "asic" => Self::Asic,
             "ccminer" => Self::Ccminer,
             "cpuminer" => Self::Cpuminer,
@@ -131,7 +139,11 @@ pub enum AdapterMode {
 
 impl AdapterMode {
     pub fn from_env(value: Option<String>) -> Self {
-        match value.unwrap_or_else(|| "auto".to_string()).to_ascii_lowercase().as_str() {
+        match value
+            .unwrap_or_else(|| "auto".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "cpuminer_compat_only" | "cpuminer_compat" | "compat" => Self::CpuminerCompatOnly,
             "native_rewardable_only" | "native_rewardable" | "native" => Self::NativeRewardableOnly,
             _ => Self::Auto,
@@ -232,6 +244,9 @@ struct CanonicalJobSnapshot {
     auxpow_mode: bool,
     irium_header80: Option<[u8; 80]>,
     irium_coinbase_hex: Option<String>,
+    /// PoAW-X pending receipts (incl. worker_pubkey/worker_sig) carried to the
+    /// cpuminer-compat submit path so it can use /rpc/submit_block_extended.
+    poawx_pending_receipts: Vec<PoawxPendingReceipt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -515,14 +530,16 @@ struct MinerStats {
 // are held only for the brief moment of updating one entry on
 // accept/reject. Sized in the low hundreds of bytes per worker - 100
 // active workers ~= 65 KB, negligible.
-static MINER_STATS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, MinerStats>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static MINER_STATS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, MinerStats>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 // Pool-wide rejection-reason histogram. Mirrors the per-miner
 // reject_reasons but aggregated across all workers for quick health
 // diagnostics. Keys are the REJECT_REASON_* &'static str constants.
-static GLOBAL_REJECT_REASONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<&'static str, u64>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static GLOBAL_REJECT_REASONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<&'static str, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 // v1.9.23 — connection-gate counters. Surfaced on /metrics so operators
 // can see how often the cap / rate-limit / ban-list fire and tune the
@@ -572,10 +589,7 @@ static GATE_ALLOWLIST: Lazy<HashSet<IpAddr>> = Lazy::new(|| {
                     set.insert(ip);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[stratum] gate-allowlist: ignoring '{}': {}",
-                        entry, e
-                    );
+                    eprintln!("[stratum] gate-allowlist: ignoring '{}': {}", entry, e);
                 }
             }
         }
@@ -625,9 +639,7 @@ fn gate_connection(ip: IpAddr, cfg: &StratumConfig) -> GateDecision {
     }
 
     // 2. Global session cap.
-    if cfg.max_sessions > 0
-        && ACTIVE_SESSIONS.load(Ordering::SeqCst) >= cfg.max_sessions
-    {
+    if cfg.max_sessions > 0 && ACTIVE_SESSIONS.load(Ordering::SeqCst) >= cfg.max_sessions {
         GATE_DROPPED_SESSION_CAP.fetch_add(1, Ordering::SeqCst);
         return GateDecision::Drop("session_cap");
     }
@@ -655,8 +667,7 @@ fn gate_connection(ip: IpAddr, cfg: &StratumConfig) -> GateDecision {
             // a deadlock when the same IP is being checked concurrently.
             drop(entry);
             if threshold > 0 && hits >= threshold {
-                let expires_at = Instant::now()
-                    + Duration::from_secs(cfg.ban_duration_secs);
+                let expires_at = Instant::now() + Duration::from_secs(cfg.ban_duration_secs);
                 BAN_LIST.insert(ip, expires_at);
                 GATE_BANS_ISSUED.fetch_add(1, Ordering::SeqCst);
                 eprintln!("[stratum] Banned IP: {} (hits={})", ip, hits);
@@ -686,8 +697,7 @@ fn spawn_gate_janitor(cfg: StratumConfig) {
             tokio::time::sleep(interval).await;
             let now = Instant::now();
             CONN_RECORDS.retain(|_, rec| {
-                now.duration_since(rec.window_start) < window * 2
-                    || rec.rate_limit_hits > 0
+                now.duration_since(rec.window_start) < window * 2 || rec.rate_limit_hits > 0
             });
             BAN_LIST.retain(|_, expires_at| now < *expires_at);
         }
@@ -828,9 +838,7 @@ async fn metrics_loop(
                 let now = unix_now_secs();
                 let pool_integrity = if active_sessions == 0 {
                     "no_miners"
-                } else if last_share_acc_at == 0
-                    || now.saturating_sub(last_share_acc_at) >= 300
-                {
+                } else if last_share_acc_at == 0 || now.saturating_sub(last_share_acc_at) >= 300 {
                     "degraded"
                 } else if submit_accepted_now > 0 {
                     "ok"
@@ -1182,7 +1190,6 @@ fn template_fingerprint(job: &Job) -> String {
     hex::encode(sha256d(&data))
 }
 
-
 /// Build a 80-byte Irium block header for AuxPoW.
 /// version = 1 | AUXPOW_VERSION_BIT (=257), nonce = 0.
 /// prev_hash and merkle_root are stored reversed (Bitcoin wire convention),
@@ -1250,7 +1257,10 @@ fn build_auxpow_parent_coinbase_prefix_suffix(
     tx.extend_from_slice(&spk);
     tx.extend_from_slice(&0u32.to_le_bytes()); // locktime
 
-    let pos = tx.windows(marker.len()).position(|w| w == &marker).unwrap_or(tx.len());
+    let pos = tx
+        .windows(marker.len())
+        .position(|w| w == &marker)
+        .unwrap_or(tx.len());
     (tx[..pos].to_vec(), tx[pos + marker.len()..].to_vec())
 }
 
@@ -1266,14 +1276,7 @@ fn build_auxpow_hex_from_solution(
 ) -> String {
     let parent_coinbase_hash = sha256d(parent_coinbase_bytes);
     // Build parent header with natural-order merkle root (as header_bytes does: no reversal)
-    let parent_header = header_bytes(
-        1,
-        [0u8; 32],
-        parent_coinbase_hash,
-        ntime,
-        bits,
-        nonce,
-    );
+    let parent_header = header_bytes(1, [0u8; 32], parent_coinbase_hash, ntime, bits, nonce);
     let parent_hash_natural = sha256d(&parent_header);
 
     let mut out = Vec::new();
@@ -1293,31 +1296,77 @@ fn build_auxpow_hex_from_solution(
     hex::encode(out)
 }
 
-fn build_canonical_job_snapshot(job: &Job, session: &SessionState, config: &StratumConfig) -> Result<CanonicalJobSnapshot> {
+fn build_canonical_job_snapshot(
+    job: &Job,
+    session: &SessionState,
+    config: &StratumConfig,
+) -> Result<CanonicalJobSnapshot> {
     let pkh = session.pkh.ok_or_else(|| anyhow!("unauthorized"))?;
     let ntime = parse_u32_hex(&job.ntime_hex)?;
 
     // Coinbase always pays the worker directly (session.pkh). No pool fee output.
-    let auxpow_active = config.auxpow_activation_height
+    let auxpow_active = config
+        .auxpow_activation_height
         .map(|h| job.height >= h)
         .unwrap_or(false);
 
-    let (coinbase_prefix, coinbase_suffix, prev_hash_internal, branches, auxpow_mode, irium_header80, irium_coinbase_hex) =
-        if auxpow_active {
-            // AuxPoW: build fixed Irium coinbase, compute Irium block hash, build parent coinbase
-            let irium_coinbase = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &[], session.coinbase_bip34, session_coinbase_extras(job, session));
-            let irium_coinbase_hash = sha256d(&irium_coinbase);
-            let irium_merkle_root = merkle_root_from_coinbase(irium_coinbase_hash, &job.branches);
-            let irium_h80 = build_irium_auxpow_header(job.prev_hash, irium_merkle_root, ntime, job.bits);
-            let aux_hash = sha256d(&irium_h80);
-            let (pp, ps) = build_auxpow_parent_coinbase_prefix_suffix(
-                job.height, job.coinbase_value, &pkh, &aux_hash, session.coinbase_bip34,
-            );
-            (pp, ps, [0u8; 32], vec![], true, Some(irium_h80), Some(hex::encode(&irium_coinbase)))
-        } else {
-            let (cp, cs) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34, session_coinbase_extras(job, session));
-            (cp, cs, job.prev_hash, job.branches.clone(), false, None, None)
-        };
+    let (
+        coinbase_prefix,
+        coinbase_suffix,
+        prev_hash_internal,
+        branches,
+        auxpow_mode,
+        irium_header80,
+        irium_coinbase_hex,
+    ) = if auxpow_active {
+        // AuxPoW: build fixed Irium coinbase, compute Irium block hash, build parent coinbase
+        let irium_coinbase = build_coinbase_tx(
+            job.height,
+            job.coinbase_value,
+            &pkh,
+            &[],
+            session.coinbase_bip34,
+            session_coinbase_extras(job, session),
+        );
+        let irium_coinbase_hash = sha256d(&irium_coinbase);
+        let irium_merkle_root = merkle_root_from_coinbase(irium_coinbase_hash, &job.branches);
+        let irium_h80 =
+            build_irium_auxpow_header(job.prev_hash, irium_merkle_root, ntime, job.bits);
+        let aux_hash = sha256d(&irium_h80);
+        let (pp, ps) = build_auxpow_parent_coinbase_prefix_suffix(
+            job.height,
+            job.coinbase_value,
+            &pkh,
+            &aux_hash,
+            session.coinbase_bip34,
+        );
+        (
+            pp,
+            ps,
+            [0u8; 32],
+            vec![],
+            true,
+            Some(irium_h80),
+            Some(hex::encode(&irium_coinbase)),
+        )
+    } else {
+        let (cp, cs) = coinbase_prefix_suffix(
+            job.height,
+            job.coinbase_value,
+            &pkh,
+            session.coinbase_bip34,
+            session_coinbase_extras(job, session),
+        );
+        (
+            cp,
+            cs,
+            job.prev_hash,
+            job.branches.clone(),
+            false,
+            None,
+            None,
+        )
+    };
 
     let mut tx_hashes_internal = Vec::with_capacity(job.tx_hex.len());
     for tx in &job.tx_hex {
@@ -1348,6 +1397,7 @@ fn build_canonical_job_snapshot(job: &Job, session: &SessionState, config: &Stra
         auxpow_mode,
         irium_header80,
         irium_coinbase_hex,
+        poawx_pending_receipts: job.poawx_pending_receipts.clone(),
     })
 }
 
@@ -1384,11 +1434,7 @@ fn encode_bip34_height_local(height: u64) -> Vec<u8> {
     out
 }
 
-fn build_native_coinbase_script_sig(
-    height: u64,
-    extranonce: &[u8],
-    bip34_height: bool,
-) -> Vec<u8> {
+fn build_native_coinbase_script_sig(height: u64, extranonce: &[u8], bip34_height: bool) -> Vec<u8> {
     let mut script_sig = if bip34_height {
         let mut s = encode_bip34_height_local(height);
         s.extend_from_slice(b"Irium");
@@ -1565,7 +1611,10 @@ async fn template_loop(
                         st.last_prevhash = prevhash.clone();
                         st.last_update_unix = now_ts;
                     }
-                    info!("[tmpl] height={} prev={} ts={}", job.height, prevhash, now_ts);
+                    info!(
+                        "[tmpl] height={} prev={} ts={}",
+                        job.height, prevhash, now_ts
+                    );
 
                     let key = format!("{}:{}", job.height, prevhash);
                     if key != last_key {
@@ -1635,10 +1684,7 @@ fn is_whatsminer_firmware(user_agent: &str) -> bool {
 /// The pool-wide STRATUM_CARRIERS=off env override applies at to_job
 /// time and produces an already-empty job.coinbase_extras, so the
 /// emergency kill-switch still wins regardless of user-agent.
-fn session_coinbase_extras<'a>(
-    job: &'a Job,
-    session: &SessionState,
-) -> &'a [(u64, Vec<u8>)] {
+fn session_coinbase_extras<'a>(job: &'a Job, session: &SessionState) -> &'a [(u64, Vec<u8>)] {
     if session
         .user_agent
         .as_deref()
@@ -1669,7 +1715,11 @@ fn to_job(seq: u64, tpl: &GetBlockTemplate) -> Result<Job> {
         } else {
             tpl.coinbase_extra_outputs
                 .iter()
-                .filter_map(|e| hex::decode(e.script_pubkey_hex.trim()).ok().map(|b| (e.value, b)))
+                .filter_map(|e| {
+                    hex::decode(e.script_pubkey_hex.trim())
+                        .ok()
+                        .map(|b| (e.value, b))
+                })
                 .collect()
         };
     // Phase 10-D: inject irx1 OP_RETURN coinbase output when PoAW-X is active.
@@ -1684,7 +1734,10 @@ fn to_job(seq: u64, tpl: &GetBlockTemplate) -> Result<Job> {
         coinbase_extras.push((0u64, irx1_script));
         tracing::info!(
             "[poawx] to_job: job={:016x} mode=active pending={} irx1_len={} receipts_root={}",
-            seq, poawx_pending_receipts.len(), 38, hex::encode(root)
+            seq,
+            poawx_pending_receipts.len(),
+            38,
+            hex::encode(root)
         );
     } else if poawx_enabled {
         tracing::warn!(
@@ -1876,7 +1929,8 @@ async fn handle_message(
             let resp = json!({"id": id, "result": true, "error": null});
             write_json(wr, &resp).await?;
             if session.pkh.is_some() {
-                send_set_difficulty(wr, conn_id, session.worker.as_deref(), session.difficulty).await?;
+                send_set_difficulty(wr, conn_id, session.worker.as_deref(), session.difficulty)
+                    .await?;
             }
         }
         "mining.multi_version" => {
@@ -1903,10 +1957,7 @@ async fn handle_message(
             // for small-buffer firmware (NerdQAxe / Bitaxe / ESP-Miner /
             // BM1370). Non-string / missing params[0] stays None -> treated
             // as large-buffer (carriers on).
-            session.user_agent = params
-                .first()
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            session.user_agent = params.first().and_then(|v| v.as_str()).map(String::from);
             if let Some(ua) = session.user_agent.as_deref() {
                 if is_small_buffer_firmware(ua) {
                     info!(
@@ -1961,7 +2012,10 @@ async fn handle_message(
                     "params": ["1fffe000"]
                 });
                 write_json(wr, &mask_notify).await?;
-                info!("[subscribe] conn={} pushed set_version_mask mask=1fffe000", conn_id);
+                info!(
+                    "[subscribe] conn={} pushed set_version_mask mask=1fffe000",
+                    conn_id
+                );
             }
         }
         "mining.authorize" => {
@@ -1998,9 +2052,16 @@ async fn handle_message(
 
                     let cur = current.read().await;
                     if let Some(job) = cur.clone() {
-                        session.current_snapshot = Some(build_canonical_job_snapshot(&job, session, config)?);
+                        session.current_snapshot =
+                            Some(build_canonical_job_snapshot(&job, session, config)?);
                         session.current_job = Some(job.clone());
-                        send_set_difficulty(wr, conn_id, session.worker.as_deref(), session.difficulty).await?;
+                        send_set_difficulty(
+                            wr,
+                            conn_id,
+                            session.worker.as_deref(),
+                            session.difficulty,
+                        )
+                        .await?;
                         send_notify(wr, session, &job, true).await?;
                     }
                 }
@@ -2065,9 +2126,11 @@ async fn handle_message(
             if session.pkh.is_some() {
                 let cur = current.read().await;
                 if let Some(job) = cur.clone() {
-                    session.current_snapshot = Some(build_canonical_job_snapshot(&job, session, config)?);
+                    session.current_snapshot =
+                        Some(build_canonical_job_snapshot(&job, session, config)?);
                     session.current_job = Some(job.clone());
-                    send_set_difficulty(wr, conn_id, session.worker.as_deref(), session.difficulty).await?;
+                    send_set_difficulty(wr, conn_id, session.worker.as_deref(), session.difficulty)
+                        .await?;
                     send_notify(wr, session, &job, true).await?;
                 }
             }
@@ -2136,7 +2199,11 @@ fn mode_allows_combo(
             // prev_rev32 (some don't apply the second swap4 step). Allow both
             // regardless of fork side.
             (prev_name == "prev_swap4" || prev_name == "prev_rev32")
-                && mr_ok && v_ok && t_ok && b_ok && n_ok
+                && mr_ok
+                && v_ok
+                && t_ok
+                && b_ok
+                && n_ok
         }
         MinerFamilyMode::Auto => {
             // Liberal mode — accept any of the four prev byte-order variants
@@ -2145,7 +2212,11 @@ fn mode_allows_combo(
                 || prev_name == "prev_rev32"
                 || prev_name == "prev_swap4"
                 || prev_name == "prev_rev32_swap4")
-                && mr_ok && v_ok && t_ok && b_ok && n_ok
+                && mr_ok
+                && v_ok
+                && t_ok
+                && b_ok
+                && n_ok
         }
         MinerFamilyMode::Cpuminer => true,
     }
@@ -2158,7 +2229,10 @@ async fn handle_submit(
     config: &StratumConfig,
     params: &[Value],
 ) -> Result<bool> {
-    let job = session.current_job.clone().ok_or_else(|| anyhow!("no active job"))?;
+    let job = session
+        .current_job
+        .clone()
+        .ok_or_else(|| anyhow!("no active job"))?;
     if params.len() < 5 {
         return Err(anyhow!("invalid params"));
     }
@@ -2176,7 +2250,12 @@ async fn handle_submit(
     }
 
     // AuxPoW mode: always use the native rewardable path (builds parent block header correctly)
-    if session.current_snapshot.as_ref().map(|s| s.auxpow_mode).unwrap_or(false) {
+    if session
+        .current_snapshot
+        .as_ref()
+        .map(|s| s.auxpow_mode)
+        .unwrap_or(false)
+    {
         return handle_submit_native_rewardable(conn_id, wr, session, config, &submit).await;
     }
 
@@ -2202,12 +2281,16 @@ fn decode_native_rewardable_submit(
         hex::decode(&submit.extranonce2_hex).map_err(|e| anyhow!("extranonce2 decode: {e}"))?;
     let coinbase = reconstruct_canonical_coinbase(snapshot, &extranonce2)?;
     let coinbase_hash_internal = sha256d(&coinbase);
-    let canonical_merkle_root =
-        reconstruct_canonical_merkle_root(snapshot, coinbase_hash_internal);
+    let canonical_merkle_root = reconstruct_canonical_merkle_root(snapshot, coinbase_hash_internal);
     let ntime = parse_u32_hex(&submit.ntime_hex)?;
     let nonce = parse_u32_hex(&submit.nonce_hex)?;
-    let canonical_header80 =
-        reconstruct_canonical_header80(snapshot, canonical_merkle_root, ntime, nonce, snapshot.version);
+    let canonical_header80 = reconstruct_canonical_header80(
+        snapshot,
+        canonical_merkle_root,
+        ntime,
+        nonce,
+        snapshot.version,
+    );
     let mut canonical_hash = sha256d(&canonical_header80);
     canonical_hash.reverse();
     let share_target = snapshot.block_target.clone();
@@ -2241,14 +2324,20 @@ fn decode_cpuminer_compat_submit(
     config: &StratumConfig,
     submit: &SubmitTuple,
 ) -> Result<CanonicalSolve> {
-    let extra2 = hex::decode(&submit.extranonce2_hex).map_err(|e| anyhow!("extranonce2 decode: {e}"))?;
+    let extra2 =
+        hex::decode(&submit.extranonce2_hex).map_err(|e| anyhow!("extranonce2 decode: {e}"))?;
     let cb = reconstruct_coinbase(snapshot, &extra2);
     let cb_hash = sha256d(&cb);
     let canonical_merkle_root = merkle_root_from_coinbase(cb_hash, &snapshot.branches);
     let ntime = parse_u32_hex(&submit.ntime_hex)?;
     let nonce = parse_u32_hex(&submit.nonce_hex)?;
 
-    fn fold_merkle(root0: [u8; 32], branches: &[[u8; 32]], rev_branch: bool, rev_each_round: bool) -> [u8; 32] {
+    fn fold_merkle(
+        root0: [u8; 32],
+        branches: &[[u8; 32]],
+        rev_branch: bool,
+        rev_each_round: bool,
+    ) -> [u8; 32] {
         let mut root = root0;
         for b in branches {
             let mut branch = *b;
@@ -2293,9 +2382,18 @@ fn decode_cpuminer_compat_submit(
         let mut rev32 = base;
         rev32.reverse();
         merkle_variants.push((base_name, base));
-        merkle_variants.push((Box::leak(format!("{}:rev32", base_name).into_boxed_str()), rev32));
-        merkle_variants.push((Box::leak(format!("{}:swap4", base_name).into_boxed_str()), swap4_bytes_each_word(base)));
-        merkle_variants.push((Box::leak(format!("{}:rev32_swap4", base_name).into_boxed_str()), swap4_bytes_each_word(rev32)));
+        merkle_variants.push((
+            Box::leak(format!("{}:rev32", base_name).into_boxed_str()),
+            rev32,
+        ));
+        merkle_variants.push((
+            Box::leak(format!("{}:swap4", base_name).into_boxed_str()),
+            swap4_bytes_each_word(base),
+        ));
+        merkle_variants.push((
+            Box::leak(format!("{}:rev32_swap4", base_name).into_boxed_str()),
+            swap4_bytes_each_word(rev32),
+        ));
     }
 
     let share_target = target_from_difficulty_with_limit(session.difficulty, &config.pow_limit);
@@ -2367,7 +2465,9 @@ fn decode_cpuminer_compat_submit(
                             let ok_block_le = hash_int_le <= block_target;
                             let ok_share = if use_le { ok_share_le } else { ok_share_be };
                             checks.push(CheckResult {
-                                name: Box::leak(format!("{}+{}:{}", prev_name, mr_name, mode).into_boxed_str()),
+                                name: Box::leak(
+                                    format!("{}+{}:{}", prev_name, mr_name, mode).into_boxed_str(),
+                                ),
                                 header: hdr_v,
                                 hash: hash_v,
                                 ok_share_be,
@@ -2391,7 +2491,11 @@ fn decode_cpuminer_compat_submit(
             chosen.name,
             chosen.hash,
             true,
-            if use_le { chosen.ok_block_le } else { chosen.ok_block_be },
+            if use_le {
+                chosen.ok_block_le
+            } else {
+                chosen.ok_block_be
+            },
         )
     } else {
         ("none", [0u8; 32], false, false)
@@ -2422,7 +2526,11 @@ fn decode_cpuminer_compat_submit(
     // meet block_target. Mirror is required for block_ok to fire correctly.
     let mut canonical_hash = sha256d(&canonical_header80);
     canonical_hash.reverse();
-    let share_hash = if accepted_idx.is_some() { share_hash } else { canonical_hash };
+    let share_hash = if accepted_idx.is_some() {
+        share_hash
+    } else {
+        canonical_hash
+    };
 
     Ok(CanonicalSolve {
         adapter_id: "cpuminer_compat",
@@ -2521,7 +2629,10 @@ async fn handle_submit_cpuminer_compat(
     config: &StratumConfig,
     submit: &SubmitTuple,
 ) -> Result<bool> {
-    let worker = session.worker.clone().unwrap_or_else(|| format!("conn-{conn_id}"));
+    let worker = session
+        .worker
+        .clone()
+        .unwrap_or_else(|| format!("conn-{conn_id}"));
     let snapshot = session
         .current_snapshot
         .clone()
@@ -2609,7 +2720,10 @@ async fn handle_submit_cpuminer_compat(
         match submit_canonical_block(&client, config, &snapshot, &solve).await? {
             NodeSubmitResult::Accepted { .. } => {
                 mark_submit_accepted();
-                info!("[block] submitted worker={} height={}", worker, snapshot.height);
+                info!(
+                    "[block] submitted worker={} height={}",
+                    worker, snapshot.height
+                );
                 let row = FoundBlockRecord {
                     height: snapshot.height,
                     hash: hex::encode(solve.canonical_hash),
@@ -2618,7 +2732,10 @@ async fn handle_submit_cpuminer_compat(
                     address: worker_address(&worker),
                 };
                 if let Err(e) = append_found_block(&config.found_blocks_file, &row) {
-                    warn!("[block] record append failed worker={} height={} err={}", worker, snapshot.height, e);
+                    warn!(
+                        "[block] record append failed worker={} height={} err={}",
+                        worker, snapshot.height, e
+                    );
                 }
             }
             NodeSubmitResult::Rejected { reason } => {
@@ -2662,6 +2779,38 @@ fn build_canonical_block_hex(
     Ok(hex::encode(block))
 }
 
+/// PoAW-X stratum fix: choose extended vs legacy block submission for the
+/// cpuminer-compat path. Extended only when PoAW-X is enabled AND the snapshot
+/// carries pending receipts; otherwise legacy is preserved exactly (mainnet
+/// pool runs with poawx_enabled=false -> always legacy).
+enum SubmitVariant {
+    Legacy(SubmitRequest),
+    Extended(SubmitBlockExtendedRequest),
+}
+
+fn build_submit_variant(
+    config: &StratumConfig,
+    snapshot: &CanonicalJobSnapshot,
+    req: SubmitRequest,
+) -> SubmitVariant {
+    if config.poawx_enabled && !snapshot.poawx_pending_receipts.is_empty() {
+        let receipts_root = hex::encode(compute_receipts_root_from_pending(
+            &snapshot.poawx_pending_receipts,
+        ));
+        SubmitVariant::Extended(SubmitBlockExtendedRequest {
+            height: req.height,
+            header: req.header,
+            tx_hex: req.tx_hex,
+            submit_source: req.submit_source,
+            auxpow_hex: req.auxpow_hex,
+            poawx_receipts: snapshot.poawx_pending_receipts.clone(),
+            poawx_receipts_root: receipts_root,
+        })
+    } else {
+        SubmitVariant::Legacy(req)
+    }
+}
+
 async fn submit_canonical_block(
     client: &reqwest::Client,
     config: &StratumConfig,
@@ -2673,7 +2822,9 @@ async fn submit_canonical_block(
     // via to_le_bytes() and recomputes the hash; this guarantees byte-identity
     // with what the chip hashed.
     let effective_version = u32::from_le_bytes(
-        solve.canonical_header80[0..4].try_into().expect("80-byte header"),
+        solve.canonical_header80[0..4]
+            .try_into()
+            .expect("80-byte header"),
     );
     let req = SubmitRequest {
         height: snapshot.height,
@@ -2696,13 +2847,35 @@ async fn submit_canonical_block(
         auxpow_hex: None,
     };
 
-    let url = format!("{}/rpc/submit_block", config.rpc_base.trim_end_matches('/'));
-    let resp = client
-        .post(url)
-        .bearer_auth(&config.rpc_token)
-        .json(&req)
-        .send()
-        .await?;
+    let resp = match build_submit_variant(config, snapshot, req) {
+        SubmitVariant::Extended(ext) => {
+            info!(
+                "[block] submit_block_extended (cpuminer_compat) height={} receipts={} root={}",
+                snapshot.height,
+                ext.poawx_receipts.len(),
+                ext.poawx_receipts_root
+            );
+            let url = format!(
+                "{}/rpc/submit_block_extended",
+                config.rpc_base.trim_end_matches('/')
+            );
+            client
+                .post(url)
+                .bearer_auth(&config.rpc_token)
+                .json(&ext)
+                .send()
+                .await?
+        }
+        SubmitVariant::Legacy(leg) => {
+            let url = format!("{}/rpc/submit_block", config.rpc_base.trim_end_matches('/'));
+            client
+                .post(url)
+                .bearer_auth(&config.rpc_token)
+                .json(&leg)
+                .send()
+                .await?
+        }
+    };
     if resp.status().is_success() {
         Ok(NodeSubmitResult::Accepted {
             canonical_block_hash: solve.canonical_hash,
@@ -2753,8 +2926,7 @@ async fn handle_submit_native_rewardable(
         record_miner_share_rejected(&worker, REJECT_REASON_LOW_POW);
         warn!(
             "[share] reject worker={} adapter_id={} reason=low_difficulty",
-            worker,
-            solve.adapter_id
+            worker, solve.adapter_id
         );
         return Err(anyhow!("low_difficulty"));
     }
@@ -2848,7 +3020,6 @@ async fn handle_submit_native_rewardable(
     Ok(true)
 }
 
-
 async fn handle_submit_auxpow(
     conn_id: u64,
     wr: &mut tokio::net::tcp::OwnedWriteHalf,
@@ -2857,10 +3028,13 @@ async fn handle_submit_auxpow(
     submit: &SubmitTuple,
     snapshot: CanonicalJobSnapshot,
 ) -> Result<bool> {
-    let worker = session.worker.clone().unwrap_or_else(|| format!("conn-{conn_id}"));
+    let worker = session
+        .worker
+        .clone()
+        .unwrap_or_else(|| format!("conn-{conn_id}"));
 
-    let extranonce2 = hex::decode(&submit.extranonce2_hex)
-        .map_err(|e| anyhow!("extranonce2 decode: {e}"))?;
+    let extranonce2 =
+        hex::decode(&submit.extranonce2_hex).map_err(|e| anyhow!("extranonce2 decode: {e}"))?;
     let parent_coinbase = reconstruct_canonical_coinbase(&snapshot, &extranonce2)?;
     let parent_coinbase_hash = sha256d(&parent_coinbase);
 
@@ -2869,7 +3043,14 @@ async fn handle_submit_auxpow(
 
     // Build parent header with NATURAL ORDER merkle root so iriumd validate() passes:
     //   parent_header[36..68] == sha256d(coinbase_txn)
-    let parent_header = header_bytes(1, snapshot.prev_hash_internal, parent_coinbase_hash, ntime, snapshot.bits, nonce);
+    let parent_header = header_bytes(
+        1,
+        snapshot.prev_hash_internal,
+        parent_coinbase_hash,
+        ntime,
+        snapshot.bits,
+        nonce,
+    );
     let mut parent_hash_display = sha256d(&parent_header);
     parent_hash_display.reverse();
 
@@ -2882,12 +3063,17 @@ async fn handle_submit_auxpow(
             mark_accepted_share();
             record_miner_share_accepted(&worker, session.difficulty);
             warn!("[AUXPOW_SHARE_SOFT_ACCEPTED] worker={}", worker);
-            maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker).await?;
+            maybe_update_vardiff_after_accepted_share(conn_id, wr, session, config, &worker)
+                .await?;
             return Ok(true);
         }
         mark_rejected_share();
         record_miner_share_rejected(&worker, REJECT_REASON_LOW_POW);
-        warn!("[AUXPOW_SHARE_REJECTED] worker={} reason=low_difficulty hash={}", worker, hex::encode(parent_hash_display));
+        warn!(
+            "[AUXPOW_SHARE_REJECTED] worker={} reason=low_difficulty hash={}",
+            worker,
+            hex::encode(parent_hash_display)
+        );
         return Err(anyhow!("low_difficulty"));
     }
 
@@ -2896,17 +3082,30 @@ async fn handle_submit_auxpow(
     mark_rewardable_share_accepted();
     info!(
         "[AUXPOW_SHARE_ACCEPTED] worker={} hash={} block_target={}",
-        worker, hex::encode(parent_hash_display), biguint_to_32hex(&snapshot.block_target)
+        worker,
+        hex::encode(parent_hash_display),
+        biguint_to_32hex(&snapshot.block_target)
     );
 
     if ok_block {
         mark_candidate_detected();
-        info!("[AUXPOW_CANDIDATE] worker={} height={} hash={}", worker, snapshot.height, hex::encode(parent_hash_display));
+        info!(
+            "[AUXPOW_CANDIDATE] worker={} height={} hash={}",
+            worker,
+            snapshot.height,
+            hex::encode(parent_hash_display)
+        );
 
-        let auxpow_hex = build_auxpow_hex_from_solution(&parent_coinbase, ntime, snapshot.bits, nonce);
+        let auxpow_hex =
+            build_auxpow_hex_from_solution(&parent_coinbase, ntime, snapshot.bits, nonce);
 
-        let irium_h80 = snapshot.irium_header80.ok_or_else(|| anyhow!("missing irium_header80"))?;
-        let irium_coinbase_hex = snapshot.irium_coinbase_hex.as_ref().ok_or_else(|| anyhow!("missing irium_coinbase_hex"))?;
+        let irium_h80 = snapshot
+            .irium_header80
+            .ok_or_else(|| anyhow!("missing irium_header80"))?;
+        let irium_coinbase_hex = snapshot
+            .irium_coinbase_hex
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing irium_coinbase_hex"))?;
 
         // Extract Irium block fields from the pre-built header
         let irium_version = u32::from_le_bytes(irium_h80[0..4].try_into().unwrap());
@@ -2947,13 +3146,21 @@ async fn handle_submit_auxpow(
 
         let url = format!("{}/rpc/submit_block", config.rpc_base.trim_end_matches('/'));
         let client = reqwest::Client::builder().build()?;
-        match client.post(&url).bearer_auth(&config.rpc_token).json(&req).send().await {
+        match client
+            .post(&url)
+            .bearer_auth(&config.rpc_token)
+            .json(&req)
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 mark_submit_accepted();
                 mark_chain_height_advanced_by_pool();
                 info!(
                     "[AUXPOW_BLOCK_ACCEPTED] worker={} height={} irium_hash={}",
-                    worker, snapshot.height, hex::encode(irium_hash)
+                    worker,
+                    snapshot.height,
+                    hex::encode(irium_hash)
                 );
                 let row = FoundBlockRecord {
                     height: snapshot.height,
@@ -2968,7 +3175,11 @@ async fn handle_submit_auxpow(
             }
             Ok(resp) => {
                 mark_submit_rejected();
-                warn!("[AUXPOW_BLOCK_REJECTED] worker={} status={}", worker, resp.status());
+                warn!(
+                    "[AUXPOW_BLOCK_REJECTED] worker={} status={}",
+                    worker,
+                    resp.status()
+                );
             }
             Err(e) => {
                 mark_submit_rejected();
@@ -2988,9 +3199,15 @@ async fn handle_submit_legacy_rewardable(
     config: &StratumConfig,
     submit: &SubmitTuple,
 ) -> Result<bool> {
-    let worker = session.worker.clone().unwrap_or_else(|| format!("conn-{conn_id}"));
+    let worker = session
+        .worker
+        .clone()
+        .unwrap_or_else(|| format!("conn-{conn_id}"));
     let pkh = session.pkh.ok_or_else(|| anyhow!("unauthorized"))?;
-    let job = session.current_job.clone().ok_or_else(|| anyhow!("no active job"))?;
+    let job = session
+        .current_job
+        .clone()
+        .ok_or_else(|| anyhow!("no active job"))?;
 
     // Stale-share rejection by job_id mismatch.
     //
@@ -3061,14 +3278,27 @@ async fn handle_submit_legacy_rewardable(
         ));
     }
 
-    let extra2 = hex::decode(&submit.extranonce2_hex).map_err(|e| anyhow!("extranonce2 decode: {e}"))?;
+    let extra2 =
+        hex::decode(&submit.extranonce2_hex).map_err(|e| anyhow!("extranonce2 decode: {e}"))?;
     let mut en = session.extranonce1.clone();
     en.extend_from_slice(&extra2);
 
-    let cb = build_coinbase_tx(job.height, job.coinbase_value, &pkh, &en, config.coinbase_bip34, session_coinbase_extras(&job, session));
+    let cb = build_coinbase_tx(
+        job.height,
+        job.coinbase_value,
+        &pkh,
+        &en,
+        config.coinbase_bip34,
+        session_coinbase_extras(&job, session),
+    );
     let cb_hash = sha256d(&cb);
 
-    fn fold_merkle(root0: [u8; 32], branches: &[[u8; 32]], rev_branch: bool, rev_each_round: bool) -> [u8; 32] {
+    fn fold_merkle(
+        root0: [u8; 32],
+        branches: &[[u8; 32]],
+        rev_branch: bool,
+        rev_each_round: bool,
+    ) -> [u8; 32] {
         let mut root = root0;
         for b in branches {
             let mut branch = *b;
@@ -3118,9 +3348,18 @@ async fn handle_submit_legacy_rewardable(
         let mut rev32 = base;
         rev32.reverse();
         merkle_variants.push((base_name, base));
-        merkle_variants.push((Box::leak(format!("{}:rev32", base_name).into_boxed_str()), rev32));
-        merkle_variants.push((Box::leak(format!("{}:swap4", base_name).into_boxed_str()), swap4_bytes_each_word(base)));
-        merkle_variants.push((Box::leak(format!("{}:rev32_swap4", base_name).into_boxed_str()), swap4_bytes_each_word(rev32)));
+        merkle_variants.push((
+            Box::leak(format!("{}:rev32", base_name).into_boxed_str()),
+            rev32,
+        ));
+        merkle_variants.push((
+            Box::leak(format!("{}:swap4", base_name).into_boxed_str()),
+            swap4_bytes_each_word(base),
+        ));
+        merkle_variants.push((
+            Box::leak(format!("{}:rev32_swap4", base_name).into_boxed_str()),
+            swap4_bytes_each_word(rev32),
+        ));
     }
 
     let share_target = target_from_difficulty_with_limit(session.difficulty, &config.pow_limit);
@@ -3170,7 +3409,16 @@ async fn handle_submit_legacy_rewardable(
                 for (t_name, t_bytes) in time_opts {
                     for (b_name, b_bytes) in bits_opts {
                         for (n_name, n_bytes) in nonce_opts {
-                            if !mode_allows_combo(&config.miner_family_mode, job.height, prev_name, mr_name, v_name, t_name, b_name, n_name) {
+                            if !mode_allows_combo(
+                                &config.miner_family_mode,
+                                job.height,
+                                prev_name,
+                                mr_name,
+                                v_name,
+                                t_name,
+                                b_name,
+                                n_name,
+                            ) {
                                 continue;
                             }
                             let hdr_v = header_bytes_from_wire(
@@ -3194,7 +3442,9 @@ async fn handle_submit_legacy_rewardable(
                             let ok_share = if use_le { ok_share_le } else { ok_share_be };
 
                             checks.push(CheckResult {
-                                name: Box::leak(format!("{}+{}:{}", prev_name, mr_name, mode).into_boxed_str()),
+                                name: Box::leak(
+                                    format!("{}+{}:{}", prev_name, mr_name, mode).into_boxed_str(),
+                                ),
                                 header: hdr_v,
                                 hash: hash_v,
                                 ok_share_be,
@@ -3320,11 +3570,7 @@ async fn handle_submit_legacy_rewardable(
         .map(|c| {
             format!(
                 "{}:sb={} sl={} bb={} bl={}",
-                c.name,
-                c.ok_share_be,
-                c.ok_share_le,
-                c.ok_block_be,
-                c.ok_block_le
+                c.name, c.ok_share_be, c.ok_share_le, c.ok_block_be, c.ok_block_le
             )
         })
         .collect::<Vec<_>>()
@@ -3337,7 +3583,11 @@ async fn handle_submit_legacy_rewardable(
     let check_line = if let Some(idx) = accepted_idx {
         let chosen = &checks[idx];
         hash = chosen.hash;
-        ok_block = if use_le { chosen.ok_block_le } else { chosen.ok_block_be };
+        ok_block = if use_le {
+            chosen.ok_block_le
+        } else {
+            chosen.ok_block_be
+        };
         selected_variant = chosen.name;
         format!(
             "[sharecheck] worker={} job={} assigned_diff={} share_target={} block_target={} chosen_variant={} variants_checked={} sample={}",
@@ -3372,20 +3622,26 @@ async fn handle_submit_legacy_rewardable(
         record_miner_share_accepted(&worker, session.difficulty);
         session.consecutive_variant_none = 0;
         info!("{}", check_line);
-        info!("[share] accepted worker={} hash={}", worker, hex::encode(hash));
+        info!(
+            "[share] accepted worker={} hash={}",
+            worker,
+            hex::encode(hash)
+        );
     } else if config.soft_accept_invalid_shares {
         mark_accepted_share();
         record_miner_share_accepted(&worker, session.difficulty);
         warn!("{}", check_line);
-        warn!("[share] soft-accepted worker={} reason=compat_soft_accept", worker);
+        warn!(
+            "[share] soft-accepted worker={} reason=compat_soft_accept",
+            worker
+        );
         return Ok(true);
     } else {
         mark_rejected_share();
         record_miner_share_rejected(&worker, REJECT_REASON_LOW_POW);
         warn!("{}", check_line);
         warn!("[share] reject worker={} reason=low_difficulty", worker);
-        session.consecutive_variant_none =
-            session.consecutive_variant_none.saturating_add(1);
+        session.consecutive_variant_none = session.consecutive_variant_none.saturating_add(1);
         if session.consecutive_variant_none >= VARIANT_NONE_DISCONNECT_THRESHOLD {
             warn!(
                 "[disconnect] worker={} reason=consecutive_variant_none count={}",
@@ -3470,9 +3726,9 @@ async fn handle_submit_legacy_rewardable(
         mark_block_submit_attempt();
         // Phase 10-D: use submit_block_extended when PoAW-X receipts present.
         let resp = if config.poawx_enabled && !job.poawx_pending_receipts.is_empty() {
-            let receipts_root = hex::encode(
-                compute_receipts_root_from_pending(&job.poawx_pending_receipts)
-            );
+            let receipts_root = hex::encode(compute_receipts_root_from_pending(
+                &job.poawx_pending_receipts,
+            ));
             let ext_req = SubmitBlockExtendedRequest {
                 height: req.height,
                 header: req.header,
@@ -3482,17 +3738,33 @@ async fn handle_submit_legacy_rewardable(
                 poawx_receipts: job.poawx_pending_receipts.clone(),
                 poawx_receipts_root: receipts_root.clone(),
             };
-            let url = format!("{}/rpc/submit_block_extended", config.rpc_base.trim_end_matches('/'));
+            let url = format!(
+                "{}/rpc/submit_block_extended",
+                config.rpc_base.trim_end_matches('/')
+            );
             info!(
                 "[block] submit_block_extended worker={} height={} receipts={} root={}",
-                worker, job.height, job.poawx_pending_receipts.len(), receipts_root
+                worker,
+                job.height,
+                job.poawx_pending_receipts.len(),
+                receipts_root
             );
             let client = reqwest::Client::builder().build()?;
-            client.post(url).bearer_auth(&config.rpc_token).json(&ext_req).send().await?
+            client
+                .post(url)
+                .bearer_auth(&config.rpc_token)
+                .json(&ext_req)
+                .send()
+                .await?
         } else {
             let url = format!("{}/rpc/submit_block", config.rpc_base.trim_end_matches('/'));
             let client = reqwest::Client::builder().build()?;
-            client.post(url).bearer_auth(&config.rpc_token).json(&req).send().await?
+            client
+                .post(url)
+                .bearer_auth(&config.rpc_token)
+                .json(&req)
+                .send()
+                .await?
         };
         if resp.status().is_success() {
             mark_submit_accepted();
@@ -3510,11 +3782,18 @@ async fn handle_submit_legacy_rewardable(
                 address: worker_address(&worker),
             };
             if let Err(e) = append_found_block(&config.found_blocks_file, &row) {
-                warn!("[block] record append failed worker={} height={} err={}", worker, job.height, e);
+                warn!(
+                    "[block] record append failed worker={} height={} err={}",
+                    worker, job.height, e
+                );
             }
         } else {
             mark_submit_rejected();
-            warn!("[block] submit failed status={} worker={}", resp.status(), worker);
+            warn!(
+                "[block] submit failed status={} worker={}",
+                resp.status(),
+                worker
+            );
         }
     }
 
@@ -3681,8 +3960,19 @@ async fn send_notify(
             )
         }
     } else {
-        let (cb1, cb2) = coinbase_prefix_suffix(job.height, job.coinbase_value, &pkh, session.coinbase_bip34, session_coinbase_extras(job, session));
-        (prev_hex_for_height(&job.prev_hash, job.height), hex::encode(&cb1), hex::encode(&cb2), job.branches.iter().map(hex::encode).collect())
+        let (cb1, cb2) = coinbase_prefix_suffix(
+            job.height,
+            job.coinbase_value,
+            &pkh,
+            session.coinbase_bip34,
+            session_coinbase_extras(job, session),
+        );
+        (
+            prev_hex_for_height(&job.prev_hash, job.height),
+            hex::encode(&cb1),
+            hex::encode(&cb2),
+            job.branches.iter().map(hex::encode).collect(),
+        )
     };
 
     info!(
@@ -3908,7 +4198,14 @@ mod tests {
         }
     }
 
-    fn native_fixture() -> (StratumConfig, SessionState, CanonicalJobSnapshot, NativeIssuedJob, NativeSubmit, CanonicalSolve) {
+    fn native_fixture() -> (
+        StratumConfig,
+        SessionState,
+        CanonicalJobSnapshot,
+        NativeIssuedJob,
+        NativeSubmit,
+        CanonicalSolve,
+    ) {
         let mut config = test_config(MinerFamilyMode::Asic);
         config.adapter_mode = AdapterMode::NativeRewardableOnly;
         config.native_rewardable_enabled = true;
@@ -3973,6 +4270,141 @@ mod tests {
 
     static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    fn sample_poawx_receipt() -> PoawxPendingReceipt {
+        PoawxPendingReceipt {
+            height: 1,
+            lane: "A".to_string(),
+            worker_pkh: "ab".repeat(20),
+            solution: "0123456789abcdef".to_string(),
+            commitment_nonce: "cd".repeat(32),
+            worker_pubkey: format!("02{}", "ef".repeat(32)),
+            worker_sig: "11".repeat(64),
+        }
+    }
+
+    fn sample_submit_request() -> SubmitRequest {
+        SubmitRequest {
+            height: 1,
+            header: SubmitHeader {
+                version: 1,
+                prev_hash: "00".repeat(32),
+                merkle_root: "00".repeat(32),
+                time: 0,
+                bits: "207fffff".to_string(),
+                nonce: 0,
+                hash: "00".repeat(32),
+            },
+            tx_hex: vec![],
+            submit_source: "test".to_string(),
+            auxpow_hex: None,
+        }
+    }
+
+    fn snapshot_with_receipts(receipts: Vec<PoawxPendingReceipt>) -> CanonicalJobSnapshot {
+        CanonicalJobSnapshot {
+            job_id: "j".to_string(),
+            template_fingerprint: "fp".to_string(),
+            height: 1,
+            version: 1,
+            prev_hash_internal: [0u8; 32],
+            bits: 0x207fffff,
+            block_target: BigUint::from(1u8),
+            coinbase_value: 0,
+            base_ntime: 0,
+            extranonce1: vec![0, 0, 0, 1],
+            extranonce2_size: 4,
+            coinbase_prefix: vec![],
+            coinbase_suffix: vec![],
+            payout_script: vec![],
+            tx_hex: vec![],
+            tx_hashes_internal: vec![],
+            branches: vec![],
+            tip_hash_at_job_create: [0u8; 32],
+            created_at_unix: 0,
+            auxpow_mode: false,
+            irium_header80: None,
+            irium_coinbase_hex: None,
+            poawx_pending_receipts: receipts,
+        }
+    }
+
+    #[test]
+    fn poawx_template_receipt_deserializes_pubkey_sig() {
+        let json = r#"{"height":1,"lane":"A","worker_pkh":"aa","solution":"bb","commitment_nonce":"cc","worker_pubkey":"02dead","worker_sig":"beef"}"#;
+        let r: PoawxPendingReceipt = serde_json::from_str(json).unwrap();
+        assert_eq!(r.worker_pubkey, "02dead");
+        assert_eq!(r.worker_sig, "beef");
+    }
+
+    #[test]
+    fn poawx_template_receipt_missing_pubkey_sig_defaults() {
+        let json =
+            r#"{"height":1,"lane":"A","worker_pkh":"aa","solution":"bb","commitment_nonce":"cc"}"#;
+        let r: PoawxPendingReceipt = serde_json::from_str(json).unwrap();
+        assert!(r.worker_pubkey.is_empty());
+        assert!(r.worker_sig.is_empty());
+    }
+
+    #[test]
+    fn poawx_snapshot_carries_receipts_with_pubkey_sig() {
+        let mut job = test_job();
+        job.poawx_pending_receipts = vec![sample_poawx_receipt()];
+        let session = test_session(AdapterKind::CpuminerCompatibility);
+        let config = test_config(MinerFamilyMode::Cpuminer);
+        let snap = build_canonical_job_snapshot(&job, &session, &config).unwrap();
+        assert_eq!(snap.poawx_pending_receipts.len(), 1);
+        assert_eq!(
+            snap.poawx_pending_receipts[0].worker_pubkey,
+            sample_poawx_receipt().worker_pubkey
+        );
+        assert_eq!(
+            snap.poawx_pending_receipts[0].worker_sig,
+            sample_poawx_receipt().worker_sig
+        );
+    }
+
+    #[test]
+    fn poawx_submit_variant_extended_when_enabled_with_receipts() {
+        let mut config = test_config(MinerFamilyMode::Cpuminer);
+        config.poawx_enabled = true;
+        let snap = snapshot_with_receipts(vec![sample_poawx_receipt()]);
+        match build_submit_variant(&config, &snap, sample_submit_request()) {
+            SubmitVariant::Extended(e) => {
+                assert_eq!(e.poawx_receipts.len(), 1);
+                assert!(!e.poawx_receipts[0].worker_pubkey.is_empty());
+                assert!(!e.poawx_receipts[0].worker_sig.is_empty());
+                assert_eq!(
+                    e.poawx_receipts_root,
+                    hex::encode(compute_receipts_root_from_pending(
+                        &snap.poawx_pending_receipts
+                    ))
+                );
+            }
+            _ => panic!("expected extended submit"),
+        }
+    }
+
+    #[test]
+    fn poawx_submit_variant_legacy_when_disabled() {
+        let config = test_config(MinerFamilyMode::Cpuminer);
+        let snap = snapshot_with_receipts(vec![sample_poawx_receipt()]);
+        assert!(matches!(
+            build_submit_variant(&config, &snap, sample_submit_request()),
+            SubmitVariant::Legacy(_)
+        ));
+    }
+
+    #[test]
+    fn poawx_submit_variant_legacy_when_no_receipts() {
+        let mut config = test_config(MinerFamilyMode::Cpuminer);
+        config.poawx_enabled = true;
+        let snap = snapshot_with_receipts(vec![]);
+        assert!(matches!(
+            build_submit_variant(&config, &snap, sample_submit_request()),
+            SubmitVariant::Legacy(_)
+        ));
+    }
+
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
         TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -3995,8 +4427,14 @@ mod tests {
         // into each other. Both maps use Mutex; unwrap_or_else handles
         // theoretical poisoning (cannot happen via the tests but the
         // type signature demands handling).
-        MINER_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        GLOBAL_REJECT_REASONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        MINER_STATS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        GLOBAL_REJECT_REASONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     #[test]
@@ -4021,7 +4459,9 @@ mod tests {
             rolled_version_hex: None,
         };
         let adapter = CpuminerCompatibilityAdapter;
-        let solve = adapter.decode_submit(&snapshot, &session, &config, &submit).unwrap();
+        let solve = adapter
+            .decode_submit(&snapshot, &session, &config, &submit)
+            .unwrap();
         assert!(solve.share_ok);
         assert!(solve.rewardable);
         assert_eq!(solve.adapter_id, "cpuminer_compat");
@@ -4050,8 +4490,7 @@ mod tests {
             .decode_submit(&snapshot, &session, &config, &submit)
             .unwrap();
         let expected_version = snapshot.version | rolled_extra;
-        let actual_version =
-            u32::from_le_bytes(solve.canonical_header80[0..4].try_into().unwrap());
+        let actual_version = u32::from_le_bytes(solve.canonical_header80[0..4].try_into().unwrap());
         assert_eq!(
             actual_version, expected_version,
             "canonical header must encode the BIP310-rolled version, not the base version"
@@ -4110,10 +4549,11 @@ mod tests {
             branches: vec![],
             tip_hash_at_job_create: [0u8; 32],
             created_at_unix: 0,
-        
+
             auxpow_mode: false,
             irium_header80: None,
             irium_coinbase_hex: None,
+            poawx_pending_receipts: vec![],
         };
         let solve = CanonicalSolve {
             adapter_id: "cpuminer_compat",
@@ -4181,7 +4621,10 @@ mod tests {
         let _guard = test_guard();
         let (_config, _session, snapshot, issued, _submit, _solve) = native_fixture();
         assert_eq!(issued.version_hex, format!("{:08x}", snapshot.version));
-        assert_eq!(issued.prevhash_internal_hex, hex::encode(snapshot.prev_hash_internal));
+        assert_eq!(
+            issued.prevhash_internal_hex,
+            hex::encode(snapshot.prev_hash_internal)
+        );
         assert_eq!(issued.nbits_hex, format!("{:08x}", snapshot.bits));
         assert_eq!(issued.ntime_hex, format!("{:08x}", snapshot.base_ntime));
         assert_eq!(issued.extranonce1_hex, hex::encode(&snapshot.extranonce1));
@@ -4190,10 +4633,26 @@ mod tests {
         let full = build_native_rewardable_coinbase(&snapshot, &marker_extranonce2).unwrap();
         let mut marker = snapshot.extranonce1.clone();
         marker.extend_from_slice(&marker_extranonce2);
-        let pos = full.windows(marker.len()).position(|w| w == marker.as_slice()).unwrap();
-        assert_eq!(issued.coinbase1_hex, hex::encode(&full[..pos + snapshot.extranonce1.len()]));
-        assert_eq!(issued.coinbase2_hex, hex::encode(&full[pos + marker.len()..]));
-        assert_eq!(issued.merkle_branches_internal_hex, snapshot.branches.iter().map(hex::encode).collect::<Vec<_>>());
+        let pos = full
+            .windows(marker.len())
+            .position(|w| w == marker.as_slice())
+            .unwrap();
+        assert_eq!(
+            issued.coinbase1_hex,
+            hex::encode(&full[..pos + snapshot.extranonce1.len()])
+        );
+        assert_eq!(
+            issued.coinbase2_hex,
+            hex::encode(&full[pos + marker.len()..])
+        );
+        assert_eq!(
+            issued.merkle_branches_internal_hex,
+            snapshot
+                .branches
+                .iter()
+                .map(hex::encode)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(issued.template_fingerprint, snapshot.template_fingerprint);
         assert!(issued.clean_jobs);
     }
@@ -4235,7 +4694,8 @@ mod tests {
         let (_config, _session, snapshot, _issued, _submit, solve) = native_fixture();
         let block_hex = build_canonical_block_hex(&snapshot, &solve).unwrap();
         let raw = hex::decode(block_hex).unwrap();
-        let (block, consumed) = CoreBlock::deserialize(&raw).expect("core parser should accept canonical block bytes");
+        let (block, consumed) =
+            CoreBlock::deserialize(&raw).expect("core parser should accept canonical block bytes");
         assert_eq!(consumed, raw.len());
         assert_eq!(block.transactions.len(), snapshot.tx_hex.len() + 1);
         assert_eq!(block.merkle_root(), solve.canonical_merkle_root);
@@ -4281,7 +4741,8 @@ mod tests {
         let (_config, _session, snapshot, _issued, _submit, solve) = native_fixture();
         let block_hex = build_canonical_block_hex(&snapshot, &solve).unwrap();
         let raw = hex::decode(&block_hex).unwrap();
-        let (block, consumed) = CoreBlock::deserialize(&raw).expect("core parser should accept canonical block bytes");
+        let (block, consumed) =
+            CoreBlock::deserialize(&raw).expect("core parser should accept canonical block bytes");
         assert_eq!(consumed, raw.len());
         assert_eq!(hex::encode(block.serialize()), block_hex);
         assert_eq!(block.header.hash(), solve.canonical_hash);
@@ -4297,8 +4758,11 @@ mod tests {
         let record = process_native_submit_result_for_test(
             &snapshot,
             &solve,
-            NodeSubmitResult::Rejected { reason: "rejected".to_string() },
-        ).unwrap();
+            NodeSubmitResult::Rejected {
+                reason: "rejected".to_string(),
+            },
+        )
+        .unwrap();
         assert!(record.is_none());
         assert_eq!(ACCEPTED_SHARES.load(Ordering::SeqCst), 1);
         assert_eq!(REWARDABLE_SHARES_ACCEPTED.load(Ordering::SeqCst), 1);
@@ -4325,7 +4789,9 @@ mod tests {
                 canonical_block_hash: solve.canonical_hash,
                 accepted_height: snapshot.height,
             },
-        ).unwrap().expect("accepted submit should create round record");
+        )
+        .unwrap()
+        .expect("accepted submit should create round record");
         assert_eq!(record.height, snapshot.height);
         assert_eq!(record.job_id, snapshot.job_id);
         assert_eq!(record.template_fingerprint, snapshot.template_fingerprint);
@@ -4358,7 +4824,9 @@ mod tests {
             nonce_hex: "00000001".to_string(),
             rolled_version_hex: None,
         };
-        let solve = CpuminerCompatibilityAdapter.decode_submit(&snapshot, &session, &config, &submit).unwrap();
+        let solve = CpuminerCompatibilityAdapter
+            .decode_submit(&snapshot, &session, &config, &submit)
+            .unwrap();
         assert!(solve.rewardable);
         // allow_rewardable_promotion gates on (rewardable && block_ok).
         // rewardable is now true; block_ok depends on the synthetic share's
@@ -4389,9 +4857,14 @@ mod tests {
         // a share that hashes correctly under prev_canon, fast misses
         // and deep scan recovers it.
         assert!(!mode_allows_combo(
-            &MinerFamilyMode::Asic, 23000,
-            "prev_canon", "mr_fold_raw_raw",
-            "v_le", "t_rev", "b_rev", "n_rev"
+            &MinerFamilyMode::Asic,
+            23000,
+            "prev_canon",
+            "mr_fold_raw_raw",
+            "v_le",
+            "t_rev",
+            "b_rev",
+            "n_rev"
         ));
     }
 
@@ -4400,11 +4873,20 @@ mod tests {
         // mr_fold_raw_rev / mr_fold_round_raw / mr_fold_round_rev all
         // fall outside the fast-path filter. Deep scan covers them.
         for mr in &["mr_fold_raw_rev", "mr_fold_round_raw", "mr_fold_round_rev"] {
-            assert!(!mode_allows_combo(
-                &MinerFamilyMode::Asic, 23000,
-                "prev_rev32", mr,
-                "v_le", "t_rev", "b_rev", "n_rev"
-            ), "mr={} should be rejected by fast path filter", mr);
+            assert!(
+                !mode_allows_combo(
+                    &MinerFamilyMode::Asic,
+                    23000,
+                    "prev_rev32",
+                    mr,
+                    "v_le",
+                    "t_rev",
+                    "b_rev",
+                    "n_rev"
+                ),
+                "mr={} should be rejected by fast path filter",
+                mr
+            );
         }
     }
 
@@ -4413,19 +4895,34 @@ mod tests {
         // t_raw, b_raw, n_raw all fall outside fast-path filter so
         // deep scan is the only place they get tested.
         assert!(!mode_allows_combo(
-            &MinerFamilyMode::Asic, 23000,
-            "prev_rev32", "mr_fold_raw_raw",
-            "v_le", "t_raw", "b_rev", "n_rev"
+            &MinerFamilyMode::Asic,
+            23000,
+            "prev_rev32",
+            "mr_fold_raw_raw",
+            "v_le",
+            "t_raw",
+            "b_rev",
+            "n_rev"
         ));
         assert!(!mode_allows_combo(
-            &MinerFamilyMode::Asic, 23000,
-            "prev_rev32", "mr_fold_raw_raw",
-            "v_le", "t_rev", "b_raw", "n_rev"
+            &MinerFamilyMode::Asic,
+            23000,
+            "prev_rev32",
+            "mr_fold_raw_raw",
+            "v_le",
+            "t_rev",
+            "b_raw",
+            "n_rev"
         ));
         assert!(!mode_allows_combo(
-            &MinerFamilyMode::Asic, 23000,
-            "prev_rev32", "mr_fold_raw_raw",
-            "v_le", "t_rev", "b_rev", "n_raw"
+            &MinerFamilyMode::Asic,
+            23000,
+            "prev_rev32",
+            "mr_fold_raw_raw",
+            "v_le",
+            "t_rev",
+            "b_rev",
+            "n_raw"
         ));
     }
 
@@ -4436,19 +4933,34 @@ mod tests {
         // or prev_swap4 with the standard LE axes must continue to
         // hit the fast path without entering deep scan.
         assert!(mode_allows_combo(
-            &MinerFamilyMode::Asic, 23000,
-            "prev_rev32", "mr_fold_raw_raw",
-            "v_le", "t_rev", "b_rev", "n_rev"
+            &MinerFamilyMode::Asic,
+            23000,
+            "prev_rev32",
+            "mr_fold_raw_raw",
+            "v_le",
+            "t_rev",
+            "b_rev",
+            "n_rev"
         ));
         assert!(mode_allows_combo(
-            &MinerFamilyMode::Asic, 23000,
-            "prev_swap4", "mr_fold_raw_raw",
-            "v_be", "t_rev", "b_rev", "n_rev"
+            &MinerFamilyMode::Asic,
+            23000,
+            "prev_swap4",
+            "mr_fold_raw_raw",
+            "v_be",
+            "t_rev",
+            "b_rev",
+            "n_rev"
         ));
         assert!(mode_allows_combo(
-            &MinerFamilyMode::Asic, 23000,
-            "prev_rev32", "mr_fold_raw_raw",
-            "v_rolled", "t_rev", "b_rev", "n_rev"
+            &MinerFamilyMode::Asic,
+            23000,
+            "prev_rev32",
+            "mr_fold_raw_raw",
+            "v_rolled",
+            "t_rev",
+            "b_rev",
+            "n_rev"
         ));
     }
 
@@ -4484,7 +4996,10 @@ mod tests {
         // rotation latency; anything 3+ blocks behind is rejected.
         let chain_tip: u64 = 100;
         // job at chain_tip - 2 (= 98): within tolerance, NOT stale
-        assert!(!(98u64 + 2 < chain_tip), "98 = tip - 2 should be within tolerance");
+        assert!(
+            !(98u64 + 2 < chain_tip),
+            "98 = tip - 2 should be within tolerance"
+        );
         // job at chain_tip - 3 (= 97): outside tolerance, IS stale
         assert!(97u64 + 2 < chain_tip, "97 = tip - 3 should be stale");
         // job at chain_tip (= 100): not stale (same height)

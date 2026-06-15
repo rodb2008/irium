@@ -52,6 +52,10 @@ pub struct PoawxPendingReceipt {
     pub worker_pkh: String,
     pub solution: String,
     pub commitment_nonce: String,
+    #[serde(default)]
+    pub worker_pubkey: String,
+    #[serde(default)]
+    pub worker_sig: String,
 }
 
 #[derive(Clone)]

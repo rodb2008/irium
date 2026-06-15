@@ -4,7 +4,9 @@ use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};
 
 pub fn parse_address_to_pkh(addr: &str) -> Result<[u8; 20]> {
-    let decoded = bs58::decode(addr).into_vec().map_err(|e| anyhow!("base58 decode: {e}"))?;
+    let decoded = bs58::decode(addr)
+        .into_vec()
+        .map_err(|e| anyhow!("base58 decode: {e}"))?;
     if decoded.len() != 25 {
         return Err(anyhow!("invalid address length"));
     }
@@ -34,7 +36,6 @@ fn put_varint(v: usize, out: &mut Vec<u8>) {
 }
 
 fn p2pkh_script(pkh: &[u8; 20]) -> Vec<u8> {
-
     let mut s = Vec::with_capacity(25);
     s.push(0x76);
     s.push(0xa9);
@@ -44,7 +45,6 @@ fn p2pkh_script(pkh: &[u8; 20]) -> Vec<u8> {
     s.push(0xac);
     s
 }
-
 
 fn encode_bip34_height(height: u64) -> Vec<u8> {
     let mut n = height;
@@ -196,7 +196,15 @@ pub fn solo_coinbase_prefix_suffix(
     bip34_height: bool,
 ) -> (Vec<u8>, Vec<u8>) {
     let marker: [u8; 8] = [0xfa, 0xce, 0xb0, 0x0c, 0x1c, 0xab, 0xad, 0x1d];
-    let full = build_solo_coinbase_tx(height, reward, worker_pkh, pool_pkh, fee_bps, &marker, bip34_height);
+    let full = build_solo_coinbase_tx(
+        height,
+        reward,
+        worker_pkh,
+        pool_pkh,
+        fee_bps,
+        &marker,
+        bip34_height,
+    );
     let pos = full
         .windows(marker.len())
         .position(|w| w == marker)
@@ -215,7 +223,11 @@ pub fn build_merkle_branches(template_tx_hex: &[String]) -> Result<Vec<[u8; 32]>
     let mut idx = 0usize;
     while level.len() > 1 {
         let sibling = if idx % 2 == 0 {
-            if idx + 1 < level.len() { level[idx + 1] } else { level[idx] }
+            if idx + 1 < level.len() {
+                level[idx + 1]
+            } else {
+                level[idx]
+            }
         } else {
             level[idx - 1]
         };
@@ -269,16 +281,26 @@ pub fn parse_u32_hex(s: &str) -> Result<u32> {
 pub fn compute_receipts_root_from_pending(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
     let mut sorted: Vec<&PoawxPendingReceipt> = receipts.iter().collect();
     sorted.sort_unstable_by(|a, b| {
-        a.height.cmp(&b.height)
-            .then_with(|| a.lane.as_bytes().cmp(b.lane.as_bytes()))
+        a.height
+            .cmp(&b.height)
+            .then_with(|| {
+                let la = a.lane.bytes().next().unwrap_or(b'A');
+                let lb = b.lane.bytes().next().unwrap_or(b'A');
+                la.cmp(&lb)
+            })
             .then_with(|| a.worker_pkh.as_bytes().cmp(b.worker_pkh.as_bytes()))
-            .then_with(|| a.commitment_nonce.as_bytes().cmp(b.commitment_nonce.as_bytes()))
+            .then_with(|| {
+                a.commitment_nonce
+                    .as_bytes()
+                    .cmp(b.commitment_nonce.as_bytes())
+            })
     });
     let mut outer = Sha256::new();
     for r in sorted {
         let mut inner = Sha256::new();
         inner.update(r.height.to_le_bytes());
-        inner.update(r.lane.as_bytes());
+        // Canonicalize lane to its first byte to match iriumd's root.
+        inner.update([r.lane.bytes().next().unwrap_or(b'A')]);
         inner.update(hex::decode(&r.worker_pkh).unwrap_or_default());
         inner.update(hex::decode(&r.solution).unwrap_or_default());
         inner.update(hex::decode(&r.commitment_nonce).unwrap_or_default());
@@ -299,6 +321,8 @@ mod tests {
             worker_pkh: pkh.to_string(),
             solution: sol.to_string(),
             commitment_nonce: nonce.to_string(),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
         }
     }
 
@@ -325,7 +349,15 @@ mod tests {
     #[test]
     fn many_receipts_shuffled_same_root() {
         let receipts: Vec<PoawxPendingReceipt> = (0u64..5)
-            .map(|i| mkr(1, "cpu", &format!("{:04x}", i * 17), &format!("{:04x}", i), &format!("{:04x}", i + 100)))
+            .map(|i| {
+                mkr(
+                    1,
+                    "cpu",
+                    &format!("{:04x}", i * 17),
+                    &format!("{:04x}", i),
+                    &format!("{:04x}", i + 100),
+                )
+            })
             .collect();
         let mut rev = receipts.clone();
         rev.reverse();
@@ -344,6 +376,25 @@ mod tests {
             compute_receipts_root_from_pending(&[r2])
         );
     }
+
+    #[test]
+    fn lane_canonicalized_to_first_byte() {
+        // iriumd canonicalizes lane to its first byte; multi-char lanes sharing
+        // a first byte must produce the same root (regression for lane="cpu").
+        let a = mkr(1, "cpu", "aabb", "dead", "cafe");
+        let b = mkr(1, "c", "aabb", "dead", "cafe");
+        assert_eq!(
+            compute_receipts_root_from_pending(&[a]),
+            compute_receipts_root_from_pending(&[b])
+        );
+        // different first byte -> different root.
+        let c = mkr(1, "cpu", "aabb", "dead", "cafe");
+        let d = mkr(1, "gpu", "aabb", "dead", "cafe");
+        assert_ne!(
+            compute_receipts_root_from_pending(&[c]),
+            compute_receipts_root_from_pending(&[d])
+        );
+    }
 }
 
 /// Phase 10-D: build irx1 OP_RETURN script for coinbase.
@@ -357,7 +408,14 @@ pub fn build_irx1_commitment_script(receipts_root: &[u8; 32]) -> Vec<u8> {
     s
 }
 
-pub fn header_bytes(version: u32, prev_hash: [u8; 32], merkle_root: [u8; 32], ntime: u32, nbits: u32, nonce: u32) -> [u8; 80] {
+pub fn header_bytes(
+    version: u32,
+    prev_hash: [u8; 32],
+    merkle_root: [u8; 32],
+    ntime: u32,
+    nbits: u32,
+    nonce: u32,
+) -> [u8; 80] {
     let mut h = [0u8; 80];
     h[0..4].copy_from_slice(&version.to_le_bytes());
     h[4..36].copy_from_slice(&prev_hash);
