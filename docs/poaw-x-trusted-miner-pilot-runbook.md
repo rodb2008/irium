@@ -103,3 +103,29 @@ See `poaw-x-trusted-miner-stop-conditions.md`. **Immediately stop** the pilot on
 - [ ] **Explicit launch approval obtained**
 
 Only when every box is checked AND explicit approval is given may the pilot start.
+
+## 13. Cleanup safety (MANDATORY — see incident doc)
+
+> Ref: `docs/poaw-x-mainnet-cleanup-incident.md` (2026-06-15 mainnet outage caused by
+> a broad process-name kill). These rules are non-negotiable.
+
+**Never** stop processes by broad/shared name:
+- ❌ `pkill -f "iriumd"`, `pkill -f irium`, `killall iriumd*`, `pgrep -f iriumd | xargs kill`
+- The production binary is `iriumd-current` / `iriumd-5d4604c` — any `iriumd`/`irium`
+  substring match reaches **production**. Binary-path isolation does NOT protect the
+  runtime process from a name-based kill.
+
+**Allowed teardown only:**
+1. Record pilot PIDs at startup to pidfiles (`/tmp/pilot-node.pid`, `/tmp/pilot-stratum.pid`).
+2. Teardown by **exact pidfile** (`kill "$(cat /tmp/pilot-node.pid)"`) or **exact devnet
+   port** (`fuser -k 39512/tcp 39511/tcp 39510/tcp 39508/tcp`) — never a mainnet port.
+3. If a path match is unavoidable, use the **full unique pilot binary path**, never the bare name.
+
+**Verify production before AND after every pilot test:**
+```bash
+systemctl show -p MainPID --value iriumd        # unchanged across the test
+sha256sum /proc/$(systemctl show -p MainPID --value iriumd)/exe   # stays 7c07ae2c…
+systemctl is-active iriumd                       # active before and after
+```
+If MainPID changes or the service is not active after teardown → incident:
+restore with `sudo systemctl start iriumd` first, before any other work.

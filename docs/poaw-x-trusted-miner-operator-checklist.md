@@ -91,11 +91,24 @@ journalctl -u <testnet-unit> --no-pager -n 40 | grep -iE "synced|heartbeat" | ta
 - [ ] Note first-accepted-share timestamp and any disconnects.
 
 ## M. Shutdown checklist
+
+> SAFETY (ref: docs/poaw-x-mainnet-cleanup-incident.md): NEVER use `pkill -f "iriumd"`
+> or any bare `iriumd`/`irium` process-name match — it kills the production node.
+> Teardown only by exact pidfile or exact devnet port. Record pilot PIDs at startup.
+> Verify the production MainPID + hash are UNCHANGED before and after teardown.
+
 ```bash
-# devnet only — never mainnet ports
+# record at startup:  echo $! > /tmp/pilot-node.pid ; echo $! > /tmp/pilot-stratum.pid
+# verify prod BEFORE teardown:
+PROD_PID_BEFORE=$(systemctl show -p MainPID --value iriumd)
+# teardown by exact pidfile (preferred):
+kill "$(cat /tmp/pilot-stratum.pid)" 2>/dev/null; kill "$(cat /tmp/pilot-node.pid)" 2>/dev/null
+# or by exact devnet port (never a mainnet port):
 for p in 39512 39510 39511 39508; do fuser -k $p/tcp 2>/dev/null; done
 for p in 39510 39511 39508 39512; do ss -ltn | grep -q ":$p " && echo "$p STILL UP" || echo "$p clear"; done
 ```
 - [ ] Devnet stratum + node stopped; ports clear.
+- [ ] Production MainPID AFTER == PROD_PID_BEFORE (unchanged): `[ "$(systemctl show -p MainPID --value iriumd)" = "$PROD_PID_BEFORE" ] && echo OK`.
+- [ ] `systemctl is-active iriumd` == active; running exe hash still `7c07ae2c…`.
 - [ ] Both mainnets still on official binary, PIDs unchanged.
-- [ ] (optional) devnet data dirs under `$HOME` removed.
+- [ ] (optional) devnet data dirs under `$HOME` removed (exact paths only).
