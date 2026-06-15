@@ -64,3 +64,13 @@ No production files touched; both build trees removed at cleanup.
 ## 8. Readiness for one trusted community volunteer
 
 **Not yet — recommend a follow-up stratum fix first.** Before inviting a CPU-miner volunteer, suppress the unsolicited `mining.set_version_mask` for cpuminer-family user agents (extend `suppress_unsolicited_mask` beyond Whatsminer, or gate it by config), then re-run this self-operated test to a committed block with a real cpuminer. Alternatively, validate with a version-rolling-capable miner the mainnet pool already supports and document the exact recommended miner/version for volunteers. The PoAW-X consensus + submit path is ready; the gap is CPU-miner stratum handshake compatibility.
+
+---
+
+## Update (post version-mask fix retest)
+
+The `mining.set_version_mask` blocker from §5 was **fixed** (`poawx: suppress version mask for cpu miners`). Retest with real `pooler/cpuminer` 2.5.1:
+- ✅ Unsolicited `set_version_mask` now **skipped** for cpuminer user agents; pooler **authorizes** and **mines**, and submitted an **accepted share** (`rewardable=true`).
+- ⚠️ Block promotion still blocked by a **separate** issue: `canonical_block_ok=false` (`COMPAT_CANDIDATE_BLOCKED`) — header canonicalization mismatch on the pre-fork path (devnet height 1 < 22888). See `docs/poaw-x-real-cpuminer-stratum-compatibility.md`.
+
+**Verdict remains PARTIAL**, but the handshake blocker is resolved; the remaining gap is real-CPU-miner block-hash canonicalization at low devnet heights (likely a devnet-height artifact; mainnet pool works at post-fork heights).

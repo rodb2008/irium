@@ -1678,6 +1678,26 @@ fn is_whatsminer_firmware(user_agent: &str) -> bool {
     ua.contains("whatsminer") || ua.contains("btminer")
 }
 
+/// Standard CPU miners (cpuminer, cpuminer-multi, cpuminer-opt) do NOT handle an
+/// unsolicited mining.set_version_mask: pooler/cpuminer aborts authorize and
+/// cpuminer-multi desyncs request-id matching and submits no shares. They
+/// negotiate version-rolling (if supported) via mining.configure, whose handler
+/// still sends the mask — so suppressing only the *unsolicited* push loses
+/// nothing for them while restoring compatibility.
+fn is_cpuminer_family(user_agent: &str) -> bool {
+    user_agent.to_ascii_lowercase().contains("cpuminer")
+}
+
+/// Whether to skip the unsolicited mining.set_version_mask push on subscribe.
+/// Suppressed for Whatsminer/BTMiner firmware (which sits idle on it) and for
+/// cpuminer-family CPU miners (which break on it). Version-rolling-capable ASIC
+/// firmware (cgminer/Antminer/Bitaxe/etc.) still receives the push unchanged.
+fn should_suppress_unsolicited_mask(user_agent: Option<&str>) -> bool {
+    user_agent
+        .map(|ua| is_whatsminer_firmware(ua) || is_cpuminer_family(ua))
+        .unwrap_or(false)
+}
+
 /// Per-session view of coinbase carrier extras. Returns an empty slice
 /// for small-buffer firmware so its mining.notify body stays under the
 /// parser limit; returns the full job-level extras for everyone else.
@@ -1994,11 +2014,8 @@ async fn handle_message(
             // mining.set_version_mask notification. If a miner explicitly
             // negotiates mining.configure or mining.multi_version, those
             // handlers still send the mask.
-            let suppress_unsolicited_mask = session
-                .user_agent
-                .as_deref()
-                .map(is_whatsminer_firmware)
-                .unwrap_or(false);
+            let suppress_unsolicited_mask =
+                should_suppress_unsolicited_mask(session.user_agent.as_deref());
             if suppress_unsolicited_mask {
                 info!(
                     "[subscribe] conn={} user_agent={:?} skipped unsolicited set_version_mask",
@@ -4403,6 +4420,33 @@ mod tests {
             build_submit_variant(&config, &snap, sample_submit_request()),
             SubmitVariant::Legacy(_)
         ));
+    }
+
+    #[test]
+    fn cpuminer_family_detected_from_user_agent() {
+        assert!(is_cpuminer_family("cpuminer/2.5.1"));
+        assert!(is_cpuminer_family("cpuminer-multi/1.3.7"));
+        assert!(is_cpuminer_family("cpuminer-opt/3.21.0"));
+        assert!(is_cpuminer_family("CPUMINER/X"));
+        assert!(!is_cpuminer_family("bitaxe/2.0"));
+        assert!(!is_cpuminer_family("cgminer/4.11"));
+    }
+
+    #[test]
+    fn unsolicited_mask_suppressed_for_cpuminer_and_whatsminer_only() {
+        // cpuminer family: suppressed (break on unsolicited set_version_mask).
+        assert!(should_suppress_unsolicited_mask(Some("cpuminer/2.5.1")));
+        assert!(should_suppress_unsolicited_mask(Some(
+            "cpuminer-multi/1.3.7"
+        )));
+        // whatsminer/btminer: still suppressed (existing behavior preserved).
+        assert!(should_suppress_unsolicited_mask(Some("WhatsMiner/v1.1")));
+        assert!(should_suppress_unsolicited_mask(Some("btminer")));
+        // version-rolling-capable ASIC firmware: NOT suppressed (unchanged).
+        assert!(!should_suppress_unsolicited_mask(Some("bitaxe/2.0")));
+        assert!(!should_suppress_unsolicited_mask(Some("cgminer/4.11")));
+        // no user agent: NOT suppressed (unchanged).
+        assert!(!should_suppress_unsolicited_mask(None));
     }
 
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
