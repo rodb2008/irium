@@ -3532,6 +3532,36 @@ fn resolve_emit_only_args(
     Ok((pool_pubkey, network_id, addr, a.worker.clone(), expiry))
 }
 
+/// Validate online-mode flags + required args (pure; no network). Mirrors the
+/// previous inline online checks exactly (same messages/order) so online behavior
+/// is unchanged and unit-testable. Returns (pool_url, addr, worker, fee_bps, expiry).
+/// Rejects the emit-only-only flags (`--pool-pubkey`/`--network-id`) and any non-zero fee.
+fn resolve_online_args(
+    a: &PoawxRegisterArgs,
+) -> Result<(String, String, String, u16, u64), String> {
+    if a.pool_pubkey_hex.is_some() || a.network_id.is_some() {
+        return Err(
+            "--pool-pubkey/--network-id are only valid with --emit-only (online mode reads them from /poawx/pool-identity)"
+                .to_string(),
+        );
+    }
+    if a.fee_bps != 0 {
+        return Err("official pool fee is 0%; --fee-bps > 0 is not supported".to_string());
+    }
+    let pool = a
+        .pool
+        .clone()
+        .ok_or_else(|| "--pool <url> required".to_string())?;
+    let addr = a
+        .addr
+        .clone()
+        .ok_or_else(|| "--addr <miner-address> required".to_string())?;
+    let expiry = a
+        .expiry
+        .ok_or_else(|| "--expiry-height <N> required".to_string())?;
+    Ok((pool, addr, a.worker.clone(), a.fee_bps, expiry))
+}
+
 fn cmd_poawx_register(args: &[String]) -> Result<(), String> {
     use rand_core::{OsRng, RngCore};
     let a = parse_poawx_register_args(args)?;
@@ -3572,24 +3602,7 @@ fn cmd_poawx_register(args: &[String]) -> Result<(), String> {
     }
 
     // ── Online path (unchanged): GET pool-identity, sign in memory, POST. ──
-    if a.pool_pubkey_hex.is_some() || a.network_id.is_some() {
-        return Err(
-            "--pool-pubkey/--network-id are only valid with --emit-only (online mode reads them from /poawx/pool-identity)"
-                .to_string(),
-        );
-    }
-    if a.fee_bps != 0 {
-        return Err("official pool fee is 0%; --fee-bps > 0 is not supported".to_string());
-    }
-    let pool = a.pool.ok_or_else(|| "--pool <url> required".to_string())?;
-    let addr = a
-        .addr
-        .ok_or_else(|| "--addr <miner-address> required".to_string())?;
-    let worker = a.worker;
-    let fee_bps = a.fee_bps;
-    let expiry = a
-        .expiry
-        .ok_or_else(|| "--expiry-height <N> required".to_string())?;
+    let (pool, addr, worker, fee_bps, expiry) = resolve_online_args(&a)?;
 
     let base = pool.trim_end_matches('/').to_string();
     let client = rpc_client(&base)?;
@@ -15356,6 +15369,96 @@ mod tests {
         ]))
         .unwrap();
         assert!(resolve_emit_only_args(&a).is_err());
+    }
+
+    /// The emit-only payload object has EXACTLY the three public fields the pool
+    /// endpoint reads — no extra fields can leak (structural no-secret guarantee).
+    #[test]
+    fn poawx_emit_only_payload_has_exact_keys() {
+        use k256::ecdsa::SigningKey;
+        let sk = SigningKey::from_slice(&[11u8; 32]).unwrap();
+        let d = build_signed_delegation(&sk, [0x02u8; 33], 1, "w1", 1000, 0, [3u8; 32]).unwrap();
+        let body = delegation_post_body(&d, "w1");
+        let obj = body.as_object().expect("payload is a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["delegation", "miner_pkh", "worker"]);
+    }
+
+    /// Online-path arg validation (pure: no network). Guards against regressions in
+    /// the online `poawx-register` flag handling extracted into `resolve_online_args`.
+    #[test]
+    fn poawx_online_args_validation() {
+        // Valid online form: parses as non-emit-only and resolves.
+        let a = parse_poawx_register_args(&poawx_args(&[
+            "--pool",
+            "http://127.0.0.1:39713",
+            "--addr",
+            "Pabc",
+            "--worker",
+            "w1",
+            "--expiry-height",
+            "1000",
+        ]))
+        .unwrap();
+        assert!(!a.emit_only);
+        assert_eq!(a.pool.as_deref(), Some("http://127.0.0.1:39713"));
+        assert!(a.pool_pubkey_hex.is_none() && a.network_id.is_none());
+        let (pool, addr, worker, fee, expiry) = resolve_online_args(&a).unwrap();
+        assert_eq!(pool, "http://127.0.0.1:39713");
+        assert_eq!(addr, "Pabc");
+        assert_eq!(worker, "w1");
+        assert_eq!(fee, 0);
+        assert_eq!(expiry, 1000);
+
+        // Rejections (each must fail closed).
+        let bad: Vec<Vec<&str>> = vec![
+            // emit-only-only flags in online mode
+            vec![
+                "--pool",
+                "http://x",
+                "--pool-pubkey",
+                "02",
+                "--addr",
+                "Pabc",
+                "--expiry-height",
+                "1000",
+            ],
+            vec![
+                "--pool",
+                "http://x",
+                "--network-id",
+                "1",
+                "--addr",
+                "Pabc",
+                "--expiry-height",
+                "1000",
+            ],
+            // non-zero fee
+            vec![
+                "--pool",
+                "http://x",
+                "--addr",
+                "Pabc",
+                "--expiry-height",
+                "1000",
+                "--fee-bps",
+                "1",
+            ],
+            // missing pool
+            vec!["--addr", "Pabc", "--expiry-height", "1000"],
+            // missing addr
+            vec!["--pool", "http://x", "--expiry-height", "1000"],
+            // missing expiry
+            vec!["--pool", "http://x", "--addr", "Pabc"],
+        ];
+        for c in bad {
+            let a = parse_poawx_register_args(&poawx_args(&c)).unwrap();
+            assert!(
+                resolve_online_args(&a).is_err(),
+                "expected online rejection for args: {c:?}"
+            );
+        }
     }
 
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
