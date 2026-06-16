@@ -1941,6 +1941,19 @@ fn poawx_block_difficulty_bits() -> u32 {
     }
 }
 
+/// Phase 18B: true when mode-1 (delegated) PoAW-X receipts are active for
+/// `height`. Mainnet always returns false (mode-1 hard-off). Testnet/devnet
+/// gate on `IRIUM_POAWX_DELEGATION_ACTIVATION_HEIGHT`.
+fn poawx_delegation_active(height: u64) -> bool {
+    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
+        return false;
+    }
+    match crate::activation::poawx_delegation_activation_height() {
+        Some(h) => height >= h,
+        None => false,
+    }
+}
+
 fn validate_poawx_reward_split_from_block(
     block: &Block,
     receipts: &[crate::poawx::PoawxBlockReceipt],
@@ -1998,6 +2011,21 @@ fn validate_poawx_block_receipts(
     height: u64,
     previous: Option<&Block>,
 ) -> Result<(), String> {
+    // Phase 18B (fail-closed): mode-1 (delegated) receipts are NEVER valid on
+    // mainnet. This is checked before any activation early-return so a malicious
+    // mainnet block carrying delegated receipts is rejected regardless of env.
+    // Legitimate mainnet blocks carry no receipts, so this is a no-op for them.
+    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
+        if let Some(receipts) = &block.poawx_receipts {
+            if receipts.iter().any(|r| r.delegation.is_some()) {
+                return Err(format!(
+                    "connect_block: delegated (mode-1) poawx receipts rejected on mainnet at height {}",
+                    height
+                ));
+            }
+        }
+    }
+
     // Activation gate — identical conditions to validate_poawx_coinbase.
     let act_h = match std::env::var("IRIUM_POAWX_ACTIVATION_HEIGHT")
         .ok()
@@ -2089,27 +2117,14 @@ fn validate_poawx_block_receipts(
             ));
         }
 
-        // (2+3) Worker identity: pubkey-to-pkh derivation and challenge signature.
+        // (2+3) Worker identity + delegation. Mode-0 (direct) is unchanged from
+        // Phase 13-B. Mode-1 (delegated) additionally verifies the miner's
+        // one-time delegation and that the receipt signer is the delegated pool
+        // key, while keeping the miner pkh as the payout identity.
         {
             use k256::ecdsa::signature::hazmat::PrehashVerifier;
             use k256::ecdsa::{Signature, VerifyingKey};
 
-            let vk = VerifyingKey::from_sec1_bytes(&r.worker_pubkey).map_err(|_| {
-                format!(
-                    "connect_block: receipt[{}] invalid worker_pubkey at height {}",
-                    i, height
-                )
-            })?;
-            let sha_of_pk = Sha256::digest(r.worker_pubkey);
-            let rip = Ripemd160::digest(sha_of_pk);
-            let mut computed_pkh = [0u8; 20];
-            computed_pkh.copy_from_slice(&rip);
-            if computed_pkh != r.worker_pkh {
-                return Err(format!(
-                    "connect_block: receipt[{}] worker_pkh/pubkey mismatch at height {}",
-                    i, height
-                ));
-            }
             let challenge: [u8; 32] = {
                 let mut h = Sha256::new();
                 h.update(r.solution);
@@ -2117,18 +2132,104 @@ fn validate_poawx_block_receipts(
                 h.update(r.height.to_le_bytes());
                 h.finalize().into()
             };
-            let sig = Signature::from_slice(&r.worker_sig).map_err(|_| {
-                format!(
-                    "connect_block: receipt[{}] malformed worker_sig at height {}",
-                    i, height
-                )
-            })?;
-            vk.verify_prehash(&challenge, &sig).map_err(|_| {
-                format!(
-                    "connect_block: receipt[{}] worker_sig verification failed at height {}",
-                    i, height
-                )
-            })?;
+
+            match &r.delegation {
+                None => {
+                    // Mode-0: signer is the miner; HASH160(worker_pubkey) == worker_pkh.
+                    let vk = VerifyingKey::from_sec1_bytes(&r.worker_pubkey).map_err(|_| {
+                        format!(
+                            "connect_block: receipt[{}] invalid worker_pubkey at height {}",
+                            i, height
+                        )
+                    })?;
+                    let sha_of_pk = Sha256::digest(r.worker_pubkey);
+                    let rip = Ripemd160::digest(sha_of_pk);
+                    let mut computed_pkh = [0u8; 20];
+                    computed_pkh.copy_from_slice(&rip);
+                    if computed_pkh != r.worker_pkh {
+                        return Err(format!(
+                            "connect_block: receipt[{}] worker_pkh/pubkey mismatch at height {}",
+                            i, height
+                        ));
+                    }
+                    let sig = Signature::from_slice(&r.worker_sig).map_err(|_| {
+                        format!(
+                            "connect_block: receipt[{}] malformed worker_sig at height {}",
+                            i, height
+                        )
+                    })?;
+                    vk.verify_prehash(&challenge, &sig).map_err(|_| {
+                        format!(
+                            "connect_block: receipt[{}] worker_sig verification failed at height {}",
+                            i, height
+                        )
+                    })?;
+                }
+                Some(d) => {
+                    // Mode-1: delegated. Never reaches here on mainnet (hard-rejected above).
+                    if !poawx_delegation_active(height) {
+                        return Err(format!(
+                            "connect_block: receipt[{}] mode-1 delegated receipt before delegation activation at height {}",
+                            i, height
+                        ));
+                    }
+                    if d.network_id != crate::activation::network_id_byte() {
+                        return Err(format!(
+                            "connect_block: receipt[{}] delegation network_id mismatch at height {}",
+                            i, height
+                        ));
+                    }
+                    // Miner pkh (payout identity) must equal the delegation's miner key hash.
+                    if d.miner_pkh() != r.worker_pkh {
+                        return Err(format!(
+                            "connect_block: receipt[{}] delegation miner_pkh != worker_pkh at height {}",
+                            i, height
+                        ));
+                    }
+                    if height > d.expiry_height {
+                        return Err(format!(
+                            "connect_block: receipt[{}] delegation expired (height {} > expiry {})",
+                            i, height, d.expiry_height
+                        ));
+                    }
+                    // Step 1: official pool is 0% — nonzero fee fails closed.
+                    if d.fee_bps != 0 {
+                        return Err(format!(
+                            "connect_block: receipt[{}] nonzero delegation fee_bps {} rejected (official pool is 0%)",
+                            i, d.fee_bps
+                        ));
+                    }
+                    // Miner's one-time delegation signature.
+                    d.verify_signature().map_err(|e| {
+                        format!("connect_block: receipt[{}] {} at height {}", i, e, height)
+                    })?;
+                    // Receipt signer must be the delegated pool key.
+                    if r.worker_pubkey != d.pool_pubkey {
+                        return Err(format!(
+                            "connect_block: receipt[{}] signer != delegated pool_pubkey at height {}",
+                            i, height
+                        ));
+                    }
+                    let vk = VerifyingKey::from_sec1_bytes(&r.worker_pubkey).map_err(|_| {
+                        format!(
+                            "connect_block: receipt[{}] invalid signer pubkey at height {}",
+                            i, height
+                        )
+                    })?;
+                    let sig = Signature::from_slice(&r.worker_sig).map_err(|_| {
+                        format!(
+                            "connect_block: receipt[{}] malformed signer sig at height {}",
+                            i, height
+                        )
+                    })?;
+                    vk.verify_prehash(&challenge, &sig).map_err(|_| {
+                        format!(
+                            "connect_block: receipt[{}] signer sig verification failed at height {}",
+                            i, height
+                        )
+                    })?;
+                }
+            }
         }
 
         // (4) Puzzle PoW: sha256d(seed || nonce || solution) >= difficulty leading zeros.
@@ -5579,7 +5680,9 @@ mod tests {
 
     #[test]
     fn test_validate_poawx_coinbase_no_activation_env_always_ok() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_POAWX_MODE");
         std::env::remove_var("IRIUM_NETWORK");
@@ -5589,7 +5692,9 @@ mod tests {
 
     #[test]
     fn test_validate_poawx_coinbase_mode_inactive_always_ok() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
         std::env::set_var("IRIUM_NETWORK", "testnet");
         std::env::remove_var("IRIUM_POAWX_MODE");
@@ -5601,7 +5706,9 @@ mod tests {
 
     #[test]
     fn test_validate_poawx_coinbase_pre_activation_height_ok() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "100");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -5614,7 +5721,9 @@ mod tests {
 
     #[test]
     fn test_validate_poawx_coinbase_rejects_missing_commitment() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -5630,7 +5739,9 @@ mod tests {
 
     #[test]
     fn test_validate_poawx_coinbase_rejects_zero_root() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -5645,7 +5756,9 @@ mod tests {
 
     #[test]
     fn test_validate_poawx_coinbase_accepts_valid_irx1() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -5662,7 +5775,9 @@ mod tests {
 
     #[test]
     fn test_validate_poawx_coinbase_mainnet_gate_skips_check() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "mainnet");
@@ -5768,6 +5883,7 @@ mod tests {
             worker_sig,
             solution,
             commitment_nonce: nonce,
+            delegation: None,
         }
     }
 
@@ -5831,7 +5947,9 @@ mod tests {
 
     #[test]
     fn phase13b_inactive_mode_always_ok() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
         std::env::set_var("IRIUM_NETWORK", "testnet");
         std::env::remove_var("IRIUM_POAWX_MODE");
@@ -5844,7 +5962,9 @@ mod tests {
 
     #[test]
     fn phase13b_pre_activation_height_ok() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "100");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -5858,7 +5978,9 @@ mod tests {
 
     #[test]
     fn phase13b_mainnet_unchanged() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "mainnet");
@@ -5875,7 +5997,9 @@ mod tests {
 
     #[test]
     fn phase13b_missing_receipts_rejected() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -5896,7 +6020,9 @@ mod tests {
 
     #[test]
     fn phase13b_empty_receipts_rejected() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -5916,7 +6042,9 @@ mod tests {
 
     #[test]
     fn phase13b_zero_irx1_root_rejected() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "10");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -5934,7 +6062,9 @@ mod tests {
 
     #[test]
     fn phase13b_valid_block_accepted() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -5957,9 +6087,347 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
     }
 
+    // ── Phase 18B: mode-1 (delegated) receipt verification tests ─────────
+
+    fn sk_from(seed: u8) -> k256::ecdsa::SigningKey {
+        k256::ecdsa::SigningKey::from_slice(&[seed; 32]).expect("valid sk")
+    }
+
+    fn pubkey33(sk: &k256::ecdsa::SigningKey) -> [u8; 33] {
+        use k256::ecdsa::VerifyingKey;
+        let vk = VerifyingKey::from(sk);
+        let enc = vk.to_encoded_point(true);
+        let mut pk = [0u8; 33];
+        pk.copy_from_slice(enc.as_bytes());
+        pk
+    }
+
+    fn pkh_of(sk: &k256::ecdsa::SigningKey) -> [u8; 20] {
+        let pk = pubkey33(sk);
+        let sha = Sha256::digest(pk);
+        let rip = ripemd::Ripemd160::digest(sha);
+        let mut pkh = [0u8; 20];
+        pkh.copy_from_slice(&rip);
+        pkh
+    }
+
+    /// Build a valid mode-1 (delegated) receipt: miner key signs the delegation,
+    /// pool delegate key signs the per-height challenge, worker_pkh = miner pkh.
+    #[allow(clippy::too_many_arguments)]
+    fn make_mode1_receipt(
+        height: u64,
+        miner_sk: &k256::ecdsa::SigningKey,
+        pool_sk: &k256::ecdsa::SigningKey,
+        parent_hash: [u8; 32],
+        difficulty: u32,
+        network_id: u8,
+        expiry_height: u64,
+        fee_bps: u16,
+    ) -> crate::poawx::PoawxBlockReceipt {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+
+        let miner_pubkey = pubkey33(miner_sk);
+        let worker_pkh = pkh_of(miner_sk);
+        let pool_pubkey = pubkey33(pool_sk);
+
+        let parent_height = height.saturating_sub(1);
+        let seed: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(parent_hash);
+            h.update(parent_height.to_le_bytes());
+            h.update(b"poawx_assignment_seed_v1");
+            h.finalize().into()
+        };
+        let nonce: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(seed);
+            h.update(b"commitment_nonce");
+            h.finalize().into()
+        };
+        let mut solution = [0u8; 8];
+        for n in 0u64..100_000_000 {
+            solution.copy_from_slice(&n.to_le_bytes());
+            let mut pow_input = [0u8; 72];
+            pow_input[..32].copy_from_slice(&seed);
+            pow_input[32..64].copy_from_slice(&nonce);
+            pow_input[64..].copy_from_slice(&solution);
+            if crate::poawx::count_leading_zero_bits(&sha256d(&pow_input)) >= difficulty {
+                break;
+            }
+        }
+
+        let mut d = crate::poawx::Delegation {
+            deleg_version: crate::poawx::Delegation::VERSION,
+            network_id,
+            miner_pubkey,
+            pool_pubkey,
+            worker_tag: [0u8; 32],
+            expiry_height,
+            fee_bps,
+            fee_pkh: [0u8; 20],
+            deleg_nonce: [0x33u8; 32],
+            delegation_sig: [0u8; 64],
+        };
+        let dsig: k256::ecdsa::Signature = miner_sk.sign_prehash(&d.message_hash()).unwrap();
+        d.delegation_sig.copy_from_slice(&dsig.to_bytes());
+
+        let challenge: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(solution);
+            h.update(nonce);
+            h.update(height.to_le_bytes());
+            h.finalize().into()
+        };
+        let rsig: k256::ecdsa::Signature = pool_sk.sign_prehash(&challenge).unwrap();
+        let mut worker_sig = [0u8; 64];
+        worker_sig.copy_from_slice(&rsig.to_bytes());
+
+        crate::poawx::PoawxBlockReceipt {
+            height,
+            lane: b'A',
+            worker_pkh,
+            worker_pubkey: pool_pubkey,
+            worker_sig,
+            solution,
+            commitment_nonce: nonce,
+            delegation: Some(d),
+        }
+    }
+
+    fn set_mode1_env() {
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_DELEGATION_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+    }
+    fn clear_mode1_env() {
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_DELEGATION_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+    }
+
+    #[test]
+    fn phase18b_mode1_accepts_valid_delegated_receipt() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_mode1_env();
+        let miner = sk_from(3);
+        let pool = sk_from(5);
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let receipt = make_mode1_receipt(height, &miner, &pool, parent_hash, 1, 1, 1000, 0);
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(
+            result.is_ok(),
+            "valid mode-1 block must be accepted: {result:?}"
+        );
+        clear_mode1_env();
+    }
+
+    #[test]
+    fn phase18b_mode1_rejected_before_activation() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_mode1_env();
+        // Delegation activation NOT reached (set far above the block height).
+        std::env::set_var("IRIUM_POAWX_DELEGATION_ACTIVATION_HEIGHT", "100");
+        let miner = sk_from(3);
+        let pool = sk_from(5);
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let receipt = make_mode1_receipt(height, &miner, &pool, parent_hash, 1, 1, 1000, 0);
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err(), "mode-1 before activation must reject");
+        assert!(result.unwrap_err().contains("before delegation activation"));
+        clear_mode1_env();
+    }
+
+    #[test]
+    fn phase18b_mode1_rejected_on_mainnet() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_mode1_env();
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        let miner = sk_from(3);
+        let pool = sk_from(5);
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        // network_id 0 = mainnet; the mainnet hard-reject fires first regardless.
+        let receipt = make_mode1_receipt(height, &miner, &pool, parent_hash, 1, 0, 1000, 0);
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err(), "mode-1 on mainnet must hard-reject");
+        assert!(result.unwrap_err().contains("rejected on mainnet"));
+        clear_mode1_env();
+    }
+
+    #[test]
+    fn phase18b_mode1_rejects_wrong_miner_pkh() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_mode1_env();
+        let miner = sk_from(3);
+        let pool = sk_from(5);
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let mut receipt = make_mode1_receipt(height, &miner, &pool, parent_hash, 1, 1, 1000, 0);
+        // worker_pkh no longer equals HASH160(delegation.miner_pubkey).
+        receipt.worker_pkh = [0xff; 20];
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("miner_pkh != worker_pkh"));
+        clear_mode1_env();
+    }
+
+    #[test]
+    fn phase18b_mode1_rejects_bad_delegation_sig() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_mode1_env();
+        let miner = sk_from(3);
+        let pool = sk_from(5);
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let mut receipt = make_mode1_receipt(height, &miner, &pool, parent_hash, 1, 1, 1000, 0);
+        if let Some(d) = receipt.delegation.as_mut() {
+            d.delegation_sig[0] ^= 0xff;
+        }
+        // Rebuild block so the irx1 root matches the (tampered) receipt digest.
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("signature verification failed"));
+        clear_mode1_env();
+    }
+
+    #[test]
+    fn phase18b_mode1_rejects_expired_delegation() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_mode1_env();
+        let miner = sk_from(3);
+        let pool = sk_from(5);
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 2u64;
+        // expiry_height 1 < block height 2 -> expired.
+        let receipt = make_mode1_receipt(height, &miner, &pool, parent_hash, 1, 1, 1, 0);
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expired"));
+        clear_mode1_env();
+    }
+
+    #[test]
+    fn phase18b_mode1_rejects_network_mismatch() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_mode1_env();
+        let miner = sk_from(3);
+        let pool = sk_from(5);
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        // network_id 2 (devnet) but node is testnet (1).
+        let receipt = make_mode1_receipt(height, &miner, &pool, parent_hash, 1, 2, 1000, 0);
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("network_id mismatch"));
+        clear_mode1_env();
+    }
+
+    #[test]
+    fn phase18b_mode1_rejects_signer_not_pool_pubkey() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_mode1_env();
+        let miner = sk_from(3);
+        let pool = sk_from(5);
+        let other = sk_from(9);
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let mut receipt = make_mode1_receipt(height, &miner, &pool, parent_hash, 1, 1, 1000, 0);
+        // Signer pubkey no longer matches the delegated pool_pubkey.
+        receipt.worker_pubkey = pubkey33(&other);
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("signer != delegated pool_pubkey"));
+        clear_mode1_env();
+    }
+
+    #[test]
+    fn phase18b_mode1_rejects_nonzero_fee() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_mode1_env();
+        let miner = sk_from(3);
+        let pool = sk_from(5);
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        // fee_bps = 100 must fail closed in step 1 (official pool 0%).
+        let receipt = make_mode1_receipt(height, &miner, &pool, parent_hash, 1, 1, 1000, 100);
+        let block = make_valid_poawx_block(parent_hash, height, receipt, true);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("nonzero delegation fee_bps"));
+        clear_mode1_env();
+    }
+
+    #[test]
+    fn phase18b_mode1_reward_split_requires_miner_payout() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_mode1_env();
+        let miner = sk_from(3);
+        let pool = sk_from(5);
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        // payout_ok=false -> miner pkh receives 0 -> reward split must reject,
+        // proving the split keys on the MINER pkh (not the pool).
+        let receipt = make_mode1_receipt(height, &miner, &pool, parent_hash, 1, 1, 1000, 0);
+        let block = make_valid_poawx_block(parent_hash, height, receipt, false);
+        let result = validate_poawx_block_receipts(&block, height, Some(&parent));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("underpaid"));
+        clear_mode1_env();
+    }
+
     #[test]
     fn phase13b_irx1_root_mismatch_rejected() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -5993,7 +6461,9 @@ mod tests {
 
     #[test]
     fn phase13b_wrong_commitment_nonce_rejected() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -6062,7 +6532,9 @@ mod tests {
 
     #[test]
     fn phase13b_bad_worker_sig_rejected() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -6087,7 +6559,9 @@ mod tests {
 
     #[test]
     fn phase13b_spoofed_pkh_rejected() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -6115,7 +6589,9 @@ mod tests {
 
     #[test]
     fn phase13b_insufficient_puzzle_difficulty_rejected() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");
@@ -6142,7 +6618,9 @@ mod tests {
 
     #[test]
     fn phase13b_missing_worker_payout_rejected() {
-        let _g = chain_poawx_env_lock().lock().unwrap();
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
         std::env::set_var("IRIUM_POAWX_MODE", "active");
         std::env::set_var("IRIUM_NETWORK", "testnet");

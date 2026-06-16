@@ -2735,6 +2735,20 @@ fn parse_persisted_block_file(
                         worker_sig: to64(r.get("worker_sig")?.as_str()?)?,
                         solution: to8(r.get("solution")?.as_str()?)?,
                         commitment_nonce: to32(r.get("commitment_nonce")?.as_str()?)?,
+                        // Phase 18B: restore the delegation for mode-1 receipts so a
+                        // persisted delegated block reloads byte-identically. Absent or
+                        // empty => mode-0. A malformed delegation drops the receipt
+                        // (via `?`), which then fails the irx1-root check on reload —
+                        // i.e. fail-closed, consistent with other malformed fields.
+                        delegation: match r.get("delegation").and_then(|v| v.as_str()) {
+                            Some(s) if !s.is_empty() => Some(
+                                irium_node_rs::poawx::Delegation::deserialize(
+                                    &hex::decode(s).ok()?,
+                                )
+                                .ok()?,
+                            ),
+                            _ => None,
+                        },
                     })
                 })
                 .collect::<Vec<_>>()
@@ -13733,6 +13747,11 @@ fn pending_receipt_to_block_receipt(
         worker_sig,
         solution,
         commitment_nonce,
+        // Phase 18B: the submit-side PoawxPendingReceipt DTO is mode-0 only in
+        // this step; delegated (mode-1) submission is wired with the pool
+        // integration. Block-contained mode-1 receipts are validated by
+        // connect_block (chain.rs).
+        delegation: None,
     })
 }
 
@@ -28946,6 +28965,7 @@ mod tests {
             worker_sig: [pkh_byte; 64],
             solution: [pkh_byte; 8],
             commitment_nonce: [pkh_byte; 32],
+            delegation: None,
         }
     }
 
@@ -28966,6 +28986,198 @@ mod tests {
             auxpow: None,
             poawx_receipts: receipts,
         }
+    }
+
+    // ── Phase 18B: JSON persist/reload round-trip for delegated receipts ──
+
+    fn p18b_blocks_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn p18b_temp_blocks_dir(tag: &str) -> std::path::PathBuf {
+        // Must live UNDER the home dir: storage::configured_dir only honors
+        // IRIUM_BLOCKS_DIR when the path normalizes under $HOME (otherwise it
+        // silently falls back to the real data dir).
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(home).join(format!(".irium-p18b-{tag}-{stamp}"))
+    }
+
+    fn p18b_sample_delegation() -> irium_node_rs::poawx::Delegation {
+        irium_node_rs::poawx::Delegation {
+            deleg_version: irium_node_rs::poawx::Delegation::VERSION,
+            network_id: 1,
+            miner_pubkey: [0xa1u8; 33],
+            pool_pubkey: [0xb2u8; 33],
+            worker_tag: [0xc3u8; 32],
+            expiry_height: 12_345,
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            deleg_nonce: [0xd4u8; 32],
+            delegation_sig: [0xe5u8; 64],
+        }
+    }
+
+    /// A structurally-complete mode-1 block at height 1 with bits=0x207fffff
+    /// (trivially meets target) and a coinbase irx1 commitment matching the
+    /// receipt root, so `parse_persisted_block_file` accepts it.
+    fn p18b_mode1_block() -> irium_node_rs::block::Block {
+        use irium_node_rs::block::{Block, BlockHeader};
+        let deleg = p18b_sample_delegation();
+        let receipt = irium_node_rs::poawx::PoawxBlockReceipt {
+            height: 1,
+            lane: b'A',
+            worker_pkh: [0x11u8; 20],
+            worker_pubkey: deleg.pool_pubkey,
+            worker_sig: [0x22u8; 64],
+            solution: [0x33u8; 8],
+            commitment_nonce: [0x44u8; 32],
+            delegation: Some(deleg),
+        };
+        let root =
+            irium_node_rs::poawx::irx1_root_from_block_receipts(std::slice::from_ref(&receipt));
+        let mut irx1 = vec![0x6au8, 0x24u8];
+        irx1.extend_from_slice(b"irx1");
+        irx1.extend_from_slice(&root);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                prev_txid: [0u8; 32],
+                prev_index: 0xffff_ffff,
+                script_sig: vec![0x01, 0x00],
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![
+                TxOutput {
+                    value: 50_0000_0000,
+                    script_pubkey: vec![0x51],
+                },
+                TxOutput {
+                    value: 0,
+                    script_pubkey: irx1,
+                },
+            ],
+            locktime: 0,
+        };
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_hash: [0u8; 32],
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0x207f_ffff,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+            auxpow: None,
+            poawx_receipts: Some(vec![receipt]),
+        };
+        block.header.merkle_root = block.merkle_root();
+        // Grind the nonce so the header meets the regtest target (≈50% hit rate),
+        // matching the check parse_persisted_block_file performs on reload.
+        while !meets_target(&block.header.hash_for_height(1), block.header.target()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        block
+    }
+
+    #[test]
+    fn phase18b_persisted_mode1_block_reload_preserves_delegation() {
+        let _g = p18b_blocks_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = p18b_temp_blocks_dir("mode1");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::env::set_var("IRIUM_BLOCKS_DIR", &base);
+
+        let block = p18b_mode1_block();
+        let original = block.poawx_receipts.clone().unwrap();
+        let original_root = irium_node_rs::poawx::irx1_root_from_block_receipts(&original);
+        let original_digest = original[0].delegation.as_ref().unwrap().digest();
+
+        // Synchronous writer (the default write_block_json is async).
+        irium_node_rs::storage::write_block_json_with_source(1, &block, None).unwrap();
+        let path = irium_node_rs::storage::blocks_dir().join("block_1.json");
+        let (h, reloaded) = parse_persisted_block_file(&path, "").expect("reload");
+        assert_eq!(h, 1);
+        let rrec = reloaded.poawx_receipts.as_ref().expect("receipts present");
+        assert_eq!(rrec.len(), 1);
+        // Full byte-equality (incl delegation) => connect_block behaves identically.
+        assert_eq!(
+            rrec[0], original[0],
+            "mode-1 receipt incl delegation must survive persist/reload"
+        );
+        assert_eq!(
+            rrec[0].delegation.as_ref().unwrap().digest(),
+            original_digest,
+            "delegation digest unchanged"
+        );
+        assert_eq!(
+            irium_node_rs::poawx::irx1_root_from_block_receipts(rrec),
+            original_root,
+            "receipt root unchanged"
+        );
+        // Internal consistency check connect_block performs: coinbase irx1 == root.
+        let coinbase_root = irium_node_rs::poawx::irx1_root_from_block_bytes(&reloaded).unwrap();
+        assert_eq!(
+            coinbase_root, original_root,
+            "reloaded coinbase irx1 root matches recomputed receipts root"
+        );
+
+        std::env::remove_var("IRIUM_BLOCKS_DIR");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn phase18b_persisted_mode0_block_json_has_no_delegation_field() {
+        let _g = p18b_blocks_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = p18b_temp_blocks_dir("mode0");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::env::set_var("IRIUM_BLOCKS_DIR", &base);
+
+        let mut block = p18b_mode1_block();
+        if let Some(recs) = block.poawx_receipts.as_mut() {
+            recs[0].delegation = None;
+        }
+        // Recompute coinbase irx1 + merkle for the mode-0 root.
+        let root = irium_node_rs::poawx::irx1_root_from_block_receipts(
+            block.poawx_receipts.as_ref().unwrap(),
+        );
+        let mut irx1 = vec![0x6au8, 0x24u8];
+        irx1.extend_from_slice(b"irx1");
+        irx1.extend_from_slice(&root);
+        block.transactions[0].outputs[1].script_pubkey = irx1;
+        block.header.merkle_root = block.merkle_root();
+        block.header.nonce = 0;
+        while !meets_target(&block.header.hash_for_height(1), block.header.target()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+
+        // Synchronous writer (the default write_block_json is async).
+        irium_node_rs::storage::write_block_json_with_source(1, &block, None).unwrap();
+        let path = irium_node_rs::storage::blocks_dir().join("block_1.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("delegation"),
+            "mode-0 persisted JSON must omit the delegation field (byte-identical)"
+        );
+        let (_h, reloaded) = parse_persisted_block_file(&path, "").expect("reload");
+        let rrec = reloaded.poawx_receipts.as_ref().unwrap();
+        assert!(
+            rrec[0].delegation.is_none(),
+            "reloaded receipt stays mode-0"
+        );
+
+        std::env::remove_var("IRIUM_BLOCKS_DIR");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn pending_entry_c(height: u64, lane: &str, pkh_hex: &str) -> PoawxPendingReceipt {

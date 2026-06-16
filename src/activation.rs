@@ -217,12 +217,38 @@ impl NetworkKind {
             _ => Self::Mainnet,
         }
     }
+
+    /// Phase 18B: stable one-byte network identifier bound into PoAW-X
+    /// delegations so a delegation signed for one network cannot be replayed on
+    /// another. Mainnet=0, Testnet=1, Devnet=2.
+    pub fn id_byte(self) -> u8 {
+        match self {
+            Self::Mainnet => 0,
+            Self::Testnet => 1,
+            Self::Devnet => 2,
+        }
+    }
+}
+
+/// Phase 18B: `network_id` byte for the current network (see `NetworkKind::id_byte`).
+pub fn network_id_byte() -> u8 {
+    network_kind_from_env().id_byte()
 }
 
 pub fn network_kind_from_env() -> NetworkKind {
     env::var("IRIUM_NETWORK")
         .map(|v| NetworkKind::from_env_value(&v))
         .unwrap_or(NetworkKind::Mainnet)
+}
+
+/// Phase 18B: activation height for mode-1 (delegated) PoAW-X receipts.
+/// `None` => delegated receipts are not yet active (mode-1 rejected). Read from
+/// `IRIUM_POAWX_DELEGATION_ACTIVATION_HEIGHT`. Testnet/devnet only — mainnet
+/// hard-rejects mode-1 regardless of this value.
+pub fn poawx_delegation_activation_height() -> Option<u64> {
+    env::var("IRIUM_POAWX_DELEGATION_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
 pub fn runtime_htlcv1_env_override() -> Option<u64> {

@@ -384,6 +384,11 @@ struct JsonPoawxReceipt {
     worker_sig: String,
     solution: String,
     commitment_nonce: String,
+    /// Phase 18B: hex of the 226-byte serialized `Delegation` for a mode-1
+    /// (delegated) receipt. `skip_serializing_if` keeps mode-0 persisted JSON
+    /// byte-identical (the field is absent for direct receipts).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    delegation: String,
 }
 
 #[derive(Serialize)]
@@ -797,6 +802,14 @@ fn write_block_json_sync(height: u64, block: &Block) -> std::io::Result<()> {
                     worker_sig: hex::encode(r.worker_sig),
                     solution: hex::encode(r.solution),
                     commitment_nonce: hex::encode(r.commitment_nonce),
+                    // Phase 18B: persist the delegation for mode-1 receipts so a
+                    // P2P-accepted delegated block survives a restart. Empty for
+                    // mode-0 (and omitted from JSON via skip_serializing_if).
+                    delegation: r
+                        .delegation
+                        .as_ref()
+                        .map(|d| hex::encode(d.serialize()))
+                        .unwrap_or_default(),
                 })
                 .collect()
         }),

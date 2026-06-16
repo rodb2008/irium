@@ -261,6 +261,76 @@ impl Block {
         leaves[0]
     }
 
+    /// Phase 18B: serialize the PoAW-X receipt section. A pure mode-0 receipt
+    /// set uses the v1 magic and the fixed 166-byte element encoding —
+    /// byte-for-byte identical to the Phase 13-A format. Only when at least one
+    /// mode-1 (delegated) receipt is present is the v2 magic / per-element
+    /// self-describing encoding used.
+    fn serialize_receipt_section(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(receipts) = &self.poawx_receipts {
+            if !receipts.is_empty() {
+                let has_mode1 = receipts.iter().any(|r| r.delegation.is_some());
+                if has_mode1 {
+                    out.extend_from_slice(crate::poawx::POAWX_RECEIPT_SECTION_MAGIC_V2);
+                    out.push(receipts.len() as u8);
+                    for r in receipts {
+                        out.extend_from_slice(&r.serialize_v2());
+                    }
+                } else {
+                    out.extend_from_slice(crate::poawx::POAWX_RECEIPT_SECTION_MAGIC);
+                    out.push(receipts.len() as u8);
+                    for r in receipts {
+                        out.extend_from_slice(&r.serialize());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Phase 18B: if a v1 or v2 receipt-section magic begins at `*offset`, parse
+    /// the section, advance `*offset` past it, and return the receipts. Returns
+    /// `Ok(None)` when the bytes at `*offset` are not a receipt section (so the
+    /// caller continues parsing transactions). v1 uses the fixed 166-byte loop
+    /// (identical to Phase 13-A); v2 uses the self-describing element parser.
+    fn try_parse_receipt_section(
+        raw: &[u8],
+        offset: &mut usize,
+    ) -> Result<Option<Vec<crate::poawx::PoawxBlockReceipt>>, String> {
+        if raw.len() - *offset < 8 {
+            return Ok(None);
+        }
+        let magic = &raw[*offset..*offset + 8];
+        let is_v1 = magic == crate::poawx::POAWX_RECEIPT_SECTION_MAGIC;
+        let is_v2 = magic == crate::poawx::POAWX_RECEIPT_SECTION_MAGIC_V2;
+        if !is_v1 && !is_v2 {
+            return Ok(None);
+        }
+        let mut off = *offset + 8;
+        if off >= raw.len() {
+            return Err("receipt section: missing count byte".to_string());
+        }
+        let count = raw[off] as usize;
+        off += 1;
+        let mut receipts = Vec::with_capacity(count);
+        for _ in 0..count {
+            if is_v1 {
+                if raw.len() - off < crate::poawx::PoawxBlockReceipt::WIRE_SIZE {
+                    return Err("receipt section truncated".to_string());
+                }
+                receipts.push(crate::poawx::PoawxBlockReceipt::deserialize(&raw[off..])?);
+                off += crate::poawx::PoawxBlockReceipt::WIRE_SIZE;
+            } else {
+                let (r, used) = crate::poawx::PoawxBlockReceipt::deserialize_v2(&raw[off..])?;
+                receipts.push(r);
+                off += used;
+            }
+        }
+        *offset = off;
+        Ok(Some(receipts))
+    }
+
     /// Deserialize a block: 80-byte header + optional AuxPoW + transactions.
     #[allow(dead_code)]
     pub fn deserialize(raw: &[u8]) -> Result<(Self, usize), String> {
@@ -275,25 +345,7 @@ impl Block {
         let mut txs = Vec::new();
         let mut poawx_receipts: Option<Vec<crate::poawx::PoawxBlockReceipt>> = None;
         while offset < raw.len() {
-            if raw.len() - offset >= 8
-                && &raw[offset..offset + 8] == crate::poawx::POAWX_RECEIPT_SECTION_MAGIC
-            {
-                offset += 8;
-                if offset >= raw.len() {
-                    return Err("receipt section: missing count byte".to_string());
-                }
-                let count = raw[offset] as usize;
-                offset += 1;
-                let mut receipts = Vec::with_capacity(count);
-                for _ in 0..count {
-                    if raw.len() - offset < crate::poawx::PoawxBlockReceipt::WIRE_SIZE {
-                        return Err("receipt section truncated".to_string());
-                    }
-                    receipts.push(crate::poawx::PoawxBlockReceipt::deserialize(
-                        &raw[offset..],
-                    )?);
-                    offset += crate::poawx::PoawxBlockReceipt::WIRE_SIZE;
-                }
+            if let Some(receipts) = Self::try_parse_receipt_section(raw, &mut offset)? {
                 poawx_receipts = Some(receipts);
                 break;
             }
@@ -322,15 +374,7 @@ impl Block {
         for tx in &self.transactions {
             out.extend_from_slice(&tx.serialize());
         }
-        if let Some(receipts) = &self.poawx_receipts {
-            if !receipts.is_empty() {
-                out.extend_from_slice(crate::poawx::POAWX_RECEIPT_SECTION_MAGIC);
-                out.push(receipts.len() as u8);
-                for r in receipts {
-                    out.extend_from_slice(&r.serialize());
-                }
-            }
-        }
+        out.extend_from_slice(&self.serialize_receipt_section());
         out
     }
 
@@ -354,25 +398,7 @@ impl Block {
         let mut txs = Vec::new();
         let mut poawx_receipts: Option<Vec<crate::poawx::PoawxBlockReceipt>> = None;
         while offset < raw.len() {
-            if raw.len() - offset >= 8
-                && &raw[offset..offset + 8] == crate::poawx::POAWX_RECEIPT_SECTION_MAGIC
-            {
-                offset += 8;
-                if offset >= raw.len() {
-                    return Err("receipt section: missing count byte".to_string());
-                }
-                let count = raw[offset] as usize;
-                offset += 1;
-                let mut receipts = Vec::with_capacity(count);
-                for _ in 0..count {
-                    if raw.len() - offset < crate::poawx::PoawxBlockReceipt::WIRE_SIZE {
-                        return Err("receipt section truncated".to_string());
-                    }
-                    receipts.push(crate::poawx::PoawxBlockReceipt::deserialize(
-                        &raw[offset..],
-                    )?);
-                    offset += crate::poawx::PoawxBlockReceipt::WIRE_SIZE;
-                }
+            if let Some(receipts) = Self::try_parse_receipt_section(raw, &mut offset)? {
                 poawx_receipts = Some(receipts);
                 break;
             }
@@ -403,15 +429,7 @@ impl Block {
         for tx in &self.transactions {
             out.extend_from_slice(&tx.serialize());
         }
-        if let Some(receipts) = &self.poawx_receipts {
-            if !receipts.is_empty() {
-                out.extend_from_slice(crate::poawx::POAWX_RECEIPT_SECTION_MAGIC);
-                out.push(receipts.len() as u8);
-                for r in receipts {
-                    out.extend_from_slice(&r.serialize());
-                }
-            }
-        }
+        out.extend_from_slice(&self.serialize_receipt_section());
         out
     }
 }
@@ -703,6 +721,7 @@ mod fix2a_boundary_tests {
             worker_sig: [0xccu8; 64],
             solution: [0xddu8; 8],
             commitment_nonce: [0xeeu8; 32],
+            delegation: None,
         }
     }
 
@@ -804,5 +823,121 @@ mod fix2a_boundary_tests {
         // And the total length must be header + magic(8) + count(1) + 3*166.
         let expected_len = 80 + 8 + 1 + 3 * crate::poawx::PoawxBlockReceipt::WIRE_SIZE;
         assert_eq!(bytes.len(), expected_len);
+    }
+
+    // ── Phase 18B: v2 (delegated) receipt-section wire tests ──────────────
+
+    fn signed_delegation() -> crate::poawx::Delegation {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        let sk = k256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let vk = k256::ecdsa::VerifyingKey::from(&sk);
+        let enc = vk.to_encoded_point(true);
+        let mut miner_pubkey = [0u8; 33];
+        miner_pubkey.copy_from_slice(enc.as_bytes());
+        let mut d = crate::poawx::Delegation {
+            deleg_version: crate::poawx::Delegation::VERSION,
+            network_id: 1,
+            miner_pubkey,
+            pool_pubkey: [0x02u8; 33],
+            worker_tag: [0xaau8; 32],
+            expiry_height: 1000,
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+            deleg_nonce: [0x77u8; 32],
+            delegation_sig: [0u8; 64],
+        };
+        let sig: k256::ecdsa::Signature = sk.sign_prehash(&d.message_hash()).unwrap();
+        d.delegation_sig.copy_from_slice(&sig.to_bytes());
+        d
+    }
+
+    fn make_mode1_receipt(height: u64) -> crate::poawx::PoawxBlockReceipt {
+        let mut r = make_receipt(height);
+        r.delegation = Some(signed_delegation());
+        r
+    }
+
+    #[test]
+    fn phase18b_mode0_block_uses_v1_magic_byte_identical() {
+        let block = make_block_with_receipts(7);
+        let bytes = block.serialize_for_height(1);
+        let v1 = crate::poawx::POAWX_RECEIPT_SECTION_MAGIC;
+        let v2 = crate::poawx::POAWX_RECEIPT_SECTION_MAGIC_V2;
+        assert!(
+            bytes.windows(8).any(|w| w == v1),
+            "mode-0 must use v1 magic"
+        );
+        assert!(
+            !bytes.windows(8).any(|w| w == v2),
+            "mode-0 must NOT use v2 magic"
+        );
+        let expected_len = 80 + 8 + 1 + crate::poawx::PoawxBlockReceipt::WIRE_SIZE;
+        assert_eq!(bytes.len(), expected_len, "Phase 13-A layout unchanged");
+    }
+
+    #[test]
+    fn phase18b_mode1_block_uses_v2_magic_and_roundtrips() {
+        let block = Block {
+            header: sample_header(),
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![make_mode1_receipt(7)]),
+        };
+        let bytes = block.serialize_for_height(1);
+        let v1 = crate::poawx::POAWX_RECEIPT_SECTION_MAGIC;
+        let v2 = crate::poawx::POAWX_RECEIPT_SECTION_MAGIC_V2;
+        assert!(
+            bytes.windows(8).any(|w| w == v2),
+            "mode-1 must use v2 magic"
+        );
+        assert!(
+            !bytes.windows(8).any(|w| w == v1),
+            "mode-1 must NOT use v1 magic"
+        );
+        let expected_len = 80
+            + 8
+            + 1
+            + 1
+            + crate::poawx::PoawxBlockReceipt::WIRE_SIZE
+            + crate::poawx::Delegation::WIRE_SIZE;
+        assert_eq!(bytes.len(), expected_len);
+        let (decoded, used) = Block::deserialize_for_height(&bytes, 1).expect("decode");
+        assert_eq!(used, bytes.len());
+        let receipts = decoded.poawx_receipts.expect("receipts present");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0], make_mode1_receipt(7));
+        assert!(receipts[0].delegation.is_some());
+    }
+
+    #[test]
+    fn phase18b_v2_mixed_block_roundtrips() {
+        let block = Block {
+            header: sample_header(),
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![make_receipt(1), make_mode1_receipt(2)]),
+        };
+        let bytes = block.serialize_for_height(1);
+        let v2 = crate::poawx::POAWX_RECEIPT_SECTION_MAGIC_V2;
+        assert!(bytes.windows(8).any(|w| w == v2));
+        let (decoded, used) = Block::deserialize_for_height(&bytes, 1).expect("decode");
+        assert_eq!(used, bytes.len());
+        let receipts = decoded.poawx_receipts.expect("receipts");
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts[0].delegation.is_none());
+        assert!(receipts[1].delegation.is_some());
+    }
+
+    #[test]
+    fn phase18b_v2_truncated_delegation_rejected() {
+        let block = Block {
+            header: sample_header(),
+            transactions: vec![],
+            auxpow: None,
+            poawx_receipts: Some(vec![make_mode1_receipt(5)]),
+        };
+        let valid = block.serialize_for_height(1);
+        let truncated = &valid[..valid.len() - 10];
+        assert!(Block::deserialize_for_height(truncated, 1).is_err());
     }
 }
