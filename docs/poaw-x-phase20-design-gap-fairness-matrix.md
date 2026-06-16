@@ -1,50 +1,84 @@
-# PoAW-X Phase 20 — Design Gap: CPU/GPU/ASIC Fairness Matrix (BLOCKED)
+# PoAW-X Phase 20 — CPU/GPU/ASIC Fairness Matrix (PARTIAL — primitives complete; live hidden-precommit pending a commitment root)
 
-**Status:** BLOCKED on consensus parameters. Not implemented — implementing it now would
-require inventing consensus-critical rules the repo does not define.
+**Status:** **PARTIAL.** Deterministic lane assignment, role-claim reveal/validation
+primitives, the 34/33/33 distribution, serialization, and the activation gate (mainnet
+hard-off) are **implemented and tested** (testnet/devnet-gated). **Live hidden-precommit
+consensus enforcement is NOT claimed** — it requires a future on-chain / prior-block
+commitment root that does not exist yet (see §"Honest limitation"). No `connect_block`
+wiring. Local-only; not pushed.
 
-## Current state (repo ground truth)
-- The PoAW-X assignment carries a `lane`. Only **`lane="cpu"`** is implemented end-to-end
-  (`EXPECTED_LANE_FIRST=b'c'` in `pool/irium-stratum/src/delegation.rs`; `gpu` is rejected
-  in tests). There is **no GPU lane, no ASIC lane**.
-- There is **no commit-reveal / hidden-assignment scheme** in code: the assignment
-  (`/poawx/assignment`) exposes `seed`, `commitment_nonce`, `puzzle_difficulty`, `lane`
-  deterministically per height. It is deterministic and verifiable, but not *hidden before
-  reveal*.
-- Block difficulty is automatic via **LWMA-144** (untouched, not part of this matrix).
+## Core principle (implemented as designed)
+PoAW-X does **not** detect or trust hardware. The chain never asks "is this really a
+CPU/GPU/ASIC?". Instead there are verifiable puzzle **lanes** with different resource
+profiles; **any miner may attempt any lane**. The protocol deterministically rotates/balances
+lane assignment per `(height, role slot)` so no hardware class permanently dominates, targeting
+a **34/33/33** split across the three production lanes. This distribution applies to the
+**auxiliary PoAW-X role slots**, NOT to normal chain difficulty (which stays automatic via
+LWMA-144).
 
-## What the blueprint requires (from the task) vs what is undefined
-Required properties: no hardware class mandatory; no permanent dominance; assignments
-unpredictable before reveal and verifiable after; cheap node verification; stock-CPU path
-stays valid; current mode-1 path must not regress.
+## Lanes (implemented)
+- `CPU_FRIENDLY` (id 0), `GPU_PARALLEL` (id 1), `ASIC_STREAMING` (id 2) — the three production
+  fairness lanes.
+- `UNIVERSAL_FALLBACK` (id 255) — **dev/test only**, excluded from production fairness
+  distribution; `assign_lane` never returns it and `validate_role_claim` rejects it.
 
-**Undefined consensus parameters (must be specified by the owner before code):**
-1. **Lane set & identity** — exact lanes (cpu/gpu/asic?), their on-wire encoding, and how a
-   miner/delegation is bound to a lane.
-2. **Per-lane eligibility rule** — which lane(s) are eligible at a given height, and the
-   deterministic function `(height, seed) → eligible lane(s)`.
-3. **Hidden-assignment / reveal scheme** — if assignments must be *hidden before reveal*, the
-   commitment scheme (what is committed, when revealed, how peers verify), since none exists.
-4. **Distribution / anti-dominance target** — the intended long-run share per class and the
-   mechanism that enforces "no permanent dominance" (rotation? quota? difficulty per lane?).
-5. **Interaction with reward split** — whether lane/class affects payout (ties into the
-   multi-role split design gap).
+## Role slots (implemented)
+`COMPUTE_CONTRIBUTOR` (1), `VERIFY_CONTRIBUTOR` (2), `SUPPORT_CONTRIBUTOR` (3). `PRIMARY_MINER`
+is **not** a fairness role and is never assigned a lane here (the existing primary path is
+unchanged).
 
-## Constraints that any implementation MUST preserve
-- Mainnet mode-1 stays hard-disabled until explicit activation (§K).
-- Stock CPU mining path remains valid; the proven mode-1 single-CPU path must not regress.
-- Node verification stays O(1)-ish per block (cheap).
-- Testnet-gated; fail-closed on malformed lane/assignment.
+## Deterministic assignment (implemented, `src/poawx.rs`)
+`fairness_assignment_digest = SHA256(b"IRIUM_POAWX_FAIRNESS_V1" || network_id || height_le8 ||
+prev_hash || role_id || slot_index_le4)`. `assign_lane(...)` reduces the first 8 digest bytes
+(LE) mod 10000 and maps: `0..3399 → CPU`, `3400..6699 → GPU`, `6700..9999 → ASIC`.
+Independently verifiable by every node; deterministic (same inputs → same lane).
 
-## What CAN be done now without inventing consensus
-- A **simulation harness** (non-consensus, off-chain) that models lane eligibility and
-  distribution over many `(height, seed)` values **once the rules in items 1–4 are defined**.
-  Building it now would mean simulating an undefined spec, so it is deferred.
-- The existing assignment **determinism/verifiability** for the CPU lane is already covered by
-  lib `poawx` tests (irx1 root, message hash, assignment height/lane mismatch fail-closed).
+## Role-claim reveal primitive (implemented)
+`role_claim_digest = SHA256(b"IRIUM_POAWX_ROLE_CLAIM_V1" || network_id || height_le8 ||
+prev_hash || role_id || lane_id || solver_pkh || nonce || secret)`.
+`PoawxRoleClaim { role_id, lane_id, solver_pkh[20], nonce[32], secret[32], claim_digest[32],
+commitment_hash: Option<[32]> }` with canonical serialize/deserialize (fixed 118-byte prefix +
+1 flag + optional 32-byte commitment). `validate_role_claim(...)` (pure) checks: role id known,
+lane id a production lane, claim digest recomputes from revealed fields, and the claimed lane
+equals the deterministic assignment for `(net, height, prev_hash, role, slot)`. Malformed/
+truncated/unknown-lane/unknown-role/wrong-lane/tampered-nonce all reject.
 
-## Decision needed
-Provide items 1–5 above (exact lane set, eligibility function, reveal scheme if any,
-distribution target, and reward interaction). With those, this becomes a normal
-testnet-gated implementation + the simulation harness + consensus tests, following the proven
-mode-1 pattern. Until then: **BLOCKED, CPU-lane-only remains the supported path.**
+## Activation gate (implemented)
+`IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT` via `chain::fairness_matrix_active(height)`:
+**mainnet hard-false** regardless of env; default off; testnet/devnet gate on the height.
+Before activation, existing behavior is unchanged (the primitives are not called anywhere yet).
+
+## Tests (all passing)
+poawx: assignment deterministic + sensitive to height/prev; **34/33/33 distribution over 3600
+deterministic assignments (±3pp tolerance, never fallback)**; lane/role id round-trip + unknown
+rejects + fallback excluded; role-claim wire round-trip (with/without commitment) + truncation +
+bad-flag reject; validation accept + reject (wrong lane, tampered nonce, unknown role, unknown
+lane, fallback, wrong height/slot). chain: fairness gate mainnet-off + testnet height + no-height-off.
+
+## Honest limitation (why PARTIAL, not COMPLETE)
+The assignment digest includes `prev_hash` (block H-1's hash), which a miner of block H already
+knows. There is currently **no mechanism to prove a commitment existed *before* the assignment
+seed (`prev_hash`) was known** — i.e. no on-chain / prior-block **commitment root**. Therefore
+the "hidden-before-reveal" property is **not yet consensus-enforceable**: a claimant could craft
+`nonce/secret` after seeing `prev_hash`. The `commitment_hash` field is provided as the future
+binding point, but enforcing it requires a prior-block commitment root (or equivalent) that
+records commitments before the seed is revealed. **Until that exists, this is PARTIAL** and is
+not wired into `connect_block`.
+
+## How this feeds the multi-role reward split
+Once live (with a commitment root), `validate_role_claim` produces verified
+`COMPUTE_CONTRIBUTOR`, `VERIFY_CONTRIBUTOR`, and `SUPPORT_CONTRIBUTOR` claimant pkhs for a
+block/height. Those pkhs become the `compute_contributor_pkh` / `verify_contributor_pkh` /
+`support_contributor_pkh` inputs to the already-implemented `RoleReward` + multi-role coinbase
+validator. So the multi-role split's remaining "role-claim source" gap is **filled at the
+primitive level**; production wiring (claim collection → RoleReward → coinbase) remains the
+follow-up, and depends on the commitment root for the hidden-precommit guarantee.
+
+## Remaining (follow-up)
+1. **Commitment root** (on-chain / prior-block) to make hidden-precommit consensus-enforceable.
+2. Live `connect_block`/role-claim enforcement gated on `fairness_matrix_active`.
+3. Production wiring: claim collection → role pkhs → multi-role coinbase (ties to the multi-role
+   production follow-up).
+4. Separate: **third-party pool fee** (own design-gap doc).
+
+Mainnet remains disabled; chain difficulty remains automatic via LWMA-144.

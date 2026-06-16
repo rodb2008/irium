@@ -40,7 +40,7 @@ fake completion."
 
 | # | Blueprint requirement | Current status | Missing (code / tests / docs) | Risk | Phase 20 action |
 |---|---|---|---|---|---|
-| B | CPU/GPU/ASIC fairness matrix | CPU lane only; no GPU/ASIC lane; no hidden-assignment/reveal | Consensus algorithm for lane eligibility, hidden-assignment/reveal, per-class distribution weights | **HIGH (consensus)** | **BLOCKED** — design-gap doc |
+| B | CPU/GPU/ASIC fairness matrix | Owner spec supplied; lane assignment + role-claim primitives + 34/33/33 distribution + activation gate implemented (mainnet-off) | Live hidden-precommit enforcement needs a future on-chain commitment root; connect_block wiring | MED | **PARTIAL** — primitives/validation/tests COMPLETE; hidden-precommit + wiring follow-up (design-gap doc, now partial-resolved) |
 | C | Multi-role reward split | Owner spec supplied (55/22/13/10); consensus primitives + validator implemented (gated, mainnet-off) | Pool production + node receipt-wire/persist threading + live connect_block enforcement | MED | **PARTIAL** — primitives/validator/tests COMPLETE; production follow-up (see design-gap doc, now resolved) |
 | D | Many-miner / multi-worker pool | Registry: multi-worker ✅; block production: single-miner | Per-worker coinbase outputs in stratum (depends on reward model) | MED | **PARTIAL** — registry test added; production gap documented |
 | E | Third-party pool fee | fee_bps must be 0 | Fee cap, fee pkh binding, fee coinbase output, connect_block verify | **HIGH (consensus)** | **BLOCKED** — design-gap doc |
@@ -59,17 +59,19 @@ fake completion."
 > block production + node receipt-wire/persistence threading remain a documented follow-up
 > (PARTIAL). See `poaw-x-phase20-design-gap-multi-role-reward-split.md` (resolved).
 
-Two items still require consensus-critical parameters the repository does **not** define.
-Implementing them would mean inventing algorithms/values that would later become binding
-consensus — explicitly disallowed. Each has a precise design-gap doc:
+**One** item still requires consensus-critical parameters the repository does **not** define.
+Implementing it would mean inventing values that would later become binding consensus —
+disallowed. It has a precise design-gap doc:
 
-- **B — Fairness matrix:** `poaw-x-phase20-design-gap-fairness-matrix.md` (BLOCKED)
-- **E — Third-party pool fee:** `poaw-x-phase20-design-gap-third-party-fee.md` (BLOCKED)
-- ~~C — Multi-role reward split~~ — **RESOLVED** (owner spec supplied; primitives/validator/tests done, gated, mainnet-off; pool production follow-up).
+- **E — Third-party pool fee:** `poaw-x-phase20-design-gap-third-party-fee.md` (**BLOCKED**)
+- ~~B — CPU/GPU/ASIC fairness matrix~~ — **PARTIAL** (owner spec supplied; assignment + role-claim primitives + 34/33/33 distribution + activation gate done, mainnet-off; live **hidden-precommit** enforcement needs a future on-chain commitment root — see design-gap doc).
+- ~~C — Multi-role reward split~~ — **PARTIAL** (owner spec supplied; primitives/validator/tests done, gated, mainnet-off; pool production follow-up).
 
-**Decision still needed from the owner** for B and E: the exact consensus parameters (lane set +
-eligibility + reveal scheme + distribution weights; fee cap + binding + output format). Once
-provided, each becomes a normal gated testnet implementation following the proven mode-1 pattern.
+**Decision still needed from the owner** for E only: fee cap + fee-pkh binding + fee output
+format + verification rules. For B, the remaining work is a **commitment-root design decision**
+(to make hidden-precommit consensus-enforceable) plus production wiring — not a blocked
+parameter. Once provided, each becomes a normal gated testnet implementation following the
+proven mode-1 pattern.
 
 ## 4. What Phase 20 delivers (safe, local)
 
