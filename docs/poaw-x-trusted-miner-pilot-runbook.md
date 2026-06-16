@@ -243,6 +243,21 @@ The **delegated mode-1** route (the route selected for real external pilots) was
 in **Phase 18** at `491a4de`: 18C single-node E2E and 18D two-node cross-VPS sync. See
 `poaw-x-phase18-delegated-receipts-validation-summary.md`.
 
+- **Phase 19C** (`a3538f0`, local-only) — single-VPS loopback E2E of the `--emit-only`
+  registration path: PASS (17/17). See `poaw-x-phase19c-local-e2e-test-plan.md`.
+- **Phase 19D** (`a3538f0`, local-only, **not pushed**) — **two-VPS trusted-miner
+  simulation: PASS (23/23)**. VPS-1 operator/node/stratum `207.244.247.86`; VPS-2 trusted
+  miner (stock cpuminer + `--emit-only`) + observer node B `157.173.116.134`. VPS-2 signed
+  the delegation offline, sent only the payload, VPS-1 registered it over loopback, VPS-2
+  mined over the source-restricted stratum, and the pool committed a mode-1 block:
+  height 2, hash `00000000246d1f4712156ffa879c67b6ee2d4ce1fc9b49dcef093c347cd4f1b7`,
+  `irx1_root` `918e0f03505feb91c320cf43a8e64230a31216961ecc64b67c36689fd801a601`, miner pkh
+  `286cda945bb0ad25435be3ebc5fbf579b431c743` paid (single output), delegate pkh
+  `21f1371648ac6f1063de137fa0796e26167aee04` **not** paid, fee 0%; observer node B synced
+  the same block. Operator-run firewall handoff (Appendix B) exercised and rules removed
+  after. Mainnet/prod untouched. Full proof table: readiness doc §11. (`STRATUM_DEFAULT_DIFF=1`
+  is stratum share difficulty; chain difficulty stays automatic via LWMA-144.)
+
 ---
 
 ## Appendix A — Delegated mode-1 route (Phase 18; selected for external pilots)

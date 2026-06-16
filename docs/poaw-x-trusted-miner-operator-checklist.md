@@ -12,6 +12,12 @@
 > **loopback-only**; registration uses the wallet **`--emit-only`** mode, **implemented
 > locally in Phase 19B commit `1628843`** (local-only checkpoint, not pushed). A real
 > external pilot still requires explicit operator approval before live testing.
+>
+> **Status: Phase 19D two-VPS trusted-miner simulation PASSED (2026-06-16, 23/23)** — VPS-1
+> `207.244.247.86` operator, VPS-2 `157.173.116.134` trusted miner + observer; mode-1 block 2
+> committed (miner paid, delegate unpaid, fee 0%), observer synced, firewall handoff exercised
+> and rules removed, mainnet/prod untouched. Full record: readiness doc §11. For a real
+> third-party miner, substitute their IP into the same operator-run handoff (Section Q).
 
 ---
 

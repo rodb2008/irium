@@ -196,4 +196,60 @@ block receipt → peer sync verified (same height/hash on the observer node) →
   only miner-facing port, source-restricted to the trusted-miner IP, never `Anywhere`;
   `/poawx/delegation`, RPC, status, metrics stay loopback-only. Exact open/verify/close
   commands + pre-open/post-close checklists: runbook **Appendix B** and operator checklist
-  **Section Q**.
+  **Section Q**. (The handoff itself was exercised end-to-end in **Phase 19D** below.)
+
+---
+
+## 11. Phase 19D — Two-VPS trusted-miner simulation (PASS)
+
+**Result: PASS, 2026-06-16.** The full non-custodial trusted-miner flow was validated across
+two separate machines over the real public internet path, using our own VPS-2 as the
+"external" trusted miner. Validation-only — **no code changes/commits** during 19D.
+
+- **VPS-1 (operator / node A / stratum / loopback delegation):** `207.244.247.86`
+- **VPS-2 (trusted miner: stock cpuminer + wallet `--emit-only`; + observer node B):** `157.173.116.134`
+- **Branch/HEAD:** `testnet/poawx-phase19b-wallet-emit-only-delegation @ a3538f0` — **local-only, no upstream, not pushed.**
+
+**Block produced (mode-1, mined by VPS-2 over the public path):**
+- height **2**
+- hash `00000000246d1f4712156ffa879c67b6ee2d4ce1fc9b49dcef093c347cd4f1b7`
+- `irx1_root` `918e0f03505feb91c320cf43a8e64230a31216961ecc64b67c36689fd801a601`
+
+**Miner / delegate:**
+- miner pkh `286cda945bb0ad25435be3ebc5fbf579b431c743` — **paid** (single p2pkh output)
+- delegate pkh `21f1371648ac6f1063de137fa0796e26167aee04` — **not paid**
+- fee **0%**
+
+**Proof summary (23/23):**
+1. VPS-2 generated the emit-only payload locally.
+2. No delegation HTTP calls from VPS-2 (offline; no delegation/RPC service on VPS-2).
+3. Payload contained only public signed delegation data (`{delegation,worker,miner_pkh}`).
+4. VPS-1 registered it via loopback `curl` only.
+5. Delegation endpoint remained loopback-only (`127.0.0.1:39813`).
+6. Registry had no private key.
+7. VPS-2 stock cpuminer connected via the source-restricted stratum rule (from `157.173.116.134`).
+8. native_rewardable used.
+9. `STRATUM_DEFAULT_DIFF=1` used as the stratum **share** difficulty.
+10. Mode-1 receipt built from the registry.
+11. `submit_block_extended` used.
+12. Block accepted.
+13. `irx1_root` present.
+14. Embedded 226-byte delegation present.
+15. Miner pkh paid.
+16. Delegate pkh not paid.
+17. Fee 0%.
+18. Observer Node B synced the same block (height/hash/`irx1_root` match; validated via `connect_block`).
+19. No compat/variant-sweep promotion (extended submit only).
+20. Mainnet/prod untouched (VPS-1 `219530` + prod pool `4042500-4042503`; VPS-2 `1851441`).
+21. Firewall rules removed after the test (verified absent + unreachable from VPS-2).
+22. All test ports clear after cleanup (both VPS); both `$TROOT` removed.
+23. No push / no remote branches / `main` untouched.
+
+**Operational notes (carried forward):**
+- `STRATUM_DEFAULT_DIFF=1` is the **stratum share difficulty**, **not** chain difficulty.
+- **Chain difficulty remains automatic via LWMA-144** and was never manually controlled.
+- Only stratum (and optional observer P2P) were exposed, **source-restricted to the VPS-2 IP**, never `Anywhere`; removed after the test.
+- Delegation endpoint, RPC, status, and metrics stayed loopback-only/private throughout.
+- For a **real third-party trusted miner**, the only change is substituting the real miner's
+  public IP into the same operator-run firewall handoff (Appendix B / Section Q).
+- Still **no public testnet and no mainnet activation**; mainnet mode-1 remains hard-disabled.

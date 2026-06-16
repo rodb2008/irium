@@ -28,6 +28,10 @@ when a PoAW-X receipt is available.
 
 This is a controlled pilot. You are one of at most 3 trusted testers.
 
+> **Status:** this delegated flow has been validated end-to-end in internal two-VPS testing
+> (Phase 19D): a stock cpuminer registered via `--emit-only` and mined an accepted mode-1
+> block that an independent node re-validated. Your session uses the same flow.
+
 **Rewardable route:** your standard cpuminer/minerd is served by the gated **native_rewardable** route. When a PoAW-X receipt is pending for your address, an accepted share at the block target produces a real block via `submit_block_extended`, committing an `irx1_root` in the coinbase. (The legacy `cpuminer_compat` adapter is non-rewardable on PoAW-X and cannot promote blocks.)
 
 ---
