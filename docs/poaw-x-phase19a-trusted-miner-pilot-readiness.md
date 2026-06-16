@@ -186,3 +186,7 @@ block receipt → peer sync verified (same height/hash on the observer node) →
   can register a delegation without exposing the loopback endpoint or granting SSH
   access. A real external pilot still requires explicit operator approval before live
   testing; chain difficulty remains automatic via LWMA-144 (never manually controlled).
+- **Phase 19C (local E2E test plan; not yet executed):** see
+  `docs/poaw-x-phase19c-local-e2e-test-plan.md` for the isolated, loopback-only,
+  single-VPS end-to-end validation of the `--emit-only` path (17 required proofs). It is
+  documented but **not executed** — running it requires explicit operator approval.

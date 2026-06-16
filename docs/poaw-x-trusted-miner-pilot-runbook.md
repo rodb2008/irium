@@ -116,6 +116,15 @@ See `poaw-x-trusted-miner-stop-conditions.md`. **Immediately stop** the pilot on
 - Sanitize all shared log excerpts (mask IPs, strip auth headers).
 - Keep 39511/39508 private at all times.
 
+### 11.1 Repository policy (local-only until completion)
+
+- **PoAW-X work stays local on the VPS.** Do **not** `git push` PoAW-X/testnet branches,
+  recreate deleted remote branches, merge, open a PR, or tag — until the owner explicitly
+  approves a final push/release. Commit locally only.
+- Never push or touch `main`. The delegation endpoint and RPC are **never** exposed publicly.
+- The miner→operator exchange is the **signed delegation payload only** — never a seed or
+  private key. The operator POSTs it over loopback (see Appendix A / `--emit-only`).
+
 ## 12. Final Go / No-Go Checklist
 
 - [ ] Operator preflight all PASS
@@ -269,6 +278,13 @@ identity; the delegate key is signer-only and never paid; the official fee is 0%
      -H 'content-type: application/json' --data @poawx-delegation.json
    ```
 5. Miner runs stock cpuminer unchanged (see §15).
+
+> **Tip (optional, safe):** before step 4, validate the received payload with the
+> read-only helper — it checks the JSON shape (exactly `delegation,worker,miner_pkh`),
+> the 226-byte delegation length, and refuses anything containing a secret token, and
+> prints the loopback curl for you to run:
+> `scripts/poawx-delegation-validate.sh poawx-delegation.json --port <delegation-port>`.
+> The helper makes no network call and posts nothing.
 
 > **`--emit-only` is implemented locally in Phase 19B commit `1628843`** (local-only
 > checkpoint, not pushed). It lets an external miner register without exposing the
