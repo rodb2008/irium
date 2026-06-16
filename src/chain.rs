@@ -1954,6 +1954,107 @@ fn poawx_delegation_active(height: u64) -> bool {
     }
 }
 
+/// Phase 20: true when the multi-role reward split is active for `height`.
+/// **Mainnet always returns false** (multi-role split hard-off until an explicit
+/// future governance activation). Testnet/devnet gate on
+/// `IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT`. Before activation the
+/// existing reward behavior (10%/receipt to worker) is unchanged.
+pub fn multi_role_reward_active(height: u64) -> bool {
+    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
+        return false;
+    }
+    match crate::activation::poawx_multi_role_reward_activation_height() {
+        Some(h) => height >= h,
+        None => false,
+    }
+}
+
+/// Phase 20: parse a standard 25-byte P2PKH script `76 a9 14 <20> 88 ac` to its pkh.
+fn parse_p2pkh_pkh(script: &[u8]) -> Option<[u8; 20]> {
+    if script.len() == 25
+        && script[0] == 0x76
+        && script[1] == 0xa9
+        && script[2] == 0x14
+        && script[23] == 0x88
+        && script[24] == 0xac
+    {
+        let mut pkh = [0u8; 20];
+        pkh.copy_from_slice(&script[3..23]);
+        Some(pkh)
+    } else {
+        None
+    }
+}
+
+/// Phase 20: validate the canonical multi-role coinbase outputs (pure; no env).
+///
+/// After the multi-role activation height a PoAW-X mode-1 coinbase must pay
+/// exactly the four canonical role outputs in fixed order
+/// `[PRIMARY, COMPUTE, VERIFY, SUPPORT]` with the exact `multi_role_amounts`
+/// split of `total_reward`. Zero-value non-P2PKH outputs (e.g. the `irx1`
+/// OP_RETURN) are allowed and ignored; any value-bearing non-P2PKH output
+/// (a hidden fee) or any extra/mis-ordered/wrong-amount P2PKH output rejects.
+/// `primary_pkh` MUST be the receipt `worker_pkh` (caller enforces). Duplicate
+/// role pkhs are kept as separate outputs (no aggregation).
+fn validate_multi_role_coinbase_outputs(
+    outputs: &[crate::tx::TxOutput],
+    primary_pkh: &[u8; 20],
+    role: &crate::poawx::RoleReward,
+    total_reward: u64,
+) -> Result<(), String> {
+    let amts = crate::poawx::multi_role_amounts(total_reward);
+    let expected: [([u8; 20], u64); 4] = [
+        (*primary_pkh, amts[0]),
+        (role.compute_contributor_pkh, amts[1]),
+        (role.verify_contributor_pkh, amts[2]),
+        (role.support_contributor_pkh, amts[3]),
+    ];
+    let mut p2pkh: Vec<([u8; 20], u64)> = Vec::new();
+    for out in outputs {
+        match parse_p2pkh_pkh(&out.script_pubkey) {
+            Some(pkh) => p2pkh.push((pkh, out.value)),
+            None => {
+                if out.value != 0 {
+                    return Err(
+                        "multi-role coinbase: value-bearing non-p2pkh output (hidden fee?)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    if p2pkh.len() != 4 {
+        return Err(format!(
+            "multi-role coinbase: expected exactly 4 role outputs, found {}",
+            p2pkh.len()
+        ));
+    }
+    for (i, (epkh, eval)) in expected.iter().enumerate() {
+        if &p2pkh[i].0 != epkh {
+            return Err(format!(
+                "multi-role coinbase: role index {} pkh/order mismatch",
+                i
+            ));
+        }
+        if p2pkh[i].1 != *eval {
+            return Err(format!(
+                "multi-role coinbase: role index {} amount {} != expected {}",
+                i, p2pkh[i].1, eval
+            ));
+        }
+    }
+    // Defensive: split must total the allowed reward exactly (guaranteed by
+    // multi_role_amounts, re-checked so a future change cannot silently over/underpay).
+    let sum: u64 = amts.iter().sum();
+    if sum != total_reward {
+        return Err(format!(
+            "multi-role coinbase: split sum {} != total reward {}",
+            sum, total_reward
+        ));
+    }
+    Ok(())
+}
+
 fn validate_poawx_reward_split_from_block(
     block: &Block,
     receipts: &[crate::poawx::PoawxBlockReceipt],
@@ -6421,6 +6522,210 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("underpaid"));
         clear_mode1_env();
+    }
+
+    // ── Phase 20: multi-role reward split (validator is pure; gate uses env lock) ──
+
+    fn p20_role() -> crate::poawx::RoleReward {
+        crate::poawx::RoleReward {
+            compute_contributor_pkh: [0xC0u8; 20],
+            verify_contributor_pkh: [0x7Eu8; 20],
+            support_contributor_pkh: [0x5Au8; 20],
+        }
+    }
+
+    fn p20_canonical_outputs(
+        primary: &[u8; 20],
+        role: &crate::poawx::RoleReward,
+        total: u64,
+        with_irx1: bool,
+    ) -> Vec<crate::tx::TxOutput> {
+        use crate::tx::{p2pkh_script, TxOutput};
+        let a = crate::poawx::multi_role_amounts(total);
+        let mut outs = Vec::new();
+        if with_irx1 {
+            // zero-value OP_RETURN (irx1-style) must be ignored by the validator.
+            outs.push(TxOutput {
+                value: 0,
+                script_pubkey: vec![0x6a, 0x24, b'i', b'r', b'x', b'1'],
+            });
+        }
+        outs.push(TxOutput {
+            value: a[0],
+            script_pubkey: p2pkh_script(primary),
+        });
+        outs.push(TxOutput {
+            value: a[1],
+            script_pubkey: p2pkh_script(&role.compute_contributor_pkh),
+        });
+        outs.push(TxOutput {
+            value: a[2],
+            script_pubkey: p2pkh_script(&role.verify_contributor_pkh),
+        });
+        outs.push(TxOutput {
+            value: a[3],
+            script_pubkey: p2pkh_script(&role.support_contributor_pkh),
+        });
+        outs
+    }
+
+    #[test]
+    fn phase20_multi_role_coinbase_valid_accepted() {
+        let primary = [0xA1u8; 20];
+        let role = p20_role();
+        let total = 5_000_000_000u64;
+        // with and without the optional irx1 OP_RETURN both validate.
+        assert!(validate_multi_role_coinbase_outputs(
+            &p20_canonical_outputs(&primary, &role, total, true),
+            &primary,
+            &role,
+            total
+        )
+        .is_ok());
+        assert!(validate_multi_role_coinbase_outputs(
+            &p20_canonical_outputs(&primary, &role, total, false),
+            &primary,
+            &role,
+            total
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn phase20_multi_role_coinbase_rejections() {
+        use crate::tx::{p2pkh_script, TxOutput};
+        let primary = [0xA1u8; 20];
+        let role = p20_role();
+        let total = 5_000_000_001u64; // odd -> remainder to primary
+        let amts = crate::poawx::multi_role_amounts(total);
+
+        // wrong amount (primary off by one)
+        let mut o = p20_canonical_outputs(&primary, &role, total, true);
+        o[1].value += 1;
+        assert!(
+            validate_multi_role_coinbase_outputs(&o, &primary, &role, total)
+                .unwrap_err()
+                .contains("amount")
+        );
+
+        // wrong order (swap compute and verify)
+        let mut o = p20_canonical_outputs(&primary, &role, total, false);
+        o.swap(1, 2);
+        assert!(
+            validate_multi_role_coinbase_outputs(&o, &primary, &role, total)
+                .unwrap_err()
+                .contains("order")
+        );
+
+        // missing role (only 3 outputs)
+        let mut o = p20_canonical_outputs(&primary, &role, total, false);
+        o.pop();
+        assert!(
+            validate_multi_role_coinbase_outputs(&o, &primary, &role, total)
+                .unwrap_err()
+                .contains("4 role outputs")
+        );
+
+        // extra value-bearing non-p2pkh output (hidden fee)
+        let mut o = p20_canonical_outputs(&primary, &role, total, false);
+        o.push(TxOutput {
+            value: 1,
+            script_pubkey: vec![0x6a, 0x01, 0x00],
+        });
+        assert!(
+            validate_multi_role_coinbase_outputs(&o, &primary, &role, total)
+                .unwrap_err()
+                .contains("hidden fee")
+        );
+
+        // extra p2pkh output (delegate/5th payout) -> count != 4
+        let mut o = p20_canonical_outputs(&primary, &role, total, false);
+        o.push(TxOutput {
+            value: 1,
+            script_pubkey: p2pkh_script(&[0xDEu8; 20]),
+        });
+        assert!(validate_multi_role_coinbase_outputs(&o, &primary, &role, total).is_err());
+
+        // primary pkh mismatch (caller binds primary=worker_pkh; a wrong primary rejects)
+        let wrong_primary = [0xBBu8; 20];
+        let o = p20_canonical_outputs(&primary, &role, total, false);
+        assert!(validate_multi_role_coinbase_outputs(&o, &wrong_primary, &role, total).is_err());
+
+        // sanity: amounts sum exactly even for the odd total
+        assert_eq!(amts.iter().sum::<u64>(), total);
+    }
+
+    #[test]
+    fn phase20_multi_role_duplicate_pkh_kept_separate() {
+        use crate::tx::{p2pkh_script, TxOutput};
+        // primary == support pkh: duplicates are allowed but remain 4 separate outputs
+        // in canonical order (no aggregation).
+        let same = [0x77u8; 20];
+        let role = crate::poawx::RoleReward {
+            compute_contributor_pkh: [0xC0u8; 20],
+            verify_contributor_pkh: [0x7Eu8; 20],
+            support_contributor_pkh: same, // == primary
+        };
+        let total = 5_000_000_000u64;
+        let a = crate::poawx::multi_role_amounts(total);
+        let outs = vec![
+            TxOutput {
+                value: a[0],
+                script_pubkey: p2pkh_script(&same),
+            },
+            TxOutput {
+                value: a[1],
+                script_pubkey: p2pkh_script(&role.compute_contributor_pkh),
+            },
+            TxOutput {
+                value: a[2],
+                script_pubkey: p2pkh_script(&role.verify_contributor_pkh),
+            },
+            TxOutput {
+                value: a[3],
+                script_pubkey: p2pkh_script(&role.support_contributor_pkh),
+            },
+        ];
+        assert!(validate_multi_role_coinbase_outputs(&outs, &same, &role, total).is_ok());
+        // aggregating the duplicate into 3 outputs must be REJECTED (separate required).
+        let agg = vec![
+            TxOutput {
+                value: a[0] + a[3],
+                script_pubkey: p2pkh_script(&same),
+            },
+            TxOutput {
+                value: a[1],
+                script_pubkey: p2pkh_script(&role.compute_contributor_pkh),
+            },
+            TxOutput {
+                value: a[2],
+                script_pubkey: p2pkh_script(&role.verify_contributor_pkh),
+            },
+        ];
+        assert!(validate_multi_role_coinbase_outputs(&agg, &same, &role, total).is_err());
+    }
+
+    #[test]
+    fn phase20_multi_role_gate_mainnet_off_and_testnet_height() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // mainnet: hard-off even with an activation height set.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "5");
+        assert!(!multi_role_reward_active(10), "mainnet must be hard-off");
+        // testnet: gated by height.
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        assert!(!multi_role_reward_active(4), "below activation height");
+        assert!(multi_role_reward_active(5), "at activation height");
+        assert!(multi_role_reward_active(6), "above activation height");
+        // no activation height -> off.
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        assert!(
+            !multi_role_reward_active(100),
+            "no activation height -> off"
+        );
+        std::env::remove_var("IRIUM_NETWORK");
     }
 
     #[test]
