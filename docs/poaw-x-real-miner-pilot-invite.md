@@ -1,6 +1,6 @@
 # PoAW-X Real Miner Pilot Invite
 
-**Version:** 1.0 (Phase 11-F)
+**Version:** 2.0 (post Phase 15 — native_rewardable route proven)
 **Network:** Isolated PoAW-X Testnet (devnet)
 **Status:** Invite-only — 1-3 trusted testers
 
@@ -20,12 +20,14 @@ when a PoAW-X receipt is available.
 
 This is a controlled pilot. You are one of at most 3 trusted testers.
 
+**Rewardable route:** your standard cpuminer/minerd is served by the gated **native_rewardable** route. When a PoAW-X receipt is pending for your address, an accepted share at the block target produces a real block via `submit_block_extended`, committing an `irx1_root` in the coinbase. (The legacy `cpuminer_compat` adapter is non-rewardable on PoAW-X and cannot promote blocks.)
+
 ---
 
 ## What You Need
 
 - `cpuminer-multi` (recommended) or any Stratum v1 CPU miner
-- Outbound TCP access on port 39512
+- Outbound TCP access to the operator-provided stratum host:port (operator-selected; not a fixed port)
 - An Irium testnet address (any valid address string works; no real funds)
 
 ---
@@ -38,7 +40,7 @@ Do not share it publicly.
 ```
 Protocol:    Stratum v1 (TCP)
 Host:        TESTNET_STRATUM_HOST  (provided by operator)
-Port:        39512
+Port:        <operator-provided>   (operator-selected stratum port; source-restricted to your IP)
 Worker:      YOUR_IRIUM_ADDRESS.WORKER_NAME
 Password:    x
 ```
@@ -48,7 +50,7 @@ Password:    x
 ```bash
 cpuminer-multi \
   -a sha256d \
-  -o stratum+tcp://TESTNET_STRATUM_HOST:39512 \
+  -o stratum+tcp://TESTNET_STRATUM_HOST:<STRATUM_PORT> \
   -u YOUR_IRIUM_ADDRESS.worker1 \
   -p x \
   -t 2
@@ -60,7 +62,7 @@ cpuminer-multi \
 
 If you are running a testnet node peer (not a miner), the P2P seed is:
 ```
-TESTNET_STRATUM_HOST:39510
+TESTNET_STRATUM_HOST:<NODE_P2P_PORT>
 ```
 This is separate from the stratum port. Most testers do not need it.
 
@@ -111,7 +113,7 @@ Notes:            [anything unexpected]
 - Testnet chain may reset without warning
 - No real Irium rewards
 - No mainnet compatibility guarantee yet
-- Difficulty is hardcoded at 1 (no adaptive difficulty)
+- Difficulty: vardiff off; on the isolated devnet a sub-1 floor is used (operator-gated, non-mainnet only) so a CPU finds genuine blocks quickly
 - RPC is not publicly accessible; operator verifies irx1 privately
 - Single seed node in this pilot
 

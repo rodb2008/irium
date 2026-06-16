@@ -1,11 +1,24 @@
 # PoAW-X Trusted Miner Pilot — Operator Runbook
 
-**Version:** 1.0 (post Phase 14-F)
-**Validated branch:** `origin/testnet/poawx-phase12-completion-rc-hardening` @ `a0aedc6`
+**Version:** 2.0 (post Phase 15 — native_rewardable route proven)
+**Validated code branch:** `origin/testnet/poawx-phase13-native-rewardable-cpuminer-e2e` @ `fad21c4`
 **Node version:** v1.9.115 (PoAW-X + MTP, reconciled with official main `5d4604c`)
 **Status:** PREPARATION ONLY — pilot NOT started. Launch requires explicit approval.
+**Proven route (Phases 13-15):** `cpuminer/minerd -> native_rewardable -> submit_block_extended -> irx1_root -> BLOCK_ACCEPTED -> peer sync`. Full proof chain in `poaw-x-native-rewardable-miner-validation-summary.md`.
 
 > **TESTNET ONLY.** Isolated PoAW-X devnet. **No real Irium coins, no real rewards, no mainnet compatibility.** Chain may reset at any time. No mainnet wallets/keys/addresses on this testnet.
+
+---
+
+## 0. Rewardable route — READ FIRST
+
+PoAW-X **rewardable** CPU mining uses the gated **NATIVE_REWARDABLE** route, **not** rewardable cpuminer_compat.
+
+- **Rewardable blocks come only from the deterministic native path.** A standard cpuminer/minerd is routed to native_rewardable when the stratum runs the explicit PoAW-X testnet/devnet config (IRIUM_STRATUM_ADAPTER_MODE=auto + IRIUM_STRATUM_NATIVE_REWARDABLE_ENABLED=1 + IRIUM_STRATUM_POAWX=1), proven byte-identical to a real cpuminer header (no byte-order bridge).
+- **cpuminer_compat remains NON-rewardable on PoAW-X** — it may be used only for compatibility / share accounting, never for block promotion.
+- **No variant sweep may promote a PoAW-X block.** Promotion is gated on a single deterministic canonical reconstruction; the compat byte-order sweep can never produce a rewardable candidate on the PoAW-X path.
+- Rewardable production fires submit_block_extended with the pending receipt(s); the committed block carries the irx1_root matching the seeded receipt root.
+- **Mainnet is byte-identical / unaffected** (poawx_enabled=false): legacy routing, the diff-1 floor, and the single-output coinbase are all unchanged on mainnet.
 
 ---
 
@@ -27,7 +40,7 @@ This is **not** a public testnet and **not** a reward program.
 | Component | Value | Exposure |
 |---|---|---|
 | Operator testnet node | devnet binary from repo target / isolated devnet path (NOT the mainnet service binary) | — |
-| Stratum endpoint | `PILOT_HOST:STRATUM_PORT` (established pilot port: 39512) | **exposed to invited miner only** |
+| Stratum endpoint | `PILOT_HOST:STRATUM_PORT` (operator-selected; 39512 is historical/optional, **not** mandatory) | **exposed to the invited/self-hosted miner IP only** |
 | P2P (seed, optional) | `PILOT_HOST:39510` | optional, node-operator testers only |
 | RPC | `127.0.0.1:39511` | **PRIVATE — localhost only, never exposed** |
 | Status | `127.0.0.1:39508` | **PRIVATE — localhost only** |
@@ -44,7 +57,7 @@ See `poaw-x-trusted-miner-operator-checklist.md`. Summary:
 3. No old devnet processes; devnet ports clear.
 4. Testnet node boots from clean devnet genesis, PoAW-X active.
 5. RPC 39511 confirmed NOT publicly reachable.
-6. Firewall: only `STRATUM_PORT` (39512) reachable from the miner; 39511/39508 blocked publicly.
+6. Firewall: only the operator-selected `STRATUM_PORT` reachable, **source-restricted to the miner IP only** (never `Anywhere`); RPC/status stay private on `127.0.0.1`.
 7. Testnet stratum up and pointed at the testnet node.
 
 ## 5. Miner Preflight (communicated via invite)
@@ -80,7 +93,7 @@ See `poaw-x-trusted-miner-stop-conditions.md`. **Immediately stop** the pilot on
 1. Signal miner(s) to stop (Ctrl+C their miner).
 2. Stop the testnet stratum process (devnet stratum only).
 3. Stop the testnet node (devnet PID / `fuser -k` the devnet ports — devnet only, never mainnet).
-4. Confirm devnet ports clear (39510/39511/39508/39512).
+4. Confirm the pilot devnet ports clear (the operator-selected Node RPC/status/P2P + STRATUM_PORT for this pilot; the 39510/39511/39508/39512 set is only a historical example).
 5. Optionally remove devnet data dirs under `$HOME`.
 6. Confirm **both mainnets unchanged** (PID + binary hash) — VPS-1 and irium-eu.
 
@@ -129,3 +142,72 @@ systemctl is-active iriumd                       # active before and after
 ```
 If MainPID changes or the service is not active after teardown → incident:
 restore with `sudo systemctl start iriumd` first, before any other work.
+
+
+---
+
+## 14. Two-VPS pilot layout (proven, Phases 14-15)
+
+| Host | Role | Notes |
+|---|---|---|
+| **VPS-1** | Node A + stratum | Mining target. Node A P2P exposed to VPS-2 only; stratum exposed to the miner IP only; RPC/status private on `127.0.0.1`. |
+| **VPS-2** | Node B (peer/sync validator) + miner | Node B dials the VPS-1 public IP to peer; the miner (external or self-hosted on VPS-2) connects to the VPS-1 stratum over the public internet. |
+
+- **Internal/devnet ports (localhost or VPS-restricted, examples):** Node A RPC `127.0.0.1:39811`, status `127.0.0.1:39808`, P2P `39810` (VPS-2-restricted); Node B RPC/status `127.0.0.1:39821/39818`, P2P `39820`.
+- **External pilot port (operator-selected):** the stratum port (e.g. `39812`), exposed **only** to the miner IP. Pick a free port per pilot; never reuse `39512` blindly and never `39512` if a prior rule exists.
+- The P2P peer filter rejects loopback/private peers, so two nodes peer via **routable** IPs (cross-VPS), not `127.0.0.1` — Node B dials the VPS-1 public IP through a source-restricted firewall rule.
+
+## 15. Miner connection instructions
+
+```
+Algorithm:  sha256d
+URL:        stratum+tcp://<VPS-1-public-ip>:<operator-selected-stratum-port>
+Username:   <testnet-address>.<worker>      (worker default: w1)
+Password:   x
+```
+
+Example (pooler/cpuminer 2.5.1 or cpuminer-multi):
+```bash
+minerd -a sha256d -o stratum+tcp://<host>:<port> -u <testnet-address>.w1 -p x -t <threads>
+```
+The <testnet-address> must be the address the pending receipt is seeded for (miner == worker), so the reward-split passes and the block commits.
+
+## 16. Operator firewall rules (source-restricted, temporary)
+
+- **Require the miner public IP before opening the stratum port.** Never open the stratum to `Anywhere`.
+- Open exactly two source-restricted rules on VPS-1 (operator runs sudo; agent only prints commands; add a descriptive comment):
+```
+sudo ufw allow from <VPS-2-IP> to any port <NODE_A_P2P>  proto tcp
+sudo ufw allow from <MINER_IP> to any port <STRATUM_PORT> proto tcp
+```
+- **Remove both immediately after the pilot** and verify absent:
+```
+sudo ufw delete allow from <VPS-2-IP> to any port <NODE_A_P2P>  proto tcp
+sudo ufw delete allow from <MINER_IP> to any port <STRATUM_PORT> proto tcp
+sudo ufw status verbose | grep -E "<NODE_A_P2P>|<STRATUM_PORT>" || echo rules-absent
+```
+- Do **not** use port `39512` as mandatory; if referenced anywhere it is optional/operator-selected and source-restricted only.
+
+## 17. Validation checklist (native_rewardable pilot)
+
+- [ ] Miner connects from the **expected public IP** (stratum is source-restricted to it).
+- [ ] Stratum logs `adapter_kind=native_rewardable_reserved`.
+- [ ] `REWARDABLE_SHARE_ACCEPTED` (>=1 accepted share).
+- [ ] `REWARDABLE_CANDIDATE`.
+- [ ] `submit_block_extended` (receipts present).
+- [ ] `BLOCK_ACCEPTED` on Node A; node logs `block_extended accepted ... cleared_receipts=N`.
+- [ ] Committed block has a non-zero `irx1_root`.
+- [ ] `irx1_root` **matches the seeded receipt root**.
+- [ ] Node A and Node B end at the **same height and same tip hash**.
+- [ ] Payout/worker address recorded in stratum logs **matches the supplied miner address**.
+
+If shares are accepted but no block is found in the window: report the accepted-share proof + miner hashrate/difficulty; do **not** fake block success; recommend lowering the devnet difficulty further **only** under the explicit non-mainnet gate (`STRATUM_DEFAULT_DIFF` < 1, devnet floor), or extending the window.
+
+## 18. Proof status
+
+Internally proven end-to-end (no external party yet):
+- **Phase 13** — real cpuminer (pooler 2.5.1) mined through `native_rewardable` and committed a local height-1 block with the correct `irx1_root`.
+- **Phase 14** — same path synced across two VPS nodes over real cross-VPS P2P (matching height/hash/`irx1_root`).
+- **Phase 15** — self-hosted remote miner on VPS-2 connected to the VPS-1 stratum over the public internet and produced a block that synced to Node B.
+
+Phases 14 and 15 were **validation-only and added no code commits** (the proven code is `fad21c4`). See `poaw-x-native-rewardable-miner-validation-summary.md`.

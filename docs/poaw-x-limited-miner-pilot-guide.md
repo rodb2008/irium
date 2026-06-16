@@ -15,7 +15,7 @@
 
 - `cpuminer-multi` (recommended) or any Stratum v1-compatible CPU miner
 - A valid Irium testnet address (or use the example PKH-derived address)
-- Outbound TCP access to the seed node IP on port 39512
+- Outbound TCP access to the seed node IP on the operator-selected stratum port
 
 ---
 
@@ -25,7 +25,7 @@
 > Do not share connection details publicly.
 
 ```
-Stratum endpoint: SEED_NODE_IP:39512
+Stratum endpoint: SEED_NODE_IP<STRATUM_PORT>
 Protocol:         Stratum v1 (TCP)
 Worker format:    YOUR_IRIUM_ADDRESS.WORKER_NAME
 Password:         x (any value)
@@ -36,7 +36,7 @@ Password:         x (any value)
 ```bash
 cpuminer-multi \
   -a sha256d \
-  -o stratum+tcp://SEED_NODE_IP:39512 \
+  -o stratum+tcp://SEED_NODE_IP<STRATUM_PORT> \
   -u YOUR_IRIUM_ADDRESS.worker1 \
   -p x \
   -t 2

@@ -1,6 +1,6 @@
 # PoAW-X Trusted Miner Pilot — Operator Checklist
 
-**Version:** 1.0 (post Phase 14-F)
+**Version:** 2.0 (post Phase 15 — native_rewardable route proven)
 **Use:** Work top-to-bottom before invite, during, and at shutdown. All commands are sanitized — no tokens/auth/IPs. Replace `<DEVNET_PID>` with the running testnet node PID.
 
 > Mainnet must never be touched. RPC 39511 / status 39508 stay private throughout.
@@ -10,8 +10,8 @@
 ## A. Branch / hash verification
 ```bash
 cd /home/irium/irium
-git rev-parse --abbrev-ref HEAD        # testnet/poawx-phase12-completion-rc-hardening
-git rev-parse --short HEAD             # a0aedc6
+git rev-parse --abbrev-ref HEAD        # native_rewardable code at testnet/poawx-phase13-native-rewardable-cpuminer-e2e
+git rev-parse --short HEAD             # fad21c4 (native_rewardable route)
 git status --porcelain                 # empty = clean
 git log --show-signature -1 | grep -i "Good .*signature"   # signed
 ```
@@ -36,10 +36,14 @@ for p in /proc/[0-9]*; do case "$(readlink $p/exe 2>/dev/null)" in *iriumd*) :;;
 - [ ] Devnet node running from repo target / isolated devnet path, NOT the mainnet service binary.
 
 ## D. Port verification
+> Ports below are EXAMPLES. Use the operator-selected Phase-N ports for this pilot
+> (internal/devnet: Node RPC/status/P2P on 127.0.0.1 or VPS-restricted; external: the
+> operator-selected stratum port, source-restricted to the miner IP). 39512 is optional,
+> NOT mandatory.
 ```bash
-for p in 39510 39511 39508 39512; do ss -ltn | grep -q ":$p " && echo "$p listening" || echo "$p down"; done
+for p in <NODE_P2P> <NODE_RPC> <NODE_STATUS> <STRATUM_PORT>; do ss -ltn | grep -q ":$p " && echo "$p listening" || echo "$p down"; done
 ```
-- [ ] 39512 (stratum) listening; 39510/39511/39508 as expected.
+- [ ] The operator-selected <STRATUM_PORT> (stratum) + node RPC/status/P2P listening as expected (ports are per-pilot; 39512 not mandatory).
 
 ## E. RPC-private verification
 ```bash
@@ -53,11 +57,11 @@ ss -ltn | grep ':39511'                 # bound to 127.0.0.1 only
 ```bash
 sudo ufw status 2>/dev/null || sudo iptables -S 2>/dev/null   # operator-run (sudo)
 ```
-- [ ] Only `STRATUM_PORT` (39512) reachable from the miner; 39511/39508 blocked publicly.
+- [ ] Only the operator-selected `STRATUM_PORT` reachable, **source-restricted to the miner IP** (never Anywhere); RPC/status private on 127.0.0.1.
 
 ## G. Stratum verification
 ```bash
-ss -ltn | grep ':39512'                 # stratum listening
+ss -ltn | grep ':<STRATUM_PORT>'                 # stratum listening
 journalctl -u <testnet-stratum-unit> --no-pager -n 30 | sed -E 's/[0-9]{1,3}(\.[0-9]{1,3}){3}/<ip>/g'
 ```
 - [ ] Testnet stratum up and pointed at the testnet node.
@@ -112,3 +116,37 @@ for p in 39510 39511 39508 39512; do ss -ltn | grep -q ":$p " && echo "$p STILL 
 - [ ] `systemctl is-active iriumd` == active; running exe hash still `7c07ae2c…`.
 - [ ] Both mainnets still on official binary, PIDs unchanged.
 - [ ] (optional) devnet data dirs under `$HOME` removed (exact paths only).
+
+
+## N. Native_rewardable route validation (PoAW-X rewardable path)
+
+> Rewardable blocks come ONLY from the gated `native_rewardable` route. `cpuminer_compat`
+> stays NON-rewardable on PoAW-X (share accounting only); no variant sweep promotes a block.
+
+Stratum env for the pilot (Phase 13 gated route):
+```
+IRIUM_NETWORK=devnet IRIUM_STRATUM_ADAPTER_MODE=auto IRIUM_STRATUM_NATIVE_REWARDABLE_ENABLED=1
+IRIUM_STRATUM_POAWX=1 IRIUM_STRATUM_MINER_FAMILY=cpuminer STRATUM_DEFAULT_DIFF=0.001
+STRATUM_CARRIERS=off IRIUM_POAWX_MODE=active
+```
+- [ ] Stratum logs `adapter_kind=native_rewardable_reserved` and `sub-1 difficulty floor active`.
+- [ ] Miner connects from the **expected miner IP** (stratum source-restricted).
+- [ ] `REWARDABLE_SHARE_ACCEPTED` -> `REWARDABLE_CANDIDATE` -> `submit_block_extended` -> `BLOCK_ACCEPTED`.
+- [ ] Node A `block_extended accepted ... cleared_receipts=N`; block `irx1_root` non-zero and == seeded receipt root.
+- [ ] Node B reaches the SAME height + tip hash via P2P.
+- [ ] Payout/worker address in stratum logs == the supplied miner address.
+
+## O. Temporary firewall (source-restricted) add/remove
+
+> Operator runs sudo; agent only prints the commands. Never `Anywhere`. Require the miner IP first.
+```
+# add (VPS-1):
+sudo ufw allow from <VPS-2-IP> to any port <NODE_A_P2P>  proto tcp
+sudo ufw allow from <MINER_IP> to any port <STRATUM_PORT> proto tcp
+# remove immediately after the pilot + verify absent:
+sudo ufw delete allow from <VPS-2-IP> to any port <NODE_A_P2P>  proto tcp
+sudo ufw delete allow from <MINER_IP> to any port <STRATUM_PORT> proto tcp
+sudo ufw status verbose | grep -E "<NODE_A_P2P>|<STRATUM_PORT>" || echo rules-absent
+```
+- [ ] Both rules source-restricted (NOT Anywhere), added before mining.
+- [ ] Both rules removed + verified absent after the pilot.
