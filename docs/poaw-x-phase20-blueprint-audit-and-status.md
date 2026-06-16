@@ -41,7 +41,7 @@ fake completion."
 | # | Blueprint requirement | Current status | Missing (code / tests / docs) | Risk | Phase 20 action |
 |---|---|---|---|---|---|
 | B | CPU/GPU/ASIC fairness matrix | CPU lane only; no GPU/ASIC lane; no hidden-assignment/reveal | Consensus algorithm for lane eligibility, hidden-assignment/reveal, per-class distribution weights | **HIGH (consensus)** | **BLOCKED** — design-gap doc |
-| C | Multi-role reward split | 10%/receipt to worker only | Role set, per-role weights, role pkh binding, coinbase format, connect_block rules | **HIGH (consensus)** | **BLOCKED** — design-gap doc |
+| C | Multi-role reward split | Owner spec supplied (55/22/13/10); consensus primitives + validator implemented (gated, mainnet-off) | Pool production + node receipt-wire/persist threading + live connect_block enforcement | MED | **PARTIAL** — primitives/validator/tests COMPLETE; production follow-up (see design-gap doc, now resolved) |
 | D | Many-miner / multi-worker pool | Registry: multi-worker ✅; block production: single-miner | Per-worker coinbase outputs in stratum (depends on reward model) | MED | **PARTIAL** — registry test added; production gap documented |
 | E | Third-party pool fee | fee_bps must be 0 | Fee cap, fee pkh binding, fee coinbase output, connect_block verify | **HIGH (consensus)** | **BLOCKED** — design-gap doc |
 | F | Long soak / restart / reorg testing | Proven ad-hoc in 18C/18D/19C/19D | A reusable loopback harness + documented full-soak commands | LOW | **COMPLETE** — harness + doc |
@@ -51,20 +51,25 @@ fake completion."
 | J | Governance / community activation | None | Activation process doc | LOW | **COMPLETE** — doc |
 | K | Mainnet activation safety framework | Gating implemented + tested | Far-future-height policy, operator/rollback checklists, default-off confirmation | MED | **COMPLETE** — framework doc (no activation) |
 
-## 3. Consensus blockers (the only items that cannot be safely implemented now)
+## 3. Consensus blockers
 
-Three items require consensus-critical parameters that the repository does **not** define.
-Implementing them would mean inventing percentages/algorithms that would later become
-binding consensus — explicitly disallowed. Each has a precise design-gap doc:
+> **Update:** item **C (multi-role reward split)** is no longer blocked — the owner supplied
+> the 55/22/13/10 spec, and the consensus primitives + canonical-coinbase validator +
+> activation gate (mainnet-off) + tests are now implemented (testnet/devnet-gated). Pool
+> block production + node receipt-wire/persistence threading remain a documented follow-up
+> (PARTIAL). See `poaw-x-phase20-design-gap-multi-role-reward-split.md` (resolved).
 
-- **B — Fairness matrix:** `poaw-x-phase20-design-gap-fairness-matrix.md`
-- **C — Multi-role reward split:** `poaw-x-phase20-design-gap-multi-role-reward-split.md`
-- **E — Third-party pool fee:** `poaw-x-phase20-design-gap-third-party-fee.md`
+Two items still require consensus-critical parameters the repository does **not** define.
+Implementing them would mean inventing algorithms/values that would later become binding
+consensus — explicitly disallowed. Each has a precise design-gap doc:
 
-**Decision needed from the owner** for each: the exact consensus parameters (lane set +
-eligibility + reveal scheme + distribution weights; role set + weights + pkh binding; fee cap
-+ binding + output format). Once provided, each becomes a normal gated testnet implementation
-following the proven mode-1 pattern.
+- **B — Fairness matrix:** `poaw-x-phase20-design-gap-fairness-matrix.md` (BLOCKED)
+- **E — Third-party pool fee:** `poaw-x-phase20-design-gap-third-party-fee.md` (BLOCKED)
+- ~~C — Multi-role reward split~~ — **RESOLVED** (owner spec supplied; primitives/validator/tests done, gated, mainnet-off; pool production follow-up).
+
+**Decision still needed from the owner** for B and E: the exact consensus parameters (lane set +
+eligibility + reveal scheme + distribution weights; fee cap + binding + output format). Once
+provided, each becomes a normal gated testnet implementation following the proven mode-1 pattern.
 
 ## 4. What Phase 20 delivers (safe, local)
 
