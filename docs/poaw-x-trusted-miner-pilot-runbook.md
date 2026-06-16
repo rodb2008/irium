@@ -8,6 +8,17 @@
 
 > **TESTNET ONLY.** Isolated PoAW-X devnet. **No real Irium coins, no real rewards, no mainnet compatibility.** Chain may reset at any time. No mainnet wallets/keys/addresses on this testnet.
 
+> **ROUTE UPDATE (Phase 18 — delegated mode-1).** This v2.0 runbook documents the
+> earlier `native_rewardable` + manually-seeded-receipt route. **Phase 18 replaced the
+> seeded step with a non-custodial delegated (mode-1) flow:** the miner registers a
+> one-time delegation, the pool produces the receipt, the miner wallet stays the sole
+> payout identity, the delegate key is signer-only (never paid), and the official pool
+> is 0% fee. **For a real external miner pilot, use the delegated route** — see
+> `docs/poaw-x-phase19a-trusted-miner-pilot-readiness.md` and **Appendix A** below.
+> The selected registration mechanism is the wallet **`--emit-only`** mode, which is a
+> **Phase 19B code requirement (not yet implemented)** — keep the delegation endpoint
+> loopback-only; do not expose it and do not require miner SSH/tunnel access.
+
 ---
 
 ## 0. Rewardable route — READ FIRST
@@ -172,6 +183,12 @@ minerd -a sha256d -o stratum+tcp://<host>:<port> -u <testnet-address>.w1 -p x -t
 ```
 The <testnet-address> must be the address the pending receipt is seeded for (miner == worker), so the reward-split passes and the block commits.
 
+> **Superseded for external pilots (Phase 18).** The seeded-receipt requirement above
+> applies only to the legacy `native_rewardable` route. On the delegated mode-1 route
+> there is **no manual seed**: the miner registers a one-time delegation (see Appendix A),
+> the pool produces the receipt automatically, and `<wallet-address>.<worker>` must match
+> the registered delegation. The miner command itself is unchanged.
+
 ## 16. Operator firewall rules (source-restricted, temporary)
 
 - **Require the miner public IP before opening the stratum port.** Never open the stratum to `Anywhere`.
@@ -211,3 +228,81 @@ Internally proven end-to-end (no external party yet):
 - **Phase 15** — self-hosted remote miner on VPS-2 connected to the VPS-1 stratum over the public internet and produced a block that synced to Node B.
 
 Phases 14 and 15 were **validation-only and added no code commits** (the proven code is `fad21c4`). See `poaw-x-native-rewardable-miner-validation-summary.md`.
+
+The **delegated mode-1** route (the route selected for real external pilots) was proven
+in **Phase 18** at `491a4de`: 18C single-node E2E and 18D two-node cross-VPS sync. See
+`poaw-x-phase18-delegated-receipts-validation-summary.md`.
+
+---
+
+## Appendix A — Delegated mode-1 route (Phase 18; selected for external pilots)
+
+This is the route to use for a real trusted external miner. It removes the manual
+seeded receipt: the miner registers a one-time, non-custodial delegation; the pool
+produces the mode-1 receipt automatically; the miner wallet remains the sole payout
+identity; the delegate key is signer-only and never paid; the official fee is 0%.
+
+**Validated:** branch base `491a4de`; Phase 18C (single-node E2E) + Phase 18D
+(two-node cross-VPS sync). Reference: `docs/poaw-x-phase19a-trusted-miner-pilot-readiness.md`.
+
+### A.1 Registration model — `--emit-only` (LOCKED; keeps the endpoint loopback-only)
+
+1. Operator runs the pool with the loopback-only delegation endpoint
+   (`IRIUM_POAWX_DELEGATION_BIND=127.0.0.1:<delegation-port>`).
+2. Operator reads the pool identity locally and sends it to the miner out-of-band:
+   ```
+   curl -sS http://127.0.0.1:<delegation-port>/poawx/pool-identity   # pool_pubkey, network_id, fee_bps=0, domain
+   ```
+3. Miner builds and signs the delegation **locally** with the wallet `--emit-only`
+   mode (Phase 19B) and returns only the signed payload (no private key):
+   ```
+   irium-wallet poawx-register --emit-only \
+     --pool-pubkey <66hex> --network-id <1|2> \
+     --addr <miner-address> --worker <worker> \
+     --expiry-height <N> --fee-bps 0 > poawx-delegation.json
+   ```
+4. Operator POSTs the payload to the loopback-only endpoint:
+   ```
+   curl -sS -X POST http://127.0.0.1:<delegation-port>/poawx/delegation \
+     -H 'content-type: application/json' --data @poawx-delegation.json
+   ```
+5. Miner runs stock cpuminer unchanged (see §15).
+
+> **`--emit-only` is a Phase 19B code requirement and is NOT implemented yet.** Until
+> 19B ships, an external miner cannot register without exposing the loopback endpoint
+> or being granted SSH/tunnel access — neither of which is permitted for the pilot.
+> An SSH tunnel may be used ONLY as an emergency/dev fallback, never as the pilot path.
+
+### A.2 Stratum environment (delegated mode-1)
+
+```
+IRIUM_NETWORK=testnet IRIUM_STRATUM_POAWX=1 IRIUM_STRATUM_NATIVE_REWARDABLE_ENABLED=1
+IRIUM_STRATUM_ADAPTER_MODE=native_rewardable IRIUM_STRATUM_VARDIFF_ENABLED=0 STRATUM_DEFAULT_DIFF=0.001
+IRIUM_POAWX_DELEGATION_BIND=127.0.0.1:<delegation-port>   # non-loopback is refused
+IRIUM_POAWX_STATE_DIR=<state-dir>
+IRIUM_POAWX_DELEGATE_KEY_PATH=<state-dir>/poawx_delegate_key.hex   # signer-only, 0600
+IRIUM_POAWX_DELEGATIONS_PATH=<state-dir>/poawx_delegations.json    # no private keys
+```
+
+### A.3 Validation checklist (delegated mode-1)
+
+- [ ] Delegation stored (registry entry present; **no private key** in the file).
+- [ ] Pool identity reports `fee_bps=0`.
+- [ ] Miner connects from the expected IP; `adapter_kind=native_rewardable`.
+- [ ] `submit_block_extended … receipts=N` (mode-1) → `BLOCK_ACCEPTED`.
+- [ ] Block has a non-zero `irx1_root`; the block receipt carries the **embedded 226-byte delegation**.
+- [ ] Coinbase pays the **miner pkh only** (single p2pkh output); **delegate pkh NOT paid**.
+- [ ] Observer node (if used) reaches the same height + tip hash.
+- [ ] **No compat / variant-sweep promotion** (single deterministic canonical reconstruction only).
+
+### A.4 Operator caveats (Phase 18C/18D)
+
+- Activation height is a testnet/devnet config value, **never** a mainnet value.
+- The two-phase bootstrap (poawx-inactive → block 1 → active) is an isolated-E2E
+  artifact, not part of a pilot against an already-live chain.
+- A standalone observer/sync node (copied binary, no repo) must run from a CWD
+  containing `bootstrap/anchors.json` and `bootstrap/trust/allowed_anchor_signers`
+  (genesis is embedded; anchors are not).
+- On testnet/devnet feed peers via node-config `p2p_seeds` or env `IRIUM_MANUAL_PEERS`;
+  `IRIUM_STATIC_PEERS` is mainnet-only for the dialer.
+- Never `pkill -f` the node binary path; kill by exact PID after `/proc/<pid>/cmdline` check.

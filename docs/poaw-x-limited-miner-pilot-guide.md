@@ -9,6 +9,14 @@
 > No real rewards are issued. The chain may reset at any time without notice.
 > Do not use mainnet wallets, keys, or addresses on this testnet.
 
+> **ROUTE UPDATE (Phase 18 — delegated mode-1).** The current pilot route is the
+> non-custodial **delegated** flow. Before mining you register a one-time delegation
+> (your private key never leaves your wallet); the pool then produces the PoAW-X receipt
+> for you and your wallet stays the sole payout identity at 0% fee. Registration uses the
+> wallet **`--emit-only`** mode (a **Phase 19B** build requirement, **not available
+> yet**). See `docs/poaw-x-real-miner-pilot-invite.md` (Step 0) and
+> `docs/poaw-x-phase19a-trusted-miner-pilot-readiness.md`.
+
 ---
 
 ## Prerequisites
@@ -49,12 +57,17 @@ Replace `YOUR_IRIUM_ADDRESS` with your testnet address.
 
 ## PoAW-X Assignment and Receipt
 
-This testnet uses PoAW-X (Proof of Assigned Work Extended). The stratum handles
-receipt injection into the coinbase automatically if a valid receipt exists in
-the node pending pool. External miners using the stratum do not need to call
-the assignment/receipt endpoints directly.
+This testnet uses PoAW-X (Proof of Assigned Work Extended). On the delegated mode-1
+route, once your one-time delegation is registered (see the invite, Step 0), the pool
+produces the PoAW-X receipt on your behalf and injects the `irx1` commitment into the
+coinbase automatically. External miners using the stratum do not call the
+assignment/receipt/delegation endpoints directly.
 
-Assignment/receipt endpoints are private (localhost only).
+Assignment, receipt, and delegation endpoints are private (localhost only) and are
+never exposed; the delegation endpoint refuses any non-loopback bind by design.
+
+> On the legacy `native_rewardable` route the receipt was instead seeded manually by
+> the operator (`miner == worker`). The delegated route replaces that manual step.
 
 ---
 

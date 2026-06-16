@@ -9,6 +9,14 @@
 > **TESTNET ONLY. No real Irium coins. No mainnet compatibility.
 > Chain may reset at any time. Do not use mainnet wallets or addresses.**
 
+> **ROUTE UPDATE (Phase 18 — delegated mode-1).** The current pilot route is the
+> non-custodial **delegated** flow: you register a one-time delegation (your wallet
+> private key never leaves your machine), the pool produces the receipt for you, and
+> your wallet stays the sole payout identity at 0% fee. See **Step 0** below. The
+> registration uses the wallet **`--emit-only`** mode, which is a **Phase 19B build
+> requirement and is not available yet** — a real external pilot starts only after
+> 19B ships.
+
 ---
 
 ## What You Are Testing
@@ -29,6 +37,30 @@ This is a controlled pilot. You are one of at most 3 trusted testers.
 - `cpuminer-multi` (recommended) or any Stratum v1 CPU miner
 - Outbound TCP access to the operator-provided stratum host:port (operator-selected; not a fixed port)
 - An Irium testnet address (any valid address string works; no real funds)
+
+---
+
+## Step 0 — Register your delegation (one-time, delegated route)
+
+Before mining on the delegated route you register a one-time delegation. This is
+non-custodial: **your wallet private key never leaves your machine**, and the operator
+only ever receives a signed delegation payload.
+
+1. The operator sends you the **public** pool identity out-of-band: `pool_pubkey`
+   (66-hex), `network_id` (`1`=testnet / `2`=devnet), `fee_bps=0`, `domain`.
+2. You sign the delegation locally and produce a payload file (no private key inside):
+   ```
+   irium-wallet poawx-register --emit-only \
+     --pool-pubkey <66hex> --network-id <1|2> \
+     --addr <your-testnet-address> --worker <worker> \
+     --expiry-height <N> --fee-bps 0 > poawx-delegation.json
+   ```
+3. You send **only** `poawx-delegation.json` back to the operator. The operator submits
+   it to the pool's loopback-only endpoint. Once confirmed, you mine (below).
+
+> `--emit-only` is a **Phase 19B** wallet feature and is **not available yet**; this
+> step is documented so you know the flow. Do not send anyone your seed phrase or
+> private key — only the signed `poawx-delegation.json` payload. `--fee-bps` must be 0.
 
 ---
 

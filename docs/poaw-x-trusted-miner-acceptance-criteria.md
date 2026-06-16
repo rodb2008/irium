@@ -18,6 +18,18 @@ The pilot is considered **successful only if ALL** of the following hold.
 10. **No failed consensus validation** — `connect_block` accepts the good block; the 7-rule PoAW-X validation passes; no unexpected rejections of valid blocks.
 11. **Clean evidence** — logs contain enough to demonstrate the above **without** exposing secrets (no tokens, auth, private keys, real IPs, personal info in shared excerpts).
 
+## Delegated mode-1 route — additional must-pass items (Phase 18; for external pilots)
+
+> For a real external miner pilot on the delegated route, these items are required in
+> addition to the list above. Reference: `docs/poaw-x-phase19a-trusted-miner-pilot-readiness.md`.
+
+12. **Non-custodial registration** — the delegation was signed on the miner's machine; the operator received only a signed delegation payload; the registry contains **no private key**.
+13. **Loopback-only delegation endpoint** — `/poawx/delegation` was bound to `127.0.0.1` only and never exposed; the miner was not granted SSH/tunnel access for registration.
+14. **Embedded delegation** — the committed block receipt carries the canonical 226-byte delegation; an independent peer validates it on sync.
+15. **Direct miner payout, delegate not paid** — the coinbase pays the miner pkh only (single p2pkh output); the delegate pkh is never an output.
+16. **Official fee 0%** — pool identity and the registered delegation are `fee_bps=0`; any `fee_bps>0` is rejected.
+17. **No variant-sweep promotion** — the block was promoted via a single deterministic canonical reconstruction and `submit_block_extended`; no compat/variant sweep promoted it.
+
 ## Quality / nice-to-have (not required for pass)
 
 - Multiple accepted shares across the session.
@@ -37,4 +49,4 @@ The pilot is considered **successful only if ALL** of the following hold.
 
 ## Sign-off
 
-Record at session end: branch/hash (`a0aedc6`), connection confirmed (external), accepted-share count, irx1 verified (height + root prefix), both-mainnet-untouched confirmation, and a PASS/FAIL against the must-pass list.
+Record at session end: branch/hash (legacy native_rewardable route `a0aedc6`; delegated mode-1 route base `491a4de`), connection confirmed (external), accepted-share count, irx1 verified (height + root prefix), both-mainnet-untouched confirmation, and a PASS/FAIL against the must-pass list (including items 12–17 for the delegated route).

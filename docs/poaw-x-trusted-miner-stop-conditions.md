@@ -19,6 +19,15 @@ If **any** condition below is observed, **STOP the pilot immediately**: signal t
 11. **Node/pool crash or repeated restart** — testnet node or stratum panics, exits, or enters a restart loop.
 12. **Suspected abuse or unknown external connection** — any connection to the stratum that is not the invited trusted miner, or any sign of probing/abuse.
 
+## Delegated mode-1 route — additional stop conditions (Phase 18; for external pilots)
+
+13. **Delegate paid** — the coinbase contains an output to the pool delegate pkh (the delegate must be signer-only and never paid).
+14. **Non-zero fee** — pool identity or a registered delegation reports `fee_bps>0`, or any `fee_bps>0` is accepted instead of rejected.
+15. **Delegation endpoint exposed** — `/poawx/delegation` (or the delegation bind) is reachable from anything other than `127.0.0.1`.
+16. **Private key exposure** — a miner private key or seed reaches the operator/registry, or appears in any payload/log (only a signed delegation payload may be transferred).
+17. **Variant-sweep promotion** — a PoAW-X block is promoted via a compat/variant byte-order sweep rather than the single deterministic canonical reconstruction.
+18. **Delegation mismatch on sync** — an independent peer rejects the embedded delegation, or the embedded delegation differs across peers for the same block.
+
 ## Stop procedure
 
 1. Tell the miner to Ctrl+C (stop mining).
