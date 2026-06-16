@@ -13,9 +13,10 @@
 > non-custodial **delegated** flow. Before mining you register a one-time delegation
 > (your private key never leaves your wallet); the pool then produces the PoAW-X receipt
 > for you and your wallet stays the sole payout identity at 0% fee. Registration uses the
-> wallet **`--emit-only`** mode (a **Phase 19B** build requirement, **not available
-> yet**). See `docs/poaw-x-real-miner-pilot-invite.md` (Step 0) and
-> `docs/poaw-x-phase19a-trusted-miner-pilot-readiness.md`.
+> wallet **`--emit-only`** mode (**implemented locally in Phase 19B commit `1628843`**,
+> local-only checkpoint, not pushed; a real external pilot starts only after the operator
+> explicitly approves live testing). See `docs/poaw-x-real-miner-pilot-invite.md` (Step 0)
+> and `docs/poaw-x-phase19a-trusted-miner-pilot-readiness.md`.
 
 ---
 

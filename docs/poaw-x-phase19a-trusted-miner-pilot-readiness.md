@@ -3,8 +3,11 @@
 **Version:** 1.0 (Phase 19A — planning/readiness, docs-only)
 **Branch:** `testnet/poawx-phase19-trusted-miner-pilot-readiness`
 **Base checkpoint:** `origin/testnet/poawx-phase18-auto-receipts-zero-fee-rewards` @ `491a4de`
-**Status:** Readiness documentation only. **No code in Phase 19A.** A real external
-miner pilot additionally requires the Phase 19B `--emit-only` wallet change (below).
+**Status:** Readiness documentation only. **No code in Phase 19A.** The Phase 19B
+`--emit-only` wallet change is **implemented locally in Phase 19B commit `1628843`**
+(branch `testnet/poawx-phase19b-wallet-emit-only-delegation` — **local-only checkpoint,
+not pushed**). A real external miner pilot **still requires explicit operator approval
+before live testing**.
 **Network scope:** testnet / devnet only. Mainnet delegated (mode-1) path is
 consensus-gated and hard-rejected.
 
@@ -87,15 +90,18 @@ RPC stays private; the official fee stays 0%; `fee_bps > 0` stays rejected.
 > **SSH tunnel is NOT the recommended pilot path.** It may be documented only as an
 > emergency/dev fallback, never as the primary trusted-miner flow.
 
-### 4.1 Phase 19B code requirement (NOT implemented in 19A)
+### 4.1 Phase 19B implementation (implemented locally in commit `1628843`)
 
-`--emit-only` does not exist yet. Today, `irium-wallet poawx-register` performs
-GET pool-identity → sign → POST in one shot, and the pool delegation server refuses
-any non-loopback bind. A real external pilot is therefore **blocked on Phase 19B**,
-which must add a build-and-print mode that signs locally and emits the canonical
-226-byte delegation payload **without** contacting the pool.
+`--emit-only` is **implemented locally in Phase 19B commit `1628843`** (branch
+`testnet/poawx-phase19b-wallet-emit-only-delegation` — **local-only checkpoint, not
+pushed**). The online `irium-wallet poawx-register` still performs GET pool-identity →
+sign → POST in one shot; `--emit-only` adds a build-and-print mode that signs locally
+and emits the canonical 226-byte delegation payload **without** contacting the pool.
+The pool delegation server **still refuses any non-loopback bind** — the endpoint
+stays loopback-only. The code is implemented and unit-tested; **a real external pilot
+still requires explicit operator approval before live testing.**
 
-**Suggested future Phase 19B CLI shape (to be implemented and tested in 19B, not now):**
+**Phase 19B CLI shape (implemented and tested in commit `1628843`):**
 
 Miner side (offline; needs only the wallet + the operator-supplied public identity):
 ```
@@ -111,9 +117,11 @@ curl -sS -X POST http://127.0.0.1:<delegation-port>/poawx/delegation \
   -H 'content-type: application/json' --data @poawx-delegation.json
 ```
 
-Phase 19B must preserve all current fail-closed behavior: `--fee-bps` other than 0
-rejected; `--emit-only` must perform the same self-verify (`verify_signature`) before
-printing; output must contain no private key.
+Phase 19B preserves all current fail-closed behavior: `--fee-bps` other than 0 is
+rejected; `--emit-only` performs the same self-verify (`verify_signature`) before
+printing; the output contains no private key (the miner private key never leaves the
+wallet — the operator receives only the signed delegation payload); stdout carries
+only the JSON payload. The official fee remains 0%.
 
 ## 5. Miner command (stock cpuminer, unchanged)
 
@@ -173,6 +181,8 @@ block receipt → peer sync verified (same height/hash on the observer node) →
   runbook, checklist, invite, guide, acceptance-criteria, and stop-conditions to the
   delegated mode-1 route with `--emit-only` as the selected design. No code, no live
   processes.
-- **Phase 19B (future, separate approval):** implement and test the wallet
-  `--emit-only` mode; only then can a real trusted external miner register a
-  delegation without exposing the loopback endpoint or granting SSH access.
+- **Phase 19B (implemented locally in commit `1628843`; local-only, not pushed):** the
+  wallet `--emit-only` mode is implemented and unit-tested, so a trusted external miner
+  can register a delegation without exposing the loopback endpoint or granting SSH
+  access. A real external pilot still requires explicit operator approval before live
+  testing; chain difficulty remains automatic via LWMA-144 (never manually controlled).

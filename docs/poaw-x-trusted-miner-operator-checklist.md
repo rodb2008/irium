@@ -9,8 +9,9 @@
 > `native_rewardable` + seeded-receipt route. For a real external miner pilot use the
 > **delegated mode-1** route: see **Section P** below and
 > `docs/poaw-x-phase19a-trusted-miner-pilot-readiness.md`. The delegation endpoint stays
-> **loopback-only**; registration uses the wallet **`--emit-only`** mode, a **Phase 19B
-> code requirement (not yet implemented)**.
+> **loopback-only**; registration uses the wallet **`--emit-only`** mode, **implemented
+> locally in Phase 19B commit `1628843`** (local-only checkpoint, not pushed). A real
+> external pilot still requires explicit operator approval before live testing.
 
 ---
 
@@ -176,7 +177,7 @@ IRIUM_POAWX_DELEGATE_KEY_PATH=<state-dir>/poawx_delegate_key.hex   # signer-only
 IRIUM_POAWX_DELEGATIONS_PATH=<state-dir>/poawx_delegations.json    # no private keys
 ```
 
-Registration (`--emit-only`; Phase 19B code requirement — NOT implemented yet):
+Registration (`--emit-only`; implemented locally in Phase 19B commit `1628843`, not pushed):
 ```
 # operator (loopback): read identity, send to miner out-of-band
 curl -sS http://127.0.0.1:<delegation-port>/poawx/pool-identity     # pool_pubkey, network_id, fee_bps=0, domain

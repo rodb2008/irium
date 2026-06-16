@@ -15,9 +15,10 @@
 > payout identity, the delegate key is signer-only (never paid), and the official pool
 > is 0% fee. **For a real external miner pilot, use the delegated route** — see
 > `docs/poaw-x-phase19a-trusted-miner-pilot-readiness.md` and **Appendix A** below.
-> The selected registration mechanism is the wallet **`--emit-only`** mode, which is a
-> **Phase 19B code requirement (not yet implemented)** — keep the delegation endpoint
-> loopback-only; do not expose it and do not require miner SSH/tunnel access.
+> The selected registration mechanism is the wallet **`--emit-only`** mode, **implemented
+> locally in Phase 19B commit `1628843`** (local-only checkpoint, not pushed) — keep the
+> delegation endpoint loopback-only; do not expose it and do not require miner SSH/tunnel
+> access. A real external pilot still requires explicit operator approval before live testing.
 
 ---
 
@@ -254,7 +255,8 @@ identity; the delegate key is signer-only and never paid; the official fee is 0%
    curl -sS http://127.0.0.1:<delegation-port>/poawx/pool-identity   # pool_pubkey, network_id, fee_bps=0, domain
    ```
 3. Miner builds and signs the delegation **locally** with the wallet `--emit-only`
-   mode (Phase 19B) and returns only the signed payload (no private key):
+   mode (implemented in Phase 19B commit `1628843`) and returns only the signed
+   payload (no private key — the miner private key never leaves the wallet):
    ```
    irium-wallet poawx-register --emit-only \
      --pool-pubkey <66hex> --network-id <1|2> \
@@ -268,10 +270,11 @@ identity; the delegate key is signer-only and never paid; the official fee is 0%
    ```
 5. Miner runs stock cpuminer unchanged (see §15).
 
-> **`--emit-only` is a Phase 19B code requirement and is NOT implemented yet.** Until
-> 19B ships, an external miner cannot register without exposing the loopback endpoint
-> or being granted SSH/tunnel access — neither of which is permitted for the pilot.
-> An SSH tunnel may be used ONLY as an emergency/dev fallback, never as the pilot path.
+> **`--emit-only` is implemented locally in Phase 19B commit `1628843`** (local-only
+> checkpoint, not pushed). It lets an external miner register without exposing the
+> loopback endpoint or being granted SSH/tunnel access. A real external pilot still
+> requires explicit operator approval before live testing. An SSH tunnel may be used
+> ONLY as an emergency/dev fallback, never as the pilot path.
 
 ### A.2 Stratum environment (delegated mode-1)
 

@@ -13,9 +13,9 @@
 > non-custodial **delegated** flow: you register a one-time delegation (your wallet
 > private key never leaves your machine), the pool produces the receipt for you, and
 > your wallet stays the sole payout identity at 0% fee. See **Step 0** below. The
-> registration uses the wallet **`--emit-only`** mode, which is a **Phase 19B build
-> requirement and is not available yet** — a real external pilot starts only after
-> 19B ships.
+> registration uses the wallet **`--emit-only`** mode, **implemented locally in Phase 19B
+> commit `1628843`** (local-only checkpoint, not pushed) — a real external pilot starts
+> only after the operator explicitly approves live testing.
 
 ---
 
@@ -58,9 +58,11 @@ only ever receives a signed delegation payload.
 3. You send **only** `poawx-delegation.json` back to the operator. The operator submits
    it to the pool's loopback-only endpoint. Once confirmed, you mine (below).
 
-> `--emit-only` is a **Phase 19B** wallet feature and is **not available yet**; this
-> step is documented so you know the flow. Do not send anyone your seed phrase or
-> private key — only the signed `poawx-delegation.json` payload. `--fee-bps` must be 0.
+> `--emit-only` is a **Phase 19B** wallet feature, **implemented locally in commit
+> `1628843`** (local-only checkpoint, not pushed); a real external pilot starts only
+> after the operator explicitly approves live testing. Do not send anyone your seed
+> phrase or private key — only the signed `poawx-delegation.json` payload. `--fee-bps`
+> must be 0.
 
 ---
 
