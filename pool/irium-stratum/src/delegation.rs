@@ -593,6 +593,18 @@ fn grind_solution(seed: &[u8; 32], nonce: &[u8; 32], difficulty: u32) -> Option<
     None
 }
 
+/// Phase 18C: gated producer trace. Logs reason codes + short prefixes only;
+/// never secrets/tokens/full delegation hex/full signatures.
+pub fn producer_trace_enabled() -> bool {
+    env::var("IRIUM_POAWX_PRODUCER_TRACE")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+fn pfx(bytes: &[u8]) -> String {
+    hex::encode(&bytes[..bytes.len().min(4)])
+}
+
 /// Produce a mode-1 (delegated) pending receipt for `miner_pkh`/`worker`, or
 /// `None` if no valid delegation applies (fail-closed: missing/expired/wrong
 /// network/non-zero fee/wrong pool key/wrong worker tag/grind failure). Pure:
@@ -605,28 +617,74 @@ pub fn build_mode1_pending_receipt(
     worker: &str,
     ctx: &AssignmentContext,
 ) -> Option<crate::template::PoawxPendingReceipt> {
+    let trace = producer_trace_enabled();
     let miner_pkh_hex = hex::encode(miner_pkh);
-    let rec = store.get(&miner_pkh_hex, worker)?;
-    // Stored-record fail-closed checks.
-    if rec.network_id != network_id || rec.fee_bps != 0 {
-        return None;
+    macro_rules! deny {
+        ($reason:expr) => {{
+            if trace {
+                info!(
+                    "[poawx-trace] build_mode1 deny reason={} miner_pkh={} worker={} key={} net={} block_h={}",
+                    $reason, pfx(&miner_pkh), worker, deleg_key(&miner_pkh_hex, worker), network_id, ctx.block_height
+                );
+            }
+            return None;
+        }};
+    }
+    let rec = match store.get(&miner_pkh_hex, worker) {
+        Some(r) => r,
+        None => deny!("delegation_missing"),
+    };
+    if trace {
+        info!(
+            "[poawx-trace] build_mode1 found rec net={} fee_bps={} expiry={}",
+            rec.network_id, rec.fee_bps, rec.expiry_height
+        );
+    }
+    if rec.network_id != network_id {
+        deny!("rec_network_mismatch");
+    }
+    if rec.fee_bps != 0 {
+        deny!("rec_nonzero_fee");
     }
     if rec.expiry_height < ctx.block_height {
-        return None; // expired for this block (consensus rejects height > expiry)
+        deny!("expired");
     }
-    // Re-verify the canonical delegation binds to THIS pool key and miner.
-    let d = Delegation::deserialize(&hex::decode(&rec.delegation_hex).ok()?).ok()?;
-    if d.pool_pubkey != key.pubkey()
-        || d.miner_pkh() != miner_pkh
-        || d.network_id != network_id
-        || d.fee_bps != 0
-        || d.worker_tag != worker_tag(worker)
-    {
-        return None;
+    let dbytes = match hex::decode(&rec.delegation_hex) {
+        Ok(b) => b,
+        Err(_) => deny!("delegation_hex_bad"),
+    };
+    let d = match Delegation::deserialize(&dbytes) {
+        Ok(d) => d,
+        Err(_) => deny!("delegation_decode_bad"),
+    };
+    if d.pool_pubkey != key.pubkey() {
+        if trace {
+            info!(
+                "[poawx-trace] pool_pubkey mismatch deleg={} key={}",
+                pfx(&d.pool_pubkey),
+                pfx(&key.pubkey())
+            );
+        }
+        deny!("pool_pubkey_mismatch");
     }
-    let solution = grind_solution(&ctx.seed, &ctx.commitment_nonce, ctx.difficulty)?;
+    if d.miner_pkh() != miner_pkh {
+        deny!("miner_pkh_mismatch");
+    }
+    if d.network_id != network_id {
+        deny!("deleg_network_mismatch");
+    }
+    if d.fee_bps != 0 {
+        deny!("deleg_nonzero_fee");
+    }
+    if d.worker_tag != worker_tag(worker) {
+        deny!("worker_tag_mismatch");
+    }
+    let solution = match grind_solution(&ctx.seed, &ctx.commitment_nonce, ctx.difficulty) {
+        Some(s) => s,
+        None => deny!("grind_failed"),
+    };
     let signer_sig = key.sign_challenge(&solution, &ctx.commitment_nonce, ctx.block_height);
-    Some(crate::template::PoawxPendingReceipt {
+    let receipt = crate::template::PoawxPendingReceipt {
         height: ctx.block_height,
         lane: ctx.lane.clone(),
         worker_pkh: miner_pkh_hex,
@@ -635,7 +693,14 @@ pub fn build_mode1_pending_receipt(
         worker_pubkey: key.pubkey_hex(),
         worker_sig: hex::encode(signer_sig),
         delegation: rec.delegation_hex.clone(),
-    })
+    };
+    if trace {
+        info!(
+            "[poawx-trace] build_mode1 OK block_h={} lane={} sol_grinded=true delegation_present=true",
+            ctx.block_height, ctx.lane
+        );
+    }
+    Some(receipt)
 }
 
 /// Fetch the node's `/poawx/assignment` (single source of truth for the

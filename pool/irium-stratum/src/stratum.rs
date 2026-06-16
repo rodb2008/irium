@@ -1383,32 +1383,60 @@ fn build_session_poawx_receipts(
     config: &StratumConfig,
     pkh: &[u8; 20],
 ) -> Vec<PoawxPendingReceipt> {
+    let trace = crate::delegation::producer_trace_enabled();
+    macro_rules! fallback {
+        ($reason:expr) => {{
+            if trace {
+                info!(
+                    "[poawx-trace] session_receipts fallback reason={} poawx_enabled={} producer={} job_h={} worker={:?}",
+                    $reason,
+                    config.poawx_enabled,
+                    config.poawx_producer.is_some(),
+                    job.height,
+                    session.worker
+                );
+            }
+            return job.poawx_pending_receipts.clone();
+        }};
+    }
     if !config.poawx_enabled {
-        return job.poawx_pending_receipts.clone();
+        fallback!("poawx_disabled");
     }
     let producer = match &config.poawx_producer {
         Some(p) => p,
-        None => return job.poawx_pending_receipts.clone(),
+        None => fallback!("producer_absent"),
     };
     let assignment = match &job.poawx_assignment {
         Some(a) => a,
-        None => return job.poawx_pending_receipts.clone(),
+        None => fallback!("assignment_missing"),
     };
     let worker = match &session.worker {
         Some(w) => w
             .split_once('.')
             .map(|(_, rest)| rest.to_string())
             .unwrap_or_default(),
-        None => return job.poawx_pending_receipts.clone(),
+        None => fallback!("session_worker_none"),
     };
+    if trace {
+        info!(
+            "[poawx-trace] session_receipts producer=present poawx_enabled=true worker={} miner_pkh={} assignment_h={} job_h={} assignment_lane={}",
+            worker,
+            hex::encode(&pkh[..pkh.len().min(4)]),
+            assignment.height,
+            job.height,
+            assignment.lane
+        );
+    }
     let ctx = match crate::delegation::assignment_context_from_dto(assignment, job.height) {
         Some(c) => c,
         None => {
-            warn!(
-                "[poawx-deleg] assignment mismatch for job height={}; no mode-1 receipt",
-                job.height
-            );
-            return job.poawx_pending_receipts.clone();
+            if trace {
+                info!(
+                    "[poawx-trace] session_receipts ctx_reject (height/lane) assignment_h={} job_h={} lane={}",
+                    assignment.height, job.height, assignment.lane
+                );
+            }
+            fallback!("assignment_ctx_reject");
         }
     };
     match crate::delegation::build_mode1_pending_receipt(
@@ -1419,8 +1447,21 @@ fn build_session_poawx_receipts(
         &worker,
         &ctx,
     ) {
-        Some(receipt) => vec![receipt],
-        None => job.poawx_pending_receipts.clone(),
+        Some(receipt) => {
+            if trace {
+                let root = crate::block::compute_receipts_root_from_pending(std::slice::from_ref(
+                    &receipt,
+                ));
+                info!(
+                    "[poawx-trace] session_receipts BUILT count=1 delegation_present={} root={} job_h={}",
+                    !receipt.delegation.is_empty(),
+                    hex::encode(&root[..4]),
+                    job.height
+                );
+            }
+            vec![receipt]
+        }
+        None => fallback!("build_mode1_none"),
     }
 }
 
@@ -1697,6 +1738,28 @@ fn build_native_rewardable_job(
         template_fingerprint: snapshot.template_fingerprint.clone(),
         clean_jobs: true,
     })
+}
+
+/// Phase 18C fix: split the native_rewardable coinbase for mining.notify at the
+/// extranonce1 boundary — `coinbase1` = bytes BEFORE extranonce1, `coinbase2` =
+/// bytes AFTER extranonce2. The miner inserts `extranonce1 || extranonce2`
+/// between them, reproducing `build_native_rewardable_coinbase` byte-for-byte
+/// (INCLUDING the mode-1 irx1 commitment). Previously send_notify used the
+/// snapshot's legacy `coinbase_prefix/suffix`, which omitted the irx1, so the
+/// mined coinbase never matched the share-validation coinbase when a delegated
+/// receipt was present (all shares rejected low_difficulty at height>=activation).
+fn native_rewardable_notify_split(snapshot: &CanonicalJobSnapshot) -> Result<(Vec<u8>, Vec<u8>)> {
+    let marker_extranonce2 = [0x1c, 0xab, 0xad, 0x1d];
+    let full = build_native_rewardable_coinbase(snapshot, &marker_extranonce2)?;
+    let mut marker = snapshot.extranonce1.clone();
+    marker.extend_from_slice(&marker_extranonce2);
+    let pos = full
+        .windows(marker.len())
+        .position(|w| w == marker.as_slice())
+        .ok_or_else(|| anyhow!("native notify split: extranonce marker missing"))?;
+    let cb1 = full[..pos].to_vec(); // before extranonce1
+    let cb2 = full[pos + marker.len()..].to_vec(); // after extranonce2
+    Ok((cb1, cb2))
 }
 
 async fn template_loop(
@@ -4209,6 +4272,18 @@ async fn send_notify(
                 hex::encode(&snap.coinbase_suffix),
                 snap.branches.iter().map(hex::encode).collect::<Vec<_>>(),
             )
+        } else if session.adapter_kind == AdapterKind::NativeRewardableReserved {
+            // Phase 18C fix: native_rewardable shares are validated against
+            // build_native_rewardable_coinbase (which carries the mode-1 irx1
+            // commitment). The notify MUST send that same coinbase, split at the
+            // extranonce boundary, so the mined coinbase matches validation.
+            let (cb1, cb2) = native_rewardable_notify_split(snap)?;
+            (
+                prev_hex_for_height(&job.prev_hash, job.height),
+                hex::encode(cb1),
+                hex::encode(cb2),
+                snap.branches.iter().map(hex::encode).collect(),
+            )
         } else {
             // Use the snapshot's prefix/suffix so the bytes stay byte-identical
             // to the share-validation path. The marker-based prefix/suffix split
@@ -4600,6 +4675,60 @@ mod tests {
         assert!(
             coinbase.windows(irx1_tag.len()).any(|w| w == irx1_tag),
             "coinbase must contain the irx1 commitment"
+        );
+    }
+
+    #[test]
+    fn phase18c_native_notify_split_matches_validation_coinbase_mode1() {
+        let config = test_config(MinerFamilyMode::Asic);
+        let session = test_session(AdapterKind::NativeRewardableReserved);
+        let mut snapshot =
+            build_canonical_job_snapshot(&native_test_job(), &session, &config).unwrap();
+        let mut deleg = vec![0u8; 226];
+        deleg[0] = 1;
+        snapshot.poawx_pending_receipts = vec![PoawxPendingReceipt {
+            height: snapshot.height,
+            lane: "cpu".to_string(),
+            worker_pkh: hex::encode([0x11u8; 20]),
+            solution: "0011223344556677".to_string(),
+            commitment_nonce: "cd".repeat(32),
+            worker_pubkey: hex::encode([0x02u8; 33]),
+            worker_sig: "11".repeat(64),
+            delegation: hex::encode(&deleg),
+        }];
+        let en2 = vec![0u8; snapshot.extranonce2_size];
+        let validation_cb = build_native_rewardable_coinbase(&snapshot, &en2).unwrap();
+        let (cb1, cb2) = native_rewardable_notify_split(&snapshot).unwrap();
+        let mut mined = cb1;
+        mined.extend_from_slice(&snapshot.extranonce1);
+        mined.extend_from_slice(&en2);
+        mined.extend_from_slice(&cb2);
+        assert_eq!(
+            mined, validation_cb,
+            "notify coinbase must reconstruct to the validation coinbase"
+        );
+        let irx1 = [0x6au8, 0x24, b'i', b'r', b'x', b'1'];
+        assert!(
+            mined.windows(irx1.len()).any(|w| w == irx1),
+            "mode-1 notify coinbase must carry irx1"
+        );
+    }
+
+    #[test]
+    fn phase18c_native_notify_split_matches_validation_coinbase_mode0() {
+        let config = test_config(MinerFamilyMode::Asic);
+        let session = test_session(AdapterKind::NativeRewardableReserved);
+        let snapshot = build_canonical_job_snapshot(&native_test_job(), &session, &config).unwrap();
+        let en2 = vec![0u8; snapshot.extranonce2_size];
+        let validation_cb = build_native_rewardable_coinbase(&snapshot, &en2).unwrap();
+        let (cb1, cb2) = native_rewardable_notify_split(&snapshot).unwrap();
+        let mut mined = cb1;
+        mined.extend_from_slice(&snapshot.extranonce1);
+        mined.extend_from_slice(&en2);
+        mined.extend_from_slice(&cb2);
+        assert_eq!(
+            mined, validation_cb,
+            "mode-0 split must still match validation"
         );
     }
 
