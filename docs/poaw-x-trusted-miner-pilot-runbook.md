@@ -327,3 +327,71 @@ IRIUM_POAWX_DELEGATIONS_PATH=<state-dir>/poawx_delegations.json    # no private 
 - On testnet/devnet feed peers via node-config `p2p_seeds` or env `IRIUM_MANUAL_PEERS`;
   `IRIUM_STATIC_PEERS` is mainnet-only for the dialer.
 - Never `pkill -f` the node binary path; kill by exact PID after `/proc/<pid>/cmdline` check.
+
+---
+
+## Appendix B — Firewall handoff (operator-run only)
+
+> **The agent/Claude must NEVER run `sudo`, `ufw`, or any firewall command.** It only
+> prints the exact commands; the **operator runs them**. The live pilot also requires
+> **explicit operator approval** before any rule is opened. The current code and docs are
+> **local-only on the VPS and not pushed.**
+
+### B.1 Exposure policy
+- **Stratum is the only miner-facing port.** Open it **source-restricted to the single
+  trusted-miner IP** — **never `Anywhere`**.
+- **Keep loopback-only / private (never expose):** the **delegation endpoint
+  `/poawx/delegation`**, **RPC**, **status**, **metrics**. Also never expose or share the
+  **wallet files**, the **delegate key path** (`poawx_delegate_key.hex`), or the
+  **delegation registry path** (`poawx_delegations.json`).
+- Status/metrics stay private unless **separately** approved.
+- An **optional observer P2P** rule (only if a second sync node is used) must be a
+  **separate** rule, **source-restricted to the observer IP only**, never `Anywhere`.
+
+### B.2 Difficulty (read before mining)
+- Use **`STRATUM_DEFAULT_DIFF=1`** for the native_rewardable pilot — this is the **stratum
+  share difficulty** (share target = block target; avoids the cpuminer flood/stall a sub-1
+  value causes). **It is NOT chain difficulty.**
+- **Chain difficulty remains automatic via LWMA-144** and must **not** be manually
+  controlled.
+
+### B.3 Pre-open checklist (operator; all must pass before opening any rule)
+- [ ] Trusted-miner **IP confirmed** (exact source IP for the rule).
+- [ ] **Stratum port confirmed** (the operator-selected `<STRATUM_PORT>` for this pilot).
+- [ ] Stratum is **bound only as intended** (e.g. the host/interface you expect; not a
+      stray `0.0.0.0` bind you did not plan) — verify with `ss -ltnp | grep <STRATUM_PORT>`.
+- [ ] **Delegation endpoint and RPC are loopback-only** (`ss -ltnp` shows `127.0.0.1` for
+      the delegation/RPC/status/metrics ports).
+- [ ] **Mainnet/prod PIDs alive** (VPS-1 mainnet + production pool) and untouched.
+- [ ] **`$TROOT` is isolated** (fresh testnet run root under `$HOME`; not a mainnet/prod path).
+
+### B.4 Open (operator runs — agent only prints)
+```
+sudo ufw allow from <MINER_IP> to any port <STRATUM_PORT> proto tcp comment 'poawx trusted miner stratum temp'
+# verify the rule exists:
+sudo ufw status numbered | grep <STRATUM_PORT>
+```
+Optional observer P2P (only if a second node peers; separate + source-restricted):
+```
+sudo ufw allow from <OBSERVER_IP> to any port <NODE_P2P_PORT> proto tcp comment 'poawx observer p2p temp'
+sudo ufw status numbered | grep <NODE_P2P_PORT>
+```
+
+### B.5 Close (operator runs immediately after the pilot)
+```
+sudo ufw delete allow from <MINER_IP> to any port <STRATUM_PORT> proto tcp
+# verify absent:
+sudo ufw status numbered | grep <STRATUM_PORT> || echo "stratum rule absent"
+```
+Observer rule (if it was opened):
+```
+sudo ufw delete allow from <OBSERVER_IP> to any port <NODE_P2P_PORT> proto tcp
+sudo ufw status numbered | grep <NODE_P2P_PORT> || echo "observer rule absent"
+```
+
+### B.6 Post-close checklist
+- [ ] Stratum (and observer, if any) firewall **rule removed + verified absent**.
+- [ ] **Test ports clear** (stratum + any pilot loopback ports no longer listening).
+- [ ] **Exact-pidfile cleanup done** (miner/stratum/node stopped by pidfile; never `pkill`/`killall`).
+- [ ] **Mainnet/prod PIDs alive** and untouched (before == after).
+- [ ] **Logs/artifacts preserved** (sanitized: mask IPs, strip tokens/auth) under a dated dir.

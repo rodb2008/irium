@@ -201,3 +201,43 @@ curl -sS -X POST http://127.0.0.1:<delegation-port>/poawx/delegation \
 - [ ] Operator caveats applied: activation height is testnet-only; standalone node needs
       `bootstrap/anchors.json` + `bootstrap/trust/allowed_anchor_signers`; testnet peers via
       `p2p_seeds`/`IRIUM_MANUAL_PEERS` not `IRIUM_STATIC_PEERS`; never `pkill -f`.
+
+## Q. Firewall handoff (operator-run only)
+
+> **The agent never runs `sudo`/`ufw`** — it prints commands; the **operator** runs them.
+> Live pilot requires **explicit operator approval**. Full detail + exact commands:
+> runbook **Appendix B**. Stratum is the **only** miner-facing port, **source-restricted
+> to the trusted-miner IP**, **never `Anywhere`**. `/poawx/delegation`, RPC, status, metrics
+> stay loopback/private; never expose wallet files, the delegate key path, or the registry path.
+> Use `STRATUM_DEFAULT_DIFF=1` (stratum **share** difficulty, **not** chain difficulty;
+> chain difficulty is automatic via LWMA-144). Code/docs are local-only, not pushed.
+
+Pre-open (all must pass):
+- [ ] Trusted-miner IP confirmed.
+- [ ] Stratum port confirmed.
+- [ ] Stratum bound only as intended (`ss -ltnp | grep <STRATUM_PORT>`; no stray bind).
+- [ ] Delegation/RPC/status/metrics loopback-only (`ss -ltnp` shows `127.0.0.1`).
+- [ ] Mainnet/prod PIDs alive and untouched.
+- [ ] `$TROOT` isolated (fresh testnet root under `$HOME`).
+
+Open (operator runs):
+```
+sudo ufw allow from <MINER_IP> to any port <STRATUM_PORT> proto tcp comment 'poawx trusted miner stratum temp'
+sudo ufw status numbered | grep <STRATUM_PORT>
+```
+
+Close (operator runs immediately after the pilot):
+```
+sudo ufw delete allow from <MINER_IP> to any port <STRATUM_PORT> proto tcp
+sudo ufw status numbered | grep <STRATUM_PORT> || echo "stratum rule absent"
+```
+
+Post-close (all must pass):
+- [ ] Stratum (and observer, if any) rule removed + verified absent.
+- [ ] Test ports clear.
+- [ ] Exact-pidfile cleanup done (no `pkill`/`killall`).
+- [ ] Mainnet/prod PIDs alive (before == after).
+- [ ] Logs/artifacts preserved (sanitized).
+
+> Optional observer P2P: a **separate** rule source-restricted to the observer IP only,
+> never `Anywhere` (see runbook Appendix B).

@@ -71,6 +71,11 @@ only ever receives a signed delegation payload.
 The operator will send you the stratum host IP directly.
 Do not share it publicly.
 
+> **You must give the operator your miner's public IP first.** The operator opens a
+> firewall rule that allows **only your IP** to reach the stratum port (the stratum is the
+> only port exposed to you), and removes it right after the session. If your IP changes
+> mid-session, tell the operator. No other port is opened to you.
+
 ```
 Protocol:    Stratum v1 (TCP)
 Host:        TESTNET_STRATUM_HOST  (provided by operator)

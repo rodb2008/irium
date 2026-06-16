@@ -186,7 +186,14 @@ block receipt → peer sync verified (same height/hash on the observer node) →
   can register a delegation without exposing the loopback endpoint or granting SSH
   access. A real external pilot still requires explicit operator approval before live
   testing; chain difficulty remains automatic via LWMA-144 (never manually controlled).
-- **Phase 19C (local E2E test plan; not yet executed):** see
-  `docs/poaw-x-phase19c-local-e2e-test-plan.md` for the isolated, loopback-only,
-  single-VPS end-to-end validation of the `--emit-only` path (17 required proofs). It is
-  documented but **not executed** — running it requires explicit operator approval.
+- **Phase 19C (local E2E — EXECUTED + PASSED 2026-06-16):** see
+  `docs/poaw-x-phase19c-local-e2e-test-plan.md`. The isolated, loopback-only, single-VPS
+  end-to-end validation of the `--emit-only` path passed all 17 proofs (block 2 committed
+  mode-1 via `submit_block_extended`, miner-paid/delegate-unpaid/fee-0%, embedded
+  delegation, registry has no private key). Local-only, not pushed.
+- **Live external trusted-miner pilot (operator-approved; not started):** the firewall
+  handoff is **operator-run only** (the agent never runs `sudo`/`ufw`) — stratum is the
+  only miner-facing port, source-restricted to the trusted-miner IP, never `Anywhere`;
+  `/poawx/delegation`, RPC, status, metrics stay loopback-only. Exact open/verify/close
+  commands + pre-open/post-close checklists: runbook **Appendix B** and operator checklist
+  **Section Q**.
