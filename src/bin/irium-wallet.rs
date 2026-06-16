@@ -2321,6 +2321,7 @@ fn usage() {
     eprintln!("  irium-wallet backup [--out <file>]");
     eprintln!("  irium-wallet restore-backup <file> [--force]");
     eprintln!("  irium-wallet address-to-pkh <base58_addr>");
+    eprintln!("  irium-wallet poawx-register --pool <url> --addr <addr> --worker <name> --expiry-height <N> [--fee-bps 0]");
     eprintln!("  irium-wallet qr <base58_addr> [--svg] [--out <file>]");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
@@ -3357,6 +3358,175 @@ fn signer_material_from_wallet(address: &str) -> Result<(WalletKey, SigningKey),
         .map_err(|e| format!("wallet secret key invalid: {e}"))?;
     let signing_key = SigningKey::from(secret);
     Ok((key, signing_key))
+}
+
+// ── Phase 18B step-2: PoAW-X one-time delegation registration ────────────────
+
+/// Build a delegation and sign it with the miner wallet key. The private key is
+/// used only in memory (inside `signing_key`) and never returned or printed.
+/// Official pool fee is 0% — a non-zero `fee_bps` is rejected.
+fn build_signed_delegation(
+    signing_key: &SigningKey,
+    pool_pubkey: [u8; 33],
+    network_id: u8,
+    worker: &str,
+    expiry_height: u64,
+    fee_bps: u16,
+    deleg_nonce: [u8; 32],
+) -> Result<irium_node_rs::poawx::Delegation, String> {
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    use sha2::{Digest, Sha256};
+    if fee_bps != 0 {
+        return Err("official pool fee is 0%; --fee-bps > 0 is not supported".to_string());
+    }
+    let vk = k256::ecdsa::VerifyingKey::from(signing_key);
+    let enc = vk.to_encoded_point(true);
+    let mut miner_pubkey = [0u8; 33];
+    miner_pubkey.copy_from_slice(enc.as_bytes());
+    let worker_tag = if worker.is_empty() {
+        [0u8; 32]
+    } else {
+        let mut h = Sha256::new();
+        h.update(worker.as_bytes());
+        h.finalize().into()
+    };
+    let mut d = irium_node_rs::poawx::Delegation {
+        deleg_version: irium_node_rs::poawx::Delegation::VERSION,
+        network_id,
+        miner_pubkey,
+        pool_pubkey,
+        worker_tag,
+        expiry_height,
+        fee_bps: 0,
+        fee_pkh: [0u8; 20],
+        deleg_nonce,
+        delegation_sig: [0u8; 64],
+    };
+    let sig: Signature = signing_key
+        .sign_prehash(&d.message_hash())
+        .map_err(|e| format!("sign delegation: {e}"))?;
+    d.delegation_sig.copy_from_slice(&sig.to_bytes());
+    Ok(d)
+}
+
+fn next_flag_value(args: &[String], i: &mut usize) -> Result<String, String> {
+    if *i + 1 >= args.len() {
+        return Err(format!("missing value for {}", args[*i]));
+    }
+    let v = args[*i + 1].clone();
+    *i += 2;
+    Ok(v)
+}
+
+fn cmd_poawx_register(args: &[String]) -> Result<(), String> {
+    use rand_core::{OsRng, RngCore};
+    let mut pool: Option<String> = None;
+    let mut addr: Option<String> = None;
+    let mut worker = String::new();
+    let mut expiry: Option<u64> = None;
+    let mut fee_bps: u16 = 0;
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pool" => pool = Some(next_flag_value(args, &mut i)?),
+            "--addr" => addr = Some(next_flag_value(args, &mut i)?),
+            "--worker" => worker = next_flag_value(args, &mut i)?,
+            "--expiry-height" => {
+                expiry = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --expiry-height".to_string())?,
+                )
+            }
+            "--fee-bps" => {
+                fee_bps = next_flag_value(args, &mut i)?
+                    .parse()
+                    .map_err(|_| "invalid --fee-bps".to_string())?
+            }
+            other => return Err(format!("unknown flag {other}")),
+        }
+    }
+    if fee_bps != 0 {
+        return Err("official pool fee is 0%; --fee-bps > 0 is not supported".to_string());
+    }
+    let pool = pool.ok_or_else(|| "--pool <url> required".to_string())?;
+    let addr = addr.ok_or_else(|| "--addr <miner-address> required".to_string())?;
+    let expiry = expiry.ok_or_else(|| "--expiry-height <N> required".to_string())?;
+
+    let base = pool.trim_end_matches('/').to_string();
+    let client = rpc_client(&base)?;
+
+    // 1. GET pool identity.
+    let id: serde_json::Value = client
+        .get(format!("{base}/poawx/pool-identity"))
+        .send()
+        .map_err(|e| format!("GET pool-identity: {e}"))
+        .and_then(|r| {
+            if r.status().is_success() {
+                r.json::<serde_json::Value>()
+                    .map_err(|e| format!("decode pool-identity: {e}"))
+            } else {
+                Err(format!("pool-identity returned HTTP {}", r.status()))
+            }
+        })?;
+    let pool_pubkey_hex = id
+        .get("pool_pubkey")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "pool-identity missing pool_pubkey".to_string())?;
+    let network_id = id
+        .get("network_id")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "pool-identity missing network_id".to_string())? as u8;
+    let pool_fee = id.get("fee_bps").and_then(|v| v.as_u64()).unwrap_or(0);
+    if pool_fee != 0 {
+        return Err(format!(
+            "pool reports non-zero fee_bps={pool_fee}; refusing"
+        ));
+    }
+    let pool_pubkey_bytes =
+        hex::decode(pool_pubkey_hex).map_err(|_| "pool_pubkey invalid hex".to_string())?;
+    if pool_pubkey_bytes.len() != 33 {
+        return Err("pool_pubkey must be 33 bytes".to_string());
+    }
+    let mut pool_pubkey = [0u8; 33];
+    pool_pubkey.copy_from_slice(&pool_pubkey_bytes);
+
+    // 2. Sign delegation with the wallet key (in memory only).
+    let (_key, signing_key) = signer_material_from_wallet(&addr)?;
+    let mut nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    let d = build_signed_delegation(
+        &signing_key,
+        pool_pubkey,
+        network_id,
+        &worker,
+        expiry,
+        fee_bps,
+        nonce,
+    )?;
+    d.verify_signature()
+        .map_err(|e| format!("self-verify failed before submit: {e}"))?;
+    let miner_pkh_hex = hex::encode(d.miner_pkh());
+
+    // 3. POST the canonical 226-byte delegation hex.
+    let body = serde_json::json!({
+        "delegation": hex::encode(d.serialize()),
+        "worker": worker,
+        "miner_pkh": miner_pkh_hex,
+    });
+    let resp = client
+        .post(format!("{base}/poawx/delegation"))
+        .json(&body)
+        .send()
+        .map_err(|e| format!("POST delegation: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if status.is_success() {
+        println!("delegation registered (miner_pkh {miner_pkh_hex}, worker {worker}, expiry {expiry}): {text}");
+        Ok(())
+    } else {
+        Err(format!("delegation rejected (HTTP {status}): {text}"))
+    }
 }
 
 fn sign_target_hash(
@@ -14838,6 +15008,35 @@ mod tests {
     };
     use std::sync::{Mutex, OnceLock};
 
+    #[test]
+    fn poawx_register_build_signed_delegation_verifies() {
+        use k256::ecdsa::{SigningKey, VerifyingKey};
+        let sk = SigningKey::from_slice(&[5u8; 32]).unwrap();
+        let vk = VerifyingKey::from(&sk);
+        let mut mp = [0u8; 33];
+        mp.copy_from_slice(vk.to_encoded_point(true).as_bytes());
+        let pool = [0x02u8; 33];
+
+        let d = build_signed_delegation(&sk, pool, 1, "rig1", 1000, 0, [9u8; 32]).unwrap();
+        // Canonical type verifies its own signature.
+        assert!(d.verify_signature().is_ok());
+        assert_eq!(d.miner_pubkey, mp);
+        assert_eq!(d.pool_pubkey, pool);
+        assert_eq!(d.fee_bps, 0);
+        // miner_pkh == HASH160(pubkey) via the wallet's own hash160.
+        assert_eq!(d.miner_pkh(), hash160(&mp));
+        // worker_tag == SHA256("rig1").
+        let wt: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"rig1");
+            h.finalize().into()
+        };
+        assert_eq!(d.worker_tag, wt);
+        // Non-zero fee is rejected.
+        assert!(build_signed_delegation(&sk, pool, 1, "rig1", 1000, 100, [9u8; 32]).is_err());
+    }
+
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -24816,6 +25015,12 @@ fn main() {
                     eprintln!("Invalid address or checksum");
                     std::process::exit(1);
                 }
+            }
+        }
+        "poawx-register" => {
+            if let Err(e) = cmd_poawx_register(&args) {
+                eprintln!("{e}");
+                std::process::exit(1);
             }
         }
         "qr" => {

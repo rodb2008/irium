@@ -1,4 +1,5 @@
 mod block;
+mod delegation;
 mod events;
 mod pow;
 mod stratum;
@@ -221,6 +222,12 @@ async fn main() -> Result<()> {
         ban_duration_secs,
         poawx_enabled,
     };
+
+    // Phase 18B step-2: opt-in PoAW-X delegation registration server. Disabled
+    // unless IRIUM_POAWX_DELEGATION_BIND is set; refuses non-loopback binds; no
+    // public exposure by default. Mainnet context returns 503. Runs as a
+    // separate task; the stratum TCP/metrics paths are unaffected.
+    delegation::maybe_spawn(cfg.rpc_base.clone(), cfg.rpc_token.clone());
 
     run(cfg).await
 }
