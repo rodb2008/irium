@@ -157,6 +157,14 @@ pub async fn get_explorer_blocks(client: &Client, base: &str, limit: u64) -> Vec
         .blocks
 }
 
+pub async fn get_node_blocks(client: &Client, base: &str, from: u64, count: u64) -> Vec<ExplorerBlock> {
+    let url = format!("{}/rpc/blocks?from={}&count={}", base, from, count);
+    fetch_json::<ExplorerBlocksResponse>(client, &url, None)
+        .await
+        .unwrap_or_default()
+        .blocks
+}
+
 pub async fn get_address_info(client: &Client, base: &str, address: &str) -> ExplorerAddress {
     let url = format!("{}/api/address/{}", base, address);
     fetch_json::<ExplorerAddress>(client, &url, None)
