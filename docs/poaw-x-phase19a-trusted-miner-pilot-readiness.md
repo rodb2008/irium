@@ -140,7 +140,7 @@ IRIUM_STRATUM_POAWX=1
 IRIUM_STRATUM_NATIVE_REWARDABLE_ENABLED=1
 IRIUM_STRATUM_ADAPTER_MODE=native_rewardable
 IRIUM_STRATUM_VARDIFF_ENABLED=0
-STRATUM_DEFAULT_DIFF=0.001
+STRATUM_DEFAULT_DIFF=1   # share diff = block target; avoids cpuminer flood on native_rewardable; NOT chain difficulty (LWMA-144)
 IRIUM_POAWX_DELEGATION_BIND=127.0.0.1:<delegation-port>   # loopback-only; non-loopback is refused
 IRIUM_POAWX_STATE_DIR=<state-dir>
 IRIUM_POAWX_DELEGATE_KEY_PATH=<state-dir>/poawx_delegate_key.hex   # signer-only, 0600

@@ -1,11 +1,19 @@
 # PoAW-X Phase 19C — Isolated Local E2E Test Plan for `poawx-register --emit-only`
 
-**Version:** 1.0 (Phase 19C — test plan, NOT yet executed)
+**Version:** 1.1 (Phase 19C — EXECUTED + PASSED 2026-06-16)
 **Branch:** `testnet/poawx-phase19b-wallet-emit-only-delegation` (**local-only, not pushed**)
 **Validated code under test:** wallet `--emit-only` = commit `1628843` (+ `7767ac1` test/refactor polish).
-**Status:** This is the **exact next live-test plan**. It has **not** been executed. Running
-it requires explicit operator approval. It is **isolated, loopback-only, single-VPS**, and
-touches no mainnet/prod services.
+**Status:** **EXECUTED + PASSED 2026-06-16** on an isolated, loopback-only, single-VPS run.
+All 17 proofs satisfied (see §5). Result: block 2 committed mode-1 via
+`submit_block_extended (cpuminer_compat) receipts=1`; height 2, hash
+`0000000016d6aa266a9a280d096444b5cfbf88dbc8cd41c07d4b9e406e101a14`, irx1_root
+`23f8cd8e115554c55f4507448e8bdfde260afe88870666b52bfc426a19a73eb0`; embedded 226-byte
+delegation; miner pkh `899d6bca…` paid as the single p2pkh output; delegate pkh
+`3c4cb516…` NOT paid; fee 0%. Delegation was registered via `--emit-only` (offline,
+no HTTP) → operator loopback `curl POST` (the registry was empty before and after the
+emit-only step, proving it made no POST). Mainnet/prod untouched; `$TROOT` removed; all
+loopback ports cleared. **Note:** use `STRATUM_DEFAULT_DIFF=1` (not `0.001`) — see §6.
+Re-running requires explicit operator approval.
 
 > **TESTNET/DEVNET ONLY.** No real coins, no rewards, no mainnet compatibility.
 > The chain may reset at any time. Never use mainnet wallets/keys/addresses.
@@ -90,8 +98,13 @@ Two-phase bootstrap (isolated-E2E artifact only; see §6):
   **untouched**, never manually set in this E2E.
 - **PoAW-X puzzle difficulty** (`IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS`) — a PoAW-X *puzzle*
   knob for the isolated bring-up only, not chain difficulty.
-- **Stratum share difficulty** (`STRATUM_DEFAULT_DIFF=0.001`, vardiff off) — a non-mainnet
-  *share-acceptance* floor for the E2E only, not chain difficulty.
+- **Stratum share difficulty** (`STRATUM_DEFAULT_DIFF=1`, vardiff off) — a *share-acceptance*
+  target for the E2E only, not chain difficulty. **Use `1` (= the block target), not a sub-1
+  value:** native_rewardable validates submitted shares at the block target, so a sub-1 share
+  diff (e.g. `0.001`) makes cpuminer flood the connection with shares that are all rejected
+  `low_difficulty`, which desyncs/stalls the miner. At `1`, cpuminer submits only
+  block-candidate shares — no flood — and the first valid one commits the block. (Validated
+  2026-06-16, see §5.)
 
 The two-phase bootstrap and these knobs are **isolated-E2E artifacts only**, never part of
 normal or mainnet operation.

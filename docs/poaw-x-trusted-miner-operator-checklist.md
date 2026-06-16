@@ -134,10 +134,10 @@ for p in 39510 39511 39508 39512; do ss -ltn | grep -q ":$p " && echo "$p STILL 
 Stratum env for the pilot (Phase 13 gated route):
 ```
 IRIUM_NETWORK=devnet IRIUM_STRATUM_ADAPTER_MODE=auto IRIUM_STRATUM_NATIVE_REWARDABLE_ENABLED=1
-IRIUM_STRATUM_POAWX=1 IRIUM_STRATUM_MINER_FAMILY=cpuminer STRATUM_DEFAULT_DIFF=0.001
+IRIUM_STRATUM_POAWX=1 IRIUM_STRATUM_MINER_FAMILY=cpuminer STRATUM_DEFAULT_DIFF=1
 STRATUM_CARRIERS=off IRIUM_POAWX_MODE=active
 ```
-- [ ] Stratum logs `adapter_kind=native_rewardable_reserved` and `sub-1 difficulty floor active`.
+- [ ] Stratum logs `adapter_kind=native_rewardable_reserved` and assigns `diff=1` (share diff = block target; do not use a sub-1 floor — it floods/stalls cpuminer on native_rewardable).
 - [ ] Miner connects from the **expected miner IP** (stratum source-restricted).
 - [ ] `REWARDABLE_SHARE_ACCEPTED` -> `REWARDABLE_CANDIDATE` -> `submit_block_extended` -> `BLOCK_ACCEPTED`.
 - [ ] Node A `block_extended accepted ... cleared_receipts=N`; block `irx1_root` non-zero and == seeded receipt root.
@@ -170,7 +170,7 @@ sudo ufw status verbose | grep -E "<NODE_A_P2P>|<STRATUM_PORT>" || echo rules-ab
 Stratum env (delegated mode-1):
 ```
 IRIUM_NETWORK=testnet IRIUM_STRATUM_POAWX=1 IRIUM_STRATUM_NATIVE_REWARDABLE_ENABLED=1
-IRIUM_STRATUM_ADAPTER_MODE=native_rewardable IRIUM_STRATUM_VARDIFF_ENABLED=0 STRATUM_DEFAULT_DIFF=0.001
+IRIUM_STRATUM_ADAPTER_MODE=native_rewardable IRIUM_STRATUM_VARDIFF_ENABLED=0 STRATUM_DEFAULT_DIFF=1
 IRIUM_POAWX_DELEGATION_BIND=127.0.0.1:<delegation-port>   # loopback-only; non-loopback refused
 IRIUM_POAWX_STATE_DIR=<state-dir>
 IRIUM_POAWX_DELEGATE_KEY_PATH=<state-dir>/poawx_delegate_key.hex   # signer-only, 0600
