@@ -221,6 +221,9 @@ pub struct StratumConfig {
     pub ban_duration_secs: u64,
     /// Phase 10-D: enable PoAW-X receipt path via IRIUM_STRATUM_POAWX=1.
     pub poawx_enabled: bool,
+    /// Phase 18B step-3: shared delegate key + delegation registry used to
+    /// auto-produce mode-1 receipts. None when delegation is disabled/mainnet.
+    pub poawx_producer: Option<std::sync::Arc<crate::delegation::PoawxProducer>>,
 }
 
 #[derive(Clone)]
@@ -243,6 +246,10 @@ struct Job {
     poawx_mode: String,
     /// Phase 10-D: pending receipts from template for irx1 coinbase injection.
     poawx_pending_receipts: Vec<PoawxPendingReceipt>,
+    /// Phase 18B step-3: per-block PoAW-X assignment fetched from the node
+    /// (/poawx/assignment) for this job's height. None when delegation is off or
+    /// the assignment was unavailable/mismatched (fail-closed → no mode-1).
+    poawx_assignment: Option<crate::template::PoawxAssignment>,
 }
 
 #[derive(Clone)]
@@ -1364,6 +1371,59 @@ fn build_auxpow_hex_from_solution(
     hex::encode(out)
 }
 
+/// Phase 18B step-3: choose this session's PoAW-X receipts. When delegation
+/// production applies (poawx enabled + producer present + valid assignment for
+/// this job height + a stored delegation for this session's miner+worker), this
+/// returns a single pool-produced mode-1 receipt. Otherwise it returns the
+/// template echo (existing mode-0 behaviour) — byte-identical. Session-scoped:
+/// keyed on this session's `pkh` + worker, so no cross-miner leakage.
+fn build_session_poawx_receipts(
+    job: &Job,
+    session: &SessionState,
+    config: &StratumConfig,
+    pkh: &[u8; 20],
+) -> Vec<PoawxPendingReceipt> {
+    if !config.poawx_enabled {
+        return job.poawx_pending_receipts.clone();
+    }
+    let producer = match &config.poawx_producer {
+        Some(p) => p,
+        None => return job.poawx_pending_receipts.clone(),
+    };
+    let assignment = match &job.poawx_assignment {
+        Some(a) => a,
+        None => return job.poawx_pending_receipts.clone(),
+    };
+    let worker = match &session.worker {
+        Some(w) => w
+            .split_once('.')
+            .map(|(_, rest)| rest.to_string())
+            .unwrap_or_default(),
+        None => return job.poawx_pending_receipts.clone(),
+    };
+    let ctx = match crate::delegation::assignment_context_from_dto(assignment, job.height) {
+        Some(c) => c,
+        None => {
+            warn!(
+                "[poawx-deleg] assignment mismatch for job height={}; no mode-1 receipt",
+                job.height
+            );
+            return job.poawx_pending_receipts.clone();
+        }
+    };
+    match crate::delegation::build_mode1_pending_receipt(
+        producer.store.as_ref(),
+        producer.key.as_ref(),
+        producer.network_id,
+        *pkh,
+        &worker,
+        &ctx,
+    ) {
+        Some(receipt) => vec![receipt],
+        None => job.poawx_pending_receipts.clone(),
+    }
+}
+
 fn build_canonical_job_snapshot(
     job: &Job,
     session: &SessionState,
@@ -1465,7 +1525,7 @@ fn build_canonical_job_snapshot(
         auxpow_mode,
         irium_header80,
         irium_coinbase_hex,
-        poawx_pending_receipts: job.poawx_pending_receipts.clone(),
+        poawx_pending_receipts: build_session_poawx_receipts(job, session, config, &pkh),
     })
 }
 
@@ -1667,7 +1727,15 @@ async fn template_loop(
     loop {
         match client.fetch_template().await {
             Ok(tpl) => {
-                let job = to_job(seq, &tpl)?;
+                let mut job = to_job(seq, &tpl)?;
+                // Phase 18B step-3: fetch the deterministic per-block assignment
+                // so a session can produce a mode-1 receipt. Fail-closed: on any
+                // error poawx_assignment stays None -> no mode-1 receipt.
+                if config.poawx_enabled && config.poawx_producer.is_some() {
+                    job.poawx_assignment =
+                        crate::delegation::fetch_assignment(&config.rpc_base, &config.rpc_token)
+                            .await;
+                }
                 // Guardrail: refuse stale pre-fork templates once we've
                 // seen the network at/above the activation height.
                 if job.height < standard_header_activation_height()
@@ -1866,6 +1934,9 @@ fn to_job(seq: u64, tpl: &GetBlockTemplate) -> Result<Job> {
         coinbase_extras,
         poawx_mode,
         poawx_pending_receipts,
+        // Filled by template_loop (async) from /poawx/assignment when delegation
+        // production is enabled; None here keeps to_job sync + mode-0 default.
+        poawx_assignment: None,
     })
 }
 
@@ -3046,7 +3117,12 @@ async fn handle_submit_native_rewardable(
         let lz = |h: &[u8; 32]| -> u32 {
             let mut n = 0u32;
             for b in h.iter() {
-                if *b == 0 { n += 8; } else { n += b.leading_zeros(); break; }
+                if *b == 0 {
+                    n += 8;
+                } else {
+                    n += b.leading_zeros();
+                    break;
+                }
             }
             n
         };
@@ -3071,14 +3147,39 @@ async fn handle_submit_native_rewardable(
         let (h_be_sw, z_be_sw) = build(v_be, prev_swap4);
         info!("[NHT] worker={} job={} height={} ext2={} ntime={} nonce={} snapshot_version={:#010x} bits={:#010x}",
             worker, snapshot.job_id, snapshot.height, solve.extranonce2_hex, solve.ntime_hex, solve.nonce_hex, snapshot.version, snapshot.bits);
-        info!("[NHT] prev_internal={} prev_natural={} prev_swap4={} merkle={}",
-            hex::encode(snapshot.prev_hash_internal), hex::encode(prev_natural), hex::encode(prev_swap4), hex::encode(merkle));
-        info!("[NHT] canonical_header80={} canonical_hash={} canonical_lz={}",
-            hex::encode(solve.canonical_header80), hex::encode(solve.canonical_hash), lz(&solve.canonical_hash));
-        info!("[NHT] cand v_le+prev_natural hash={} lz={}", hex::encode(h_le_nat), z_le_nat);
-        info!("[NHT] cand v_be+prev_natural hash={} lz={}", hex::encode(h_be_nat), z_be_nat);
-        info!("[NHT] cand v_le+prev_swap4   hash={} lz={}", hex::encode(h_le_sw), z_le_sw);
-        info!("[NHT] cand v_be+prev_swap4   hash={} lz={}", hex::encode(h_be_sw), z_be_sw);
+        info!(
+            "[NHT] prev_internal={} prev_natural={} prev_swap4={} merkle={}",
+            hex::encode(snapshot.prev_hash_internal),
+            hex::encode(prev_natural),
+            hex::encode(prev_swap4),
+            hex::encode(merkle)
+        );
+        info!(
+            "[NHT] canonical_header80={} canonical_hash={} canonical_lz={}",
+            hex::encode(solve.canonical_header80),
+            hex::encode(solve.canonical_hash),
+            lz(&solve.canonical_hash)
+        );
+        info!(
+            "[NHT] cand v_le+prev_natural hash={} lz={}",
+            hex::encode(h_le_nat),
+            z_le_nat
+        );
+        info!(
+            "[NHT] cand v_be+prev_natural hash={} lz={}",
+            hex::encode(h_be_nat),
+            z_be_nat
+        );
+        info!(
+            "[NHT] cand v_le+prev_swap4   hash={} lz={}",
+            hex::encode(h_le_sw),
+            z_le_sw
+        );
+        info!(
+            "[NHT] cand v_be+prev_swap4   hash={} lz={}",
+            hex::encode(h_be_sw),
+            z_be_sw
+        );
     }
 
     if !solve.share_ok {
@@ -4300,6 +4401,7 @@ mod tests {
             ban_threshold: 0,
             ban_duration_secs: 0,
             poawx_enabled: false,
+            poawx_producer: None,
         }
     }
 
@@ -4337,6 +4439,7 @@ mod tests {
             coinbase_extras: vec![],
             poawx_mode: String::new(),
             poawx_pending_receipts: vec![],
+            poawx_assignment: None,
         }
     }
 
@@ -4355,6 +4458,7 @@ mod tests {
             coinbase_extras: vec![],
             poawx_mode: String::new(),
             poawx_pending_receipts: vec![],
+            poawx_assignment: None,
         }
     }
 
@@ -4439,7 +4543,64 @@ mod tests {
             commitment_nonce: "cd".repeat(32),
             worker_pubkey: format!("02{}", "ef".repeat(32)),
             worker_sig: "11".repeat(64),
+            delegation: String::new(),
         }
+    }
+
+    #[test]
+    fn phase18b3_native_coinbase_pays_miner_not_delegate_with_irx1() {
+        let config = test_config(MinerFamilyMode::Asic);
+        let session = test_session(AdapterKind::NativeRewardableReserved);
+        let mut snapshot =
+            build_canonical_job_snapshot(&native_test_job(), &session, &config).unwrap();
+        // Inject a mode-1 receipt: worker_pkh = miner (session.pkh = [0x11;20]),
+        // signer/worker_pubkey = a delegate key distinct from the miner.
+        let delegate_pubkey = [0x02u8; 33];
+        let miner_pkh = [0x11u8; 20];
+        let mut deleg_blob = vec![0u8; 226];
+        deleg_blob[0] = 1;
+        let receipt = PoawxPendingReceipt {
+            height: snapshot.height,
+            lane: "cpu".to_string(),
+            worker_pkh: hex::encode(miner_pkh),
+            solution: "0011223344556677".to_string(),
+            commitment_nonce: "cd".repeat(32),
+            worker_pubkey: hex::encode(delegate_pubkey),
+            worker_sig: "11".repeat(64),
+            delegation: hex::encode(&deleg_blob),
+        };
+        snapshot.poawx_pending_receipts = vec![receipt];
+        let extranonce2 = vec![0u8; snapshot.extranonce2_size];
+        let coinbase = build_native_rewardable_coinbase(&snapshot, &extranonce2).unwrap();
+
+        let miner_script = payout_script_from_pkh(&miner_pkh);
+        assert!(
+            coinbase
+                .windows(miner_script.len())
+                .any(|w| w == miner_script.as_slice()),
+            "coinbase must pay the miner pkh"
+        );
+        let delegate_pkh = {
+            use ripemd::Ripemd160;
+            use sha2::{Digest, Sha256};
+            let sha = Sha256::digest(delegate_pubkey);
+            let rip = Ripemd160::digest(sha);
+            let mut a = [0u8; 20];
+            a.copy_from_slice(&rip);
+            a
+        };
+        let delegate_script = payout_script_from_pkh(&delegate_pkh);
+        assert!(
+            !coinbase
+                .windows(delegate_script.len())
+                .any(|w| w == delegate_script.as_slice()),
+            "coinbase must NOT pay the delegate pkh (pool is signer-only)"
+        );
+        let irx1_tag = [0x6au8, 0x24, b'i', b'r', b'x', b'1'];
+        assert!(
+            coinbase.windows(irx1_tag.len()).any(|w| w == irx1_tag),
+            "coinbase must contain the irx1 commitment"
+        );
     }
 
     fn sample_submit_request() -> SubmitRequest {
@@ -4765,7 +4926,8 @@ mod tests {
         let cb = build_native_rewardable_coinbase(&snap, &[0u8; 4]).unwrap();
         // OP_RETURN tag must be absent.
         assert!(
-            !cb.windows(6).any(|w| w == [0x6a, 0x24, 0x69, 0x72, 0x78, 0x31]),
+            !cb.windows(6)
+                .any(|w| w == [0x6a, 0x24, 0x69, 0x72, 0x78, 0x31]),
             "no-receipts coinbase must not contain an irx1 OP_RETURN"
         );
         // Exactly one output (count byte == 0x01 sits right after the 4-byte
@@ -4774,7 +4936,11 @@ mod tests {
             .windows(4)
             .rposition(|w| w == [0xff, 0xff, 0xff, 0xff])
             .unwrap();
-        assert_eq!(cb[seq_pos + 4], 0x01, "no-receipts coinbase must have 1 output");
+        assert_eq!(
+            cb[seq_pos + 4],
+            0x01,
+            "no-receipts coinbase must have 1 output"
+        );
     }
 
     #[test]

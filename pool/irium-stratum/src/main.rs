@@ -165,6 +165,15 @@ async fn main() -> Result<()> {
         warn!("[poawx] IRIUM_STRATUM_POAWX unset: PoAW-X receipt path disabled (legacy submit)");
     }
 
+    // Phase 18B step-3: load the shared PoAW-X producer (delegate key + delegation
+    // registry) only when the receipt path is enabled. None on mainnet or when
+    // disabled — no key/store files are created and behaviour is unchanged.
+    let poawx_producer = if poawx_enabled {
+        delegation::load_producer().map(std::sync::Arc::new)
+    } else {
+        None
+    };
+
     if default_diff_raw < default_diff {
         warn!(
             "[config] STRATUM_DEFAULT_DIFF={} below active floor; clamped to {}",
@@ -221,13 +230,15 @@ async fn main() -> Result<()> {
         ban_threshold,
         ban_duration_secs,
         poawx_enabled,
+        poawx_producer: poawx_producer.clone(),
     };
 
-    // Phase 18B step-2: opt-in PoAW-X delegation registration server. Disabled
+    // Phase 18B step-2/3: opt-in PoAW-X delegation registration server. Disabled
     // unless IRIUM_POAWX_DELEGATION_BIND is set; refuses non-loopback binds; no
-    // public exposure by default. Mainnet context returns 503. Runs as a
-    // separate task; the stratum TCP/metrics paths are unaffected.
-    delegation::maybe_spawn(cfg.rpc_base.clone(), cfg.rpc_token.clone());
+    // public exposure by default. Mainnet context returns 503. Shares the
+    // producer (store+key) with the receipt path. Runs as a separate task; the
+    // stratum TCP/metrics paths are unaffected.
+    delegation::maybe_spawn(poawx_producer, cfg.rpc_base.clone(), cfg.rpc_token.clone());
 
     run(cfg).await
 }

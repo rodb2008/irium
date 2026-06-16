@@ -56,6 +56,25 @@ pub struct PoawxPendingReceipt {
     pub worker_pubkey: String,
     #[serde(default)]
     pub worker_sig: String,
+    /// Phase 18B: hex of the canonical 226-byte `Delegation` for a mode-1
+    /// (delegated) receipt. Empty => mode-0 (direct). `skip_serializing_if`
+    /// keeps mode-0 submit JSON byte-identical.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub delegation: String,
+}
+
+/// Phase 18B: response of the node's `GET /poawx/assignment`. The pool uses this
+/// as the single source of truth for the deterministic per-block puzzle context
+/// (the node derives it exactly as consensus expects).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PoawxAssignment {
+    /// Current chain tip height. The next block (the one being mined) is
+    /// `height + 1`, which is the height a produced receipt must carry.
+    pub height: u64,
+    pub seed: String,
+    pub commitment_nonce: String,
+    pub puzzle_difficulty: u32,
+    pub lane: String,
 }
 
 #[derive(Clone)]

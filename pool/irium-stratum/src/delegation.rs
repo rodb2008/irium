@@ -233,6 +233,32 @@ impl DelegateKey {
     pub fn secret(&self) -> &[u8; 32] {
         &self.secret
     }
+
+    /// Sign the per-height receipt challenge `SHA256(solution‖commitment_nonce‖
+    /// height_le8)` with the delegate key. This is the signer signature embedded
+    /// in a mode-1 receipt (`worker_sig`); the consensus verifies it against the
+    /// delegate pubkey, which the miner authorized via the delegation.
+    pub fn sign_challenge(
+        &self,
+        solution: &[u8],
+        commitment_nonce: &[u8; 32],
+        height: u64,
+    ) -> [u8; 64] {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        use k256::ecdsa::{Signature, SigningKey};
+        let sk = SigningKey::from_slice(&self.secret).expect("delegate secret validated at load");
+        let challenge: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(solution);
+            h.update(commitment_nonce);
+            h.update(height.to_le_bytes());
+            h.finalize().into()
+        };
+        let sig: Signature = sk.sign_prehash(&challenge).expect("sign challenge");
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&sig.to_bytes());
+        out
+    }
 }
 
 fn pubkey_from_secret(secret: &[u8; 32]) -> Result<[u8; 33], String> {
@@ -418,7 +444,9 @@ impl DelegError {
             DelegError::BadHex => "delegation: invalid hex".into(),
             DelegError::BadFormat => "delegation: malformed wire format".into(),
             DelegError::BadSignature => "delegation: signature verification failed".into(),
-            DelegError::MinerPkhMismatch => "delegation: miner_pkh does not match miner_pubkey".into(),
+            DelegError::MinerPkhMismatch => {
+                "delegation: miner_pkh does not match miner_pubkey".into()
+            }
             DelegError::WorkerTagMismatch => "delegation: worker_tag does not match worker".into(),
             DelegError::NetworkMismatch => "delegation: network_id mismatch".into(),
             DelegError::PoolPubkeyMismatch => "delegation: pool_pubkey is not this pool".into(),
@@ -487,6 +515,144 @@ pub fn verify_and_store(
     Ok(rec)
 }
 
+// ── Mode-1 receipt production (pure; pool-side) ──────────────────────────────
+
+/// Expected CPU lane first byte (assignment lane is "cpu").
+pub const EXPECTED_LANE_FIRST: u8 = b'c';
+
+/// Decoded, validated per-block assignment context the pool uses to produce a
+/// mode-1 receipt for `block_height` (= tip + 1).
+#[derive(Debug, Clone)]
+pub struct AssignmentContext {
+    pub block_height: u64,
+    pub seed: [u8; 32],
+    pub commitment_nonce: [u8; 32],
+    pub difficulty: u32,
+    pub lane: String,
+}
+
+fn decode32(s: &str) -> Option<[u8; 32]> {
+    let b = hex::decode(s).ok()?;
+    if b.len() != 32 {
+        return None;
+    }
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&b);
+    Some(a)
+}
+
+/// Convert the node assignment DTO into an `AssignmentContext` for `job_height`,
+/// applying the fail-closed checks: the assignment must be for the tip the job
+/// builds on (`assignment.height + 1 == job_height`) and the CPU lane.
+pub fn assignment_context_from_dto(
+    dto: &crate::template::PoawxAssignment,
+    job_height: u64,
+) -> Option<AssignmentContext> {
+    if dto.height.checked_add(1) != Some(job_height) {
+        return None; // assignment not for this job's parent tip
+    }
+    let lane_first = dto.lane.bytes().next()?;
+    if lane_first != EXPECTED_LANE_FIRST {
+        return None; // unexpected lane
+    }
+    Some(AssignmentContext {
+        block_height: job_height,
+        seed: decode32(&dto.seed)?,
+        commitment_nonce: decode32(&dto.commitment_nonce)?,
+        difficulty: dto.puzzle_difficulty,
+        lane: dto.lane.clone(),
+    })
+}
+
+fn count_leading_zero_bits(hash: &[u8; 32]) -> u32 {
+    let mut bits = 0u32;
+    for &b in hash.iter() {
+        let z = b.leading_zeros();
+        bits += z;
+        if z < 8 {
+            break;
+        }
+    }
+    bits
+}
+
+/// Grind an 8-byte solution so `sha256d(seed‖nonce‖solution)` has at least
+/// `difficulty` leading zero bits. Bounded; returns None if not found (fail-closed).
+fn grind_solution(seed: &[u8; 32], nonce: &[u8; 32], difficulty: u32) -> Option<[u8; 8]> {
+    let mut input = [0u8; 72];
+    input[..32].copy_from_slice(seed);
+    input[32..64].copy_from_slice(nonce);
+    for n in 0u64..50_000_000 {
+        let sol = n.to_le_bytes();
+        input[64..].copy_from_slice(&sol);
+        let hash = crate::pow::sha256d(&input);
+        if count_leading_zero_bits(&hash) >= difficulty {
+            return Some(sol);
+        }
+    }
+    None
+}
+
+/// Produce a mode-1 (delegated) pending receipt for `miner_pkh`/`worker`, or
+/// `None` if no valid delegation applies (fail-closed: missing/expired/wrong
+/// network/non-zero fee/wrong pool key/wrong worker tag/grind failure). Pure:
+/// the assignment is supplied by the caller (fetched from `/poawx/assignment`).
+pub fn build_mode1_pending_receipt(
+    store: &dyn DelegationStore,
+    key: &DelegateKey,
+    network_id: u8,
+    miner_pkh: [u8; 20],
+    worker: &str,
+    ctx: &AssignmentContext,
+) -> Option<crate::template::PoawxPendingReceipt> {
+    let miner_pkh_hex = hex::encode(miner_pkh);
+    let rec = store.get(&miner_pkh_hex, worker)?;
+    // Stored-record fail-closed checks.
+    if rec.network_id != network_id || rec.fee_bps != 0 {
+        return None;
+    }
+    if rec.expiry_height < ctx.block_height {
+        return None; // expired for this block (consensus rejects height > expiry)
+    }
+    // Re-verify the canonical delegation binds to THIS pool key and miner.
+    let d = Delegation::deserialize(&hex::decode(&rec.delegation_hex).ok()?).ok()?;
+    if d.pool_pubkey != key.pubkey()
+        || d.miner_pkh() != miner_pkh
+        || d.network_id != network_id
+        || d.fee_bps != 0
+        || d.worker_tag != worker_tag(worker)
+    {
+        return None;
+    }
+    let solution = grind_solution(&ctx.seed, &ctx.commitment_nonce, ctx.difficulty)?;
+    let signer_sig = key.sign_challenge(&solution, &ctx.commitment_nonce, ctx.block_height);
+    Some(crate::template::PoawxPendingReceipt {
+        height: ctx.block_height,
+        lane: ctx.lane.clone(),
+        worker_pkh: miner_pkh_hex,
+        solution: hex::encode(solution),
+        commitment_nonce: hex::encode(ctx.commitment_nonce),
+        worker_pubkey: key.pubkey_hex(),
+        worker_sig: hex::encode(signer_sig),
+        delegation: rec.delegation_hex.clone(),
+    })
+}
+
+/// Fetch the node's `/poawx/assignment` (single source of truth for the
+/// deterministic puzzle context). Returns None on any error (fail-closed).
+pub async fn fetch_assignment(
+    rpc_base: &str,
+    rpc_token: &str,
+) -> Option<crate::template::PoawxAssignment> {
+    let client = reqwest::Client::builder().build().ok()?;
+    let url = format!("{}/poawx/assignment", rpc_base.trim_end_matches('/'));
+    let resp = client.get(&url).bearer_auth(rpc_token).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<crate::template::PoawxAssignment>().await.ok()
+}
+
 // ── HTTP server (raw-TCP, loopback-only by config; opt-in) ───────────────────
 
 fn poawx_state_dir() -> PathBuf {
@@ -519,10 +685,54 @@ fn is_loopback_bind(bind: &str) -> bool {
     t.starts_with("127.0.0.1:") || t.starts_with("localhost:") || t.starts_with("[::1]:")
 }
 
+/// Shared PoAW-X producer context: the delegate key + delegation registry +
+/// network id, shared via a single `Arc` between the HTTP registration server
+/// and the live receipt-producer path so a freshly registered delegation is
+/// immediately visible to the mining path. None on mainnet (mode-1 hard-off).
+pub struct PoawxProducer {
+    pub store: Arc<dyn DelegationStore>,
+    pub key: Arc<DelegateKey>,
+    pub network_id: u8,
+}
+
+/// Load the producer (delegate key + delegation store). Returns None on mainnet
+/// (no key generated, delegation refused) or if the key/store cannot be loaded.
+pub fn load_producer() -> Option<PoawxProducer> {
+    let network_id = network_id_from_env();
+    if network_id == 0 {
+        warn!("[poawx-deleg] mainnet context: PoAW-X delegation disabled (mode-1 hard-off)");
+        return None;
+    }
+    let key = match DelegateKey::load_or_generate(&delegate_key_path(), true) {
+        Ok(k) => k,
+        Err(e) => {
+            warn!("[poawx-deleg] delegate key unavailable: {e}");
+            return None;
+        }
+    };
+    let store = match JsonDelegationStore::open(delegations_path()) {
+        Ok(s) => Arc::new(s) as Arc<dyn DelegationStore>,
+        Err(e) => {
+            warn!("[poawx-deleg] delegation store unavailable: {e}");
+            return None;
+        }
+    };
+    info!(
+        "[poawx-deleg] pool_pubkey={} network_id={network_id}",
+        key.pubkey_hex()
+    );
+    Some(PoawxProducer {
+        store,
+        key: Arc::new(key),
+        network_id,
+    })
+}
+
 /// Spawn the delegation HTTP server if `IRIUM_POAWX_DELEGATION_BIND` is set.
-/// Default = DISABLED (no bind). Refuses any non-loopback bind. Safe to call
-/// unconditionally; it is a no-op unless explicitly configured.
-pub fn maybe_spawn(rpc_base: String, rpc_token: String) {
+/// Default = DISABLED (no bind). Refuses any non-loopback bind. The server shares
+/// `producer` (store+key) with the receipt-producer path. On mainnet (`producer`
+/// None) the endpoints return 503.
+pub fn maybe_spawn(producer: Option<Arc<PoawxProducer>>, rpc_base: String, rpc_token: String) {
     let bind = match env::var("IRIUM_POAWX_DELEGATION_BIND")
         .ok()
         .map(|v| v.trim().to_string())
@@ -537,8 +747,9 @@ pub fn maybe_spawn(rpc_base: String, rpc_token: String) {
         );
         return;
     }
+    let network_id = network_id_from_env();
     tokio::spawn(async move {
-        if let Err(e) = serve(bind, rpc_base, rpc_token).await {
+        if let Err(e) = serve(bind, producer, network_id, rpc_base, rpc_token).await {
             warn!("[poawx-deleg] server stopped: {e}");
         }
     });
@@ -547,39 +758,24 @@ pub fn maybe_spawn(rpc_base: String, rpc_token: String) {
 struct ServerCtx {
     network_id: u8,
     /// None on mainnet (delegation disabled → 503).
-    key: Option<Arc<DelegateKey>>,
-    store: Option<Arc<dyn DelegationStore>>,
+    producer: Option<Arc<PoawxProducer>>,
     rpc_base: String,
     rpc_token: String,
 }
 
-async fn serve(bind: String, rpc_base: String, rpc_token: String) -> anyhow::Result<()> {
-    let network_id = network_id_from_env();
-    let mainnet = network_id == 0;
-    let (key, store) = if mainnet {
-        warn!("[poawx-deleg] mainnet context: delegation endpoints will return 503 (mode-1 hard-off)");
-        (None, None)
-    } else {
-        let key = DelegateKey::load_or_generate(&delegate_key_path(), true)
-            .map_err(|e| anyhow::anyhow!("delegate key: {e}"))?;
-        let store = Arc::new(
-            JsonDelegationStore::open(delegations_path())
-                .map_err(|e| anyhow::anyhow!("delegation store: {e}"))?,
-        ) as Arc<dyn DelegationStore>;
-        info!(
-            "[poawx-deleg] pool_pubkey={} network_id={network_id}",
-            key.pubkey_hex()
-        );
-        (Some(Arc::new(key)), Some(store))
-    };
-
+async fn serve(
+    bind: String,
+    producer: Option<Arc<PoawxProducer>>,
+    network_id: u8,
+    rpc_base: String,
+    rpc_token: String,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     info!("[poawx-deleg] listening on http://{bind} (loopback-only, network_id={network_id})");
 
     let ctx = Arc::new(ServerCtx {
         network_id,
-        key,
-        store,
+        producer,
         rpc_base,
         rpc_token,
     });
@@ -639,9 +835,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 async fn respond(stream: &mut TcpStream, status: u16, reason: &str, body: &serde_json::Value) {
@@ -656,7 +850,8 @@ async fn respond(stream: &mut TcpStream, status: u16, reason: &str, body: &serde
 }
 
 async fn fetch_tip_height(rpc_base: &str, rpc_token: &str) -> Option<u64> {
-    let tpl = crate::template::TemplateClient::new(rpc_base.to_string(), rpc_token.to_string()).ok()?;
+    let tpl =
+        crate::template::TemplateClient::new(rpc_base.to_string(), rpc_token.to_string()).ok()?;
     let template = tpl.fetch_template().await.ok()?;
     Some(template.height.saturating_sub(1))
 }
@@ -669,7 +864,7 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<ServerCtx>) {
     let path_only = path.split('?').next().unwrap_or(&path);
 
     match (method.as_str(), path_only) {
-        ("GET", "/poawx/pool-identity") => match &ctx.key {
+        ("GET", "/poawx/pool-identity") => match &ctx.producer {
             None => {
                 respond(
                     &mut stream,
@@ -679,15 +874,15 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<ServerCtx>) {
                 )
                 .await
             }
-            Some(key) => {
-                let v = pool_identity_json(&key.pubkey_hex(), ctx.network_id);
+            Some(p) => {
+                let v = pool_identity_json(&p.key.pubkey_hex(), p.network_id);
                 respond(&mut stream, 200, "OK", &v).await
             }
         },
         ("POST", "/poawx/delegation") => {
-            let (key, store) = match (&ctx.key, &ctx.store) {
-                (Some(k), Some(s)) => (k, s),
-                _ => {
+            let (key, store) = match &ctx.producer {
+                Some(p) => (&p.key, &p.store),
+                None => {
                     respond(
                         &mut stream,
                         503,
@@ -875,9 +1070,16 @@ mod tests {
         assert_eq!(irium_node_rs::poawx::Delegation::WIRE_SIZE, 226);
         assert_eq!(canon.serialize(), mir.serialize(), "serialize parity");
         assert_eq!(canon.serialize().len(), 226);
-        assert_eq!(canon.message_hash(), mir.message_hash(), "message_hash parity");
+        assert_eq!(
+            canon.message_hash(),
+            mir.message_hash(),
+            "message_hash parity"
+        );
         assert_eq!(canon.digest(), mir.digest(), "digest parity");
-        assert_eq!(Delegation::VERSION, irium_node_rs::poawx::Delegation::VERSION);
+        assert_eq!(
+            Delegation::VERSION,
+            irium_node_rs::poawx::Delegation::VERSION
+        );
         assert_eq!(DELEG_DOMAIN, irium_node_rs::poawx::DOMAIN_DELEG);
     }
 
@@ -902,14 +1104,20 @@ mod tests {
 
         // Mirror deserializes the canonical bytes and verifies the signature.
         let mir = Delegation::deserialize(&canon.serialize()).unwrap();
-        assert!(mir.verify_signature().is_ok(), "mirror verifies canonical-signed");
+        assert!(
+            mir.verify_signature().is_ok(),
+            "mirror verifies canonical-signed"
+        );
         assert_eq!(mir.miner_pkh(), canon.miner_pkh(), "miner_pkh parity");
 
         // Tampered canonical delegation must be rejected by the mirror.
         let mut tampered = canon.clone();
         tampered.delegation_sig[0] ^= 0xff;
         let mir_bad = Delegation::deserialize(&tampered.serialize()).unwrap();
-        assert!(mir_bad.verify_signature().is_err(), "mirror rejects tampered");
+        assert!(
+            mir_bad.verify_signature().is_err(),
+            "mirror rejects tampered"
+        );
     }
 
     #[test]
@@ -963,7 +1171,11 @@ mod tests {
             assert_eq!(s.get(&rec.miner_pkh, "rig1").unwrap(), rec);
         }
         let s2 = JsonDelegationStore::open(&path).unwrap();
-        assert_eq!(s2.get(&rec.miner_pkh, "rig1").unwrap(), rec, "persists across reload");
+        assert_eq!(
+            s2.get(&rec.miner_pkh, "rig1").unwrap(),
+            rec,
+            "persists across reload"
+        );
         // Registry stores no private keys.
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("privkey") && !raw.contains("secret") && !raw.contains("private"));
@@ -1012,27 +1224,72 @@ mod tests {
 
         // mainnet (network_id 0)
         assert_eq!(
-            verify_and_store(&store, &hexd(&mirror_signed(&miner, pool_pub, 0, "r", 100, 0)), "r", "", &pool_pub, 0, 10, 1),
+            verify_and_store(
+                &store,
+                &hexd(&mirror_signed(&miner, pool_pub, 0, "r", 100, 0)),
+                "r",
+                "",
+                &pool_pub,
+                0,
+                10,
+                1
+            ),
             Err(DelegError::Mainnet)
         );
         // network mismatch
         assert_eq!(
-            verify_and_store(&store, &hexd(&mirror_signed(&miner, pool_pub, 2, "r", 100, 0)), "r", "", &pool_pub, 1, 10, 1),
+            verify_and_store(
+                &store,
+                &hexd(&mirror_signed(&miner, pool_pub, 2, "r", 100, 0)),
+                "r",
+                "",
+                &pool_pub,
+                1,
+                10,
+                1
+            ),
             Err(DelegError::NetworkMismatch)
         );
         // pool pubkey mismatch
         assert_eq!(
-            verify_and_store(&store, &hexd(&mirror_signed(&miner, other_pool, 1, "r", 100, 0)), "r", "", &pool_pub, 1, 10, 1),
+            verify_and_store(
+                &store,
+                &hexd(&mirror_signed(&miner, other_pool, 1, "r", 100, 0)),
+                "r",
+                "",
+                &pool_pub,
+                1,
+                10,
+                1
+            ),
             Err(DelegError::PoolPubkeyMismatch)
         );
         // fee > 0
         assert_eq!(
-            verify_and_store(&store, &hexd(&mirror_signed(&miner, pool_pub, 1, "r", 100, 100)), "r", "", &pool_pub, 1, 10, 1),
+            verify_and_store(
+                &store,
+                &hexd(&mirror_signed(&miner, pool_pub, 1, "r", 100, 100)),
+                "r",
+                "",
+                &pool_pub,
+                1,
+                10,
+                1
+            ),
             Err(DelegError::NonZeroFee)
         );
         // worker_tag mismatch (claimed worker differs from signed tag)
         assert_eq!(
-            verify_and_store(&store, &hexd(&mirror_signed(&miner, pool_pub, 1, "rig1", 100, 0)), "rig2", "", &pool_pub, 1, 10, 1),
+            verify_and_store(
+                &store,
+                &hexd(&mirror_signed(&miner, pool_pub, 1, "rig1", 100, 0)),
+                "rig2",
+                "",
+                &pool_pub,
+                1,
+                10,
+                1
+            ),
             Err(DelegError::WorkerTagMismatch)
         );
         // bad signature
@@ -1044,12 +1301,30 @@ mod tests {
         );
         // miner_pkh mismatch (claim a different pkh)
         assert_eq!(
-            verify_and_store(&store, &hexd(&mirror_signed(&miner, pool_pub, 1, "r", 100, 0)), "r", &"ff".repeat(20), &pool_pub, 1, 10, 1),
+            verify_and_store(
+                &store,
+                &hexd(&mirror_signed(&miner, pool_pub, 1, "r", 100, 0)),
+                "r",
+                &"ff".repeat(20),
+                &pool_pub,
+                1,
+                10,
+                1
+            ),
             Err(DelegError::MinerPkhMismatch)
         );
         // expired (expiry <= tip)
         assert_eq!(
-            verify_and_store(&store, &hexd(&mirror_signed(&miner, pool_pub, 1, "r", 10, 0)), "r", "", &pool_pub, 1, 10, 1),
+            verify_and_store(
+                &store,
+                &hexd(&mirror_signed(&miner, pool_pub, 1, "r", 10, 0)),
+                "r",
+                "",
+                &pool_pub,
+                1,
+                10,
+                1
+            ),
             Err(DelegError::Expired)
         );
         // bad hex / format
@@ -1098,5 +1373,161 @@ mod tests {
         assert!(is_loopback_bind("[::1]:39520"));
         assert!(!is_loopback_bind("0.0.0.0:39520"));
         assert!(!is_loopback_bind("10.0.0.5:39520"));
+    }
+
+    // ── Phase 18B step-3: mode-1 receipt production ──
+
+    fn p18b3_assignment_dto(
+        tip: u64,
+        difficulty: u32,
+        lane: &str,
+    ) -> crate::template::PoawxAssignment {
+        crate::template::PoawxAssignment {
+            height: tip,
+            seed: hex::encode([0xaau8; 32]),
+            commitment_nonce: hex::encode([0xbbu8; 32]),
+            puzzle_difficulty: difficulty,
+            lane: lane.to_string(),
+        }
+    }
+
+    /// Generate a delegate key in a temp dir + a store holding a valid delegation
+    /// for `miner`/`worker`. Returns (key, store, miner_pkh).
+    fn p18b3_setup(
+        miner: &SigningKey,
+        worker: &str,
+        expiry: u64,
+        fee_bps: u16,
+        network_id: u8,
+    ) -> (DelegateKey, JsonDelegationStore, [u8; 20]) {
+        let dir = temp_dir("p18b3");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = DelegateKey::load_or_generate(&dir.join("k.hex"), true).unwrap();
+        let store = JsonDelegationStore::open(dir.join("d.json")).unwrap();
+        let d = mirror_signed(miner, key.pubkey(), network_id, worker, expiry, fee_bps);
+        let miner_pkh = d.miner_pkh();
+        // store via the real registration path (tip 0 so expiry>tip holds).
+        verify_and_store(
+            &store,
+            &hex::encode(d.serialize()),
+            worker,
+            &hex::encode(miner_pkh),
+            &key.pubkey(),
+            network_id,
+            0,
+            1,
+        )
+        .expect("store delegation");
+        (key, store, miner_pkh)
+    }
+
+    #[test]
+    fn phase18b3_build_mode1_receipt_and_root_parity() {
+        let miner = SigningKey::from_slice(&[5u8; 32]).unwrap();
+        let (key, store, miner_pkh) = p18b3_setup(&miner, "rig1", 1000, 0, 1);
+        let dto = p18b3_assignment_dto(0, 4, "cpu"); // tip 0 -> block height 1
+        let ctx = assignment_context_from_dto(&dto, 1).expect("ctx");
+        let rec =
+            build_mode1_pending_receipt(&store, &key, 1, miner_pkh, "rig1", &ctx).expect("receipt");
+        // Field checks.
+        assert_eq!(rec.worker_pkh, hex::encode(miner_pkh), "pays miner pkh");
+        assert_eq!(
+            rec.worker_pubkey,
+            key.pubkey_hex(),
+            "signer = pool delegate"
+        );
+        assert_eq!(rec.height, 1);
+        assert_eq!(rec.lane, "cpu");
+        assert!(!rec.delegation.is_empty(), "carries embedded delegation");
+        // Root parity: pool root == node irx1_root_from_block_receipts.
+        let block_rec = irium_node_rs::poawx::PoawxBlockReceipt {
+            height: rec.height,
+            lane: rec.lane.bytes().next().unwrap(),
+            worker_pkh: {
+                let mut a = [0u8; 20];
+                a.copy_from_slice(&hex::decode(&rec.worker_pkh).unwrap());
+                a
+            },
+            worker_pubkey: {
+                let mut a = [0u8; 33];
+                a.copy_from_slice(&hex::decode(&rec.worker_pubkey).unwrap());
+                a
+            },
+            worker_sig: {
+                let mut a = [0u8; 64];
+                a.copy_from_slice(&hex::decode(&rec.worker_sig).unwrap());
+                a
+            },
+            solution: {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&hex::decode(&rec.solution).unwrap());
+                a
+            },
+            commitment_nonce: {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&hex::decode(&rec.commitment_nonce).unwrap());
+                a
+            },
+            delegation: Some(
+                irium_node_rs::poawx::Delegation::deserialize(
+                    &hex::decode(&rec.delegation).unwrap(),
+                )
+                .unwrap(),
+            ),
+        };
+        let node_root =
+            irium_node_rs::poawx::irx1_root_from_block_receipts(std::slice::from_ref(&block_rec));
+        let pool_root =
+            crate::block::compute_receipts_root_from_pending(std::slice::from_ref(&rec));
+        assert_eq!(
+            pool_root, node_root,
+            "pool mode-1 root must equal node irx1_root_from_block_receipts"
+        );
+        // The produced solution actually meets the puzzle difficulty.
+        let mut input = [0u8; 72];
+        input[..32].copy_from_slice(&ctx.seed);
+        input[32..64].copy_from_slice(&ctx.commitment_nonce);
+        input[64..].copy_from_slice(&hex::decode(&rec.solution).unwrap());
+        assert!(count_leading_zero_bits(&crate::pow::sha256d(&input)) >= ctx.difficulty);
+    }
+
+    #[test]
+    fn phase18b3_no_delegation_returns_none() {
+        let key_dir = temp_dir("p18b3-none");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key = DelegateKey::load_or_generate(&key_dir.join("k.hex"), true).unwrap();
+        let store = JsonDelegationStore::open(key_dir.join("d.json")).unwrap();
+        let dto = p18b3_assignment_dto(0, 4, "cpu");
+        let ctx = assignment_context_from_dto(&dto, 1).unwrap();
+        // empty store -> no mode-1 receipt (mode-0 path preserved upstream).
+        assert!(build_mode1_pending_receipt(&store, &key, 1, [0x11u8; 20], "rig1", &ctx).is_none());
+    }
+
+    #[test]
+    fn phase18b3_assignment_height_and_lane_mismatch_fail_closed() {
+        // height mismatch: assignment tip 5 but job height 1 -> None
+        assert!(assignment_context_from_dto(&p18b3_assignment_dto(5, 4, "cpu"), 1).is_none());
+        // correct: tip 0 -> job height 1
+        assert!(assignment_context_from_dto(&p18b3_assignment_dto(0, 4, "cpu"), 1).is_some());
+        // wrong lane -> None
+        assert!(assignment_context_from_dto(&p18b3_assignment_dto(0, 4, "gpu"), 1).is_none());
+    }
+
+    #[test]
+    fn phase18b3_expired_wrong_worker_wrong_pkh_fail_closed() {
+        let miner = SigningKey::from_slice(&[5u8; 32]).unwrap();
+        let (key, store, miner_pkh) = p18b3_setup(&miner, "rig1", 5, 0, 1);
+        // expired: delegation expiry 5, block height 10 -> None
+        let ctx10 = assignment_context_from_dto(&p18b3_assignment_dto(9, 4, "cpu"), 10).unwrap();
+        assert!(build_mode1_pending_receipt(&store, &key, 1, miner_pkh, "rig1", &ctx10).is_none());
+        // wrong worker (registered rig1, ask rig2) -> None
+        let ctx1 = assignment_context_from_dto(&p18b3_assignment_dto(0, 4, "cpu"), 1).unwrap();
+        assert!(build_mode1_pending_receipt(&store, &key, 1, miner_pkh, "rig2", &ctx1).is_none());
+        // wrong miner pkh -> None
+        assert!(
+            build_mode1_pending_receipt(&store, &key, 1, [0xffu8; 20], "rig1", &ctx1).is_none()
+        );
+        // wrong network id (delegation stored for net 1; ask as net 2) -> None
+        assert!(build_mode1_pending_receipt(&store, &key, 2, miner_pkh, "rig1", &ctx1).is_none());
     }
 }

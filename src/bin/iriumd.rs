@@ -1516,7 +1516,7 @@ struct CoinbaseExtraOutput {
     script_pubkey_hex: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PoawxPendingReceipt {
     height: u64,
     lane: String,
@@ -1527,6 +1527,11 @@ struct PoawxPendingReceipt {
     worker_pubkey: String,
     #[serde(default)]
     worker_sig: String,
+    /// Phase 18B: hex of the canonical 226-byte `Delegation` for a mode-1
+    /// (delegated) receipt. Empty => mode-0 (direct), byte-identical behaviour.
+    /// `skip_serializing_if` keeps mode-0 pending JSON byte-identical.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    delegation: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -13747,11 +13752,17 @@ fn pending_receipt_to_block_receipt(
         worker_sig,
         solution,
         commitment_nonce,
-        // Phase 18B: the submit-side PoawxPendingReceipt DTO is mode-0 only in
-        // this step; delegated (mode-1) submission is wired with the pool
-        // integration. Block-contained mode-1 receipts are validated by
-        // connect_block (chain.rs).
-        delegation: None,
+        // Phase 18B step-3: parse the embedded delegation (mode-1) back from the
+        // DTO. Empty => mode-0 (None). A malformed delegation drops the receipt
+        // (via `?`), which then fails the irx1-root check — i.e. fail-closed.
+        delegation: if r.delegation.is_empty() {
+            None
+        } else {
+            Some(
+                irium_node_rs::poawx::Delegation::deserialize(&hex::decode(&r.delegation).ok()?)
+                    .ok()?,
+            )
+        },
     })
 }
 
@@ -13781,6 +13792,17 @@ fn compute_poawx_receipts_root(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
         inner.update(hex::decode(&r.worker_pkh).unwrap_or_default());
         inner.update(hex::decode(&r.solution).unwrap_or_default());
         inner.update(hex::decode(&r.commitment_nonce).unwrap_or_default());
+        // Phase 18B: mode-1 mixes the delegation digest (SHA256 of the 226-byte
+        // delegation) so the root matches irx1_root_from_block_receipts. Mode-0
+        // (empty delegation) is byte-identical to Phase 10-D.
+        if !r.delegation.is_empty() {
+            if let Ok(deleg_bytes) = hex::decode(&r.delegation) {
+                let mut dh = Sha256::new();
+                dh.update(&deleg_bytes);
+                let digest: [u8; 32] = dh.finalize().into();
+                inner.update(digest);
+            }
+        }
         outer.update(inner.finalize());
     }
     outer.finalize().into()
@@ -13797,6 +13819,13 @@ fn block_receipt_to_pending(r: &irium_node_rs::poawx::PoawxBlockReceipt) -> Poaw
         commitment_nonce: hex::encode(r.commitment_nonce),
         worker_pubkey: hex::encode(r.worker_pubkey),
         worker_sig: hex::encode(r.worker_sig),
+        // Phase 18B step-3: preserve the delegation across reorg restore so a
+        // mode-1 receipt is NOT down-converted to mode-0 (closes step-1 #9).
+        delegation: r
+            .delegation
+            .as_ref()
+            .map(|d| hex::encode(d.serialize()))
+            .unwrap_or_default(),
     }
 }
 
@@ -14036,6 +14065,70 @@ fn verify_worker_identity(
         .map_err(|_| "worker identity signature verification failed")
 }
 
+/// Phase 18B step-3: true when mode-1 delegated receipts are active for `height`
+/// on the submit path. Mirrors chain.rs `poawx_delegation_active`. Mainnet false.
+fn poawx_delegation_active_submit(height: u64) -> bool {
+    if network_kind_from_env() == NetworkKind::Mainnet {
+        return false;
+    }
+    match irium_node_rs::activation::poawx_delegation_activation_height() {
+        Some(h) => height >= h,
+        None => false,
+    }
+}
+
+/// Phase 18B step-3: submit-path verification of a mode-1 (delegated) pending
+/// receipt. Mirrors the mode-1 checks in chain.rs `validate_poawx_block_receipts`
+/// so the pool gets a clear early rejection; `connect_block` remains the
+/// authoritative validator. `worker_pubkey`/`worker_sig` are the pool delegate's.
+fn verify_delegated_pending_receipt(
+    r: &PoawxPendingReceipt,
+    sol: &[u8],
+    nonce_bytes: &[u8; 32],
+    height: u64,
+) -> Result<(), String> {
+    if !poawx_delegation_active_submit(height) {
+        return Err("mode-1 delegated receipt before delegation activation".to_string());
+    }
+    let dbytes = hex::decode(&r.delegation).map_err(|_| "delegation: invalid hex".to_string())?;
+    let d = irium_node_rs::poawx::Delegation::deserialize(&dbytes)?;
+    if d.network_id != irium_node_rs::activation::network_id_byte() {
+        return Err("delegation network_id mismatch".to_string());
+    }
+    let worker_pkh =
+        hex::decode(&r.worker_pkh).map_err(|_| "worker_pkh: invalid hex".to_string())?;
+    if d.miner_pkh().as_slice() != worker_pkh.as_slice() {
+        return Err("delegation miner_pkh != worker_pkh".to_string());
+    }
+    if height > d.expiry_height {
+        return Err("delegation expired".to_string());
+    }
+    if d.fee_bps != 0 {
+        return Err("nonzero delegation fee_bps rejected (official pool is 0%)".to_string());
+    }
+    d.verify_signature().map_err(|e| e.to_string())?;
+    let signer_pub =
+        hex::decode(&r.worker_pubkey).map_err(|_| "worker_pubkey: invalid hex".to_string())?;
+    if signer_pub.as_slice() != d.pool_pubkey.as_slice() {
+        return Err("signer != delegated pool_pubkey".to_string());
+    }
+    let challenge: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(sol);
+        h.update(nonce_bytes);
+        h.update(height.to_le_bytes());
+        h.finalize().into()
+    };
+    let vk = VerifyingKey::from_sec1_bytes(&signer_pub)
+        .map_err(|_| "signer pubkey: invalid secp256k1 key".to_string())?;
+    let sig_bytes =
+        hex::decode(&r.worker_sig).map_err(|_| "worker_sig: invalid hex".to_string())?;
+    let parsed_sig =
+        Signature::from_slice(&sig_bytes).map_err(|_| "worker_sig: invalid bytes".to_string())?;
+    vk.verify_prehash(&challenge, &parsed_sig)
+        .map_err(|_| "signer sig verification failed".to_string())
+}
+
 async fn poawx_get_assignment(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -14188,6 +14281,9 @@ async fn poawx_post_receipt(
         commitment_nonce: req.commitment_nonce.clone(),
         worker_pubkey: req.worker_pubkey.clone(),
         worker_sig: req.worker_sig.clone(),
+        // Manual-seed endpoint is mode-0 only; delegated receipts arrive via the
+        // pool's submit_block_extended path.
+        delegation: String::new(),
     };
     let tip_height = state
         .chain
@@ -14339,16 +14435,28 @@ async fn submit_block_extended(
                 return Err(StatusCode::BAD_REQUEST);
             }
             let sol = hex::decode(&r.solution).map_err(|_| StatusCode::BAD_REQUEST)?;
-            if let Err(e) = verify_worker_identity(
-                &r.worker_pkh,
-                &r.worker_pubkey,
-                &r.worker_sig,
-                &sol,
-                &sbe_nonce,
-                req.height,
-            ) {
+            // Phase 18B step-3: mode-0 (direct) uses verify_worker_identity;
+            // mode-1 (delegated) uses the delegation verifier. connect_block is
+            // the authoritative validator either way.
+            if r.delegation.is_empty() {
+                if let Err(e) = verify_worker_identity(
+                    &r.worker_pkh,
+                    &r.worker_pubkey,
+                    &r.worker_sig,
+                    &sol,
+                    &sbe_nonce,
+                    req.height,
+                ) {
+                    eprintln!(
+                        "[submit_block_extended] reject: worker identity failed ({}) height={}",
+                        e, req.height
+                    );
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            } else if let Err(e) = verify_delegated_pending_receipt(r, &sol, &sbe_nonce, req.height)
+            {
                 eprintln!(
-                    "[submit_block_extended] reject: worker identity failed ({}) height={}",
+                    "[submit_block_extended] reject: delegated receipt ({}) height={}",
                     e, req.height
                 );
                 return Err(StatusCode::BAD_REQUEST);
@@ -26886,6 +26994,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         let req = SubmitBlockExtendedRequest {
             height: 1,
@@ -26990,6 +27099,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         let req = SubmitBlockExtendedRequest {
             height: 1,
@@ -27015,6 +27125,189 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "SBE must return 503 when difficulty below minimum on active testnet"
         );
+    }
+
+    // ── Phase 18B step-3: mode-1 submit-side verification / mapping / root ──
+
+    fn p18b3_pk33(sk: &k256::ecdsa::SigningKey) -> [u8; 33] {
+        let vk = k256::ecdsa::VerifyingKey::from(sk);
+        let enc = vk.to_encoded_point(true);
+        let mut p = [0u8; 33];
+        p.copy_from_slice(enc.as_bytes());
+        p
+    }
+
+    fn p18b3_worker_tag(worker: &str) -> [u8; 32] {
+        if worker.is_empty() {
+            return [0u8; 32];
+        }
+        let mut h = Sha256::new();
+        h.update(worker.as_bytes());
+        h.finalize().into()
+    }
+
+    fn p18b3_signed_delegation(
+        miner: &k256::ecdsa::SigningKey,
+        pool_pub: [u8; 33],
+        network_id: u8,
+        worker: &str,
+        expiry: u64,
+        fee_bps: u16,
+    ) -> irium_node_rs::poawx::Delegation {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        let mut d = irium_node_rs::poawx::Delegation {
+            deleg_version: irium_node_rs::poawx::Delegation::VERSION,
+            network_id,
+            miner_pubkey: p18b3_pk33(miner),
+            pool_pubkey: pool_pub,
+            worker_tag: p18b3_worker_tag(worker),
+            expiry_height: expiry,
+            fee_bps,
+            fee_pkh: [0u8; 20],
+            deleg_nonce: [0x5au8; 32],
+            delegation_sig: [0u8; 64],
+        };
+        let sig: k256::ecdsa::Signature = miner.sign_prehash(&d.message_hash()).unwrap();
+        d.delegation_sig.copy_from_slice(&sig.to_bytes());
+        d
+    }
+
+    /// Build a mode-1 pending receipt where the pool delegate signs the per-height
+    /// challenge over solution [0x11;8].
+    fn p18b3_mode1_pending(
+        height: u64,
+        nonce: [u8; 32],
+        miner: &k256::ecdsa::SigningKey,
+        pool: &k256::ecdsa::SigningKey,
+        network_id: u8,
+        worker: &str,
+        expiry: u64,
+        fee_bps: u16,
+    ) -> PoawxPendingReceipt {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        let pool_pub = p18b3_pk33(pool);
+        let d = p18b3_signed_delegation(miner, pool_pub, network_id, worker, expiry, fee_bps);
+        let miner_pkh = d.miner_pkh();
+        let solution = [0x11u8; 8];
+        let challenge: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(solution);
+            h.update(nonce);
+            h.update(height.to_le_bytes());
+            h.finalize().into()
+        };
+        let sig: k256::ecdsa::Signature = pool.sign_prehash(&challenge).unwrap();
+        let mut signer_sig = [0u8; 64];
+        signer_sig.copy_from_slice(&sig.to_bytes());
+        PoawxPendingReceipt {
+            height,
+            lane: "cpu".to_string(),
+            worker_pkh: hex::encode(miner_pkh),
+            solution: hex::encode(solution),
+            commitment_nonce: hex::encode(nonce),
+            worker_pubkey: hex::encode(pool_pub),
+            worker_sig: hex::encode(signer_sig),
+            delegation: hex::encode(d.serialize()),
+        }
+    }
+
+    #[test]
+    fn phase18b3_compute_root_mode1_parity() {
+        let miner = k256::ecdsa::SigningKey::from_slice(&[5u8; 32]).unwrap();
+        let pool = k256::ecdsa::SigningKey::from_slice(&[6u8; 32]).unwrap();
+        let pend = p18b3_mode1_pending(1, [0x44u8; 32], &miner, &pool, 1, "rig1", 1000, 0);
+        let block_rec = pending_receipt_to_block_receipt(&pend).expect("map");
+        let node_root =
+            irium_node_rs::poawx::irx1_root_from_block_receipts(std::slice::from_ref(&block_rec));
+        let pool_root = compute_poawx_receipts_root(std::slice::from_ref(&pend));
+        assert_eq!(
+            pool_root, node_root,
+            "compute_poawx_receipts_root mode-1 must equal irx1_root_from_block_receipts"
+        );
+    }
+
+    #[test]
+    fn phase18b3_pending_json_roundtrips_delegation() {
+        let miner = k256::ecdsa::SigningKey::from_slice(&[5u8; 32]).unwrap();
+        let pool = k256::ecdsa::SigningKey::from_slice(&[6u8; 32]).unwrap();
+        let pend = p18b3_mode1_pending(1, [0x44u8; 32], &miner, &pool, 1, "rig1", 1000, 0);
+        let json = serde_json::to_string(&pend).unwrap();
+        assert!(json.contains("delegation"));
+        let back: PoawxPendingReceipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.delegation, pend.delegation);
+        // mode-0 omits the delegation field entirely (byte-identical).
+        let mut m0 = pend.clone();
+        m0.delegation = String::new();
+        let j0 = serde_json::to_string(&m0).unwrap();
+        assert!(
+            !j0.contains("delegation"),
+            "mode-0 pending JSON omits delegation"
+        );
+        let b0: PoawxPendingReceipt = serde_json::from_str(&j0).unwrap();
+        assert!(b0.delegation.is_empty());
+    }
+
+    #[test]
+    fn phase18b3_reorg_restore_preserves_delegation() {
+        let miner = k256::ecdsa::SigningKey::from_slice(&[5u8; 32]).unwrap();
+        let pool = k256::ecdsa::SigningKey::from_slice(&[6u8; 32]).unwrap();
+        let pend = p18b3_mode1_pending(1, [0x44u8; 32], &miner, &pool, 1, "rig1", 1000, 0);
+        let block_rec = pending_receipt_to_block_receipt(&pend).expect("map");
+        assert!(block_rec.delegation.is_some());
+        // reorg restore path must preserve the delegation (no down-convert).
+        let restored = block_receipt_to_pending(&block_rec);
+        assert_eq!(
+            restored.delegation, pend.delegation,
+            "reorg restore preserves delegation"
+        );
+        let block_rec2 = pending_receipt_to_block_receipt(&restored).expect("map2");
+        assert_eq!(block_rec2.delegation, block_rec.delegation);
+    }
+
+    #[test]
+    fn phase18b3_verify_delegated_pending_receipt_accept_and_reject() {
+        let _g = poawx_env_lock().lock().unwrap();
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_DELEGATION_ACTIVATION_HEIGHT", "1");
+        let miner = k256::ecdsa::SigningKey::from_slice(&[5u8; 32]).unwrap();
+        let pool = k256::ecdsa::SigningKey::from_slice(&[6u8; 32]).unwrap();
+        let nonce = [0x44u8; 32];
+        let height = 1u64;
+        let sol = hex::decode("1111111111111111").unwrap();
+
+        let ok = p18b3_mode1_pending(height, nonce, &miner, &pool, 1, "rig1", 1000, 0);
+        assert!(
+            verify_delegated_pending_receipt(&ok, &sol, &nonce, height).is_ok(),
+            "valid delegated receipt accepted"
+        );
+        // fee>0
+        let feebad = p18b3_mode1_pending(height, nonce, &miner, &pool, 1, "rig1", 1000, 100);
+        assert!(verify_delegated_pending_receipt(&feebad, &sol, &nonce, height).is_err());
+        // expired (expiry_height 0 < height 1; rule is height > expiry)
+        let exp = p18b3_mode1_pending(height, nonce, &miner, &pool, 1, "rig1", 0, 0);
+        assert!(verify_delegated_pending_receipt(&exp, &sol, &nonce, height).is_err());
+        // worker_pkh mismatch
+        let mut wrongpkh = p18b3_mode1_pending(height, nonce, &miner, &pool, 1, "rig1", 1000, 0);
+        wrongpkh.worker_pkh = "ff".repeat(20);
+        assert!(verify_delegated_pending_receipt(&wrongpkh, &sol, &nonce, height).is_err());
+        // network mismatch (delegation says devnet=2, node testnet=1)
+        let netbad = p18b3_mode1_pending(height, nonce, &miner, &pool, 2, "rig1", 1000, 0);
+        assert!(verify_delegated_pending_receipt(&netbad, &sol, &nonce, height).is_err());
+        // signer != delegated pool_pubkey
+        let other = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let mut signerbad = p18b3_mode1_pending(height, nonce, &miner, &pool, 1, "rig1", 1000, 0);
+        signerbad.worker_pubkey = hex::encode(p18b3_pk33(&other));
+        assert!(verify_delegated_pending_receipt(&signerbad, &sol, &nonce, height).is_err());
+        // mainnet hard-off
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(verify_delegated_pending_receipt(&ok, &sol, &nonce, height).is_err());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        // before activation
+        std::env::set_var("IRIUM_POAWX_DELEGATION_ACTIVATION_HEIGHT", "100");
+        assert!(verify_delegated_pending_receipt(&ok, &sol, &nonce, height).is_err());
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_DELEGATION_ACTIVATION_HEIGHT");
     }
 
     /// post_receipt returns 503 when difficulty is below minimum while mode=active (testnet).
@@ -27068,6 +27361,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         let req = SubmitBlockExtendedRequest {
             height: 1,
@@ -27110,6 +27404,7 @@ mod tests {
             commitment_nonce: "ef".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         save_poawx_pending_receipts(&[receipt.clone()]);
         let loaded = load_poawx_pending_receipts();
@@ -27187,6 +27482,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         save_poawx_pending_receipts(&[receipt]);
         let exists = tmp.exists();
@@ -27210,6 +27506,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         let json = serde_json::to_string(&vec![receipt]).unwrap();
         std::fs::write(&tmp, json).unwrap();
@@ -27239,6 +27536,7 @@ mod tests {
                 commitment_nonce: "00".repeat(32),
                 worker_pubkey: String::new(),
                 worker_sig: String::new(),
+                delegation: String::new(),
             })
             .collect();
         if receipts.len() > POAWX_MAX_PENDING_RECEIPTS {
@@ -27272,6 +27570,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         let mut receipts = vec![make_r(100), make_r(200)];
         save_poawx_pending_receipts(&receipts);
@@ -27304,6 +27603,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         }];
         prune_expired_poawx_receipts(&mut receipts, 100);
         assert_eq!(receipts.len(), 1, "fresh receipt at tip must be retained");
@@ -27319,6 +27619,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         }];
         let tip = 10 + POAWX_RECEIPT_MAX_AGE_BLOCKS + 1;
         prune_expired_poawx_receipts(&mut receipts, tip);
@@ -27338,6 +27639,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         let mut receipts = vec![make_r(50), make_r(80), make_r(100)];
         // tip=105: 50+24=74<105 stale, 80+24=104<105 stale, 100+24=124>=105 fresh
@@ -27356,6 +27658,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         }];
         prune_expired_poawx_receipts(&mut receipts, 50);
         assert_eq!(
@@ -27387,6 +27690,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         save_poawx_pending_receipts(&[stale]);
         let mut receipts = load_poawx_pending_receipts();
@@ -27416,6 +27720,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         let mut receipts = vec![make_r(1), make_r(500)];
         save_poawx_pending_receipts(&receipts);
@@ -27449,6 +27754,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         save_poawx_pending_receipts(&[receipt]);
         let loaded = load_poawx_pending_receipts();
@@ -27480,6 +27786,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         save_poawx_pending_receipts(&[receipt_on_disk]);
         let (state, _, _, _) = create_test_state(None);
@@ -27528,6 +27835,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         save_poawx_pending_receipts(&[receipt_on_disk.clone()]);
         let (state, _, _, _) = create_test_state(None);
@@ -27656,6 +27964,7 @@ mod tests {
             commitment_nonce: "ef".repeat(32),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         }];
         save_poawx_pending_receipts(&receipts);
         let loaded = load_poawx_pending_receipts();
@@ -27828,6 +28137,7 @@ mod tests {
             commitment_nonce: "cd".repeat(32),
             worker_pubkey: pubkey_hex.clone(),
             worker_sig: "ef".repeat(64),
+            delegation: String::new(),
         };
         save_poawx_pending_receipts(&[receipt]);
         let loaded = load_poawx_pending_receipts();
@@ -27969,6 +28279,7 @@ mod tests {
                 commitment_nonce: "bb".repeat(32),
                 worker_pubkey: String::new(),
                 worker_sig: String::new(),
+                delegation: String::new(),
             })
             .collect()
     }
@@ -27999,6 +28310,7 @@ mod tests {
             worker_pkh: pkh,
             worker_pubkey: pubk,
             worker_sig: "ee".repeat(64),
+            delegation: String::new(),
             solution: "0123456789abcdef".to_string(),
             commitment_nonce: "ff".repeat(32),
         };
@@ -28277,6 +28589,7 @@ mod tests {
             commitment_nonce: hex::encode(nonce),
             worker_pubkey: pubkey_hex,
             worker_sig: sig_str,
+            delegation: String::new(),
         }
     }
 
@@ -28520,6 +28833,7 @@ mod tests {
             commitment_nonce: hex::encode(nonce),
             worker_pubkey: pubkey_hex,
             worker_sig: String::new(),
+            delegation: String::new(),
         };
         let root = compute_poawx_receipts_root(&[receipt.clone()]);
         let req = SubmitBlockExtendedRequest {
@@ -28565,6 +28879,7 @@ mod tests {
             commitment_nonce: hex::encode(nonce),
             worker_pubkey: pubkey_hex,
             worker_sig: "dd".repeat(64),
+            delegation: String::new(),
         };
         let root = compute_poawx_receipts_root(&[receipt.clone()]);
         let req = SubmitBlockExtendedRequest {
@@ -28609,6 +28924,7 @@ mod tests {
             commitment_nonce: "00".repeat(32),
             worker_pubkey: pubkey_hex,
             worker_sig: "dd".repeat(64),
+            delegation: String::new(),
         };
         let root = compute_poawx_receipts_root(&[receipt.clone()]);
         let req = SubmitBlockExtendedRequest {
@@ -28668,6 +28984,7 @@ mod tests {
             commitment_nonce: hex::encode(nonce),
             worker_pubkey: pubkey_hex,
             worker_sig: sig,
+            delegation: String::new(),
         };
         let root = compute_poawx_receipts_root(&[receipt.clone()]);
         let req = SubmitBlockExtendedRequest {
@@ -28834,6 +29151,7 @@ mod tests {
                 commitment_nonce: "bb".repeat(32),
                 worker_pubkey: pubkey_hex,
                 worker_sig: "cc".repeat(64),
+                delegation: String::new(),
             }],
             poawx_receipts_root: "dd".repeat(32),
         };
@@ -29189,6 +29507,7 @@ mod tests {
             commitment_nonce: "0".repeat(64),
             worker_pubkey: "00".repeat(33),
             worker_sig: "00".repeat(64),
+            delegation: String::new(),
         }
     }
 

@@ -304,6 +304,17 @@ pub fn compute_receipts_root_from_pending(receipts: &[PoawxPendingReceipt]) -> [
         inner.update(hex::decode(&r.worker_pkh).unwrap_or_default());
         inner.update(hex::decode(&r.solution).unwrap_or_default());
         inner.update(hex::decode(&r.commitment_nonce).unwrap_or_default());
+        // Phase 18B: mode-1 mixes the delegation digest (SHA256 of the 226-byte
+        // delegation) to match the node's irx1_root_from_block_receipts. Mode-0
+        // (empty delegation) is byte-identical to Phase 10-D.
+        if !r.delegation.is_empty() {
+            if let Ok(deleg_bytes) = hex::decode(&r.delegation) {
+                let mut dh = Sha256::new();
+                dh.update(&deleg_bytes);
+                let digest: [u8; 32] = dh.finalize().into();
+                inner.update(digest);
+            }
+        }
         outer.update(inner.finalize());
     }
     outer.finalize().into()
@@ -323,6 +334,7 @@ mod tests {
             commitment_nonce: nonce.to_string(),
             worker_pubkey: String::new(),
             worker_sig: String::new(),
+            delegation: String::new(),
         }
     }
 
