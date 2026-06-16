@@ -2322,6 +2322,7 @@ fn usage() {
     eprintln!("  irium-wallet restore-backup <file> [--force]");
     eprintln!("  irium-wallet address-to-pkh <base58_addr>");
     eprintln!("  irium-wallet poawx-register --pool <url> --addr <addr> --worker <name> --expiry-height <N> [--fee-bps 0]");
+    eprintln!("  irium-wallet poawx-register --emit-only --pool-pubkey <66hex> --network-id <id> --addr <addr> --worker <name> --expiry-height <N> --fee-bps 0  > poawx-delegation.json");
     eprintln!("  irium-wallet qr <base58_addr> [--svg] [--out <file>]");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
@@ -3418,40 +3419,177 @@ fn next_flag_value(args: &[String], i: &mut usize) -> Result<String, String> {
     Ok(v)
 }
 
-fn cmd_poawx_register(args: &[String]) -> Result<(), String> {
-    use rand_core::{OsRng, RngCore};
-    let mut pool: Option<String> = None;
-    let mut addr: Option<String> = None;
-    let mut worker = String::new();
-    let mut expiry: Option<u64> = None;
-    let mut fee_bps: u16 = 0;
+/// The exact JSON body the wallet sends to the pool's loopback-only
+/// `POST /poawx/delegation` endpoint. Used by BOTH the online register path
+/// (as the POST body) and the `--emit-only` path (printed verbatim), so the
+/// two are byte-identical by construction. Contains only public data — the
+/// canonical 226-byte delegation hex, the worker name, and the miner pkh.
+/// It never includes the wallet private key.
+fn delegation_post_body(d: &irium_node_rs::poawx::Delegation, worker: &str) -> serde_json::Value {
+    serde_json::json!({
+        "delegation": hex::encode(d.serialize()),
+        "worker": worker,
+        "miner_pkh": hex::encode(d.miner_pkh()),
+    })
+}
+
+/// Parsed `poawx-register` flags (mode-agnostic). `emit_only` selects the
+/// offline path; the remaining fields are validated per-mode afterwards.
+struct PoawxRegisterArgs {
+    emit_only: bool,
+    pool: Option<String>,
+    pool_pubkey_hex: Option<String>,
+    network_id: Option<u8>,
+    addr: Option<String>,
+    worker: String,
+    expiry: Option<u64>,
+    fee_bps: u16,
+}
+
+fn parse_poawx_register_args(args: &[String]) -> Result<PoawxRegisterArgs, String> {
+    let mut a = PoawxRegisterArgs {
+        emit_only: false,
+        pool: None,
+        pool_pubkey_hex: None,
+        network_id: None,
+        addr: None,
+        worker: String::new(),
+        expiry: None,
+        fee_bps: 0,
+    };
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
-            "--pool" => pool = Some(next_flag_value(args, &mut i)?),
-            "--addr" => addr = Some(next_flag_value(args, &mut i)?),
-            "--worker" => worker = next_flag_value(args, &mut i)?,
+            "--emit-only" => {
+                a.emit_only = true;
+                i += 1;
+            }
+            "--pool" => a.pool = Some(next_flag_value(args, &mut i)?),
+            "--pool-pubkey" => a.pool_pubkey_hex = Some(next_flag_value(args, &mut i)?),
+            "--network-id" => {
+                a.network_id = Some(
+                    next_flag_value(args, &mut i)?
+                        .parse()
+                        .map_err(|_| "invalid --network-id".to_string())?,
+                )
+            }
+            "--addr" => a.addr = Some(next_flag_value(args, &mut i)?),
+            "--worker" => a.worker = next_flag_value(args, &mut i)?,
             "--expiry-height" => {
-                expiry = Some(
+                a.expiry = Some(
                     next_flag_value(args, &mut i)?
                         .parse()
                         .map_err(|_| "invalid --expiry-height".to_string())?,
                 )
             }
             "--fee-bps" => {
-                fee_bps = next_flag_value(args, &mut i)?
+                a.fee_bps = next_flag_value(args, &mut i)?
                     .parse()
                     .map_err(|_| "invalid --fee-bps".to_string())?
             }
             other => return Err(format!("unknown flag {other}")),
         }
     }
-    if fee_bps != 0 {
+    Ok(a)
+}
+
+/// Validate the offline (`--emit-only`) inputs and resolve the 33-byte pool
+/// pubkey. Pure: no wallet access, no network, no signing — fully unit-testable.
+/// Fails closed on a non-zero fee and on any missing/malformed required input.
+fn resolve_emit_only_args(
+    a: &PoawxRegisterArgs,
+) -> Result<([u8; 33], u8, String, String, u64), String> {
+    if a.pool.is_some() {
+        return Err("--pool is not used with --emit-only (offline: no network access)".to_string());
+    }
+    if a.fee_bps != 0 {
         return Err("official pool fee is 0%; --fee-bps > 0 is not supported".to_string());
     }
-    let pool = pool.ok_or_else(|| "--pool <url> required".to_string())?;
-    let addr = addr.ok_or_else(|| "--addr <miner-address> required".to_string())?;
-    let expiry = expiry.ok_or_else(|| "--expiry-height <N> required".to_string())?;
+    let pool_pubkey_hex = a
+        .pool_pubkey_hex
+        .as_deref()
+        .ok_or_else(|| "--pool-pubkey <66hex> required with --emit-only".to_string())?;
+    let network_id = a
+        .network_id
+        .ok_or_else(|| "--network-id <id> required with --emit-only".to_string())?;
+    let addr = a
+        .addr
+        .clone()
+        .ok_or_else(|| "--addr <miner-address> required".to_string())?;
+    if a.worker.is_empty() {
+        return Err("--worker <name> required with --emit-only".to_string());
+    }
+    let expiry = a
+        .expiry
+        .ok_or_else(|| "--expiry-height <N> required".to_string())?;
+    let pool_pubkey_bytes =
+        hex::decode(pool_pubkey_hex).map_err(|_| "--pool-pubkey invalid hex".to_string())?;
+    if pool_pubkey_bytes.len() != 33 {
+        return Err("--pool-pubkey must be 33 bytes (66 hex chars)".to_string());
+    }
+    let mut pool_pubkey = [0u8; 33];
+    pool_pubkey.copy_from_slice(&pool_pubkey_bytes);
+    Ok((pool_pubkey, network_id, addr, a.worker.clone(), expiry))
+}
+
+fn cmd_poawx_register(args: &[String]) -> Result<(), String> {
+    use rand_core::{OsRng, RngCore};
+    let a = parse_poawx_register_args(args)?;
+
+    // ── Offline path: sign locally, print the POSTable payload, no network. ──
+    // For a trusted external miner pilot: the operator shares the public pool
+    // identity out-of-band; the miner signs locally (private key never leaves
+    // the wallet) and returns ONLY the printed JSON, which the operator submits
+    // to the loopback-only /poawx/delegation endpoint. No GET, no POST, no SSH.
+    if a.emit_only {
+        let (pool_pubkey, network_id, addr, worker, expiry) = resolve_emit_only_args(&a)?;
+        let (_key, signing_key) = signer_material_from_wallet(&addr)?;
+        let mut nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut nonce);
+        let d = build_signed_delegation(
+            &signing_key,
+            pool_pubkey,
+            network_id,
+            &worker,
+            expiry,
+            0,
+            nonce,
+        )?;
+        d.verify_signature()
+            .map_err(|e| format!("self-verify failed before emit: {e}"))?;
+        let body = delegation_post_body(&d, &worker);
+        // stdout carries ONLY the JSON payload so `> poawx-delegation.json`
+        // produces a file usable directly with `curl --data @`. All human
+        // notes go to stderr. The private key is never printed or logged.
+        let line = serde_json::to_string(&body)
+            .map_err(|e| format!("serialize delegation payload: {e}"))?;
+        println!("{line}");
+        eprintln!(
+            "[emit-only] signed delegation for miner_pkh {} (worker {worker}, expiry {expiry}, fee_bps 0); no network used. Send the JSON above to the operator to POST to the loopback-only /poawx/delegation endpoint.",
+            hex::encode(d.miner_pkh())
+        );
+        return Ok(());
+    }
+
+    // ── Online path (unchanged): GET pool-identity, sign in memory, POST. ──
+    if a.pool_pubkey_hex.is_some() || a.network_id.is_some() {
+        return Err(
+            "--pool-pubkey/--network-id are only valid with --emit-only (online mode reads them from /poawx/pool-identity)"
+                .to_string(),
+        );
+    }
+    if a.fee_bps != 0 {
+        return Err("official pool fee is 0%; --fee-bps > 0 is not supported".to_string());
+    }
+    let pool = a.pool.ok_or_else(|| "--pool <url> required".to_string())?;
+    let addr = a
+        .addr
+        .ok_or_else(|| "--addr <miner-address> required".to_string())?;
+    let worker = a.worker;
+    let fee_bps = a.fee_bps;
+    let expiry = a
+        .expiry
+        .ok_or_else(|| "--expiry-height <N> required".to_string())?;
 
     let base = pool.trim_end_matches('/').to_string();
     let client = rpc_client(&base)?;
@@ -3509,11 +3647,7 @@ fn cmd_poawx_register(args: &[String]) -> Result<(), String> {
     let miner_pkh_hex = hex::encode(d.miner_pkh());
 
     // 3. POST the canonical 226-byte delegation hex.
-    let body = serde_json::json!({
-        "delegation": hex::encode(d.serialize()),
-        "worker": worker,
-        "miner_pkh": miner_pkh_hex,
-    });
+    let body = delegation_post_body(&d, &worker);
     let resp = client
         .post(format!("{base}/poawx/delegation"))
         .json(&body)
@@ -15035,6 +15169,193 @@ mod tests {
         assert_eq!(d.worker_tag, wt);
         // Non-zero fee is rejected.
         assert!(build_signed_delegation(&sk, pool, 1, "rig1", 1000, 100, [9u8; 32]).is_err());
+    }
+
+    // Phase 19B: --emit-only offline delegation.
+
+    /// The `--emit-only` output is byte-identical to the online POST body, because
+    /// both call `delegation_post_body`. Proves the payload shape + no private key.
+    #[test]
+    fn poawx_emit_only_payload_matches_post_body() {
+        use k256::ecdsa::SigningKey;
+        let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let pool = [0x02u8; 33];
+        let d = build_signed_delegation(&sk, pool, 1, "rig1", 1000, 0, [9u8; 32]).unwrap();
+        let body = delegation_post_body(&d, "rig1");
+        // Exactly the three public fields the pool's POST /poawx/delegation reads.
+        assert_eq!(
+            body["delegation"].as_str().unwrap(),
+            hex::encode(d.serialize())
+        );
+        assert_eq!(body["worker"].as_str().unwrap(), "rig1");
+        assert_eq!(
+            body["miner_pkh"].as_str().unwrap(),
+            hex::encode(d.miner_pkh())
+        );
+        // Valid JSON; carries no private-key material.
+        let s = serde_json::to_string(&body).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&s).is_ok());
+        assert!(!s.contains("privkey"));
+        assert!(!s.contains(&hex::encode(sk.to_bytes())));
+    }
+
+    fn poawx_args(parts: &[&str]) -> Vec<String> {
+        std::iter::once("poawx-register".to_string())
+            .chain(parts.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    /// `--emit-only` input validation (pure: no wallet, no network, no signing).
+    #[test]
+    fn poawx_emit_only_arg_validation() {
+        let pk = hex::encode([0x02u8; 33]); // well-formed 33-byte length, 66 hex
+
+        // Valid: resolves to the expected fields.
+        let a = parse_poawx_register_args(&poawx_args(&[
+            "--emit-only",
+            "--pool-pubkey",
+            &pk,
+            "--network-id",
+            "1",
+            "--addr",
+            "Pabc",
+            "--worker",
+            "w1",
+            "--expiry-height",
+            "1000",
+            "--fee-bps",
+            "0",
+        ]))
+        .unwrap();
+        let (ppk, nid, addr, worker, expiry) = resolve_emit_only_args(&a).unwrap();
+        assert_eq!(ppk, [0x02u8; 33]);
+        assert_eq!(nid, 1);
+        assert_eq!(addr, "Pabc");
+        assert_eq!(worker, "w1");
+        assert_eq!(expiry, 1000);
+
+        // Each rejection case.
+        let cases: Vec<Vec<&str>> = vec![
+            // missing pool-pubkey
+            vec![
+                "--emit-only",
+                "--network-id",
+                "1",
+                "--addr",
+                "Pabc",
+                "--worker",
+                "w1",
+                "--expiry-height",
+                "1000",
+            ],
+            // missing network-id
+            vec![
+                "--emit-only",
+                "--pool-pubkey",
+                &pk,
+                "--addr",
+                "Pabc",
+                "--worker",
+                "w1",
+                "--expiry-height",
+                "1000",
+            ],
+            // missing worker
+            vec![
+                "--emit-only",
+                "--pool-pubkey",
+                &pk,
+                "--network-id",
+                "1",
+                "--addr",
+                "Pabc",
+                "--expiry-height",
+                "1000",
+            ],
+            // missing expiry
+            vec![
+                "--emit-only",
+                "--pool-pubkey",
+                &pk,
+                "--network-id",
+                "1",
+                "--addr",
+                "Pabc",
+                "--worker",
+                "w1",
+            ],
+            // fee_bps > 0
+            vec![
+                "--emit-only",
+                "--pool-pubkey",
+                &pk,
+                "--network-id",
+                "1",
+                "--addr",
+                "Pabc",
+                "--worker",
+                "w1",
+                "--expiry-height",
+                "1000",
+                "--fee-bps",
+                "1",
+            ],
+            // malformed pool-pubkey (bad hex)
+            vec![
+                "--emit-only",
+                "--pool-pubkey",
+                "zz",
+                "--network-id",
+                "1",
+                "--addr",
+                "Pabc",
+                "--worker",
+                "w1",
+                "--expiry-height",
+                "1000",
+            ],
+            // --pool together with --emit-only
+            vec![
+                "--emit-only",
+                "--pool",
+                "http://x",
+                "--pool-pubkey",
+                &pk,
+                "--network-id",
+                "1",
+                "--addr",
+                "Pabc",
+                "--worker",
+                "w1",
+                "--expiry-height",
+                "1000",
+            ],
+        ];
+        for c in cases {
+            let a = parse_poawx_register_args(&poawx_args(&c)).unwrap();
+            assert!(
+                resolve_emit_only_args(&a).is_err(),
+                "expected rejection for args: {c:?}"
+            );
+        }
+
+        // malformed pool-pubkey (wrong length) — separate, needs an owned String.
+        let short = hex::encode([0x02u8; 10]);
+        let a = parse_poawx_register_args(&poawx_args(&[
+            "--emit-only",
+            "--pool-pubkey",
+            &short,
+            "--network-id",
+            "1",
+            "--addr",
+            "Pabc",
+            "--worker",
+            "w1",
+            "--expiry-height",
+            "1000",
+        ]))
+        .unwrap();
+        assert!(resolve_emit_only_args(&a).is_err());
     }
 
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
