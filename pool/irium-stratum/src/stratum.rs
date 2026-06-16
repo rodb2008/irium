@@ -1183,11 +1183,54 @@ fn select_adapter_kind(config: &StratumConfig) -> AdapterKind {
             }
         }
         AdapterMode::Auto => match config.miner_family_mode {
+            // PoAW-X testnet/devnet (explicit): route cpuminer-family to the
+            // deterministic native_rewardable path, which is empirically
+            // byte-identical to a standard cpuminer's header (Phase 13
+            // measurement: version=01000000, prev/merkle natural, PoW hash ==
+            // canonical). Gated by poawx_enabled && native_rewardable_enabled,
+            // so mainnet (poawx_enabled=false) keeps legacy compat routing
+            // byte-identically.
+            MinerFamilyMode::Cpuminer
+                if config.poawx_enabled && config.native_rewardable_enabled =>
+            {
+                AdapterKind::NativeRewardableReserved
+            }
             MinerFamilyMode::Cpuminer => AdapterKind::CpuminerCompatibility,
             _ if config.native_rewardable_enabled => AdapterKind::NativeRewardableReserved,
             _ => AdapterKind::LegacyRewardable,
         },
     }
+}
+
+/// True only when IRIUM_NETWORK explicitly selects a non-mainnet network
+/// (testnet/devnet/regtest/trial). Mainnet or unset => false, so mainnet-gated
+/// behaviors stay byte-identical. Mirrors the network detection used by
+/// standard_header_activation_height().
+pub fn is_non_mainnet_network() -> bool {
+    std::env::var("IRIUM_NETWORK")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "testnet" | "devnet" | "regtest" | "trial"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Resolve the starting share difficulty floor. Mainnet floor is fixed at 1
+/// (unchanged). Testnet/devnet (explicit non-mainnet gate) may use a sub-1 floor
+/// so a real CPU miner finds genuine blocks quickly in the isolated harness.
+/// `non_mainnet` MUST come from an explicit IRIUM_NETWORK gate; mainnet/unset
+/// keeps the historical floor of 1.0 byte-for-byte.
+pub fn resolved_default_diff(raw: f64, non_mainnet: bool) -> f64 {
+    const MAINNET_DIFF_FLOOR: f64 = 1.0;
+    const DEVNET_DIFF_FLOOR: f64 = 1e-9;
+    let floor = if non_mainnet {
+        DEVNET_DIFF_FLOOR
+    } else {
+        MAINNET_DIFF_FLOOR
+    };
+    raw.max(floor)
 }
 
 fn payout_script_from_pkh(pkh: &[u8; 20]) -> Vec<u8> {
@@ -1496,10 +1539,29 @@ fn build_native_rewardable_coinbase(
     tx.push(script_sig.len() as u8);
     tx.extend_from_slice(&script_sig);
     tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
-    tx.push(1); // single output: full coinbase value to worker
+    // PoAW-X: when the snapshot carries pending receipts (PoAW-X testnet/devnet),
+    // commit the irx1 receipts-root via a zero-value OP_RETURN output, byte-
+    // identical to the coinbase_prefix_suffix/to_job layout that send_notify
+    // emits (output_count = 1 + extras, extra = value(0) + varint(len) + script).
+    // This keeps the native notify and decode coinbases byte-for-byte equal so
+    // the miner PoW still matches, and lets iriumd submit_block_extended find the
+    // commitment. Mainnet / no-receipts keeps the single-output coinbase
+    // byte-for-byte (the OP_RETURN is only appended when receipts are present).
+    let irx1_commitment: Option<Vec<u8>> = if snapshot.poawx_pending_receipts.is_empty() {
+        None
+    } else {
+        let root = compute_receipts_root_from_pending(&snapshot.poawx_pending_receipts);
+        Some(build_irx1_commitment_script(&root))
+    };
+    tx.push(if irx1_commitment.is_some() { 2 } else { 1 });
     tx.extend_from_slice(&snapshot.coinbase_value.to_le_bytes());
     tx.push(snapshot.payout_script.len() as u8);
     tx.extend_from_slice(&snapshot.payout_script);
+    if let Some(script) = irx1_commitment {
+        tx.extend_from_slice(&0u64.to_le_bytes());
+        tx.push(script.len() as u8);
+        tx.extend_from_slice(&script);
+    }
     tx.extend_from_slice(&0u32.to_le_bytes());
     Ok(tx)
 }
@@ -2968,6 +3030,56 @@ async fn handle_submit_native_rewardable(
     let worker = session.worker.clone().unwrap_or_else(|| "-".to_string());
     let adapter = NativeRewardableAdapter;
     let solve = adapter.decode_submit(&snapshot, session, config, submit)?;
+
+    // PoAW-X Phase 13 measurement-only (env-gated IRIUM_NATIVE_HEADER_TRACE=1).
+    // Captures the exact header-byte divergence between a real cpuminer's
+    // submitted work and the deterministic canonical reconstruction. Fires for
+    // EVERY native submit (before share_ok) so a diverging submit is still
+    // traced. Logs only; never promotes. Off by default -> mainnet/prod unaffected.
+    if std::env::var("IRIUM_NATIVE_HEADER_TRACE").as_deref() == Ok("1") {
+        let ntime = parse_u32_hex(&solve.ntime_hex).unwrap_or(0);
+        let nonce = parse_u32_hex(&solve.nonce_hex).unwrap_or(0);
+        let merkle = solve.canonical_merkle_root;
+        let mut prev_natural = snapshot.prev_hash_internal;
+        prev_natural.reverse();
+        let prev_swap4 = swap4_bytes_each_word(prev_natural);
+        let lz = |h: &[u8; 32]| -> u32 {
+            let mut n = 0u32;
+            for b in h.iter() {
+                if *b == 0 { n += 8; } else { n += b.leading_zeros(); break; }
+            }
+            n
+        };
+        let build = |ver: [u8; 4], prev: [u8; 32]| -> ([u8; 32], u32) {
+            let mut h = [0u8; 80];
+            h[0..4].copy_from_slice(&ver);
+            h[4..36].copy_from_slice(&prev);
+            h[36..68].copy_from_slice(&merkle);
+            h[68..72].copy_from_slice(&ntime.to_le_bytes());
+            h[72..76].copy_from_slice(&snapshot.bits.to_le_bytes());
+            h[76..80].copy_from_slice(&nonce.to_le_bytes());
+            let mut hh = sha256d(&h);
+            hh.reverse();
+            let z = lz(&hh);
+            (hh, z)
+        };
+        let v_le = snapshot.version.to_le_bytes();
+        let v_be = snapshot.version.to_be_bytes();
+        let (h_le_nat, z_le_nat) = build(v_le, prev_natural);
+        let (h_be_nat, z_be_nat) = build(v_be, prev_natural);
+        let (h_le_sw, z_le_sw) = build(v_le, prev_swap4);
+        let (h_be_sw, z_be_sw) = build(v_be, prev_swap4);
+        info!("[NHT] worker={} job={} height={} ext2={} ntime={} nonce={} snapshot_version={:#010x} bits={:#010x}",
+            worker, snapshot.job_id, snapshot.height, solve.extranonce2_hex, solve.ntime_hex, solve.nonce_hex, snapshot.version, snapshot.bits);
+        info!("[NHT] prev_internal={} prev_natural={} prev_swap4={} merkle={}",
+            hex::encode(snapshot.prev_hash_internal), hex::encode(prev_natural), hex::encode(prev_swap4), hex::encode(merkle));
+        info!("[NHT] canonical_header80={} canonical_hash={} canonical_lz={}",
+            hex::encode(solve.canonical_header80), hex::encode(solve.canonical_hash), lz(&solve.canonical_hash));
+        info!("[NHT] cand v_le+prev_natural hash={} lz={}", hex::encode(h_le_nat), z_le_nat);
+        info!("[NHT] cand v_be+prev_natural hash={} lz={}", hex::encode(h_be_nat), z_be_nat);
+        info!("[NHT] cand v_le+prev_swap4   hash={} lz={}", hex::encode(h_le_sw), z_le_sw);
+        info!("[NHT] cand v_be+prev_swap4   hash={} lz={}", hex::encode(h_be_sw), z_be_sw);
+    }
 
     if !solve.share_ok {
         mark_rejected_share();
@@ -4600,6 +4712,112 @@ mod tests {
     /// PoAW-X rewardable production is deterministic/canonical: decoding the
     /// identical native submit twice yields byte-identical canonical header and
     /// hash (no variant sweep, no byte-order guessing), and it is the rewardable path.
+    #[test]
+    fn mainnet_auto_cpuminer_routes_to_compat_when_not_poawx() {
+        // poawx_enabled=false (mainnet/legacy) => cpuminer-family stays on the
+        // compat adapter regardless of native_rewardable_enabled. Unchanged.
+        let mut config = test_config(MinerFamilyMode::Cpuminer); // Auto, poawx=false
+        assert!(matches!(
+            select_adapter_kind(&config),
+            AdapterKind::CpuminerCompatibility
+        ));
+        config.native_rewardable_enabled = true; // still mainnet (poawx=false)
+        assert!(matches!(
+            select_adapter_kind(&config),
+            AdapterKind::CpuminerCompatibility
+        ));
+    }
+
+    #[test]
+    fn poawx_auto_cpuminer_routes_to_native_when_enabled() {
+        let mut config = test_config(MinerFamilyMode::Cpuminer); // Auto
+        config.poawx_enabled = true;
+        // PoAW-X but native NOT explicitly enabled => still compat (explicit gate).
+        assert!(matches!(
+            select_adapter_kind(&config),
+            AdapterKind::CpuminerCompatibility
+        ));
+        // PoAW-X + explicit native enable => deterministic native_rewardable.
+        config.native_rewardable_enabled = true;
+        assert!(matches!(
+            select_adapter_kind(&config),
+            AdapterKind::NativeRewardableReserved
+        ));
+    }
+
+    #[test]
+    fn diff_floor_mainnet_unchanged_devnet_relaxed() {
+        // Mainnet floor stays at 1.0 (sub-1 clamped up); larger values pass.
+        assert_eq!(resolved_default_diff(0.0001, false), 1.0);
+        assert_eq!(resolved_default_diff(16.0, false), 16.0);
+        // Non-mainnet allows sub-1 floors so a CPU finds blocks quickly.
+        assert_eq!(resolved_default_diff(0.0001, true), 0.0001);
+        assert_eq!(resolved_default_diff(1e-9, true), 1e-9);
+        // Degenerate inputs still produce a positive devnet floor.
+        assert_eq!(resolved_default_diff(0.0, true), 1e-9);
+    }
+
+    #[test]
+    fn native_coinbase_no_receipts_single_output_byte_identical() {
+        // No pending receipts (mainnet/legacy/no-PoAW-X): the native coinbase
+        // stays a single-output tx with NO OP_RETURN, byte-for-byte as before.
+        let snap = snapshot_with_receipts(vec![]);
+        let cb = build_native_rewardable_coinbase(&snap, &[0u8; 4]).unwrap();
+        // OP_RETURN tag must be absent.
+        assert!(
+            !cb.windows(6).any(|w| w == [0x6a, 0x24, 0x69, 0x72, 0x78, 0x31]),
+            "no-receipts coinbase must not contain an irx1 OP_RETURN"
+        );
+        // Exactly one output (count byte == 0x01 sits right after the 4-byte
+        // input sequence 0xffffffff that ends the single coinbase input).
+        let seq_pos = cb
+            .windows(4)
+            .rposition(|w| w == [0xff, 0xff, 0xff, 0xff])
+            .unwrap();
+        assert_eq!(cb[seq_pos + 4], 0x01, "no-receipts coinbase must have 1 output");
+    }
+
+    #[test]
+    fn native_coinbase_with_receipts_contains_irx1_commitment() {
+        let receipt = sample_poawx_receipt();
+        let root = compute_receipts_root_from_pending(&[receipt.clone()]);
+        let snap = snapshot_with_receipts(vec![receipt]);
+        let cb = build_native_rewardable_coinbase(&snap, &[0u8; 4]).unwrap();
+        // Must carry the exact irx1 commitment (6a 24 "irx1" + root).
+        let mut expected = vec![0x6a, 0x24u8];
+        expected.extend_from_slice(b"irx1");
+        expected.extend_from_slice(&root);
+        assert!(
+            cb.windows(expected.len()).any(|w| w == expected.as_slice()),
+            "receipt-bearing coinbase must contain the irx1 commitment"
+        );
+    }
+
+    #[test]
+    fn native_notify_and_decode_coinbase_byte_identical_with_irx1() {
+        // The coinbase send_notify emits (snapshot prefix/suffix split, built via
+        // coinbase_prefix_suffix WITH the irx1 extra) MUST be byte-identical to the
+        // coinbase the native decoder reconstructs (build_native_rewardable_coinbase),
+        // or the miner PoW would not match. Proven here end-to-end through
+        // build_canonical_job_snapshot.
+        let receipt = sample_poawx_receipt();
+        let root = compute_receipts_root_from_pending(&[receipt.clone()]);
+        let irx1 = build_irx1_commitment_script(&root);
+        let mut job = test_job();
+        job.coinbase_extras = vec![(0u64, irx1)];
+        job.poawx_pending_receipts = vec![receipt];
+        let session = test_session(AdapterKind::NativeRewardableReserved);
+        let config = test_config(MinerFamilyMode::Cpuminer);
+        let snap = build_canonical_job_snapshot(&job, &session, &config).unwrap();
+        let ext2 = [0u8; 4];
+        let notify_cb = reconstruct_coinbase(&snap, &ext2);
+        let decode_cb = build_native_rewardable_coinbase(&snap, &ext2).unwrap();
+        assert_eq!(
+            notify_cb, decode_cb,
+            "native notify and decode coinbases must be byte-identical"
+        );
+    }
+
     #[test]
     fn native_rewardable_is_deterministic_canonical() {
         let (_cfg, _sess, snapshot, _issued, submit, solve1) = native_fixture();

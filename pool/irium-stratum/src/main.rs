@@ -28,7 +28,8 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(16.0);
-    let default_diff = default_diff_raw.max(1.0);
+    let default_diff =
+        stratum::resolved_default_diff(default_diff_raw, stratum::is_non_mainnet_network());
     let extranonce1_size = env::var("STRATUM_EXTRANONCE1_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -163,10 +164,16 @@ async fn main() -> Result<()> {
         warn!("[poawx] IRIUM_STRATUM_POAWX unset: PoAW-X receipt path disabled (legacy submit)");
     }
 
-    if default_diff_raw < 1.0 {
+    if default_diff_raw < default_diff {
         warn!(
-            "[config] STRATUM_DEFAULT_DIFF={} below diff1; clamped to 1",
-            default_diff_raw
+            "[config] STRATUM_DEFAULT_DIFF={} below active floor; clamped to {}",
+            default_diff_raw, default_diff
+        );
+    }
+    if default_diff < 1.0 {
+        warn!(
+            "[config] sub-1 difficulty floor active (devnet/testnet, non-mainnet gate only): default_diff={}",
+            default_diff
         );
     }
     if vardiff_min_diff_raw < 1.0 {
