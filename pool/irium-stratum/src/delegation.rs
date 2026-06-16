@@ -1248,6 +1248,62 @@ mod tests {
     }
 
     #[test]
+    fn multi_worker_registry_isolation_and_reload() {
+        // Phase 20 (Part D, registry layer): the delegation registry holds many
+        // (miner_pkh, worker) entries without cross-contamination; reload preserves
+        // all; all_active() honors expiry; no worker can resolve to another's record.
+        let dir = temp_dir("multiworker");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("poawx_delegations.json");
+        let mk = |pkh: &str, worker: &str, expiry: u64| StoredDelegation {
+            delegation_hex: "cd".repeat(226),
+            miner_pkh: pkh.to_string(),
+            worker: worker.to_string(),
+            network_id: 1,
+            expiry_height: expiry,
+            fee_bps: 0,
+            status: "active".into(),
+            received_at_unix: 1,
+        };
+        let a = mk(&"aa".repeat(20), "rig1", 100); // miner A / worker rig1
+        let b = mk(&"bb".repeat(20), "rig2", 100); // miner B / worker rig2 (different miner+worker)
+        let a2 = mk(&"aa".repeat(20), "rig3", 5); // miner A / worker rig3, expires early
+        {
+            let s = JsonDelegationStore::open(&path).unwrap();
+            s.put(a.clone()).unwrap();
+            s.put(b.clone()).unwrap();
+            s.put(a2.clone()).unwrap();
+            // exact (pkh,worker) resolution — no cross-pay collisions:
+            assert_eq!(s.get(&a.miner_pkh, "rig1").unwrap(), a);
+            assert_eq!(s.get(&b.miner_pkh, "rig2").unwrap(), b);
+            assert_eq!(s.get(&a.miner_pkh, "rig3").unwrap(), a2);
+            assert!(
+                s.get(&b.miner_pkh, "rig1").is_none(),
+                "worker rig1 belongs to miner A only"
+            );
+            assert!(
+                s.get(&a.miner_pkh, "rig2").is_none(),
+                "worker rig2 belongs to miner B only"
+            );
+            assert!(
+                s.get(&"cc".repeat(20), "rig1").is_none(),
+                "unknown miner has no record"
+            );
+            // all_active(tip=10): a and b active; a2 expired (expiry 5 <= 10).
+            let active = s.all_active(10);
+            assert_eq!(active.len(), 2, "two active delegations at tip 10");
+        }
+        // reload preserves every (pkh,worker) entry, including the expired-but-stored a2.
+        let s2 = JsonDelegationStore::open(&path).unwrap();
+        assert_eq!(s2.get(&a.miner_pkh, "rig1").unwrap(), a);
+        assert_eq!(s2.get(&b.miner_pkh, "rig2").unwrap(), b);
+        assert_eq!(s2.get(&a.miner_pkh, "rig3").unwrap(), a2);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("privkey") && !raw.contains("secret") && !raw.contains("private"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn verify_and_store_accepts_valid_and_no_privkey_in_registry() {
         let dir = temp_dir("ok");
         std::fs::create_dir_all(&dir).unwrap();
