@@ -49,6 +49,92 @@ pub const DOMAIN_DELEG: &[u8] = b"irium.poawx.delegation.v1";
 pub const RECEIPT_MODE_DIRECT: u8 = 0;
 pub const RECEIPT_MODE_DELEGATED: u8 = 1;
 
+// ── Phase 20: multi-role reward split (testnet/devnet-gated) ──────────────────
+//
+// Owner-supplied spec. Basis points of the block subsidy per role; total = 10000.
+// PRIMARY_MINER is the miner/block-producing identity = the receipt `worker_pkh`
+// (never the pool delegate key). COMPUTE/VERIFY/SUPPORT are consensus-bound payout
+// roles only here; their eligibility/fairness assignment is a SEPARATE task (the
+// CPU/GPU/ASIC fairness matrix), and this code invents no assignment rules.
+//
+// Activation is gated by `IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT`
+// (testnet/devnet only); mainnet is hard-off until an explicit future governance
+// activation. Before activation, nothing here is used and existing Phase 18/19
+// behavior is byte-identical.
+pub const MULTI_ROLE_PRIMARY_BPS: u64 = 5500;
+pub const MULTI_ROLE_COMPUTE_BPS: u64 = 2200;
+pub const MULTI_ROLE_VERIFY_BPS: u64 = 1300;
+pub const MULTI_ROLE_SUPPORT_BPS: u64 = 1000;
+pub const MULTI_ROLE_TOTAL_BPS: u64 = 10000;
+
+/// The three non-primary role payout identities for a multi-role PoAW-X block.
+/// The PRIMARY role pkh is the receipt `worker_pkh` (the miner = payout identity)
+/// and is intentionally NOT stored here so it can never be replaced by a pool key.
+/// Canonical 60-byte wire encoding: compute || verify || support (20 bytes each).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleReward {
+    pub compute_contributor_pkh: [u8; 20],
+    pub verify_contributor_pkh: [u8; 20],
+    pub support_contributor_pkh: [u8; 20],
+}
+
+impl RoleReward {
+    /// Fixed wire size: 3 × 20 = 60 bytes.
+    pub const WIRE_SIZE: usize = 60;
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::WIRE_SIZE);
+        out.extend_from_slice(&self.compute_contributor_pkh);
+        out.extend_from_slice(&self.verify_contributor_pkh);
+        out.extend_from_slice(&self.support_contributor_pkh);
+        out
+    }
+
+    pub fn deserialize(raw: &[u8]) -> Result<Self, String> {
+        if raw.len() < Self::WIRE_SIZE {
+            return Err(format!(
+                "role reward too short: {} < {}",
+                raw.len(),
+                Self::WIRE_SIZE
+            ));
+        }
+        let mut compute_contributor_pkh = [0u8; 20];
+        compute_contributor_pkh.copy_from_slice(&raw[0..20]);
+        let mut verify_contributor_pkh = [0u8; 20];
+        verify_contributor_pkh.copy_from_slice(&raw[20..40]);
+        let mut support_contributor_pkh = [0u8; 20];
+        support_contributor_pkh.copy_from_slice(&raw[40..60]);
+        Ok(Self {
+            compute_contributor_pkh,
+            verify_contributor_pkh,
+            support_contributor_pkh,
+        })
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(self.serialize());
+        h.finalize().into()
+    }
+}
+
+/// Split `total_reward` (atomic units) into the four canonical role amounts in
+/// fixed order `[primary, compute, verify, support]`. Each non-primary role gets
+/// `floor(total * bps / 10000)`; any integer-division remainder goes to PRIMARY.
+/// The returned amounts always sum to exactly `total_reward` (no over/underpay).
+/// Uses u128 intermediates to avoid overflow.
+pub fn multi_role_amounts(total_reward: u64) -> [u64; 4] {
+    let bps = |b: u64| -> u64 { ((total_reward as u128 * b as u128) / 10000u128) as u64 };
+    let compute = bps(MULTI_ROLE_COMPUTE_BPS);
+    let verify = bps(MULTI_ROLE_VERIFY_BPS);
+    let support = bps(MULTI_ROLE_SUPPORT_BPS);
+    let primary_floor = bps(MULTI_ROLE_PRIMARY_BPS);
+    // remainder (from all four floors) goes to PRIMARY so the sum is exact.
+    let remainder = total_reward - primary_floor - compute - verify - support;
+    let primary = primary_floor + remainder;
+    [primary, compute, verify, support]
+}
+
 /// Per-receipt data embedded in the block wire/storage format so that every
 /// node can validate PoAW-X receipts from block-contained data (Phase 13-A).
 /// All multi-byte integers are little-endian.
@@ -527,6 +613,110 @@ mod tests {
         assert_eq!(r2.worker_sig, [0x33u8; 64]);
         assert_eq!(r2.solution, [0x44u8; 8]);
         assert_eq!(r2.commitment_nonce, [0x55u8; 32]);
+    }
+
+    // ── Phase 20: multi-role reward split primitives ─────────────────────────
+
+    #[test]
+    fn phase20_multi_role_amounts_exact_split_and_remainder() {
+        // 55/22/13/10 of a clean total divides exactly.
+        let amts = multi_role_amounts(10_000);
+        assert_eq!(amts, [5500, 2200, 1300, 1000]);
+        assert_eq!(amts.iter().sum::<u64>(), 10_000);
+        // A reward that does not divide evenly: remainder goes to PRIMARY, sum exact.
+        let total = 5_000_000_001u64; // odd, forces a remainder
+        let a = multi_role_amounts(total);
+        assert_eq!(a[1], (total as u128 * 2200 / 10000) as u64);
+        assert_eq!(a[2], (total as u128 * 1300 / 10000) as u64);
+        assert_eq!(a[3], (total as u128 * 1000 / 10000) as u64);
+        assert_eq!(a.iter().sum::<u64>(), total, "sum equals total exactly");
+        // remainder lands in PRIMARY: primary >= its floor.
+        assert!(a[0] >= (total as u128 * 5500 / 10000) as u64);
+        // zero reward → all zero.
+        assert_eq!(multi_role_amounts(0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn phase20_role_reward_wire_roundtrip() {
+        let r = RoleReward {
+            compute_contributor_pkh: [0xC0u8; 20],
+            verify_contributor_pkh: [0x7Eu8; 20],
+            support_contributor_pkh: [0x5Au8; 20],
+        };
+        let bytes = r.serialize();
+        assert_eq!(bytes.len(), RoleReward::WIRE_SIZE);
+        assert_eq!(RoleReward::WIRE_SIZE, 60);
+        let r2 = RoleReward::deserialize(&bytes).expect("deserialize");
+        assert_eq!(r, r2);
+        // digest is deterministic + sensitive to content.
+        assert_eq!(r.digest(), r2.digest());
+        let mut r3 = r.clone();
+        r3.support_contributor_pkh = [0x5Bu8; 20];
+        assert_ne!(r.digest(), r3.digest());
+        // truncated input rejects.
+        assert!(RoleReward::deserialize(&bytes[..59]).is_err());
+    }
+
+    #[test]
+    fn phase20_role_reward_json_roundtrip() {
+        // serde round-trip of the role pkhs (hex) — the persistence carrier shape.
+        let r = RoleReward {
+            compute_contributor_pkh: [1u8; 20],
+            verify_contributor_pkh: [2u8; 20],
+            support_contributor_pkh: [3u8; 20],
+        };
+        let j = serde_json::json!({
+            "compute_contributor_pkh": hex::encode(r.compute_contributor_pkh),
+            "verify_contributor_pkh": hex::encode(r.verify_contributor_pkh),
+            "support_contributor_pkh": hex::encode(r.support_contributor_pkh),
+        });
+        let s = serde_json::to_string(&j).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let back = RoleReward {
+            compute_contributor_pkh: {
+                let b = hex::decode(v["compute_contributor_pkh"].as_str().unwrap()).unwrap();
+                let mut a = [0u8; 20];
+                a.copy_from_slice(&b);
+                a
+            },
+            verify_contributor_pkh: {
+                let b = hex::decode(v["verify_contributor_pkh"].as_str().unwrap()).unwrap();
+                let mut a = [0u8; 20];
+                a.copy_from_slice(&b);
+                a
+            },
+            support_contributor_pkh: {
+                let b = hex::decode(v["support_contributor_pkh"].as_str().unwrap()).unwrap();
+                let mut a = [0u8; 20];
+                a.copy_from_slice(&b);
+                a
+            },
+        };
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn phase20_bps_constants_total_10000() {
+        assert_eq!(
+            MULTI_ROLE_PRIMARY_BPS
+                + MULTI_ROLE_COMPUTE_BPS
+                + MULTI_ROLE_VERIFY_BPS
+                + MULTI_ROLE_SUPPORT_BPS,
+            MULTI_ROLE_TOTAL_BPS
+        );
+        assert_eq!(MULTI_ROLE_TOTAL_BPS, 10_000);
+    }
+
+    #[test]
+    fn phase20_v1_v2_receipt_encoding_unchanged() {
+        // Adding the multi-role primitives must NOT change the existing receipt
+        // wire size or mode-0 encoding (pre-activation byte-identical guarantee).
+        assert_eq!(PoawxBlockReceipt::WIRE_SIZE, 166);
+        let r = make_test_receipt(7);
+        assert_eq!(r.serialize().len(), 166);
+        assert_eq!(r.mode(), RECEIPT_MODE_DIRECT);
+        // mode-0 v2 element = 1 (mode) + 166 (legacy), no delegation/role bytes.
+        assert_eq!(r.serialize_v2().len(), 1 + 166);
     }
 
     #[test]

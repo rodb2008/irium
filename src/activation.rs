@@ -251,6 +251,18 @@ pub fn poawx_delegation_activation_height() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
+/// Phase 20: activation height for the multi-role reward split. `None` => not
+/// active (existing reward behavior unchanged). Read from
+/// `IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT`. Testnet/devnet only —
+/// mainnet hard-rejects the multi-role split regardless of this value (the
+/// activation gate in `chain` returns false on mainnet) until an explicit
+/// future governance activation path exists.
+pub fn poawx_multi_role_reward_activation_height() -> Option<u64> {
+    env::var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 pub fn runtime_htlcv1_env_override() -> Option<u64> {
     env::var("IRIUM_HTLCV1_ACTIVATION_HEIGHT")
         .ok()
