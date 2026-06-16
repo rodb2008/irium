@@ -135,6 +135,308 @@ pub fn multi_role_amounts(total_reward: u64) -> [u64; 4] {
     [primary, compute, verify, support]
 }
 
+// ── Phase 20: CPU/GPU/ASIC fairness matrix (testnet/devnet-gated primitives) ──
+//
+// Hardware is NEVER detected or trusted. The chain does not ask "is this a
+// CPU/GPU/ASIC?". Instead there are verifiable puzzle *lanes* with different
+// resource profiles; any miner may attempt any lane. The protocol deterministically
+// assigns lanes per (height, role slot) so no hardware class permanently dominates,
+// targeting a 34/33/33 distribution across the three production lanes.
+//
+// This is the future SOURCE of COMPUTE/VERIFY/SUPPORT role claims for the
+// multi-role reward split. These are primitives only — they do NOT change chain
+// difficulty (LWMA-144) and are not wired into connect_block in this task.
+
+/// Lane wire ids. UNIVERSAL_FALLBACK is dev/test only and is NOT a production
+/// fairness lane (never produced by `assign_lane`, excluded from distribution).
+pub const LANE_CPU_FRIENDLY: u8 = 0;
+pub const LANE_GPU_PARALLEL: u8 = 1;
+pub const LANE_ASIC_STREAMING: u8 = 2;
+pub const LANE_UNIVERSAL_FALLBACK: u8 = 255;
+
+/// PoAW-X puzzle lane (resource profile, NOT a mandatory hardware label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoawxLane {
+    CpuFriendly,
+    GpuParallel,
+    AsicStreaming,
+    /// Dev/test fallback only — excluded from production fairness distribution.
+    UniversalFallback,
+}
+
+impl PoawxLane {
+    pub fn id(self) -> u8 {
+        match self {
+            PoawxLane::CpuFriendly => LANE_CPU_FRIENDLY,
+            PoawxLane::GpuParallel => LANE_GPU_PARALLEL,
+            PoawxLane::AsicStreaming => LANE_ASIC_STREAMING,
+            PoawxLane::UniversalFallback => LANE_UNIVERSAL_FALLBACK,
+        }
+    }
+    pub fn from_id(b: u8) -> Option<Self> {
+        match b {
+            LANE_CPU_FRIENDLY => Some(PoawxLane::CpuFriendly),
+            LANE_GPU_PARALLEL => Some(PoawxLane::GpuParallel),
+            LANE_ASIC_STREAMING => Some(PoawxLane::AsicStreaming),
+            LANE_UNIVERSAL_FALLBACK => Some(PoawxLane::UniversalFallback),
+            _ => None,
+        }
+    }
+    /// True for the three production fairness lanes (fallback excluded).
+    pub fn is_fairness_lane(self) -> bool {
+        matches!(
+            self,
+            PoawxLane::CpuFriendly | PoawxLane::GpuParallel | PoawxLane::AsicStreaming
+        )
+    }
+}
+
+/// Role-slot ids that the fairness matrix assigns lanes for. These align with the
+/// multi-role reward split's non-primary roles. PRIMARY_MINER (the existing path)
+/// is intentionally NOT a fairness role and is never assigned a lane here.
+pub const ROLE_COMPUTE_CONTRIBUTOR: u8 = 1;
+pub const ROLE_VERIFY_CONTRIBUTOR: u8 = 2;
+pub const ROLE_SUPPORT_CONTRIBUTOR: u8 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoawxRoleSlot {
+    ComputeContributor,
+    VerifyContributor,
+    SupportContributor,
+}
+
+impl PoawxRoleSlot {
+    pub fn id(self) -> u8 {
+        match self {
+            PoawxRoleSlot::ComputeContributor => ROLE_COMPUTE_CONTRIBUTOR,
+            PoawxRoleSlot::VerifyContributor => ROLE_VERIFY_CONTRIBUTOR,
+            PoawxRoleSlot::SupportContributor => ROLE_SUPPORT_CONTRIBUTOR,
+        }
+    }
+    pub fn from_id(b: u8) -> Option<Self> {
+        match b {
+            ROLE_COMPUTE_CONTRIBUTOR => Some(PoawxRoleSlot::ComputeContributor),
+            ROLE_VERIFY_CONTRIBUTOR => Some(PoawxRoleSlot::VerifyContributor),
+            ROLE_SUPPORT_CONTRIBUTOR => Some(PoawxRoleSlot::SupportContributor),
+            _ => None,
+        }
+    }
+}
+
+/// Domain separators (versioned) for the fairness assignment and role-claim hashes.
+pub const FAIRNESS_DOMAIN_V1: &[u8] = b"IRIUM_POAWX_FAIRNESS_V1";
+pub const ROLE_CLAIM_DOMAIN_V1: &[u8] = b"IRIUM_POAWX_ROLE_CLAIM_V1";
+
+/// Distribution thresholds over a mod-10000 reduction: 0..3399 CPU (34%),
+/// 3400..6699 GPU (33%), 6700..9999 ASIC (33%).
+pub const FAIRNESS_CPU_UPPER: u32 = 3400; // [0, 3400)
+pub const FAIRNESS_GPU_UPPER: u32 = 6700; // [3400, 6700) ; [6700, 10000) = ASIC
+
+/// Deterministic, independently-verifiable assignment digest for a role slot.
+/// `H(FAIRNESS_DOMAIN_V1 || network_id || height_le8 || prev_hash || role_id || slot_index_le4)`.
+pub fn fairness_assignment_digest(
+    network_id: u8,
+    height: u64,
+    prev_hash: &[u8; 32],
+    role_id: u8,
+    slot_index: u32,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(FAIRNESS_DOMAIN_V1);
+    h.update([network_id]);
+    h.update(height.to_le_bytes());
+    h.update(prev_hash);
+    h.update([role_id]);
+    h.update(slot_index.to_le_bytes());
+    h.finalize().into()
+}
+
+/// Deterministically assign a production lane (CPU/GPU/ASIC) for a role slot.
+/// Reduces the assignment digest mod 10000 and maps to the 34/33/33 bands.
+/// Never returns UniversalFallback (that lane is dev/test-only).
+pub fn assign_lane(
+    network_id: u8,
+    height: u64,
+    prev_hash: &[u8; 32],
+    role_id: u8,
+    slot_index: u32,
+) -> PoawxLane {
+    let d = fairness_assignment_digest(network_id, height, prev_hash, role_id, slot_index);
+    // Unbiased-enough deterministic reduction: first 8 bytes LE mod 10000.
+    let v = (u64::from_le_bytes(d[0..8].try_into().expect("len 8")) % 10_000) as u32;
+    if v < FAIRNESS_CPU_UPPER {
+        PoawxLane::CpuFriendly
+    } else if v < FAIRNESS_GPU_UPPER {
+        PoawxLane::GpuParallel
+    } else {
+        PoawxLane::AsicStreaming
+    }
+}
+
+/// Claim digest binding the revealed fields:
+/// `H(ROLE_CLAIM_DOMAIN_V1 || network_id || height_le8 || prev_hash || role_id ||
+///    lane_id || solver_pkh || nonce || secret)`.
+#[allow(clippy::too_many_arguments)]
+pub fn role_claim_digest(
+    network_id: u8,
+    height: u64,
+    prev_hash: &[u8; 32],
+    role_id: u8,
+    lane_id: u8,
+    solver_pkh: &[u8; 20],
+    nonce: &[u8; 32],
+    secret: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(ROLE_CLAIM_DOMAIN_V1);
+    h.update([network_id]);
+    h.update(height.to_le_bytes());
+    h.update(prev_hash);
+    h.update([role_id]);
+    h.update([lane_id]);
+    h.update(solver_pkh);
+    h.update(nonce);
+    h.update(secret);
+    h.finalize().into()
+}
+
+/// A revealed role claim. `commitment_hash` is an OPTIONAL pre-commitment
+/// (`H(secret || nonce)`); see the design-gap doc — without a prior on-chain
+/// commitment root the protocol cannot yet prove the commitment existed before
+/// the assignment seed (`prev_hash`) was known, so hidden-precommit enforcement
+/// is PARTIAL (documented).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoawxRoleClaim {
+    pub role_id: u8,
+    pub lane_id: u8,
+    pub solver_pkh: [u8; 20],
+    pub nonce: [u8; 32],
+    pub secret: [u8; 32],
+    pub claim_digest: [u8; 32],
+    pub commitment_hash: Option<[u8; 32]>,
+}
+
+impl PoawxRoleClaim {
+    /// Fixed prefix size (without the optional commitment): 1+1+20+32+32+32 = 118.
+    pub const FIXED_SIZE: usize = 1 + 1 + 20 + 32 + 32 + 32;
+
+    /// Wire: fixed prefix, then 1 flag byte (0/1), then 32-byte commitment iff flag=1.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::FIXED_SIZE + 1 + 32);
+        out.push(self.role_id);
+        out.push(self.lane_id);
+        out.extend_from_slice(&self.solver_pkh);
+        out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&self.secret);
+        out.extend_from_slice(&self.claim_digest);
+        match &self.commitment_hash {
+            Some(c) => {
+                out.push(1);
+                out.extend_from_slice(c);
+            }
+            None => out.push(0),
+        }
+        out
+    }
+
+    pub fn deserialize(raw: &[u8]) -> Result<Self, String> {
+        if raw.len() < Self::FIXED_SIZE + 1 {
+            return Err(format!(
+                "role claim too short: {} < {}",
+                raw.len(),
+                Self::FIXED_SIZE + 1
+            ));
+        }
+        let mut off = 0usize;
+        let role_id = raw[off];
+        off += 1;
+        let lane_id = raw[off];
+        off += 1;
+        let mut solver_pkh = [0u8; 20];
+        solver_pkh.copy_from_slice(&raw[off..off + 20]);
+        off += 20;
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&raw[off..off + 32]);
+        off += 32;
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&raw[off..off + 32]);
+        off += 32;
+        let mut claim_digest = [0u8; 32];
+        claim_digest.copy_from_slice(&raw[off..off + 32]);
+        off += 32;
+        let flag = raw[off];
+        off += 1;
+        let commitment_hash = match flag {
+            0 => None,
+            1 => {
+                if raw.len() < off + 32 {
+                    return Err("role claim: commitment flag set but bytes truncated".to_string());
+                }
+                let mut c = [0u8; 32];
+                c.copy_from_slice(&raw[off..off + 32]);
+                Some(c)
+            }
+            other => return Err(format!("role claim: bad commitment flag {}", other)),
+        };
+        Ok(Self {
+            role_id,
+            lane_id,
+            solver_pkh,
+            nonce,
+            secret,
+            claim_digest,
+            commitment_hash,
+        })
+    }
+}
+
+/// Validate a revealed role claim against the deterministic assignment (pure).
+/// Checks: role id known, lane id known (production lane), claim digest recomputes
+/// from revealed fields, and the assigned lane for `(network, height, prev_hash,
+/// role, slot)` equals the claimed lane. Does NOT enforce hidden-precommit (see
+/// design-gap doc — needs a future on-chain commitment root).
+pub fn validate_role_claim(
+    claim: &PoawxRoleClaim,
+    network_id: u8,
+    height: u64,
+    prev_hash: &[u8; 32],
+    slot_index: u32,
+) -> Result<(), String> {
+    let role = PoawxRoleSlot::from_id(claim.role_id)
+        .ok_or_else(|| format!("role claim: unknown role id {}", claim.role_id))?;
+    let lane = PoawxLane::from_id(claim.lane_id)
+        .ok_or_else(|| format!("role claim: unknown lane id {}", claim.lane_id))?;
+    if !lane.is_fairness_lane() {
+        return Err("role claim: lane is not a production fairness lane".to_string());
+    }
+    // Recompute the claim digest from the revealed fields.
+    let expect = role_claim_digest(
+        network_id,
+        height,
+        prev_hash,
+        claim.role_id,
+        claim.lane_id,
+        &claim.solver_pkh,
+        &claim.nonce,
+        &claim.secret,
+    );
+    if expect != claim.claim_digest {
+        return Err("role claim: digest does not verify from revealed fields".to_string());
+    }
+    // The claimed lane must equal the deterministic assignment for this slot.
+    let assigned = assign_lane(network_id, height, prev_hash, role.id(), slot_index);
+    if assigned != lane {
+        return Err(format!(
+            "role claim: lane {} != assigned lane {} for role {} slot {}",
+            claim.lane_id,
+            assigned.id(),
+            claim.role_id,
+            slot_index
+        ));
+    }
+    Ok(())
+}
+
 /// Per-receipt data embedded in the block wire/storage format so that every
 /// node can validate PoAW-X receipts from block-contained data (Phase 13-A).
 /// All multi-byte integers are little-endian.
@@ -717,6 +1019,203 @@ mod tests {
         assert_eq!(r.mode(), RECEIPT_MODE_DIRECT);
         // mode-0 v2 element = 1 (mode) + 166 (legacy), no delegation/role bytes.
         assert_eq!(r.serialize_v2().len(), 1 + 166);
+    }
+
+    // ── Phase 20: CPU/GPU/ASIC fairness matrix primitives ────────────────────
+
+    fn fairness_valid_claim(
+        net: u8,
+        height: u64,
+        prev: &[u8; 32],
+        role_id: u8,
+        slot: u32,
+    ) -> PoawxRoleClaim {
+        let lane = assign_lane(net, height, prev, role_id, slot);
+        let solver_pkh = [0xABu8; 20];
+        let nonce = [0x01u8; 32];
+        let secret = [0x02u8; 32];
+        let claim_digest = role_claim_digest(
+            net,
+            height,
+            prev,
+            role_id,
+            lane.id(),
+            &solver_pkh,
+            &nonce,
+            &secret,
+        );
+        let mut ch = Sha256::new();
+        ch.update(secret);
+        ch.update(nonce);
+        PoawxRoleClaim {
+            role_id,
+            lane_id: lane.id(),
+            solver_pkh,
+            nonce,
+            secret,
+            claim_digest,
+            commitment_hash: Some(ch.finalize().into()),
+        }
+    }
+
+    #[test]
+    fn phase20_fairness_assignment_deterministic_and_sensitive() {
+        let prev = [0x07u8; 32];
+        // same inputs -> same lane (deterministic).
+        let a = assign_lane(1, 100, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0);
+        let b = assign_lane(1, 100, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0);
+        assert_eq!(a, b);
+        // never the dev/test fallback.
+        assert!(a.is_fairness_lane());
+        // changing any field can change the assignment across a small sweep
+        // (proves height/role/prev/slot all feed the digest).
+        let mut prev2 = prev;
+        prev2[0] ^= 0xFF;
+        let changed = (0..8).any(|s| {
+            assign_lane(1, 100, &prev, ROLE_COMPUTE_CONTRIBUTOR, s)
+                != assign_lane(1, 101, &prev, ROLE_COMPUTE_CONTRIBUTOR, s)
+        }) || (0..8).any(|s| {
+            assign_lane(1, 100, &prev, ROLE_COMPUTE_CONTRIBUTOR, s)
+                != assign_lane(1, 100, &prev2, ROLE_COMPUTE_CONTRIBUTOR, s)
+        });
+        assert!(changed, "assignment must depend on height/prev_hash");
+    }
+
+    #[test]
+    fn phase20_fairness_distribution_34_33_33() {
+        // Deterministic (not random): sweep 3600 slot indices.
+        let prev = [0x5Au8; 32];
+        let n = 3600u32;
+        let (mut cpu, mut gpu, mut asic) = (0u32, 0u32, 0u32);
+        for s in 0..n {
+            match assign_lane(2, 12345, &prev, ROLE_VERIFY_CONTRIBUTOR, s) {
+                PoawxLane::CpuFriendly => cpu += 1,
+                PoawxLane::GpuParallel => gpu += 1,
+                PoawxLane::AsicStreaming => asic += 1,
+                PoawxLane::UniversalFallback => panic!("fallback must never be assigned"),
+            }
+        }
+        assert_eq!(cpu + gpu + asic, n);
+        let pct = |c: u32| (c as f64) * 100.0 / (n as f64);
+        // ±3 percentage-point tolerance around 34/33/33.
+        assert!((31.0..=37.0).contains(&pct(cpu)), "cpu% = {}", pct(cpu));
+        assert!((30.0..=36.0).contains(&pct(gpu)), "gpu% = {}", pct(gpu));
+        assert!((30.0..=36.0).contains(&pct(asic)), "asic% = {}", pct(asic));
+    }
+
+    #[test]
+    fn phase20_lane_and_role_id_roundtrip() {
+        for l in [
+            PoawxLane::CpuFriendly,
+            PoawxLane::GpuParallel,
+            PoawxLane::AsicStreaming,
+            PoawxLane::UniversalFallback,
+        ] {
+            assert_eq!(PoawxLane::from_id(l.id()), Some(l));
+        }
+        assert_eq!(PoawxLane::from_id(7), None, "unknown lane id");
+        assert!(!PoawxLane::UniversalFallback.is_fairness_lane());
+        for r in [
+            PoawxRoleSlot::ComputeContributor,
+            PoawxRoleSlot::VerifyContributor,
+            PoawxRoleSlot::SupportContributor,
+        ] {
+            assert_eq!(PoawxRoleSlot::from_id(r.id()), Some(r));
+        }
+        assert_eq!(
+            PoawxRoleSlot::from_id(0),
+            None,
+            "PRIMARY is not a fairness role"
+        );
+        assert_eq!(PoawxRoleSlot::from_id(99), None);
+    }
+
+    #[test]
+    fn phase20_role_claim_wire_roundtrip() {
+        let prev = [0x11u8; 32];
+        let c = fairness_valid_claim(1, 50, &prev, ROLE_SUPPORT_CONTRIBUTOR, 3);
+        let bytes = c.serialize();
+        let c2 = PoawxRoleClaim::deserialize(&bytes).expect("deserialize");
+        assert_eq!(c, c2);
+        // no-commitment variant round-trips and is shorter.
+        let mut c3 = c.clone();
+        c3.commitment_hash = None;
+        let b3 = c3.serialize();
+        assert_eq!(b3.len(), PoawxRoleClaim::FIXED_SIZE + 1);
+        assert_eq!(PoawxRoleClaim::deserialize(&b3).unwrap(), c3);
+        // truncation rejects (wrong pkh/field length).
+        assert!(PoawxRoleClaim::deserialize(&bytes[..PoawxRoleClaim::FIXED_SIZE]).is_err());
+        // commitment flag set but bytes missing rejects.
+        let mut bad = c3.serialize();
+        *bad.last_mut().unwrap() = 1; // flag=1 but no 32 bytes follow
+        assert!(PoawxRoleClaim::deserialize(&bad).is_err());
+    }
+
+    #[test]
+    fn phase20_role_claim_validation_accept_and_reject() {
+        let net = 1u8;
+        let height = 777u64;
+        let prev = [0x22u8; 32];
+        let slot = 5u32;
+        let role = ROLE_COMPUTE_CONTRIBUTOR;
+
+        // valid claim accepted.
+        let good = fairness_valid_claim(net, height, &prev, role, slot);
+        assert!(validate_role_claim(&good, net, height, &prev, slot).is_ok());
+
+        // wrong lane (correct digest for a non-assigned lane) rejects.
+        let assigned = assign_lane(net, height, &prev, role, slot);
+        let other = match assigned {
+            PoawxLane::CpuFriendly => PoawxLane::GpuParallel,
+            _ => PoawxLane::CpuFriendly,
+        };
+        let mut wl = good.clone();
+        wl.lane_id = other.id();
+        wl.claim_digest = role_claim_digest(
+            net,
+            height,
+            &prev,
+            role,
+            other.id(),
+            &wl.solver_pkh,
+            &wl.nonce,
+            &wl.secret,
+        );
+        assert!(validate_role_claim(&wl, net, height, &prev, slot)
+            .unwrap_err()
+            .contains("assigned lane"));
+
+        // tampered nonce/secret -> digest fails to verify.
+        let mut wn = good.clone();
+        wn.nonce[0] ^= 0xFF;
+        assert!(validate_role_claim(&wn, net, height, &prev, slot)
+            .unwrap_err()
+            .contains("digest"));
+
+        // unknown role id rejects.
+        let mut wr = good.clone();
+        wr.role_id = 99;
+        assert!(validate_role_claim(&wr, net, height, &prev, slot)
+            .unwrap_err()
+            .contains("unknown role"));
+
+        // unknown lane id rejects.
+        let mut wlid = good.clone();
+        wlid.lane_id = 200;
+        assert!(validate_role_claim(&wlid, net, height, &prev, slot)
+            .unwrap_err()
+            .contains("unknown lane"));
+
+        // fallback lane is not a valid production fairness lane.
+        let mut wfb = good.clone();
+        wfb.lane_id = LANE_UNIVERSAL_FALLBACK;
+        assert!(validate_role_claim(&wfb, net, height, &prev, slot).is_err());
+
+        // wrong slot/height/prev -> assignment differs (or digest differs) -> reject.
+        assert!(
+            validate_role_claim(&good, net, height, &prev, slot + 1).is_err()
+                || validate_role_claim(&good, net, height + 1, &prev, slot).is_err()
+        );
     }
 
     #[test]
