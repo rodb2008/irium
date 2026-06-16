@@ -1969,6 +1969,22 @@ pub fn multi_role_reward_active(height: u64) -> bool {
     }
 }
 
+/// Phase 20: true when the CPU/GPU/ASIC fairness matrix primitives are active for
+/// `height`. **Mainnet always returns false** (hard-off until explicit future
+/// governance activation). Testnet/devnet gate on
+/// `IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT`. Gates *use* of the fairness
+/// assignment/role-claim primitives by future role-claim validation; does not
+/// change chain difficulty (LWMA-144) or existing block validation.
+pub fn fairness_matrix_active(height: u64) -> bool {
+    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
+        return false;
+    }
+    match crate::activation::poawx_fairness_matrix_activation_height() {
+        Some(h) => height >= h,
+        None => false,
+    }
+}
+
 /// Phase 20: parse a standard 25-byte P2PKH script `76 a9 14 <20> 88 ac` to its pkh.
 fn parse_p2pkh_pkh(script: &[u8]) -> Option<[u8; 20]> {
     if script.len() == 25
@@ -6725,6 +6741,26 @@ mod tests {
             !multi_role_reward_active(100),
             "no activation height -> off"
         );
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn phase20_fairness_matrix_gate_mainnet_off_and_testnet_height() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // mainnet: hard-off even with an activation height set.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "8");
+        assert!(!fairness_matrix_active(20), "mainnet must be hard-off");
+        // testnet: gated by height.
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        assert!(!fairness_matrix_active(7), "below activation height");
+        assert!(fairness_matrix_active(8), "at activation height");
+        assert!(fairness_matrix_active(9), "above activation height");
+        // no activation height -> off.
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        assert!(!fairness_matrix_active(100), "no activation height -> off");
         std::env::remove_var("IRIUM_NETWORK");
     }
 
