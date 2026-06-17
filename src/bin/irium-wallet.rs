@@ -2323,6 +2323,7 @@ fn usage() {
     eprintln!("  irium-wallet address-to-pkh <base58_addr>");
     eprintln!("  irium-wallet poawx-register --pool <url> --addr <addr> --worker <name> --expiry-height <N> [--fee-bps 0]");
     eprintln!("  irium-wallet poawx-register --emit-only --pool-pubkey <66hex> --network-id <id> --addr <addr> --worker <name> --expiry-height <N> --fee-bps 0  > poawx-delegation.json");
+    eprintln!("      (third-party pool, opt-in only) add: --third-party-pool --fee-bps <1..200> --fee-pkh <base58-addr|40hex>");
     eprintln!("  irium-wallet qr <base58_addr> [--svg] [--out <file>]");
     eprintln!("  irium-wallet balance <base58_addr> [--rpc <url>]");
     eprintln!("  irium-wallet list-unspent <base58_addr> [--rpc <url>]");
@@ -3365,7 +3366,9 @@ fn signer_material_from_wallet(address: &str) -> Result<(WalletKey, SigningKey),
 
 /// Build a delegation and sign it with the miner wallet key. The private key is
 /// used only in memory (inside `signing_key`) and never returned or printed.
-/// Official pool fee is 0% — a non-zero `fee_bps` is rejected.
+/// OFFICIAL pool fee is 0% (`fee_bps == 0`, zero `fee_pkh`). Phase 20 Step 4: a
+/// third-party fee (`fee_bps` in 1..=200 with a non-zero `fee_pkh`) is supported
+/// on non-mainnet networks; the fee terms are bound into the miner's signature.
 fn build_signed_delegation(
     signing_key: &SigningKey,
     pool_pubkey: [u8; 33],
@@ -3373,12 +3376,29 @@ fn build_signed_delegation(
     worker: &str,
     expiry_height: u64,
     fee_bps: u16,
+    fee_pkh: [u8; 20],
     deleg_nonce: [u8; 32],
 ) -> Result<irium_node_rs::poawx::Delegation, String> {
     use k256::ecdsa::signature::hazmat::PrehashSigner;
     use sha2::{Digest, Sha256};
-    if fee_bps != 0 {
-        return Err("official pool fee is 0%; --fee-bps > 0 is not supported".to_string());
+    if fee_bps == 0 {
+        if fee_pkh != [0u8; 20] {
+            return Err("fee_pkh must be empty when --fee-bps is 0 (official 0%)".to_string());
+        }
+    } else {
+        if network_id == 0 {
+            return Err("third-party fee not allowed on mainnet (network_id 0)".to_string());
+        }
+        if fee_bps > irium_node_rs::poawx::THIRD_PARTY_FEE_CAP_BPS {
+            return Err(format!(
+                "--fee-bps {} exceeds cap {} (2.00%)",
+                fee_bps,
+                irium_node_rs::poawx::THIRD_PARTY_FEE_CAP_BPS
+            ));
+        }
+        if fee_pkh == [0u8; 20] {
+            return Err("--fee-pkh required when --fee-bps > 0".to_string());
+        }
     }
     let vk = k256::ecdsa::VerifyingKey::from(signing_key);
     let enc = vk.to_encoded_point(true);
@@ -3398,8 +3418,8 @@ fn build_signed_delegation(
         pool_pubkey,
         worker_tag,
         expiry_height,
-        fee_bps: 0,
-        fee_pkh: [0u8; 20],
+        fee_bps,
+        fee_pkh,
         deleg_nonce,
         delegation_sig: [0u8; 64],
     };
@@ -3444,6 +3464,32 @@ struct PoawxRegisterArgs {
     worker: String,
     expiry: Option<u64>,
     fee_bps: u16,
+    /// Phase 20 Step 4: explicit third-party fee opt-in.
+    third_party_pool: bool,
+    /// Phase 20 Step 4: third-party fee recipient (base58 address or 40-hex pkh).
+    fee_pkh: Option<String>,
+}
+
+/// Resolve a `--fee-pkh` argument: a 40-char hex (20-byte) pkh, or a base58 P2PKH
+/// address. Fails closed on malformed input.
+fn resolve_fee_pkh_arg(s: &str) -> Result<[u8; 20], String> {
+    if s.len() == 40 {
+        if let Ok(b) = hex::decode(s) {
+            if b.len() == 20 {
+                let mut a = [0u8; 20];
+                a.copy_from_slice(&b);
+                return Ok(a);
+            }
+        }
+    }
+    let v = base58_p2pkh_to_hash(s)
+        .ok_or_else(|| "--fee-pkh: invalid base58 address or 20-byte hex".to_string())?;
+    if v.len() != 20 {
+        return Err("--fee-pkh: decoded pkh is not 20 bytes".to_string());
+    }
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&v);
+    Ok(a)
 }
 
 fn parse_poawx_register_args(args: &[String]) -> Result<PoawxRegisterArgs, String> {
@@ -3456,6 +3502,8 @@ fn parse_poawx_register_args(args: &[String]) -> Result<PoawxRegisterArgs, Strin
         worker: String::new(),
         expiry: None,
         fee_bps: 0,
+        third_party_pool: false,
+        fee_pkh: None,
     };
     let mut i = 1usize;
     while i < args.len() {
@@ -3487,24 +3535,62 @@ fn parse_poawx_register_args(args: &[String]) -> Result<PoawxRegisterArgs, Strin
                     .parse()
                     .map_err(|_| "invalid --fee-bps".to_string())?
             }
+            "--third-party-pool" => {
+                a.third_party_pool = true;
+                i += 1;
+            }
+            "--fee-pkh" => a.fee_pkh = Some(next_flag_value(args, &mut i)?),
             other => return Err(format!("unknown flag {other}")),
         }
     }
     Ok(a)
 }
 
+/// Resolve fee terms from the register flags (shared by emit-only + online).
+/// OFFICIAL: `--fee-bps 0`, no `--third-party-pool`, no `--fee-pkh` → `(0, zero)`.
+/// THIRD-PARTY: `--fee-bps 1..=200` + `--third-party-pool` + `--fee-pkh` →
+/// `(bps, pkh)`. Fails closed on any inconsistent combination.
+fn resolve_fee_terms(a: &PoawxRegisterArgs) -> Result<(u16, [u8; 20]), String> {
+    if a.fee_bps == 0 {
+        if a.third_party_pool {
+            return Err("--third-party-pool requires --fee-bps 1..200".to_string());
+        }
+        if a.fee_pkh.is_some() {
+            return Err("--fee-pkh is only valid with --fee-bps > 0".to_string());
+        }
+        Ok((0, [0u8; 20]))
+    } else {
+        if !a.third_party_pool {
+            return Err(
+                "--fee-bps > 0 requires --third-party-pool (official pool is 0%)".to_string(),
+            );
+        }
+        if a.fee_bps > irium_node_rs::poawx::THIRD_PARTY_FEE_CAP_BPS {
+            return Err(format!(
+                "--fee-bps {} exceeds cap {} (2.00%)",
+                a.fee_bps,
+                irium_node_rs::poawx::THIRD_PARTY_FEE_CAP_BPS
+            ));
+        }
+        let s = a
+            .fee_pkh
+            .as_deref()
+            .ok_or_else(|| "--fee-pkh required with --fee-bps > 0".to_string())?;
+        let pkh = resolve_fee_pkh_arg(s)?;
+        Ok((a.fee_bps, pkh))
+    }
+}
+
 /// Validate the offline (`--emit-only`) inputs and resolve the 33-byte pool
-/// pubkey. Pure: no wallet access, no network, no signing — fully unit-testable.
-/// Fails closed on a non-zero fee and on any missing/malformed required input.
+/// pubkey + fee terms. Pure: no wallet access, no network, no signing.
+/// Returns `(pool_pubkey, network_id, addr, worker, expiry, fee_bps, fee_pkh)`.
 fn resolve_emit_only_args(
     a: &PoawxRegisterArgs,
-) -> Result<([u8; 33], u8, String, String, u64), String> {
+) -> Result<([u8; 33], u8, String, String, u64, u16, [u8; 20]), String> {
     if a.pool.is_some() {
         return Err("--pool is not used with --emit-only (offline: no network access)".to_string());
     }
-    if a.fee_bps != 0 {
-        return Err("official pool fee is 0%; --fee-bps > 0 is not supported".to_string());
-    }
+    let (fee_bps, fee_pkh) = resolve_fee_terms(a)?;
     let pool_pubkey_hex = a
         .pool_pubkey_hex
         .as_deref()
@@ -3529,7 +3615,15 @@ fn resolve_emit_only_args(
     }
     let mut pool_pubkey = [0u8; 33];
     pool_pubkey.copy_from_slice(&pool_pubkey_bytes);
-    Ok((pool_pubkey, network_id, addr, a.worker.clone(), expiry))
+    Ok((
+        pool_pubkey,
+        network_id,
+        addr,
+        a.worker.clone(),
+        expiry,
+        fee_bps,
+        fee_pkh,
+    ))
 }
 
 /// Validate online-mode flags + required args (pure; no network). Mirrors the
@@ -3538,16 +3632,14 @@ fn resolve_emit_only_args(
 /// Rejects the emit-only-only flags (`--pool-pubkey`/`--network-id`) and any non-zero fee.
 fn resolve_online_args(
     a: &PoawxRegisterArgs,
-) -> Result<(String, String, String, u16, u64), String> {
+) -> Result<(String, String, String, u16, [u8; 20], u64), String> {
     if a.pool_pubkey_hex.is_some() || a.network_id.is_some() {
         return Err(
             "--pool-pubkey/--network-id are only valid with --emit-only (online mode reads them from /poawx/pool-identity)"
                 .to_string(),
         );
     }
-    if a.fee_bps != 0 {
-        return Err("official pool fee is 0%; --fee-bps > 0 is not supported".to_string());
-    }
+    let (fee_bps, fee_pkh) = resolve_fee_terms(a)?;
     let pool = a
         .pool
         .clone()
@@ -3559,7 +3651,7 @@ fn resolve_online_args(
     let expiry = a
         .expiry
         .ok_or_else(|| "--expiry-height <N> required".to_string())?;
-    Ok((pool, addr, a.worker.clone(), a.fee_bps, expiry))
+    Ok((pool, addr, a.worker.clone(), fee_bps, fee_pkh, expiry))
 }
 
 fn cmd_poawx_register(args: &[String]) -> Result<(), String> {
@@ -3572,7 +3664,8 @@ fn cmd_poawx_register(args: &[String]) -> Result<(), String> {
     // the wallet) and returns ONLY the printed JSON, which the operator submits
     // to the loopback-only /poawx/delegation endpoint. No GET, no POST, no SSH.
     if a.emit_only {
-        let (pool_pubkey, network_id, addr, worker, expiry) = resolve_emit_only_args(&a)?;
+        let (pool_pubkey, network_id, addr, worker, expiry, fee_bps, fee_pkh) =
+            resolve_emit_only_args(&a)?;
         let (_key, signing_key) = signer_material_from_wallet(&addr)?;
         let mut nonce = [0u8; 32];
         OsRng.fill_bytes(&mut nonce);
@@ -3582,7 +3675,8 @@ fn cmd_poawx_register(args: &[String]) -> Result<(), String> {
             network_id,
             &worker,
             expiry,
-            0,
+            fee_bps,
+            fee_pkh,
             nonce,
         )?;
         d.verify_signature()
@@ -3594,15 +3688,24 @@ fn cmd_poawx_register(args: &[String]) -> Result<(), String> {
         let line = serde_json::to_string(&body)
             .map_err(|e| format!("serialize delegation payload: {e}"))?;
         println!("{line}");
+        let fee_note = if fee_bps > 0 {
+            format!(
+                "third-party fee_bps {} fee_pkh {}",
+                fee_bps,
+                hex::encode(fee_pkh)
+            )
+        } else {
+            "official fee_bps 0".to_string()
+        };
         eprintln!(
-            "[emit-only] signed delegation for miner_pkh {} (worker {worker}, expiry {expiry}, fee_bps 0); no network used. Send the JSON above to the operator to POST to the loopback-only /poawx/delegation endpoint.",
+            "[emit-only] signed delegation for miner_pkh {} (worker {worker}, expiry {expiry}, {fee_note}); no network used. Send the JSON above to the operator to POST to the loopback-only /poawx/delegation endpoint.",
             hex::encode(d.miner_pkh())
         );
         return Ok(());
     }
 
-    // ── Online path (unchanged): GET pool-identity, sign in memory, POST. ──
-    let (pool, addr, worker, fee_bps, expiry) = resolve_online_args(&a)?;
+    // ── Online path: GET pool-identity, sign in memory, POST. ──
+    let (pool, addr, worker, fee_bps, fee_pkh, expiry) = resolve_online_args(&a)?;
 
     let base = pool.trim_end_matches('/').to_string();
     let client = rpc_client(&base)?;
@@ -3629,10 +3732,31 @@ fn cmd_poawx_register(args: &[String]) -> Result<(), String> {
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "pool-identity missing network_id".to_string())? as u8;
     let pool_fee = id.get("fee_bps").and_then(|v| v.as_u64()).unwrap_or(0);
-    if pool_fee != 0 {
-        return Err(format!(
-            "pool reports non-zero fee_bps={pool_fee}; refusing"
-        ));
+    if fee_bps == 0 {
+        // Official: refuse if the pool advertises any fee (opt in explicitly with
+        // --third-party-pool --fee-bps --fee-pkh).
+        if pool_fee != 0 {
+            return Err(format!(
+                "pool reports non-zero fee_bps={pool_fee}; refusing (opt in with --third-party-pool --fee-bps <1..200> --fee-pkh <addr>)"
+            ));
+        }
+    } else {
+        // Third-party: the pool MUST advertise the exact terms the miner signs, so
+        // the registry (which checks delegation==identity) accepts them.
+        if pool_fee != fee_bps as u64 {
+            return Err(format!(
+                "pool advertises fee_bps={pool_fee} but --fee-bps={fee_bps}; terms must match"
+            ));
+        }
+        let pool_fee_pkh = id
+            .get("fee_pkh")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "pool-identity missing fee_pkh for third-party fee".to_string())?;
+        let pool_fee_pkh_bytes =
+            hex::decode(pool_fee_pkh).map_err(|_| "pool fee_pkh invalid hex".to_string())?;
+        if pool_fee_pkh_bytes.as_slice() != fee_pkh.as_slice() {
+            return Err("pool fee_pkh does not match --fee-pkh; terms must match".to_string());
+        }
     }
     let pool_pubkey_bytes =
         hex::decode(pool_pubkey_hex).map_err(|_| "pool_pubkey invalid hex".to_string())?;
@@ -3653,10 +3777,18 @@ fn cmd_poawx_register(args: &[String]) -> Result<(), String> {
         &worker,
         expiry,
         fee_bps,
+        fee_pkh,
         nonce,
     )?;
     d.verify_signature()
         .map_err(|e| format!("self-verify failed before submit: {e}"))?;
+    if fee_bps > 0 {
+        eprintln!(
+            "[register] third-party fee terms: fee_bps {} fee_pkh {}",
+            fee_bps,
+            hex::encode(fee_pkh)
+        );
+    }
     let miner_pkh_hex = hex::encode(d.miner_pkh());
 
     // 3. POST the canonical 226-byte delegation hex.
@@ -15164,7 +15296,8 @@ mod tests {
         mp.copy_from_slice(vk.to_encoded_point(true).as_bytes());
         let pool = [0x02u8; 33];
 
-        let d = build_signed_delegation(&sk, pool, 1, "rig1", 1000, 0, [9u8; 32]).unwrap();
+        let d =
+            build_signed_delegation(&sk, pool, 1, "rig1", 1000, 0, [0u8; 20], [9u8; 32]).unwrap();
         // Canonical type verifies its own signature.
         assert!(d.verify_signature().is_ok());
         assert_eq!(d.miner_pubkey, mp);
@@ -15180,8 +15313,34 @@ mod tests {
             h.finalize().into()
         };
         assert_eq!(d.worker_tag, wt);
-        // Non-zero fee is rejected.
-        assert!(build_signed_delegation(&sk, pool, 1, "rig1", 1000, 100, [9u8; 32]).is_err());
+        // Non-zero fee with a zero fee_pkh is rejected.
+        assert!(
+            build_signed_delegation(&sk, pool, 1, "rig1", 1000, 100, [0u8; 20], [9u8; 32]).is_err()
+        );
+        // Non-zero fee on mainnet (network_id 0) is rejected.
+        assert!(
+            build_signed_delegation(&sk, pool, 0, "rig1", 1000, 100, [0xFEu8; 20], [9u8; 32])
+                .is_err()
+        );
+        // Fee over the 200 bps cap is rejected.
+        assert!(
+            build_signed_delegation(&sk, pool, 1, "rig1", 1000, 201, [0xFEu8; 20], [9u8; 32])
+                .is_err()
+        );
+        // Valid third-party fee (1..=200 + fee_pkh on a non-mainnet net) is accepted
+        // and binds the fee terms into the signature.
+        let dt = build_signed_delegation(&sk, pool, 1, "rig1", 1000, 200, [0xFEu8; 20], [9u8; 32])
+            .unwrap();
+        assert_eq!(dt.fee_bps, 200);
+        assert_eq!(dt.fee_pkh, [0xFEu8; 20]);
+        assert!(dt.verify_signature().is_ok());
+        // Mutating either fee term breaks the signature.
+        let mut m = dt.clone();
+        m.fee_bps = 100;
+        assert!(m.verify_signature().is_err());
+        let mut m = dt.clone();
+        m.fee_pkh[0] ^= 0xff;
+        assert!(m.verify_signature().is_err());
     }
 
     // Phase 19B: --emit-only offline delegation.
@@ -15193,7 +15352,8 @@ mod tests {
         use k256::ecdsa::SigningKey;
         let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
         let pool = [0x02u8; 33];
-        let d = build_signed_delegation(&sk, pool, 1, "rig1", 1000, 0, [9u8; 32]).unwrap();
+        let d =
+            build_signed_delegation(&sk, pool, 1, "rig1", 1000, 0, [0u8; 20], [9u8; 32]).unwrap();
         let body = delegation_post_body(&d, "rig1");
         // Exactly the three public fields the pool's POST /poawx/delegation reads.
         assert_eq!(
@@ -15240,12 +15400,15 @@ mod tests {
             "0",
         ]))
         .unwrap();
-        let (ppk, nid, addr, worker, expiry) = resolve_emit_only_args(&a).unwrap();
+        let (ppk, nid, addr, worker, expiry, fee_bps, fee_pkh) =
+            resolve_emit_only_args(&a).unwrap();
         assert_eq!(ppk, [0x02u8; 33]);
         assert_eq!(nid, 1);
         assert_eq!(addr, "Pabc");
         assert_eq!(worker, "w1");
         assert_eq!(expiry, 1000);
+        assert_eq!(fee_bps, 0);
+        assert_eq!(fee_pkh, [0u8; 20]);
 
         // Each rejection case.
         let cases: Vec<Vec<&str>> = vec![
@@ -15371,13 +15534,98 @@ mod tests {
         assert!(resolve_emit_only_args(&a).is_err());
     }
 
+    /// Phase 20 Step 4: third-party fee flag resolution (pure; no network/wallet).
+    #[test]
+    fn poawx_third_party_fee_arg_resolution() {
+        let pk = hex::encode([0x02u8; 33]);
+        let fee_addr = "ab".repeat(20); // 40-hex pkh
+        let emit = |extra: &[&str]| -> Vec<String> {
+            let mut v = vec![
+                "--emit-only",
+                "--pool-pubkey",
+                &pk,
+                "--network-id",
+                "1",
+                "--addr",
+                "Pabc",
+                "--worker",
+                "w1",
+                "--expiry-height",
+                "1000",
+            ];
+            v.extend_from_slice(extra);
+            poawx_args(&v)
+        };
+
+        // Valid third-party fee (1 bps).
+        let a = parse_poawx_register_args(&emit(&[
+            "--third-party-pool",
+            "--fee-bps",
+            "1",
+            "--fee-pkh",
+            &fee_addr,
+        ]))
+        .unwrap();
+        let (_p, _n, _addr, _w, _e, fee_bps, fee_pkh) = resolve_emit_only_args(&a).unwrap();
+        assert_eq!(fee_bps, 1);
+        assert_eq!(hex::encode(fee_pkh), fee_addr);
+
+        // Valid third-party fee at the cap (200 bps).
+        let a = parse_poawx_register_args(&emit(&[
+            "--third-party-pool",
+            "--fee-bps",
+            "200",
+            "--fee-pkh",
+            &fee_addr,
+        ]))
+        .unwrap();
+        assert_eq!(resolve_emit_only_args(&a).unwrap().5, 200);
+
+        // fee > 0 WITHOUT --third-party-pool rejects.
+        let a = parse_poawx_register_args(&emit(&["--fee-bps", "100", "--fee-pkh", &fee_addr]))
+            .unwrap();
+        assert!(resolve_emit_only_args(&a).is_err());
+
+        // fee > 0 WITHOUT --fee-pkh rejects.
+        let a =
+            parse_poawx_register_args(&emit(&["--third-party-pool", "--fee-bps", "100"])).unwrap();
+        assert!(resolve_emit_only_args(&a).is_err());
+
+        // fee 201 (over cap) rejects.
+        let a = parse_poawx_register_args(&emit(&[
+            "--third-party-pool",
+            "--fee-bps",
+            "201",
+            "--fee-pkh",
+            &fee_addr,
+        ]))
+        .unwrap();
+        assert!(resolve_emit_only_args(&a).is_err());
+
+        // malformed fee_pkh rejects.
+        let a = parse_poawx_register_args(&emit(&[
+            "--third-party-pool",
+            "--fee-bps",
+            "100",
+            "--fee-pkh",
+            "not-a-pkh",
+        ]))
+        .unwrap();
+        assert!(resolve_emit_only_args(&a).is_err());
+
+        // --fee-pkh with fee 0 rejects (inconsistent).
+        let a = parse_poawx_register_args(&emit(&["--fee-pkh", &fee_addr])).unwrap();
+        assert!(resolve_emit_only_args(&a).is_err());
+    }
+
     /// The emit-only payload object has EXACTLY the three public fields the pool
     /// endpoint reads — no extra fields can leak (structural no-secret guarantee).
     #[test]
     fn poawx_emit_only_payload_has_exact_keys() {
         use k256::ecdsa::SigningKey;
         let sk = SigningKey::from_slice(&[11u8; 32]).unwrap();
-        let d = build_signed_delegation(&sk, [0x02u8; 33], 1, "w1", 1000, 0, [3u8; 32]).unwrap();
+        let d = build_signed_delegation(&sk, [0x02u8; 33], 1, "w1", 1000, 0, [0u8; 20], [3u8; 32])
+            .unwrap();
         let body = delegation_post_body(&d, "w1");
         let obj = body.as_object().expect("payload is a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
@@ -15404,11 +15652,12 @@ mod tests {
         assert!(!a.emit_only);
         assert_eq!(a.pool.as_deref(), Some("http://127.0.0.1:39713"));
         assert!(a.pool_pubkey_hex.is_none() && a.network_id.is_none());
-        let (pool, addr, worker, fee, expiry) = resolve_online_args(&a).unwrap();
+        let (pool, addr, worker, fee, fee_pkh, expiry) = resolve_online_args(&a).unwrap();
         assert_eq!(pool, "http://127.0.0.1:39713");
         assert_eq!(addr, "Pabc");
         assert_eq!(worker, "w1");
         assert_eq!(fee, 0);
+        assert_eq!(fee_pkh, [0u8; 20]);
         assert_eq!(expiry, 1000);
 
         // Rejections (each must fail closed).
