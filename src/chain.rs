@@ -2189,6 +2189,80 @@ fn validate_poawx_coinbase_payout(
     Ok(())
 }
 
+/// Phase 20 production gate: both multi-role reward split AND the fairness matrix
+/// are active for `height` (third-party fee is layered separately). Mainnet always
+/// false (both sub-gates are mainnet-hard-off).
+pub fn phase20_production_active(height: u64) -> bool {
+    multi_role_reward_active(height) && fairness_matrix_active(height)
+}
+
+/// Phase 20 INTEGRATED production-block validator (the connect_block entry point
+/// once the receipt extension is threaded through the node wire). Pure given the
+/// supplied `ext`; reads only the runtime `third_party_mode` flag for fee policy.
+///
+/// Validates, in order:
+///   1. each role claim (compute/verify/support) against the deterministic fairness
+///      assignment (slot 0 per role) — wrong role/lane/height/prev/digest reject;
+///   2. that the RoleReward payout pkhs equal the validated claim solver pkhs;
+///   3. the fee terms (cap/mode/pkh) via `validate_fee_terms`;
+///   4. the canonical fee-aware multi-role coinbase via `validate_poawx_coinbase_payout`.
+///
+/// Callers gate by `phase20_production_active(height)` (mainnet-off) before calling.
+#[allow(clippy::too_many_arguments)]
+fn validate_phase20_production_payout(
+    coinbase_outputs: &[crate::tx::TxOutput],
+    primary_pkh: &[u8; 20],
+    total_reward: u64,
+    height: u64,
+    prev_hash: &[u8; 32],
+    network_id: u8,
+    ext: &crate::poawx::Phase20ReceiptExt,
+    third_party_mode: bool,
+) -> Result<(), String> {
+    use crate::poawx::{
+        validate_fee_terms, validate_role_claim, ROLE_COMPUTE_CONTRIBUTOR,
+        ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+    };
+    // 1. each role claim must carry its expected role and validate against fairness.
+    //    Distinct expected role_ids also reject a duplicate claim for the same role.
+    let claims = [
+        (ROLE_COMPUTE_CONTRIBUTOR, &ext.compute_claim),
+        (ROLE_VERIFY_CONTRIBUTOR, &ext.verify_claim),
+        (ROLE_SUPPORT_CONTRIBUTOR, &ext.support_claim),
+    ];
+    for (expected_role, claim) in claims.iter() {
+        if claim.role_id != *expected_role {
+            return Err(format!(
+                "phase20: claim role_id {} != expected {}",
+                claim.role_id, expected_role
+            ));
+        }
+        validate_role_claim(claim, network_id, height, prev_hash, 0)?;
+    }
+    // 2. RoleReward pkhs must equal the validated claim solver pkhs.
+    if ext.role_reward.compute_contributor_pkh != ext.compute_claim.solver_pkh
+        || ext.role_reward.verify_contributor_pkh != ext.verify_claim.solver_pkh
+        || ext.role_reward.support_contributor_pkh != ext.support_claim.solver_pkh
+    {
+        return Err("phase20: RoleReward pkh does not match validated role claim".to_string());
+    }
+    // 3. fee terms (official => fee_bps 0; third-party => mode + cap + pkh).
+    validate_fee_terms(ext.fee_bps, &ext.fee_pkh, third_party_mode)?;
+    let fee = if ext.fee_bps > 0 {
+        Some((ext.fee_bps, ext.fee_pkh))
+    } else {
+        None
+    };
+    // 4. canonical fee-aware multi-role coinbase.
+    validate_poawx_coinbase_payout(
+        coinbase_outputs,
+        primary_pkh,
+        total_reward,
+        Some(&ext.role_reward),
+        fee,
+    )
+}
+
 fn validate_poawx_reward_split_from_block(
     block: &Block,
     receipts: &[crate::poawx::PoawxBlockReceipt],
@@ -7042,6 +7116,221 @@ mod tests {
         )
         .unwrap_err()
         .contains("hidden fee"));
+    }
+
+    // ── Phase 20: integrated production-block validator + gate ───────────────
+
+    fn p20_claim(
+        net: u8,
+        height: u64,
+        prev: &[u8; 32],
+        role_id: u8,
+        solver: [u8; 20],
+    ) -> crate::poawx::PoawxRoleClaim {
+        let lane = crate::poawx::assign_lane(net, height, prev, role_id, 0);
+        let nonce = [0x01u8; 32];
+        let secret = [0x02u8; 32];
+        let cd = crate::poawx::role_claim_digest(
+            net,
+            height,
+            prev,
+            role_id,
+            lane.id(),
+            &solver,
+            &nonce,
+            &secret,
+        );
+        crate::poawx::PoawxRoleClaim {
+            role_id,
+            lane_id: lane.id(),
+            solver_pkh: solver,
+            nonce,
+            secret,
+            claim_digest: cd,
+            commitment_hash: None,
+        }
+    }
+
+    fn p20_ext(
+        net: u8,
+        height: u64,
+        prev: &[u8; 32],
+        fee_bps: u16,
+        fee_pkh: [u8; 20],
+    ) -> crate::poawx::Phase20ReceiptExt {
+        let c = [0xC1u8; 20];
+        let v = [0xC2u8; 20];
+        let s = [0xC3u8; 20];
+        crate::poawx::Phase20ReceiptExt {
+            role_reward: crate::poawx::RoleReward {
+                compute_contributor_pkh: c,
+                verify_contributor_pkh: v,
+                support_contributor_pkh: s,
+            },
+            compute_claim: p20_claim(net, height, prev, crate::poawx::ROLE_COMPUTE_CONTRIBUTOR, c),
+            verify_claim: p20_claim(net, height, prev, crate::poawx::ROLE_VERIFY_CONTRIBUTOR, v),
+            support_claim: p20_claim(net, height, prev, crate::poawx::ROLE_SUPPORT_CONTRIBUTOR, s),
+            fee_bps,
+            fee_pkh,
+        }
+    }
+
+    // Build the canonical coinbase outputs for a given ext + total.
+    fn p20_coinbase(
+        primary: &[u8; 20],
+        ext: &crate::poawx::Phase20ReceiptExt,
+        total: u64,
+    ) -> Vec<crate::tx::TxOutput> {
+        use crate::tx::{p2pkh_script, TxOutput};
+        let a = crate::poawx::multi_role_amounts(total);
+        let (pnet, pfee) = if ext.fee_bps > 0 {
+            crate::poawx::apply_fee(a[0], ext.fee_bps)
+        } else {
+            (a[0], 0)
+        };
+        let mut outs = vec![
+            TxOutput {
+                value: 0,
+                script_pubkey: vec![0x6a, 0x24, b'i', b'r', b'x', b'1'],
+            },
+            TxOutput {
+                value: pnet,
+                script_pubkey: p2pkh_script(primary),
+            },
+            TxOutput {
+                value: a[1],
+                script_pubkey: p2pkh_script(&ext.role_reward.compute_contributor_pkh),
+            },
+            TxOutput {
+                value: a[2],
+                script_pubkey: p2pkh_script(&ext.role_reward.verify_contributor_pkh),
+            },
+            TxOutput {
+                value: a[3],
+                script_pubkey: p2pkh_script(&ext.role_reward.support_contributor_pkh),
+            },
+        ];
+        if ext.fee_bps > 0 {
+            outs.push(TxOutput {
+                value: pfee,
+                script_pubkey: p2pkh_script(&ext.fee_pkh),
+            });
+        }
+        outs
+    }
+
+    #[test]
+    fn phase20_integrated_production_validator() {
+        let net = 1u8;
+        let height = 500u64;
+        let prev = [0x44u8; 32];
+        let primary = [0xA1u8; 20];
+        let total = 5_000_000_001u64;
+
+        // (1) official (fee 0): valid integrated block accepted.
+        let ext = p20_ext(net, height, &prev, 0, [0u8; 20]);
+        let cb = p20_coinbase(&primary, &ext, total);
+        assert!(validate_phase20_production_payout(
+            &cb, &primary, total, height, &prev, net, &ext, false
+        )
+        .is_ok());
+
+        // (2) third-party fee (mode on): valid accepted; coinbase has the fee output.
+        let fee_pkh = [0xFEu8; 20];
+        let extf = p20_ext(net, height, &prev, 200, fee_pkh);
+        let cbf = p20_coinbase(&primary, &extf, total);
+        assert!(validate_phase20_production_payout(
+            &cbf, &primary, total, height, &prev, net, &extf, true
+        )
+        .is_ok());
+        // same fee ext without third-party mode rejects (fee policy).
+        assert!(validate_phase20_production_payout(
+            &cbf, &primary, total, height, &prev, net, &extf, false
+        )
+        .is_err());
+
+        // (3) wrong role claim (compute_claim carries the verify role) rejects.
+        let mut wrole = ext.clone();
+        wrole.compute_claim.role_id = crate::poawx::ROLE_VERIFY_CONTRIBUTOR;
+        assert!(validate_phase20_production_payout(
+            &cb, &primary, total, height, &prev, net, &wrole, false
+        )
+        .is_err());
+
+        // (4) tampered claim (lane) rejects.
+        let mut wlane = ext.clone();
+        wlane.verify_claim.lane_id ^= 0x01;
+        assert!(validate_phase20_production_payout(
+            &cb, &primary, total, height, &prev, net, &wlane, false
+        )
+        .is_err());
+
+        // (5) RoleReward pkh != validated claim solver rejects.
+        let mut wrr = ext.clone();
+        wrr.role_reward.support_contributor_pkh = [0xDEu8; 20];
+        let cb_wrr = p20_coinbase(&primary, &wrr, total);
+        assert!(validate_phase20_production_payout(
+            &cb_wrr, &primary, total, height, &prev, net, &wrr, false
+        )
+        .unwrap_err()
+        .contains("RoleReward pkh"));
+
+        // (6) wrong height/prev rejects (claim digest/assignment differ).
+        assert!(validate_phase20_production_payout(
+            &cb,
+            &primary,
+            total,
+            height + 1,
+            &prev,
+            net,
+            &ext,
+            false
+        )
+        .is_err());
+
+        // (7) coinbase tamper (wrong primary amount) rejects.
+        let mut cb_bad = cb.clone();
+        cb_bad[1].value += 1;
+        assert!(validate_phase20_production_payout(
+            &cb_bad, &primary, total, height, &prev, net, &ext, false
+        )
+        .is_err());
+
+        // (8) fee output present but ext is official (fee_bps 0) -> count mismatch rejects.
+        assert!(validate_phase20_production_payout(
+            &cbf, &primary, total, height, &prev, net, &ext, false
+        )
+        .is_err());
+
+        // (9) fee over cap (201) rejects via fee policy.
+        let mut over = p20_ext(net, height, &prev, 201, fee_pkh);
+        over.role_reward = ext.role_reward.clone();
+        let cb_over = p20_coinbase(&primary, &over, total);
+        assert!(validate_phase20_production_payout(
+            &cb_over, &primary, total, height, &prev, net, &over, true
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn phase20_production_gate_requires_multirole_and_fairness_mainnet_off() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "5");
+        // fairness not yet active -> production gate off.
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        assert!(!phase20_production_active(10), "needs fairness too");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "5");
+        assert!(!phase20_production_active(4), "below activation");
+        assert!(phase20_production_active(5), "both active at height");
+        // mainnet hard-off even with both env set.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!phase20_production_active(10), "mainnet hard-off");
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_NETWORK");
     }
 
     #[test]
