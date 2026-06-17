@@ -14164,8 +14164,28 @@ fn verify_delegated_pending_receipt(
     if height > d.expiry_height {
         return Err("delegation expired".to_string());
     }
+    // Official pool is 0%. Phase 20 Step 4: a nonzero delegation fee is allowed
+    // only in explicit third-party mode + fee gate (both mainnet-hard-off), capped.
+    // connect_block remains the authoritative validator; this is an early reject.
     if d.fee_bps != 0 {
-        return Err("nonzero delegation fee_bps rejected (official pool is 0%)".to_string());
+        let third_party = irium_node_rs::chain::third_party_fee_active(height)
+            && irium_node_rs::chain::third_party_pool_mode_enabled();
+        if !third_party {
+            return Err(
+                "nonzero delegation fee_bps rejected (third-party mode/fee gate not active)"
+                    .to_string(),
+            );
+        }
+        if d.fee_bps > irium_node_rs::poawx::THIRD_PARTY_FEE_CAP_BPS {
+            return Err(format!(
+                "delegation fee_bps {} exceeds cap {}",
+                d.fee_bps,
+                irium_node_rs::poawx::THIRD_PARTY_FEE_CAP_BPS
+            ));
+        }
+        if d.fee_pkh == [0u8; 20] {
+            return Err("nonzero delegation fee_bps with zero fee_pkh".to_string());
+        }
     }
     d.verify_signature().map_err(|e| e.to_string())?;
     let signer_pub =

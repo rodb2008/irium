@@ -2299,6 +2299,19 @@ fn validate_phase20_production_block(
                 i, height
             )
         })?;
+        // Bind the coinbase fee to the miner-signed delegation: when the receipt
+        // is delegated (mode-1), the extension fee terms MUST equal the signed
+        // delegation fee terms, so a pool cannot pay itself a fee the miner did
+        // not sign. (Mode-0 has no delegation to bind; its ext fee is still gated
+        // + capped by validate_phase20_production_payout below.)
+        if let Some(d) = &r.delegation {
+            if ext.fee_bps != d.fee_bps || ext.fee_pkh != d.fee_pkh {
+                return Err(format!(
+                    "phase20: receipt[{}] extension fee terms != signed delegation fee terms at height {}",
+                    i, height
+                ));
+            }
+        }
         validate_phase20_production_payout(
             &coinbase.outputs,
             &r.worker_pkh,
@@ -2556,12 +2569,33 @@ fn validate_poawx_block_receipts(
                             i, height, d.expiry_height
                         ));
                     }
-                    // Step 1: official pool is 0% — nonzero fee fails closed.
+                    // Official pool is 0%. Phase 20 Step 4: a nonzero delegation fee
+                    // is allowed ONLY in explicit third-party mode with the fee gate
+                    // active, capped at THIRD_PARTY_FEE_CAP_BPS, with a nonzero
+                    // fee_pkh. Both gates are mainnet-hard-off, so mainnet stays 0%.
                     if d.fee_bps != 0 {
-                        return Err(format!(
-                            "connect_block: receipt[{}] nonzero delegation fee_bps {} rejected (official pool is 0%)",
-                            i, d.fee_bps
-                        ));
+                        let third_party =
+                            third_party_fee_active(height) && third_party_pool_mode_enabled();
+                        if !third_party {
+                            return Err(format!(
+                                "connect_block: receipt[{}] nonzero delegation fee_bps {} rejected (third-party mode/fee gate not active)",
+                                i, d.fee_bps
+                            ));
+                        }
+                        if d.fee_bps > crate::poawx::THIRD_PARTY_FEE_CAP_BPS {
+                            return Err(format!(
+                                "connect_block: receipt[{}] delegation fee_bps {} exceeds cap {}",
+                                i,
+                                d.fee_bps,
+                                crate::poawx::THIRD_PARTY_FEE_CAP_BPS
+                            ));
+                        }
+                        if d.fee_pkh == [0u8; 20] {
+                            return Err(format!(
+                                "connect_block: receipt[{}] nonzero delegation fee_bps with zero fee_pkh",
+                                i
+                            ));
+                        }
                     }
                     // Miner's one-time delegation signature.
                     d.verify_signature().map_err(|e| {
@@ -7619,6 +7653,117 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
         std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn phase20_connect_block_mode1_third_party_fee_and_binding() {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_mode1_env();
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_THIRD_PARTY_POOL_MODE", "1");
+
+        let net = crate::activation::network_id_byte();
+        let miner = sk_from(3);
+        let pool = sk_from(5);
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let total = block_reward(height);
+        let fee_pkh = [0xFEu8; 20];
+        let fee_bps = 150u16;
+
+        // Base mode-1 receipt, then upgrade its delegation to carry a third-party
+        // fee (re-signed by the miner) and attach a matching production extension.
+        let base = make_mode1_receipt(height, &miner, &pool, parent_hash, 1, 1, 1000, 0);
+        let primary = base.worker_pkh;
+
+        // Build a (receipt, ext) pair with the given ext fee, and a canonical fee
+        // coinbase whose irx1 root is the gated-on root over the receipt.
+        let build = |ext_fee_bps: u16| -> (Block, crate::poawx::PoawxBlockReceipt) {
+            let mut receipt = base.clone();
+            // re-sign the delegation with the third-party fee terms.
+            {
+                let d = receipt.delegation.as_mut().unwrap();
+                d.fee_bps = fee_bps;
+                d.fee_pkh = fee_pkh;
+                let sig: k256::ecdsa::Signature = miner.sign_prehash(&d.message_hash()).unwrap();
+                d.delegation_sig.copy_from_slice(&sig.to_bytes());
+            }
+            let ext = p20_ext(net, height, &parent_hash, ext_fee_bps, fee_pkh);
+            receipt.phase20_ext = Some(ext.clone());
+            let root = crate::poawx::irx1_root_from_block_receipts_gated(
+                std::slice::from_ref(&receipt),
+                true,
+            );
+            let mut irx1 = vec![0x6a, 0x24u8];
+            irx1.extend_from_slice(b"irx1");
+            irx1.extend_from_slice(&root);
+            // p20_coinbase appends the fee output when ext.fee_bps > 0.
+            let mut payout = p20_coinbase(&primary, &ext, total);
+            payout[0] = TxOutput {
+                value: 0,
+                script_pubkey: irx1,
+            };
+            let coinbase = Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    prev_txid: [0u8; 32],
+                    prev_index: 0xffff_ffff,
+                    script_sig: vec![0x01, 0x00],
+                    sequence: 0xffff_ffff,
+                }],
+                outputs: payout,
+                locktime: 0,
+            };
+            let block = Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: parent_hash,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![coinbase],
+                auxpow: None,
+                poawx_receipts: Some(vec![receipt.clone()]),
+            };
+            (block, receipt)
+        };
+
+        // (1) ext fee == delegation fee (150): accepted (mode-1 fee relaxation +
+        // fee-aware multi-role coinbase + ext↔delegation binding all hold).
+        let (ok_block, _r) = build(fee_bps);
+        let res = validate_poawx_block_receipts(&ok_block, height, Some(&parent));
+        assert!(
+            res.is_ok(),
+            "mode-1 third-party fee block must be accepted: {res:?}"
+        );
+
+        // (2) ext fee (100) != signed delegation fee (150): binding rejects.
+        let (bad_block, _r) = build(100);
+        let res = validate_poawx_block_receipts(&bad_block, height, Some(&parent));
+        assert!(res.is_err(), "ext/delegation fee mismatch must reject");
+        assert!(
+            res.unwrap_err().contains("extension fee terms"),
+            "expected binding error"
+        );
+
+        // (3) same valid block rejects once the third-party gate is off (the
+        // delegation fee>0 is no longer permitted).
+        std::env::remove_var("IRIUM_POAWX_THIRD_PARTY_POOL_MODE");
+        let res = validate_poawx_block_receipts(&ok_block, height, Some(&parent));
+        assert!(res.is_err(), "third-party fee rejected when mode off");
+
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT");
+        clear_mode1_env();
     }
 
     #[test]
