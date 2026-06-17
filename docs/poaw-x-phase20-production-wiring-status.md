@@ -1,11 +1,42 @@
-# PoAW-X Phase 20 — Production Wiring Status (PARTIAL: consensus validator + extension done; live node/pool/wallet integration follow-up)
+# PoAW-X Phase 20 — Production Wiring Status (Steps 1 & 2 COMPLETE: extension threaded + consensus-enforced + root-committed; pool/wallet/E2E follow-up)
 
-**Status:** **PARTIAL** (advancing). The consensus validator + extension type are done, and
-**Step 1 — threading `Phase20ReceiptExt` through node storage, persistence, P2P/block sync, and
-reorg plumbing — is now COMPLETE (data only, NOT enforced)**. The extension survives all internal
-node data paths; pre-Phase-20 blocks/receipts remain byte-identical. Still remaining: the
-`connect_block`/`submit_block_extended` enforcement call site, pool coinbase production, wallet
-third-party-fee CLI, pool registry fee relaxation, and a loopback E2E.
+**Status:** **PARTIAL** (advancing). The consensus validator + extension type are done; **Step 1**
+(threading `Phase20ReceiptExt` through node storage, persistence, P2P/block sync, and reorg) is
+COMPLETE; and **Step 2 — `connect_block` / `submit_block_extended` enforcement + receipts-root
+inclusion, gated by `phase20_production_active(height)` — is now COMPLETE and ENFORCED**. After
+activation (testnet/devnet only; mainnet hard-off) the extension is required, is bound into the
+receipts root, and the integrated production validator runs in `connect_block`. Before activation
+the Phase 18/19 path is byte/logically identical. Still remaining: pool canonical coinbase
+production, wallet third-party-fee CLI, pool registry fee relaxation, a synthetic role-claim
+builder, the hidden-precommit commitment root, and a live loopback E2E.
+
+### Step 2 (this pass) — connect_block / submit_block_extended enforcement + receipts-root: COMPLETE
+- **Receipts-root inclusion (gated).** `irx1_root_from_block_receipts_gated(receipts, phase20_active)`
+  (lib) and `compute_poawx_receipts_root_gated(receipts, phase20_active)` (iriumd) bind
+  `Phase20ReceiptExt::digest()` into each receipt's inner hash **after** the optional mode-1
+  delegation digest, **only when `phase20_active`**. The old public functions are thin wrappers
+  (`..., false`), so every pre-activation / non-production caller is **byte-identical**. The hex
+  pending `phase20_ext` is exactly `serialize()`, so the submit-path root equals the connect-path
+  root. Mutating any extension field (role claim, RoleReward, fee_bps, fee_pkh) changes the root.
+- **`connect_block` enforcement.** `validate_poawx_block_receipts` now recomputes the root with the
+  gate and, after activation, runs `validate_phase20_production_block` (per receipt:
+  `validate_phase20_production_payout` with PRIMARY = receipt `worker_pkh`, total = block subsidy,
+  `prev_hash` = parent hash, `third_party_mode = third_party_fee_active && third_party_pool_mode_enabled`).
+  Pre-activation it runs the legacy 10%/receipt floor check unchanged. A missing extension after
+  activation **fails closed**.
+- **`submit_block_extended` enforcement.** Uses the gated root for the irx1 commitment check and
+  adds an early reject when production is active but a receipt is missing the extension; the
+  authoritative validation remains `connect_block` (called from the handler).
+- **Reject coverage** (all via the integrated validator): missing extension, bad role claim,
+  RoleReward mismatch, wrong coinbase amount/order, hidden extra payout, fee output in official
+  mode, fee without third-party mode, fee over the 200 bps cap, root/extension mismatch, and
+  mainnet (hard-off — the gate is false, so enforcement never runs and the root stays legacy).
+- **Coinbase-only assumption (documented).** The production payout check uses the block subsidy as
+  the distributable total; the supported single-miner producer builds a coinbase-only block (no
+  fee-bearing txs). Fee-aware totals for fee-bearing blocks are a follow-up (no such producer
+  exists yet — pool production is out of scope here).
+
+### Step 1 — receipt-wire / storage / P2P / reorg threading: COMPLETE
 
 ### Step 1 (this pass) — receipt-wire / storage / P2P / reorg threading: COMPLETE
 - **Receipt wire (`PoawxBlockReceipt.phase20_ext: Option<Phase20ReceiptExt>`)** + a **present-only
@@ -21,11 +52,22 @@ third-party-fee CLI, pool registry fee relaxation, and a loopback E2E.
 - **NOT enforced:** the extension is only preserved, never validated/required in this step; the
   receipts root is unchanged (root/digest inclusion + validation belong to the enforcement step).
 - Tests: v3 element round-trip + byte-identity-when-absent (poawx); v3 block wire round-trip +
-  old-block-no-v3-magic (block); reorg mapper preserves ext + plain→None (iriumd). Full suites
-  green (lib 628, iriumd bin 255, stratum delegation 14 / native_rewardable 6, wallet 420).
+  old-block-no-v3-magic (block); reorg mapper preserves ext + plain→None (iriumd).
 
-> Mainnet hard-off for all three features. Chain difficulty automatic via LWMA-144. Local-only;
-> not pushed. Hidden-precommit commitment root remains a separate PARTIAL (see fairness doc).
+### Tests added in Step 2
+- **poawx** `phase20_root_gating_and_mutation_sensitivity`: gate-off byte-identity (extension
+  ignored == no-ext root == wrapper); gate-on differs and is deterministic; mutating role
+  claim / RoleReward / fee_bps / fee_pkh each changes the gated-on root; malformed/truncated
+  extension fails to deserialize.
+- **iriumd** `phase20_gated_root_parity_pending_vs_block_and_byte_identity`: gate-off equals the
+  legacy root; gate-on submit-path (pending) root equals connect-path (block) root; gate-on
+  differs from legacy.
+- **chain** `phase20_connect_block_production_enforcement`: valid Phase 20 block accepted;
+  rejects bad role claim, RoleReward mismatch, wrong coinbase order, wrong amount, hidden extra
+  payout, fee-without-mode; accepts third-party fee with fee gate + mode; rejects fee over cap;
+  rejects missing extension after activation; mainnet hard-off skips enforcement.
+- submit_block_extended handler accept/reject is exercised through the gated-root parity +
+  the authoritative `connect_block` tests; a live running-node loopback E2E is **Step 5**.
 
 > Mainnet hard-off for all three features. Chain difficulty automatic via LWMA-144. Local-only;
 > not pushed. Hidden-precommit commitment root remains a separate PARTIAL (see fairness doc).
@@ -67,12 +109,13 @@ Each touches the validated Phase 18/19/19D code and is staged to avoid regressin
 1. **Node receipt-wire threading** — ✅ **DONE (Step 1)**: `Phase20ReceiptExt` is carried in the
    present-only v3 receipt section through `iriumd` pending receipts, `storage` JSON persist/reload,
    reorg pending↔block mappers, and P2P block ser/de (data only, not enforced).
-2. **connect_block / submit_block_extended** — call `validate_phase20_production_payout` when
-   `phase20_production_active(height)` and the extension is present; reject missing/malformed
-   extension after activation; keep pre-activation Phase 18/19 blocks valid.
+2. **connect_block / submit_block_extended** — ✅ **DONE (Step 2)**: `validate_phase20_production_payout`
+   runs in `connect_block` when `phase20_production_active(height)`; the extension is bound into the
+   receipts root; missing extension after activation fails closed; pre-activation Phase 18/19 blocks
+   remain valid (byte-identical). submit path uses the gated root + early missing-ext reject.
 3. **Pool production** — build the canonical multi-role (+ optional fee) coinbase in the
    stratum native_rewardable path; assemble the extension from registered delegations / role
-   claims.
+   claims. **(Step 3 — NOT done.)**
 4. **Role-claim source** — real claims from miners, or a clearly-named testnet/devnet-only
    `IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1` synthetic builder (mainnet-impossible). Not added yet.
 5. **Wallet CLI** — `--third-party-pool` / `--fee-bps` / `--fee-pkh` on `poawx-register`/
@@ -80,6 +123,16 @@ Each touches the validated Phase 18/19/19D code and is staged to avoid regressin
 6. **Pool registry** — relax `verify_and_store` (currently fail-closed on `fee_bps>0`) to accept
    capped third-party fees + persist `fee_pkh`, gated on third-party mode; reject mismatch/mutation.
 7. **Observer + loopback smoke** — two-node + isolated `$TROOT` E2E (operator-approved, loopback).
+   **(Step 5 — NOT done; submit_block_extended live handler accept/reject is covered here.)**
+
+### Still NOT done after Step 2 (explicit)
+- pool canonical coinbase production (Step 3)
+- wallet third-party-fee CLI (`--third-party-pool` / `--fee-bps` / `--fee-pkh`)
+- pool registry fee relaxation (`verify_and_store` still fail-closed on `fee_bps>0`)
+- synthetic role-claim builder
+- hidden-precommit commitment root (fairness matrix remains PARTIAL — assignment uses `prev_hash`,
+  known at block time; a prior-block commitment root is required for true hidden-before-reveal)
+- live loopback / two-node E2E (Step 5)
 
 ## Why staged (honest)
 The live integration is a multi-thousand-line change across `iriumd` (~25k lines), `chain.rs`,
