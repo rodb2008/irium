@@ -1,46 +1,76 @@
-# PoAW-X Phase 20 — Design Gap: Third-Party Pool Fee (BLOCKED)
+# PoAW-X Phase 20 — Third-Party Pool Fee (DESIGN GAP RESOLVED — consensus primitives + validator implemented; wallet CLI / pool / production wiring follow-up)
 
-**Status:** BLOCKED on consensus parameters. Not implemented. The safe default
-(**official pool = 0% fee**, `fee_bps > 0` rejected) is unchanged.
+**Status:** **RESOLVED for consensus primitives + canonical fee-aware coinbase validator +
+activation/mode gates + delegation fee-binding (already signed) + tests** (testnet/devnet-gated,
+mainnet hard-off). **PARTIAL overall:** wallet `--third-party-pool`/`--fee-pkh` CLI flags, pool
+registry relaxation, and live `connect_block` production enforcement remain a documented
+follow-up (per the spec's PARTIAL clause) so the validated Phase 18/19/19D registration path
+stays byte-identical. Local-only; not pushed.
 
-## Current state (repo ground truth)
-- The 226-byte `Delegation` carries a `fee_bps` field, but it **must be 0** everywhere:
-  the wallet (`poawx-register` / `--emit-only`), the pool (`verify_and_store`,
-  `build_mode1_*`), and consensus (`connect_block`) all **fail closed** on `fee_bps > 0`.
-- There is **no fee-output consensus path**: nothing defines a fee payout address, a fee cap,
-  or how a fee output is verified in the coinbase.
+## Policy (implemented / enforced by the primitives)
+- **Official Irium pool fee remains 0%**; `fee_bps = 0` is the default everywhere and is
+  always allowed with no fee output.
+- **Third-party fee cap = 200 bps (2.00%)** (`THIRD_PARTY_FEE_CAP_BPS`); `fee_bps > 200` rejects.
+- A nonzero fee is allowed **only** with explicit third-party opt-in (`validate_fee_terms`
+  requires `third_party_mode == true`) AND a non-zero `fee_pkh`.
+- **Fee terms are signed by the miner and cannot be mutated:** the 226-byte `Delegation`
+  already binds `fee_bps` + `fee_pkh` inside `message_hash()`. Test
+  `phase20_delegation_binds_fee_terms` proves any change to `fee_bps` or `fee_pkh` both alters
+  the hash and **breaks the signature**.
+- **No hidden fee:** the validator rejects any value-bearing non-P2PKH output and any extra/
+  mis-ordered P2PKH output.
+- **Mainnet hard-off:** `chain::third_party_fee_active` and `third_party_pool_mode_enabled`
+  return false on mainnet regardless of env. No mainnet/production activation.
+- **Fee applies to PRIMARY_MINER only:** when multi-role is active the fee is taken from the
+  PRIMARY allocation; COMPUTE/VERIFY/SUPPORT are never taxed.
+- Chain difficulty remains automatic via LWMA-144 (untouched).
 
-## What is undefined (must be specified before code)
-1. **Explicit third-party-pool mode** — how a block/delegation is marked as third-party
-   (vs the official 0% pool), and how nodes know to expect a fee output.
-2. **Fee cap** — the maximum allowed `fee_bps` (consensus-enforced), to prevent abusive fees.
-3. **Fee pkh binding** — the fee recipient address, **signed into the delegation** by the
-   miner so it cannot be changed after the miner agrees (transparency-before-delegation).
-4. **Fee coinbase output format** — canonical encoding/ordering of the fee output and the
-   miner's net output, deterministically verifiable on sync.
-5. **connect_block + sync verification** — exact checks: fee ≤ cap, fee output pays the bound
-   fee pkh exactly, miner net output correct, mismatch/over-cap/hidden-fee all reject.
-6. **Relationship to the multi-role reward split** (that design gap) — whether the fee is a
-   role in the split or a separate output.
+## What is implemented (this commit set)
+`src/poawx.rs`:
+- `THIRD_PARTY_FEE_CAP_BPS = 200`, `THIRD_PARTY_FEE_DOMAIN_V1`.
+- `validate_fee_terms(fee_bps, fee_pkh, third_party_mode)` — fee-policy rules (cap, mode, pkh).
+- `apply_fee(gross, fee_bps) -> (net, fee)` — `fee = floor(gross*bps/10000)`, miner keeps the
+  remainder, `net + fee == gross` exactly.
 
-## Constraints any implementation MUST preserve
-- Official Irium pool default remains **0%**.
-- `fee_bps > 0` allowed **only** in an explicit third-party mode, never by accident.
-- Fee transparent to the miner **before** delegation; fee terms **signed/bound** into the
-  delegation; cannot change after.
-- Fee payout consensus-verifiable; miner still receives correct net payout.
-- The pool **delegate key is not automatically the fee recipient** — the fee pkh must be a
-  configured/bound pool-fee address.
-- Mainnet stays disabled; invalid/excessive/mismatched fee rejects.
+`src/activation.rs` + `src/chain.rs`:
+- `poawx_third_party_fee_activation_height()` (env `IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT`).
+- `third_party_fee_active(height)` (mainnet hard-false) + `third_party_pool_mode_enabled()`
+  (env `IRIUM_POAWX_THIRD_PARTY_POOL_MODE=1`, mainnet hard-false).
+- `validate_poawx_coinbase_payout(outputs, primary_pkh, total_reward, role, fee)` — the single
+  comprehensive canonical validator covering **all four formats** (official/third-party × no-
+  multi-role/multi-role), fee from PRIMARY only, zero-value `irx1` OP_RETURN ignored.
 
-## Required tests once defined (from the task)
-official pool fee 0 · third-party fee only in explicit mode · fee mismatch rejects · fee
-over cap rejects · fee output correct · miner net output correct · delegate key not auto fee
-recipient unless configured.
+## Canonical coinbase formats (validated)
+- Official, no multi-role: `[irx1?] PRIMARY(total)`.
+- Third-party fee, no multi-role: `[irx1?] PRIMARY(net) FEE(fee_pkh)`.
+- Official, multi-role: `[irx1?] PRIMARY COMPUTE VERIFY SUPPORT`.
+- Third-party fee, multi-role: `[irx1?] PRIMARY(net) COMPUTE VERIFY SUPPORT FEE(fee_pkh)`.
 
-## Decision needed
-This is the most consensus-sensitive of the three gaps (it moves real value to a non-miner
-party). Provide items 1–6 (mode flag, cap, fee-pkh binding, output format, verification
-rules, split relationship). Until then: **BLOCKED — official 0% fee only; `fee_bps > 0`
-rejected.** This is the single most important unresolved consensus decision before any
-fee-bearing pool can exist.
+## Rounding
+Integer atomic units; `fee = floor(primary_gross * fee_bps / 10000)`; miner keeps the
+remainder; outputs sum to the allowed reward exactly (no over/underpay).
+
+## Validation rejects (tested)
+fee output in official mode · wrong fee amount · fee_pkh mismatch · taxing a role instead of
+PRIMARY · hidden value-bearing non-p2pkh output · over-cap (`>200`) · fee>0 without third-party
+mode · fee>0 without fee_pkh · mainnet gate/mode on.
+
+## Tests (all passing)
+poawx: `validate_fee_terms` (official/over-cap/no-mode/no-pkh), `apply_fee` (floor + remainder
++ zero), `delegation_binds_fee_terms` (round-trip + signature mutation-proof). chain:
+`fee_aware_coinbase_payout` (all 4 formats + rejects), `third_party_fee_gate_mainnet_off_and_testnet`.
+
+## Remaining (follow-up; PARTIAL — not faked COMPLETE)
+1. **Wallet CLI**: `--third-party-pool` + `--fee-pkh` on `poawx-register`/`--emit-only`,
+   allowing `fee_bps 1..200` gated, printing fee terms, with `emit-only == online body` tests.
+   Deferred to keep the validated registration path byte-identical (zero regression risk).
+2. **Pool registry**: relax `verify_and_store` (currently fail-closed on `fee_bps>0`) to accept
+   capped third-party fees + persist `fee_pkh`, gated on third-party mode; reject mismatched
+   fee terms / fee_pkh mutation.
+3. **Live production enforcement**: build the canonical fee-aware coinbase in the pool and call
+   `validate_poawx_coinbase_payout` from `connect_block`/`submit_block_extended` when
+   `third_party_fee_active(height)`.
+4. Ties to the multi-role production wiring + fairness commitment root (separate follow-ups).
+
+Official pool stays 0% and `fee_bps>0` stays rejected on the live path until the follow-up
+lands. Mainnet remains disabled.

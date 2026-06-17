@@ -43,7 +43,7 @@ fake completion."
 | B | CPU/GPU/ASIC fairness matrix | Owner spec supplied; lane assignment + role-claim primitives + 34/33/33 distribution + activation gate implemented (mainnet-off) | Live hidden-precommit enforcement needs a future on-chain commitment root; connect_block wiring | MED | **PARTIAL** — primitives/validation/tests COMPLETE; hidden-precommit + wiring follow-up (design-gap doc, now partial-resolved) |
 | C | Multi-role reward split | Owner spec supplied (55/22/13/10); consensus primitives + validator implemented (gated, mainnet-off) | Pool production + node receipt-wire/persist threading + live connect_block enforcement | MED | **PARTIAL** — primitives/validator/tests COMPLETE; production follow-up (see design-gap doc, now resolved) |
 | D | Many-miner / multi-worker pool | Registry: multi-worker ✅; block production: single-miner | Per-worker coinbase outputs in stratum (depends on reward model) | MED | **PARTIAL** — registry test added; production gap documented |
-| E | Third-party pool fee | fee_bps must be 0 | Fee cap, fee pkh binding, fee coinbase output, connect_block verify | **HIGH (consensus)** | **BLOCKED** — design-gap doc |
+| E | Third-party pool fee | Owner spec supplied (cap 200bps); fee primitives + fee-aware canonical validator + gates implemented (mainnet-off); delegation already binds fee terms | Wallet CLI flags + pool registry relax + live connect_block enforcement | MED | **PARTIAL** — primitives/validator/tests COMPLETE; wallet/pool/production follow-up (see design-gap doc, now resolved) |
 | F | Long soak / restart / reorg testing | Proven ad-hoc in 18C/18D/19C/19D | A reusable loopback harness + documented full-soak commands | LOW | **COMPLETE** — harness + doc |
 | G | Metrics / monitoring | `/metrics` exists (aggregate, loopback) | PoAW-X-specific counters + safe-monitoring doc | LOW | **PARTIAL** — monitoring doc + counter plan (code deferred, non-consensus) |
 | H | Public miner onboarding at scale | 19A–19D docs + emit-only validator | Consolidated onboarding package + helper scripts | LOW | **COMPLETE** — doc + scripts |
@@ -51,26 +51,23 @@ fake completion."
 | J | Governance / community activation | None | Activation process doc | LOW | **COMPLETE** — doc |
 | K | Mainnet activation safety framework | Gating implemented + tested | Far-future-height policy, operator/rollback checklists, default-off confirmation | MED | **COMPLETE** — framework doc (no activation) |
 
-## 3. Consensus blockers
+## 3. Consensus blockers — NONE remaining (all three resolved to PARTIAL)
 
-> **Update:** item **C (multi-role reward split)** is no longer blocked — the owner supplied
-> the 55/22/13/10 spec, and the consensus primitives + canonical-coinbase validator +
-> activation gate (mainnet-off) + tests are now implemented (testnet/devnet-gated). Pool
-> block production + node receipt-wire/persistence threading remain a documented follow-up
-> (PARTIAL). See `poaw-x-phase20-design-gap-multi-role-reward-split.md` (resolved).
+> **Update:** all three previously-blocked consensus items (B fairness matrix, C multi-role
+> reward split, E third-party fee) now have owner-supplied specs and are implemented to
+> **PARTIAL** — consensus primitives + validators + activation gates (mainnet-off) + tests are
+> done (testnet/devnet-gated); each has remaining production-wiring follow-up. **No item is
+> BLOCKED on an undefined consensus parameter anymore.**
 
-**One** item still requires consensus-critical parameters the repository does **not** define.
-Implementing it would mean inventing values that would later become binding consensus —
-disallowed. It has a precise design-gap doc:
+- ~~B — CPU/GPU/ASIC fairness matrix~~ — **PARTIAL** (assignment + role-claim primitives + 34/33/33 distribution + gate done; live **hidden-precommit** needs a future on-chain commitment root).
+- ~~C — Multi-role reward split~~ — **PARTIAL** (primitives/validator/tests done; pool production + receipt-wire threading follow-up).
+- ~~E — Third-party pool fee~~ — **PARTIAL** (fee primitives + fee-aware canonical validator + gates done, cap 2%, mainnet-off; wallet CLI + pool registry + live enforcement follow-up).
 
-- **E — Third-party pool fee:** `poaw-x-phase20-design-gap-third-party-fee.md` (**BLOCKED**)
-- ~~B — CPU/GPU/ASIC fairness matrix~~ — **PARTIAL** (owner spec supplied; assignment + role-claim primitives + 34/33/33 distribution + activation gate done, mainnet-off; live **hidden-precommit** enforcement needs a future on-chain commitment root — see design-gap doc).
-- ~~C — Multi-role reward split~~ — **PARTIAL** (owner spec supplied; primitives/validator/tests done, gated, mainnet-off; pool production follow-up).
-
-**Decision still needed from the owner** for E only: fee cap + fee-pkh binding + fee output
-format + verification rules. For B, the remaining work is a **commitment-root design decision**
-(to make hidden-precommit consensus-enforceable) plus production wiring — not a blocked
-parameter. Once provided, each becomes a normal gated testnet implementation following the
+**Remaining work is implementation/integration, not blocked parameters:** (1) a fairness
+**commitment-root** design decision to make hidden-precommit consensus-enforceable; (2)
+**production wiring** for each — pool building canonical (multi-role/fee) coinbases, node
+receipt-wire/persist threading, and live `connect_block`/`submit_block_extended` enforcement
+gated on the activation heights; (3) wallet CLI fee flags. Each follows the
 proven mode-1 pattern.
 
 ## 4. What Phase 20 delivers (safe, local)
