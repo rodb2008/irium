@@ -279,6 +279,20 @@ pub fn parse_u32_hex(s: &str) -> Result<u32> {
 /// Phase 11-B: sort canonically by (height, lane, worker_pkh, commitment_nonce)
 /// so the root is deterministic regardless of receipt insertion order.
 pub fn compute_receipts_root_from_pending(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
+    compute_receipts_root_from_pending_gated(receipts, false)
+}
+
+/// Phase 20: gated variant mirroring `irium_node_rs::poawx::irx1_root_from_block_receipts_gated`
+/// / iriumd `compute_poawx_receipts_root_gated`. When `phase20_active`, binds
+/// `SHA256(phase20_ext bytes)` into the inner hash AFTER the optional mode-1
+/// delegation digest. The pending `phase20_ext` hex is exactly the serialized
+/// extension, so this digest equals the node's `Phase20ReceiptExt::digest()` and
+/// the pool root matches connect_block / submit_block_extended. Inactive/absent
+/// => byte-identical to the Phase 10-D / 18B root.
+pub fn compute_receipts_root_from_pending_gated(
+    receipts: &[PoawxPendingReceipt],
+    phase20_active: bool,
+) -> [u8; 32] {
     let mut sorted: Vec<&PoawxPendingReceipt> = receipts.iter().collect();
     sorted.sort_unstable_by(|a, b| {
         a.height
@@ -315,6 +329,16 @@ pub fn compute_receipts_root_from_pending(receipts: &[PoawxPendingReceipt]) -> [
                 inner.update(digest);
             }
         }
+        // Phase 20: bind the production-extension digest (gated) to match the
+        // node. The hex IS the serialized ext, so SHA256(bytes) == digest().
+        if phase20_active && !r.phase20_ext.is_empty() {
+            if let Ok(ext_bytes) = hex::decode(&r.phase20_ext) {
+                let mut eh = Sha256::new();
+                eh.update(&ext_bytes);
+                let digest: [u8; 32] = eh.finalize().into();
+                inner.update(digest);
+            }
+        }
         outer.update(inner.finalize());
     }
     outer.finalize().into()
@@ -335,6 +359,7 @@ mod tests {
             worker_pubkey: String::new(),
             worker_sig: String::new(),
             delegation: String::new(),
+            phase20_ext: String::new(),
         }
     }
 
@@ -406,6 +431,68 @@ mod tests {
             compute_receipts_root_from_pending(&[c]),
             compute_receipts_root_from_pending(&[d])
         );
+    }
+
+    #[test]
+    fn phase20_gated_root_byte_identity_and_node_parity() {
+        // A node Phase20ReceiptExt, attached (as hex) to a pool pending receipt.
+        let claim = |role: u8| irium_node_rs::poawx::PoawxRoleClaim {
+            role_id: role,
+            lane_id: irium_node_rs::poawx::LANE_CPU_FRIENDLY,
+            solver_pkh: [role; 20],
+            nonce: [1u8; 32],
+            secret: [2u8; 32],
+            claim_digest: [3u8; 32],
+            commitment_hash: None,
+        };
+        let node_ext = irium_node_rs::poawx::Phase20ReceiptExt {
+            role_reward: irium_node_rs::poawx::RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: claim(irium_node_rs::poawx::ROLE_COMPUTE_CONTRIBUTOR),
+            verify_claim: claim(irium_node_rs::poawx::ROLE_VERIFY_CONTRIBUTOR),
+            support_claim: claim(irium_node_rs::poawx::ROLE_SUPPORT_CONTRIBUTOR),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+        };
+        let worker_pkh = [0xabu8; 20];
+        let sol = [0x01u8; 8];
+        let nonce = [0xcdu8; 32];
+        let mut r = mkr(7, "cpu", &hex::encode(worker_pkh), &hex::encode(sol), &hex::encode(nonce));
+        r.phase20_ext = hex::encode(node_ext.serialize());
+
+        // Gate OFF: wrapper == gated(false); the extension is ignored.
+        assert_eq!(
+            compute_receipts_root_from_pending_gated(std::slice::from_ref(&r), false),
+            compute_receipts_root_from_pending(std::slice::from_ref(&r)),
+            "gate off must equal legacy wrapper"
+        );
+        // Gate ON: differs and is deterministic.
+        let pool_on = compute_receipts_root_from_pending_gated(std::slice::from_ref(&r), true);
+        assert_ne!(
+            pool_on,
+            compute_receipts_root_from_pending(std::slice::from_ref(&r)),
+            "gate on must change the root"
+        );
+        // Node parity: pool gated-on root == node gated-on root for the same receipt.
+        let block_rec = irium_node_rs::poawx::PoawxBlockReceipt {
+            height: 7,
+            lane: b'c',
+            worker_pkh,
+            worker_pubkey: [0u8; 33],
+            worker_sig: [0u8; 64],
+            solution: sol,
+            commitment_nonce: nonce,
+            delegation: None,
+            phase20_ext: Some(node_ext),
+        };
+        let node_on = irium_node_rs::poawx::irx1_root_from_block_receipts_gated(
+            std::slice::from_ref(&block_rec),
+            true,
+        );
+        assert_eq!(pool_on, node_on, "pool gated root must equal node gated root");
     }
 }
 

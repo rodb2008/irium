@@ -693,6 +693,10 @@ pub fn build_mode1_pending_receipt(
         worker_pubkey: key.pubkey_hex(),
         worker_sig: hex::encode(signer_sig),
         delegation: rec.delegation_hex.clone(),
+        // Phase 20: base mode-1 receipt carries no extension here; the pool's
+        // production path (stratum) attaches a synthetic Phase20ReceiptExt after
+        // activation. Empty => legacy/pre-activation (byte-identical submit JSON).
+        phase20_ext: String::new(),
     };
     if trace {
         info!(
@@ -716,6 +720,314 @@ pub async fn fetch_assignment(
         return None;
     }
     resp.json::<crate::template::PoawxAssignment>().await.ok()
+}
+
+// ── Phase 20: production primitives (testnet/devnet mirror of node consensus) ─
+//
+// STRATUM-LOCAL mirror of the Phase 20 consensus primitives in
+// `irium_node_rs::poawx` (multi-role reward split + fairness role claims +
+// production receipt extension). Mirrored byte-for-byte; the parity tests below
+// assert equality against the dev-dep node lib so any drift fails. Production
+// here is OFFICIAL fee-0 only (fee_bps=0 / fee_pkh=0). Mainnet is hard-off.
+// The role-claim *source* used by pool production is the gated SYNTHETIC builder
+// (testnet/devnet-only, for production-wiring validation) — NOT a live
+// hidden-precommit protocol (which remains pending; see design-gap docs).
+
+pub const MULTI_ROLE_PRIMARY_BPS: u64 = 5500;
+pub const MULTI_ROLE_COMPUTE_BPS: u64 = 2200;
+pub const MULTI_ROLE_VERIFY_BPS: u64 = 1300;
+pub const MULTI_ROLE_SUPPORT_BPS: u64 = 1000;
+
+pub const ROLE_COMPUTE_CONTRIBUTOR: u8 = 1;
+pub const ROLE_VERIFY_CONTRIBUTOR: u8 = 2;
+pub const ROLE_SUPPORT_CONTRIBUTOR: u8 = 3;
+
+pub const LANE_CPU_FRIENDLY: u8 = 0;
+pub const LANE_GPU_PARALLEL: u8 = 1;
+pub const LANE_ASIC_STREAMING: u8 = 2;
+
+pub const FAIRNESS_DOMAIN_V1: &[u8] = b"IRIUM_POAWX_FAIRNESS_V1";
+pub const ROLE_CLAIM_DOMAIN_V1: &[u8] = b"IRIUM_POAWX_ROLE_CLAIM_V1";
+pub const FAIRNESS_CPU_UPPER: u32 = 3400;
+pub const FAIRNESS_GPU_UPPER: u32 = 6700;
+pub const PHASE20_EXT_VERSION: u8 = 1;
+
+/// Mirror of `irium_node_rs::poawx::multi_role_amounts`: split `total` into
+/// `[primary, compute, verify, support]` (floor; remainder → PRIMARY; exact sum).
+pub fn multi_role_amounts(total: u64) -> [u64; 4] {
+    let bps = |b: u64| -> u64 { ((total as u128 * b as u128) / 10_000u128) as u64 };
+    let compute = bps(MULTI_ROLE_COMPUTE_BPS);
+    let verify = bps(MULTI_ROLE_VERIFY_BPS);
+    let support = bps(MULTI_ROLE_SUPPORT_BPS);
+    let primary_floor = bps(MULTI_ROLE_PRIMARY_BPS);
+    let remainder = total - primary_floor - compute - verify - support;
+    [primary_floor + remainder, compute, verify, support]
+}
+
+/// Mirror of `irium_node_rs::poawx::fairness_assignment_digest`.
+pub fn fairness_assignment_digest(
+    network_id: u8,
+    height: u64,
+    prev_hash: &[u8; 32],
+    role_id: u8,
+    slot_index: u32,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(FAIRNESS_DOMAIN_V1);
+    h.update([network_id]);
+    h.update(height.to_le_bytes());
+    h.update(prev_hash);
+    h.update([role_id]);
+    h.update(slot_index.to_le_bytes());
+    h.finalize().into()
+}
+
+/// Mirror of `irium_node_rs::poawx::assign_lane` returning the lane *id* byte
+/// (production lanes only; never the dev/test fallback).
+pub fn assign_lane_id(
+    network_id: u8,
+    height: u64,
+    prev_hash: &[u8; 32],
+    role_id: u8,
+    slot_index: u32,
+) -> u8 {
+    let d = fairness_assignment_digest(network_id, height, prev_hash, role_id, slot_index);
+    let v = (u64::from_le_bytes(d[0..8].try_into().expect("len 8")) % 10_000) as u32;
+    if v < FAIRNESS_CPU_UPPER {
+        LANE_CPU_FRIENDLY
+    } else if v < FAIRNESS_GPU_UPPER {
+        LANE_GPU_PARALLEL
+    } else {
+        LANE_ASIC_STREAMING
+    }
+}
+
+/// Mirror of `irium_node_rs::poawx::role_claim_digest`.
+#[allow(clippy::too_many_arguments)]
+pub fn role_claim_digest(
+    network_id: u8,
+    height: u64,
+    prev_hash: &[u8; 32],
+    role_id: u8,
+    lane_id: u8,
+    solver_pkh: &[u8; 20],
+    nonce: &[u8; 32],
+    secret: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(ROLE_CLAIM_DOMAIN_V1);
+    h.update([network_id]);
+    h.update(height.to_le_bytes());
+    h.update(prev_hash);
+    h.update([role_id]);
+    h.update([lane_id]);
+    h.update(solver_pkh);
+    h.update(nonce);
+    h.update(secret);
+    h.finalize().into()
+}
+
+/// Mirror of `irium_node_rs::poawx::RoleReward` (60-byte wire).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleRewardMirror {
+    pub compute_contributor_pkh: [u8; 20],
+    pub verify_contributor_pkh: [u8; 20],
+    pub support_contributor_pkh: [u8; 20],
+}
+
+impl RoleRewardMirror {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(60);
+        out.extend_from_slice(&self.compute_contributor_pkh);
+        out.extend_from_slice(&self.verify_contributor_pkh);
+        out.extend_from_slice(&self.support_contributor_pkh);
+        out
+    }
+}
+
+/// Mirror of `irium_node_rs::poawx::PoawxRoleClaim`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoawxRoleClaimMirror {
+    pub role_id: u8,
+    pub lane_id: u8,
+    pub solver_pkh: [u8; 20],
+    pub nonce: [u8; 32],
+    pub secret: [u8; 32],
+    pub claim_digest: [u8; 32],
+    pub commitment_hash: Option<[u8; 32]>,
+}
+
+impl PoawxRoleClaimMirror {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(118 + 1 + 32);
+        out.push(self.role_id);
+        out.push(self.lane_id);
+        out.extend_from_slice(&self.solver_pkh);
+        out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&self.secret);
+        out.extend_from_slice(&self.claim_digest);
+        match &self.commitment_hash {
+            Some(c) => {
+                out.push(1);
+                out.extend_from_slice(c);
+            }
+            None => out.push(0),
+        }
+        out
+    }
+}
+
+/// Mirror of `irium_node_rs::poawx::Phase20ReceiptExt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Phase20ReceiptExtMirror {
+    pub role_reward: RoleRewardMirror,
+    pub compute_claim: PoawxRoleClaimMirror,
+    pub verify_claim: PoawxRoleClaimMirror,
+    pub support_claim: PoawxRoleClaimMirror,
+    pub fee_bps: u16,
+    pub fee_pkh: [u8; 20],
+}
+
+impl Phase20ReceiptExtMirror {
+    /// Wire: version(1) || role_reward(60) || (len_u16 || claim)×3 || fee_bps(2) || fee_pkh(20).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(PHASE20_EXT_VERSION);
+        out.extend_from_slice(&self.role_reward.serialize());
+        for claim in [&self.compute_claim, &self.verify_claim, &self.support_claim] {
+            let b = claim.serialize();
+            out.extend_from_slice(&(b.len() as u16).to_le_bytes());
+            out.extend_from_slice(&b);
+        }
+        out.extend_from_slice(&self.fee_bps.to_le_bytes());
+        out.extend_from_slice(&self.fee_pkh);
+        out
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(self.serialize());
+        h.finalize().into()
+    }
+}
+
+/// Parse an env activation height (`>= h`), mainnet-off handled by the caller.
+fn activation_height_reached(var: &str, height: u64) -> bool {
+    match env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(h) => height >= h,
+        None => false,
+    }
+}
+
+/// Mirror of `irium_node_rs::chain::phase20_production_active`: both multi-role
+/// reward AND fairness matrix active for `height`. **Mainnet hard-off**
+/// (`network_id_from_env() == 0`). Used to gate pool production + the gated root.
+pub fn phase20_production_active(height: u64) -> bool {
+    if network_id_from_env() == 0 {
+        return false; // mainnet
+    }
+    activation_height_reached("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", height)
+        && activation_height_reached("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", height)
+}
+
+/// Whether the gated SYNTHETIC role-claim builder is enabled. Testnet/devnet-only
+/// (`IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1`), mainnet hard-off, disabled by default.
+/// This is for production-wiring validation; it is NOT the live hidden-precommit
+/// role-claim protocol (pending).
+pub fn synthetic_role_claims_enabled() -> bool {
+    if network_id_from_env() == 0 {
+        return false; // mainnet
+    }
+    env::var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Deterministic per-(role) 32-byte field for reproducible synthetic claims.
+fn synth_field(tag: &[u8], network_id: u8, height: u64, prev_hash: &[u8; 32], role_id: u8) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"IRIUM_POAWX_SYNTHETIC_V1");
+    h.update(tag);
+    h.update([network_id]);
+    h.update(height.to_le_bytes());
+    h.update(prev_hash);
+    h.update([role_id]);
+    h.finalize().into()
+}
+
+/// Build a synthetic OFFICIAL (fee-0) `Phase20ReceiptExtMirror` for pool
+/// production on testnet/devnet. For each role: deterministic nonce/secret, the
+/// assigned lane via `assign_lane_id`, a verifying `role_claim_digest`, and a
+/// solver pkh chosen deterministically from `workers` (if any) else `primary_pkh`
+/// (the MVP single-miner case). `RoleReward` mirrors the validated solver pkhs.
+/// Returns None on mainnet or when synthetic claims are disabled (never fakes).
+pub fn build_synthetic_phase20_ext(
+    network_id: u8,
+    height: u64,
+    prev_hash: &[u8; 32],
+    primary_pkh: &[u8; 20],
+    workers: &[[u8; 20]],
+) -> Option<Phase20ReceiptExtMirror> {
+    if network_id == 0 || !synthetic_role_claims_enabled() {
+        return None;
+    }
+    let mk = |role_id: u8, idx: usize| -> PoawxRoleClaimMirror {
+        let lane_id = assign_lane_id(network_id, height, prev_hash, role_id, 0);
+        let nonce = synth_field(b"nonce", network_id, height, prev_hash, role_id);
+        let secret = synth_field(b"secret", network_id, height, prev_hash, role_id);
+        let solver = if workers.is_empty() {
+            *primary_pkh
+        } else {
+            workers[idx % workers.len()]
+        };
+        let claim_digest = role_claim_digest(
+            network_id, height, prev_hash, role_id, lane_id, &solver, &nonce, &secret,
+        );
+        PoawxRoleClaimMirror {
+            role_id,
+            lane_id,
+            solver_pkh: solver,
+            nonce,
+            secret,
+            claim_digest,
+            commitment_hash: None,
+        }
+    };
+    let compute_claim = mk(ROLE_COMPUTE_CONTRIBUTOR, 0);
+    let verify_claim = mk(ROLE_VERIFY_CONTRIBUTOR, 1);
+    let support_claim = mk(ROLE_SUPPORT_CONTRIBUTOR, 2);
+    Some(Phase20ReceiptExtMirror {
+        role_reward: RoleRewardMirror {
+            compute_contributor_pkh: compute_claim.solver_pkh,
+            verify_contributor_pkh: verify_claim.solver_pkh,
+            support_contributor_pkh: support_claim.solver_pkh,
+        },
+        compute_claim,
+        verify_claim,
+        support_claim,
+        fee_bps: 0,
+        fee_pkh: [0u8; 20],
+    })
+}
+
+/// Extract the three RoleReward pkhs from a hex-encoded `Phase20ReceiptExt`
+/// (`version(1) || role_reward(60) || …`). Used by the coinbase builder without
+/// a full deserialize. Returns None on malformed/short input (fail-closed).
+pub fn role_reward_pkhs_from_ext_hex(ext_hex: &str) -> Option<([u8; 20], [u8; 20], [u8; 20])> {
+    let b = hex::decode(ext_hex).ok()?;
+    if b.len() < 1 + 60 || b[0] != PHASE20_EXT_VERSION {
+        return None;
+    }
+    let mut c = [0u8; 20];
+    let mut v = [0u8; 20];
+    let mut s = [0u8; 20];
+    c.copy_from_slice(&b[1..21]);
+    v.copy_from_slice(&b[21..41]);
+    s.copy_from_slice(&b[41..61]);
+    Some((c, v, s))
 }
 
 // ── HTTP server (raw-TCP, loopback-only by config; opt-in) ───────────────────
@@ -1040,6 +1352,15 @@ async fn handle_conn(mut stream: TcpStream, ctx: Arc<ServerCtx>) {
             .await
         }
     }
+}
+
+/// Shared process-wide lock for tests that mutate `IRIUM_NETWORK` / the Phase 20
+/// activation env vars (env is global). Exposed `pub(crate)` so the stratum test
+/// module can serialize against the same lock.
+#[cfg(test)]
+pub(crate) fn p20_env_lock() -> &'static std::sync::Mutex<()> {
+    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 #[cfg(test)]
@@ -1651,5 +1972,251 @@ mod tests {
         );
         // wrong network id (delegation stored for net 1; ask as net 2) -> None
         assert!(build_mode1_pending_receipt(&store, &key, 2, miner_pkh, "rig1", &ctx1).is_none());
+    }
+
+    // ── Phase 20 production primitives: parity, gate, synthetic builder ───────
+
+    #[test]
+    fn phase20_mirror_wire_parity_vs_node() {
+        // RoleReward 60-byte wire parity.
+        let rr = RoleRewardMirror {
+            compute_contributor_pkh: [0xC1u8; 20],
+            verify_contributor_pkh: [0xC2u8; 20],
+            support_contributor_pkh: [0xC3u8; 20],
+        };
+        let node_rr = irium_node_rs::poawx::RoleReward {
+            compute_contributor_pkh: [0xC1u8; 20],
+            verify_contributor_pkh: [0xC2u8; 20],
+            support_contributor_pkh: [0xC3u8; 20],
+        };
+        assert_eq!(rr.serialize(), node_rr.serialize(), "RoleReward wire parity");
+
+        // multi_role_amounts parity over a range incl. remainder cases.
+        for total in [0u64, 1, 7, 999, 5_000_000_000, 5_000_000_001, u64::MAX / 2] {
+            assert_eq!(
+                multi_role_amounts(total),
+                irium_node_rs::poawx::multi_role_amounts(total),
+                "multi_role_amounts parity total={total}"
+            );
+            // exact-sum invariant.
+            assert_eq!(multi_role_amounts(total).iter().sum::<u64>(), total);
+        }
+
+        // fairness digest / assign_lane / role_claim_digest parity.
+        let prev = [0x44u8; 32];
+        for role in [
+            ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_VERIFY_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR,
+        ] {
+            assert_eq!(
+                fairness_assignment_digest(1, 100, &prev, role, 0),
+                irium_node_rs::poawx::fairness_assignment_digest(1, 100, &prev, role, 0)
+            );
+            assert_eq!(
+                assign_lane_id(1, 100, &prev, role, 0),
+                irium_node_rs::poawx::assign_lane(1, 100, &prev, role, 0).id()
+            );
+            assert_eq!(
+                role_claim_digest(1, 100, &prev, role, 0, &[0x07u8; 20], &[1u8; 32], &[2u8; 32]),
+                irium_node_rs::poawx::role_claim_digest(
+                    1,
+                    100,
+                    &prev,
+                    role,
+                    0,
+                    &[0x07u8; 20],
+                    &[1u8; 32],
+                    &[2u8; 32]
+                )
+            );
+        }
+
+        // PoawxRoleClaim + Phase20ReceiptExt wire + digest parity.
+        let mk_pool = |role: u8| PoawxRoleClaimMirror {
+            role_id: role,
+            lane_id: LANE_GPU_PARALLEL,
+            solver_pkh: [role; 20],
+            nonce: [role; 32],
+            secret: [role.wrapping_add(1); 32],
+            claim_digest: [role.wrapping_add(2); 32],
+            commitment_hash: None,
+        };
+        let mk_node = |role: u8| irium_node_rs::poawx::PoawxRoleClaim {
+            role_id: role,
+            lane_id: LANE_GPU_PARALLEL,
+            solver_pkh: [role; 20],
+            nonce: [role; 32],
+            secret: [role.wrapping_add(1); 32],
+            claim_digest: [role.wrapping_add(2); 32],
+            commitment_hash: None,
+        };
+        assert_eq!(mk_pool(1).serialize(), mk_node(1).serialize(), "RoleClaim parity");
+        let ext = Phase20ReceiptExtMirror {
+            role_reward: rr,
+            compute_claim: mk_pool(1),
+            verify_claim: mk_pool(2),
+            support_claim: mk_pool(3),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+        };
+        let node_ext = irium_node_rs::poawx::Phase20ReceiptExt {
+            role_reward: node_rr,
+            compute_claim: mk_node(1),
+            verify_claim: mk_node(2),
+            support_claim: mk_node(3),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+        };
+        assert_eq!(ext.serialize(), node_ext.serialize(), "Phase20ReceiptExt wire parity");
+        assert_eq!(ext.digest(), node_ext.digest(), "ext digest parity");
+        // The node can deserialize the pool's bytes back to the identical type.
+        let round = irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
+        assert_eq!(round, node_ext);
+        // RoleReward pkhs extractable from the hex without full deserialize.
+        let (c, v, s) = role_reward_pkhs_from_ext_hex(&hex::encode(ext.serialize())).unwrap();
+        assert_eq!((c, v, s), ([0xC1u8; 20], [0xC2u8; 20], [0xC3u8; 20]));
+    }
+
+    #[test]
+    fn phase20_gate_mainnet_off_and_heights() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "5");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        assert!(!phase20_production_active(10), "needs fairness too");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "5");
+        assert!(!phase20_production_active(4), "below activation");
+        assert!(phase20_production_active(5), "both active at height");
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!phase20_production_active(10), "mainnet hard-off");
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+    }
+
+    #[test]
+    fn phase20_synthetic_disabled_or_mainnet_returns_none() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let prev = [0x44u8; 32];
+        // disabled by default on testnet (no fakes).
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
+        assert!(
+            build_synthetic_phase20_ext(1, 10, &prev, &[0x11u8; 20], &[]).is_none(),
+            "synthetic disabled by default"
+        );
+        // enabled flag but mainnet (network_id 0 passed) -> None.
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(
+            build_synthetic_phase20_ext(0, 10, &prev, &[0x11u8; 20], &[]).is_none(),
+            "mainnet hard-off"
+        );
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
+    }
+
+    #[test]
+    fn phase20_synthetic_builder_valid_and_node_validator_passes() {
+        let _g = p20_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+        let net = 1u8;
+        let height = 500u64;
+        let prev = [0x55u8; 32];
+        let primary = [0xA1u8; 20];
+        let total = 5_000_000_001u64;
+
+        let ext = build_synthetic_phase20_ext(net, height, &prev, &primary, &[]).expect("ext");
+        // three role claims, expected role ids, solver == primary (MVP single-miner).
+        assert_eq!(ext.compute_claim.role_id, ROLE_COMPUTE_CONTRIBUTOR);
+        assert_eq!(ext.verify_claim.role_id, ROLE_VERIFY_CONTRIBUTOR);
+        assert_eq!(ext.support_claim.role_id, ROLE_SUPPORT_CONTRIBUTOR);
+        assert_eq!(ext.role_reward.compute_contributor_pkh, ext.compute_claim.solver_pkh);
+        assert_eq!(ext.role_reward.verify_contributor_pkh, ext.verify_claim.solver_pkh);
+        assert_eq!(ext.role_reward.support_contributor_pkh, ext.support_claim.solver_pkh);
+        assert_eq!(ext.fee_bps, 0, "official fee-0 only");
+        assert_eq!(ext.fee_pkh, [0u8; 20]);
+        // deterministic / reproducible.
+        let ext2 = build_synthetic_phase20_ext(net, height, &prev, &primary, &[]).unwrap();
+        assert_eq!(ext.serialize(), ext2.serialize(), "synthetic builder is deterministic");
+
+        // each claim validates via the node consensus primitive.
+        let node_ext =
+            irium_node_rs::poawx::Phase20ReceiptExt::deserialize(&ext.serialize()).unwrap();
+        for c in [
+            &node_ext.compute_claim,
+            &node_ext.verify_claim,
+            &node_ext.support_claim,
+        ] {
+            irium_node_rs::poawx::validate_role_claim(c, net, height, &prev, 0)
+                .expect("synthetic role claim must validate");
+        }
+
+        // Build the canonical pool coinbase outputs and assert the AUTHORITATIVE
+        // node validators accept them (item 8). p2pkh = 76 a9 14 <20> 88 ac.
+        let amts = multi_role_amounts(total);
+        let p2pkh = |pkh: &[u8; 20]| -> Vec<u8> {
+            let mut s = vec![0x76u8, 0xa9, 0x14];
+            s.extend_from_slice(pkh);
+            s.extend_from_slice(&[0x88, 0xac]);
+            s
+        };
+        let irx1 = irium_node_rs::tx::TxOutput {
+            value: 0,
+            script_pubkey: vec![0x6a, 0x24, b'i', b'r', b'x', b'1'],
+        };
+        let outs = vec![
+            irx1,
+            irium_node_rs::tx::TxOutput { value: amts[0], script_pubkey: p2pkh(&primary) },
+            irium_node_rs::tx::TxOutput {
+                value: amts[1],
+                script_pubkey: p2pkh(&node_ext.role_reward.compute_contributor_pkh),
+            },
+            irium_node_rs::tx::TxOutput {
+                value: amts[2],
+                script_pubkey: p2pkh(&node_ext.role_reward.verify_contributor_pkh),
+            },
+            irium_node_rs::tx::TxOutput {
+                value: amts[3],
+                script_pubkey: p2pkh(&node_ext.role_reward.support_contributor_pkh),
+            },
+        ];
+        irium_node_rs::chain::validate_phase20_production_payout(
+            &outs, &primary, total, height, &prev, net, &node_ext, false,
+        )
+        .expect("node validator must accept the pool-produced fixture");
+        irium_node_rs::chain::validate_poawx_coinbase_payout(
+            &outs,
+            &primary,
+            total,
+            Some(&node_ext.role_reward),
+            None,
+        )
+        .expect("node coinbase payout must accept the pool-produced fixture");
+
+        // Tamper cases rejected by the node validator.
+        let mut bad = outs.clone();
+        bad[1].value += 1;
+        assert!(irium_node_rs::chain::validate_phase20_production_payout(
+            &bad, &primary, total, height, &prev, net, &node_ext, false
+        )
+        .is_err(), "wrong amount must reject");
+        let mut bad = outs.clone();
+        bad.swap(1, 2);
+        assert!(irium_node_rs::chain::validate_phase20_production_payout(
+            &bad, &primary, total, height, &prev, net, &node_ext, false
+        )
+        .is_err(), "wrong order must reject");
+        let mut bad = outs.clone();
+        bad.push(irium_node_rs::tx::TxOutput { value: 1, script_pubkey: p2pkh(&[0x9Au8; 20]) });
+        assert!(irium_node_rs::chain::validate_phase20_production_payout(
+            &bad, &primary, total, height, &prev, net, &node_ext, false
+        )
+        .is_err(), "hidden extra output must reject");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
     }
 }

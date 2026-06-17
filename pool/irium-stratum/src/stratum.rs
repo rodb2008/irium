@@ -1,6 +1,7 @@
 use crate::block::{
     build_coinbase_tx, build_irx1_commitment_script, build_merkle_branches, coinbase_prefix_suffix,
-    compute_receipts_root_from_pending, header_bytes, merkle_root_from_coinbase,
+    compute_receipts_root_from_pending, compute_receipts_root_from_pending_gated, header_bytes,
+    merkle_root_from_coinbase,
     parse_address_to_pkh, parse_hex32, parse_u32_hex,
 };
 use crate::pow::{hash_meets_target, sha256d, target_from_bits, target_from_difficulty_with_limit};
@@ -1447,14 +1448,50 @@ fn build_session_poawx_receipts(
         &worker,
         &ctx,
     ) {
-        Some(receipt) => {
+        Some(mut receipt) => {
+            // Phase 20 (Step 3): after production activation, attach a synthetic
+            // OFFICIAL fee-0 Phase20ReceiptExt so the pool can build the canonical
+            // multi-role coinbase + gated root. Gated by phase20_production_active
+            // AND IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1 (testnet/devnet, mainnet-off).
+            // If production is active but synthetic claims are disabled, NO ext is
+            // attached — the pool does not fake claims; the node then fails closed
+            // on the missing extension (no invalid block is produced).
+            if crate::delegation::phase20_production_active(ctx.block_height) {
+                match crate::delegation::build_synthetic_phase20_ext(
+                    producer.network_id,
+                    ctx.block_height,
+                    &job.prev_hash,
+                    pkh,
+                    &[],
+                ) {
+                    Some(ext) => {
+                        receipt.phase20_ext = hex::encode(ext.serialize());
+                        if trace {
+                            info!(
+                                "[poawx-trace] phase20 synthetic ext attached block_h={} (official fee-0)",
+                                ctx.block_height
+                            );
+                        }
+                    }
+                    None => {
+                        if trace {
+                            info!(
+                                "[poawx-trace] phase20 production active but synthetic claims disabled block_h={}; no ext attached (node will fail closed)",
+                                ctx.block_height
+                            );
+                        }
+                    }
+                }
+            }
             if trace {
-                let root = crate::block::compute_receipts_root_from_pending(std::slice::from_ref(
-                    &receipt,
-                ));
+                let root = crate::block::compute_receipts_root_from_pending_gated(
+                    std::slice::from_ref(&receipt),
+                    crate::delegation::phase20_production_active(ctx.block_height),
+                );
                 info!(
-                    "[poawx-trace] session_receipts BUILT count=1 delegation_present={} root={} job_h={}",
+                    "[poawx-trace] session_receipts BUILT count=1 delegation_present={} phase20_ext_present={} root={} job_h={}",
                     !receipt.delegation.is_empty(),
+                    !receipt.phase20_ext.is_empty(),
                     hex::encode(&root[..4]),
                     job.height
                 );
@@ -1640,6 +1677,49 @@ fn build_native_rewardable_coinbase(
     tx.push(script_sig.len() as u8);
     tx.extend_from_slice(&script_sig);
     tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+
+    // Phase 20 (Step 3): after production activation, when the receipt carries a
+    // Phase20ReceiptExt, build the CANONICAL multi-role coinbase (OFFICIAL fee-0):
+    // outputs = irx1 OP_RETURN, then PRIMARY/COMPUTE/VERIFY/SUPPORT p2pkh in fixed
+    // order with the 55/22/13/10 split (remainder → PRIMARY). The irx1 root is the
+    // GATED root (binds the extension digest) so it matches connect_block /
+    // submit_block_extended. No fee output, no delegate output. Mainnet hard-off.
+    // Duplicate pkhs (MVP single-miner: all role pkhs == primary) stay separate.
+    let phase20_multi_role = crate::delegation::phase20_production_active(snapshot.height)
+        && snapshot
+            .poawx_pending_receipts
+            .first()
+            .map(|r| !r.phase20_ext.is_empty())
+            .unwrap_or(false);
+    if phase20_multi_role {
+        let first = &snapshot.poawx_pending_receipts[0];
+        let (compute_pkh, verify_pkh, support_pkh) =
+            crate::delegation::role_reward_pkhs_from_ext_hex(&first.phase20_ext)
+                .ok_or_else(|| anyhow!("phase20 coinbase: malformed phase20_ext"))?;
+        let amts = crate::delegation::multi_role_amounts(snapshot.coinbase_value);
+        let root = compute_receipts_root_from_pending_gated(&snapshot.poawx_pending_receipts, true);
+        let irx1_script = build_irx1_commitment_script(&root);
+        let role_outs: [(u64, Vec<u8>); 4] = [
+            (amts[0], snapshot.payout_script.clone()),
+            (amts[1], payout_script_from_pkh(&compute_pkh)),
+            (amts[2], payout_script_from_pkh(&verify_pkh)),
+            (amts[3], payout_script_from_pkh(&support_pkh)),
+        ];
+        tx.push(5); // irx1 + 4 role outputs
+        // irx1 OP_RETURN (zero value) first.
+        tx.extend_from_slice(&0u64.to_le_bytes());
+        tx.push(irx1_script.len() as u8);
+        tx.extend_from_slice(&irx1_script);
+        // PRIMARY, COMPUTE, VERIFY, SUPPORT in fixed canonical order.
+        for (value, script) in role_outs.iter() {
+            tx.extend_from_slice(&value.to_le_bytes());
+            tx.push(script.len() as u8);
+            tx.extend_from_slice(script);
+        }
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        return Ok(tx);
+    }
+
     // PoAW-X: when the snapshot carries pending receipts (PoAW-X testnet/devnet),
     // commit the irx1 receipts-root via a zero-value OP_RETURN output, byte-
     // identical to the coinbase_prefix_suffix/to_job layout that send_notify
@@ -3038,8 +3118,12 @@ fn build_submit_variant(
     req: SubmitRequest,
 ) -> SubmitVariant {
     if config.poawx_enabled && !snapshot.poawx_pending_receipts.is_empty() {
-        let receipts_root = hex::encode(compute_receipts_root_from_pending(
+        // Phase 20: use the gated root so an ext-bearing production block commits
+        // the same root the node recomputes; pre-activation this equals the legacy
+        // root (no extension to bind).
+        let receipts_root = hex::encode(compute_receipts_root_from_pending_gated(
             &snapshot.poawx_pending_receipts,
+            crate::delegation::phase20_production_active(snapshot.height),
         ));
         SubmitVariant::Extended(SubmitBlockExtendedRequest {
             height: req.height,
@@ -4050,8 +4134,13 @@ async fn handle_submit_legacy_rewardable(
         mark_block_submit_attempt();
         // Phase 10-D: use submit_block_extended when PoAW-X receipts present.
         let resp = if config.poawx_enabled && !job.poawx_pending_receipts.is_empty() {
-            let receipts_root = hex::encode(compute_receipts_root_from_pending(
+            // Phase 20: gated root (matches the node). Pre-activation / no extension
+            // this equals the legacy root; if production is active but these job
+            // receipts carry no extension, the node fails closed on the missing
+            // extension rather than on a root mismatch.
+            let receipts_root = hex::encode(compute_receipts_root_from_pending_gated(
                 &job.poawx_pending_receipts,
+                crate::delegation::phase20_production_active(job.height),
             ));
             let ext_req = SubmitBlockExtendedRequest {
                 height: req.height,
@@ -4619,6 +4708,7 @@ mod tests {
             worker_pubkey: format!("02{}", "ef".repeat(32)),
             worker_sig: "11".repeat(64),
             delegation: String::new(),
+            phase20_ext: String::new(),
         }
     }
 
@@ -4643,6 +4733,7 @@ mod tests {
             worker_pubkey: hex::encode(delegate_pubkey),
             worker_sig: "11".repeat(64),
             delegation: hex::encode(&deleg_blob),
+            phase20_ext: String::new(),
         };
         snapshot.poawx_pending_receipts = vec![receipt];
         let extranonce2 = vec![0u8; snapshot.extranonce2_size];
@@ -4678,6 +4769,157 @@ mod tests {
         );
     }
 
+    // Parse coinbase tx output list (value, script). Assumes single-byte script
+    // varints (true for p2pkh=25 and irx1=38). Used by the Phase 20 coinbase tests.
+    fn parse_coinbase_outputs(tx: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        let mut o = 4usize; // version
+        assert_eq!(tx[o], 1, "single coinbase input");
+        // input prefix: in_count(1) + 0x20 marker(1) + prev_txid(32) + prev_index(4),
+        // matching build_native_rewardable_coinbase's byte layout.
+        o += 1 + 1 + 32 + 4;
+        let ss_len = tx[o] as usize;
+        o += 1 + ss_len; // scriptsig_len + scriptsig
+        o += 4; // sequence
+        let out_count = tx[o] as usize;
+        o += 1;
+        let mut outs = Vec::with_capacity(out_count);
+        for _ in 0..out_count {
+            let val = u64::from_le_bytes(tx[o..o + 8].try_into().unwrap());
+            o += 8;
+            let slen = tx[o] as usize;
+            o += 1;
+            outs.push((val, tx[o..o + slen].to_vec()));
+            o += slen;
+        }
+        outs
+    }
+
+    #[test]
+    fn phase20_native_coinbase_canonical_multi_role_official() {
+        let _g = crate::delegation::p20_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS", "1");
+
+        let config = test_config(MinerFamilyMode::Asic);
+        let session = test_session(AdapterKind::NativeRewardableReserved);
+        let job = native_test_job();
+        let mut snapshot = build_canonical_job_snapshot(&job, &session, &config).unwrap();
+        let primary = session.pkh.unwrap();
+
+        // Attach a synthetic OFFICIAL (fee-0) Phase 20 extension to a receipt
+        // (the synthetic builder is the production role-claim source on testnet).
+        let ext = crate::delegation::build_synthetic_phase20_ext(
+            1,
+            snapshot.height,
+            &job.prev_hash,
+            &primary,
+            &[],
+        )
+        .expect("synthetic ext");
+        let receipt = PoawxPendingReceipt {
+            height: snapshot.height,
+            lane: "cpu".to_string(),
+            worker_pkh: hex::encode(primary),
+            solution: "0011223344556677".to_string(),
+            commitment_nonce: "cd".repeat(32),
+            worker_pubkey: String::new(),
+            worker_sig: String::new(),
+            delegation: String::new(),
+            phase20_ext: hex::encode(ext.serialize()),
+        };
+        snapshot.poawx_pending_receipts = vec![receipt.clone()];
+
+        let en2 = vec![0u8; snapshot.extranonce2_size];
+        let cb = build_native_rewardable_coinbase(&snapshot, &en2).unwrap();
+        let outs = parse_coinbase_outputs(&cb);
+
+        // 5 outputs: irx1 OP_RETURN + PRIMARY/COMPUTE/VERIFY/SUPPORT (no fee, no delegate).
+        assert_eq!(outs.len(), 5, "irx1 + 4 role outputs");
+        // irx1 first, zero value, gated root.
+        assert_eq!(outs[0].0, 0);
+        let expected_root = compute_receipts_root_from_pending_gated(&[receipt], true);
+        assert_eq!(outs[0].1, build_irx1_commitment_script(&expected_root), "gated irx1 root");
+        // canonical 55/22/13/10 amounts (remainder -> primary), exact sum.
+        let amts = crate::delegation::multi_role_amounts(snapshot.coinbase_value);
+        let p2pkh = |pkh: &[u8; 20]| payout_script_from_pkh(pkh);
+        assert_eq!(outs[1], (amts[0], p2pkh(&primary)), "PRIMARY 55%");
+        assert_eq!(
+            outs[2],
+            (amts[1], p2pkh(&ext.role_reward.compute_contributor_pkh)),
+            "COMPUTE 22%"
+        );
+        assert_eq!(
+            outs[3],
+            (amts[2], p2pkh(&ext.role_reward.verify_contributor_pkh)),
+            "VERIFY 13%"
+        );
+        assert_eq!(
+            outs[4],
+            (amts[3], p2pkh(&ext.role_reward.support_contributor_pkh)),
+            "SUPPORT 10%"
+        );
+        let paid: u64 = outs.iter().skip(1).map(|(v, _)| *v).sum();
+        assert_eq!(paid, snapshot.coinbase_value, "split sums to coinbase value");
+        // No fee output (official): every p2pkh is a role pkh; none is a fresh fee pkh.
+        // (In the MVP single-miner case all role pkhs == primary; still exactly 4.)
+        assert_eq!(outs.iter().filter(|(_, s)| s.len() == 25).count(), 4);
+
+        // notify split rebuilds the SAME bytes (18C invariant) incl. the multi-role coinbase.
+        let (cb1, cb2) = native_rewardable_notify_split(&snapshot).unwrap();
+        let mut rebuilt = cb1.clone();
+        rebuilt.extend_from_slice(&snapshot.extranonce1);
+        rebuilt.extend_from_slice(&[0x1c, 0xab, 0xad, 0x1d]);
+        rebuilt.extend_from_slice(&cb2);
+        let marker_cb =
+            build_native_rewardable_coinbase(&snapshot, &[0x1c, 0xab, 0xad, 0x1d]).unwrap();
+        assert_eq!(rebuilt, marker_cb, "notify split matches validation coinbase");
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
+    }
+
+    #[test]
+    fn phase20_preactivation_coinbase_is_legacy() {
+        let _g = crate::delegation::p20_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // No Phase 20 activation env -> production inactive -> legacy coinbase shape.
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS");
+
+        let config = test_config(MinerFamilyMode::Asic);
+        let session = test_session(AdapterKind::NativeRewardableReserved);
+        let mut snapshot =
+            build_canonical_job_snapshot(&native_test_job(), &session, &config).unwrap();
+        // A mode-1 receipt with NO phase20 extension (pre-activation).
+        let mut deleg = vec![0u8; 226];
+        deleg[0] = 1;
+        snapshot.poawx_pending_receipts = vec![PoawxPendingReceipt {
+            height: snapshot.height,
+            lane: "cpu".to_string(),
+            worker_pkh: hex::encode([0x11u8; 20]),
+            solution: "0011223344556677".to_string(),
+            commitment_nonce: "cd".repeat(32),
+            worker_pubkey: hex::encode([0x02u8; 33]),
+            worker_sig: "11".repeat(64),
+            delegation: hex::encode(&deleg),
+            phase20_ext: String::new(),
+        }];
+        let en2 = vec![0u8; snapshot.extranonce2_size];
+        let cb = build_native_rewardable_coinbase(&snapshot, &en2).unwrap();
+        let outs = parse_coinbase_outputs(&cb);
+        // legacy: single payout + irx1 (2 outputs), NOT the 5-output multi-role shape.
+        assert_eq!(outs.len(), 2, "pre-activation coinbase stays legacy");
+        assert_eq!(outs[0].0, snapshot.coinbase_value, "single full miner payout");
+    }
+
     #[test]
     fn phase18c_native_notify_split_matches_validation_coinbase_mode1() {
         let config = test_config(MinerFamilyMode::Asic);
@@ -4695,6 +4937,7 @@ mod tests {
             worker_pubkey: hex::encode([0x02u8; 33]),
             worker_sig: "11".repeat(64),
             delegation: hex::encode(&deleg),
+            phase20_ext: String::new(),
         }];
         let en2 = vec![0u8; snapshot.extranonce2_size];
         let validation_cb = build_native_rewardable_coinbase(&snapshot, &en2).unwrap();

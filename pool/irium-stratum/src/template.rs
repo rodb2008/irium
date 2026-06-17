@@ -61,6 +61,12 @@ pub struct PoawxPendingReceipt {
     /// keeps mode-0 submit JSON byte-identical.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub delegation: String,
+    /// Phase 20: hex of the canonical `Phase20ReceiptExt` for a production block
+    /// after activation. Empty => no extension (pre-activation / legacy), which
+    /// keeps the submit JSON byte-identical to Phase 18/19. Matches the node's
+    /// `PoawxPendingReceipt.phase20_ext` field so the node round-trips it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub phase20_ext: String,
 }
 
 /// Phase 18B: response of the node's `GET /poawx/assignment`. The pool uses this
