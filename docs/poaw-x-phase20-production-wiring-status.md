@@ -1,16 +1,55 @@
-# PoAW-X Phase 20 — Production Wiring Status (Steps 1 & 2 COMPLETE: extension threaded + consensus-enforced + root-committed; pool/wallet/E2E follow-up)
+# PoAW-X Phase 20 — Production Wiring Status (Steps 1–3 COMPLETE: extension threaded + consensus-enforced + root-committed + pool official-fee-0 production; wallet/third-party/E2E follow-up)
 
-**Status:** **PARTIAL** (advancing). The consensus validator + extension type are done; **Step 1**
-(threading `Phase20ReceiptExt` through node storage, persistence, P2P/block sync, and reorg) is
-COMPLETE; and **Step 2 — `connect_block` / `submit_block_extended` enforcement + receipts-root
-inclusion, gated by `phase20_production_active(height)` — is now COMPLETE and ENFORCED**. After
-activation (testnet/devnet only; mainnet hard-off) the extension is required, is bound into the
-receipts root, and the integrated production validator runs in `connect_block`. Before activation
-the Phase 18/19 path is byte/logically identical. Still remaining: pool canonical coinbase
-production, wallet third-party-fee CLI, pool registry fee relaxation, a synthetic role-claim
-builder, the hidden-precommit commitment root, and a live loopback E2E.
+**Status:** **PARTIAL** (advancing). **Step 1** (threading `Phase20ReceiptExt` through node storage,
+persistence, P2P/block sync, reorg) is COMPLETE; **Step 2** (`connect_block` /
+`submit_block_extended` enforcement + receipts-root inclusion, gated by
+`phase20_production_active(height)`) is COMPLETE and ENFORCED; **Step 3 — pool canonical multi-role
+coinbase production in OFFICIAL fee-0 mode — is now COMPLETE** (synthetic testnet/devnet role-claim
+source). After activation (testnet/devnet only; mainnet hard-off) the pool builds a valid
+`Phase20ReceiptExt` + the canonical 55/22/13/10 coinbase + the gated root the node enforces. Before
+activation the Phase 18/19 path is byte/logically identical. Still remaining: third-party fee block
+production, wallet third-party-fee CLI, pool registry fee relaxation, a live (non-synthetic)
+hidden-precommit role-claim protocol + commitment root, and a live loopback E2E.
 
-### Step 2 (this pass) — connect_block / submit_block_extended enforcement + receipts-root: COMPLETE
+### Step 3 (this pass) — pool canonical multi-role coinbase production (OFFICIAL fee-0): COMPLETE
+After all Phase 20 production gates are active on testnet/devnet (multi-role + fairness; mainnet
+hard-off), the stratum pool builds a valid `Phase20ReceiptExt`, the canonical multi-role coinbase,
+and the gated root that matches `connect_block` / `submit_block_extended`.
+- **Mirror primitives** (`pool/irium-stratum/src/delegation.rs`): byte-for-byte stratum-local
+  mirrors of the node consensus primitives — `multi_role_amounts`, `fairness_assignment_digest`,
+  `assign_lane_id`, `role_claim_digest`, and `RoleRewardMirror` / `PoawxRoleClaimMirror` /
+  `Phase20ReceiptExtMirror`. Parity tests assert equality vs the dev-dep node lib (any drift fails).
+- **Gate** `phase20_production_active(height)` (mainnet hard-off via `network_id_from_env()==0`;
+  requires both `IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT` and
+  `IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT`).
+- **Synthetic role-claim builder** `build_synthetic_phase20_ext(...)`, gated by
+  `IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1` (testnet/devnet-only, mainnet hard-off, disabled by
+  default). Deterministic per-role nonce/secret; assigned lane via `assign_lane_id`; a verifying
+  `role_claim_digest`; solver pkh from registered workers if supplied, else the primary miner pkh
+  (MVP single-miner). **This is local/testnet-only for production-wiring validation — NOT the live
+  hidden-precommit role-claim protocol, which remains pending. No hidden-precommit is claimed.**
+  If production is active but synthetic claims are disabled, the pool attaches NO extension — it does
+  not fake claims; the node then fails closed on the missing extension.
+- **Canonical coinbase** (`build_native_rewardable_coinbase`): after activation + an ext-bearing
+  receipt, emits `irx1 OP_RETURN` + PRIMARY/COMPUTE/VERIFY/SUPPORT p2pkh in fixed order with the
+  55/22/13/10 split (remainder → PRIMARY; exact sum), OFFICIAL fee-0 (no fee output, no delegate
+  output). Duplicate pkhs (MVP: all role pkhs == primary) stay separate. The irx1 root is the
+  GATED root. The mining.notify split rebuilds the same bytes (18C invariant preserved).
+- **Gated root** (`compute_receipts_root_from_pending_gated`) + the submit paths use it so the
+  pool-committed root equals the node's; pre-activation it equals the legacy root (byte-identical).
+- **Pre-activation unchanged:** legacy single-output (or mode-1) coinbase + legacy root; existing
+  native_rewardable / delegation behavior untouched (keyed on `phase20_ext` presence).
+- Node parity for the test: two pure node validators (`validate_phase20_production_payout`,
+  `validate_poawx_coinbase_payout`) were made `pub` so the pool dev-test asserts the AUTHORITATIVE
+  node validator accepts the pool-produced fixture.
+- Tests: pool `phase20_mirror_wire_parity_vs_node`, `phase20_gate_mainnet_off_and_heights`,
+  `phase20_synthetic_disabled_or_mainnet_returns_none`,
+  `phase20_synthetic_builder_valid_and_node_validator_passes` (delegation);
+  `phase20_gated_root_byte_identity_and_node_parity` (block);
+  `phase20_native_coinbase_canonical_multi_role_official` + `phase20_preactivation_coinbase_is_legacy`
+  (stratum). Pre-existing delegation/native_rewardable/wallet suites unchanged.
+
+### Step 2 — connect_block / submit_block_extended enforcement + receipts-root: COMPLETE
 - **Receipts-root inclusion (gated).** `irx1_root_from_block_receipts_gated(receipts, phase20_active)`
   (lib) and `compute_poawx_receipts_root_gated(receipts, phase20_active)` (iriumd) bind
   `Phase20ReceiptExt::digest()` into each receipt's inner hash **after** the optional mode-1
@@ -113,9 +152,10 @@ Each touches the validated Phase 18/19/19D code and is staged to avoid regressin
    runs in `connect_block` when `phase20_production_active(height)`; the extension is bound into the
    receipts root; missing extension after activation fails closed; pre-activation Phase 18/19 blocks
    remain valid (byte-identical). submit path uses the gated root + early missing-ext reject.
-3. **Pool production** — build the canonical multi-role (+ optional fee) coinbase in the
-   stratum native_rewardable path; assemble the extension from registered delegations / role
-   claims. **(Step 3 — NOT done.)**
+3. **Pool production** — ✅ **DONE (Step 3, OFFICIAL fee-0)**: the stratum native_rewardable path
+   builds the canonical multi-role coinbase + `Phase20ReceiptExt` + gated root after activation,
+   using the gated synthetic role-claim builder (testnet/devnet-only). Third-party-fee block
+   production is NOT done (Step 4).
 4. **Role-claim source** — real claims from miners, or a clearly-named testnet/devnet-only
    `IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1` synthetic builder (mainnet-impossible). Not added yet.
 5. **Wallet CLI** — `--third-party-pool` / `--fee-bps` / `--fee-pkh` on `poawx-register`/
@@ -125,14 +165,17 @@ Each touches the validated Phase 18/19/19D code and is staged to avoid regressin
 7. **Observer + loopback smoke** — two-node + isolated `$TROOT` E2E (operator-approved, loopback).
    **(Step 5 — NOT done; submit_block_extended live handler accept/reject is covered here.)**
 
-### Still NOT done after Step 2 (explicit)
-- pool canonical coinbase production (Step 3)
+### Still NOT done after Step 3 (explicit)
+- third-party-fee block production (Step 4) — pool builds OFFICIAL fee-0 only
 - wallet third-party-fee CLI (`--third-party-pool` / `--fee-bps` / `--fee-pkh`)
 - pool registry fee relaxation (`verify_and_store` still fail-closed on `fee_bps>0`)
-- synthetic role-claim builder
+- a LIVE (non-synthetic) role-claim protocol — Step 3 uses a gated testnet/devnet synthetic builder
 - hidden-precommit commitment root (fairness matrix remains PARTIAL — assignment uses `prev_hash`,
   known at block time; a prior-block commitment root is required for true hidden-before-reveal)
+- public/external miner test
 - live loopback / two-node E2E (Step 5)
+
+Mainnet remains disabled for all Phase 20 features; chain difficulty remains automatic via LWMA-144.
 
 ## Why staged (honest)
 The live integration is a multi-thousand-line change across `iriumd` (~25k lines), `chain.rs`,
