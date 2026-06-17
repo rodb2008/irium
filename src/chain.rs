@@ -1985,6 +1985,32 @@ pub fn fairness_matrix_active(height: u64) -> bool {
     }
 }
 
+/// Phase 20: whether the third-party pool fee is active for `height`. **Mainnet
+/// always false** (hard-off until explicit future governance activation).
+/// Testnet/devnet gate on `IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT`.
+pub fn third_party_fee_active(height: u64) -> bool {
+    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
+        return false;
+    }
+    match crate::activation::poawx_third_party_fee_activation_height() {
+        Some(h) => height >= h,
+        None => false,
+    }
+}
+
+/// Phase 20: whether explicit third-party pool mode is enabled
+/// (`IRIUM_POAWX_THIRD_PARTY_POOL_MODE=1`). **Mainnet always false.** This is the
+/// runtime opt-in required (in addition to the activation height) before any
+/// nonzero fee is permitted; official pools leave it unset (fee stays 0%).
+pub fn third_party_pool_mode_enabled() -> bool {
+    if crate::activation::network_kind_from_env() == crate::activation::NetworkKind::Mainnet {
+        return false;
+    }
+    std::env::var("IRIUM_POAWX_THIRD_PARTY_POOL_MODE")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
 /// Phase 20: parse a standard 25-byte P2PKH script `76 a9 14 <20> 88 ac` to its pkh.
 fn parse_p2pkh_pkh(script: &[u8]) -> Option<[u8; 20]> {
     if script.len() == 25
@@ -2065,6 +2091,98 @@ fn validate_multi_role_coinbase_outputs(
     if sum != total_reward {
         return Err(format!(
             "multi-role coinbase: split sum {} != total reward {}",
+            sum, total_reward
+        ));
+    }
+    Ok(())
+}
+
+/// Phase 20: comprehensive canonical PoAW-X coinbase payout validator (pure; no env).
+/// Handles all four canonical formats — official/third-party-fee × no-multi-role/multi-role:
+/// - `role = None`  => single PRIMARY/miner payout; `role = Some` => 4-role split.
+/// - `fee = None` (official) => no fee output allowed; `fee = Some((bps, fee_pkh))`
+///   (third-party) => when `bps > 0`, a fee output is appended LAST. The fee is taken
+///   ONLY from the PRIMARY allocation (`fee = floor(primary_gross * bps / 10000)`,
+///   miner keeps the remainder); compute/verify/support are never taxed.
+///
+/// Canonical P2PKH output order (zero-value `irx1` OP_RETURN allowed and ignored):
+///   PRIMARY(net) [, COMPUTE, VERIFY, SUPPORT if multi-role] [, FEE if bps>0].
+/// Rejects: wrong count/order/amount, value-bearing non-p2pkh (hidden fee), a fee
+/// output in official mode, and any over/underpay. Callers gate by activation/mode
+/// and verify `fee_pkh`/`fee_bps` against the signed delegation.
+fn validate_poawx_coinbase_payout(
+    outputs: &[crate::tx::TxOutput],
+    primary_pkh: &[u8; 20],
+    total_reward: u64,
+    role: Option<&crate::poawx::RoleReward>,
+    fee: Option<(u16, [u8; 20])>,
+) -> Result<(), String> {
+    // PRIMARY gross + the (untaxed) role outputs.
+    let (primary_gross, role_outs): (u64, Vec<([u8; 20], u64)>) = match role {
+        Some(r) => {
+            let a = crate::poawx::multi_role_amounts(total_reward);
+            (
+                a[0],
+                vec![
+                    (r.compute_contributor_pkh, a[1]),
+                    (r.verify_contributor_pkh, a[2]),
+                    (r.support_contributor_pkh, a[3]),
+                ],
+            )
+        }
+        None => (total_reward, Vec::new()),
+    };
+    // Fee from PRIMARY only.
+    let (primary_net, fee_out): (u64, Option<([u8; 20], u64)>) = match fee {
+        Some((bps, fpkh)) if bps > 0 => {
+            let (net, f) = crate::poawx::apply_fee(primary_gross, bps);
+            (net, Some((fpkh, f)))
+        }
+        _ => (primary_gross, None),
+    };
+    // Build expected outputs in canonical order.
+    let mut expected: Vec<([u8; 20], u64)> = Vec::with_capacity(6);
+    expected.push((*primary_pkh, primary_net));
+    expected.extend(role_outs);
+    if let Some(fo) = fee_out {
+        expected.push(fo);
+    }
+    // Collect actual p2pkh outputs; reject value-bearing non-p2pkh (hidden fee).
+    let mut p2pkh: Vec<([u8; 20], u64)> = Vec::new();
+    for out in outputs {
+        match parse_p2pkh_pkh(&out.script_pubkey) {
+            Some(pkh) => p2pkh.push((pkh, out.value)),
+            None => {
+                if out.value != 0 {
+                    return Err(
+                        "poawx coinbase: value-bearing non-p2pkh output (hidden fee?)".to_string(),
+                    );
+                }
+            }
+        }
+    }
+    if p2pkh.len() != expected.len() {
+        return Err(format!(
+            "poawx coinbase: expected {} payout outputs, found {}",
+            expected.len(),
+            p2pkh.len()
+        ));
+    }
+    for (i, (epkh, eval)) in expected.iter().enumerate() {
+        if &p2pkh[i].0 != epkh {
+            return Err(format!("poawx coinbase: output {} pkh/order mismatch", i));
+        }
+        if p2pkh[i].1 != *eval {
+            return Err(format!(
+                "poawx coinbase: output {} amount {} != expected {}",
+                i, p2pkh[i].1, eval
+            ));
+        }
+    }
+    let sum: u64 = expected.iter().map(|(_, v)| *v).sum();
+    if sum != total_reward {
+        return Err(format!(
+            "poawx coinbase: payout sum {} != total reward {}",
             sum, total_reward
         ));
     }
@@ -6762,6 +6880,168 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
         assert!(!fairness_matrix_active(100), "no activation height -> off");
         std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn phase20_third_party_fee_gate_mainnet_off_and_testnet() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // mainnet: hard-off (both gate + mode) even with env set.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        std::env::set_var("IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT", "3");
+        std::env::set_var("IRIUM_POAWX_THIRD_PARTY_POOL_MODE", "1");
+        assert!(!third_party_fee_active(10), "mainnet fee gate hard-off");
+        assert!(!third_party_pool_mode_enabled(), "mainnet mode hard-off");
+        // testnet: gated by height + explicit mode.
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        assert!(!third_party_fee_active(2), "below activation height");
+        assert!(third_party_fee_active(3), "at activation height");
+        assert!(third_party_pool_mode_enabled(), "explicit mode on");
+        std::env::remove_var("IRIUM_POAWX_THIRD_PARTY_POOL_MODE");
+        assert!(!third_party_pool_mode_enabled(), "mode off when unset");
+        std::env::remove_var("IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT");
+        assert!(!third_party_fee_active(100), "no activation height -> off");
+        std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn phase20_fee_aware_coinbase_payout() {
+        use crate::tx::{p2pkh_script, TxOutput};
+        let primary = [0xA1u8; 20];
+        let role = crate::poawx::RoleReward {
+            compute_contributor_pkh: [0xC0u8; 20],
+            verify_contributor_pkh: [0x7Eu8; 20],
+            support_contributor_pkh: [0x5Au8; 20],
+        };
+        let fee_pkh = [0xFEu8; 20];
+        let total = 5_000_000_001u64; // odd -> remainder
+        let p2 = |pkh: &[u8; 20], v: u64| TxOutput {
+            value: v,
+            script_pubkey: p2pkh_script(pkh),
+        };
+        let irx1 = || TxOutput {
+            value: 0,
+            script_pubkey: vec![0x6a, 0x24, b'i', b'r', b'x', b'1'],
+        };
+
+        // (a) official, no multi-role: single miner output == total.
+        assert!(validate_poawx_coinbase_payout(
+            &[irx1(), p2(&primary, total)],
+            &primary,
+            total,
+            None,
+            None
+        )
+        .is_ok());
+        // fee output in official mode (fee=None) rejects.
+        let (onet, ofee) = crate::poawx::apply_fee(total, 100);
+        assert!(validate_poawx_coinbase_payout(
+            &[p2(&primary, onet), p2(&fee_pkh, ofee)],
+            &primary,
+            total,
+            None,
+            None
+        )
+        .is_err());
+
+        // (b) third-party fee, no multi-role: [miner_net, fee].
+        let bps = crate::poawx::THIRD_PARTY_FEE_CAP_BPS; // 200 = 2%
+        let (net, fee) = crate::poawx::apply_fee(total, bps);
+        assert_eq!(net + fee, total);
+        assert!(validate_poawx_coinbase_payout(
+            &[irx1(), p2(&primary, net), p2(&fee_pkh, fee)],
+            &primary,
+            total,
+            None,
+            Some((bps, fee_pkh))
+        )
+        .is_ok());
+        // wrong fee amount rejects.
+        assert!(validate_poawx_coinbase_payout(
+            &[p2(&primary, net), p2(&fee_pkh, fee + 1)],
+            &primary,
+            total,
+            None,
+            Some((bps, fee_pkh))
+        )
+        .is_err());
+        // fee_pkh mismatch rejects.
+        assert!(validate_poawx_coinbase_payout(
+            &[p2(&primary, net), p2(&[0xBBu8; 20], fee)],
+            &primary,
+            total,
+            None,
+            Some((bps, fee_pkh))
+        )
+        .is_err());
+
+        // (c) multi-role + fee: fee from PRIMARY only; roles untouched.
+        let a = crate::poawx::multi_role_amounts(total);
+        let (pnet, pfee) = crate::poawx::apply_fee(a[0], bps);
+        assert!(validate_poawx_coinbase_payout(
+            &[
+                irx1(),
+                p2(&primary, pnet),
+                p2(&role.compute_contributor_pkh, a[1]),
+                p2(&role.verify_contributor_pkh, a[2]),
+                p2(&role.support_contributor_pkh, a[3]),
+                p2(&fee_pkh, pfee)
+            ],
+            &primary,
+            total,
+            Some(&role),
+            Some((bps, fee_pkh))
+        )
+        .is_ok());
+        // taxing a role (compute) instead of staying within primary rejects.
+        assert!(validate_poawx_coinbase_payout(
+            &[
+                p2(&primary, pnet),
+                p2(&role.compute_contributor_pkh, a[1] - 1),
+                p2(&role.verify_contributor_pkh, a[2]),
+                p2(&role.support_contributor_pkh, a[3]),
+                p2(&fee_pkh, pfee + 1)
+            ],
+            &primary,
+            total,
+            Some(&role),
+            Some((bps, fee_pkh))
+        )
+        .is_err());
+
+        // (d) multi-role official (no fee).
+        assert!(validate_poawx_coinbase_payout(
+            &[
+                p2(&primary, a[0]),
+                p2(&role.compute_contributor_pkh, a[1]),
+                p2(&role.verify_contributor_pkh, a[2]),
+                p2(&role.support_contributor_pkh, a[3])
+            ],
+            &primary,
+            total,
+            Some(&role),
+            None
+        )
+        .is_ok());
+
+        // (e) hidden value-bearing non-p2pkh output rejects.
+        assert!(validate_poawx_coinbase_payout(
+            &[
+                p2(&primary, net),
+                p2(&fee_pkh, fee),
+                TxOutput {
+                    value: 1,
+                    script_pubkey: vec![0x6a, 0x01, 0x00]
+                }
+            ],
+            &primary,
+            total,
+            None,
+            Some((bps, fee_pkh))
+        )
+        .unwrap_err()
+        .contains("hidden fee"));
     }
 
     #[test]
