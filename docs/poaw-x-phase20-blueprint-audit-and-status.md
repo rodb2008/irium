@@ -81,6 +81,13 @@ proven mode-1 pattern.
   and **mainnet activation safety framework** docs.
 - Helper scripts: pool-identity package printer, pilot-readiness checker, log PASS/FAIL
   scanner, firewall-command template printer (never executes).
+- **Consensus primitives + validators (gated, mainnet-off):** multi-role reward split,
+  CPU/GPU/ASIC fairness lane assignment + role-claim reveal, third-party fee (cap 2%), plus
+  the **integrated Phase 20 production validator** (`validate_phase20_production_payout`) and the
+  **`Phase20ReceiptExt`** wire/JSON type that ties role claims → RoleReward → canonical
+  fee-aware multi-role coinbase. **Production wiring status (PARTIAL):**
+  `poaw-x-phase20-production-wiring-status.md` — the consensus validator + extension are done;
+  live node/pool/wallet/persistence/reorg/P2P integration is the staged follow-up.
 
 Everything is local on the VPS; nothing pushed; no mainnet activation; chain difficulty stays
 LWMA-144 automatic.
