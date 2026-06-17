@@ -135,6 +135,53 @@ pub fn multi_role_amounts(total_reward: u64) -> [u64; 4] {
     [primary, compute, verify, support]
 }
 
+// ── Phase 20: third-party pool fee (testnet/devnet-gated) ────────────────────
+//
+// Official Irium pool fee remains 0% (fee_bps=0 default everywhere). A nonzero fee
+// is allowed ONLY in explicit third-party pool mode, capped at THIRD_PARTY_FEE_CAP_BPS
+// (200 bps = 2.00%), with a fee_pkh that is SIGNED into the miner delegation — the
+// 226-byte `Delegation` already binds `fee_bps` + `fee_pkh` in `message_hash()`, so
+// fee terms cannot be mutated after the miner signs. No hidden fee output. Mainnet is
+// hard-off (the `chain` gate returns false on mainnet). The fee is deducted ONLY from
+// the PRIMARY/miner allocation; compute/verify/support role rewards are never taxed.
+pub const THIRD_PARTY_FEE_CAP_BPS: u16 = 200;
+pub const THIRD_PARTY_FEE_DOMAIN_V1: &[u8] = b"IRIUM_POAWX_THIRD_PARTY_FEE_V1";
+
+/// Validate fee terms against the third-party policy (pure; no env). `fee_bps=0`
+/// is always allowed (official mode; requires no fee_pkh and no fee output).
+/// `fee_bps>0` requires explicit third-party mode, a non-zero `fee_pkh`, and
+/// `fee_bps <= THIRD_PARTY_FEE_CAP_BPS`.
+pub fn validate_fee_terms(
+    fee_bps: u16,
+    fee_pkh: &[u8; 20],
+    third_party_mode: bool,
+) -> Result<(), String> {
+    if fee_bps == 0 {
+        return Ok(());
+    }
+    if !third_party_mode {
+        return Err("fee_bps > 0 requires explicit third-party pool mode".to_string());
+    }
+    if fee_bps > THIRD_PARTY_FEE_CAP_BPS {
+        return Err(format!(
+            "fee_bps {} exceeds third-party cap {} (2.00%)",
+            fee_bps, THIRD_PARTY_FEE_CAP_BPS
+        ));
+    }
+    if fee_pkh == &[0u8; 20] {
+        return Err("fee_bps > 0 requires a fee_pkh".to_string());
+    }
+    Ok(())
+}
+
+/// Split a PRIMARY/miner gross allocation into `(net, fee)`:
+/// `fee = floor(gross * fee_bps / 10000)`, miner keeps the remainder; `net + fee == gross`.
+/// Only the PRIMARY allocation is fee-taxed (compute/verify/support untouched).
+pub fn apply_fee(gross: u64, fee_bps: u16) -> (u64, u64) {
+    let fee = ((gross as u128 * fee_bps as u128) / 10000u128) as u64;
+    (gross - fee, fee)
+}
+
 // ── Phase 20: CPU/GPU/ASIC fairness matrix (testnet/devnet-gated primitives) ──
 //
 // Hardware is NEVER detected or trusted. The chain does not ask "is this a
@@ -1215,6 +1262,78 @@ mod tests {
         assert!(
             validate_role_claim(&good, net, height, &prev, slot + 1).is_err()
                 || validate_role_claim(&good, net, height + 1, &prev, slot).is_err()
+        );
+    }
+
+    // ── Phase 20: third-party pool fee primitives ────────────────────────────
+
+    #[test]
+    fn phase20_validate_fee_terms() {
+        let fpkh = [0xFEu8; 20];
+        let zero = [0u8; 20];
+        // official: fee 0 ok in any mode, no fee_pkh required.
+        assert!(validate_fee_terms(0, &zero, false).is_ok());
+        assert!(validate_fee_terms(0, &zero, true).is_ok());
+        // fee>0 without third-party mode rejects.
+        assert!(validate_fee_terms(50, &fpkh, false)
+            .unwrap_err()
+            .contains("third-party"));
+        // fee>0 in third-party mode with pkh: 1 and the 200 cap accepted.
+        assert!(validate_fee_terms(1, &fpkh, true).is_ok());
+        assert!(validate_fee_terms(THIRD_PARTY_FEE_CAP_BPS, &fpkh, true).is_ok());
+        // over cap (201) rejects.
+        assert!(validate_fee_terms(201, &fpkh, true)
+            .unwrap_err()
+            .contains("cap"));
+        // fee>0 without fee_pkh rejects.
+        assert!(validate_fee_terms(100, &zero, true)
+            .unwrap_err()
+            .contains("fee_pkh"));
+    }
+
+    #[test]
+    fn phase20_apply_fee_floor_and_remainder() {
+        // floor + miner keeps remainder; net + fee == gross exactly.
+        let g = 5_000_000_001u64;
+        let (net, fee) = apply_fee(g, 200);
+        assert_eq!(fee, (g as u128 * 200 / 10000) as u64);
+        assert_eq!(net + fee, g);
+        // fee rounds down (1% of 101 = 1.01 -> 1; miner keeps 100).
+        assert_eq!(apply_fee(101, 100), (100, 1));
+        // fee 0 -> net == gross.
+        assert_eq!(apply_fee(123, 0), (123, 0));
+    }
+
+    #[test]
+    fn phase20_delegation_binds_fee_terms() {
+        // fee_bps + fee_pkh round-trip AND are covered by the signed message_hash,
+        // so the pool cannot mutate fee terms after the miner signs.
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        let sk = test_sk();
+        let mut d = make_signed_delegation(&sk, 150);
+        d.fee_pkh = [0xFEu8; 20];
+        let sig: k256::ecdsa::Signature = sk.sign_prehash(&d.message_hash()).unwrap();
+        d.delegation_sig.copy_from_slice(&sig.to_bytes());
+        assert!(d.verify_signature().is_ok());
+        // wire round-trip preserves fee terms.
+        let d2 = Delegation::deserialize(&d.serialize()).unwrap();
+        assert_eq!(d2.fee_bps, 150);
+        assert_eq!(d2.fee_pkh, [0xFEu8; 20]);
+        assert_eq!(d, d2);
+        // mutating fee_bps or fee_pkh changes message_hash AND breaks the signature.
+        let mut m_bps = d.clone();
+        m_bps.fee_bps = 151;
+        assert_ne!(d.message_hash(), m_bps.message_hash());
+        assert!(
+            m_bps.verify_signature().is_err(),
+            "fee_bps mutation must break the signature"
+        );
+        let mut m_pkh = d.clone();
+        m_pkh.fee_pkh = [0xABu8; 20];
+        assert_ne!(d.message_hash(), m_pkh.message_hash());
+        assert!(
+            m_pkh.verify_signature().is_err(),
+            "fee_pkh mutation must break the signature"
         );
     }
 

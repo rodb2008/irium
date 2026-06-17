@@ -273,6 +273,16 @@ pub fn poawx_fairness_matrix_activation_height() -> Option<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
 }
 
+/// Phase 20: activation height for the third-party pool fee. `None` => not active
+/// (official 0% only). Read from `IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT`.
+/// Testnet/devnet only — mainnet is hard-off (the `chain` gate returns false on
+/// mainnet) until an explicit future governance activation.
+pub fn poawx_third_party_fee_activation_height() -> Option<u64> {
+    env::var("IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 pub fn runtime_htlcv1_env_override() -> Option<u64> {
     env::var("IRIUM_HTLCV1_ACTIVATION_HEIGHT")
         .ok()
