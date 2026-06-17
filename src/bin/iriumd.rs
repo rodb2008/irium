@@ -13796,6 +13796,20 @@ fn pending_receipt_to_block_receipt(
 }
 
 fn compute_poawx_receipts_root(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
+    compute_poawx_receipts_root_gated(receipts, false)
+}
+
+/// Phase 20: gated variant matching `irx1_root_from_block_receipts_gated` in the
+/// node lib. When `phase20_active`, binds `SHA256(phase20_ext bytes)` into the
+/// inner hash (after the optional mode-1 delegation digest). Because the pending
+/// `phase20_ext` hex is exactly `Phase20ReceiptExt::serialize()`, this digest
+/// equals `Phase20ReceiptExt::digest()` used on the block-receipt side, so the
+/// submit-path root and the connect_block root agree. Inactive/absent =>
+/// byte-identical to the legacy root.
+fn compute_poawx_receipts_root_gated(
+    receipts: &[PoawxPendingReceipt],
+    phase20_active: bool,
+) -> [u8; 32] {
     let mut sorted: Vec<&PoawxPendingReceipt> = receipts.iter().collect();
     sorted.sort_unstable_by(|a, b| {
         a.height
@@ -13829,6 +13843,17 @@ fn compute_poawx_receipts_root(receipts: &[PoawxPendingReceipt]) -> [u8; 32] {
                 let mut dh = Sha256::new();
                 dh.update(&deleg_bytes);
                 let digest: [u8; 32] = dh.finalize().into();
+                inner.update(digest);
+            }
+        }
+        // Phase 20: bind the production-extension digest (gated) to match
+        // irx1_root_from_block_receipts_gated. The hex IS the serialized ext, so
+        // SHA256(bytes) == Phase20ReceiptExt::digest(). Inactive/empty => no-op.
+        if phase20_active && !r.phase20_ext.is_empty() {
+            if let Ok(ext_bytes) = hex::decode(&r.phase20_ext) {
+                let mut eh = Sha256::new();
+                eh.update(&ext_bytes);
+                let digest: [u8; 32] = eh.finalize().into();
                 inner.update(digest);
             }
         }
@@ -14418,10 +14443,24 @@ async fn submit_block_extended(
         );
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
+    // Phase 20: after production activation, the receipt extension is required and
+    // is bound into the receipts root. connect_block is the authoritative validator;
+    // this is an early, clear rejection for a missing extension on the submit path.
+    let sbe_phase20_active = irium_node_rs::chain::phase20_production_active(req.height);
+    if !req.poawx_receipts.is_empty()
+        && sbe_phase20_active
+        && req.poawx_receipts.iter().any(|r| r.phase20_ext.is_empty())
+    {
+        eprintln!(
+            "[submit_block_extended] reject: phase20 production active but a receipt is missing the extension at height={}",
+            req.height
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let expected_root = if req.poawx_receipts.is_empty() {
         [0u8; 32]
     } else {
-        compute_poawx_receipts_root(&req.poawx_receipts)
+        compute_poawx_receipts_root_gated(&req.poawx_receipts, sbe_phase20_active)
     };
     let submitted_root_bytes = if req.poawx_receipts_root.is_empty() {
         [0u8; 32]
@@ -28381,6 +28420,70 @@ mod tests {
             hex::encode(pending_root),
             hex::encode(block_root),
             "B-1: lane multi-byte string must hash as single canonical byte"
+        );
+    }
+
+    #[test]
+    fn phase20_gated_root_parity_pending_vs_block_and_byte_identity() {
+        use irium_node_rs::poawx::{
+            Phase20ReceiptExt, PoawxRoleClaim, RoleReward, ROLE_COMPUTE_CONTRIBUTOR,
+            ROLE_SUPPORT_CONTRIBUTOR, ROLE_VERIFY_CONTRIBUTOR,
+        };
+        let mk_claim = |role: u8| PoawxRoleClaim {
+            role_id: role,
+            lane_id: 0,
+            solver_pkh: [role; 20],
+            nonce: [1u8; 32],
+            secret: [2u8; 32],
+            claim_digest: [3u8; 32],
+            commitment_hash: None,
+        };
+        let ext = Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: mk_claim(ROLE_COMPUTE_CONTRIBUTOR),
+            verify_claim: mk_claim(ROLE_VERIFY_CONTRIBUTOR),
+            support_claim: mk_claim(ROLE_SUPPORT_CONTRIBUTOR),
+            fee_bps: 0,
+            fee_pkh: [0u8; 20],
+        };
+        let pubk = "02".to_string() + &"cd".repeat(32);
+        let r = PoawxPendingReceipt {
+            height: 1,
+            lane: "cpu".to_string(),
+            worker_pkh: "ab".repeat(20),
+            worker_pubkey: pubk,
+            worker_sig: "ee".repeat(64),
+            delegation: String::new(),
+            solution: "0123456789abcdef".to_string(),
+            commitment_nonce: "ff".repeat(32),
+            phase20_ext: hex::encode(ext.serialize()),
+        };
+        // Gate OFF: byte-identical to the legacy root (extension ignored).
+        assert_eq!(
+            compute_poawx_receipts_root_gated(&[r.clone()], false),
+            compute_poawx_receipts_root(&[r.clone()]),
+            "gate off must equal legacy root"
+        );
+        // Gate ON: the submit-path (pending) root equals the connect-path (block) root.
+        let pending_on = compute_poawx_receipts_root_gated(&[r.clone()], true);
+        let block_rec = pending_receipt_to_block_receipt(&r).expect("valid receipt");
+        assert_eq!(block_rec.phase20_ext.as_ref(), Some(&ext));
+        let block_on =
+            irium_node_rs::poawx::irx1_root_from_block_receipts_gated(&[block_rec], true);
+        assert_eq!(
+            hex::encode(pending_on),
+            hex::encode(block_on),
+            "phase20 gated submit-root must equal connect-root"
+        );
+        // Gate ON differs from gate OFF (the extension actually contributes).
+        assert_ne!(
+            pending_on,
+            compute_poawx_receipts_root(&[r.clone()]),
+            "gate on must differ from legacy root"
         );
     }
 

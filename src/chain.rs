@@ -2263,6 +2263,53 @@ fn validate_phase20_production_payout(
     )
 }
 
+/// Phase 20 connect_block enforcement entry: validate each block-contained PoAW-X
+/// receipt's production extension against the canonical fee-aware multi-role
+/// coinbase. Called from `validate_poawx_block_receipts` only when
+/// `phase20_production_active(height)` (which is mainnet-hard-off). Fails closed if
+/// any receipt is missing its extension. The payout PRIMARY is the receipt
+/// `worker_pkh` (the miner payout identity), and `total_reward` is the block
+/// subsidy: the supported single-miner producer builds a coinbase-only block (no
+/// fee-bearing txs), so the subsidy is the full distributable amount. `prev_hash`
+/// is the parent block hash used by the deterministic fairness assignment.
+fn validate_phase20_production_block(
+    block: &Block,
+    receipts: &[crate::poawx::PoawxBlockReceipt],
+    height: u64,
+    prev_hash: &[u8; 32],
+) -> Result<(), String> {
+    let coinbase = block
+        .transactions
+        .first()
+        .ok_or_else(|| "phase20: no coinbase for production payout check".to_string())?;
+    let total_reward = block_reward(height);
+    let network_id = crate::activation::network_id_byte();
+    // Third-party fee is permitted ONLY when both the fee activation height is
+    // reached AND explicit third-party pool mode is enabled (both mainnet-off).
+    // Otherwise `third_party_mode == false` and any nonzero fee fails closed via
+    // `validate_fee_terms` inside the production validator.
+    let third_party_mode = third_party_fee_active(height) && third_party_pool_mode_enabled();
+    for (i, r) in receipts.iter().enumerate() {
+        let ext = r.phase20_ext.as_ref().ok_or_else(|| {
+            format!(
+                "phase20: production active but receipt[{}] missing extension at height {}",
+                i, height
+            )
+        })?;
+        validate_phase20_production_payout(
+            &coinbase.outputs,
+            &r.worker_pkh,
+            total_reward,
+            height,
+            prev_hash,
+            network_id,
+            ext,
+            third_party_mode,
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_poawx_reward_split_from_block(
     block: &Block,
     receipts: &[crate::poawx::PoawxBlockReceipt],
@@ -2382,7 +2429,12 @@ fn validate_poawx_block_receipts(
     }
 
     // Recompute root from block-contained receipts; must match coinbase.
-    let computed_root = crate::poawx::irx1_root_from_block_receipts(receipts);
+    // Phase 20: after production activation the extension is bound into the root,
+    // so a missing/mutated extension changes `computed_root` and is rejected here
+    // (in addition to the explicit production validator below). Mainnet-off: the
+    // gate is false on mainnet, so the root is byte-identical to Phase 13-A/18B.
+    let phase20_active = phase20_production_active(height);
+    let computed_root = crate::poawx::irx1_root_from_block_receipts_gated(receipts, phase20_active);
     if computed_root != coinbase_root {
         return Err(format!(
             "connect_block: irx1 root mismatch at height {} coinbase={} computed={}",
@@ -2558,8 +2610,16 @@ fn validate_poawx_block_receipts(
         }
     }
 
-    // (5) Reward split.
-    validate_poawx_reward_split_from_block(block, receipts, height)?;
+    // (5) Reward split (legacy) OR Phase 20 production payout (after activation).
+    // Pre-activation behavior is byte-identical (legacy 10%/receipt floor). After
+    // `phase20_production_active(height)` (mainnet-off), the integrated production
+    // validator enforces role claims + RoleReward + the canonical fee-aware
+    // multi-role coinbase, and a missing extension fails closed.
+    if phase20_active {
+        validate_phase20_production_block(block, receipts, height, &parent_hash)?;
+    } else {
+        validate_poawx_reward_split_from_block(block, receipts, height)?;
+    }
 
     Ok(())
 }
@@ -7333,6 +7393,229 @@ mod tests {
         std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
         std::env::remove_var("IRIUM_NETWORK");
+    }
+
+    #[test]
+    fn phase20_connect_block_production_enforcement() {
+        let _g = chain_poawx_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRIUM_NETWORK", "testnet");
+        std::env::set_var("IRIUM_POAWX_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_MODE", "active");
+        std::env::set_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS", "1");
+        std::env::set_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT", "1");
+        std::env::remove_var("IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_THIRD_PARTY_POOL_MODE");
+
+        let net = crate::activation::network_id_byte();
+        let sk = test_signing_key();
+        let parent = phase13b_parent_block();
+        let parent_hash = parent.header.hash_for_height(0);
+        let height = 1u64;
+        let total = block_reward(height);
+        let base_receipt = make_test_receipt(height, &sk, parent_hash, 1);
+        let primary = base_receipt.worker_pkh;
+
+        // Build a valid Phase 20 production block: the receipt carries `ext`, the
+        // coinbase is the canonical multi-role (+ optional fee) payout, and the irx1
+        // root is the gated-on root over the ext-bearing receipt.
+        let build = |ext: &crate::poawx::Phase20ReceiptExt| -> Block {
+            let mut receipt = base_receipt.clone();
+            receipt.phase20_ext = Some(ext.clone());
+            let root = crate::poawx::irx1_root_from_block_receipts_gated(
+                std::slice::from_ref(&receipt),
+                true,
+            );
+            let mut irx1_script = vec![0x6a, 0x24u8];
+            irx1_script.extend_from_slice(b"irx1");
+            irx1_script.extend_from_slice(&root);
+            let mut payout = p20_coinbase(&primary, ext, total);
+            // Replace the stub irx1 (index 0) with the full 38-byte commitment.
+            payout[0] = TxOutput {
+                value: 0,
+                script_pubkey: irx1_script,
+            };
+            let coinbase = Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    prev_txid: [0u8; 32],
+                    prev_index: 0xffff_ffff,
+                    script_sig: vec![0x01, 0x00],
+                    sequence: 0xffff_ffff,
+                }],
+                outputs: payout,
+                locktime: 0,
+            };
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: parent_hash,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![coinbase],
+                auxpow: None,
+                poawx_receipts: Some(vec![receipt]),
+            }
+        };
+
+        // (13) valid Phase 20 production block accepted.
+        let ext = p20_ext(net, height, &parent_hash, 0, [0u8; 20]);
+        let ok = build(&ext);
+        let r = validate_poawx_block_receipts(&ok, height, Some(&parent));
+        assert!(
+            r.is_ok(),
+            "valid phase20 production block must be accepted: {:?}",
+            r
+        );
+
+        // (14) bad role claim (compute carries the verify role) rejects.
+        let mut e = ext.clone();
+        e.compute_claim.role_id = crate::poawx::ROLE_VERIFY_CONTRIBUTOR;
+        assert!(
+            validate_poawx_block_receipts(&build(&e), height, Some(&parent)).is_err(),
+            "bad role claim must reject"
+        );
+
+        // (15) RoleReward pkh != validated claim solver rejects.
+        let mut e = ext.clone();
+        e.role_reward.support_contributor_pkh = [0xDEu8; 20];
+        assert!(
+            validate_poawx_block_receipts(&build(&e), height, Some(&parent)).is_err(),
+            "RoleReward mismatch must reject"
+        );
+
+        // (16) wrong coinbase order rejects (swap two p2pkh payout outputs).
+        let mut b = build(&ext);
+        b.transactions[0].outputs.swap(1, 2);
+        assert!(
+            validate_poawx_block_receipts(&b, height, Some(&parent)).is_err(),
+            "wrong coinbase order must reject"
+        );
+
+        // (17) wrong coinbase amount rejects.
+        let mut b = build(&ext);
+        b.transactions[0].outputs[1].value += 1;
+        assert!(
+            validate_poawx_block_receipts(&b, height, Some(&parent)).is_err(),
+            "wrong coinbase amount must reject"
+        );
+
+        // (18) hidden extra value-bearing p2pkh payout rejects (count mismatch).
+        let mut b = build(&ext);
+        b.transactions[0].outputs.push(TxOutput {
+            value: 1,
+            script_pubkey: p2pkh_script(&[0x9Au8; 20]),
+        });
+        assert!(
+            validate_poawx_block_receipts(&b, height, Some(&parent)).is_err(),
+            "hidden extra payout must reject"
+        );
+
+        // (19/20) third-party fee: rejected without mode; accepted with fee gate + mode.
+        let fee_pkh = [0xFEu8; 20];
+        let extf = p20_ext(net, height, &parent_hash, 200, fee_pkh);
+        assert!(
+            validate_poawx_block_receipts(&build(&extf), height, Some(&parent)).is_err(),
+            "third-party fee without mode must reject"
+        );
+        std::env::set_var("IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT", "1");
+        std::env::set_var("IRIUM_POAWX_THIRD_PARTY_POOL_MODE", "1");
+        let rf = validate_poawx_block_receipts(&build(&extf), height, Some(&parent));
+        assert!(
+            rf.is_ok(),
+            "third-party fee with gate+mode must be accepted: {:?}",
+            rf
+        );
+
+        // (21) fee over cap (201 bps) rejects even with mode enabled.
+        let over = p20_ext(net, height, &parent_hash, 201, fee_pkh);
+        assert!(
+            validate_poawx_block_receipts(&build(&over), height, Some(&parent)).is_err(),
+            "fee over cap must reject"
+        );
+        std::env::remove_var("IRIUM_POAWX_THIRD_PARTY_FEE_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_THIRD_PARTY_POOL_MODE");
+
+        // (11) missing extension after activation rejects (root still matches because
+        // a no-ext receipt contributes no phase20 digest; the production validator
+        // fails closed on the absent extension).
+        {
+            let mut receipt = base_receipt.clone();
+            receipt.phase20_ext = None;
+            let root = crate::poawx::irx1_root_from_block_receipts_gated(
+                std::slice::from_ref(&receipt),
+                true,
+            );
+            let mut irx1_script = vec![0x6a, 0x24u8];
+            irx1_script.extend_from_slice(b"irx1");
+            irx1_script.extend_from_slice(&root);
+            let worker_due = total * 100 / 1000;
+            let coinbase = Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    prev_txid: [0u8; 32],
+                    prev_index: 0xffff_ffff,
+                    script_sig: vec![0x01, 0x00],
+                    sequence: 0xffff_ffff,
+                }],
+                outputs: vec![
+                    TxOutput {
+                        value: 0,
+                        script_pubkey: irx1_script,
+                    },
+                    TxOutput {
+                        value: total - worker_due,
+                        script_pubkey: vec![0x51],
+                    },
+                    TxOutput {
+                        value: worker_due,
+                        script_pubkey: p2pkh_script(&primary),
+                    },
+                ],
+                locktime: 0,
+            };
+            let block = Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_hash: parent_hash,
+                    merkle_root: [0u8; 32],
+                    time: 0,
+                    bits: 0x207fffff,
+                    nonce: 0,
+                },
+                transactions: vec![coinbase],
+                auxpow: None,
+                poawx_receipts: Some(vec![receipt]),
+            };
+            let res = validate_poawx_block_receipts(&block, height, Some(&parent));
+            assert!(
+                res.is_err(),
+                "missing extension after activation must reject"
+            );
+            let msg = res.unwrap_err();
+            assert!(msg.contains("missing extension"), "unexpected err: {}", msg);
+        }
+
+        // (22) mainnet hard-off: the SAME multi-role block is not production-validated
+        // (mainnet skips PoAW-X receipt validation entirely) => no enforcement.
+        std::env::set_var("IRIUM_NETWORK", "mainnet");
+        assert!(!phase20_production_active(height), "mainnet hard-off");
+        assert!(
+            validate_poawx_block_receipts(&ok, height, Some(&parent)).is_ok(),
+            "mainnet must skip phase20 production enforcement"
+        );
+
+        std::env::remove_var("IRIUM_NETWORK");
+        std::env::remove_var("IRIUM_POAWX_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_MODE");
+        std::env::remove_var("IRIUM_POAWX_PUZZLE_DIFFICULTY_BITS");
+        std::env::remove_var("IRIUM_POAWX_MULTI_ROLE_REWARD_ACTIVATION_HEIGHT");
+        std::env::remove_var("IRIUM_POAWX_FAIRNESS_MATRIX_ACTIVATION_HEIGHT");
     }
 
     #[test]

@@ -937,6 +937,21 @@ pub fn count_leading_zero_bits(hash: &[u8; 32]) -> u32 {
 ///   root  = SHA256(concat inner hashes; receipts sorted by
 ///                  (height, lane, worker_pkh, commitment_nonce))
 pub fn irx1_root_from_block_receipts(receipts: &[PoawxBlockReceipt]) -> [u8; 32] {
+    irx1_root_from_block_receipts_gated(receipts, false)
+}
+
+/// Phase 20: gated variant of [`irx1_root_from_block_receipts`]. When
+/// `phase20_active` is true, a receipt's `phase20_ext` digest is bound into its
+/// inner hash (after the optional mode-1 delegation digest), so any change to the
+/// production extension (role claims, RoleReward, fee terms) changes the receipts
+/// root and is tamper-evident. When `phase20_active` is false — every pre-activation
+/// and non-production caller — the result is **byte-identical** to the Phase 13-A /
+/// 18B root (the extension is ignored, exactly as the wrapper above). The inner
+/// hash field order mirrors `compute_poawx_receipts_root_gated` in iriumd.rs.
+pub fn irx1_root_from_block_receipts_gated(
+    receipts: &[PoawxBlockReceipt],
+    phase20_active: bool,
+) -> [u8; 32] {
     let mut sorted: Vec<&PoawxBlockReceipt> = receipts.iter().collect();
     sorted.sort_unstable_by(|a, b| {
         a.height
@@ -958,6 +973,13 @@ pub fn irx1_root_from_block_receipts(receipts: &[PoawxBlockReceipt]) -> [u8; 32]
         // is byte-identical to the Phase 13-A inner hash.
         if let Some(d) = &r.delegation {
             inner.update(d.digest());
+        }
+        // Phase 20: bind the production-extension digest (gated). Absent extension
+        // or `phase20_active == false` => byte-identical to the Phase 13-A/18B root.
+        if phase20_active {
+            if let Some(e) = &r.phase20_ext {
+                inner.update(e.digest());
+            }
         }
         outer.update(inner.finalize());
     }
@@ -1552,6 +1574,97 @@ mod tests {
         assert_eq!(r3, r2);
         assert_eq!(r3.phase20_ext, Some(mk_ext()));
         assert_eq!(used, bytes.len());
+    }
+
+    #[test]
+    fn phase20_root_gating_and_mutation_sensitivity() {
+        let prev = [0x44u8; 32];
+        let mk_ext = |fee_bps: u16, fee_pkh: [u8; 20]| Phase20ReceiptExt {
+            role_reward: RoleReward {
+                compute_contributor_pkh: [0xC1u8; 20],
+                verify_contributor_pkh: [0xC2u8; 20],
+                support_contributor_pkh: [0xC3u8; 20],
+            },
+            compute_claim: fairness_valid_claim(1, 60, &prev, ROLE_COMPUTE_CONTRIBUTOR, 0),
+            verify_claim: fairness_valid_claim(1, 60, &prev, ROLE_VERIFY_CONTRIBUTOR, 0),
+            support_claim: fairness_valid_claim(1, 60, &prev, ROLE_SUPPORT_CONTRIBUTOR, 0),
+            fee_bps,
+            fee_pkh,
+        };
+
+        // Base mode-0 receipt with a production extension attached.
+        let mut r = make_test_receipt(7);
+        r.phase20_ext = Some(mk_ext(0, [0u8; 20]));
+
+        // Gate OFF: the extension is ignored -> byte-identical to the no-ext root
+        // and to the public wrapper (old behavior unchanged before activation).
+        let mut r_no_ext = make_test_receipt(7);
+        r_no_ext.phase20_ext = None;
+        assert_eq!(
+            irx1_root_from_block_receipts_gated(&[r.clone()], false),
+            irx1_root_from_block_receipts(&[r_no_ext]),
+            "gate off: extension must not affect the root"
+        );
+        assert_eq!(
+            irx1_root_from_block_receipts_gated(&[r.clone()], false),
+            irx1_root_from_block_receipts(&[r.clone()]),
+            "wrapper must equal gated(false)"
+        );
+
+        // Gate ON: the extension contributes -> root differs from the gate-off root,
+        // and is deterministic across calls.
+        let base = irx1_root_from_block_receipts_gated(&[r.clone()], true);
+        assert_ne!(
+            base,
+            irx1_root_from_block_receipts_gated(&[r.clone()], false),
+            "gate on: extension must change the root"
+        );
+        assert_eq!(
+            base,
+            irx1_root_from_block_receipts_gated(&[r.clone()], true)
+        );
+
+        // Mutating ANY extension field changes the gated-on root.
+        let mut m = r.clone();
+        m.phase20_ext.as_mut().unwrap().compute_claim.lane_id ^= 0x01;
+        assert_ne!(
+            base,
+            irx1_root_from_block_receipts_gated(&[m], true),
+            "role claim mutation must change root"
+        );
+        let mut m = r.clone();
+        m.phase20_ext
+            .as_mut()
+            .unwrap()
+            .role_reward
+            .support_contributor_pkh = [0xDEu8; 20];
+        assert_ne!(
+            base,
+            irx1_root_from_block_receipts_gated(&[m], true),
+            "RoleReward mutation must change root"
+        );
+        let mut m = r.clone();
+        m.phase20_ext.as_mut().unwrap().fee_bps = 200;
+        assert_ne!(
+            base,
+            irx1_root_from_block_receipts_gated(&[m], true),
+            "fee_bps mutation must change root"
+        );
+        let mut m = r.clone();
+        m.phase20_ext.as_mut().unwrap().fee_pkh = [0xFEu8; 20];
+        assert_ne!(
+            base,
+            irx1_root_from_block_receipts_gated(&[m], true),
+            "fee_pkh mutation must change root"
+        );
+
+        // Malformed extension bytes fail to deserialize (fail-closed at the wire).
+        assert!(Phase20ReceiptExt::deserialize(&[]).is_err());
+        let good = mk_ext(0, [0u8; 20]).serialize();
+        assert!(
+            Phase20ReceiptExt::deserialize(&good[..good.len() - 1]).is_err(),
+            "truncated extension must fail to deserialize"
+        );
     }
 
     #[test]
