@@ -7,6 +7,15 @@ flow into a repeatable onboarding runbook for additional trusted miners.
 > `STRATUM_DEFAULT_DIFF=1` is the stratum **share** difficulty (not chain difficulty). Chain
 > difficulty is automatic via LWMA-144. Delegation endpoint and RPC stay loopback-only.
 
+> **Third-party pools (Phase 20 Step 4, opt-in).** The official Irium pool is **0% fee** and the
+> default `poawx-register` flow is unchanged. A third-party operator may charge a capped fee (max
+> **2% = 200 bps**) taken **only from the miner's PRIMARY allocation**. The miner opts in explicitly
+> and signs the fee terms into the delegation:
+> `poawx-register … --third-party-pool --fee-bps <1..200> --fee-pkh <base58-addr|40hex>`
+> (works with `--emit-only` too). The wallet refuses `--fee-bps>0` without `--third-party-pool` +
+> `--fee-pkh`, refuses fees over the cap, and (online) refuses unless the pool advertises the exact
+> same terms. Fees are mainnet-hard-off.
+
 ## 1. Miner requirements
 - A stock SHA-256d CPU miner (`cpuminer`/`minerd`) — unchanged, no version-rolling needed.
 - The Irium wallet binary with `poawx-register --emit-only` (Phase 19B+).

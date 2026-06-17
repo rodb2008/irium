@@ -1,17 +1,54 @@
-# PoAW-X Phase 20 — Production Wiring Status (Steps 1–3 COMPLETE: extension threaded + consensus-enforced + root-committed + pool official-fee-0 production; wallet/third-party/E2E follow-up)
+# PoAW-X Phase 20 — Production Wiring Status (Steps 1–4 COMPLETE: extension threaded + consensus-enforced + root-committed + pool official-fee-0 AND third-party-fee production; E2E/live-protocol follow-up)
 
 **Status:** **PARTIAL** (advancing). **Step 1** (threading `Phase20ReceiptExt` through node storage,
-persistence, P2P/block sync, reorg) is COMPLETE; **Step 2** (`connect_block` /
-`submit_block_extended` enforcement + receipts-root inclusion, gated by
-`phase20_production_active(height)`) is COMPLETE and ENFORCED; **Step 3 — pool canonical multi-role
-coinbase production in OFFICIAL fee-0 mode — is now COMPLETE** (synthetic testnet/devnet role-claim
-source). After activation (testnet/devnet only; mainnet hard-off) the pool builds a valid
-`Phase20ReceiptExt` + the canonical 55/22/13/10 coinbase + the gated root the node enforces. Before
-activation the Phase 18/19 path is byte/logically identical. Still remaining: third-party fee block
-production, wallet third-party-fee CLI, pool registry fee relaxation, a live (non-synthetic)
-hidden-precommit role-claim protocol + commitment root, and a live loopback E2E.
+persistence, P2P/block sync, reorg) COMPLETE; **Step 2** (`connect_block` / `submit_block_extended`
+enforcement + receipts-root inclusion) COMPLETE and ENFORCED; **Step 3** (pool canonical multi-role
+coinbase, OFFICIAL fee-0) COMPLETE; **Step 4 — third-party-fee production wiring (wallet CLI + pool
+identity/config + registry relaxation + fee-aware coinbase + fee-aware receipt extension) — is now
+COMPLETE.** Official Irium pool stays **0%**; third-party fee is **explicit opt-in**, capped at **2%**,
+applied **only to PRIMARY_MINER**, **miner-signed** into the delegation and **bound** into the
+production extension; mainnet hard-off. Before activation the Phase 18/19/20-official path is
+byte/logically identical. Still remaining: a live (non-synthetic) hidden-precommit role-claim
+protocol + commitment root, a public/external miner test, and a live loopback E2E.
 
-### Step 3 (this pass) — pool canonical multi-role coinbase production (OFFICIAL fee-0): COMPLETE
+### Step 4 (this pass) — third-party-fee production wiring: COMPLETE
+Third-party fee is **explicit opt-in only**; the official Irium pool remains **0%** and the entire
+Phase 18/19/20-official path is byte/logically unchanged. Cap is **200 bps (2%)**, applied **only to
+the PRIMARY_MINER allocation** (compute/verify/support are never taxed). Fee terms are **miner-signed**
+into the 226-byte `Delegation` (`fee_bps` + `fee_pkh` are in `message_hash`), and the production
+extension fee is **bound to that signed delegation**. Mainnet is hard-off throughout.
+- **Wallet CLI** (`src/bin/irium-wallet.rs`): `--third-party-pool`, `--fee-bps <1..200>`,
+  `--fee-pkh <base58-addr|40hex>`. `--fee-bps 0` still works with no third-party flag (official).
+  `fee>0` requires `--third-party-pool` + `--fee-pkh` + cap + non-mainnet, else fails closed. The
+  emit-only JSON equals the online POST body (both are the signed delegation hex, which carries the
+  fee terms); online mode verifies the pool identity advertises the exact same `fee_bps`/`fee_pkh`.
+  No private key/seed is printed; fee terms are logged when `fee>0`.
+- **Pool identity** (`pool_identity_json` + `/poawx/pool-identity`): advertises `fee_bps` + `fee_pkh`
+  only via `pool_third_party_fee_terms()` (third-party mode on + cap + valid pkh + non-mainnet);
+  official advertises `fee_bps:0` and no `fee_pkh` (byte-identical to before). Invalid config fails
+  closed to official 0% with a warning.
+- **Pool registry** (`verify_and_store` + `expected_fee`): official mode still rejects `fee_bps>0`;
+  third-party mode accepts a signed delegation ONLY when its fee terms equal the pool's configured
+  terms (gated on `third_party_fee_active(tip)`). `StoredDelegation.fee_pkh` persists/reloads. Rejects
+  fee mutation (`BadSignature`), `fee_bps` mismatch (`FeeMismatch`), `fee_pkh` mismatch
+  (`FeePkhMismatch`), over-cap, and fee in official mode.
+- **Pool coinbase** (`build_native_rewardable_coinbase`): with a fee-bearing ext, appends a 6th
+  output (fee → `fee_pkh`) where `fee = floor(primary_gross * fee_bps / 10000)` and `primary_net =
+  primary_gross - fee`; compute/verify/support unchanged; total == block reward; no delegate/hidden
+  output. Official keeps the 5-output (irx1 + 4 role) shape byte-identical to Step 3.
+- **Receipt extension**: `build_synthetic_phase20_ext` takes optional fee terms; ext digest (and thus
+  the gated root) changes with `fee_bps`/`fee_pkh`.
+- **Node consensus** (`src/chain.rs`, `src/bin/iriumd.rs`): the Step-1 mode-1 `fee_bps==0` hard-reject
+  is relaxed to allow a delegation fee ONLY under the third-party gates (cap + nonzero `fee_pkh`;
+  mainnet stays 0%); `validate_phase20_production_block` binds the extension fee terms to the signed
+  delegation (`ext.fee != delegation.fee` rejects). The fee-aware coinbase validator
+  (`validate_poawx_coinbase_payout`) was already present (Step 2).
+- Tests: wallet (`poawx_register_build_signed_delegation_verifies` extended for cap/mainnet/valid +
+  sig-binding; `poawx_third_party_fee_arg_resolution`); pool (`phase20_registry_third_party_fee`,
+  `phase20_synthetic_builder_third_party_fee`, `phase20_native_coinbase_third_party_fee`, identity
+  shape); node (`phase20_connect_block_mode1_third_party_fee_and_binding`).
+
+### Step 3 — pool canonical multi-role coinbase production (OFFICIAL fee-0): COMPLETE
 After all Phase 20 production gates are active on testnet/devnet (multi-role + fairness; mainnet
 hard-off), the stratum pool builds a valid `Phase20ReceiptExt`, the canonical multi-role coinbase,
 and the gated root that matches `connect_block` / `submit_block_extended`.
@@ -158,18 +195,16 @@ Each touches the validated Phase 18/19/19D code and is staged to avoid regressin
    production is NOT done (Step 4).
 4. **Role-claim source** — real claims from miners, or a clearly-named testnet/devnet-only
    `IRIUM_POAWX_SYNTHETIC_ROLE_CLAIMS=1` synthetic builder (mainnet-impossible). Not added yet.
-5. **Wallet CLI** — `--third-party-pool` / `--fee-bps` / `--fee-pkh` on `poawx-register`/
-   `--emit-only` (fee terms already round-trip in the signed delegation).
-6. **Pool registry** — relax `verify_and_store` (currently fail-closed on `fee_bps>0`) to accept
-   capped third-party fees + persist `fee_pkh`, gated on third-party mode; reject mismatch/mutation.
+5. **Wallet CLI** — ✅ **DONE (Step 4)**: `--third-party-pool` / `--fee-bps` / `--fee-pkh` on
+   `poawx-register` + `--emit-only` (fee terms signed into the delegation; emit==online body).
+6. **Pool registry** — ✅ **DONE (Step 4)**: `verify_and_store` accepts capped third-party fees that
+   match the pool config + persists `fee_pkh`, gated on third-party mode + fee activation; rejects
+   mismatch/mutation/over-cap (official mode still fail-closed on `fee_bps>0`).
 7. **Observer + loopback smoke** — two-node + isolated `$TROOT` E2E (operator-approved, loopback).
    **(Step 5 — NOT done; submit_block_extended live handler accept/reject is covered here.)**
 
-### Still NOT done after Step 3 (explicit)
-- third-party-fee block production (Step 4) — pool builds OFFICIAL fee-0 only
-- wallet third-party-fee CLI (`--third-party-pool` / `--fee-bps` / `--fee-pkh`)
-- pool registry fee relaxation (`verify_and_store` still fail-closed on `fee_bps>0`)
-- a LIVE (non-synthetic) role-claim protocol — Step 3 uses a gated testnet/devnet synthetic builder
+### Still NOT done after Step 4 (explicit)
+- a LIVE (non-synthetic) role-claim protocol — Steps 3/4 use a gated testnet/devnet synthetic builder
 - hidden-precommit commitment root (fairness matrix remains PARTIAL — assignment uses `prev_hash`,
   known at block time; a prior-block commitment root is required for true hidden-before-reveal)
 - public/external miner test

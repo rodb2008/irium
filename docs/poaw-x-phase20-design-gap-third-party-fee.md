@@ -1,11 +1,17 @@
-# PoAW-X Phase 20 — Third-Party Pool Fee (DESIGN GAP RESOLVED — consensus primitives + validator implemented; wallet CLI / pool / production wiring follow-up)
+# PoAW-X Phase 20 — Third-Party Pool Fee (FULLY WIRED — Step 4 complete)
 
-**Status:** **RESOLVED for consensus primitives + canonical fee-aware coinbase validator +
-activation/mode gates + delegation fee-binding (already signed) + tests** (testnet/devnet-gated,
-mainnet hard-off). **PARTIAL overall:** wallet `--third-party-pool`/`--fee-pkh` CLI flags, pool
-registry relaxation, and live `connect_block` production enforcement remain a documented
-follow-up (per the spec's PARTIAL clause) so the validated Phase 18/19/19D registration path
-stays byte-identical. Local-only; not pushed.
+**Status:** **COMPLETE (Step 4, 2026-06-17).** The earlier follow-ups are now implemented end to
+end: wallet `--third-party-pool`/`--fee-bps`/`--fee-pkh` CLI, pool identity advertising, pool
+registry relaxation (`verify_and_store` accepts capped, signed, config-matching fees + persists
+`fee_pkh`), fee-aware coinbase production (6th fee output from PRIMARY only), fee-aware receipt
+extension, and live `connect_block` enforcement (mode-1 fee relaxed under the third-party gates +
+ext↔delegation fee binding). See `poaw-x-phase20-production-wiring-status.md` (Step 4) for the full
+inventory + tests. Official pool stays 0%; cap 2%; fee on PRIMARY only; miner-signed; mainnet
+hard-off; chain difficulty remains LWMA-144 automatic. Local-only; not pushed.
+
+> Historical note (pre-Step-4): only the consensus primitives + canonical fee-aware coinbase
+> validator + activation/mode gates + delegation fee-binding were implemented; wallet CLI, pool
+> registry relaxation, and live production enforcement were the documented follow-up — now done.
 
 ## Policy (implemented / enforced by the primitives)
 - **Official Irium pool fee remains 0%**; `fee_bps = 0` is the default everywhere and is
