@@ -1,12 +1,31 @@
 # PoAW-X Phase 20 — Production Wiring Status (PARTIAL: consensus validator + extension done; live node/pool/wallet integration follow-up)
 
-**Status:** **PARTIAL.** The Phase 20 **consensus-validation + wire layer** is implemented and
-tested (the integrated production validator + the receipt-extension type), gated and mainnet-off,
-with **zero changes to the proven `iriumd` / pool / wallet / storage paths** (zero regression to
-the validated Phase 18/19/19D trusted-miner flow). The **live integration** (threading the
-extension through the node pending/persistence/reorg/P2P path, the `connect_block`/
-`submit_block_extended` call site, pool coinbase production, wallet CLI, and registry
-relaxation) is the **documented remaining step** — deliberately staged, not faked.
+**Status:** **PARTIAL** (advancing). The consensus validator + extension type are done, and
+**Step 1 — threading `Phase20ReceiptExt` through node storage, persistence, P2P/block sync, and
+reorg plumbing — is now COMPLETE (data only, NOT enforced)**. The extension survives all internal
+node data paths; pre-Phase-20 blocks/receipts remain byte-identical. Still remaining: the
+`connect_block`/`submit_block_extended` enforcement call site, pool coinbase production, wallet
+third-party-fee CLI, pool registry fee relaxation, and a loopback E2E.
+
+### Step 1 (this pass) — receipt-wire / storage / P2P / reorg threading: COMPLETE
+- **Receipt wire (`PoawxBlockReceipt.phase20_ext: Option<Phase20ReceiptExt>`)** + a **present-only
+  v3 receipt section** (`POAWX_RECEIPT_SECTION_MAGIC_V3`): a block uses v3 only when a receipt
+  carries the extension; v1/v2 (mode-0/mode-1) blocks are **byte-identical** to before
+  (`serialize_v3` = `serialize_v2` + a `0` flag when absent). Round-trips through block
+  serialize/deserialize (the **P2P / binary-persist path**).
+- **JSON persistence** (`storage::JsonPoawxReceipt.phase20_ext`, `write_block_json`) +
+  **JSON reload** (`iriumd` block-load reconstruction) carry the extension hex (omitted when absent).
+- **Pending receipt** (`iriumd PoawxPendingReceipt.phase20_ext`) + both mappers
+  (`pending_receipt_to_block_receipt` / `block_receipt_to_pending`) preserve it, so **reorg
+  rollback/reapply** keeps the extension (malformed → fail-closed, like delegation).
+- **NOT enforced:** the extension is only preserved, never validated/required in this step; the
+  receipts root is unchanged (root/digest inclusion + validation belong to the enforcement step).
+- Tests: v3 element round-trip + byte-identity-when-absent (poawx); v3 block wire round-trip +
+  old-block-no-v3-magic (block); reorg mapper preserves ext + plain→None (iriumd). Full suites
+  green (lib 628, iriumd bin 255, stratum delegation 14 / native_rewardable 6, wallet 420).
+
+> Mainnet hard-off for all three features. Chain difficulty automatic via LWMA-144. Local-only;
+> not pushed. Hidden-precommit commitment root remains a separate PARTIAL (see fairness doc).
 
 > Mainnet hard-off for all three features. Chain difficulty automatic via LWMA-144. Local-only;
 > not pushed. Hidden-precommit commitment root remains a separate PARTIAL (see fairness doc).
@@ -45,9 +64,9 @@ level) — depend on the live integration below.
 
 ## Remaining live integration (follow-up — NOT done; the bulk of A/C/D/E/F/G/H/I)
 Each touches the validated Phase 18/19/19D code and is staged to avoid regressing it:
-1. **Node receipt-wire threading** — carry `Phase20ReceiptExt` in the block receipt section
-   (v3, present-only so v1/v2 stay byte-identical) through `iriumd` pending receipts,
-   `storage` JSON persist/reload, reorg pending↔block mappers, and P2P block ser/de.
+1. **Node receipt-wire threading** — ✅ **DONE (Step 1)**: `Phase20ReceiptExt` is carried in the
+   present-only v3 receipt section through `iriumd` pending receipts, `storage` JSON persist/reload,
+   reorg pending↔block mappers, and P2P block ser/de (data only, not enforced).
 2. **connect_block / submit_block_extended** — call `validate_phase20_production_payout` when
    `phase20_production_active(height)` and the extension is present; reject missing/malformed
    extension after activation; keep pre-activation Phase 18/19 blocks valid.
